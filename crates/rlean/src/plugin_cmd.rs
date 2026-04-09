@@ -302,7 +302,9 @@ fn plugin_src_dir(name: &str) -> Result<PathBuf> {
 }
 
 fn plugin_lib_path(name: &str) -> Result<PathBuf> {
-    let lib_name = format!("lib{}.{}", name.replace('-', "_"), dylib_ext());
+    // Must match the pattern providers.rs uses to look up installed plugins:
+    //   librlean_plugin_<name>.<dylib|so>
+    let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
     Ok(plugins_dir()?.join(lib_name))
 }
 
