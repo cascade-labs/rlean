@@ -156,7 +156,21 @@ async fn main() -> Result<()> {
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
 
-async fn run_backtest(args: RunArgs) -> Result<()> {
+async fn run_backtest(mut args: RunArgs) -> Result<()> {
+    // If the user passed a directory, look for main.py inside it.
+    if args.strategy.is_dir() {
+        let candidate = args.strategy.join("main.py");
+        if candidate.exists() {
+            args.strategy = candidate;
+        } else {
+            bail!(
+                "'{}' is a directory but contains no main.py. \
+                 Pass the strategy file directly or run `rlean create-project` to scaffold one.",
+                args.strategy.display()
+            );
+        }
+    }
+
     validate_strategy_path(&args.strategy)?;
 
     let historical_provider = build_historical_provider(&args)?;
@@ -182,6 +196,7 @@ async fn run_python_backtest(
     use lean_python::report::write_report;
 
     // Register the AlgorithmImports PyO3 module before starting Python.
+    // Must be called before prepare_freethreaded_python.
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::prepare_freethreaded_python();
 
@@ -189,6 +204,8 @@ async fn run_python_backtest(
     let thetadata_api_key = args.thetadata_api_key.clone()
         .or_else(|| creds.thetadata_api_key);
 
+    let strategy = args.strategy.clone();
+    let report = args.report.clone();
     let config = RunConfig {
         data_root: args.data.clone(),
         historical_provider,
@@ -198,19 +215,18 @@ async fn run_python_backtest(
         ..Default::default()
     };
 
-    match run_strategy(&args.strategy, config) {
-        Ok(results) => {
-            results.print_summary();
-            if let Some(ref path) = args.report {
-                match write_report(&results, path) {
-                    Ok(()) => println!("Report written to {}", path.display()),
-                    Err(e) => eprintln!("Failed to write report: {e}"),
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Backtest failed: {e:#}");
-            std::process::exit(1);
+    // run_strategy is synchronous and creates its own tokio runtime internally.
+    // Use spawn_blocking so it runs on a thread without an active tokio context,
+    // avoiding the "cannot start a runtime from within a runtime" panic.
+    let results = tokio::task::spawn_blocking(move || run_strategy(&strategy, config))
+        .await
+        .map_err(|e| anyhow::anyhow!("Strategy thread panicked: {e}"))??;
+
+    results.print_summary();
+    if let Some(ref path) = report {
+        match write_report(&results, path) {
+            Ok(()) => println!("Report written to {}", path.display()),
+            Err(e) => eprintln!("Failed to write report: {e}"),
         }
     }
 
@@ -241,8 +257,10 @@ fn run_rust_plugin_backtest(args: RunArgs) -> Result<()> {
     };
 
     let engine = BacktestEngine::new(config);
-    let rt = tokio::runtime::Handle::current();
-    match rt.block_on(engine.run(algo)) {
+    // block_in_place lets us call async code from a sync fn inside an async context.
+    match tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(engine.run(algo))
+    }) {
         Ok(results) => results.print_summary(),
         Err(e) => {
             eprintln!("Backtest failed: {e}");
