@@ -1,0 +1,29 @@
+[package]
+name = "rlean"
+version.workspace = true
+edition.workspace = true
+description = "Unified Lean-Rust CLI — backtest and live-trade Python or Rust strategies"
+
+[[bin]]
+name = "rlean"
+path = "src/main.rs"
+
+[dependencies]
+lean-core           = { path = "../lean-core" }
+lean-plugin         = { path = "../lean-plugin" }
+lean-data           = { path = "../lean-data" }
+lean-data-providers = { path = "../lean-data-providers" }
+lean-engine         = { path = "../lean-engine" }
+lean-algorithm      = { path = "../lean-algorithm" }
+lean-python         = { path = "../lean-python" }
+
+clap               = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+chrono             = { workspace = true }
+pyo3               = { workspace = true }
+libloading         = { workspace = true }

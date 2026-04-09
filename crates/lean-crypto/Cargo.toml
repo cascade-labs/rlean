@@ -1,0 +1,13 @@
+[package]
+name = "lean-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core    = { path = "../lean-core" }
+lean-orders  = { path = "../lean-orders" }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono       = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }

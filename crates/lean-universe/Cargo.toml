@@ -1,0 +1,14 @@
+[package]
+name = "lean-universe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+lean-data = { path = "../lean-data" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }

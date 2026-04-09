@@ -1,0 +1,28 @@
+[package]
+name = "lean-algorithm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+lean-data = { path = "../lean-data" }
+lean-orders = { path = "../lean-orders" }
+lean-indicators = { path = "../lean-indicators" }
+lean-options = { path = "../lean-options" }
+lean-risk = { path = "../lean-risk" }
+lean-universe = { path = "../lean-universe" }
+lean-scheduling = { path = "../lean-scheduling" }
+lean-statistics = { path = "../lean-statistics" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+indexmap = { workspace = true }

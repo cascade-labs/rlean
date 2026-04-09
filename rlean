@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# rlean — Lean-Rust unified runner
+#
+# Builds the rlean binary (release) then delegates all args to it.
+# First run compiles (~30s). Subsequent runs are instant.
+#
+# Usage:
+#   ./rlean install                           # install rlean into ~/.cargo/bin (PATH)
+#   ./rlean init                              # bootstrap workspace
+#   ./rlean create-project <name>             # scaffold a new strategy project
+#   ./rlean backtest <project>/main.py        # run a backtest
+#   ./rlean live     <project>/main.py        # run live trading
+#   ./rlean research <project>                # start research kernel
+#   ./rlean --help
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Handle ./rlean install before building — installs into ~/.cargo/bin.
+if [[ "${1:-}" == "install" ]]; then
+    echo "Installing rlean into ~/.cargo/bin ..." >&2
+    cargo install --path "$SCRIPT_DIR/crates/rlean" --manifest-path "$SCRIPT_DIR/Cargo.toml"
+    echo "Done. Run: rlean --help" >&2
+    exit 0
+fi
+
+# Build release binary if not already up to date.
+cargo build --release -p rlean --manifest-path "$SCRIPT_DIR/Cargo.toml" 1>&2
+
+exec "$SCRIPT_DIR/target/release/rlean" "$@"

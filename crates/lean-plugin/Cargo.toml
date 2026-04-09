@@ -1,0 +1,9 @@
+[package]
+name = "lean-plugin"
+version.workspace = true
+edition.workspace = true
+description = "Plugin ABI for rlean — defines the C-stable interface every rlean plugin must export"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }

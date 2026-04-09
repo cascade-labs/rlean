@@ -1,0 +1,35 @@
+[package]
+name = "lean-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+lean-data = { path = "../lean-data" }
+lean-storage = { path = "../lean-storage" }
+lean-orders = { path = "../lean-orders" }
+lean-algorithm = { path = "../lean-algorithm" }
+lean-statistics = { path = "../lean-statistics" }
+lean-risk = { path = "../lean-risk" }
+lean-universe = { path = "../lean-universe" }
+lean-scheduling = { path = "../lean-scheduling" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+num_cpus = { workspace = true }
+lean-brokerages = { path = "../lean-brokerages" }
+lean-indicators = { path = "../lean-indicators" }
