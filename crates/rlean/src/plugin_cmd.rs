@@ -214,16 +214,14 @@ fn cmd_install(name: &str) -> Result<()> {
     println!("Cloning {} ...", entry.git_url);
     git_clone(&entry.git_url, &src_dir)?;
 
-    // Build
-    let crate_dir = match &entry.subdir {
-        Some(sub) => src_dir.join(sub),
-        None      => src_dir.clone(),
-    };
+    // Build — always run from the workspace/repo root so path resolution is correct.
+    // Use `-p` to build only this plugin crate even if the repo is a workspace.
     println!("Building {} ...", entry.name);
-    cargo_build(&crate_dir)?;
+    let package_name = format!("rlean-plugin-{}", entry.name);
+    cargo_build(&src_dir, &package_name)?;
 
-    // Copy the compiled library
-    let built = find_built_lib(&crate_dir, &entry.name)?;
+    // The compiled library is always in the workspace root's target/, not the subdir's.
+    let built = find_built_lib(&src_dir, &entry.name)?;
     std::fs::copy(&built, &lib_path)
         .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
 
@@ -253,15 +251,12 @@ fn cmd_upgrade(name: &str) -> Result<()> {
     println!("Pulling latest source for '{}' ...", name);
     git_pull(&src_dir)?;
 
-    // Rebuild
-    let crate_dir = match &subdir {
-        Some(sub) => src_dir.join(sub),
-        None      => src_dir.clone(),
-    };
+    // Rebuild from workspace root with -p flag.
     println!("Building '{}' ...", name);
-    cargo_build(&crate_dir)?;
+    let package_name = format!("rlean-plugin-{}", name);
+    cargo_build(&src_dir, &package_name)?;
 
-    let built = find_built_lib(&crate_dir, name)?;
+    let built = find_built_lib(&src_dir, name)?;
     std::fs::copy(&built, &lib_path)
         .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
 
@@ -407,14 +402,14 @@ fn git_pull(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cargo_build(crate_dir: &Path) -> Result<()> {
+fn cargo_build(workspace_root: &Path, package_name: &str) -> Result<()> {
     let status = Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
+        .args(["build", "--release", "-p", package_name])
+        .current_dir(workspace_root)
         .status()
         .context("Failed to run cargo build — is Rust installed?")?;
     if !status.success() {
-        bail!("cargo build failed in {}", crate_dir.display());
+        bail!("cargo build failed in {}", workspace_root.display());
     }
     Ok(())
 }
