@@ -1,0 +1,11 @@
+[package]
+name = "lean-portfolio-construction"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core    = { path = "../lean-core" }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }

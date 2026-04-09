@@ -1,0 +1,12 @@
+[package]
+name = "lean-statistics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+statrs = { workspace = true }
+thiserror = { workspace = true }

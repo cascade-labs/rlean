@@ -1,0 +1,12 @@
+[package]
+name = "lean-risk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+lean-orders = { path = "../lean-orders" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }

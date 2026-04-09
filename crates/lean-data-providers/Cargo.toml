@@ -1,0 +1,24 @@
+[package]
+name = "lean-data-providers"
+version.workspace = true
+edition.workspace = true
+description = "Data provider traits and registry — Rust equivalent of QuantConnect.Interfaces"
+
+[dependencies]
+lean-core    = { path = "../lean-core" }
+lean-data    = { path = "../lean-data" }
+lean-storage = { path = "../lean-storage" }
+
+anyhow       = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+async-trait  = { workspace = true }
+chrono       = { workspace = true }
+reqwest      = { workspace = true }
+rust_decimal = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true }
+tempfile     = { workspace = true }

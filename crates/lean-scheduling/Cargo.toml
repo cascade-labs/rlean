@@ -1,0 +1,11 @@
+[package]
+name = "lean-scheduling"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }

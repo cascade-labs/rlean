@@ -1,0 +1,35 @@
+[package]
+name = "lean-examples"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lean-core = { path = "../crates/lean-core" }
+lean-data = { path = "../crates/lean-data" }
+lean-storage = { path = "../crates/lean-storage" }
+lean-engine = { path = "../crates/lean-engine" }
+lean-algorithm = { path = "../crates/lean-algorithm" }
+lean-indicators = { path = "../crates/lean-indicators" }
+lean-orders = { path = "../crates/lean-orders" }
+lean-brokerages = { path = "../crates/lean-brokerages" }
+lean-python = { path = "../crates/lean-python" }
+lean-data-providers = { path = "../crates/lean-data-providers" }
+
+tokio = { workspace = true }
+pyo3 = { workspace = true }
+tracing-subscriber = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono = { workspace = true }
+
+[[bin]]
+name = "sma_crossover"
+path = "src/sma_crossover.rs"
+
+[[bin]]
+name = "parquet_migration"
+path = "src/parquet_migration.rs"
+
+[[bin]]
+name = "python_runner"
+path = "src/python_runner.rs"

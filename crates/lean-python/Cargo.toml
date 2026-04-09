@@ -1,0 +1,28 @@
+[package]
+name = "lean-python"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lean_python"
+crate-type = ["lib"]
+
+[dependencies]
+lean-core       = { path = "../lean-core" }
+lean-data       = { path = "../lean-data" }
+lean-algorithm  = { path = "../lean-algorithm" }
+lean-indicators = { path = "../lean-indicators" }
+lean-orders     = { path = "../lean-orders" }
+lean-storage    = { path = "../lean-storage" }
+lean-data-providers = { path = "../lean-data-providers" }
+lean-options    = { path = "../lean-options" }
+lean-statistics = { path = "../lean-statistics" }
+
+pyo3              = { workspace = true }
+rust_decimal      = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tokio             = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+chrono            = { workspace = true }
+serde             = { workspace = true }
