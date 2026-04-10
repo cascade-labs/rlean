@@ -38,6 +38,10 @@ pub struct RunConfig {
     pub _compression_level: i32,
     /// If set, missing price data is fetched from this provider before the backtest loop.
     pub historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
+    /// Raw stacked provider for DataType-specific requests (e.g. FactorFile).
+    /// Providers that don't support a DataType return NotImplemented: and the
+    /// next provider in the stack is tried.
+    pub history_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
     /// ThetaData API key for fetching real option EOD chains.
     pub thetadata_api_key: Option<String>,
     /// Data root for the ThetaData Parquet store.  Option EOD bars are cached at
@@ -60,6 +64,7 @@ impl Default for RunConfig {
             data_root: PathBuf::from("data"),
             _compression_level: 3,
             historical_provider: None,
+            history_provider: None,
             thetadata_api_key: None,
             thetadata_data_root: None,
             thetadata_rps: 4.0,
@@ -243,6 +248,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     if let Some(ref provider) = config.historical_provider {
         pre_fetch_all(
             provider.as_ref(),
+            config.history_provider.clone(),
             &subscriptions,
             start_date,
             end_date,
@@ -252,10 +258,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
     // ── factor files: load from disk ─────────────────────────────────────────
     // Factor files are Parquet; key = symbol SID → rows sorted newest first.
-    // Factor files are written to disk by data providers (e.g. Polygon) that
-    // support corporate actions.  When using a stacked provider list such as
-    // "thetadata,polygon", the Polygon provider in the stack will generate the
-    // factor file as a side-effect of fetching bars.
+    // Generated during pre_fetch_all via DataType::FactorFile requests —
+    // providers that support corporate actions (e.g. massive) handle the
+    // request; those that don't (e.g. thetadata) return NotImplemented.
     let factor_reader = ParquetReader::new();
     let mut factor_map: HashMap<u64, Vec<FactorFileEntry>> = HashMap::new();
     for sub in &subscriptions {
@@ -335,6 +340,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         if let Some(ref provider) = config.historical_provider {
             pre_fetch_all(
                 provider.as_ref(),
+                config.history_provider.clone(),
                 &subscriptions,
                 wu_start,
                 start_date - chrono::Duration::days(1),
@@ -631,6 +637,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 /// missing, fetches the full range and the provider splits by date on write.
 async fn pre_fetch_all(
     provider: &dyn IHistoricalDataProvider,
+    factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
     subscriptions: &[Arc<SubscriptionDataConfig>],
     start: NaiveDate,
     end: NaiveDate,
@@ -641,7 +648,6 @@ async fn pre_fetch_all(
             .trade_bar(&sub.symbol, sub.resolution, start)
             .to_path();
 
-        // Also check if a factor file exists for this symbol.
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
         let sec    = format!("{}", sub.symbol.security_type()).to_lowercase();
@@ -652,35 +658,42 @@ async fn pre_fetch_all(
             .join(format!("{ticker}.parquet"));
 
         if bar_path.exists() && factor_path.exists() {
-            continue; // bars and factor file both present
-        }
-
-        if bar_path.exists() {
-            info!(
-                "Factor file missing for {} — re-fetching from provider to generate it ({} → {})",
-                sub.symbol.value, start, end
-            );
-        } else {
-            info!(
-                "No local data for {} — fetching from provider ({} → {})",
-                sub.symbol.value, start, end
-            );
+            continue;
         }
 
         let start_dt = date_to_datetime(start, 0, 0, 0);
         let end_dt   = date_to_datetime(end, 23, 59, 59);
 
-        let bars = provider
-            .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
-            .await
-            .map_err(|e| anyhow::anyhow!(
-                "historical provider failed for {}: {}", sub.symbol.value, e
-            ))?;
+        if !bar_path.exists() {
+            info!("No local data for {} — fetching from provider ({} → {})", sub.symbol.value, start, end);
+            let bars = provider
+                .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "historical provider failed for {}: {}", sub.symbol.value, e
+                ))?;
+            info!("Downloaded {} bars for {} and cached to disk", bars.len(), sub.symbol.value);
+        }
 
-        info!(
-            "Downloaded {} bars for {} and cached to disk",
-            bars.len(), sub.symbol.value
-        );
+        // Re-check after bar fetch — some providers write the factor file as a side-effect.
+        if !factor_path.exists() {
+            if let Some(ref fp) = factor_provider {
+                info!("Factor file missing for {} — requesting from provider", sub.symbol.value);
+                let fp = Arc::clone(fp);
+                let request = lean_data_providers::HistoryRequest {
+                    symbol:     sub.symbol.clone(),
+                    resolution: lean_core::Resolution::Daily,
+                    start:      start_dt,
+                    end:        end_dt,
+                    data_type:  lean_data_providers::DataType::FactorFile,
+                };
+                match tokio::task::spawn_blocking(move || fp.get_history(&request)).await {
+                    Ok(Ok(_))  => info!("Factor file generated for {}", sub.symbol.value),
+                    Ok(Err(e)) => warn!("Factor file generation failed for {}: {e}", sub.symbol.value),
+                    Err(e)     => warn!("Factor file task panicked for {}: {e}", sub.symbol.value),
+                }
+            }
+        }
     }
     Ok(())
 }

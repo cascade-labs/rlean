@@ -173,12 +173,12 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
-    let historical_provider = build_historical_provider(&args)?;
+    let (historical_provider, history_provider) = build_providers(&args)?;
 
     let ext = args.strategy.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
-        "py" => run_python_backtest(args, historical_provider).await,
+        "py" => run_python_backtest(args, historical_provider, history_provider).await,
         "so" | "dylib" => run_rust_plugin_backtest(args),
         other => bail!(
             "Unknown strategy extension '.{}'. Expected .py, .so, or .dylib",
@@ -190,6 +190,7 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
 async fn run_python_backtest(
     args: RunArgs,
     historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
+    history_provider: Option<Arc<dyn IHistoryProvider>>,
 ) -> Result<()> {
     use lean_python::AlgorithmImports;
     use lean_python::runner::{run_strategy, RunConfig};
@@ -230,6 +231,7 @@ async fn run_python_backtest(
     let config = RunConfig {
         data_root: args.data.clone(),
         historical_provider,
+        history_provider,
         thetadata_api_key,
         thetadata_rps: args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
@@ -303,10 +305,13 @@ fn validate_strategy_path(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn build_historical_provider(args: &RunArgs) -> Result<Option<Arc<dyn IHistoricalDataProvider>>> {
+fn build_providers(args: &RunArgs) -> Result<(
+    Option<Arc<dyn IHistoricalDataProvider>>,
+    Option<Arc<dyn IHistoryProvider>>,
+)> {
     let names = match args.data_provider_historical.as_deref() {
         Some(n) => n,
-        None => return Ok(None),
+        None => return Ok((None, None)),
     };
 
     let provider_args = providers::ProviderArgs {
@@ -316,8 +321,9 @@ fn build_historical_provider(args: &RunArgs) -> Result<Option<Arc<dyn IHistorica
         thetadata_concurrent: args.thetadata_concurrent,
     };
 
-    let new_provider = providers::build_history_provider(names, provider_args)?;
-    Ok(Some(Arc::new(HistoryProviderAdapter(new_provider))))
+    let raw = providers::build_history_provider(names, provider_args)?;
+    let historical = Arc::new(HistoryProviderAdapter(Arc::clone(&raw)));
+    Ok((Some(historical), Some(raw)))
 }
 
 // ─── Adapter: IHistoryProvider → IHistoricalDataProvider ─────────────────────
