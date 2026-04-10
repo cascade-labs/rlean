@@ -7,6 +7,10 @@ pub enum DataType {
     QuoteBar,
     Tick,
     OpenInterest,
+    /// Request a provider to generate/cache a factor file for the symbol.
+    /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
+    /// Providers that do not support corporate actions return `NotImplemented:`.
+    FactorFile,
 }
 
 /// A request for historical data — mirrors C# `HistoryRequest`.
