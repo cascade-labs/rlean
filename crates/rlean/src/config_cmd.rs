@@ -10,7 +10,7 @@
 ///   data-folder              Parquet data root (relative to lean.json)
 use anyhow::{bail, Result};
 
-use crate::config::{Credentials, GlobalConfig, WorkspaceConfig};
+use crate::config::{Credentials, GlobalConfig, PluginConfigs, WorkspaceConfig};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
 
@@ -51,6 +51,15 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_set(key: &str, value: &str) -> Result<()> {
+    // Dotted keys are plugin config: e.g. "thetadata.api_key"
+    if let Some((plugin, subkey)) = key.split_once('.') {
+        let mut configs = PluginConfigs::load()?;
+        configs.set_key(plugin, subkey, serde_json::Value::String(value.to_string()));
+        configs.save()?;
+        println!("Set {plugin}.{subkey} in ~/.rlean/plugin-configs.json");
+        return Ok(());
+    }
+
     match key {
         "polygon-api-key" => {
             let mut creds = Credentials::load()?;
@@ -100,6 +109,18 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
 }
 
 fn cmd_get(key: &str) -> Result<()> {
+    // Dotted keys are plugin config: e.g. "thetadata.api_key"
+    if let Some((plugin, subkey)) = key.split_once('.') {
+        let configs = PluginConfigs::load()?;
+        let plugin_cfg = configs.get_plugin(plugin);
+        match plugin_cfg.get(subkey) {
+            Some(serde_json::Value::String(s)) => println!("{}", mask(s)),
+            Some(v) => println!("{v}"),
+            None => println!("(not set)"),
+        }
+        return Ok(());
+    }
+
     match key {
         "polygon-api-key" => {
             let creds = Credentials::load()?;
@@ -126,7 +147,7 @@ fn cmd_get(key: &str) -> Result<()> {
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: polygon-api-key, thetadata-api-key, \
-             default-language, data-folder",
+             default-language, data-folder. Use <plugin>.<key> for plugin config.",
             key
         ),
     }
@@ -134,30 +155,55 @@ fn cmd_get(key: &str) -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let creds  = Credentials::load()?;
-    let global = GlobalConfig::load()?;
-    let ws     = std::env::current_dir()?;
-    let ws_cfg = WorkspaceConfig::load(&ws).ok();
+    let creds       = Credentials::load()?;
+    let global      = GlobalConfig::load()?;
+    let ws          = std::env::current_dir()?;
+    let ws_cfg      = WorkspaceConfig::load(&ws).ok();
+    let plugin_cfgs = PluginConfigs::load()?;
 
-    println!("{:<22} {}", "KEY", "VALUE");
-    println!("{}", "-".repeat(50));
+    println!("{:<30} {}", "KEY", "VALUE");
+    println!("{}", "-".repeat(60));
 
     println!(
-        "{:<22} {}",
+        "{:<30} {}",
         "polygon-api-key",
         creds.polygon_api_key.as_deref().map(mask).unwrap_or("(not set)".to_string())
     );
     println!(
-        "{:<22} {}",
+        "{:<30} {}",
         "thetadata-api-key",
         creds.thetadata_api_key.as_deref().map(mask).unwrap_or("(not set)".to_string())
     );
-    println!("{:<22} {}", "default-language", global.default_language);
+    println!("{:<30} {}", "default-language", global.default_language);
 
     if let Some(ws_cfg) = ws_cfg {
-        println!("{:<22} {}", "data-folder", ws_cfg.data_folder);
+        println!("{:<30} {}", "data-folder", ws_cfg.data_folder);
     } else {
-        println!("{:<22} (no lean.json in cwd)", "data-folder");
+        println!("{:<30} (no lean.json in cwd)", "data-folder");
+    }
+
+    // Plugin configs
+    let mut plugin_names: Vec<&str> = plugin_cfgs.0.keys().map(String::as_str).collect();
+    plugin_names.sort();
+
+    if !plugin_names.is_empty() {
+        println!();
+        println!("Plugin configs (~/.rlean/plugin-configs.json):");
+        println!("{}", "-".repeat(60));
+        for plugin in plugin_names {
+            let cfg = plugin_cfgs.get_plugin(plugin);
+            let mut keys: Vec<&str> = cfg.keys().map(String::as_str).collect();
+            keys.sort();
+            for key in keys {
+                let display_key = format!("{plugin}.{key}");
+                let display_val = match cfg.get(key) {
+                    Some(serde_json::Value::String(s)) => mask(s),
+                    Some(v) => v.to_string(),
+                    None => "(not set)".to_string(),
+                };
+                println!("{:<30} {}", display_key, display_val);
+            }
+        }
     }
 
     Ok(())

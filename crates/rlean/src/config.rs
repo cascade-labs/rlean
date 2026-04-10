@@ -73,6 +73,11 @@ pub struct Credentials {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thetadata_api_key: Option<String>,
+
+    /// Override the ThetaData sidecar/cloud URL (default: http://127.0.0.1:25510).
+    /// Example: https://thetadata.cascadelabs.io
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thetadata_url: Option<String>,
 }
 
 impl Credentials {
@@ -179,6 +184,52 @@ impl ProjectConfig {
         let path = project_dir.join("config.json");
         let text = serde_json::to_string_pretty(self)?;
         atomic_write(&path, &text)
+    }
+}
+
+// ── Plugin configs (~/.rlean/plugin-configs.json) ─────────────────────────────
+
+pub fn plugin_configs_path() -> Result<PathBuf> {
+    Ok(rlean_dir()?.join("plugin-configs.json"))
+}
+
+/// Per-plugin config store (~/.rlean/plugin-configs.json).
+///
+/// The outer map key is the plugin name (e.g. `"thetadata"`).
+/// The inner map holds arbitrary key/value pairs defined by that plugin.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct PluginConfigs(pub std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>);
+
+impl PluginConfigs {
+    pub fn load() -> Result<Self> {
+        let path = plugin_configs_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse {}", path.display()))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = plugin_configs_path()?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let text = serde_json::to_string_pretty(&self.0)?;
+        atomic_write(&path, &text)
+    }
+
+    /// Return the stored config map for the given plugin (empty map if not set).
+    pub fn get_plugin(&self, plugin: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.0.get(plugin).cloned().unwrap_or_default()
+    }
+
+    /// Insert or overwrite a key in the given plugin's config section.
+    pub fn set_key(&mut self, plugin: &str, key: &str, value: serde_json::Value) {
+        self.0
+            .entry(plugin.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
     }
 }
 

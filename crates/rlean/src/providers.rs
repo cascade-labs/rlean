@@ -112,13 +112,35 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
 
     let max_concurrent = if args.thetadata_concurrent > 0 { args.thetadata_concurrent } else { 4 };
 
-    let config_json = serde_json::json!({
-        "api_key": args.api_key_for(name).unwrap_or(""),
-        "data_root": args.data_root.display().to_string(),
-        "requests_per_second": args.rps_for(name),
-        "max_concurrent": max_concurrent,
-    })
-    .to_string();
+    // Start with stored plugin config from ~/.rlean/plugin-configs.json.
+    // This lets users set plugin-specific keys (e.g. api_key, base_url) via
+    // `rlean config set <plugin>.<key> <value>`.
+    use crate::config::PluginConfigs;
+    let plugin_configs = PluginConfigs::load().unwrap_or_default();
+    let mut plugin_cfg = plugin_configs.get_plugin(name);
+
+    // Add rlean-managed fields (do not overwrite if the plugin explicitly set them).
+    plugin_cfg
+        .entry("data_root".to_string())
+        .or_insert_with(|| serde_json::json!(args.data_root.display().to_string()));
+    plugin_cfg
+        .entry("requests_per_second".to_string())
+        .or_insert_with(|| serde_json::json!(args.rps_for(name)));
+    plugin_cfg
+        .entry("max_concurrent".to_string())
+        .or_insert_with(|| serde_json::json!(max_concurrent));
+
+    // Backward compat: if api_key was not set via plugin config, fall back to
+    // the old per-provider credentials from ~/.rlean/credentials.
+    if !plugin_cfg.contains_key("api_key") {
+        if let Some(k) = args.api_key_for(name) {
+            if !k.is_empty() {
+                plugin_cfg.insert("api_key".to_string(), serde_json::json!(k));
+            }
+        }
+    }
+
+    let config_json = serde_json::Value::Object(plugin_cfg).to_string();
 
     // Leak the library so it lives for the process lifetime.
     // Providers are long-lived (process-scoped) so this is intentional.
