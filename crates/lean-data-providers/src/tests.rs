@@ -57,13 +57,13 @@ mod tests {
 
     // ── LocalHistoryProvider — no data file ───────────────────────────────────
 
-    #[tokio::test]
-    async fn local_provider_returns_empty_when_no_file() {
+    #[test]
+    fn local_provider_returns_empty_when_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let provider = LocalHistoryProvider::new(dir.path());
 
         let request = make_history_request();
-        let bars = provider.get_history(&request).await.unwrap();
+        let bars = provider.get_history(&request).unwrap();
 
         assert!(
             bars.is_empty(),
@@ -85,12 +85,12 @@ mod tests {
     // ── Unknown provider name (via providers module in rlean) — tested here
     //    by calling LocalHistoryProvider directly ───────────────────────────────
 
-    #[tokio::test]
-    async fn local_provider_handles_non_existent_dir_gracefully() {
+    #[test]
+    fn local_provider_handles_non_existent_dir_gracefully() {
         // A data root that doesn't exist should return empty rather than error.
         let provider = LocalHistoryProvider::new("/nonexistent/path/to/data");
         let request = make_history_request();
-        let result = provider.get_history(&request).await;
+        let result = provider.get_history(&request);
         // Either Ok(empty) or we accept errors — the key property is no panic.
         let _ = result; // result can be Ok([]) or Err — both are acceptable
     }

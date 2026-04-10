@@ -9,10 +9,16 @@ use crate::request::{DownloadRequest, HistoryRequest};
 ///
 /// Implementors are expected to fetch data from a remote source (or local
 /// disk), write it to the Parquet store, and return the raw bars.
-#[async_trait]
+///
+/// This trait is **synchronous** by design.  Plugins are loaded as cdylib
+/// dynamic libraries; each plugin links its own copy of tokio and cannot share
+/// runtime state (thread-locals) with the host binary.  Making the trait sync
+/// lets plugins block internally (e.g. via a `current_thread` runtime or
+/// `reqwest::blocking`) while the host adapts the call to async via
+/// `tokio::task::spawn_blocking`.
 pub trait IHistoryProvider: Send + Sync {
     /// Fetch historical trade bars for the symbol described in `request`.
-    async fn get_history(
+    fn get_history(
         &self,
         request: &HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>>;

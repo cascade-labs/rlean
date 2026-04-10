@@ -7,7 +7,6 @@
 /// and is returned immediately.
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use lean_data::TradeBar;
 
 use crate::{HistoryRequest, IHistoryProvider};
@@ -33,14 +32,13 @@ impl StackedHistoryProvider {
     }
 }
 
-#[async_trait]
 impl IHistoryProvider for StackedHistoryProvider {
-    async fn get_history(
+    fn get_history(
         &self,
         request: &HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
         for provider in &self.providers {
-            match provider.get_history(request).await {
+            match provider.get_history(request) {
                 // Non-empty result — this provider has the data.
                 Ok(data) if !data.is_empty() => return Ok(data),
                 // Empty result — try the next provider.

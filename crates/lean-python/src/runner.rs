@@ -193,7 +193,11 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
 }
 
 /// Run the full backtest loop for a Python strategy.
-#[tokio::main]
+///
+/// Must be called from within an existing tokio runtime (e.g. via `.await`).
+/// Do NOT decorate call-sites with `#[tokio::main]` — the caller's runtime
+/// is reused so that tokio primitives (Mutex, Semaphore, reqwest) in the
+/// historical provider work correctly across the same runtime context.
 pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<BacktestResult> {
     let mut adapter = Python::with_gil(|py| load_strategy(py, strategy_path))?;
 
