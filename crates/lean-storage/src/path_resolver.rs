@@ -14,7 +14,6 @@ pub fn option_eod_path(root: &Path, underlying: &str) -> PathBuf {
     p.push("option");
     p.push("usa");
     p.push("daily");
-    p.push(&ul);
     p.push(format!("{ul}_eod.parquet"));
     p
 }
@@ -140,10 +139,10 @@ impl DataPath {
     ///
     /// For standard (equity/forex/crypto) data:
     /// `{root}/{security_type}/{market}/{resolution}/{ticker}/{YYYYMMDD}_{suffix}.parquet`  (high-res)
-    /// `{root}/{security_type}/{market}/{resolution}/{ticker}/{ticker}_{suffix}.parquet`    (daily)
+    /// `{root}/{security_type}/{market}/{resolution}/{ticker}_{suffix}.parquet`             (daily)
     ///
     /// For option EOD bars (option_underlying is Some):
-    /// `{root}/option/{market}/daily/{ticker}/{ticker}_{suffix}.parquet`                   (daily)
+    /// `{root}/option/{market}/daily/{ticker}_{suffix}.parquet`                            (daily)
     /// `{root}/option/{market}/{resolution}/{ticker}/{YYYYMMDD}_{suffix}.parquet`          (intraday)
     ///
     /// For option universes (is_universe = true):
@@ -164,8 +163,8 @@ impl DataPath {
             } else {
                 let res = self.resolution.folder_name();
                 p.push(res);
-                p.push(ticker);
                 if self.resolution.is_high_resolution() {
+                    p.push(ticker);
                     p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
                 } else {
                     p.push(format!("{}_{}.parquet", ticker, self.suffix));
@@ -180,9 +179,9 @@ impl DataPath {
             p.push(&sec_type);
             p.push(&market);
             p.push(res);
-            p.push(&ticker);
 
             if self.resolution.is_high_resolution() {
+                p.push(&ticker);
                 p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
             } else {
                 p.push(format!("{}_{}.parquet", ticker, self.suffix));
