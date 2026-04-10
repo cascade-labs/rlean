@@ -15,9 +15,6 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(rlean_dir()?.join("config"))
 }
 
-pub fn credentials_path() -> Result<PathBuf> {
-    Ok(rlean_dir()?.join("credentials"))
-}
 
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
@@ -65,40 +62,6 @@ impl GlobalConfig {
 
 // ── Credentials (~/.rlean/credentials) ────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct Credentials {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub polygon_api_key: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thetadata_api_key: Option<String>,
-
-    /// Override the ThetaData sidecar/cloud URL (default: http://127.0.0.1:25510).
-    /// Example: https://thetadata.cascadelabs.io
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thetadata_url: Option<String>,
-}
-
-impl Credentials {
-    pub fn load() -> Result<Self> {
-        let path = credentials_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse {}", path.display()))
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = credentials_path()?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let text = serde_json::to_string_pretty(self)?;
-        atomic_write(&path, &text)
-    }
-}
 
 // ── Workspace config (lean.json) ──────────────────────────────────────────────
 

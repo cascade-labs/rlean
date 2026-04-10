@@ -101,19 +101,19 @@ struct RunArgs {
     #[arg(long, env = "RLEAN_DATA_PROVIDER_LIVE")]
     data_provider_live: Option<String>,
 
-    // ── Polygon ───────────────────────────────────────────────────────────────
-    /// Polygon.io API key (or POLYGON_API_KEY env)
-    #[arg(long, env = "POLYGON_API_KEY")]
-    polygon_api_key: Option<String>,
+    // ── Date range override ───────────────────────────────────────────────────
+    /// Override the strategy start date (YYYY-MM-DD)
+    #[arg(long)]
+    start_date: Option<String>,
 
-    /// Polygon requests/second (default: 5)
+    /// Override the strategy end date (YYYY-MM-DD)
+    #[arg(long)]
+    end_date: Option<String>,
+
+    // ── Rate limits (plugin API keys/URLs live in ~/.rlean/plugin-configs.json) ─
+    /// Polygon/Massive requests/second (default: 5)
     #[arg(long, default_value_t = 5.0)]
     polygon_rate: f64,
-
-    // ── ThetaData ─────────────────────────────────────────────────────────────
-    /// ThetaData API key (or THETADATA_API_KEY env)
-    #[arg(long, env = "THETADATA_API_KEY")]
-    thetadata_api_key: Option<String>,
 
     /// ThetaData requests/second (default: 4)
     #[arg(long, default_value_t = 4.0)]
@@ -200,9 +200,18 @@ async fn run_python_backtest(
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::prepare_freethreaded_python();
 
-    let creds = config::Credentials::load().unwrap_or_default();
-    let thetadata_api_key = args.thetadata_api_key.clone()
-        .or_else(|| creds.thetadata_api_key);
+    let plugin_cfgs = config::PluginConfigs::load().unwrap_or_default();
+    let thetadata_cfg = plugin_cfgs.get_plugin("thetadata");
+    let thetadata_api_key = thetadata_cfg.get("api_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| anyhow::anyhow!("invalid date '{}', expected YYYY-MM-DD", s))
+    };
+    let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
+    let end_date_override   = args.end_date.as_deref().map(parse_date).transpose()?;
 
     let report = args.report.clone();
     let config = RunConfig {
@@ -211,6 +220,8 @@ async fn run_python_backtest(
         thetadata_api_key,
         thetadata_rps: args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
+        start_date_override,
+        end_date_override,
         ..Default::default()
     };
 
@@ -290,18 +301,9 @@ fn build_historical_provider(args: &RunArgs) -> Result<Option<Arc<dyn IHistorica
         None => return Ok(None),
     };
 
-    // API keys: CLI flag > env var (already merged by clap) > ~/.rlean/credentials
-    let creds = config::Credentials::load().unwrap_or_default();
-    let polygon_api_key = args.polygon_api_key.clone()
-        .or_else(|| creds.polygon_api_key.clone());
-    let thetadata_api_key = args.thetadata_api_key.clone()
-        .or_else(|| creds.thetadata_api_key.clone());
-
     let provider_args = providers::ProviderArgs {
         data_root:            args.data.clone(),
-        polygon_api_key,
         polygon_rate:         args.polygon_rate,
-        thetadata_api_key,
         thetadata_rate:       args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
     };

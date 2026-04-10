@@ -10,28 +10,19 @@ use anyhow::{bail, Context, Result};
 
 use lean_data_providers::{config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider};
 
-/// Full set of provider credentials / rate-limit settings available to the CLI.
+/// Rate-limit settings for the CLI — passed alongside plugin config.
 ///
-/// `build_history_provider` selects the relevant fields for each named provider.
+/// Plugin-specific config (API keys, URLs, etc.) lives in
+/// ~/.rlean/plugin-configs.json and is loaded separately in `load_plugin_provider`.
 #[derive(Clone, Default)]
 pub struct ProviderArgs {
     pub data_root:            std::path::PathBuf,
-    pub polygon_api_key:      Option<String>,
     pub polygon_rate:         f64,
-    pub thetadata_api_key:    Option<String>,
     pub thetadata_rate:       f64,
     pub thetadata_concurrent: usize,
 }
 
 impl ProviderArgs {
-    fn api_key_for(&self, provider: &str) -> Option<&str> {
-        match provider {
-            "massive" | "polygon" => self.polygon_api_key.as_deref(),
-            "thetadata"           => self.thetadata_api_key.as_deref(),
-            _                     => None,
-        }
-    }
-
     fn rps_for(&self, provider: &str) -> f64 {
         match provider {
             "thetadata" => if self.thetadata_rate > 0.0 { self.thetadata_rate } else { 4.0 },
@@ -130,15 +121,7 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         .entry("max_concurrent".to_string())
         .or_insert_with(|| serde_json::json!(max_concurrent));
 
-    // Backward compat: if api_key was not set via plugin config, fall back to
-    // the old per-provider credentials from ~/.rlean/credentials.
-    if !plugin_cfg.contains_key("api_key") {
-        if let Some(k) = args.api_key_for(name) {
-            if !k.is_empty() {
-                plugin_cfg.insert("api_key".to_string(), serde_json::json!(k));
-            }
-        }
-    }
+
 
     let config_json = serde_json::Value::Object(plugin_cfg).to_string();
 

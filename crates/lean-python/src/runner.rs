@@ -48,6 +48,10 @@ pub struct RunConfig {
     pub thetadata_rps: f64,
     /// Max concurrent ThetaData requests (default 4).
     pub thetadata_concurrent: usize,
+    /// Override the strategy's set_start_date (YYYY-MM-DD).
+    pub start_date_override: Option<chrono::NaiveDate>,
+    /// Override the strategy's set_end_date (YYYY-MM-DD).
+    pub end_date_override: Option<chrono::NaiveDate>,
 }
 
 impl Default for RunConfig {
@@ -60,6 +64,8 @@ impl Default for RunConfig {
             thetadata_data_root: None,
             thetadata_rps: 4.0,
             thetadata_concurrent: 4,
+            start_date_override: None,
+            end_date_override: None,
         }
     }
 }
@@ -204,8 +210,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── initialize ──────────────────────────────────────────────────────────
     adapter.initialize().context("strategy initialize() failed")?;
 
-    let start_date = adapter.start_date().date_utc();
-    let end_date   = adapter.end_date().date_utc();
+    let start_date = config.start_date_override.unwrap_or_else(|| adapter.start_date().date_utc());
+    let end_date   = config.end_date_override.unwrap_or_else(|| adapter.end_date().date_utc());
 
     let starting_cash = {
         use rust_decimal::prelude::ToPrimitive;
