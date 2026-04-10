@@ -275,8 +275,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             }
             _ => {
                 warn!(
-                    "Factor file missing for {} — bars will not be adjusted. \
-                     Add 'polygon' to --data-provider-historical to generate factor files.",
+                    "Factor file missing for {} — bars will not be adjusted.",
                     sub.symbol.value
                 );
             }
@@ -638,18 +637,35 @@ async fn pre_fetch_all(
     resolver: &PathResolver,
 ) -> Result<()> {
     for sub in subscriptions {
-        let check_path = resolver
+        let bar_path = resolver
             .trade_bar(&sub.symbol, sub.resolution, start)
             .to_path();
 
-        if check_path.exists() {
-            continue; // already have local data
+        // Also check if a factor file exists for this symbol.
+        let ticker = sub.symbol.permtick.to_lowercase();
+        let market = sub.symbol.market().as_str().to_lowercase();
+        let sec    = format!("{}", sub.symbol.security_type()).to_lowercase();
+        let factor_path = resolver.data_root
+            .join(&sec)
+            .join(&market)
+            .join("factor_files")
+            .join(format!("{ticker}.parquet"));
+
+        if bar_path.exists() && factor_path.exists() {
+            continue; // bars and factor file both present
         }
 
-        info!(
-            "No local data for {} — fetching from provider ({} → {})",
-            sub.symbol.value, start, end
-        );
+        if bar_path.exists() {
+            info!(
+                "Factor file missing for {} — re-fetching from provider to generate it ({} → {})",
+                sub.symbol.value, start, end
+            );
+        } else {
+            info!(
+                "No local data for {} — fetching from provider ({} → {})",
+                sub.symbol.value, start, end
+            );
+        }
 
         let start_dt = date_to_datetime(start, 0, 0, 0);
         let end_dt   = date_to_datetime(end, 23, 59, 59);

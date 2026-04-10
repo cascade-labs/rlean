@@ -124,7 +124,7 @@ struct RunArgs {
     thetadata_concurrent: usize,
 
     // ── Output ────────────────────────────────────────────────────────────────
-    /// Write an HTML performance report to this path
+    /// Override the report output path (default: <project>/backtests/<timestamp>.html)
     #[arg(long)]
     report: Option<PathBuf>,
 }
@@ -213,7 +213,20 @@ async fn run_python_backtest(
     let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
     let end_date_override   = args.end_date.as_deref().map(parse_date).transpose()?;
 
-    let report = args.report.clone();
+    // Determine report path: explicit --report flag, or auto-derive from strategy location.
+    // Strategy lives at <project>/main.py → report goes to <project>/backtests/<timestamp>.html
+    let report_path: PathBuf = if let Some(p) = args.report.clone() {
+        p
+    } else {
+        let backtests_dir = args.strategy
+            .parent()           // <project>/
+            .map(|p| p.join("backtests"))
+            .unwrap_or_else(|| PathBuf::from("backtests"));
+        std::fs::create_dir_all(&backtests_dir)?;
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        backtests_dir.join(format!("{ts}.html"))
+    };
+
     let config = RunConfig {
         data_root: args.data.clone(),
         historical_provider,
@@ -225,17 +238,12 @@ async fn run_python_backtest(
         ..Default::default()
     };
 
-    // run_strategy is async — call it directly in the current runtime so that
-    // tokio primitives inside the historical provider (Mutex, Semaphore, reqwest)
-    // share the same runtime context and don't panic.
     let results = run_strategy(&args.strategy, config).await?;
 
     results.print_summary();
-    if let Some(ref path) = report {
-        match write_report(&results, path) {
-            Ok(()) => println!("Report written to {}", path.display()),
-            Err(e) => eprintln!("Failed to write report: {e}"),
-        }
+    match write_report(&results, &report_path) {
+        Ok(()) => println!("Report: {}", report_path.display()),
+        Err(e) => eprintln!("Failed to write report: {e}"),
     }
 
     Ok(())

@@ -37,19 +37,40 @@ impl IHistoryProvider for StackedHistoryProvider {
         &self,
         request: &HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
+        // Run ALL providers regardless of earlier successes.
+        //
+        // Rationale: providers may have valuable side-effects beyond returning
+        // bars (e.g. the massive plugin generates LEAN factor files when it
+        // fetches daily equity data).  Stopping at the first successful result
+        // would skip those side-effects when a higher-priority provider (e.g.
+        // thetadata) already has the data.
+        //
+        // Semantics: first non-empty Ok wins for the returned bars; subsequent
+        // providers still run.  Errors from non-primary providers (i.e. after
+        // we already have bars) are logged as warnings, not propagated.
+        let mut bars: Vec<TradeBar> = Vec::new();
+
         for provider in &self.providers {
             match provider.get_history(request) {
-                // Non-empty result — this provider has the data.
-                Ok(data) if !data.is_empty() => return Ok(data),
-                // Empty result — try the next provider.
+                Ok(data) if !data.is_empty() => {
+                    if bars.is_empty() {
+                        bars = data;
+                    }
+                    // continue — let remaining providers run for side-effects
+                }
                 Ok(_) => continue,
-                // Explicit "not implemented" — try the next provider.
                 Err(ref e) if is_not_implemented(e) => continue,
-                // Any other error is a real failure — propagate immediately.
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if bars.is_empty() {
+                        // No data yet — this is a real failure.
+                        return Err(e);
+                    }
+                    // Already have bars — log and continue.
+                    tracing::warn!("Provider error (data already available from earlier provider): {e}");
+                }
             }
         }
-        // All providers returned empty.
-        Ok(vec![])
+
+        Ok(bars)
     }
 }
