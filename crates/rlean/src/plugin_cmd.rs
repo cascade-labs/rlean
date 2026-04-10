@@ -224,6 +224,7 @@ fn cmd_install(name: &str) -> Result<()> {
     let built = find_built_lib(&src_dir, &entry.name)?;
     std::fs::copy(&built, &lib_path)
         .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
+    adhoc_codesign(&lib_path);
 
     // Update manifest
     manifest.plugins.push(InstalledEntry {
@@ -259,6 +260,7 @@ fn cmd_upgrade(name: &str) -> Result<()> {
     let built = find_built_lib(&src_dir, name)?;
     std::fs::copy(&built, &lib_path)
         .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
+    adhoc_codesign(&lib_path);
 
     manifest.plugins[idx].installed_at = now_utc();
     save_manifest(&manifest)?;
@@ -322,6 +324,25 @@ fn home_dir() -> Result<PathBuf> {
 
 fn dylib_ext() -> &'static str {
     if cfg!(target_os = "macos") { "dylib" } else { "so" }
+}
+
+/// Apply an ad-hoc code signature to a dylib on macOS so the OS doesn't kill
+/// the process when the library is mapped into memory with CS_KILL enforcement.
+/// On other platforms this is a no-op.
+fn adhoc_codesign(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("codesign")
+            .args(["-s", "-", "--force", path.to_str().unwrap_or("")])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("codesign exited with status {s} for {}", path.display()),
+            Err(e) => eprintln!("codesign not available: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
 }
 
 // ── Manifest I/O ──────────────────────────────────────────────────────────────
