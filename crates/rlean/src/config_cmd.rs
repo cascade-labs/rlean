@@ -1,16 +1,15 @@
-/// `rlean config` — get/set/list workspace and credential configuration
+/// `rlean config` — get/set/list workspace and plugin configuration
 ///
-/// API keys are stored in ~/.rlean/credentials (never in lean.json).
+/// Plugin config is stored per-plugin in ~/.rlean/plugin-configs.json.
 /// Workspace settings are stored in ~/.rlean/config and lean.json.
 ///
 /// Known keys:
-///   polygon-api-key          Polygon.io API key
-///   thetadata-api-key        ThetaData API key
-///   default-language         python | csharp
-///   data-folder              Parquet data root (relative to lean.json)
+///   default-language            python | csharp
+///   data-folder                 Parquet data root (relative to lean.json)
+///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 
-use crate::config::{Credentials, GlobalConfig, PluginConfigs, WorkspaceConfig};
+use crate::config::{GlobalConfig, PluginConfigs, WorkspaceConfig};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
 
@@ -61,18 +60,6 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
     }
 
     match key {
-        "polygon-api-key" => {
-            let mut creds = Credentials::load()?;
-            creds.polygon_api_key = Some(value.to_string());
-            creds.save()?;
-            println!("Set polygon-api-key in ~/.rlean/credentials");
-        }
-        "thetadata-api-key" => {
-            let mut creds = Credentials::load()?;
-            creds.thetadata_api_key = Some(value.to_string());
-            creds.save()?;
-            println!("Set thetadata-api-key in ~/.rlean/credentials");
-        }
         "default-language" => {
             if value != "python" && value != "csharp" {
                 bail!("default-language must be python or csharp, got '{}'", value);
@@ -100,8 +87,8 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set data-folder = {value} in lean.json");
         }
         _ => bail!(
-            "Unknown key '{}'. Known keys: polygon-api-key, thetadata-api-key, \
-             default-language, data-folder",
+            "Unknown key '{}'. Known keys: default-language, data-folder. \
+             Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
     }
@@ -122,20 +109,6 @@ fn cmd_get(key: &str) -> Result<()> {
     }
 
     match key {
-        "polygon-api-key" => {
-            let creds = Credentials::load()?;
-            match &creds.polygon_api_key {
-                Some(v) => println!("{}", mask(v)),
-                None    => println!("(not set)"),
-            }
-        }
-        "thetadata-api-key" => {
-            let creds = Credentials::load()?;
-            match &creds.thetadata_api_key {
-                Some(v) => println!("{}", mask(v)),
-                None    => println!("(not set)"),
-            }
-        }
         "default-language" => {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.default_language);
@@ -146,8 +119,8 @@ fn cmd_get(key: &str) -> Result<()> {
             println!("{}", cfg.data_folder);
         }
         _ => bail!(
-            "Unknown key '{}'. Known keys: polygon-api-key, thetadata-api-key, \
-             default-language, data-folder. Use <plugin>.<key> for plugin config.",
+            "Unknown key '{}'. Known keys: default-language, data-folder. \
+             Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
     }
@@ -155,7 +128,6 @@ fn cmd_get(key: &str) -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let creds       = Credentials::load()?;
     let global      = GlobalConfig::load()?;
     let ws          = std::env::current_dir()?;
     let ws_cfg      = WorkspaceConfig::load(&ws).ok();
@@ -164,16 +136,6 @@ fn cmd_list() -> Result<()> {
     println!("{:<30} {}", "KEY", "VALUE");
     println!("{}", "-".repeat(60));
 
-    println!(
-        "{:<30} {}",
-        "polygon-api-key",
-        creds.polygon_api_key.as_deref().map(mask).unwrap_or("(not set)".to_string())
-    );
-    println!(
-        "{:<30} {}",
-        "thetadata-api-key",
-        creds.thetadata_api_key.as_deref().map(mask).unwrap_or("(not set)".to_string())
-    );
     println!("{:<30} {}", "default-language", global.default_language);
 
     if let Some(ws_cfg) = ws_cfg {
