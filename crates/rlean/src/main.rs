@@ -204,7 +204,6 @@ async fn run_python_backtest(
     let thetadata_api_key = args.thetadata_api_key.clone()
         .or_else(|| creds.thetadata_api_key);
 
-    let strategy = args.strategy.clone();
     let report = args.report.clone();
     let config = RunConfig {
         data_root: args.data.clone(),
@@ -215,12 +214,10 @@ async fn run_python_backtest(
         ..Default::default()
     };
 
-    // run_strategy is synchronous and creates its own tokio runtime internally.
-    // Use spawn_blocking so it runs on a thread without an active tokio context,
-    // avoiding the "cannot start a runtime from within a runtime" panic.
-    let results = tokio::task::spawn_blocking(move || run_strategy(&strategy, config))
-        .await
-        .map_err(|e| anyhow::anyhow!("Strategy thread panicked: {e}"))??;
+    // run_strategy is async — call it directly in the current runtime so that
+    // tokio primitives inside the historical provider (Mutex, Semaphore, reqwest)
+    // share the same runtime context and don't panic.
+    let results = run_strategy(&args.strategy, config).await?;
 
     results.print_summary();
     if let Some(ref path) = report {
@@ -334,10 +331,14 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
             end,
             data_type:  lean_data_providers::DataType::TradeBar,
         };
+        // IHistoryProvider::get_history is synchronous so that plugins (cdylibs
+        // with their own tokio copy) can block internally without conflicting
+        // with the host runtime's thread-locals.  We bridge to async here using
+        // spawn_blocking so the tokio scheduler is not blocked.
         Box::pin(async move {
-            provider
-                .get_history(&request)
+            tokio::task::spawn_blocking(move || provider.get_history(&request))
                 .await
+                .map_err(|e| lean_core::LeanError::DataError(format!("provider task panicked: {e}")))?
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
         })
     }

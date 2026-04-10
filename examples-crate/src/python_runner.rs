@@ -89,7 +89,12 @@ fn main() {
     };
     let report_path = find_arg(&args, "--report").map(std::path::PathBuf::from);
 
-    match run_strategy(&strategy_path, config) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    match rt.block_on(run_strategy(&strategy_path, config)) {
         Ok(results) => {
             results.print_summary();
             if let Some(ref path) = report_path {
