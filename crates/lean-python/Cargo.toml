@@ -14,7 +14,7 @@ lean-algorithm  = { path = "../lean-algorithm" }
 lean-indicators = { path = "../lean-indicators" }
 lean-orders     = { path = "../lean-orders" }
 lean-storage    = { path = "../lean-storage" }
-lean-data-providers = { path = "../lean-data-providers" }
+lean-data-providers    = { path = "../lean-data-providers" }
 lean-options    = { path = "../lean-options" }
 lean-statistics = { path = "../lean-statistics" }
 
@@ -25,4 +25,9 @@ tokio             = { workspace = true }
 anyhow            = { workspace = true }
 tracing           = { workspace = true }
 chrono            = { workspace = true }
+chrono-tz         = { workspace = true }
 serde             = { workspace = true }
+serde_json        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

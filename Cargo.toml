@@ -96,10 +96,18 @@ num_cpus = "1"
 glob = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tempfile = "3"
-pyo3 = { version = "0.23", features = ["auto-initialize"] }
+pyo3 = { version = "0.23", features = ["auto-initialize", "chrono"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 clap = { version = "4", features = ["derive", "env"] }
 libloading = "0.8"
+lean-plugin            = { path = "crates/lean-plugin" }
+
+[patch."ssh://git@github.com/cascade-labs/rlean"]
+lean-core           = { path = "crates/lean-core" }
+lean-data           = { path = "crates/lean-data" }
+lean-storage        = { path = "crates/lean-storage" }
+lean-data-providers = { path = "crates/lean-data-providers" }
+lean-plugin         = { path = "crates/lean-plugin" }
 
 [profile.release]
 opt-level = 3
