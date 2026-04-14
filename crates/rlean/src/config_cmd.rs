@@ -1,11 +1,11 @@
 /// `rlean config` — get/set/list workspace and plugin configuration
 ///
 /// Plugin config is stored per-plugin in ~/.rlean/plugin-configs.json.
-/// Workspace settings are stored in ~/.rlean/config and lean.json.
+/// Workspace settings are stored in ~/.rlean/config and rlean.json.
 ///
 /// Known keys:
 ///   default-language            python | csharp
-///   data-folder                 Parquet data root (relative to lean.json)
+///   data-folder                 Parquet data root (relative to rlean.json)
 ///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 
@@ -67,9 +67,9 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             let mut cfg = GlobalConfig::load()?;
             cfg.default_language = value.to_string();
             cfg.save()?;
-            // Also update lean.json if present in cwd
+            // Also update rlean.json if present in cwd
             let ws = std::env::current_dir()?;
-            if ws.join("lean.json").exists() {
+            if ws.join("rlean.json").exists() {
                 let mut ws_cfg = WorkspaceConfig::load(&ws)?;
                 ws_cfg.default_language = value.to_string();
                 ws_cfg.save(&ws)?;
@@ -78,13 +78,13 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
         }
         "data-folder" => {
             let ws = std::env::current_dir()?;
-            if !ws.join("lean.json").exists() {
-                bail!("No lean.json in current directory. Run `rlean init` first.");
+            if !ws.join("rlean.json").exists() {
+                bail!("No rlean.json in current directory. Run `rlean init` first.");
             }
             let mut ws_cfg = WorkspaceConfig::load(&ws)?;
             ws_cfg.data_folder = value.to_string();
             ws_cfg.save(&ws)?;
-            println!("Set data-folder = {value} in lean.json");
+            println!("Set data-folder = {value} in rlean.json");
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \
@@ -141,7 +141,7 @@ fn cmd_list() -> Result<()> {
     if let Some(ws_cfg) = ws_cfg {
         println!("{:<30} {}", "data-folder", ws_cfg.data_folder);
     } else {
-        println!("{:<30} (no lean.json in cwd)", "data-folder");
+        println!("{:<30} (no rlean.json in cwd)", "data-folder");
     }
 
     // Plugin configs

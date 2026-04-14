@@ -88,6 +88,10 @@ pub struct QcAlgorithm {
     pub open_option_contracts: Vec<Symbol>,
     /// Generated option chains keyed by canonical ticker (e.g. "?SPY").
     pub option_chains: HashMap<String, OptionChain>,
+
+    /// The benchmark symbol set by the algorithm (ticker, e.g. "SPY").
+    /// When None, the runner defaults to SPY automatically.
+    pub benchmark_symbol: Option<String>,
 }
 
 impl QcAlgorithm {
@@ -114,7 +118,14 @@ impl QcAlgorithm {
             option_subscriptions: Vec::new(),
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
+            benchmark_symbol: None,
         }
+    }
+
+    /// Set the benchmark symbol (e.g. "SPY"). When not called, the runner
+    /// automatically uses SPY as the default benchmark.
+    pub fn set_benchmark(&mut self, ticker: impl Into<String>) {
+        self.benchmark_symbol = Some(ticker.into().to_uppercase());
     }
 
     // ─── Configuration ──────────────────────────────────────────────────────
@@ -363,8 +374,8 @@ impl QcAlgorithm {
         if delta_value.abs() < dec!(1) { return None; } // avoid tiny orders
 
         let qty = delta_value / current_price;
-        // Round to integer for equities
-        let qty_rounded = qty.round();
+        // Truncate (floor toward zero) to integer, matching C# LEAN's lot-size behavior
+        let qty_rounded = qty.trunc();
 
         if qty_rounded.is_zero() { return None; }
 

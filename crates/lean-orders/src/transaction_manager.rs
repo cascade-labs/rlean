@@ -81,6 +81,19 @@ impl TransactionManager {
     pub fn order_count(&self) -> usize {
         self.orders.len()
     }
+
+    pub fn get_all_orders(&self) -> Vec<Order> {
+        self.orders.iter().map(|entry| entry.read().clone()).collect()
+    }
+
+    pub fn get_all_order_events(&self) -> Vec<OrderEvent> {
+        let mut events: Vec<OrderEvent> = self.tickets
+            .iter()
+            .flat_map(|t| t.order_events())
+            .collect();
+        events.sort_by_key(|e| e.utc_time);
+        events
+    }
 }
 
 impl Default for TransactionManager {

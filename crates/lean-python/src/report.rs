@@ -8,12 +8,193 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Serialize;
+
 use crate::charting::{ChartCollection, SeriesType};
 use crate::runner::BacktestResult;
+
+// ── LEAN-compatible output file writers ───────────────────────────────────────
+
+/// Write `<id>-order-events.json` — serialised list of all OrderEvent structs.
+pub fn write_order_events_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(&result.order_events)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
+
+/// Summary statistics struct written to `<id>-summary.json`.
+#[derive(Serialize)]
+struct SummaryJson {
+    #[serde(rename = "TotalReturn")]
+    total_return: f64,
+    #[serde(rename = "CAGR")]
+    cagr: f64,
+    #[serde(rename = "SharpeRatio")]
+    sharpe_ratio: f64,
+    #[serde(rename = "SortinoRatio")]
+    sortino_ratio: f64,
+    #[serde(rename = "ProbabilisticSharpeRatio")]
+    probabilistic_sharpe_ratio: f64,
+    #[serde(rename = "MaxDrawdown")]
+    max_drawdown: f64,
+    #[serde(rename = "CalmarRatio")]
+    calmar_ratio: f64,
+    #[serde(rename = "OmegaRatio")]
+    omega_ratio: f64,
+    #[serde(rename = "RecoveryFactor")]
+    recovery_factor: f64,
+    #[serde(rename = "AnnualStandardDeviation")]
+    annual_standard_deviation: f64,
+    #[serde(rename = "Alpha")]
+    alpha: f64,
+    #[serde(rename = "Beta")]
+    beta: f64,
+    #[serde(rename = "TreynorRatio")]
+    treynor_ratio: f64,
+    #[serde(rename = "WinRate")]
+    win_rate: f64,
+    #[serde(rename = "LossRate")]
+    loss_rate: f64,
+    #[serde(rename = "ProfitLossRatio")]
+    profit_loss_ratio: f64,
+    #[serde(rename = "Expectancy")]
+    expectancy: f64,
+    #[serde(rename = "TotalNetProfit")]
+    total_net_profit: f64,
+    #[serde(rename = "TotalTrades")]
+    total_trades: usize,
+    #[serde(rename = "WinningTrades")]
+    winning_trades: usize,
+    #[serde(rename = "LosingTrades")]
+    losing_trades: usize,
+    #[serde(rename = "AverageTradeDurationDays")]
+    average_trade_duration_days: f64,
+    #[serde(rename = "StartingCash")]
+    starting_cash: f64,
+    #[serde(rename = "FinalValue")]
+    final_value: f64,
+    #[serde(rename = "TradingDays")]
+    trading_days: i64,
+}
+
+/// Write `<id>-summary.json` — flat key/value stats matching LEAN's summary format.
+pub fn write_summary_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
+    use rust_decimal::prelude::ToPrimitive;
+    let s = &result.statistics;
+    let summary = SummaryJson {
+        total_return:                result.total_return,
+        cagr:                        s.compounding_annual_return.to_f64().unwrap_or(0.0),
+        sharpe_ratio:                s.sharpe_ratio.to_f64().unwrap_or(0.0),
+        sortino_ratio:               s.sortino_ratio.to_f64().unwrap_or(0.0),
+        probabilistic_sharpe_ratio:  s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0),
+        max_drawdown:                s.drawdown.to_f64().unwrap_or(0.0),
+        calmar_ratio:                s.calmar_ratio.to_f64().unwrap_or(0.0),
+        omega_ratio:                 s.omega_ratio.to_f64().unwrap_or(0.0),
+        recovery_factor:             s.recovery_factor.to_f64().unwrap_or(0.0),
+        annual_standard_deviation:   s.annual_standard_deviation.to_f64().unwrap_or(0.0),
+        alpha:                       s.alpha.to_f64().unwrap_or(0.0),
+        beta:                        s.beta.to_f64().unwrap_or(0.0),
+        treynor_ratio:               s.treynor_ratio.to_f64().unwrap_or(0.0),
+        win_rate:                    s.win_rate.to_f64().unwrap_or(0.0),
+        loss_rate:                   s.loss_rate.to_f64().unwrap_or(0.0),
+        profit_loss_ratio:           s.profit_loss_ratio.to_f64().unwrap_or(0.0),
+        expectancy:                  s.expectancy.to_f64().unwrap_or(0.0),
+        total_net_profit:            s.total_net_profit.to_f64().unwrap_or(0.0),
+        total_trades:                s.total_trades,
+        winning_trades:              s.winning_trades,
+        losing_trades:               s.losing_trades,
+        average_trade_duration_days: s.average_trade_duration_days.to_f64().unwrap_or(0.0),
+        starting_cash:               result.starting_cash,
+        final_value:                 result.final_value,
+        trading_days:                result.trading_days,
+    };
+    let json = serde_json::to_string_pretty(&summary)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
+
+/// Write `succeeded-data-requests-<timestamp>.txt` and `failed-data-requests-<timestamp>.txt`.
+pub fn write_data_request_files(
+    result: &BacktestResult,
+    succeeded_path: &Path,
+    failed_path: &Path,
+) -> std::io::Result<()> {
+    std::fs::write(succeeded_path, result.succeeded_data_requests.join("\n"))?;
+    std::fs::write(failed_path, result.failed_data_requests.join("\n"))
+}
+
+/// Write `<id>-log.txt` (and `log.txt`) — captured log lines for the backtest.
+///
+/// Currently mirrors the same content: a header line plus a summary of key stats.
+/// Full per-line log capture would require a custom tracing subscriber; for now
+/// we emit a structured stats summary that matches LEAN's convention of having a
+/// log file alongside each result.
+pub fn write_log_txt(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
+    use rust_decimal::prelude::ToPrimitive;
+    let s = &result.statistics;
+    let mut lines = Vec::new();
+    lines.push(format!("Backtest ID:       {}", result.backtest_id));
+    lines.push(format!("Trading Days:      {}", result.trading_days));
+    lines.push(format!("Starting Cash:     {:.2}", result.starting_cash));
+    lines.push(format!("Final Value:       {:.2}", result.final_value));
+    lines.push(format!("Total Return:      {:.4}", result.total_return));
+    lines.push(format!("CAGR:              {:.4}", s.compounding_annual_return.to_f64().unwrap_or(0.0)));
+    lines.push(format!("Sharpe Ratio:      {:.4}", s.sharpe_ratio.to_f64().unwrap_or(0.0)));
+    lines.push(format!("Max Drawdown:      {:.4}", s.drawdown.to_f64().unwrap_or(0.0)));
+    lines.push(format!("Total Trades:      {}", s.total_trades));
+    lines.push(format!("Win Rate:          {:.4}", s.win_rate.to_f64().unwrap_or(0.0)));
+    std::fs::write(path, lines.join("\n"))
+}
 
 pub fn write_report(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
     let html = generate_html(result);
     std::fs::write(path, html)
+}
+
+/// LEAN-compatible results JSON written to <backtest_dir>/results.json.
+///
+/// Top-level keys mirror the C# `BacktestResultPacket` format so tooling
+/// that understands LEAN output can consume this file directly.
+#[derive(Serialize)]
+struct BacktestResultJson<'a> {
+    #[serde(rename = "Statistics")]
+    statistics: &'a lean_statistics::PortfolioStatistics,
+    #[serde(rename = "Charts")]
+    charts: &'a ChartCollection,
+    /// Equity curve as {date → portfolio value} pairs (LEAN "Strategy Equity" series).
+    #[serde(rename = "Equity")]
+    equity: std::collections::HashMap<&'a str, f64>,
+    #[serde(rename = "TradingDays")]
+    trading_days: i64,
+    #[serde(rename = "StartingCash")]
+    starting_cash: f64,
+    #[serde(rename = "FinalValue")]
+    final_value: f64,
+    #[serde(rename = "TotalReturn")]
+    total_return: f64,
+}
+
+pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
+    let equity: std::collections::HashMap<&str, f64> = result
+        .daily_dates
+        .iter()
+        .zip(result.equity_curve.iter())
+        .map(|(d, &v)| (d.as_str(), v))
+        .collect();
+
+    let json_obj = BacktestResultJson {
+        statistics:   &result.statistics,
+        charts:       &result.charts,
+        equity,
+        trading_days: result.trading_days,
+        starting_cash: result.starting_cash,
+        final_value:  result.final_value,
+        total_return: result.total_return,
+    };
+
+    let json = serde_json::to_string_pretty(&json_obj)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
 }
 
 fn generate_html(r: &BacktestResult) -> String {
@@ -517,5 +698,192 @@ fn ret_color(pct: f64) -> String {
     } else {
         let intensity = ((-clamped) / 10.0 * 180.0) as u8;
         format!("rgba(244,67,54,{:.2})", intensity as f64 / 255.0 + 0.1)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_statistics::PortfolioStatistics;
+    use rust_decimal_macros::dec;
+
+    /// Construct a minimal `BacktestResult` suitable for testing output writers.
+    fn make_result() -> BacktestResult {
+        let stats = PortfolioStatistics::compute(
+            &[dec!(100_000), dec!(101_000), dec!(102_000)],
+            &[],
+            &[],
+            2,
+            dec!(100_000),
+            dec!(0),
+        );
+        BacktestResult {
+            trading_days:             2,
+            final_value:              102_000.0,
+            total_return:             0.02,
+            starting_cash:            100_000.0,
+            equity_curve:             vec![100_000.0, 101_000.0, 102_000.0],
+            daily_dates:              vec![
+                "2026-01-02".to_string(),
+                "2026-01-03".to_string(),
+                "2026-01-04".to_string(),
+            ],
+            statistics:               stats,
+            charts:                   crate::charting::ChartCollection::default(),
+            order_events:             vec![],
+            succeeded_data_requests:  vec!["SPY/2026-01-02".to_string()],
+            failed_data_requests:     vec!["SPY/2026-01-05".to_string()],
+            backtest_id:              1_744_000_000,
+            benchmark_symbol:         "SPY".to_string(),
+        }
+    }
+
+    // ── write_results_json ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_results_json_creates_file_with_expected_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let path = dir.path().join(format!("{id}.json"));
+
+        write_results_json(&result, &path).unwrap();
+
+        assert!(path.exists(), "{id}.json should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(v.get("Statistics").is_some(),  "missing 'Statistics' key");
+        assert!(v.get("Equity").is_some(),       "missing 'Equity' key");
+        assert!(v.get("TradingDays").is_some(),  "missing 'TradingDays' key");
+        assert!(v.get("TotalReturn").is_some(),  "missing 'TotalReturn' key");
+    }
+
+    // ── write_order_events_json ────────────────────────────────────────────────
+
+    #[test]
+    fn test_order_events_json_is_valid_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let path = dir.path().join(format!("{id}-order-events.json"));
+
+        write_order_events_json(&result, &path).unwrap();
+
+        assert!(path.exists(), "{id}-order-events.json should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(v.is_array(), "order-events.json must be a JSON array");
+    }
+
+    // ── write_summary_json ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_summary_json_contains_required_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let path = dir.path().join(format!("{id}-summary.json"));
+
+        write_summary_json(&result, &path).unwrap();
+
+        assert!(path.exists(), "{id}-summary.json should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let required_keys = [
+            "TotalReturn", "CAGR", "SharpeRatio", "SortinoRatio",
+            "MaxDrawdown", "CalmarRatio", "WinRate", "Expectancy",
+            "TotalNetProfit", "TotalTrades", "StartingCash", "FinalValue",
+            "TradingDays",
+        ];
+        for key in &required_keys {
+            assert!(v.get(key).is_some(), "summary.json missing key '{key}'");
+        }
+    }
+
+    // ── write_log_txt ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_log_txt_contains_backtest_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let path = dir.path().join(format!("{id}-log.txt"));
+
+        write_log_txt(&result, &path).unwrap();
+
+        assert!(path.exists(), "{id}-log.txt should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&id.to_string()),
+            "log should contain the backtest ID"
+        );
+    }
+
+    // ── write_data_request_files ───────────────────────────────────────────────
+
+    #[test]
+    fn test_data_request_files_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+
+        let succeeded = dir.path().join("succeeded-data-requests-20260401051450171.txt");
+        let failed    = dir.path().join("failed-data-requests-20260401051450171.txt");
+
+        write_data_request_files(&result, &succeeded, &failed).unwrap();
+
+        assert!(succeeded.exists(), "succeeded-data-requests file should exist");
+        assert!(failed.exists(),    "failed-data-requests file should exist");
+
+        let succ_content = std::fs::read_to_string(&succeeded).unwrap();
+        assert!(succ_content.contains("SPY/2026-01-02"), "succeeded file should list SPY data");
+
+        let fail_content = std::fs::read_to_string(&failed).unwrap();
+        assert!(fail_content.contains("SPY/2026-01-05"), "failed file should list missing data");
+    }
+
+    // ── full output directory structure ───────────────────────────────────────
+
+    #[test]
+    fn test_all_expected_output_files_created() {
+        // Verify that the complete set of LEAN-compatible output files can be
+        // created in a single output directory, mirroring what main.rs produces.
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let ts_ms = "20260410120000000";
+
+        write_results_json(&result,      &dir.path().join(format!("{id}.json"))).unwrap();
+        write_order_events_json(&result, &dir.path().join(format!("{id}-order-events.json"))).unwrap();
+        write_summary_json(&result,      &dir.path().join(format!("{id}-summary.json"))).unwrap();
+        write_log_txt(&result,           &dir.path().join(format!("{id}-log.txt"))).unwrap();
+        std::fs::copy(
+            dir.path().join(format!("{id}-log.txt")),
+            dir.path().join("log.txt"),
+        ).unwrap();
+        write_data_request_files(
+            &result,
+            &dir.path().join(format!("succeeded-data-requests-{ts_ms}.txt")),
+            &dir.path().join(format!("failed-data-requests-{ts_ms}.txt")),
+        ).unwrap();
+        write_report(&result, &dir.path().join("report.html")).unwrap();
+
+        let expected = [
+            format!("{id}.json"),
+            format!("{id}-order-events.json"),
+            format!("{id}-summary.json"),
+            format!("{id}-log.txt"),
+            "log.txt".to_string(),
+            format!("succeeded-data-requests-{ts_ms}.txt"),
+            format!("failed-data-requests-{ts_ms}.txt"),
+            "report.html".to_string(),
+        ];
+
+        for name in &expected {
+            let p = dir.path().join(name);
+            assert!(p.exists(), "expected output file '{}' not found", name);
+        }
     }
 }

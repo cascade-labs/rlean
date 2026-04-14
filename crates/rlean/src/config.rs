@@ -63,7 +63,7 @@ impl GlobalConfig {
 // ── Credentials (~/.rlean/credentials) ────────────────────────────────────────
 
 
-// ── Workspace config (lean.json) ──────────────────────────────────────────────
+// ── Workspace config (rlean.json) ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +73,7 @@ pub struct WorkspaceConfig {
 
     #[serde(default = "default_language")]
     pub default_language: String,
+
 }
 
 fn default_data_folder() -> String {
@@ -90,7 +91,7 @@ impl Default for WorkspaceConfig {
 
 impl WorkspaceConfig {
     pub fn load(workspace: &Path) -> Result<Self> {
-        let path = workspace.join("lean.json");
+        let path = workspace.join("rlean.json");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -101,7 +102,7 @@ impl WorkspaceConfig {
     }
 
     pub fn save(&self, workspace: &Path) -> Result<()> {
-        let path = workspace.join("lean.json");
+        let path = workspace.join("rlean.json");
         let text = serde_json::to_string_pretty(self)?;
         atomic_write(&path, &text)
     }

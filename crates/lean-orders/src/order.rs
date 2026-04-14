@@ -41,6 +41,11 @@ impl OrderStatus {
     pub fn is_closed(&self) -> bool {
         !self.is_open()
     }
+
+    /// Mirrors C# LEAN's `OrderStatus.IsFill()` extension method.
+    pub fn is_fill(&self) -> bool {
+        matches!(self, OrderStatus::Filled | OrderStatus::PartiallyFilled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

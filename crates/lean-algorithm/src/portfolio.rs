@@ -138,6 +138,25 @@ impl SecurityPortfolioManager {
             .sum()
     }
 
+    /// Apply an option exercise or assignment directly at the given price.
+    ///
+    /// Unlike `apply_fill` this does NOT go through the order queue — it
+    /// settles the stock leg of an option exercise immediately on the
+    /// expiration day so the equity curve stays correct.
+    ///
+    /// - `fill_quantity` > 0 → buying shares (put assignment, call exercise)
+    /// - `fill_quantity` < 0 → selling shares (call assignment, put exercise)
+    /// - `fill_price` is the option strike price (the contractual settlement price)
+    pub fn apply_exercise(&self, symbol: &Symbol, fill_price: Price, fill_quantity: Quantity) {
+        let mut holdings = self.holdings.write();
+        let h = holdings
+            .entry(symbol.id.sid)
+            .or_insert_with(|| SecurityHolding::new(symbol.clone()));
+        h.apply_fill(fill_price, fill_quantity, dec!(0));
+        let cash_delta = -(fill_price * fill_quantity);
+        *self.cash.write() += cash_delta;
+    }
+
     pub fn apply_fill(&self, order: &Order, fill_price: Price, fill_quantity: Quantity, fee: Price) {
         let symbol = &order.symbol;
         let mut holdings = self.holdings.write();

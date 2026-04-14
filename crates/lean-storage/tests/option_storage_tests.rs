@@ -59,8 +59,8 @@ fn sample_universe_row(underlying: &str, osi: &str, expiry: NaiveDate) -> Option
 
 // ─── Path generation tests ───────────────────────────────────────────────────
 
-/// LEAN canonical daily option path:
-///   option/usa/daily/spy/spy_trade.parquet
+/// Date-partitioned daily option path — one file per date per underlying:
+///   option/usa/daily/spy/20210430_trade.parquet
 #[test]
 fn test_option_daily_path() {
     let spy = spy_equity();
@@ -69,12 +69,12 @@ fn test_option_daily_path() {
 
     assert_eq!(
         path,
-        PathBuf::from("/data/option/usa/daily/spy/spy_trade.parquet"),
+        PathBuf::from("/data/option/usa/daily/spy/20210430_trade.parquet"),
         "daily option EOD path mismatch"
     );
 }
 
-/// Minute resolution option path mirrors LEAN's intraday layout:
+/// Minute resolution option path:
 ///   option/usa/minute/spy/20210430_trade.parquet
 #[test]
 fn test_option_minute_path() {
@@ -104,26 +104,23 @@ fn test_option_universe_path() {
     );
 }
 
-/// The underlying ticker, not the OSI contract string, drives the directory.
+/// The underlying ticker drives the subdirectory; the date drives the filename.
 #[test]
 fn test_option_path_uses_underlying_not_osi() {
     let spy = spy_equity();
-    // Even if the caller somehow passes a symbol with an OSI value, the
-    // path should be keyed on whatever symbol.value is — which for an
-    // equity symbol is just "SPY".
     let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
     let path_str = dp.to_path().to_string_lossy().to_lowercase();
     assert!(
         path_str.contains("/spy/"),
-        "path should contain /spy/ not an OSI string: {path_str}"
+        "path should contain spy subdirectory: {path_str}"
     );
     assert!(
-        !path_str.contains("210430"),
-        "daily path should NOT contain date in filename portion (only ticker): {path_str}"
+        path_str.contains("20210430_trade.parquet"),
+        "daily path should contain date-prefixed filename: {path_str}"
     );
 }
 
-/// dir() should give the parent directory.
+/// dir() should give the ticker subdirectory (date-partitioned layout).
 #[test]
 fn test_option_dir() {
     let spy = spy_equity();
@@ -134,7 +131,7 @@ fn test_option_dir() {
     );
 }
 
-/// glob_all_dates for daily option EOD bars.
+/// glob_all_dates for daily option bars — all dates under ticker subdirectory.
 #[test]
 fn test_option_glob_all_dates_daily() {
     let spy = spy_equity();
@@ -142,11 +139,11 @@ fn test_option_glob_all_dates_daily() {
     let glob = dp.glob_all_dates();
     assert_eq!(
         glob,
-        "/data/option/usa/daily/spy_trade.parquet"
+        "/data/option/usa/daily/spy/*_trade.parquet"
     );
 }
 
-/// glob_all_dates for minute option EOD bars.
+/// glob_all_dates for minute option bars.
 #[test]
 fn test_option_glob_all_dates_minute() {
     let spy = spy_equity();
@@ -296,7 +293,7 @@ fn test_write_option_eod_bars_at_data_path() {
     let spy = spy_equity();
 
     let dp = DataPath::option_eod_bar(tmp.path(), &spy, Resolution::Daily, date(2021, 4, 30));
-    let expected_path = tmp.path().join("option/usa/daily/spy/spy_trade.parquet");
+    let expected_path = tmp.path().join("option/usa/daily/spy/20210430_trade.parquet");
 
     let bars = vec![sample_eod_bar("SPY", "SPY210430P00480000", date(2021, 4, 30), "P")];
     let writer = ParquetWriter::new(WriterConfig::default());

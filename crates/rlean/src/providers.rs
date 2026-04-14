@@ -4,11 +4,49 @@
 /// located at `~/.rlean/plugins/librlean_plugin_<name>.<dylib|so>`.
 /// The only built-in provider is `local` / `""` which reads from the local
 /// Parquet store without any network calls.
-use std::sync::Arc;
+///
+/// Plugin dylibs are loaded **lazily** — the `Library::new` call happens only
+/// when the first actual data fetch is needed.  This means `--data-provider-historical`
+/// is safe to pass even when all data is cached: if `pre_fetch_all` finds
+/// existing Parquet files it skips fetching entirely and the dylibs are
+/// never loaded.
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
 use lean_data_providers::{config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider};
+
+/// A lazy wrapper around a named plugin provider.
+///
+/// The dylib is not loaded until the first call to `get_history`.
+struct LazyPluginProvider {
+    name:  String,
+    args:  ProviderArgs,
+    inner: OnceLock<Result<Arc<dyn IHistoryProvider>, String>>,
+}
+
+impl LazyPluginProvider {
+    fn new(name: &str, args: ProviderArgs) -> Self {
+        Self { name: name.to_string(), args, inner: OnceLock::new() }
+    }
+
+    fn get(&self) -> anyhow::Result<Arc<dyn IHistoryProvider>> {
+        let result = self.inner.get_or_init(|| {
+            load_plugin_provider(&self.name, &self.args).map_err(|e| e.to_string())
+        });
+        result.clone().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+impl IHistoryProvider for LazyPluginProvider {
+    fn get_history(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_history(request)
+    }
+}
 
 /// Rate-limit settings for the CLI — passed alongside plugin config.
 ///
@@ -63,6 +101,9 @@ pub fn build_history_provider(
 }
 
 /// Build a single named provider, drawing credentials from `args`.
+///
+/// Plugin providers are returned as [`LazyPluginProvider`] wrappers so the
+/// dylib is not loaded until a fetch is actually needed.
 fn build_single_provider(
     name: &str,
     args: &ProviderArgs,
@@ -75,7 +116,23 @@ fn build_single_provider(
             };
             Ok(Arc::new(LocalHistoryProvider::new(&config.data_root)))
         }
-        name => load_plugin_provider(name, args),
+        name => {
+            // Validate plugin path exists before accepting the name, so the user
+            // gets a clear error at startup rather than at first fetch.
+            let lib_name = format!(
+                "librlean_plugin_{}.{}",
+                name.replace('-', "_"),
+                dylib_ext()
+            );
+            let plugin_path = home_dir()?.join(".rlean").join("plugins").join(&lib_name);
+            if !plugin_path.exists() {
+                bail!(
+                    "Plugin '{}' is not installed. Run: rlean plugin install {}",
+                    name, name
+                );
+            }
+            Ok(Arc::new(LazyPluginProvider::new(name, args.clone())))
+        }
     }
 }
 

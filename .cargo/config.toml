@@ -2,3 +2,10 @@
 # Allow pyo3 to build against Python 3.14 using the stable ABI forward compatibility.
 # Python 3.14 is newer than pyo3's explicitly tested range but is ABI-compatible.
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+
+[net]
+# Required for SSH-key auth when resolving git deps from private cascade-labs repos.
+# The rlean-plugins/* path-deps reference cascade-labs/rlean via SSH git URL;
+# [patch] in Cargo.toml redirects those to local crates, but Cargo still needs
+# SSH auth to resolve the source before applying the patch.
+git-fetch-with-cli = true

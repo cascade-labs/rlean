@@ -168,6 +168,38 @@ impl ExchangeHours {
     fn us_equity_holidays() -> HashSet<NaiveDate> {
         use chrono::NaiveDate;
         let mut h = HashSet::new();
+        // 2021 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 1, 18).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 2, 15).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 4, 2).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 5, 31).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 6, 18).unwrap()); // Juneteenth observed
+        h.insert(NaiveDate::from_ymd_opt(2021, 7, 5).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 9, 6).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 11, 25).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2021, 12, 24).unwrap());
+        // 2022 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2022, 1, 17).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 2, 21).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 4, 15).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 5, 30).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 6, 20).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 7, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 9, 5).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 11, 24).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2022, 12, 26).unwrap());
+        // 2023 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2023, 1, 2).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 1, 16).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 2, 20).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 4, 7).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 5, 29).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 6, 19).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 7, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 9, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 11, 23).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap());
         // 2024 NYSE holidays
         h.insert(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
@@ -191,6 +223,17 @@ impl ExchangeHours {
         h.insert(NaiveDate::from_ymd_opt(2025, 9, 1).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2025, 11, 27).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2025, 12, 25).unwrap());
+        // 2026 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 1, 19).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 2, 16).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 4, 3).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 6, 19).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 9, 7).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
         h
     }
 }

@@ -27,9 +27,5 @@ name = "sma_crossover"
 path = "src/sma_crossover.rs"
 
 [[bin]]
-name = "parquet_migration"
-path = "src/parquet_migration.rs"
-
-[[bin]]
 name = "python_runner"
 path = "src/python_runner.rs"
