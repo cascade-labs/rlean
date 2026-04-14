@@ -44,6 +44,7 @@ impl IOptionExerciseModel for DefaultExerciseModel {
 
         let mut events = vec![
             OrderEvent {
+                id: 0,
                 order_id: order.order.id,
                 symbol: contract.symbol.clone(),
                 utc_time,
@@ -61,6 +62,12 @@ impl IOptionExerciseModel for DefaultExerciseModel {
                     if is_assignment { "(assignment)" } else { "" }
                 ),
                 shortable_inventory: None,
+                order_fee: Decimal::ZERO,
+                limit_price: None,
+                stop_price: None,
+                trigger_price: None,
+                trailing_amount: None,
+                trailing_as_percentage: false,
             }
         ];
 
@@ -76,6 +83,7 @@ impl IOptionExerciseModel for DefaultExerciseModel {
             // Get the underlying symbol from the option symbol's `underlying` field
             if let Some(ref underlying_sym) = contract.symbol.underlying {
                 events.push(OrderEvent {
+                    id: 0,
                     order_id: order.order.id,
                     symbol: *underlying_sym.clone(),
                     utc_time,
@@ -93,6 +101,12 @@ impl IOptionExerciseModel for DefaultExerciseModel {
                         "Option Exercise".to_string()
                     },
                     shortable_inventory: None,
+                    order_fee: Decimal::ZERO,
+                    limit_price: None,
+                    stop_price: None,
+                    trigger_price: None,
+                    trailing_amount: None,
+                    trailing_as_percentage: false,
                 });
             }
         }

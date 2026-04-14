@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{Market, Resolution};
+use lean_core::{Market, Resolution, SymbolOptionsExt};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal_macros::dec;
 use crate::charting::ChartCollection;
 use crate::py_portfolio::PyPortfolio;
-use crate::py_types::{PyResolution, PySecurity, PySymbol};
+use crate::py_types::{PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol};
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
@@ -94,6 +94,15 @@ impl PyQcAlgorithm {
         self.inner.lock().unwrap().name = name.to_string();
     }
 
+    /// Set the benchmark symbol.  When not called, SPY is used as the default.
+    ///
+    /// ```python
+    /// self.set_benchmark("QQQ")
+    /// ```
+    fn set_benchmark(&mut self, ticker: &str) {
+        self.inner.lock().unwrap().set_benchmark(ticker);
+    }
+
     /// Set the warm-up period.
     ///
     /// If `bars_or_days` > 365 it is treated as a bar count; otherwise as a
@@ -141,11 +150,31 @@ impl PyQcAlgorithm {
 
     // ─── Ordering ─────────────────────────────────────────────────────────────
 
-    /// Place a market order. symbol can be a PySymbol or a ticker string.
+    /// LEAN API: place a market order. Routes option symbols through the option
+    /// position manager using the current chain mid price.
     fn market_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner.lock().unwrap().market_order(&sym, f2d(quantity));
-        Ok(())
+        if sym.option_symbol_id().is_some() {
+            self.option_market_order(sym, f2d(quantity))
+        } else {
+            self.inner.lock().unwrap().market_order(&sym, f2d(quantity));
+            Ok(())
+        }
+    }
+
+    /// LEAN API: `self.buy(symbol, quantity)` — market buy.
+    fn buy(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
+        self.market_order(symbol, quantity.abs())
+    }
+
+    /// LEAN API: `self.sell(symbol, quantity)` — market sell.
+    fn sell(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
+        self.market_order(symbol, -quantity.abs())
+    }
+
+    /// LEAN API: `self.order(symbol, quantity)` — alias for market_order.
+    fn order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
+        self.market_order(symbol, quantity)
     }
 
     /// Place a limit order.
@@ -184,79 +213,61 @@ impl PyQcAlgorithm {
         Ok(())
     }
 
+    /// LEAN API: exercise a long option position.
+    fn exercise_option(&mut self, symbol: &Bound<'_, PyAny>) -> PyResult<()> {
+        let sym = self.resolve_symbol(symbol)?;
+        tracing::info!("Exercise option: {}", sym.value);
+        // Actual exercise is handled by the runner at expiry; this is a no-op
+        // for strategies that call it before expiry (LEAN ignores early exercise for Americans in backtests).
+        Ok(())
+    }
+
     // ─── Options ──────────────────────────────────────────────────────────────
 
     /// Subscribe to an option chain for an underlying equity.
-    /// Returns the canonical option ticker string (e.g. `?SPY`).
+    /// Returns a LEAN-compatible `Option` security object with `.symbol` and `.set_filter()`.
+    /// Accepts `Resolution.Daily`, `Resolution.Minute`, etc. or a string, defaulting to Daily.
     #[pyo3(signature = (ticker, resolution=None))]
-    fn add_option(&mut self, ticker: &str, resolution: Option<&str>) -> PyResult<String> {
+    fn add_option(&mut self, ticker: &str, resolution: Option<&Bound<'_, PyAny>>) -> PyResult<crate::py_types::PyOptionSecurity> {
         use lean_core::Resolution;
         let res = match resolution {
-            Some("Daily") | Some("daily") => Resolution::Daily,
-            Some("Hour") | Some("hour") => Resolution::Hour,
-            Some("Minute") | Some("minute") => Resolution::Minute,
-            _ => Resolution::Daily,
+            Some(r) => {
+                if let Ok(py_res) = r.extract::<PyResolution>() {
+                    Resolution::from(py_res)
+                } else if let Ok(s) = r.extract::<String>() {
+                    match s.to_lowercase().as_str() {
+                        "daily" => Resolution::Daily,
+                        "hour" => Resolution::Hour,
+                        "minute" => Resolution::Minute,
+                        _ => Resolution::Daily,
+                    }
+                } else {
+                    Resolution::Daily
+                }
+            }
+            None => Resolution::Daily,
         };
         let canonical = self.inner.lock().unwrap().add_option(ticker, res);
-        Ok(canonical.permtick.clone())
-    }
-
-    /// Get the current option chain for a canonical ticker (e.g. `?SPY`).
-    /// Returns None if no chain data is available yet.
-    fn get_option_chain(&self, canonical_ticker: &str) -> Option<crate::py_options::PyOptionChain> {
-        self.inner.lock().unwrap()
-            .get_option_chain(canonical_ticker)
-            .map(|chain| crate::py_options::PyOptionChain { inner: chain })
-    }
-
-    /// Sell to open: write an option contract (collect premium).
-    fn sell_to_open(&mut self, contract: &crate::py_options::PyOptionContract, quantity: f64, premium: f64) -> PyResult<i64> {
-        use rust_decimal::prelude::FromPrimitive;
-        let qty = Decimal::from_f64(quantity).unwrap_or(Decimal::ONE);
-        let prem = f2d(premium);
-        Ok(self.inner.lock().unwrap().sell_to_open(contract.inner.symbol.clone(), qty, prem))
-    }
-
-    /// Buy to open: long an option contract (pay premium).
-    fn buy_to_open(&mut self, contract: &crate::py_options::PyOptionContract, quantity: f64, premium: f64) -> PyResult<i64> {
-        use rust_decimal::prelude::FromPrimitive;
-        let qty = Decimal::from_f64(quantity).unwrap_or(Decimal::ONE);
-        let prem = f2d(premium);
-        Ok(self.inner.lock().unwrap().buy_to_open(contract.inner.symbol.clone(), qty, prem))
-    }
-
-    /// Buy to close: cover a short option position.
-    fn buy_to_close(&mut self, contract: &crate::py_options::PyOptionContract, quantity: f64, premium: f64) -> PyResult<i64> {
-        use rust_decimal::prelude::FromPrimitive;
-        let qty = Decimal::from_f64(quantity).unwrap_or(Decimal::ONE);
-        let prem = f2d(premium);
-        Ok(self.inner.lock().unwrap().buy_to_close(contract.inner.symbol.clone(), qty, prem))
-    }
-
-    /// Sell to close: exit a long option position.
-    fn sell_to_close(&mut self, contract: &crate::py_options::PyOptionContract, quantity: f64, premium: f64) -> PyResult<i64> {
-        use rust_decimal::prelude::FromPrimitive;
-        let qty = Decimal::from_f64(quantity).unwrap_or(Decimal::ONE);
-        let prem = f2d(premium);
-        Ok(self.inner.lock().unwrap().sell_to_close(contract.inner.symbol.clone(), qty, prem))
-    }
-
-    /// Get all open option positions as a list of dicts.
-    fn get_option_positions(&self) -> Vec<PyObject> {
-        Python::with_gil(|py| {
-            let inner = self.inner.lock().unwrap();
-            inner.option_positions.values().map(|pos| {
-                use rust_decimal::prelude::ToPrimitive;
-                let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("ticker", pos.symbol.permtick.clone()).ok();
-                dict.set_item("strike", pos.strike.to_f64().unwrap_or(0.0)).ok();
-                dict.set_item("expiry", pos.expiry.to_string()).ok();
-                dict.set_item("right", format!("{:?}", pos.right)).ok();
-                dict.set_item("quantity", pos.quantity.to_f64().unwrap_or(0.0)).ok();
-                dict.set_item("entry_price", pos.entry_price.to_f64().unwrap_or(0.0)).ok();
-                dict.into_py(py)
-            }).collect()
+        Ok(crate::py_types::PyOptionSecurity {
+            canonical: crate::py_types::PySymbol { inner: canonical },
         })
+    }
+
+    // ─── Securities ───────────────────────────────────────────────────────────
+
+    /// LEAN API: `self.securities[symbol]` — returns the Security for a symbol.
+    #[getter]
+    fn securities(&self) -> PySecurityManager {
+        let alg = self.inner.lock().unwrap();
+        let mut entries = HashMap::new();
+        for sec in alg.securities.all() {
+            let sid = sec.symbol.id.sid;
+            entries.insert(sid, PySecurityManager::build_entry(
+                sec.symbol.clone(),
+                sec.current_price().to_f64().unwrap_or(0.0),
+            ));
+        }
+        PySecurityManager::from_entries(entries)
     }
 
     // ─── Portfolio ────────────────────────────────────────────────────────────
@@ -322,6 +333,21 @@ impl PyQcAlgorithm {
         self.inner.lock().unwrap().debug(message);
     }
 
+    /// LEAN API: `self.error(message)` — log an error-level message.
+    fn error(&self, message: &str) {
+        tracing::error!("Algorithm: {message}");
+        self.inner.lock().unwrap().log_message(&format!("ERROR: {message}"));
+    }
+
+    // ─── Market Hours ─────────────────────────────────────────────────────────
+
+    /// LEAN API: `self.is_market_open(symbol)` — always True in daily-resolution backtests.
+    #[pyo3(signature = (symbol=None))]
+    fn is_market_open(&self, symbol: Option<&Bound<'_, PyAny>>) -> bool {
+        let _ = symbol;
+        true
+    }
+
     // ─── Charting ─────────────────────────────────────────────────────────────
 
     /// Plot a value on a named chart/series using the current algorithm time.
@@ -350,6 +376,7 @@ impl PyQcAlgorithm {
     fn initialize(&mut self) {}
     fn on_data(&mut self, _data: PyObject) {}
     fn on_order_event(&mut self, _event: PyObject) {}
+    fn on_assignment_order_event(&mut self, _event: PyObject) {}
     fn on_end_of_algorithm(&mut self) {}
     fn on_warmup_finished(&mut self) {}
 
@@ -399,6 +426,10 @@ impl PyQcAlgorithm {
         if let Ok(sec) = arg.downcast::<PySecurity>() {
             return Ok(sec.get().inner.inner.clone());
         }
+        // Accept OptionContract objects — uses contract.symbol
+        if let Ok(contract) = arg.downcast::<crate::py_options::PyOptionContract>() {
+            return Ok(contract.borrow().inner.symbol.clone());
+        }
         if let Ok(ticker) = arg.extract::<String>() {
             let upper = ticker.to_uppercase();
             if let Some(sym) = self.symbols.get(&upper) {
@@ -408,7 +439,51 @@ impl PyQcAlgorithm {
             return Ok(lean_core::Symbol::create_equity(&ticker, &Market::usa()));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "Expected Security, Symbol, or ticker string"
+            "Expected Security, Symbol, OptionContract, or ticker string"
         ))
+    }
+
+    /// Route a market order for an option symbol through the option position manager.
+    /// Looks up the mid price from the current option chain.
+    fn option_market_order(&mut self, sym: lean_core::Symbol, quantity: Decimal) -> PyResult<()> {
+        // Determine canonical permtick: ?UNDERLYING
+        let canonical = sym.underlying.as_ref()
+            .map(|u| format!("?{}", u.permtick))
+            .unwrap_or_default();
+
+        // Look up mid price from option chains (keyed by Symbol, match by SID)
+        let sid = sym.id.sid;
+        let premium = {
+            let alg = self.inner.lock().unwrap();
+            alg.option_chains
+                .get(&canonical)
+                .and_then(|chain| chain.contracts.iter().find(|(s, _)| s.id.sid == sid))
+                .map(|(_, c)| c.mid_price())
+                .unwrap_or(Decimal::ZERO)
+        };
+
+        // Determine if opening or closing based on existing position
+        let existing_qty = {
+            self.inner.lock().unwrap()
+                .option_positions
+                .get(&sym.id.sid)
+                .map(|p| p.quantity)
+        };
+
+        let abs_qty = quantity.abs();
+        if quantity < Decimal::ZERO {
+            if existing_qty.map(|q| q > Decimal::ZERO).unwrap_or(false) {
+                self.inner.lock().unwrap().sell_to_close(sym, abs_qty, premium);
+            } else {
+                self.inner.lock().unwrap().sell_to_open(sym, abs_qty, premium);
+            }
+        } else if quantity > Decimal::ZERO {
+            if existing_qty.map(|q| q < Decimal::ZERO).unwrap_or(false) {
+                self.inner.lock().unwrap().buy_to_close(sym, abs_qty, premium);
+            } else {
+                self.inner.lock().unwrap().buy_to_open(sym, abs_qty, premium);
+            }
+        }
+        Ok(())
     }
 }

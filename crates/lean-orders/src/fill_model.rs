@@ -86,8 +86,12 @@ fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price
 // ImmediateFillModel  (original — unchanged behaviour)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Simple immediate fill model — fills at the bar's open price.
-/// Suitable for daily resolution backtesting.
+/// Immediate fill model — fills market orders at the bar's open price.
+///
+/// Matches C# LEAN's default `ImmediateFillModel` behaviour: an order
+/// submitted inside `on_data` on day N is processed by `process_orders` at
+/// the start of day N+1, so the fill bar is already the next day's bar.
+/// Using `bar.open` replicates C# LEAN's next-day-open fill semantics.
 pub struct ImmediateFillModel {
     pub slippage: Box<dyn SlippageModel>,
 }

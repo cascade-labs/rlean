@@ -217,12 +217,19 @@ impl FeeModel for InteractiveBrokersFeeModel {
 
         match params.security_type {
             SecurityType::Equity => {
-                // $0.005/share, min $1, max 1% of trade value
+                // $0.005/share, min $1, max 0.5% of trade value
+                // (mirrors C# InteractiveBrokersFeeModel: feePerShare=0.005, minFee=1, maxFeeRate=0.005)
                 let shares = order.abs_quantity();
                 let raw = shares * dec!(0.005);
                 let notional = shares * params.security_price;
-                let max_fee = notional * dec!(0.01);
-                let fee = raw.max(dec!(1.00)).min(max_fee);
+                let max_fee = notional * dec!(0.005);
+                let fee = if raw < dec!(1.00) {
+                    dec!(1.00)
+                } else if raw > max_fee {
+                    max_fee
+                } else {
+                    raw
+                };
                 OrderFee::new(fee, "USD")
             }
             SecurityType::Option | SecurityType::FutureOption | SecurityType::IndexOption => {

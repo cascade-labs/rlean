@@ -1,7 +1,7 @@
 /// `rlean init` — bootstrap a Lean workspace in the current directory
 ///
 /// Creates:
-///   lean.json          — LEAN engine workspace config (data-folder, default-language)
+///   rlean.json          — LEAN engine workspace config (data-folder, default-language)
 ///   data/              — local Parquet data root
 ///   ~/.rlean/config    — global CLI config (updated with workspace path)
 use std::path::PathBuf;
@@ -25,21 +25,21 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     let workspace = std::env::current_dir()?;
 
     // Refuse to re-init an already-initialised workspace.
-    if workspace.join("lean.json").exists() {
+    if workspace.join("rlean.json").exists() {
         bail!(
-            "lean.json already exists in {}.\n\
-             If you want to re-initialise, delete lean.json first.",
+            "rlean.json already exists in {}.\n\
+             If you want to re-initialise, delete rlean.json first.",
             workspace.display()
         );
     }
 
-    // ── lean.json ─────────────────────────────────────────────────────────────
+    // ── rlean.json ─────────────────────────────────────────────────────────────
     let ws_config = WorkspaceConfig {
         data_folder: "data".to_string(),
         default_language: args.language.clone(),
     };
     ws_config.save(&workspace)?;
-    println!("Created lean.json");
+    println!("Created rlean.json");
 
     // ── data/ ─────────────────────────────────────────────────────────────────
     let data_dir = workspace.join("data");

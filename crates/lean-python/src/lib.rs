@@ -15,8 +15,8 @@ pub mod report;
 use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
-use py_types::{PyResolution, PySecurity, PySymbol, PyIndicatorResult};
-use py_data::{PySlice, PyTradeBar, PyTradeBars};
+use py_types::{PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PyOptionSecurity, PySymbol, PyIndicatorResult};
+use py_data::{PySlice, PyTradeBar, PyTradeBars, PyQuoteBar, PyQuoteBars, PyBar};
 use py_orders::PyOrderEvent;
 use py_indicators::{PySma, PyEma, PyRsi, PyMacd, PyBollingerBands, PyAtr, PyIndicatorDataPoint};
 use py_portfolio::{PyPortfolio, PySecurityHolding};
@@ -70,6 +70,15 @@ pub enum PyOrderStatus {
     UpdateSubmitted = 8,
 }
 
+/// LEAN OrderDirection enum values.
+#[pyclass(name = "OrderDirection", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyOrderDirection {
+    Buy  = 0,
+    Sell = 1,
+    Hold = 2,
+}
+
 /// The `AlgorithmImports` Python module — importable as `from AlgorithmImports import *`.
 ///
 /// Register before starting the interpreter:
@@ -94,12 +103,17 @@ pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResolution>()?;
     m.add_class::<PySymbol>()?;
     m.add_class::<PySecurity>()?;
+    m.add_class::<PySecurityEntry>()?;
+    m.add_class::<PySecurityManager>()?;
     m.add_class::<PyIndicatorResult>()?;
     m.add_class::<PyIndicatorDataPoint>()?;
 
     // Data
     m.add_class::<PyTradeBar>()?;
     m.add_class::<PyTradeBars>()?;
+    m.add_class::<PyBar>()?;
+    m.add_class::<PyQuoteBar>()?;
+    m.add_class::<PyQuoteBars>()?;
     m.add_class::<PySlice>()?;
 
     // Orders
@@ -113,7 +127,10 @@ pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<py_options::PyOptionRight>()?;
     m.add_class::<py_options::PyGreeks>()?;
     m.add_class::<py_options::PyOptionContract>()?;
+    m.add_class::<py_options::PyUnderlying>()?;
     m.add_class::<py_options::PyOptionChain>()?;
+    m.add_class::<py_options::PyOptionChains>()?;
+    m.add_class::<PyOptionSecurity>()?;
 
     // Charting
     m.add_class::<PyChartCollection>()?;
@@ -136,6 +153,7 @@ pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySecurityType>()?;
     m.add_class::<PyOrderType>()?;
     m.add_class::<PyOrderStatus>()?;
+    m.add_class::<PyOrderDirection>()?;
 
     Ok(())
 }
@@ -250,6 +268,36 @@ assert AverageTrueRange is not None
                 None,
             );
             assert!(result.is_ok(), "Indicator names test failed: {:?}", result);
+
+            // Test 7: All expected LEAN OrderEvent properties are present
+            let result = py.run(
+                c"
+from AlgorithmImports import OrderEvent, OrderStatus, OrderDirection
+
+expected_props = [
+    'order_id', 'id', 'symbol', 'utc_time', 'status', 'direction',
+    'fill_price', 'fill_price_currency', 'fill_quantity',
+    'absolute_fill_quantity', 'quantity', 'is_assignment', 'is_in_the_money',
+    'message', 'is_fill', 'order_fee', 'limit_price', 'stop_price',
+    'trigger_price', 'trailing_amount', 'trailing_as_percentage',
+]
+for prop in expected_props:
+    assert hasattr(OrderEvent, prop), f'OrderEvent missing property: {prop}'
+
+assert hasattr(OrderStatus, 'New')
+assert hasattr(OrderStatus, 'Submitted')
+assert hasattr(OrderStatus, 'PartiallyFilled')
+assert hasattr(OrderStatus, 'Filled')
+assert hasattr(OrderStatus, 'Canceled')
+
+assert hasattr(OrderDirection, 'Buy')
+assert hasattr(OrderDirection, 'Sell')
+assert hasattr(OrderDirection, 'Hold')
+",
+                None,
+                None,
+            );
+            assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
         });
     }
 }

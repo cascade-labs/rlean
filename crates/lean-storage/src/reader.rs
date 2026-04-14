@@ -5,7 +5,6 @@ use lean_core::{DateTime, Result as LeanResult, Symbol};
 use lean_data::TradeBar;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use arrow_array::{Float64Array, Int64Array, StringArray};
-use arrow::compute;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
@@ -178,70 +177,6 @@ impl ParquetReader {
 
         debug!("Read {} option EOD bars from {} file(s)", result.len(), paths.len());
         Ok(result)
-    }
-
-    /// Read option EOD bars from a Parquet file filtered to a specific `date_ns`.
-    ///
-    /// Uses row-level filtering (post-batch) to return only rows where `date_ns`
-    /// equals the given nanosecond timestamp (midnight UTC of the requested date).
-    /// Returns `Ok(vec![])` if the file does not exist.
-    pub fn read_option_eod_bars_for_date(
-        &self,
-        path: &Path,
-        date_ns: i64,
-    ) -> LeanResult<Vec<OptionEodBar>> {
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let file = std::fs::File::open(path)
-            .map_err(|e| lean_core::LeanError::DataError(format!("{}: {}", path.display(), e)))?;
-
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-            .build()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        let mut result: Vec<OptionEodBar> = Vec::new();
-
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-            // Column 0 is date_ns — filter rows matching the requested date.
-            let date_col = batch.column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| lean_core::LeanError::DataError("date_ns column missing".into()))?;
-
-            let mask: arrow_array::BooleanArray = (0..batch.num_rows())
-                .map(|i| Some(date_col.value(i) == date_ns))
-                .collect();
-
-            let filtered = arrow::compute::filter_record_batch(&batch, &mask)
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-            result.extend(convert::record_batch_to_option_eod_bars(&filtered));
-        }
-
-        debug!(
-            "Read {} option EOD bars from {} for date_ns={}",
-            result.len(),
-            path.display(),
-            date_ns,
-        );
-        Ok(result)
-    }
-
-    /// Check whether the Parquet file at `path` contains any rows for `date_ns`.
-    ///
-    /// Returns `false` if the file does not exist or an error occurs.
-    pub fn option_eod_date_cached(&self, path: &Path, date_ns: i64) -> bool {
-        if !path.exists() { return false; }
-        match self.read_option_eod_bars_for_date(path, date_ns) {
-            Ok(rows) => !rows.is_empty(),
-            Err(_) => false,
-        }
     }
 
     /// Read option universe rows from one or more parquet files.

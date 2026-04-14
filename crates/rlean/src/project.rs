@@ -35,7 +35,7 @@ pub fn run_create_project(args: CreateProjectArgs) -> Result<()> {
         bail!("Directory '{}' already exists.", project_dir.display());
     }
 
-    // Resolve language: --language flag → lean.json default-language → error
+    // Resolve language: --language flag → rlean.json default-language → error
     let language = if let Some(lang) = args.language {
         lang
     } else {
@@ -43,7 +43,7 @@ pub fn run_create_project(args: CreateProjectArgs) -> Result<()> {
             .ok()
             .map(|c| c.default_language)
             .ok_or_else(|| anyhow::anyhow!(
-                "No --language specified and no lean.json found in {}.\n\
+                "No --language specified and no rlean.json found in {}.\n\
                  Run `rlean init` first or pass --language python|csharp.",
                 workspace.display()
             ))?

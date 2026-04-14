@@ -6,7 +6,7 @@ use lean_core::{DateTime, Result as LeanResult, Symbol};
 use lean_data::Slice;
 use lean_orders::{Order, OrderEvent};
 use crate::charting::ChartCollection;
-use crate::py_data::PySlice;
+use crate::py_data::{PySlice, SliceProxy};
 use crate::py_orders::PyOrderEvent;
 use crate::py_qc_algorithm::PyQcAlgorithm;
 
@@ -25,6 +25,18 @@ pub struct PyAlgorithmAdapter {
 }
 
 impl PyAlgorithmAdapter {
+    /// Hot-path `on_data` using a pre-allocated `SliceProxy`.
+    ///
+    /// Updates the proxy's bar objects in-place (zero allocation), then calls
+    /// Python's `on_data` with the same stable Python object as every other day.
+    /// Must be called with the GIL already held via `Python::with_gil`.
+    pub fn on_data_proxy(&mut self, py: Python<'_>, proxy: &SliceProxy, slice: &Slice) {
+        proxy.update(py, slice);
+        if let Err(e) = self.py_obj.call_method1(py, "on_data", (proxy.py_slice.bind(py),)) {
+            e.print(py);
+        }
+    }
+
     /// Build an adapter from a Python strategy instance.
     /// The instance must be a subclass of `lean_rust.QcAlgorithm`.
     pub fn from_instance(py: Python<'_>, instance: Py<PyAny>) -> PyResult<Self> {
@@ -68,9 +80,13 @@ impl IAlgorithm for PyAlgorithmAdapter {
 
     fn on_data(&mut self, slice: &Slice) {
         Python::with_gil(|py| {
-            let py_slice = PySlice::from_slice(slice);
-            if let Err(e) = self.py_obj.call_method1(py, "on_data", (py_slice,)) {
-                e.print(py);
+            match PySlice::from_slice(py, slice) {
+                Ok(py_slice) => {
+                    if let Err(e) = self.py_obj.call_method1(py, "on_data", (py_slice,)) {
+                        e.print(py);
+                    }
+                }
+                Err(e) => e.print(py),
             }
         });
     }
@@ -126,21 +142,55 @@ impl IAlgorithm for PyAlgorithmAdapter {
 }
 
 impl PyAlgorithmAdapter {
-    /// Notify the Python strategy of an option assignment order event.
+    /// Notify the Python strategy of an option assignment/expiry event.
+    ///
+    /// LEAN API (OTM expiry): `on_order_event` with fill_price=0 and "OTM." message.
+    ///
+    /// LEAN fires `on_order_event` (not `on_assignment_order_event`) when an option
+    /// expires worthless out-of-the-money.  This method constructs the matching event
+    /// and dispatches to the Python `on_order_event` hook.
+    pub fn on_otm_expiry(
+        &self,
+        contract: lean_options::OptionContract,
+        quantity: rust_decimal::Decimal,
+        underlying_price: rust_decimal::Decimal,
+        entry_premium: rust_decimal::Decimal,
+    ) {
+        use rust_decimal::prelude::ToPrimitive;
+        let utc_ns = self.inner.lock().unwrap().time.0;
+        let event = crate::py_orders::PyOrderEvent::for_otm_expiry_event(
+            contract.symbol,
+            utc_ns,
+            quantity,
+            underlying_price.to_f64().unwrap_or(0.0),
+            (entry_premium * quantity * rust_decimal_macros::dec!(100)).to_f64().unwrap_or(0.0),
+        );
+        let result = Python::with_gil(|py| -> PyResult<()> {
+            self.py_obj.call_method1(py, "on_order_event", (event,))?;
+            Ok(())
+        });
+        if let Err(e) = result {
+            tracing::warn!("on_otm_expiry (on_order_event) error: {e}");
+        }
+    }
+
+    /// LEAN API: `on_assignment_order_event(order_event: OrderEvent)`
+    /// where `order_event.is_assignment` distinguishes assignment vs worthless expiry.
     pub fn on_assignment_order_event(
         &self,
         contract: lean_options::OptionContract,
         quantity: rust_decimal::Decimal,
         is_assignment: bool,
     ) {
-        use rust_decimal::prelude::ToPrimitive;
+        let utc_ns = self.inner.lock().unwrap().time.0;
+        let event = crate::py_orders::PyOrderEvent::for_expiry_event(
+            contract.symbol,
+            utc_ns,
+            quantity,
+            is_assignment,
+        );
         let result = Python::with_gil(|py| -> PyResult<()> {
-            let contract_py = crate::py_options::PyOptionContract { inner: contract };
-            self.py_obj.call_method1(
-                py,
-                "on_assignment_order_event",
-                (contract_py, quantity.to_f64().unwrap_or(0.0), is_assignment),
-            )?;
+            self.py_obj.call_method1(py, "on_assignment_order_event", (event,))?;
             Ok(())
         });
         if let Err(e) = result {

@@ -47,6 +47,17 @@ impl Resolution {
         matches!(self, Resolution::Tick | Resolution::Second | Resolution::Minute)
     }
 
+    /// Duration as a `TimeSpan` for non-tick resolutions.
+    pub fn to_time_span(&self) -> Option<crate::TimeSpan> {
+        match self {
+            Resolution::Tick   => None,
+            Resolution::Second => Some(crate::TimeSpan::from_nanos(1_000_000_000)),
+            Resolution::Minute => Some(crate::TimeSpan::from_nanos(60_000_000_000)),
+            Resolution::Hour   => Some(crate::TimeSpan::from_nanos(3_600_000_000_000)),
+            Resolution::Daily  => Some(crate::TimeSpan::from_nanos(86_400_000_000_000)),
+        }
+    }
+
     /// LEAN's canonical data folder name for this resolution.
     pub fn folder_name(&self) -> &'static str {
         match self {

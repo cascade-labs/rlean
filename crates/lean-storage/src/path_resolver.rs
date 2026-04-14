@@ -2,20 +2,30 @@ use lean_core::{Resolution, SecurityType, Symbol};
 use chrono::NaiveDate;
 use std::path::{Path, PathBuf};
 
-/// Returns the canonical path for the option EOD Parquet file for an underlying.
+/// Returns the canonical path for a date-partitioned option EOD Parquet file.
 ///
-/// Layout: `{root}/option/usa/daily/{underlying_lower}/{underlying_lower}_eod.parquet`
+/// Layout: `{root}/option/usa/daily/{underlying_lower}/{YYYYMMDD}_eod.parquet`
 ///
-/// All dates and all contracts for the underlying live in one file;
-/// predicate pushdown on `date_ns` is used to query specific dates.
-pub fn option_eod_path(root: &Path, underlying: &str) -> PathBuf {
+/// One file per trading date per underlying — cache check is a single
+/// `file.exists()` syscall; reads open the file and return all rows with no
+/// predicate filtering needed.
+pub fn option_eod_path(root: &Path, underlying: &str, date: NaiveDate) -> PathBuf {
     let ul = underlying.to_lowercase();
     let mut p = root.to_path_buf();
     p.push("option");
     p.push("usa");
     p.push("daily");
-    p.push(format!("{ul}_eod.parquet"));
+    p.push(&ul);
+    p.push(format!("{}_{}.parquet", date.format("%Y%m%d"), "eod"));
     p
+}
+
+/// Glob pattern to list all cached EOD dates for an underlying.
+///
+/// Matches: `{root}/option/usa/daily/{underlying_lower}/*_eod.parquet`
+pub fn option_eod_glob(root: &Path, underlying: &str) -> String {
+    let ul = underlying.to_lowercase();
+    format!("{}/option/usa/daily/{}/*_eod.parquet", root.display(), ul)
 }
 
 /// Canonical data path for a symbol + date + resolution combination.
@@ -91,7 +101,7 @@ impl DataPath {
     /// pass `Minute` for intraday option data.
     ///
     /// Produced paths mirror LEAN's canonical option layout:
-    /// - Daily:   `{root}/option/{market}/daily/{ticker}/{ticker}_{suffix}.parquet`
+    /// - Daily:   `{root}/option/{market}/daily/{ticker}_{suffix}.parquet`  (flat)
     /// - Minute+: `{root}/option/{market}/minute/{ticker}/{YYYYMMDD}_{suffix}.parquet`
     pub fn option_eod_bar(
         root: impl AsRef<Path>,
@@ -142,7 +152,7 @@ impl DataPath {
     /// `{root}/{security_type}/{market}/{resolution}/{ticker}_{suffix}.parquet`             (daily)
     ///
     /// For option EOD bars (option_underlying is Some):
-    /// `{root}/option/{market}/daily/{ticker}_{suffix}.parquet`                            (daily)
+    /// `{root}/option/{market}/daily/{ticker}/{YYYYMMDD}_{suffix}.parquet`                 (daily, date-partitioned)
     /// `{root}/option/{market}/{resolution}/{ticker}/{YYYYMMDD}_{suffix}.parquet`          (intraday)
     ///
     /// For option universes (is_universe = true):
@@ -163,12 +173,10 @@ impl DataPath {
             } else {
                 let res = self.resolution.folder_name();
                 p.push(res);
-                if self.resolution.is_high_resolution() {
-                    p.push(ticker);
-                    p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
-                } else {
-                    p.push(format!("{}_{}.parquet", ticker, self.suffix));
-                }
+                // All resolutions use ticker subdirectory + date prefix
+                // (daily is date-partitioned: one file per date per underlying)
+                p.push(ticker);
+                p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
             }
         } else {
             // Standard path layout
@@ -210,17 +218,11 @@ impl DataPath {
                 )
             } else {
                 let res = self.resolution.folder_name();
-                if self.resolution.is_high_resolution() {
-                    format!(
-                        "{}/option/{}/{}/{}/*_{}.parquet",
-                        self.root.display(), market, res, ticker, self.suffix
-                    )
-                } else {
-                    format!(
-                        "{}/option/{}/{}/{}_{}.parquet",
-                        self.root.display(), market, res, ticker, self.suffix
-                    )
-                }
+                // All resolutions: ticker subdirectory + date-partitioned files
+                format!(
+                    "{}/option/{}/{}/{}/*_{}.parquet",
+                    self.root.display(), market, res, ticker, self.suffix
+                )
             }
         } else {
             let sec_type = format!("{}", self.symbol.security_type()).to_lowercase();
@@ -318,7 +320,8 @@ pub fn factor_file_path(root: impl AsRef<Path>, market: &str, ticker: &str) -> P
 ///
 /// Layout: `{root}/equity/{market}/map_files/{ticker_lower}.parquet`
 ///
-/// Mirrors LEAN's `MapFile.GetRelativeMapFilePath` convention.
+/// We store all LEAN data as Parquet (converted from LEAN's CSV sources)
+/// to enable fast predicate-pushdown reads.
 pub fn map_file_path(root: impl AsRef<Path>, market: &str, ticker: &str) -> PathBuf {
     let mut p = root.as_ref().to_path_buf();
     p.push("equity");
