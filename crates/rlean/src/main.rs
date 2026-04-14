@@ -57,7 +57,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Bootstrap a Lean workspace in the current directory (creates lean.json and data/)
+    /// Bootstrap a Lean workspace in the current directory (creates rlean.json and data/)
     Init(InitArgs),
 
     /// Scaffold a new strategy project
@@ -127,6 +127,11 @@ struct RunArgs {
     /// Override the report output path (default: <project>/backtests/<timestamp>.html)
     #[arg(long)]
     report: Option<PathBuf>,
+
+    // ── Logging ───────────────────────────────────────────────────────────────
+    /// Enable debug logging (equivalent to RUST_LOG=debug)
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -135,11 +140,20 @@ struct RunArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let verbose = match &cli.command {
+        Command::Backtest(args) | Command::Live(args) => args.verbose,
+        _ => false,
+    };
+
+    let filter = if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::from_default_env()
+            .add_directive("info".parse().unwrap())
+    };
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("info".parse().unwrap()),
-        )
+        .with_env_filter(filter)
         .init();
 
     match cli.command {
@@ -194,18 +208,16 @@ async fn run_python_backtest(
 ) -> Result<()> {
     use lean_python::AlgorithmImports;
     use lean_python::runner::{run_strategy, RunConfig};
-    use lean_python::report::write_report;
+    use lean_python::report::{
+        write_report, write_results_json, write_order_events_json,
+        write_summary_json, write_log_txt, write_data_request_files,
+    };
 
     // Register the AlgorithmImports PyO3 module before starting Python.
     // Must be called before prepare_freethreaded_python.
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::prepare_freethreaded_python();
 
-    let plugin_cfgs = config::PluginConfigs::load().unwrap_or_default();
-    let thetadata_cfg = plugin_cfgs.get_plugin("thetadata");
-    let thetadata_api_key = thetadata_cfg.get("api_key")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
 
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -214,27 +226,28 @@ async fn run_python_backtest(
     let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
     let end_date_override   = args.end_date.as_deref().map(parse_date).transpose()?;
 
-    // Determine report path: explicit --report flag, or auto-derive from strategy location.
-    // Strategy lives at <project>/main.py → report goes to <project>/backtests/<timestamp>.html
-    let report_path: PathBuf = if let Some(p) = args.report.clone() {
+    // Each backtest creates a LEAN-compatible output directory:
+    //   <project>/backtests/YYYY-MM-DD_<strategy-name>/
+    //
+    // Matches C# LEAN format (e.g. "backtests/2026-04-01_sma_crossover/").
+    // When --report is set it is treated as the folder path directly.
+    let backtest_dir: PathBuf = if let Some(p) = args.report.clone() {
         p
     } else {
-        let backtests_dir = args.strategy
+        let backtests_root = args.strategy
             .parent()           // <project>/
             .map(|p| p.join("backtests"))
             .unwrap_or_else(|| PathBuf::from("backtests"));
-        std::fs::create_dir_all(&backtests_dir)?;
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        backtests_dir.join(format!("{ts}.html"))
+        let now  = chrono::Utc::now();
+        let name = strategy_name_from_path(&args.strategy);
+        backtests_root.join(backtest_dir_name(now, &name))
     };
+    std::fs::create_dir_all(&backtest_dir)?;
 
     let config = RunConfig {
         data_root: args.data.clone(),
         historical_provider,
         history_provider,
-        thetadata_api_key,
-        thetadata_rps: args.thetadata_rate,
-        thetadata_concurrent: args.thetadata_concurrent,
         start_date_override,
         end_date_override,
         ..Default::default()
@@ -243,11 +256,32 @@ async fn run_python_backtest(
     let results = run_strategy(&args.strategy, config).await?;
 
     results.print_summary();
-    match write_report(&results, &report_path) {
-        Ok(()) => println!("Report: {}", report_path.display()),
-        Err(e) => eprintln!("Failed to write report: {e}"),
-    }
 
+    // The backtest ID (Unix epoch seconds at backtest start) is used as the
+    // filename prefix for all per-backtest files, matching C# LEAN's convention.
+    let id = results.backtest_id;
+    // Millisecond timestamp suffix for data-request files.
+    let ts_ms = chrono::Utc::now().format("%Y%m%d%H%M%S%3f");
+
+    // ── write all output files ────────────────────────────────────────────────
+    let json_path      = backtest_dir.join(format!("{id}.json"));
+    let order_events_path = backtest_dir.join(format!("{id}-order-events.json"));
+    let summary_path   = backtest_dir.join(format!("{id}-summary.json"));
+    let id_log_path    = backtest_dir.join(format!("{id}-log.txt"));
+    let top_log_path   = backtest_dir.join("log.txt");
+    let succeeded_path = backtest_dir.join(format!("succeeded-data-requests-{ts_ms}.txt"));
+    let failed_path    = backtest_dir.join(format!("failed-data-requests-{ts_ms}.txt"));
+    let report_path    = backtest_dir.join("report.html");
+
+    if let Err(e) = write_results_json(&results, &json_path)           { eprintln!("Failed to write results: {e}"); }
+    if let Err(e) = write_order_events_json(&results, &order_events_path) { eprintln!("Failed to write order events: {e}"); }
+    if let Err(e) = write_summary_json(&results, &summary_path)        { eprintln!("Failed to write summary: {e}"); }
+    if let Err(e) = write_log_txt(&results, &id_log_path)              { eprintln!("Failed to write log: {e}"); }
+    let _ = std::fs::copy(&id_log_path, &top_log_path);
+    if let Err(e) = write_data_request_files(&results, &succeeded_path, &failed_path) { eprintln!("Failed to write data requests: {e}"); }
+    if let Err(e) = write_report(&results, &report_path)               { eprintln!("Failed to write report: {e}"); }
+
+    println!("Results: {}", backtest_dir.display());
     Ok(())
 }
 
@@ -297,6 +331,40 @@ async fn run_live(_args: RunArgs) -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Derive a human-readable strategy name from a strategy file path.
+///
+/// Rules (matching C# LEAN's project-name convention):
+///  - If the file is `main.py`, use the parent directory name.
+///  - Otherwise use the file stem (filename without extension).
+///  - Falls back to `"strategy"` when neither can be determined.
+///
+/// Examples:
+///  - `sma_crossover/main.py`     → `"sma_crossover"`
+///  - `my_algo/my_algo.py`        → `"my_algo"`
+///  - `/absolute/path/signal.py`  → `"signal"`
+pub(crate) fn strategy_name_from_path(strategy: &std::path::Path) -> String {
+    let stem = strategy.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("strategy")
+        .to_string();
+    if stem == "main" {
+        strategy
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("strategy")
+            .to_string()
+    } else {
+        stem
+    }
+}
+
+/// Build the backtest output directory path in LEAN format:
+///   `<backtests_root>/YYYY-MM-DD_HHMMSS_<strategy_name>`
+pub(crate) fn backtest_dir_name(datetime: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
+    format!("{}_{}", datetime.format("%Y-%m-%d_%H%M%S"), strategy_name)
+}
 
 fn validate_strategy_path(path: &PathBuf) -> Result<()> {
     if !path.exists() {
@@ -357,5 +425,76 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
                 .map_err(|e| lean_core::LeanError::DataError(format!("provider task panicked: {e}")))?
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
         })
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── strategy_name_from_path ────────────────────────────────────────────────
+
+    #[test]
+    fn test_strategy_name_main_py_uses_parent_dir() {
+        // "sma_crossover/main.py" → "sma_crossover"
+        let p = Path::new("sma_crossover/main.py");
+        assert_eq!(strategy_name_from_path(p), "sma_crossover");
+    }
+
+    #[test]
+    fn test_strategy_name_non_main_uses_stem() {
+        // "sma_crossover/my_algo.py" → "my_algo"
+        let p = Path::new("sma_crossover/my_algo.py");
+        assert_eq!(strategy_name_from_path(p), "my_algo");
+    }
+
+    #[test]
+    fn test_strategy_name_absolute_path_main_py() {
+        let p = Path::new("/home/user/strategies/etf_blend/main.py");
+        assert_eq!(strategy_name_from_path(p), "etf_blend");
+    }
+
+    #[test]
+    fn test_strategy_name_absolute_path_named_file() {
+        let p = Path::new("/home/user/strategies/signal_generator.py");
+        assert_eq!(strategy_name_from_path(p), "signal_generator");
+    }
+
+    #[test]
+    fn test_strategy_name_rust_plugin() {
+        // Rust plugins use .so/.dylib extensions — stem is used directly.
+        let p = Path::new("plugins/my_strategy.so");
+        assert_eq!(strategy_name_from_path(p), "my_strategy");
+    }
+
+    // ── backtest_dir_name ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_backtest_dir_name_format() {
+        use chrono::{TimeZone, Utc};
+        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
+        let dir = backtest_dir_name(dt, "sma_crossover");
+        assert_eq!(dir, "2026-04-10_143000_sma_crossover");
+    }
+
+    #[test]
+    fn test_backtest_dir_name_seconds_unique() {
+        use chrono::{TimeZone, Utc};
+        let dt1 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 5).unwrap();
+        let d1  = backtest_dir_name(dt1, "spy_wheel");
+        let d2  = backtest_dir_name(dt2, "spy_wheel");
+        assert_ne!(d1, d2, "runs on same day must produce different dirs");
+    }
+
+    #[test]
+    fn test_backtest_dir_name_date_prefix() {
+        use chrono::{TimeZone, Utc};
+        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 9, 5, 3).unwrap();
+        let dir = backtest_dir_name(dt, "sma_crossover");
+        assert!(dir.starts_with("2026-04-10_090503_"), "dir={dir}");
     }
 }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lean_core::Symbol;
 use lean_data::TradeBar;
-use lean_storage::FactorFileEntry;
+use lean_storage::{FactorFileEntry, OptionEodBar};
 
 use crate::request::{DownloadRequest, HistoryRequest};
 
@@ -22,6 +22,20 @@ pub trait IHistoryProvider: Send + Sync {
         &self,
         request: &HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>>;
+
+    /// Fetch all option EOD bars for `ticker` on `date`.
+    ///
+    /// Returns an empty vec if this provider does not support option data.
+    /// Providers that do (e.g. ThetaData) override this to fetch from their
+    /// source and cache locally.  The host runner calls this through
+    /// `tokio::task::spawn_blocking` since the trait is sync.
+    fn get_option_eod_bars(
+        &self,
+        _ticker: &str,
+        _date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionEodBar>> {
+        Ok(vec![])
+    }
 }
 
 /// Downloads and persists data to the local Parquet store.
