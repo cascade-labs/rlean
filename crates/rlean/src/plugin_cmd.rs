@@ -212,15 +212,15 @@ fn cmd_list_registry() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<32} {:<28} {}", "NAME", "DESCRIPTION", "KIND", "STATUS");
-    println!("{}", "-".repeat(96));
+    println!("{:<22} {:<16} {:<55} {}", "NAME", "KIND", "DESCRIPTION", "STATUS");
+    println!("{}", "-".repeat(100));
     for entry in &plugins {
         let status = if installed_names.contains(entry.name.as_str()) { "installed" } else { "" };
         println!(
-            "{:<22} {:<32} {:<28} {}",
+            "{:<22} {:<16} {:<55} {}",
             entry.name,
-            truncate(&entry.description, 31),
             entry.kind,
+            entry.description,
             status
         );
     }
@@ -555,6 +555,3 @@ fn now_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
-}
