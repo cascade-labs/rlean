@@ -292,6 +292,9 @@ fn cmd_upgrade(name: &str) -> Result<()> {
     println!("Pulling latest source for '{}' ...", name);
     git_pull(&src_dir)?;
 
+    println!("Updating dependencies for '{}' ...", name);
+    cargo_update(&src_dir)?;
+
     println!("Building '{}' ...", name);
     let package_name = package_name_for(name);
     cargo_build(&src_dir, &package_name)?;
@@ -456,13 +459,35 @@ fn git_clone(url: &str, dest: &Path) -> Result<()> {
 }
 
 fn git_pull(dir: &Path) -> Result<()> {
+    let d = dir.display().to_string();
+    // Discard build-generated changes (e.g. Cargo.lock) before pulling.
+    Command::new("git")
+        .args(["-C", &d, "reset", "--hard", "HEAD"])
+        .status()
+        .context("Failed to run git reset")?;
     let status = Command::new("git")
-        .args(["-C", &dir.display().to_string(), "pull", "--ff-only", "--autostash"])
+        .args(["-C", &d, "pull", "--ff-only"])
         .status()
         .context("Failed to run git pull")?;
     if !status.success() {
         bail!("git pull failed in {}", dir.display());
     }
+    // Delete Cargo.lock so cargo re-resolves git dependencies to their latest HEAD
+    // rather than the commit that was pinned at install time.
+    let lock = dir.join("Cargo.lock");
+    if lock.exists() {
+        let _ = std::fs::remove_file(&lock);
+    }
+    Ok(())
+}
+
+fn cargo_update(workspace_root: &Path) -> Result<()> {
+    // Force cargo to re-fetch git dependencies (e.g. rlean crates) to their latest HEAD.
+    Command::new("cargo")
+        .args(["update"])
+        .current_dir(workspace_root)
+        .status()
+        .context("Failed to run cargo update")?;
     Ok(())
 }
 
