@@ -222,6 +222,63 @@ impl PyQcAlgorithm {
         Ok(())
     }
 
+    // ─── Custom Data ──────────────────────────────────────────────────────────
+
+    /// LEAN API: `self.add_data(source_type, ticker, resolution=Resolution.Daily)`.
+    ///
+    /// Registers a custom data subscription so the runner fetches and delivers
+    /// data points to `on_data` via `data.custom[ticker]`.
+    ///
+    /// ```python
+    /// self.unrate = self.add_data("fred", "UNRATE").symbol
+    /// self.vix    = self.add_data("cboe_vix", "VIX", Resolution.Daily)
+    /// ```
+    #[pyo3(signature = (source_type, ticker, resolution=None))]
+    fn add_data(&mut self, source_type: &str, ticker: &str, resolution: Option<&Bound<'_, PyAny>>) -> PyResult<PySecurity> {
+        use lean_core::Resolution;
+        use lean_data::{CustomDataConfig, CustomDataSubscription};
+        use std::collections::HashMap;
+
+        let res = match resolution {
+            Some(r) => {
+                if let Ok(py_res) = r.extract::<PyResolution>() {
+                    Resolution::from(py_res)
+                } else if let Ok(s) = r.extract::<String>() {
+                    match s.to_lowercase().as_str() {
+                        "daily" => Resolution::Daily,
+                        "hour" => Resolution::Hour,
+                        "minute" => Resolution::Minute,
+                        _ => Resolution::Daily,
+                    }
+                } else {
+                    Resolution::Daily
+                }
+            }
+            None => Resolution::Daily,
+        };
+
+        let config = CustomDataConfig {
+            ticker: ticker.to_string(),
+            source_type: source_type.to_string(),
+            resolution: res,
+            properties: HashMap::new(),
+        };
+        let sub = CustomDataSubscription {
+            source_type: source_type.to_string(),
+            ticker: ticker.to_string(),
+            config,
+        };
+
+        self.inner.lock().unwrap().custom_data_subscriptions.push(sub);
+
+        // Return a synthetic security object so callers can do:
+        //   self.unrate = self.add_data("fred", "UNRATE").symbol
+        let market = lean_core::Market::usa();
+        let sym = lean_core::Symbol::create_equity(ticker, &market);
+        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        Ok(PySecurity { inner: PySymbol { inner: sym } })
+    }
+
     // ─── Options ──────────────────────────────────────────────────────────────
 
     /// Subscribe to an option chain for an underlying equity.

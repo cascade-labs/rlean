@@ -1,4 +1,5 @@
 pub mod history_provider;
+pub mod custom;
 pub mod base_data;
 pub mod trade_bar;
 pub mod quote_bar;
@@ -26,3 +27,7 @@ pub use slice::Slice;
 pub use subscription::{SubscriptionDataConfig, SubscriptionManager};
 pub use data_queue::DataQueueHandler;
 pub use history_provider::IHistoricalDataProvider;
+pub use custom::{
+    CustomDataConfig, CustomDataFormat, CustomDataPoint,
+    CustomDataSource, CustomDataSubscription, CustomDataTransport,
+};

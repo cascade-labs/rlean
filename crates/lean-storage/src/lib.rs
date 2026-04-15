@@ -9,6 +9,6 @@ pub mod cache;
 pub use writer::{ParquetWriter, WriterConfig};
 pub use reader::{ParquetReader, QueryParams};
 pub use predicate::Predicate;
-pub use path_resolver::{DataPath, PathResolver, option_eod_path, option_eod_glob, factor_file_path, map_file_path};
+pub use path_resolver::{DataPath, PathResolver, option_eod_path, option_eod_glob, factor_file_path, map_file_path, custom_data_path};
 pub use cache::DataCache;
-pub use schema::{OptionEodBar, OptionUniverseRow, FactorFileEntry, MapFileEntry};
+pub use schema::{OptionEodBar, OptionUniverseRow, FactorFileEntry, MapFileEntry, custom_data_schema};

@@ -66,25 +66,10 @@ fn main() {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::prepare_freethreaded_python();
 
-    // ── ThetaData API key (for real option EOD chains) ────────────────────────
-    let thetadata_api_key = find_arg(&args, "--thetadata-api-key")
-        .or_else(|| std::env::var("THETADATA_API_KEY").ok());
-
-    let thetadata_rps: f64 = find_arg(&args, "--thetadata-rate")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4.0);
-
-    let thetadata_concurrent: usize = find_arg(&args, "--thetadata-concurrent")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-
     // ── run backtest ─────────────────────────────────────────────────────────
     let config = RunConfig {
         data_root,
         historical_provider,
-        thetadata_api_key,
-        thetadata_rps,
-        thetadata_concurrent,
         ..Default::default()
     };
     let report_path = find_arg(&args, "--report").map(std::path::PathBuf::from);

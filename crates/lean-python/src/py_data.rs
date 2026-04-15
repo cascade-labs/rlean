@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use pyo3::prelude::*;
-use lean_data::{Slice, SubscriptionDataConfig, TradeBar};
+use lean_data::{CustomDataPoint, Slice, SubscriptionDataConfig, TradeBar};
 use lean_options::OptionChain;
 use lean_data::QuoteBar;
 use rust_decimal::prelude::ToPrimitive;
@@ -256,6 +256,7 @@ pub struct PySlice {
     bars_obj: Py<PyTradeBars>,
     quote_bars_obj: Py<PyQuoteBars>,
     option_chains_obj: Py<PyOptionChains>,
+    custom_data_obj: Py<PyCustomData>,
     #[pyo3(get)]
     pub has_data: bool,
 }
@@ -275,7 +276,8 @@ impl PySlice {
         let py_bars = Py::new(py, PyTradeBars { bars, ticker_to_sid })?;
         let py_chains = Py::new(py, PyOptionChains::empty())?;
         let py_quote_bars = Py::new(py, PyQuoteBars::empty())?;
-        Ok(PySlice { bars_obj: py_bars, quote_bars_obj: py_quote_bars, option_chains_obj: py_chains, has_data: slice.has_data })
+        let py_custom = Py::new(py, PyCustomData::empty())?;
+        Ok(PySlice { bars_obj: py_bars, quote_bars_obj: py_quote_bars, option_chains_obj: py_chains, custom_data_obj: py_custom, has_data: slice.has_data })
     }
 }
 
@@ -297,6 +299,12 @@ impl PySlice {
     #[getter]
     fn option_chains(&self, py: Python<'_>) -> Py<PyOptionChains> {
         self.option_chains_obj.clone_ref(py)
+    }
+
+    /// LEAN API: `data.custom` — returns the CustomData dict (refcount bump only).
+    #[getter]
+    fn custom(&self, py: Python<'_>) -> Py<PyCustomData> {
+        self.custom_data_obj.clone_ref(py)
     }
 
     /// LEAN API: `data.get(symbol)` — delegates to bars.get().
@@ -327,6 +335,122 @@ impl PySlice {
     }
 }
 
+// ─── Custom Data ─────────────────────────────────────────────────────────────
+
+/// Python-visible custom data point.
+///
+/// LEAN API: `data.custom["UNRATE"]` returns the latest `CustomDataPoint`
+/// for the ticker.  Access via `.value`, `.time`, and `.fields`.
+#[pyclass(name = "CustomDataPoint")]
+#[derive(Debug, Clone)]
+pub struct PyCustomDataPoint {
+    /// Primary scalar value (equivalent to LEAN's `BaseData.Value`).
+    #[pyo3(get)]
+    pub value: f64,
+    /// Date this point applies to.
+    #[pyo3(get)]
+    pub time: chrono::NaiveDate,
+    /// JSON-decoded extra fields dict.
+    fields_inner: HashMap<String, serde_json::Value>,
+}
+
+#[pymethods]
+impl PyCustomDataPoint {
+    /// Extra fields dict — `data.custom["VIX"].fields["open"]`.
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3::types::PyDict;
+        let dict = PyDict::new(py);
+        for (k, v) in &self.fields_inner {
+            let py_val = json_value_to_py(py, v)?;
+            dict.set_item(k, py_val)?;
+        }
+        Ok(dict.into())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CustomDataPoint(time={} value={})", self.time, self.value)
+    }
+}
+
+/// Convert a `serde_json::Value` to a Python object.
+fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
+    match v {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(b) => Ok(b.to_object(py)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_object(py))
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.to_object(py))
+            } else {
+                Ok(n.to_string().to_object(py))
+            }
+        }
+        serde_json::Value::String(s) => Ok(s.to_object(py)),
+        serde_json::Value::Array(arr) => {
+            use pyo3::types::PyList;
+            let list = PyList::empty(py);
+            for item in arr {
+                list.append(json_value_to_py(py, item)?)?;
+            }
+            Ok(list.into())
+        }
+        serde_json::Value::Object(map) => {
+            use pyo3::types::PyDict;
+            let dict = PyDict::new(py);
+            for (k, val) in map {
+                dict.set_item(k, json_value_to_py(py, val)?)?;
+            }
+            Ok(dict.into())
+        }
+    }
+}
+
+/// LEAN API: `data.custom` — dict-like collection of custom data points.
+///
+/// Keyed by ticker string (e.g. `"UNRATE"`, `"VIX"`).
+/// Each value is the latest `CustomDataPoint` for that ticker on this date.
+#[pyclass(name = "CustomData")]
+pub struct PyCustomData {
+    /// ticker (uppercase) → latest data point for this bar
+    points: HashMap<String, Py<PyCustomDataPoint>>,
+}
+
+impl PyCustomData {
+    pub fn empty() -> Self {
+        PyCustomData { points: HashMap::new() }
+    }
+}
+
+#[pymethods]
+impl PyCustomData {
+    fn __getitem__(&self, py: Python<'_>, ticker: &str) -> PyResult<Option<Py<PyCustomDataPoint>>> {
+        let key = ticker.to_uppercase();
+        Ok(self.points.get(&key).map(|p| p.clone_ref(py)))
+    }
+
+    fn get(&self, py: Python<'_>, ticker: &str) -> PyResult<Option<Py<PyCustomDataPoint>>> {
+        self.__getitem__(py, ticker)
+    }
+
+    fn __contains__(&self, ticker: &str) -> bool {
+        self.points.contains_key(&ticker.to_uppercase())
+    }
+
+    fn __len__(&self) -> usize {
+        self.points.len()
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.points.keys().cloned().collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CustomData(count={})", self.points.len())
+    }
+}
+
 // ─── SliceProxy ───────────────────────────────────────────────────────────────
 
 /// Pre-allocated Python objects for the simulation hot path.
@@ -348,6 +472,8 @@ pub struct SliceProxy {
     quote_bars_cell: Py<PyQuoteBars>,
     /// Mutable option chains cell — updated in-place each bar.
     option_chains_cell: Py<PyOptionChains>,
+    /// Mutable custom data cell — updated once per trading day.
+    custom_data_cell: Py<PyCustomData>,
 }
 
 impl SliceProxy {
@@ -391,10 +517,12 @@ impl SliceProxy {
         let py_bars      = Py::new(py, PyTradeBars { bars: bars_map, ticker_to_sid })?;
         let py_chains    = Py::new(py, PyOptionChains::empty())?;
         let py_qbars_obj = Py::new(py, PyQuoteBars { bars: quote_bars_map, ticker_to_sid: qb_ticker_to_sid })?;
+        let py_custom    = Py::new(py, PyCustomData::empty())?;
         let py_slice     = Py::new(py, PySlice {
             bars_obj:        py_bars,
             quote_bars_obj:  py_qbars_obj.clone_ref(py),
             option_chains_obj: py_chains.clone_ref(py),
+            custom_data_obj: py_custom.clone_ref(py),
             has_data: false,
         })?;
 
@@ -404,6 +532,7 @@ impl SliceProxy {
             quote_bar_cells,
             quote_bars_cell: py_qbars_obj,
             option_chains_cell: py_chains,
+            custom_data_cell: py_custom,
         })
     }
 
@@ -472,6 +601,37 @@ impl SliceProxy {
         for (permtick, chain) in chains {
             let py_chain = PyOptionChain { inner: chain.clone() };
             chains_obj.set(py, permtick, py_chain).ok();
+        }
+    }
+
+    /// Write custom data points for this bar in-place.
+    ///
+    /// Replaces the `data.custom` dict with the latest points for each ticker.
+    /// Called once per trading day (or once per minute in minute-mode) before `on_data`.
+    ///
+    /// `data`: ticker (any case) → list of `CustomDataPoint`s for this date.
+    /// The last point in each list is used as the representative value.
+    pub fn update_custom_data(
+        &self,
+        py: Python<'_>,
+        data: &HashMap<String, Vec<CustomDataPoint>>,
+    ) {
+        let mut custom_obj = self.custom_data_cell.borrow_mut(py);
+        custom_obj.points.clear();
+
+        for (ticker, points) in data {
+            // Use the last point as the current value (most recent intraday bar,
+            // or the single daily point).
+            let Some(last) = points.last() else { continue; };
+            let py_point = match Py::new(py, PyCustomDataPoint {
+                value: last.value.to_f64().unwrap_or(0.0),
+                time: last.time,
+                fields_inner: last.fields.clone(),
+            }) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            custom_obj.points.insert(ticker.to_uppercase(), py_point);
         }
     }
 }

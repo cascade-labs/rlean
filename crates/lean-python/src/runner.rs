@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde_json;
 use chrono::Datelike;
 use chrono::NaiveDate;
 use pyo3::prelude::*;
@@ -15,7 +16,7 @@ use tracing::{info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan};
-use lean_data::{IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig, TradeBar};
+use lean_data::{CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataSubscription, CustomDataTransport, IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig, TradeBar};
 use lean_options::{OptionChain, OptionContract, OptionContractData};
 use lean_options::payoff::{intrinsic_value, is_auto_exercised, get_exercise_quantity};
 use lean_orders::{
@@ -26,7 +27,7 @@ use lean_orders::{
     slippage::NullSlippageModel,
 };
 use lean_statistics::{PortfolioStatistics, Trade};
-use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, option_eod_path};
+use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, custom_data_path, option_eod_path};
 
 use crate::charting::ChartCollection;
 use crate::py_adapter::{PyAlgorithmAdapter, set_algorithm_time};
@@ -46,6 +47,9 @@ pub struct RunConfig {
     pub start_date_override: Option<chrono::NaiveDate>,
     /// Override the strategy's set_end_date (YYYY-MM-DD).
     pub end_date_override: Option<chrono::NaiveDate>,
+    /// Custom data source plugins loaded from `~/.rlean/plugins/` or set explicitly.
+    /// Keyed by `source_type` name (e.g. `"fred"`, `"cboe_vix"`).
+    pub custom_data_sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>>,
 }
 
 impl Default for RunConfig {
@@ -57,6 +61,7 @@ impl Default for RunConfig {
             history_provider: None,
             start_date_override: None,
             end_date_override: None,
+            custom_data_sources: vec![],
         }
     }
 }
@@ -652,6 +657,28 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     alg.option_chains.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                 };
 
+                // Fetch custom data once per day for minute-mode too.
+                let custom_subs: Vec<CustomDataSubscription> = {
+                    adapter.inner.lock().unwrap()
+                        .custom_data_subscriptions.clone()
+                };
+                let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
+                for sub in &custom_subs {
+                    let source = config.custom_data_sources.iter()
+                        .find(|s| s.name() == sub.source_type)
+                        .cloned();
+                    let data_root = config.data_root.clone();
+                    let source_type = sub.source_type.clone();
+                    let ticker = sub.ticker.clone();
+                    let cfg = sub.config.clone();
+                    let points = tokio::task::spawn_blocking(move || {
+                        load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
+                    }).await.unwrap_or_default();
+                    if !points.is_empty() {
+                        custom_data_for_day.insert(sub.ticker.clone(), points);
+                    }
+                }
+
                 // Iterate minute by minute.
                 for &ts_ns in &all_timestamps {
                     let utc_time = lean_core::NanosecondTimestamp(ts_ns);
@@ -695,6 +722,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     Python::with_gil(|py| {
                         slice_proxy.update_option_chains(py, &chains_snapshot);
                         slice_proxy.update_quote_bars(py, &minute_quote_bars);
+                        slice_proxy.update_custom_data(py, &custom_data_for_day);
                         adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
                     });
 
@@ -894,8 +922,32 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let alg = adapter.inner.lock().unwrap();
                 alg.option_chains.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
+
+            // ── Custom data fetch (daily) ─────────────────────────────────
+            let custom_subs: Vec<CustomDataSubscription> = {
+                adapter.inner.lock().unwrap()
+                    .custom_data_subscriptions.clone()
+            };
+            let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
+            for sub in &custom_subs {
+                let source = config.custom_data_sources.iter()
+                    .find(|s| s.name() == sub.source_type)
+                    .cloned();
+                let data_root = config.data_root.clone();
+                let source_type = sub.source_type.clone();
+                let ticker = sub.ticker.clone();
+                let cfg = sub.config.clone();
+                let points = tokio::task::spawn_blocking(move || {
+                    load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
+                }).await.unwrap_or_default();
+                if !points.is_empty() {
+                    custom_data_for_day.insert(sub.ticker.clone(), points);
+                }
+            }
+
             Python::with_gil(|py| {
                 slice_proxy.update_option_chains(py, &chains_snapshot);
+                slice_proxy.update_custom_data(py, &custom_data_for_day);
                 adapter.on_data_proxy(py, &slice_proxy, &slice);
             });
             adapter.on_end_of_day(None);
@@ -1277,6 +1329,118 @@ fn load_option_eod_bars(
     }
 
     bars
+}
+
+/// Cache-first fetch for custom data points.
+///
+/// Cache layout: `{data_root}/custom/{source_type}/{ticker_lower}/{YYYYMMDD}.parquet`
+/// One file per (source_type, ticker, date).  A cache hit is a single `path.exists()` check.
+///
+/// On cache miss, calls `source.get_source()` to get the URI, fetches via HTTP or reads a
+/// local file, then calls `source.reader()` line-by-line to parse points.  Parsed points
+/// are written to the Parquet cache before returning.
+///
+/// Called from inside `tokio::task::spawn_blocking` — all I/O is synchronous.
+fn load_custom_data_points(
+    data_root: &Path,
+    source_type: &str,
+    ticker: &str,
+    date: NaiveDate,
+    source: Option<&Arc<dyn lean_data_providers::ICustomDataSource>>,
+    config: &CustomDataConfig,
+) -> Vec<CustomDataPoint> {
+    let cache_path = custom_data_path(data_root, source_type, ticker, date);
+
+    // Cache hit — read and return.
+    if cache_path.exists() {
+        let reader = ParquetReader::new();
+        return reader.read_custom_data_points(&cache_path).unwrap_or_default();
+    }
+
+    // Cache miss — need a source plugin to fetch.
+    let Some(source) = source else { return vec![]; };
+
+    // Ask plugin where to fetch data for this date.
+    let data_source = match source.get_source(ticker, date, config) {
+        Some(s) => s,
+        None => return vec![], // no data for this date (e.g. weekend)
+    };
+
+    // Fetch raw content.
+    let raw_content = match data_source.transport {
+        CustomDataTransport::Http => {
+            match reqwest::blocking::get(&data_source.uri) {
+                Ok(resp) => match resp.text() {
+                    Ok(text) => text,
+                    Err(e) => {
+                        warn!("custom data fetch body error for {}/{} {}: {}", source_type, ticker, date, e);
+                        return vec![];
+                    }
+                },
+                Err(e) => {
+                    warn!("custom data HTTP fetch failed for {}/{} {}: {}", source_type, ticker, date, e);
+                    return vec![];
+                }
+            }
+        }
+        CustomDataTransport::LocalFile => {
+            match std::fs::read_to_string(&data_source.uri) {
+                Ok(content) => content,
+                Err(e) => {
+                    warn!("custom data file read failed for {}/{} {}: {}", source_type, ticker, date, e);
+                    return vec![];
+                }
+            }
+        }
+    };
+
+    // Parse content using the plugin's reader() method.
+    let mut points: Vec<CustomDataPoint> = Vec::new();
+    match data_source.format {
+        CustomDataFormat::Csv | CustomDataFormat::JsonLines => {
+            // Line-by-line: call reader() on each non-empty line.
+            for line in raw_content.lines() {
+                if line.trim().is_empty() { continue; }
+                if let Some(point) = source.reader(line, date, config) {
+                    points.push(point);
+                }
+            }
+        }
+        CustomDataFormat::Json => {
+            // Try to parse as JSON array; call reader() on each serialized element.
+            match serde_json::from_str::<serde_json::Value>(&raw_content) {
+                Ok(serde_json::Value::Array(arr)) => {
+                    for elem in arr {
+                        let line = elem.to_string();
+                        if let Some(point) = source.reader(&line, date, config) {
+                            points.push(point);
+                        }
+                    }
+                }
+                Ok(obj) => {
+                    // Single JSON object — pass it as a single "line".
+                    if let Some(point) = source.reader(&obj.to_string(), date, config) {
+                        points.push(point);
+                    }
+                }
+                Err(e) => {
+                    warn!("custom data JSON parse error for {}/{} {}: {}", source_type, ticker, date, e);
+                }
+            }
+        }
+    }
+
+    if points.is_empty() {
+        return vec![];
+    }
+
+    // Write to Parquet cache.
+    let writer = ParquetWriter::new(WriterConfig::default());
+    if let Err(e) = writer.write_custom_data_points(&points, &cache_path) {
+        warn!("failed to cache custom data for {}/{} {}: {}", source_type, ticker, date, e);
+    }
+
+    points
 }
 
 /// Apply a factor-file adjustment to a raw bar.

@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
 use py_types::{PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PyOptionSecurity, PySymbol, PyIndicatorResult};
-use py_data::{PySlice, PyTradeBar, PyTradeBars, PyQuoteBar, PyQuoteBars, PyBar};
+use py_data::{PySlice, PyTradeBar, PyTradeBars, PyQuoteBar, PyQuoteBars, PyBar, PyCustomDataPoint, PyCustomData};
 use py_orders::PyOrderEvent;
 use py_indicators::{PySma, PyEma, PyRsi, PyMacd, PyBollingerBands, PyAtr, PyIndicatorDataPoint};
 use py_portfolio::{PyPortfolio, PySecurityHolding};
@@ -115,6 +115,8 @@ pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuoteBar>()?;
     m.add_class::<PyQuoteBars>()?;
     m.add_class::<PySlice>()?;
+    m.add_class::<PyCustomDataPoint>()?;
+    m.add_class::<PyCustomData>()?;
 
     // Orders
     m.add_class::<PyOrderEvent>()?;

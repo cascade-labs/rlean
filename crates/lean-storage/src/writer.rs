@@ -1,5 +1,5 @@
 use crate::{convert, path_resolver::DataPath, schema};
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use lean_core::Result as LeanResult;
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
 use parquet::{
@@ -251,6 +251,43 @@ impl ParquetWriter {
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         debug!("Wrote {} map file entries to {}", entries.len(), path.display());
+        Ok(())
+    }
+
+    /// Write custom data points to a parquet cache file.
+    ///
+    /// Schema: `date_ns` (Int64 ns UTC), `value` (Float64), `fields_json` (Utf8).
+    pub fn write_custom_data_points(&self, points: &[CustomDataPoint], path: &Path) -> LeanResult<()> {
+        if points.is_empty() { return Ok(()); }
+        self.ensure_dir(path)?;
+
+        let schema = schema::custom_data_schema();
+
+        let dates: Vec<i64> = points.iter().map(|p| schema::date_to_ns(p.time)).collect();
+        let values: Vec<f64> = points.iter().map(|p| {
+            use rust_decimal::prelude::ToPrimitive;
+            p.value.to_f64().unwrap_or(0.0)
+        }).collect();
+        let fields_json: Vec<String> = points.iter()
+            .map(|p| serde_json::to_string(&p.fields).unwrap_or_else(|_| "{}".to_string()))
+            .collect();
+        let fields_json_refs: Vec<&str> = fields_json.iter().map(|s| s.as_str()).collect();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(dates)),
+            Arc::new(arrow_array::Float64Array::from(values)),
+            Arc::new(StringArray::from(fields_json_refs)),
+        ]).map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let file = fs::File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        writer.write(&batch)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        writer.close()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        debug!("Wrote {} custom data points to {}", points.len(), path.display());
         Ok(())
     }
 

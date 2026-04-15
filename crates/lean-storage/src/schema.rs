@@ -206,6 +206,24 @@ pub struct OptionUniverseRow {
     pub right: String,
 }
 
+// ─── Custom data ─────────────────────────────────────────────────────────────
+
+/// Arrow schema for custom data point Parquet cache files.
+///
+/// Layout: `{root}/custom/{source_type}/{ticker_lower}/{YYYYMMDD}.parquet`
+///
+/// Columns:
+/// - `date_ns`    — nanoseconds since Unix epoch (midnight UTC) for the data point date
+/// - `value`      — primary scalar value (Float64)
+/// - `fields_json`— JSON-encoded extra fields map (Utf8)
+pub fn custom_data_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("date_ns",     DataType::Int64,   false),
+        Field::new("value",       DataType::Float64, false),
+        Field::new("fields_json", DataType::Utf8,    false),
+    ]))
+}
+
 // ─── Factor file / Map file ───────────────────────────────────────────────────
 
 /// Arrow schema for factor file parquet files.

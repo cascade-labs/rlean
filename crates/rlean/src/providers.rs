@@ -212,6 +212,69 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
     Ok(provider)
 }
 
+/// Scan `~/.rlean/plugins/` for dylibs that export `rlean_custom_data_factory`
+/// and load them as `ICustomDataSource` instances.
+///
+/// Plugins that don't export the symbol are silently skipped — not every plugin
+/// is a custom data source.  Any dylib that does export it is loaded eagerly
+/// (custom data sources are lightweight and used throughout the backtest).
+pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDataSource>> {
+    use libloading::{Library, Symbol};
+
+    let plugins_dir = match home_dir() {
+        Ok(h) => h.join(".rlean").join("plugins"),
+        Err(_) => return vec![],
+    };
+
+    if !plugins_dir.exists() {
+        return vec![];
+    }
+
+    let pattern = plugins_dir.join(format!("*.{}", dylib_ext()));
+    let glob_pattern = pattern.to_string_lossy().to_string();
+
+    let mut sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>> = Vec::new();
+
+    let paths: Vec<_> = match glob::glob(&glob_pattern) {
+        Ok(paths) => paths.filter_map(|r| r.ok()).collect(),
+        Err(_) => return vec![],
+    };
+
+    for path in paths {
+        // Safety: the plugin must export the factory with C ABI.
+        let lib = match unsafe { Library::new(&path) } {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!("Could not load plugin {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        let factory: Symbol<unsafe extern "C" fn() -> *mut ()> =
+            match unsafe { lib.get(b"rlean_custom_data_factory\0") } {
+                Ok(f) => f,
+                Err(_) => continue, // this plugin doesn't have a custom data factory
+            };
+
+        let raw = unsafe { factory() };
+        if raw.is_null() {
+            tracing::warn!("Plugin {} returned null from rlean_custom_data_factory", path.display());
+            continue;
+        }
+
+        let source: Arc<dyn lean_data_providers::ICustomDataSource> =
+            unsafe { *Box::from_raw(raw as *mut Arc<dyn lean_data_providers::ICustomDataSource>) };
+
+        tracing::info!("Loaded custom data plugin: {} ({})", source.name(), path.display());
+        sources.push(source);
+
+        // Leak the library so the vtable stays valid for the process lifetime.
+        Box::leak(Box::new(lib));
+    }
+
+    sources
+}
+
 fn dylib_ext() -> &'static str {
     if cfg!(target_os = "macos") { "dylib" } else { "so" }
 }

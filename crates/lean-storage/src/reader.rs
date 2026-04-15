@@ -1,7 +1,9 @@
 use crate::{convert, predicate::Predicate, schema};
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
+use lean_data::CustomDataPoint;
 use datafusion::prelude::*;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
+use rust_decimal::prelude::FromPrimitive as _;
 use lean_data::TradeBar;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use arrow_array::{Float64Array, Int64Array, StringArray};
@@ -246,6 +248,48 @@ impl ParquetReader {
         }
 
         debug!("Read {} factor file entries from {}", result.len(), path.display());
+        Ok(result)
+    }
+
+    /// Read custom data points from a parquet cache file.
+    ///
+    /// Returns an empty `Vec` (no error) when the file does not exist.
+    /// Schema: `date_ns` (Int64 ns UTC), `value` (Float64), `fields_json` (Utf8).
+    pub fn read_custom_data_points(&self, path: &Path) -> LeanResult<Vec<CustomDataPoint>> {
+        if !path.exists() { return Ok(vec![]); }
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| lean_core::LeanError::DataError(format!("{}: {}", path.display(), e)))?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+            .build()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            let dates  = batch.column(0).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| lean_core::LeanError::DataError("date_ns column missing".into()))?;
+            let values = batch.column(1).as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| lean_core::LeanError::DataError("value column missing".into()))?;
+            let fields_col = batch.column(2).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| lean_core::LeanError::DataError("fields_json column missing".into()))?;
+
+            for i in 0..batch.num_rows() {
+                let date = schema::ns_to_date(dates.value(i));
+                let value_f64 = values.value(i);
+                let value = rust_decimal::Decimal::from_f64_retain(value_f64)
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                let fields: std::collections::HashMap<String, serde_json::Value> =
+                    serde_json::from_str(fields_col.value(i)).unwrap_or_default();
+                result.push(CustomDataPoint { time: date, value, fields });
+            }
+        }
+
+        debug!("Read {} custom data points from {}", result.len(), path.display());
         Ok(result)
     }
 
