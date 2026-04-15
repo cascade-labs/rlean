@@ -16,9 +16,7 @@ use tracing::{info, warn};
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan};
 use lean_data::{IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig, TradeBar};
-use lean_options::{
-    BlackScholesPriceModel, IOptionPriceModel, OptionChain, OptionContract, OptionContractData,
-};
+use lean_options::{OptionChain, OptionContract, OptionContractData};
 use lean_options::payoff::{intrinsic_value, is_auto_exercised, get_exercise_quantity};
 use lean_orders::{
     fee_model::{FeeModel, InteractiveBrokersFeeModel, OrderFeeParameters},
@@ -28,7 +26,7 @@ use lean_orders::{
     slippage::NullSlippageModel,
 };
 use lean_statistics::{PortfolioStatistics, Trade};
-use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, PathResolver, QueryParams};
+use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, option_eod_path};
 
 use crate::charting::ChartCollection;
 use crate::py_adapter::{PyAlgorithmAdapter, set_algorithm_time};
@@ -627,19 +625,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 .unwrap_or(Decimal::ZERO)
                         };
 
-                        let chain = if let Some(ref provider) = config.history_provider {
+                        let chain = {
                             let ticker = underlying_ticker.to_uppercase();
                             let bars = tokio::task::spawn_blocking({
-                                let provider = provider.clone();
-                                move || provider.get_option_eod_bars(&ticker, current_date)
-                            }).await.unwrap_or(Ok(vec![])).unwrap_or_default();
+                                let provider = config.history_provider.clone();
+                                let data_root = config.data_root.clone();
+                                move || load_option_eod_bars(&data_root, &ticker, current_date, provider.as_ref())
+                            }).await.unwrap_or_default();
                             if !bars.is_empty() {
                                 build_option_chain_from_eod_bars(canonical, spot, current_date, &bars)
                             } else {
-                                generate_option_chain(canonical, spot, current_date)
+                                OptionChain::new(canonical.clone(), spot)
                             }
-                        } else {
-                            generate_option_chain(canonical, spot, current_date)
                         };
                         chains_for_day.push((canonical.permtick.clone(), chain));
                     }
@@ -871,19 +868,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             .unwrap_or(Decimal::ZERO)
                     };
 
-                    let chain = if let Some(ref provider) = config.history_provider {
+                    let chain = {
                         let ticker = underlying_ticker.to_uppercase();
                         let bars = tokio::task::spawn_blocking({
-                            let provider = provider.clone();
-                            move || provider.get_option_eod_bars(&ticker, current_date)
-                        }).await.unwrap_or(Ok(vec![])).unwrap_or_default();
+                            let provider = config.history_provider.clone();
+                            let data_root = config.data_root.clone();
+                            move || load_option_eod_bars(&data_root, &ticker, current_date, provider.as_ref())
+                        }).await.unwrap_or_default();
                         if !bars.is_empty() {
                             build_option_chain_from_eod_bars(canonical, spot, current_date, &bars)
                         } else {
-                            generate_option_chain(canonical, spot, current_date)
+                            OptionChain::new(canonical.clone(), spot)
                         }
-                    } else {
-                        generate_option_chain(canonical, spot, current_date)
                     };
                     chains_for_day.push((canonical.permtick.clone(), chain));
                 }
@@ -1237,104 +1233,50 @@ fn build_option_chain_from_eod_bars(
     chain
 }
 
-/// Generate a synthetic option chain for `canonical_sym` centred on `spot`.
+/// Check the local Parquet cache for option EOD bars; download and cache on miss.
 ///
-/// Produces call and put contracts for:
-/// - Strikes: ATM ± 5%, 10%, 15%, 20% rounded to nearest $5.
-/// - Expirations: 3rd Friday of each of the next 3 calendar months.
-/// - Greeks/price via Black-Scholes at 20% IV.
-fn generate_option_chain(
-    canonical_sym: &Symbol,
-    spot: Decimal,
-    today: NaiveDate,
-) -> OptionChain {
-    let mut chain = OptionChain::new(canonical_sym.clone(), spot);
+/// Called from inside `tokio::task::spawn_blocking` — all I/O here is synchronous.
+///
+/// Cache layout: `{data_root}/option/usa/daily/{ticker_lower}/{YYYYMMDD}_eod.parquet`
+/// One file per (ticker, date). A cache hit is a single `path.exists()` check.
+fn load_option_eod_bars(
+    data_root: &Path,
+    ticker: &str,
+    date: NaiveDate,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> Vec<OptionEodBar> {
+    let cache_path = option_eod_path(data_root, ticker, date);
 
-    if spot.is_zero() {
-        return chain;
+    // Cache hit — read and return.
+    if cache_path.exists() {
+        let reader = ParquetReader::new();
+        return reader.read_option_eod_bars(&[cache_path]).unwrap_or_default();
     }
 
-    // Derive the underlying Symbol from the canonical's underlying field.
-    let underlying_sym: Symbol = canonical_sym.underlying.as_ref()
-        .map(|u| *u.clone())
-        .unwrap_or_else(|| canonical_sym.clone());
-
-    // Compute target strikes: ATM ± 5,10,15,20% rounded to nearest $5.
-    let spot_f64 = spot.to_f64().unwrap_or(1.0);
-    let pcts = [-0.20, -0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20];
-    let strikes: Vec<Decimal> = pcts.iter().map(|&pct| {
-        let raw = spot_f64 * (1.0 + pct);
-        let rounded = (raw / 5.0).round() * 5.0;
-        Decimal::from_f64(rounded.max(1.0)).unwrap_or(spot)
-    }).collect();
-
-    // Compute expirations: 3rd Friday of each of the next 3 months.
-    let expirations: Vec<NaiveDate> = (1i32..=3).filter_map(|months_ahead| {
-        let total_months = today.month() as i32 + months_ahead;
-        let year = today.year() + (total_months - 1) / 12;
-        let month = ((total_months - 1) % 12 + 1) as u32;
-        third_friday(year, month)
-    }).collect();
-
-    let bs = BlackScholesPriceModel;
-    let market = Market::usa();
-
-    for &expiry in &expirations {
-        let t_days = (expiry - today).num_days();
-        if t_days <= 0 { continue; }
-
-        for &strike in &strikes {
-            for &right in &[OptionRight::Call, OptionRight::Put] {
-                let sym = Symbol::create_option_osi(
-                    underlying_sym.clone(),
-                    strike,
-                    expiry,
-                    right,
-                    OptionStyle::American,
-                    &market,
-                );
-
-                let mut contract = OptionContract::new(sym);
-                let iv = rust_decimal_macros::dec!(0.20);
-                contract.data = OptionContractData {
-                    underlying_last_price: spot,
-                    implied_volatility: iv,
-                    ..Default::default()
-                };
-
-                // Price via Black-Scholes.
-                let result = bs.evaluate(&contract, 0.05, 0.0);
-                contract.data.theoretical_price = result.theoretical_price;
-                contract.data.bid_price = (result.theoretical_price
-                    - rust_decimal_macros::dec!(0.05)).max(Decimal::ZERO);
-                contract.data.ask_price = result.theoretical_price
-                    + rust_decimal_macros::dec!(0.05);
-                contract.data.last_price = result.theoretical_price;
-                contract.data.greeks = result.greeks;
-
-                chain.add_contract(contract);
-            }
+    // Cache miss — fetch from provider.
+    let Some(provider) = provider else { return vec![]; };
+    let bars = match provider.get_option_eod_bars(ticker, date) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("option EOD fetch failed for {ticker} {date}: {e}");
+            return vec![];
         }
+    };
+
+    if bars.is_empty() {
+        return vec![];
     }
 
-    chain
-}
+    // Write to cache so future backtests don't re-fetch.
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let writer = ParquetWriter::new(WriterConfig::default());
+    if let Err(e) = writer.write_option_eod_bars(&bars, &cache_path) {
+        warn!("failed to cache option EOD bars for {ticker} {date}: {e}");
+    }
 
-/// Return the 3rd Friday of the given year and month, or None if invalid.
-fn third_friday(year: i32, month: u32) -> Option<NaiveDate> {
-    use chrono::Weekday;
-    // Find the first day of the month.
-    let first = NaiveDate::from_ymd_opt(year, month, 1)?;
-    // Find the first Friday.
-    let first_friday_offset = {
-        let wd = first.weekday().num_days_from_monday(); // Mon=0 .. Sun=6
-        // Friday = 4
-        (4 + 7 - wd) % 7
-    };
-    // Third Friday = first Friday + 14 days.
-    first.checked_add_signed(chrono::Duration::days(
-        first_friday_offset as i64 + 14,
-    ))
+    bars
 }
 
 /// Apply a factor-file adjustment to a raw bar.
