@@ -260,6 +260,9 @@ fn cmd_install(name: &str) -> Result<()> {
     println!("Cloning {} ...", entry.git_url);
     git_clone(&entry.git_url, &src_dir)?;
 
+    println!("Resolving dependencies for '{}' ...", entry.name);
+    cargo_update(&src_dir)?;
+
     println!("Building {} ...", entry.name);
     let package_name = package_name_for(&entry.name);
     cargo_build(&src_dir, &package_name)?;
