@@ -317,6 +317,21 @@ pub fn custom_data_path(root: impl AsRef<Path>, source_type: &str, ticker: &str,
     p
 }
 
+/// Canonical path for the full-history cache of a custom data series.
+///
+/// Used when `ICustomDataSource::is_full_history_source()` is `true` — the
+/// entire series is stored in one file rather than one file per trading date.
+///
+/// Layout: `{root}/custom/{source_type_lower}/{ticker_lower}/history.parquet`
+pub fn custom_data_history_path(root: impl AsRef<Path>, source_type: &str, ticker: &str) -> PathBuf {
+    let mut p = root.as_ref().to_path_buf();
+    p.push("custom");
+    p.push(source_type.to_lowercase());
+    p.push(ticker.to_lowercase());
+    p.push("history.parquet");
+    p
+}
+
 /// Canonical path for a factor file.
 ///
 /// Layout: `{root}/equity/{market}/factor_files/{ticker_lower}.parquet`

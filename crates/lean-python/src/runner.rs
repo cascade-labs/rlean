@@ -27,7 +27,7 @@ use lean_orders::{
     slippage::NullSlippageModel,
 };
 use lean_statistics::{PortfolioStatistics, Trade};
-use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, custom_data_path, option_eod_path};
+use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, custom_data_path, custom_data_history_path, option_eod_path};
 
 use crate::charting::ChartCollection;
 use crate::py_adapter::{PyAlgorithmAdapter, set_algorithm_time};
@@ -528,6 +528,80 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // Record the backtest start time as Unix epoch seconds (used as the LEAN backtest ID).
     let backtest_id = chrono::Utc::now().timestamp();
 
+    // ── prefetch full-history custom data sources ────────────────────────────
+    // For sources where is_full_history_source() is true (FRED, CBOE VIX, …),
+    // download the full series once, cache to history.parquet, and load the
+    // entire series into memory so the loop can look up by date without any
+    // per-day I/O or HTTP calls.
+    //
+    // key: ticker (uppercased) → date → points for that date
+    let custom_history: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = {
+        let subs: Vec<CustomDataSubscription> = adapter.inner.lock().unwrap()
+            .custom_data_subscriptions.clone();
+        let data_root_c = config.data_root.clone();
+        let sources_c   = config.custom_data_sources.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = HashMap::new();
+            for sub in &subs {
+                let Some(source) = sources_c.iter().find(|s| s.name() == sub.source_type) else {
+                    continue;
+                };
+                if !source.is_full_history_source() {
+                    continue;
+                }
+                let history_path = custom_data_history_path(&data_root_c, &sub.source_type, &sub.ticker);
+                // Try reading from existing cache first.
+                let all_points: Vec<CustomDataPoint> = if history_path.exists() {
+                    ParquetReader::new().read_custom_data_points(&history_path).unwrap_or_default()
+                } else {
+                    // Download full series.
+                    let data_source = match source.get_source(&sub.ticker, NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(), &sub.config) {
+                        Some(s) => s,
+                        None => { warn!("custom data: get_source returned None for {}/{}", sub.source_type, sub.ticker); continue; }
+                    };
+                    let raw = match data_source.transport {
+                        lean_data::custom::CustomDataTransport::Http => {
+                            match reqwest::blocking::get(&data_source.uri).and_then(|r| r.text()) {
+                                Ok(t) => t,
+                                Err(e) => { warn!("custom data full-history download failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
+                            }
+                        }
+                        lean_data::custom::CustomDataTransport::LocalFile => {
+                            match std::fs::read_to_string(&data_source.uri) {
+                                Ok(t) => t,
+                                Err(e) => { warn!("custom data local file read failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
+                            }
+                        }
+                    };
+                    // Parse all rows (no date filter).
+                    let pts: Vec<CustomDataPoint> = raw.lines()
+                        .filter_map(|line| source.read_history_line(line, &sub.config))
+                        .collect();
+                    if pts.is_empty() {
+                        warn!("custom data: no points parsed for {}/{}", sub.source_type, sub.ticker);
+                        continue;
+                    }
+                    // Cache to Parquet.
+                    if let Some(parent) = history_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = ParquetWriter::new(WriterConfig::default()).write_custom_data_points(&pts, &history_path) {
+                        warn!("custom data: failed to cache history for {}/{}: {}", sub.source_type, sub.ticker, e);
+                    }
+                    pts
+                };
+                info!("custom data: loaded {} history points for {}/{}", all_points.len(), sub.source_type, sub.ticker);
+                // Index by date.
+                let mut by_date: HashMap<NaiveDate, Vec<CustomDataPoint>> = HashMap::new();
+                for pt in all_points {
+                    by_date.entry(pt.time).or_default().push(pt);
+                }
+                out.insert(sub.ticker.to_uppercase(), by_date);
+            }
+            out
+        }).await.unwrap_or_default()
+    };
+
     // ── date loop ───────────────────────────────────────────────────────────
     let sim_start = std::time::Instant::now();
     let mut current_date = start_date;
@@ -664,18 +738,27 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 };
                 let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
                 for sub in &custom_subs {
-                    let source = config.custom_data_sources.iter()
-                        .find(|s| s.name() == sub.source_type)
-                        .cloned();
-                    let data_root = config.data_root.clone();
-                    let source_type = sub.source_type.clone();
-                    let ticker = sub.ticker.clone();
-                    let cfg = sub.config.clone();
-                    let points = tokio::task::spawn_blocking(move || {
-                        load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
-                    }).await.unwrap_or_default();
-                    if !points.is_empty() {
-                        custom_data_for_day.insert(sub.ticker.clone(), points);
+                    let key = sub.ticker.to_uppercase();
+                    if let Some(by_date) = custom_history.get(&key) {
+                        // Full-history source: look up from preloaded in-memory map.
+                        if let Some(pts) = by_date.get(&current_date) {
+                            custom_data_for_day.insert(sub.ticker.clone(), pts.clone());
+                        }
+                    } else {
+                        // Date-keyed source: per-day HTTP fetch with per-day Parquet cache.
+                        let source = config.custom_data_sources.iter()
+                            .find(|s| s.name() == sub.source_type)
+                            .cloned();
+                        let data_root = config.data_root.clone();
+                        let source_type = sub.source_type.clone();
+                        let ticker = sub.ticker.clone();
+                        let cfg = sub.config.clone();
+                        let points = tokio::task::spawn_blocking(move || {
+                            load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
+                        }).await.unwrap_or_default();
+                        if !points.is_empty() {
+                            custom_data_for_day.insert(sub.ticker.clone(), points);
+                        }
                     }
                 }
 
@@ -930,18 +1013,27 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             };
             let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
             for sub in &custom_subs {
-                let source = config.custom_data_sources.iter()
-                    .find(|s| s.name() == sub.source_type)
-                    .cloned();
-                let data_root = config.data_root.clone();
-                let source_type = sub.source_type.clone();
-                let ticker = sub.ticker.clone();
-                let cfg = sub.config.clone();
-                let points = tokio::task::spawn_blocking(move || {
-                    load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
-                }).await.unwrap_or_default();
-                if !points.is_empty() {
-                    custom_data_for_day.insert(sub.ticker.clone(), points);
+                let key = sub.ticker.to_uppercase();
+                if let Some(by_date) = custom_history.get(&key) {
+                    // Full-history source: look up from preloaded in-memory map.
+                    if let Some(pts) = by_date.get(&current_date) {
+                        custom_data_for_day.insert(sub.ticker.clone(), pts.clone());
+                    }
+                } else {
+                    // Date-keyed source: per-day HTTP fetch with per-day Parquet cache.
+                    let source = config.custom_data_sources.iter()
+                        .find(|s| s.name() == sub.source_type)
+                        .cloned();
+                    let data_root = config.data_root.clone();
+                    let source_type = sub.source_type.clone();
+                    let ticker = sub.ticker.clone();
+                    let cfg = sub.config.clone();
+                    let points = tokio::task::spawn_blocking(move || {
+                        load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
+                    }).await.unwrap_or_default();
+                    if !points.is_empty() {
+                        custom_data_for_day.insert(sub.ticker.clone(), points);
+                    }
                 }
             }
 

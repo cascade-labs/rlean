@@ -62,6 +62,35 @@ pub trait ICustomDataSource: Send + Sync {
     fn requires_mapping(&self) -> bool {
         false
     }
+
+    /// Returns `true` when `get_source()` always returns the same URL regardless
+    /// of date (e.g. FRED, CBOE VIX — a single file contains the full history).
+    ///
+    /// When `true`, the runner downloads the file **once**, parses all rows with
+    /// `read_history_line()`, caches the entire series to a single Parquet file,
+    /// and then looks up by date during the backtest loop — no per-day HTTP requests.
+    ///
+    /// When `false` (default), the existing per-date fetch + per-date Parquet cache
+    /// is used.
+    fn is_full_history_source(&self) -> bool {
+        false
+    }
+
+    /// Parse one raw line from a full-history file without filtering by date.
+    ///
+    /// Called only when `is_full_history_source()` returns `true`.
+    /// The returned `CustomDataPoint.time` carries the date parsed from the line
+    /// itself.  Return `None` for headers, empty lines, malformed rows, and
+    /// missing-value sentinels (e.g. FRED `"."`).
+    ///
+    /// Default implementation returns `None`; full-history sources must override.
+    fn read_history_line(
+        &self,
+        _line: &str,
+        _config: &CustomDataConfig,
+    ) -> Option<CustomDataPoint> {
+        None
+    }
 }
 
 /// Type-erased `Arc` wrapper — cloneable for use across threads and `RunConfig`.
