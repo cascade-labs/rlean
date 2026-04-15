@@ -244,13 +244,17 @@ async fn run_python_backtest(
     };
     std::fs::create_dir_all(&backtest_dir)?;
 
+    // Auto-load custom data source plugins from ~/.rlean/plugins/.
+    let custom_data_sources = crate::providers::load_custom_data_plugins();
+
     let config = RunConfig {
         data_root: args.data.clone(),
+        _compression_level: 3,
         historical_provider,
         history_provider,
         start_date_override,
         end_date_override,
-        ..Default::default()
+        custom_data_sources,
     };
 
     let results = run_strategy(&args.strategy, config).await?;

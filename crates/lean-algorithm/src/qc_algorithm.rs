@@ -12,7 +12,7 @@ use lean_core::{
     OptionRight, OptionStyle, SettlementType, SymbolOptionsExt,
 };
 use lean_core::exchange_hours::ExchangeHours;
-use lean_data::{Slice, SubscriptionDataConfig, SubscriptionManager};
+use lean_data::{CustomDataSubscription, Slice, SubscriptionDataConfig, SubscriptionManager};
 use lean_indicators::Indicator;
 use lean_options::OptionChain;
 use lean_orders::{
@@ -92,6 +92,9 @@ pub struct QcAlgorithm {
     /// The benchmark symbol set by the algorithm (ticker, e.g. "SPY").
     /// When None, the runner defaults to SPY automatically.
     pub benchmark_symbol: Option<String>,
+
+    /// Custom data subscriptions registered via `add_data()`.
+    pub custom_data_subscriptions: Vec<CustomDataSubscription>,
 }
 
 impl QcAlgorithm {
@@ -119,6 +122,7 @@ impl QcAlgorithm {
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
             benchmark_symbol: None,
+            custom_data_subscriptions: Vec::new(),
         }
     }
 

@@ -302,6 +302,21 @@ impl PathResolver {
     }
 }
 
+/// Canonical path for a custom data point cache file.
+///
+/// Layout: `{root}/custom/{source_type}/{ticker_lower}/{YYYYMMDD}.parquet`
+///
+/// One file per trading date per source per ticker — cache check is a single
+/// `file.exists()` syscall; reads return all rows for that date.
+pub fn custom_data_path(root: impl AsRef<Path>, source_type: &str, ticker: &str, date: NaiveDate) -> PathBuf {
+    let mut p = root.as_ref().to_path_buf();
+    p.push("custom");
+    p.push(source_type.to_lowercase());
+    p.push(ticker.to_lowercase());
+    p.push(format!("{}.parquet", date.format("%Y%m%d")));
+    p
+}
+
 /// Canonical path for a factor file.
 ///
 /// Layout: `{root}/equity/{market}/factor_files/{ticker_lower}.parquet`

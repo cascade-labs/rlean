@@ -27,3 +27,4 @@ serde_json         = { workspace = true }
 chrono             = { workspace = true }
 pyo3               = { workspace = true }
 libloading         = { workspace = true }
+glob               = { workspace = true }

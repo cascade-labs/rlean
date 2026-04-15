@@ -102,6 +102,38 @@ pub type CreateHistoryProviderFn =
 /// Free a provider created by `CreateHistoryProviderFn`.
 pub type DestroyHistoryProviderFn = unsafe extern "C" fn(ptr: *mut ());
 
+/// C-stable factory: create a custom data source.
+///
+/// Plugins with `kind = PluginKind::CustomData` must export this symbol:
+///
+/// ```rust
+/// #[no_mangle]
+/// pub extern "C" fn rlean_custom_data_factory() -> *mut () {
+///     let source: Arc<dyn ICustomDataSource> = Arc::new(MyCustomSource::new());
+///     let boxed = Box::new(source);
+///     Box::into_raw(boxed) as *mut ()
+/// }
+/// ```
+///
+/// The runner casts the returned pointer back to
+/// `Box<Arc<dyn lean_data_providers::ICustomDataSource>>` and takes ownership.
+///
+/// A corresponding destroy function must also be exported:
+/// ```rust
+/// #[no_mangle]
+/// pub unsafe extern "C" fn rlean_destroy_custom_data_source(ptr: *mut ()) {
+///     drop(Box::from_raw(ptr as *mut Arc<dyn lean_data_providers::ICustomDataSource>));
+/// }
+/// ```
+///
+/// Note: `ICustomDataSource` is defined in `lean-data-providers`, not `lean-plugin`,
+/// so the factory signature is documented here but not type-checked at the ABI boundary.
+/// The runner loads it via `libloading` and performs the cast internally.
+pub type CreateCustomDataSourceFn = unsafe extern "C" fn() -> *mut ();
+
+/// Free a custom data source created by `CreateCustomDataSourceFn`.
+pub type DestroyCustomDataSourceFn = unsafe extern "C" fn(ptr: *mut ());
+
 /// Convenience macro for plugin crates to implement the required export.
 ///
 /// ```rust

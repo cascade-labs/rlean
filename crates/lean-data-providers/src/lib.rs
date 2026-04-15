@@ -15,6 +15,7 @@
 //! ```
 
 pub mod config;
+pub mod custom_data;
 pub mod local;
 pub mod request;
 pub mod stacked;
@@ -24,6 +25,7 @@ pub use config::ProviderConfig;
 pub use local::LocalHistoryProvider;
 pub use request::{DataType, DownloadRequest, HistoryRequest};
 pub use stacked::{StackedHistoryProvider, is_not_implemented};
+pub use custom_data::{ICustomDataSource, ArcCustomDataSource};
 pub use traits::{
     IDataDownloader, IFactorFileProvider, IHistoryProvider, ILiveDataProvider,
     IMapFileProvider, IOptionChainProvider,
