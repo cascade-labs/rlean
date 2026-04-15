@@ -439,7 +439,7 @@ fn dylib_ext() -> &'static str {
 }
 
 fn package_name_for(plugin_name: &str) -> String {
-    format!("rlean-plugin-{}", plugin_name)
+    format!("rlean-plugin-{}", plugin_name.replace('_', "-"))
 }
 
 // ── Git + Cargo helpers ───────────────────────────────────────────────────────
