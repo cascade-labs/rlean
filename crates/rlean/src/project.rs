@@ -125,62 +125,44 @@ class {class_name}(QCAlgorithm):
     )
 }
 
-fn research_notebook(project_name: &str) -> String {
-    // Standard Jupyter nbformat v4 notebook with a single starter cell.
-    let cell_source = format!(
-        r#"from AlgorithmImports import *
-
-qb = QuantBook()
-qb.set_start_date(2020, 1, 1)
-qb.set_end_date(2023, 1, 1)
-
-# Add a security
-spy = qb.add_equity("SPY", Resolution.Daily).symbol
-
-# Pull daily history (last 252 bars)
-history = qb.history(spy, 252, Resolution.Daily)
-print(history.tail())"#
-    );
-
-    // Escape for JSON string (replace " with \", newline with \n)
-    let cell_lines: Vec<String> = cell_source
-        .lines()
-        .enumerate()
-        .map(|(i, line)| {
-            let sep = if i == 0 { "" } else { r"\n" };
-            format!("\"{}{}\"", sep, line.replace('\"', "\\\""))
-        })
-        .collect();
-    let source_json = cell_lines.join(",\n      ");
-
-    format!(
-        r#"{{
- "cells": [
-  {{
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {{}},
-   "outputs": [],
-   "source": [
-      {source}
-   ]
-  }}
- ],
- "metadata": {{
-  "kernelspec": {{
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  }},
-  "language_info": {{
-   "name": "python",
-   "version": "3.10.0"
-  }}
- }},
- "nbformat": 4,
- "nbformat_minor": 5
-}}
-"#,
-        source = source_json,
-    )
+pub(crate) fn research_notebook(project_name: &str) -> String {
+    let nb = serde_json::json!({
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "# Research Notebook\n",
+                    "\n",
+                    format!("Use this notebook to research and develop your **{}** strategy.", project_name)
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": serde_json::Value::Null,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "import pandas as pd\n",
+                    "import numpy as np\n",
+                    "import matplotlib.pyplot as plt\n",
+                    "%matplotlib inline"
+                ]
+            }
+        ],
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "name": "python",
+                "version": "3.10.0"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5
+    });
+    serde_json::to_string_pretty(&nb).expect("notebook serialization failed")
 }

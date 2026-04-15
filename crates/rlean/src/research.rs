@@ -16,6 +16,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::project::research_notebook;
+
 // ── Embedded lean_research Python package ────────────────────────────────────
 
 const PY_INIT: &str = include_str!(concat!(
@@ -84,11 +86,14 @@ pub fn run_research(args: ResearchArgs) -> Result<()> {
 
     let notebook = project_dir.join("research.ipynb");
     if !notebook.exists() {
-        bail!(
-            "No research.ipynb in '{}'.\n\
-             Re-create the project: rlean create-project <name>",
-            project_dir.display()
-        );
+        let project_name = project_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let content = research_notebook(&project_name);
+        std::fs::write(&notebook, content)
+            .with_context(|| format!("Failed to create research.ipynb in '{}'", project_dir.display()))?;
+        println!("Created research.ipynb in '{}'", project_dir.display());
     }
 
     let session = session_name(&project_dir);
@@ -293,7 +298,37 @@ fn ensure_python_package() -> Result<PathBuf> {
     write_if_changed(&kernel.join("__init__.py"), PY_KERNEL_INIT)?;
     write_if_changed(&kernel.join("startup.py"),  PY_KERNEL_STARTUP)?;
 
+    ensure_py_deps()?;
+
     Ok(base)
+}
+
+/// Ensure `jupyter_client` and `ipykernel` are importable; pip-install if not.
+fn ensure_py_deps() -> Result<()> {
+    let already_installed = Command::new("python3")
+        .args(["-c", "import jupyter_client, ipykernel"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if already_installed {
+        return Ok(());
+    }
+
+    println!("Installing research dependencies (jupyter_client, ipykernel) ...");
+    let status = Command::new("python3")
+        .args(["-m", "pip", "install", "--quiet", "jupyter_client", "ipykernel"])
+        .status()
+        .context("Failed to run pip — is Python 3 installed?")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to install jupyter_client and ipykernel.\n\
+             Run manually: python3 -m pip install jupyter_client ipykernel"
+        );
+    }
+
+    Ok(())
 }
 
 fn home_dir() -> Result<PathBuf> {
