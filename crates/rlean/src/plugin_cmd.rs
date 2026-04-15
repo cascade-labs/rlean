@@ -457,7 +457,7 @@ fn git_clone(url: &str, dest: &Path) -> Result<()> {
 
 fn git_pull(dir: &Path) -> Result<()> {
     let status = Command::new("git")
-        .args(["-C", &dir.display().to_string(), "pull", "--ff-only"])
+        .args(["-C", &dir.display().to_string(), "pull", "--ff-only", "--autostash"])
         .status()
         .context("Failed to run git pull")?;
     if !status.success() {
