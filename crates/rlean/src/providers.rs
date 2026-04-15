@@ -262,8 +262,11 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
             continue;
         }
 
-        let source: Arc<dyn lean_data_providers::ICustomDataSource> =
-            unsafe { *Box::from_raw(raw as *mut Arc<dyn lean_data_providers::ICustomDataSource>) };
+        // The factory returns *mut () pointing to a heap-allocated
+        // Box<dyn ICustomDataSource> (double-boxed to keep a thin pointer over FFI).
+        let source_box: Box<dyn lean_data_providers::ICustomDataSource> =
+            unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+        let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
 
         tracing::info!("Loaded custom data plugin: {} ({})", source.name(), path.display());
         sources.push(source);
