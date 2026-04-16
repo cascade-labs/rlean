@@ -32,14 +32,18 @@ mod init;
 mod plugin_cmd;
 mod project;
 mod providers;
+mod registry_cmd;
 mod research;
+mod research_daemon;
 mod stubs_cmd;
 
 use config_cmd::{ConfigArgs, run_config};
 use init::{InitArgs, run_init};
 use plugin_cmd::{PluginArgs, run_plugin};
 use project::{CreateProjectArgs, run_create_project};
+use registry_cmd::{RegistryArgs, run_registry};
 use research::{ResearchArgs, run_research};
+use research_daemon::{ResearchDaemonArgs, run_daemon};
 use stubs_cmd::{StubsArgs, run_stubs};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -70,6 +74,9 @@ enum Command {
     /// Manage rlean plugins (brokerages, data providers, AI skills, custom data)
     Plugin(PluginArgs),
 
+    /// Manage plugin registries (add, remove, list)
+    Registry(RegistryArgs),
+
     /// Run a backtest
     Backtest(RunArgs),
 
@@ -81,6 +88,10 @@ enum Command {
 
     /// Generate and install AlgorithmImports.pyi stub files for IDE autocomplete
     Stubs(StubsArgs),
+
+    /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
+    #[command(name = "__research-daemon", hide = true)]
+    ResearchDaemon(ResearchDaemonArgs),
 }
 
 #[derive(clap::Args, Clone)]
@@ -157,14 +168,16 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Command::Init(args)          => run_init(args),
-        Command::CreateProject(args) => run_create_project(args),
-        Command::Config(args)        => run_config(args),
-        Command::Plugin(args)        => run_plugin(args),
-        Command::Backtest(args)      => run_backtest(args).await,
-        Command::Live(args)          => run_live(args).await,
-        Command::Research(args)      => run_research(args),
-        Command::Stubs(args)         => run_stubs(args),
+        Command::Init(args)            => run_init(args),
+        Command::CreateProject(args)   => run_create_project(args),
+        Command::Config(args)          => run_config(args),
+        Command::Plugin(args)          => run_plugin(args),
+        Command::Registry(args)        => run_registry(args),
+        Command::Backtest(args)        => run_backtest(args).await,
+        Command::Live(args)            => run_live(args).await,
+        Command::Research(args)        => run_research(args),
+        Command::Stubs(args)           => run_stubs(args),
+        Command::ResearchDaemon(args)  => run_daemon(args),
     }
 }
 
@@ -429,6 +442,10 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
                 .map_err(|e| lean_core::LeanError::DataError(format!("provider task panicked: {e}")))?
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
         })
+    }
+
+    fn earliest_date(&self) -> Option<chrono::NaiveDate> {
+        self.0.earliest_date()
     }
 }
 

@@ -36,6 +36,16 @@ pub trait IHistoryProvider: Send + Sync {
     ) -> anyhow::Result<Vec<OptionEodBar>> {
         Ok(vec![])
     }
+
+    /// The earliest date this provider can supply data for, if limited.
+    ///
+    /// The async adapter (`HistoryProviderAdapter`) forwards this to
+    /// `IHistoricalDataProvider::earliest_date` so the runner can clip
+    /// requested date ranges before making network calls.
+    /// Returns `None` (default) when the provider has no known lower bound.
+    fn earliest_date(&self) -> Option<chrono::NaiveDate> {
+        None
+    }
 }
 
 /// Downloads and persists data to the local Parquet store.
