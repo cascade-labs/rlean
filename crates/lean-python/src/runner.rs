@@ -534,72 +534,115 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // entire series into memory so the loop can look up by date without any
     // per-day I/O or HTTP calls.
     //
+    // Uses async reqwest (not blocking) so that HTTP/2 (required by some
+    // providers like FRED) works correctly inside the tokio runtime.
+    //
     // key: ticker (uppercased) → date → points for that date
     let custom_history: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = {
         let subs: Vec<CustomDataSubscription> = adapter.inner.lock().unwrap()
             .custom_data_subscriptions.clone();
-        let data_root_c = config.data_root.clone();
-        let sources_c   = config.custom_data_sources.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut out: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = HashMap::new();
-            for sub in &subs {
-                let Some(source) = sources_c.iter().find(|s| s.name() == sub.source_type) else {
-                    continue;
+        let mut out: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = HashMap::new();
+
+        // Build a single async HTTP client for all downloads.
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent("Mozilla/5.0 (compatible; rlean/0.1)")
+            .build()
+            .unwrap_or_default();
+
+        for sub in &subs {
+            let Some(source) = config.custom_data_sources.iter().find(|s| s.name() == sub.source_type) else {
+                continue;
+            };
+            if !source.is_full_history_source() {
+                continue;
+            }
+            let history_path = custom_data_history_path(&config.data_root, &sub.source_type, &sub.ticker);
+
+            // Try reading from existing on-disk cache first (synchronous, fast).
+            let all_points: Vec<CustomDataPoint> = if history_path.exists() {
+                let hp = history_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    ParquetReader::new().read_custom_data_points(&hp).unwrap_or_default()
+                }).await.unwrap_or_default()
+            } else {
+                // Download full series using async HTTP.
+                let data_source = match source.get_source(&sub.ticker, NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(), &sub.config) {
+                    Some(s) => s,
+                    None => { warn!("custom data: get_source returned None for {}/{}", sub.source_type, sub.ticker); continue; }
                 };
-                if !source.is_full_history_source() {
+                let raw = match data_source.transport {
+                    lean_data::custom::CustomDataTransport::Http => {
+                        // Use curl subprocess: handles HTTP/2, TLS quirks, and redirects
+                        // more reliably than reqwest in this environment (some servers
+                        // like FRED require HTTP/2 which curl negotiates natively).
+                        let output = tokio::process::Command::new("curl")
+                            .args([
+                                "-s",
+                                "--max-time", "120",
+                                "-L",  // follow redirects
+                                &data_source.uri,
+                            ])
+                            .output()
+                            .await;
+                        match output {
+                            Ok(out) if out.status.success() => {
+                                String::from_utf8_lossy(&out.stdout).to_string()
+                            }
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                warn!("custom data full-history curl failed for {}/{}: {}", sub.source_type, sub.ticker, stderr);
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("custom data full-history download failed for {}/{}: {}", sub.source_type, sub.ticker, e);
+                                continue;
+                            }
+                        }
+                    }
+                    lean_data::custom::CustomDataTransport::LocalFile => {
+                        match std::fs::read_to_string(&data_source.uri) {
+                            Ok(t) => t,
+                            Err(e) => { warn!("custom data local file read failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
+                        }
+                    }
+                };
+                // Parse all rows using the plugin (no date filter).
+                let source_clone = source.clone();
+                let cfg_clone = sub.config.clone();
+                let pts: Vec<CustomDataPoint> = tokio::task::spawn_blocking(move || {
+                    raw.lines()
+                        .filter_map(|line| source_clone.read_history_line(line, &cfg_clone))
+                        .collect()
+                }).await.unwrap_or_default();
+
+                if pts.is_empty() {
+                    warn!("custom data: no points parsed for {}/{}", sub.source_type, sub.ticker);
                     continue;
                 }
-                let history_path = custom_data_history_path(&data_root_c, &sub.source_type, &sub.ticker);
-                // Try reading from existing cache first.
-                let all_points: Vec<CustomDataPoint> = if history_path.exists() {
-                    ParquetReader::new().read_custom_data_points(&history_path).unwrap_or_default()
-                } else {
-                    // Download full series.
-                    let data_source = match source.get_source(&sub.ticker, NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(), &sub.config) {
-                        Some(s) => s,
-                        None => { warn!("custom data: get_source returned None for {}/{}", sub.source_type, sub.ticker); continue; }
-                    };
-                    let raw = match data_source.transport {
-                        lean_data::custom::CustomDataTransport::Http => {
-                            match reqwest::blocking::get(&data_source.uri).and_then(|r| r.text()) {
-                                Ok(t) => t,
-                                Err(e) => { warn!("custom data full-history download failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
-                            }
-                        }
-                        lean_data::custom::CustomDataTransport::LocalFile => {
-                            match std::fs::read_to_string(&data_source.uri) {
-                                Ok(t) => t,
-                                Err(e) => { warn!("custom data local file read failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
-                            }
-                        }
-                    };
-                    // Parse all rows (no date filter).
-                    let pts: Vec<CustomDataPoint> = raw.lines()
-                        .filter_map(|line| source.read_history_line(line, &sub.config))
-                        .collect();
-                    if pts.is_empty() {
-                        warn!("custom data: no points parsed for {}/{}", sub.source_type, sub.ticker);
-                        continue;
-                    }
-                    // Cache to Parquet.
-                    if let Some(parent) = history_path.parent() {
+                // Cache to Parquet (off the async thread).
+                let hp = history_path.clone();
+                let pts_clone = pts.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(parent) = hp.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(e) = ParquetWriter::new(WriterConfig::default()).write_custom_data_points(&pts, &history_path) {
-                        warn!("custom data: failed to cache history for {}/{}: {}", sub.source_type, sub.ticker, e);
+                    if let Err(e) = ParquetWriter::new(WriterConfig::default()).write_custom_data_points(&pts_clone, &hp) {
+                        warn!("custom data: failed to cache history: {}", e);
                     }
-                    pts
-                };
-                info!("custom data: loaded {} history points for {}/{}", all_points.len(), sub.source_type, sub.ticker);
-                // Index by date.
-                let mut by_date: HashMap<NaiveDate, Vec<CustomDataPoint>> = HashMap::new();
-                for pt in all_points {
-                    by_date.entry(pt.time).or_default().push(pt);
-                }
-                out.insert(sub.ticker.to_uppercase(), by_date);
+                }).await.ok();
+                pts
+            };
+
+            info!("custom data: loaded {} history points for {}/{}", all_points.len(), sub.source_type, sub.ticker);
+            // Index by date.
+            let mut by_date: HashMap<NaiveDate, Vec<CustomDataPoint>> = HashMap::new();
+            for pt in all_points {
+                by_date.entry(pt.time).or_default().push(pt);
             }
-            out
-        }).await.unwrap_or_default()
+            out.insert(sub.ticker.to_uppercase(), by_date);
+        }
+        out
     };
 
     // ── date loop ───────────────────────────────────────────────────────────
@@ -1461,7 +1504,12 @@ fn load_custom_data_points(
     // Fetch raw content.
     let raw_content = match data_source.transport {
         CustomDataTransport::Http => {
-            match reqwest::blocking::get(&data_source.uri) {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .user_agent("Mozilla/5.0 (compatible; rlean/0.1)")
+                .build()
+                .unwrap_or_default();
+            match client.get(&data_source.uri).send() {
                 Ok(resp) => match resp.text() {
                     Ok(text) => text,
                     Err(e) => {
