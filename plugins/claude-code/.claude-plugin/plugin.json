@@ -1,0 +1,9 @@
+{
+  "name": "rlean",
+  "description": "rlean — Rust-native quantitative trading CLI. Backtests, live trading, research kernels, and notebook management for Python strategies targeting the QCAlgorithm API.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Cascade Labs"
+  },
+  "keywords": ["trading", "backtest", "quant", "research", "lean", "rlean"]
+}
