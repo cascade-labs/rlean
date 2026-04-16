@@ -1,0 +1,24 @@
+{
+  "name": "rlean",
+  "id": "rlean",
+  "owner": {
+    "name": "cascade-labs"
+  },
+  "metadata": {
+    "description": "rlean — Rust-native quantitative trading CLI. Backtests, live trading, and research kernels for Python strategies targeting the QCAlgorithm API.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "rlean",
+      "source": "./plugins/claude-code",
+      "description": "rlean quantitative trading CLI — backtests, live trading, research kernels",
+      "version": "0.1.0",
+      "author": {
+        "name": "Cascade Labs"
+      },
+      "keywords": ["trading", "backtest", "quant", "research", "lean", "rlean"],
+      "category": "workflow"
+    }
+  ]
+}
