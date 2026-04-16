@@ -1202,11 +1202,24 @@ async fn pre_fetch_all(
             continue;
         }
 
-        let start_dt = date_to_datetime(start, 0, 0, 0);
+        // Clip start to the provider's earliest supported date (e.g. ThetaData
+        // STANDARD only has data from 2018-01-01; requesting earlier causes 403).
+        let effective_start = match provider.earliest_date() {
+            Some(earliest) if start < earliest => {
+                warn!(
+                    "Provider earliest date is {}; clipping backtest start from {} for {}",
+                    earliest, start, sub.symbol.value
+                );
+                earliest
+            }
+            _ => start,
+        };
+
+        let start_dt = date_to_datetime(effective_start, 0, 0, 0);
         let end_dt   = date_to_datetime(end, 23, 59, 59);
 
         if !bar_path.exists() {
-            info!("No local data for {} — fetching from provider ({} → {})", sub.symbol.value, start, end);
+            info!("No local data for {} — fetching from provider ({} → {})", sub.symbol.value, effective_start, end);
             let bars = provider
                 .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
                 .await

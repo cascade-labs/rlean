@@ -28,3 +28,4 @@ chrono             = { workspace = true }
 pyo3               = { workspace = true }
 libloading         = { workspace = true }
 glob               = { workspace = true }
+base64             = { workspace = true }

@@ -1,11 +1,10 @@
-/// `rlean plugin` — plugin registry management
+/// `rlean plugin` — install, upgrade, remove, and list plugins
 ///
 /// Plugins are `cdylib` crates that export `rlean_plugin_descriptor()`.
 /// Installed plugins live in ~/.rlean/plugins/ as .dylib/.so files.
 /// The manifest at ~/.rlean/plugins.json tracks what is installed.
 ///
-/// Registries are stored in ~/.rlean/registries.json.
-/// The official registry is always included automatically.
+/// Registries are managed separately with `rlean registry`.
 ///
 /// Usage:
 ///   rlean plugin list                               # list plugins from all registries
@@ -14,9 +13,6 @@
 ///   rlean plugin install <git-url>                  # install ad-hoc plugin from git URL
 ///   rlean plugin upgrade <name>                     # rebuild from updated source
 ///   rlean plugin remove <name>                      # remove installed plugin
-///   rlean plugin registry list                      # show configured registries
-///   rlean plugin registry add <url>                 # add a custom registry
-///   rlean plugin registry remove <url>              # remove a custom registry
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Raw GitHub URL for the official plugin registry.
-const OFFICIAL_REGISTRY_URL: &str =
+pub(crate) const OFFICIAL_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/cascade-labs/rlean-plugins/main/registry.json";
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
@@ -58,27 +54,6 @@ pub enum PluginCommand {
         /// Plugin name
         name: String,
     },
-    /// Manage plugin registries
-    Registry {
-        #[command(subcommand)]
-        command: RegistryCommand,
-    },
-}
-
-#[derive(clap::Subcommand)]
-pub enum RegistryCommand {
-    /// List all configured registries
-    List,
-    /// Add a custom registry URL
-    Add {
-        /// Registry URL (must serve a registry.json compatible with the rlean format)
-        url: String,
-    },
-    /// Remove a custom registry URL
-    Remove {
-        /// Registry URL to remove
-        url: String,
-    },
 }
 
 // ── Registry types ────────────────────────────────────────────────────────────
@@ -106,8 +81,8 @@ struct RemoteRegistry {
 /// Persisted list of user-configured registry URLs.
 /// The official registry is always fetched in addition to these.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct UserRegistries {
-    urls: Vec<String>,
+pub(crate) struct UserRegistries {
+    pub(crate) urls: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -128,20 +103,33 @@ struct InstalledEntry {
 
 // ── Registry fetch ────────────────────────────────────────────────────────────
 
-/// Fetch the plugin list from a single registry URL via curl.
+/// Fetch the plugin list from a single registry URL.
+///
+/// Supports:
+/// - `https://` / `http://` — fetched via curl
+/// - `file:///path/to/registry.json` — read directly from disk
+/// - `/absolute/path/to/registry.json` — read directly from disk
 fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
-    let output = Command::new("curl")
-        .args(["--silent", "--fail", "--location", "--max-time", "10", url])
-        .output()
-        .context("Failed to run curl — is it installed?")?;
+    let body = if let Some(path) = url.strip_prefix("file://") {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read registry file: {path}"))?
+    } else if url.starts_with('/') {
+        std::fs::read_to_string(url)
+            .with_context(|| format!("Failed to read registry file: {url}"))?
+    } else {
+        let output = Command::new("curl")
+            .args(["--silent", "--fail", "--location", "--max-time", "10", url])
+            .output()
+            .context("Failed to run curl — is it installed?")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to fetch registry from {url}: {stderr}");
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to fetch registry from {url}: {stderr}");
+        }
 
-    let body = String::from_utf8(output.stdout)
-        .context("Registry response is not valid UTF-8")?;
+        String::from_utf8(output.stdout)
+            .context("Registry response is not valid UTF-8")?
+    };
 
     // Support both wrapped {"version":…,"plugins":[…]} and bare […] formats.
     if body.trim_start().starts_with('[') {
@@ -190,11 +178,6 @@ pub fn run_plugin(args: PluginArgs) -> Result<()> {
         PluginCommand::Install { name }  => cmd_install(&name),
         PluginCommand::Upgrade { name }  => cmd_upgrade(&name),
         PluginCommand::Remove  { name }  => cmd_remove(&name),
-        PluginCommand::Registry { command } => match command {
-            RegistryCommand::List         => cmd_registry_list(),
-            RegistryCommand::Add { url }  => cmd_registry_add(&url),
-            RegistryCommand::Remove { url } => cmd_registry_remove(&url),
-        },
     }
 }
 
@@ -334,11 +317,24 @@ fn cmd_remove(name: &str) -> Result<()> {
 
 // ── Registry lookup ───────────────────────────────────────────────────────────
 
+/// Returns true if the argument looks like a git URL or local path that
+/// can be passed directly to `git clone` rather than resolved via a registry.
+fn is_git_url_or_path(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("ssh://")
+        || s.starts_with("git@")
+        || s.starts_with("git://")
+        || s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+}
+
 /// Resolve a name or git URL to a RegistryEntry.
-/// - Full git URL → synthesise an entry (ad-hoc install, no registry needed)
-/// - Short name   → search all configured registries
+/// - Git URL / local path → synthesise an entry (ad-hoc install, no registry needed)
+/// - Short name           → search all configured registries
 fn resolve_entry(name_or_url: &str) -> Result<RegistryEntry> {
-    if name_or_url.starts_with("http") {
+    if is_git_url_or_path(name_or_url) {
         let inferred_name = name_or_url
             .trim_end_matches('/')
             .rsplit('/')
@@ -366,42 +362,6 @@ fn resolve_entry(name_or_url: &str) -> Result<RegistryEntry> {
         ))
 }
 
-// ── Registry management commands ──────────────────────────────────────────────
-
-fn cmd_registry_list() -> Result<()> {
-    let user = load_user_registries()?;
-    println!("{:<6} {}", "TYPE", "URL");
-    println!("{}", "-".repeat(72));
-    println!("{:<6} {}", "built-in", OFFICIAL_REGISTRY_URL);
-    for url in &user.urls {
-        println!("{:<6} {}", "user", url);
-    }
-    Ok(())
-}
-
-fn cmd_registry_add(url: &str) -> Result<()> {
-    let mut user = load_user_registries()?;
-    if user.urls.iter().any(|u| u == url) {
-        bail!("Registry '{}' is already configured.", url);
-    }
-    user.urls.push(url.to_string());
-    save_user_registries(&user)?;
-    println!("Added registry: {url}");
-    Ok(())
-}
-
-fn cmd_registry_remove(url: &str) -> Result<()> {
-    let mut user = load_user_registries()?;
-    let before = user.urls.len();
-    user.urls.retain(|u| u != url);
-    if user.urls.len() == before {
-        bail!("Registry '{}' not found.", url);
-    }
-    save_user_registries(&user)?;
-    println!("Removed registry: {url}");
-    Ok(())
-}
-
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 fn plugins_dir() -> Result<PathBuf> {
@@ -427,7 +387,7 @@ fn manifest_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".rlean").join("plugins.json"))
 }
 
-fn home_dir() -> Result<PathBuf> {
+pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("USERPROFILE").map(PathBuf::from))
@@ -562,7 +522,7 @@ fn save_manifest(manifest: &InstalledManifest) -> Result<()> {
     Ok(())
 }
 
-fn load_user_registries() -> Result<UserRegistries> {
+pub(crate) fn load_user_registries() -> Result<UserRegistries> {
     let path = home_dir()?.join(".rlean").join("registries.json");
     if !path.exists() {
         return Ok(UserRegistries::default());
@@ -571,7 +531,7 @@ fn load_user_registries() -> Result<UserRegistries> {
     serde_json::from_str(&text).context("Failed to parse registries.json")
 }
 
-fn save_user_registries(r: &UserRegistries) -> Result<()> {
+pub(crate) fn save_user_registries(r: &UserRegistries) -> Result<()> {
     let path = home_dir()?.join(".rlean").join("registries.json");
     std::fs::write(&path, serde_json::to_string_pretty(r)?)?;
     Ok(())

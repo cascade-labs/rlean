@@ -20,4 +20,14 @@ pub trait IHistoricalDataProvider: Send + Sync {
         start: DateTime,
         end: DateTime,
     ) -> Pin<Box<dyn Future<Output = LeanResult<Vec<TradeBar>>> + Send + '_>>;
+
+    /// The earliest date this provider can supply data for, if limited.
+    ///
+    /// When `Some(date)` is returned the framework clips the requested start
+    /// to this date before calling `get_trade_bars`, preventing subscription-
+    /// tier errors (e.g. ThetaData STANDARD only covers data from 2018-01-01).
+    /// Returns `None` (default) when the provider has no known lower bound.
+    fn earliest_date(&self) -> Option<chrono::NaiveDate> {
+        None
+    }
 }
