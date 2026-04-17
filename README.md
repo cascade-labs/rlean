@@ -1,7 +1,6 @@
 # rlean
 
 [![Tests Passing](https://github.com/cascade-labs/rlean/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cascade-labs/rlean/actions/workflows/test.yml)
-[![Coverage](https://codecov.io/gh/cascade-labs/rlean/graph/badge.svg?branch=main)](https://app.codecov.io/gh/cascade-labs/rlean)
 [![gitcgr](https://gitcgr.com/badge/cascade-labs/rlean.svg)](https://gitcgr.com/cascade-labs/rlean)
 
 A Rust rewrite of [QuantConnect LEAN](https://github.com/QuantConnect/Lean), the open-source algorithmic trading engine. rlean targets the same strategy API as LEAN's C# Python bindings — existing `QCAlgorithm`-based strategies run unmodified — while adding a native Rust library for writing high-performance strategies directly. All market data is backed by [Apache Parquet](https://parquet.apache.org/), replacing LEAN's CSV-based data layer.
@@ -18,7 +17,7 @@ A Rust rewrite of [QuantConnect LEAN](https://github.com/QuantConnect/Lean), the
 
 ## CI
 
-GitHub Actions runs `cargo fmt --all --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` on every push to `main` and on every pull request. Test coverage is published from the test workflow and surfaced in the badge above.
+GitHub Actions runs `cargo fmt --all --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` on every push to `main` and on every pull request.
 
 To enforce merge gates on GitHub, configure branch protection or a ruleset for `main` and mark these checks as required: `format`, `check`, `clippy`, and `test`.
 
