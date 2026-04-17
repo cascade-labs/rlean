@@ -93,24 +93,25 @@ impl Indicator for ConnorsRsi {
             .update_price(time, Decimal::from(self.trend_streak));
 
         // PercentRank
-        let pct_rank = if self.prev_value.is_some() && self.prev_value.unwrap_or(dec!(0)) != dec!(0)
-        {
-            let prev = self.prev_value.unwrap();
-            let ratio = (value - prev) / prev;
+        let pct_rank = match self.prev_value {
+            Some(prev) if prev != dec!(0) => {
+                let ratio = (value - prev) / prev;
 
-            let rank = if self.price_changes.is_full() {
-                let count = self.price_changes.len();
-                let below = self.price_changes.iter().filter(|&&x| x < ratio).count();
-                dec!(100) * Decimal::from(below) / Decimal::from(count)
-            } else {
+                let rank = if self.price_changes.is_full() {
+                    let count = self.price_changes.len();
+                    let below = self.price_changes.iter().filter(|&&x| x < ratio).count();
+                    dec!(100) * Decimal::from(below) / Decimal::from(count)
+                } else {
+                    dec!(0)
+                };
+
+                self.price_changes.push(ratio);
+                rank
+            }
+            _ => {
+                self.price_changes.push(dec!(0));
                 dec!(0)
-            };
-
-            self.price_changes.push(ratio);
-            rank
-        } else {
-            self.price_changes.push(dec!(0));
-            dec!(0)
+            }
         };
 
         self.prev_value = Some(value);
