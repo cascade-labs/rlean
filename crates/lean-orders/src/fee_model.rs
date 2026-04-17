@@ -16,12 +16,18 @@ pub struct OrderFee {
 
 impl OrderFee {
     pub fn new(amount: Price, currency: impl Into<String>) -> Self {
-        OrderFee { amount, currency: currency.into() }
+        OrderFee {
+            amount,
+            currency: currency.into(),
+        }
     }
 
     /// Zero fee in USD.
     pub fn zero() -> Self {
-        OrderFee { amount: dec!(0), currency: "USD".into() }
+        OrderFee {
+            amount: dec!(0),
+            currency: "USD".into(),
+        }
     }
 }
 
@@ -103,11 +109,17 @@ pub struct FlatFeeModel {
 
 impl FlatFeeModel {
     pub fn new(fee: Price) -> Self {
-        FlatFeeModel { fee, currency: "USD".into() }
+        FlatFeeModel {
+            fee,
+            currency: "USD".into(),
+        }
     }
 
     pub fn with_currency(fee: Price, currency: impl Into<String>) -> Self {
-        FlatFeeModel { fee, currency: currency.into() }
+        FlatFeeModel {
+            fee,
+            currency: currency.into(),
+        }
     }
 }
 
@@ -128,17 +140,26 @@ pub struct ConstantFeeModel {
 
 impl Default for ConstantFeeModel {
     fn default() -> Self {
-        ConstantFeeModel { fee: dec!(1.00), currency: "USD".into() }
+        ConstantFeeModel {
+            fee: dec!(1.00),
+            currency: "USD".into(),
+        }
     }
 }
 
 impl ConstantFeeModel {
     pub fn new(fee: Price) -> Self {
-        ConstantFeeModel { fee: fee.abs(), currency: "USD".into() }
+        ConstantFeeModel {
+            fee: fee.abs(),
+            currency: "USD".into(),
+        }
     }
 
     pub fn with_currency(fee: Price, currency: impl Into<String>) -> Self {
-        ConstantFeeModel { fee: fee.abs(), currency: currency.into() }
+        ConstantFeeModel {
+            fee: fee.abs(),
+            currency: currency.into(),
+        }
     }
 }
 
@@ -158,21 +179,26 @@ pub struct PercentFeeModel {
 
 impl Default for PercentFeeModel {
     fn default() -> Self {
-        PercentFeeModel { rate: dec!(0.001), currency: "USD".into() }
+        PercentFeeModel {
+            rate: dec!(0.001),
+            currency: "USD".into(),
+        }
     }
 }
 
 impl PercentFeeModel {
     pub fn new(rate: Decimal) -> Self {
-        PercentFeeModel { rate, currency: "USD".into() }
+        PercentFeeModel {
+            rate,
+            currency: "USD".into(),
+        }
     }
 }
 
 impl FeeModel for PercentFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
-        let notional = params.order.abs_quantity()
-            * params.security_price
-            * params.contract_multiplier;
+        let notional =
+            params.order.abs_quantity() * params.security_price * params.contract_multiplier;
         OrderFee::new(notional * self.rate, &self.currency)
     }
 }
@@ -196,7 +222,7 @@ pub struct InteractiveBrokersFeeModel {
 impl Default for InteractiveBrokersFeeModel {
     fn default() -> Self {
         InteractiveBrokersFeeModel {
-            forex_commission_rate: dec!(0.000002),  // 0.20 bps
+            forex_commission_rate: dec!(0.000002), // 0.20 bps
             forex_minimum_fee: dec!(2.00),
             options_fee_per_contract: dec!(0.70),
             futures_fee_per_contract: dec!(0.85),
@@ -217,19 +243,14 @@ impl FeeModel for InteractiveBrokersFeeModel {
 
         match params.security_type {
             SecurityType::Equity => {
-                // $0.005/share, min $1, max 0.5% of trade value
-                // (mirrors C# InteractiveBrokersFeeModel: feePerShare=0.005, minFee=1, maxFeeRate=0.005)
+                // $0.005/share, min $1, max 1% of trade value.
+                // The notional cap is applied after the minimum fee so very small
+                // trades cannot exceed the max-fee rate.
                 let shares = order.abs_quantity();
                 let raw = shares * dec!(0.005);
                 let notional = shares * params.security_price;
-                let max_fee = notional * dec!(0.005);
-                let fee = if raw < dec!(1.00) {
-                    dec!(1.00)
-                } else if raw > max_fee {
-                    max_fee
-                } else {
-                    raw
-                };
+                let max_fee = notional * dec!(0.01);
+                let fee = raw.max(dec!(1.00)).min(max_fee);
                 OrderFee::new(fee, "USD")
             }
             SecurityType::Option | SecurityType::FutureOption | SecurityType::IndexOption => {
@@ -241,9 +262,8 @@ impl FeeModel for InteractiveBrokersFeeModel {
                 OrderFee::new(fee, "USD")
             }
             SecurityType::Forex => {
-                let notional = order.abs_quantity()
-                    * params.security_price
-                    * params.contract_multiplier;
+                let notional =
+                    order.abs_quantity() * params.security_price * params.contract_multiplier;
                 let fee = (self.forex_commission_rate * notional)
                     .abs()
                     .max(self.forex_minimum_fee);
@@ -267,20 +287,30 @@ pub struct BinanceFeeModel {
 
 impl Default for BinanceFeeModel {
     fn default() -> Self {
-        BinanceFeeModel { maker_fee: dec!(0.001), taker_fee: dec!(0.001) }
+        BinanceFeeModel {
+            maker_fee: dec!(0.001),
+            taker_fee: dec!(0.001),
+        }
     }
 }
 
 impl BinanceFeeModel {
     pub fn new(maker_fee: Decimal, taker_fee: Decimal) -> Self {
-        BinanceFeeModel { maker_fee, taker_fee }
+        BinanceFeeModel {
+            maker_fee,
+            taker_fee,
+        }
     }
 }
 
 impl FeeModel for BinanceFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
         let order = params.order;
-        let fee_rate = if is_maker(order) { self.maker_fee } else { self.taker_fee };
+        let fee_rate = if is_maker(order) {
+            self.maker_fee
+        } else {
+            self.taker_fee
+        };
 
         match order.direction() {
             OrderDirection::Buy => {
@@ -291,9 +321,8 @@ impl FeeModel for BinanceFeeModel {
             }
             _ => {
                 // Fee in quote currency
-                let notional = order.abs_quantity()
-                    * params.security_price
-                    * params.contract_multiplier;
+                let notional =
+                    order.abs_quantity() * params.security_price * params.contract_multiplier;
                 OrderFee::new(notional * fee_rate, &params.quote_currency)
             }
         }
@@ -370,19 +399,29 @@ pub struct GDAXFeeModel {
 impl Default for GDAXFeeModel {
     fn default() -> Self {
         // Advanced 1 defaults
-        GDAXFeeModel { maker_fee: dec!(0.006), taker_fee: dec!(0.008) }
+        GDAXFeeModel {
+            maker_fee: dec!(0.006),
+            taker_fee: dec!(0.008),
+        }
     }
 }
 
 impl GDAXFeeModel {
     pub fn new(maker_fee: Decimal, taker_fee: Decimal) -> Self {
-        GDAXFeeModel { maker_fee, taker_fee }
+        GDAXFeeModel {
+            maker_fee,
+            taker_fee,
+        }
     }
 }
 
 impl FeeModel for GDAXFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
-        let fee_rate = if is_maker(params.order) { self.maker_fee } else { self.taker_fee };
+        let fee_rate = if is_maker(params.order) {
+            self.maker_fee
+        } else {
+            self.taker_fee
+        };
         let unit_price = params.security_price * params.contract_multiplier;
         let fee = unit_price * params.order.abs_quantity() * fee_rate;
         OrderFee::new(fee, &params.quote_currency)
@@ -418,7 +457,11 @@ impl Default for KrakenFeeModel {
 impl FeeModel for KrakenFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
         let order = params.order;
-        let fee_rate = if is_maker(order) { self.maker_fee } else { self.taker_fee };
+        let fee_rate = if is_maker(order) {
+            self.maker_fee
+        } else {
+            self.taker_fee
+        };
 
         let unit_price = params.security_price * params.contract_multiplier;
 
@@ -452,31 +495,43 @@ pub struct BybitFeeModel {
 
 impl Default for BybitFeeModel {
     fn default() -> Self {
-        BybitFeeModel { maker_fee: dec!(0.001), taker_fee: dec!(0.001) }
+        BybitFeeModel {
+            maker_fee: dec!(0.001),
+            taker_fee: dec!(0.001),
+        }
     }
 }
 
 impl BybitFeeModel {
     pub fn new(maker_fee: Decimal, taker_fee: Decimal) -> Self {
-        BybitFeeModel { maker_fee, taker_fee }
+        BybitFeeModel {
+            maker_fee,
+            taker_fee,
+        }
     }
 
     /// Perpetuals preset: maker 0.02%, taker 0.055%.
     pub fn perpetuals() -> Self {
-        BybitFeeModel { maker_fee: dec!(0.0002), taker_fee: dec!(0.00055) }
+        BybitFeeModel {
+            maker_fee: dec!(0.0002),
+            taker_fee: dec!(0.00055),
+        }
     }
 }
 
 impl FeeModel for BybitFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
         let order = params.order;
-        let fee_rate = if is_maker(order) { self.maker_fee } else { self.taker_fee };
+        let fee_rate = if is_maker(order) {
+            self.maker_fee
+        } else {
+            self.taker_fee
+        };
 
         if params.security_type == SecurityType::CryptoFuture {
             // Position value in quote currency
-            let notional = order.abs_quantity()
-                * params.security_price
-                * params.contract_multiplier;
+            let notional =
+                order.abs_quantity() * params.security_price * params.contract_multiplier;
             return OrderFee::new(notional * fee_rate, &params.quote_currency);
         }
 
@@ -615,7 +670,9 @@ pub struct FxcmFeeModel {
 
 impl Default for FxcmFeeModel {
     fn default() -> Self {
-        FxcmFeeModel { currency: "USD".into() }
+        FxcmFeeModel {
+            currency: "USD".into(),
+        }
     }
 }
 
@@ -626,7 +683,9 @@ impl FxcmFeeModel {
     ];
 
     pub fn new(currency: impl Into<String>) -> Self {
-        FxcmFeeModel { currency: currency.into() }
+        FxcmFeeModel {
+            currency: currency.into(),
+        }
     }
 
     fn is_major(ticker: &str) -> bool {
@@ -641,7 +700,11 @@ impl FeeModel for FxcmFeeModel {
         }
 
         let ticker = &params.order.symbol.value;
-        let rate = if Self::is_major(ticker) { dec!(0.04) } else { dec!(0.06) };
+        let rate = if Self::is_major(ticker) {
+            dec!(0.04)
+        } else {
+            dec!(0.06)
+        };
         // $rate per side per 1k lot
         let fee = (rate * params.order.abs_quantity() / dec!(1000)).abs();
         OrderFee::new(fee, &self.currency)

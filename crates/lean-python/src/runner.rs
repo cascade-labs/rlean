@@ -4,21 +4,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use serde_json;
-use chrono::Datelike;
 use chrono::NaiveDate;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::prelude::ToPrimitive as _;
+use rust_decimal::Decimal;
+use serde_json;
 use tracing::{info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
-use lean_core::{DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan};
-use lean_data::{CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataSubscription, CustomDataTransport, IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig, TradeBar};
+use lean_core::{
+    DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan,
+};
+use lean_data::{
+    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
+    CustomDataTransport, IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig,
+    TradeBar,
+};
+use lean_options::payoff::{get_exercise_quantity, intrinsic_value};
 use lean_options::{OptionChain, OptionContract, OptionContractData};
-use lean_options::payoff::{intrinsic_value, is_auto_exercised, get_exercise_quantity};
 use lean_orders::{
     fee_model::{FeeModel, InteractiveBrokersFeeModel, OrderFeeParameters},
     fill_model::ImmediateFillModel,
@@ -27,12 +31,14 @@ use lean_orders::{
     slippage::NullSlippageModel,
 };
 use lean_statistics::{PortfolioStatistics, Trade};
-use lean_storage::{DataCache, FactorFileEntry, OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig, custom_data_path, custom_data_history_path, option_eod_path};
+use lean_storage::{
+    custom_data_history_path, custom_data_path, option_eod_path, DataCache, FactorFileEntry,
+    OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig,
+};
 
 use crate::charting::ChartCollection;
-use crate::py_adapter::{PyAlgorithmAdapter, set_algorithm_time};
+use crate::py_adapter::{set_algorithm_time, PyAlgorithmAdapter};
 use crate::py_data::SliceProxy;
-use crate::py_qc_algorithm::PyQcAlgorithm;
 
 pub struct RunConfig {
     pub data_root: PathBuf,
@@ -67,22 +73,22 @@ impl Default for RunConfig {
 }
 
 pub struct BacktestResult {
-    pub trading_days:  i64,
-    pub final_value:   f64,
-    pub total_return:  f64,
+    pub trading_days: i64,
+    pub final_value: f64,
+    pub total_return: f64,
     pub starting_cash: f64,
-    pub start_date:    chrono::NaiveDate,
-    pub end_date:      chrono::NaiveDate,
+    pub start_date: chrono::NaiveDate,
+    pub end_date: chrono::NaiveDate,
     /// Daily portfolio values (one per trading day, in order).
-    pub equity_curve:  Vec<f64>,
+    pub equity_curve: Vec<f64>,
     /// ISO date strings matching equity_curve.
-    pub daily_dates:   Vec<String>,
+    pub daily_dates: Vec<String>,
     /// Full statistics computed at the end of the backtest.
-    pub statistics:    PortfolioStatistics,
+    pub statistics: PortfolioStatistics,
     /// Custom strategy charts plotted via self.plot().
-    pub charts:        ChartCollection,
+    pub charts: ChartCollection,
     /// All order fill events from the backtest run.
-    pub order_events:  Vec<OrderEvent>,
+    pub order_events: Vec<OrderEvent>,
     /// Symbols/dates for which data was found in the Parquet store.
     pub succeeded_data_requests: Vec<String>,
     /// Symbols/dates for which no data was found.
@@ -103,24 +109,69 @@ impl BacktestResult {
         let row = |label: &str, value: &str| {
             println!("║  {:<30} {:>20}  ║", label, value);
         };
-        row("Start Date",             &self.start_date.to_string());
-        row("End Date",               &self.end_date.to_string());
-        row("Trading Days",           &self.trading_days.to_string());
-        row("Starting Cash",          &format!("${:.2}", self.starting_cash));
-        row("Final Value",            &format!("${:.2}", self.final_value));
-        row("Total Return",           &format!("{:.2}%", self.total_return * 100.0));
-        row("CAGR",                   &format!("{:.2}%", s.compounding_annual_return.to_f64().unwrap_or(0.0) * 100.0));
-        row("Sharpe Ratio",           &format!("{:.3}", s.sharpe_ratio.to_f64().unwrap_or(0.0)));
-        row("Sortino Ratio",          &format!("{:.3}", s.sortino_ratio.to_f64().unwrap_or(0.0)));
-        row("Probabilistic SR",       &format!("{:.1}%", s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0) * 100.0));
-        row("Calmar Ratio",           &format!("{:.3}", s.calmar_ratio.to_f64().unwrap_or(0.0)));
-        row("Omega Ratio",            &format!("{:.3}", s.omega_ratio.to_f64().unwrap_or(0.0)));
-        row("Max Drawdown",           &format!("{:.2}%", s.drawdown.to_f64().unwrap_or(0.0) * 100.0));
-        row("Recovery Factor",        &format!("{:.2}", s.recovery_factor.to_f64().unwrap_or(0.0)));
-        row("Annual Std Dev",         &format!("{:.2}%", s.annual_standard_deviation.to_f64().unwrap_or(0.0) * 100.0));
-        row("Alpha",                  &format!("{:.2}%", s.alpha.to_f64().unwrap_or(0.0) * 100.0));
-        row("Beta",                   &format!("{:.3}", s.beta.to_f64().unwrap_or(0.0)));
-        row("Treynor Ratio",          &format!("{:.3}", s.treynor_ratio.to_f64().unwrap_or(0.0)));
+        row("Start Date", &self.start_date.to_string());
+        row("End Date", &self.end_date.to_string());
+        row("Trading Days", &self.trading_days.to_string());
+        row("Starting Cash", &format!("${:.2}", self.starting_cash));
+        row("Final Value", &format!("${:.2}", self.final_value));
+        row(
+            "Total Return",
+            &format!("{:.2}%", self.total_return * 100.0),
+        );
+        row(
+            "CAGR",
+            &format!(
+                "{:.2}%",
+                s.compounding_annual_return.to_f64().unwrap_or(0.0) * 100.0
+            ),
+        );
+        row(
+            "Sharpe Ratio",
+            &format!("{:.3}", s.sharpe_ratio.to_f64().unwrap_or(0.0)),
+        );
+        row(
+            "Sortino Ratio",
+            &format!("{:.3}", s.sortino_ratio.to_f64().unwrap_or(0.0)),
+        );
+        row(
+            "Probabilistic SR",
+            &format!(
+                "{:.1}%",
+                s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0) * 100.0
+            ),
+        );
+        row(
+            "Calmar Ratio",
+            &format!("{:.3}", s.calmar_ratio.to_f64().unwrap_or(0.0)),
+        );
+        row(
+            "Omega Ratio",
+            &format!("{:.3}", s.omega_ratio.to_f64().unwrap_or(0.0)),
+        );
+        row(
+            "Max Drawdown",
+            &format!("{:.2}%", s.drawdown.to_f64().unwrap_or(0.0) * 100.0),
+        );
+        row(
+            "Recovery Factor",
+            &format!("{:.2}", s.recovery_factor.to_f64().unwrap_or(0.0)),
+        );
+        row(
+            "Annual Std Dev",
+            &format!(
+                "{:.2}%",
+                s.annual_standard_deviation.to_f64().unwrap_or(0.0) * 100.0
+            ),
+        );
+        row(
+            "Alpha",
+            &format!("{:.2}%", s.alpha.to_f64().unwrap_or(0.0) * 100.0),
+        );
+        row("Beta", &format!("{:.3}", s.beta.to_f64().unwrap_or(0.0)));
+        row(
+            "Treynor Ratio",
+            &format!("{:.3}", s.treynor_ratio.to_f64().unwrap_or(0.0)),
+        );
         println!("╚══════════════════════════════════════════════════════╝");
     }
 }
@@ -132,7 +183,8 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
     let parent = strategy_path.parent().unwrap_or(Path::new("."));
     let sys = py.import("sys").context("failed to import sys")?;
     let path_list = sys.getattr("path").context("no sys.path")?;
-    path_list.call_method1("insert", (0, parent.to_string_lossy().as_ref()))
+    path_list
+        .call_method1("insert", (0, parent.to_string_lossy().as_ref()))
         .context("failed to insert to sys.path")?;
 
     // Read and compile the strategy source.
@@ -142,9 +194,9 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
 
     // pyo3 0.23 requires &CStr
     use std::ffi::CString;
-    let code_c     = CString::new(code_str.as_str()).context("strategy code contains null byte")?;
+    let code_c = CString::new(code_str.as_str()).context("strategy code contains null byte")?;
     let filename_c = CString::new(filename_str.as_str()).context("filename contains null byte")?;
-    let modname_c  = CString::new("strategy").unwrap();
+    let modname_c = CString::new("strategy").unwrap();
 
     let module = PyModule::from_code(py, &code_c, &filename_c, &modname_c)
         .with_context(|| format!("failed to compile {}", strategy_path.display()))?;
@@ -154,7 +206,8 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
     let lean_mod = py.import("AlgorithmImports")
         .or_else(|_| py.import("lean_rust"))
         .context("AlgorithmImports not importable — was append_to_inittab!(lean_python::AlgorithmImports) called before prepare_freethreaded_python()?")?;
-    let base_class = lean_mod.getattr("QCAlgorithm")
+    let base_class = lean_mod
+        .getattr("QCAlgorithm")
         .or_else(|_| lean_mod.getattr("QcAlgorithm"))
         .context("QCAlgorithm not found in AlgorithmImports")?;
 
@@ -164,8 +217,12 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
 
     let mut strategy_class: Option<Bound<'_, PyAny>> = None;
     for (_, value) in module.dict() {
-        if !value.is_instance_of::<PyType>() { continue; }
-        if value.eq(&base_class).unwrap_or(false) { continue; }
+        if !value.is_instance_of::<PyType>() {
+            continue;
+        }
+        if value.eq(&base_class).unwrap_or(false) {
+            continue;
+        }
 
         let is_sub = issubclass_fn
             .call1((&value, &base_class))
@@ -173,7 +230,8 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
             .unwrap_or(false);
 
         if is_sub {
-            let name = value.getattr("__name__")
+            let name = value
+                .getattr("__name__")
                 .map(|n| n.to_string())
                 .unwrap_or_default();
             info!("Found strategy class: {}", name);
@@ -182,12 +240,16 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
         }
     }
 
-    let cls = strategy_class
-        .ok_or_else(|| anyhow::anyhow!(
-            "No QcAlgorithm subclass found in {}", strategy_path.display()
-        ))?;
+    let cls = strategy_class.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No QcAlgorithm subclass found in {}",
+            strategy_path.display()
+        )
+    })?;
 
-    let instance    = cls.call0().context("failed to instantiate strategy class")?;
+    let instance = cls
+        .call0()
+        .context("failed to instantiate strategy class")?;
     let instance_py = instance.unbind();
 
     PyAlgorithmAdapter::from_instance(py, instance_py)
@@ -204,20 +266,31 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut adapter = Python::with_gil(|py| load_strategy(py, strategy_path))?;
 
     // ── initialize ──────────────────────────────────────────────────────────
-    adapter.initialize().context("strategy initialize() failed")?;
+    adapter
+        .initialize()
+        .context("strategy initialize() failed")?;
 
-    let start_date = config.start_date_override.unwrap_or_else(|| adapter.start_date().date_utc());
-    let end_date   = config.end_date_override.unwrap_or_else(|| adapter.end_date().date_utc());
+    let start_date = config
+        .start_date_override
+        .unwrap_or_else(|| adapter.start_date().date_utc());
+    let end_date = config
+        .end_date_override
+        .unwrap_or_else(|| adapter.end_date().date_utc());
 
     let starting_cash = {
         use rust_decimal::prelude::ToPrimitive;
-        adapter.inner.lock().unwrap().portfolio_value().to_f64().unwrap_or(100_000.0)
+        adapter
+            .inner
+            .lock()
+            .unwrap()
+            .portfolio_value()
+            .to_f64()
+            .unwrap_or(100_000.0)
     };
 
     // ── gather subscriptions ────────────────────────────────────────────────
-    let subscriptions: Vec<Arc<SubscriptionDataConfig>> = {
-        adapter.inner.lock().unwrap().subscription_manager.get_all()
-    };
+    let subscriptions: Vec<Arc<SubscriptionDataConfig>> =
+        { adapter.inner.lock().unwrap().subscription_manager.get_all() };
 
     if subscriptions.is_empty() {
         warn!("No subscriptions — strategy did not call add_equity/add_forex.");
@@ -226,7 +299,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── determine effective benchmark ticker ────────────────────────────────
     // Use the symbol set by set_benchmark(), or fall back to SPY.
     let effective_benchmark_ticker: String = {
-        adapter.inner.lock().unwrap()
+        adapter
+            .inner
+            .lock()
+            .unwrap()
             .benchmark_symbol
             .clone()
             .unwrap_or_else(|| "SPY".to_string())
@@ -240,21 +316,28 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         let market = lean_core::Market::usa();
         Symbol::create_equity(&effective_benchmark_ticker, &market)
     };
-    let benchmark_in_subs: bool = subscriptions.iter()
-        .any(|s| s.symbol.permtick.eq_ignore_ascii_case(&effective_benchmark_ticker));
+    let benchmark_in_subs: bool = subscriptions.iter().any(|s| {
+        s.symbol
+            .permtick
+            .eq_ignore_ascii_case(&effective_benchmark_ticker)
+    });
 
     info!(
         "Benchmark: {} ({})",
         effective_benchmark_ticker,
-        if benchmark_in_subs { "already subscribed" } else { "internal subscription" }
+        if benchmark_in_subs {
+            "already subscribed"
+        } else {
+            "internal subscription"
+        }
     );
 
     // ── build infrastructure ────────────────────────────────────────────────
-    let reader      = Arc::new(ParquetReader::new());
-    let resolver    = PathResolver::new(config.data_root.clone());
-    let cache       = DataCache::new(50_000);
+    let reader = Arc::new(ParquetReader::new());
+    let resolver = PathResolver::new(config.data_root.clone());
+    let cache = DataCache::new(50_000);
     let transactions = adapter.inner.lock().unwrap().transactions.clone();
-    let portfolio    = adapter.inner.lock().unwrap().portfolio.clone();
+    let portfolio = adapter.inner.lock().unwrap().portfolio.clone();
 
     let order_processor = OrderProcessor::new(
         Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
@@ -270,7 +353,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             start_date,
             end_date,
             &resolver,
-        ).await?;
+        )
+        .await?;
     }
 
     // ── factor files: load from disk ─────────────────────────────────────────
@@ -283,8 +367,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     for sub in &subscriptions {
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
-        let sec    = format!("{}", sub.symbol.security_type()).to_lowercase();
-        let factor_path = config.data_root
+        let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
+        let factor_path = config
+            .data_root
             .join(&sec)
             .join(&market)
             .join("factor_files")
@@ -340,7 +425,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         map
     };
 
-
     // ── warm-up loop ────────────────────────────────────────────────────────
     // Determine the warm-up window from the strategy's configuration.
     // The strategy may call set_warm_up(days) or set_warm_up_bars(n) in
@@ -375,7 +459,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 wu_start,
                 start_date - chrono::Duration::days(1),
                 &resolver,
-            ).await?;
+            )
+            .await?;
         }
 
         let mut wu_date = wu_start;
@@ -385,18 +470,20 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             let mut slice = Slice::new(utc_time);
             for sub in &subscriptions {
-                let sid     = sub.symbol.id.sid;
+                let sid = sub.symbol.id.sid;
                 let day_key = day_key(wu_date);
-                let path    = resolver.trade_bar(&sub.symbol, sub.resolution, wu_date).to_path();
+                let path = resolver
+                    .trade_bar(&sub.symbol, sub.resolution, wu_date)
+                    .to_path();
 
                 if path.exists() {
                     let bars = if let Some(cached) = cache.get_bars(sid, day_key) {
                         cached.as_ref().clone()
                     } else {
                         let day_start = date_to_datetime(wu_date, 0, 0, 0);
-                        let day_end   = date_to_datetime(wu_date, 23, 59, 59);
-                        let params    = QueryParams::new().with_time_range(day_start, day_end);
-                        let loaded    = reader
+                        let day_end = date_to_datetime(wu_date, 23, 59, 59);
+                        let params = QueryParams::new().with_time_range(day_start, day_end);
+                        let loaded = reader
                             .read_trade_bars(&[path], sub.symbol.clone(), &params)
                             .await
                             .unwrap_or_default();
@@ -410,8 +497,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         } else {
                             bar
                         };
-                        adapter.inner.lock().unwrap()
-                            .securities.update_price(&bar.symbol, bar.close);
+                        adapter
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .securities
+                            .update_price(&bar.symbol, bar.close);
                         portfolio.update_prices(&bar.symbol, bar.close);
                         slice.add_bar(bar);
                     }
@@ -434,30 +525,37 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     }
 
     // ── detect resolution mode ───────────────────────────────────────────────
-    let is_intraday = subscriptions.iter().any(|s| s.resolution.is_high_resolution());
+    let is_intraday = subscriptions
+        .iter()
+        .any(|s| s.resolution.is_high_resolution());
 
     // ── pre-load all subscription bars (daily mode only) ─────────────────────
     // For daily (and other single-file) resolutions the same parquet file would
     // be opened and scanned once per trading day in the loop.  Pre-loading the
     // full date range up front reduces 629 file reads to 1 per subscription.
     let bar_map: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>> = if !is_intraday {
-        let full_params = QueryParams::new()
-            .with_time_range(date_to_datetime(start_date, 0, 0, 0),
-                             date_to_datetime(end_date, 23, 59, 59));
+        let full_params = QueryParams::new().with_time_range(
+            date_to_datetime(start_date, 0, 0, 0),
+            date_to_datetime(end_date, 23, 59, 59),
+        );
         let mut map = HashMap::new();
         for sub in &subscriptions {
-            let sid  = sub.symbol.id.sid;
-            let path = resolver.trade_bar(&sub.symbol, sub.resolution, start_date).to_path();
+            let sid = sub.symbol.id.sid;
+            let path = resolver
+                .trade_bar(&sub.symbol, sub.resolution, start_date)
+                .to_path();
             if path.exists() {
                 let bars = reader
                     .read_trade_bars(&[path], sub.symbol.clone(), &full_params)
                     .await
                     .unwrap_or_default();
-                let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> = bars
-                    .into_iter()
-                    .map(|b| (b.time.date_utc(), b))
-                    .collect();
-                info!("Pre-loaded {} bars for {}", date_map.len(), sub.symbol.value);
+                let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
+                    bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+                info!(
+                    "Pre-loaded {} bars for {}",
+                    date_map.len(),
+                    sub.symbol.value
+                );
                 map.insert(sid, date_map);
             }
         }
@@ -480,11 +578,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         if !benchmark_in_subs {
             let bm_sym = benchmark_symbol_obj.clone();
             let day_start = date_to_datetime(start_date, 0, 0, 0);
-            let day_end   = date_to_datetime(end_date, 23, 59, 59);
-            let params    = QueryParams::new().with_time_range(day_start, day_end);
-            let bm_path = resolver.trade_bar(&bm_sym, Resolution::Daily, start_date).to_path();
+            let day_end = date_to_datetime(end_date, 23, 59, 59);
+            let params = QueryParams::new().with_time_range(day_start, day_end);
+            let bm_path = resolver
+                .trade_bar(&bm_sym, Resolution::Daily, start_date)
+                .to_path();
             if bm_path.exists() {
-                match reader.read_trade_bars(&[bm_path], bm_sym.clone(), &params).await {
+                match reader
+                    .read_trade_bars(&[bm_path], bm_sym.clone(), &params)
+                    .await
+                {
                     Ok(bars) => {
                         for b in bars {
                             let d = b.time.date_utc();
@@ -492,7 +595,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                         info!(
                             "Loaded {} benchmark price points for {}",
-                            map.len(), effective_benchmark_ticker
+                            map.len(),
+                            effective_benchmark_ticker
                         );
                     }
                     Err(e) => {
@@ -506,7 +610,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 warn!(
                     "Benchmark data file not found for {} at {} — proceeding without benchmark",
                     effective_benchmark_ticker,
-                    resolver.trade_bar(&bm_sym, Resolution::Daily, start_date).to_path().display()
+                    resolver
+                        .trade_bar(&bm_sym, Resolution::Daily, start_date)
+                        .to_path()
+                        .display()
                 );
             }
         }
@@ -539,37 +646,53 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     //
     // key: ticker (uppercased) → date → points for that date
     let custom_history: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = {
-        let subs: Vec<CustomDataSubscription> = adapter.inner.lock().unwrap()
-            .custom_data_subscriptions.clone();
+        let subs: Vec<CustomDataSubscription> = adapter
+            .inner
+            .lock()
+            .unwrap()
+            .custom_data_subscriptions
+            .clone();
         let mut out: HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>> = HashMap::new();
 
-        // Build a single async HTTP client for all downloads.
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .user_agent("Mozilla/5.0 (compatible; rlean/0.1)")
-            .build()
-            .unwrap_or_default();
-
         for sub in &subs {
-            let Some(source) = config.custom_data_sources.iter().find(|s| s.name() == sub.source_type) else {
+            let Some(source) = config
+                .custom_data_sources
+                .iter()
+                .find(|s| s.name() == sub.source_type)
+            else {
                 continue;
             };
             if !source.is_full_history_source() {
                 continue;
             }
-            let history_path = custom_data_history_path(&config.data_root, &sub.source_type, &sub.ticker);
+            let history_path =
+                custom_data_history_path(&config.data_root, &sub.source_type, &sub.ticker);
 
             // Try reading from existing on-disk cache first (synchronous, fast).
             let all_points: Vec<CustomDataPoint> = if history_path.exists() {
                 let hp = history_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    ParquetReader::new().read_custom_data_points(&hp).unwrap_or_default()
-                }).await.unwrap_or_default()
+                    ParquetReader::new()
+                        .read_custom_data_points(&hp)
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default()
             } else {
                 // Download full series using async HTTP.
-                let data_source = match source.get_source(&sub.ticker, NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(), &sub.config) {
+                let data_source = match source.get_source(
+                    &sub.ticker,
+                    NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+                    &sub.config,
+                ) {
                     Some(s) => s,
-                    None => { warn!("custom data: get_source returned None for {}/{}", sub.source_type, sub.ticker); continue; }
+                    None => {
+                        warn!(
+                            "custom data: get_source returned None for {}/{}",
+                            sub.source_type, sub.ticker
+                        );
+                        continue;
+                    }
                 };
                 let raw = match data_source.transport {
                     lean_data::custom::CustomDataTransport::Http => {
@@ -579,8 +702,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let output = tokio::process::Command::new("curl")
                             .args([
                                 "-s",
-                                "--max-time", "120",
-                                "-L",  // follow redirects
+                                "--max-time",
+                                "120",
+                                "-L", // follow redirects
                                 &data_source.uri,
                             ])
                             .output()
@@ -591,11 +715,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             }
                             Ok(out) => {
                                 let stderr = String::from_utf8_lossy(&out.stderr);
-                                warn!("custom data full-history curl failed for {}/{}: {}", sub.source_type, sub.ticker, stderr);
+                                warn!(
+                                    "custom data full-history curl failed for {}/{}: {}",
+                                    sub.source_type, sub.ticker, stderr
+                                );
                                 continue;
                             }
                             Err(e) => {
-                                warn!("custom data full-history download failed for {}/{}: {}", sub.source_type, sub.ticker, e);
+                                warn!(
+                                    "custom data full-history download failed for {}/{}: {}",
+                                    sub.source_type, sub.ticker, e
+                                );
                                 continue;
                             }
                         }
@@ -603,7 +733,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     lean_data::custom::CustomDataTransport::LocalFile => {
                         match std::fs::read_to_string(&data_source.uri) {
                             Ok(t) => t,
-                            Err(e) => { warn!("custom data local file read failed for {}/{}: {}", sub.source_type, sub.ticker, e); continue; }
+                            Err(e) => {
+                                warn!(
+                                    "custom data local file read failed for {}/{}: {}",
+                                    sub.source_type, sub.ticker, e
+                                );
+                                continue;
+                            }
                         }
                     }
                 };
@@ -614,10 +750,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     raw.lines()
                         .filter_map(|line| source_clone.read_history_line(line, &cfg_clone))
                         .collect()
-                }).await.unwrap_or_default();
+                })
+                .await
+                .unwrap_or_default();
 
                 if pts.is_empty() {
-                    warn!("custom data: no points parsed for {}/{}", sub.source_type, sub.ticker);
+                    warn!(
+                        "custom data: no points parsed for {}/{}",
+                        sub.source_type, sub.ticker
+                    );
                     continue;
                 }
                 // Cache to Parquet (off the async thread).
@@ -627,14 +768,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     if let Some(parent) = hp.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(e) = ParquetWriter::new(WriterConfig::default()).write_custom_data_points(&pts_clone, &hp) {
+                    if let Err(e) = ParquetWriter::new(WriterConfig::default())
+                        .write_custom_data_points(&pts_clone, &hp)
+                    {
                         warn!("custom data: failed to cache history: {}", e);
                     }
-                }).await.ok();
+                })
+                .await
+                .ok();
                 pts
             };
 
-            info!("custom data: loaded {} history points for {}/{}", all_points.len(), sub.source_type, sub.ticker);
+            info!(
+                "custom data: loaded {} history points for {}/{}",
+                all_points.len(),
+                sub.source_type,
+                sub.ticker
+            );
             // Index by date.
             let mut by_date: HashMap<NaiveDate, Vec<CustomDataPoint>> = HashMap::new();
             for pt in all_points {
@@ -652,18 +802,24 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut equity_curve: Vec<Decimal> = Vec::new();
     let mut daily_dates: Vec<String> = Vec::new();
 
-    info!("Backtest: {} → {} ({})", start_date, end_date, if is_intraday { "minute" } else { "daily" });
+    info!(
+        "Backtest: {} → {} ({})",
+        start_date,
+        end_date,
+        if is_intraday { "minute" } else { "daily" }
+    );
 
     while current_date <= end_date {
         if is_intraday {
             // ── MINUTE LOOP ──────────────────────────────────────────────────
             // Load minute trade and quote bars from Parquet for each subscription.
             let mut day_trade_bars: HashMap<u64, Vec<lean_data::TradeBar>> = HashMap::new();
-            let mut day_quote_bars: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+            let day_quote_bars: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
 
-            let day_params = QueryParams::new()
-                .with_time_range(date_to_datetime(current_date, 0, 0, 0),
-                                 date_to_datetime(current_date, 23, 59, 59));
+            let day_params = QueryParams::new().with_time_range(
+                date_to_datetime(current_date, 0, 0, 0),
+                date_to_datetime(current_date, 23, 59, 59),
+            );
 
             for sub in &subscriptions {
                 // In intraday mode skip low-resolution subscriptions (e.g. the daily
@@ -675,9 +831,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
 
                 let sid = sub.symbol.id.sid;
-                let trade_path = resolver.trade_bar(&sub.symbol, sub.resolution, current_date).to_path();
+                let trade_path = resolver
+                    .trade_bar(&sub.symbol, sub.resolution, current_date)
+                    .to_path();
                 if trade_path.exists() {
-                    match reader.read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params).await {
+                    match reader
+                        .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
+                        .await
+                    {
                         Ok(mut bars) if !bars.is_empty() => {
                             // Filter pre-market / after-hours bars for subscriptions where
                             // extended_market_hours=false (the default for US equity).
@@ -688,14 +849,24 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             // non-trading days (weekends/holidays) by the data provider.
                             bars.retain(|b| b.close > rust_decimal::Decimal::ZERO);
                             if !bars.is_empty() {
-                                succeeded_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
+                                succeeded_data_requests
+                                    .push(format!("{}/{}", sub.symbol.value, current_date));
                                 day_trade_bars.insert(sid, bars);
                             } else {
-                                failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
+                                failed_data_requests
+                                    .push(format!("{}/{}", sub.symbol.value, current_date));
                             }
                         }
-                        Ok(_) => { failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date)); }
-                        Err(e) => { warn!("Failed to read minute bars for {} on {}: {}", sub.symbol.value, current_date, e); }
+                        Ok(_) => {
+                            failed_data_requests
+                                .push(format!("{}/{}", sub.symbol.value, current_date));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to read minute bars for {} on {}: {}",
+                                sub.symbol.value, current_date, e
+                            );
+                        }
                     }
                 } else {
                     failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
@@ -705,9 +876,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             }
 
             // Collect union of all minute timestamps across subscriptions.
-            let mut all_timestamps: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+            let mut all_timestamps: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
             for bars in day_trade_bars.values() {
-                for b in bars { all_timestamps.insert(b.time.0); }
+                for b in bars {
+                    all_timestamps.insert(b.time.0);
+                }
             }
 
             let has_data = !all_timestamps.is_empty();
@@ -716,32 +890,40 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 trading_days += 1;
 
                 // Build per-timestamp lookup: sid → bar at that timestamp
-                let mut trade_by_ts: HashMap<u64, HashMap<i64, lean_data::TradeBar>> = HashMap::new();
+                let mut trade_by_ts: HashMap<u64, HashMap<i64, lean_data::TradeBar>> =
+                    HashMap::new();
                 for (&sid, bars) in &day_trade_bars {
                     let mut ts_map: HashMap<i64, lean_data::TradeBar> = HashMap::new();
-                    for b in bars { ts_map.insert(b.time.0, b.clone()); }
+                    for b in bars {
+                        ts_map.insert(b.time.0, b.clone());
+                    }
                     trade_by_ts.insert(sid, ts_map);
                 }
 
                 let mut quote_by_ts: HashMap<u64, HashMap<i64, QuoteBar>> = HashMap::new();
                 for (&sid, qbars) in &day_quote_bars {
                     let mut ts_map: HashMap<i64, QuoteBar> = HashMap::new();
-                    for q in qbars { ts_map.insert(q.time.0, q.clone()); }
+                    for q in qbars {
+                        ts_map.insert(q.time.0, q.clone());
+                    }
                     quote_by_ts.insert(sid, ts_map);
                 }
 
                 // Fetch and deliver option chains once at the start of each trading day.
                 {
-                    let option_subs: Vec<Symbol> = {
-                        adapter.inner.lock().unwrap().option_subscriptions.clone()
-                    };
+                    let option_subs: Vec<Symbol> =
+                        { adapter.inner.lock().unwrap().option_subscriptions.clone() };
 
                     let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
                     for canonical in &option_subs {
                         let underlying_ticker = canonical.permtick.trim_start_matches('?');
                         let spot = {
-                            adapter.inner.lock().unwrap()
-                                .securities.all()
+                            adapter
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .securities
+                                .all()
                                 .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
                                 .map(|s| s.current_price())
                                 .unwrap_or(Decimal::ZERO)
@@ -752,10 +934,24 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             let bars = tokio::task::spawn_blocking({
                                 let provider = config.history_provider.clone();
                                 let data_root = config.data_root.clone();
-                                move || load_option_eod_bars(&data_root, &ticker, current_date, provider.as_ref())
-                            }).await.unwrap_or_default();
+                                move || {
+                                    load_option_eod_bars(
+                                        &data_root,
+                                        &ticker,
+                                        current_date,
+                                        provider.as_ref(),
+                                    )
+                                }
+                            })
+                            .await
+                            .unwrap_or_default();
                             if !bars.is_empty() {
-                                build_option_chain_from_eod_bars(canonical, spot, current_date, &bars)
+                                build_option_chain_from_eod_bars(
+                                    canonical,
+                                    spot,
+                                    current_date,
+                                    &bars,
+                                )
                             } else {
                                 OptionChain::new(canonical.clone(), spot)
                             }
@@ -771,13 +967,20 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                 let chains_snapshot: Vec<(String, OptionChain)> = {
                     let alg = adapter.inner.lock().unwrap();
-                    alg.option_chains.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    alg.option_chains
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 };
 
                 // Fetch custom data once per day for minute-mode too.
                 let custom_subs: Vec<CustomDataSubscription> = {
-                    adapter.inner.lock().unwrap()
-                        .custom_data_subscriptions.clone()
+                    adapter
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .custom_data_subscriptions
+                        .clone()
                 };
                 let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
                 for sub in &custom_subs {
@@ -789,7 +992,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                     } else {
                         // Date-keyed source: per-day HTTP fetch with per-day Parquet cache.
-                        let source = config.custom_data_sources.iter()
+                        let source = config
+                            .custom_data_sources
+                            .iter()
                             .find(|s| s.name() == sub.source_type)
                             .cloned();
                         let data_root = config.data_root.clone();
@@ -797,8 +1002,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let ticker = sub.ticker.clone();
                         let cfg = sub.config.clone();
                         let points = tokio::task::spawn_blocking(move || {
-                            load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
-                        }).await.unwrap_or_default();
+                            load_custom_data_points(
+                                &data_root,
+                                &source_type,
+                                &ticker,
+                                current_date,
+                                source.as_ref(),
+                                &cfg,
+                            )
+                        })
+                        .await
+                        .unwrap_or_default();
                         if !points.is_empty() {
                             custom_data_for_day.insert(sub.ticker.clone(), points);
                         }
@@ -825,18 +1039,26 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             } else {
                                 raw_bar.clone()
                             };
-                            adapter.inner.lock().unwrap()
-                                .securities.update_price(&bar.symbol, bar.close);
+                            adapter
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .securities
+                                .update_price(&bar.symbol, bar.close);
                             portfolio.update_prices(&bar.symbol, bar.close);
                             minute_slice.add_bar(bar);
                         }
                     }
 
                     // Gather quote bars for this minute.
-                    let minute_quote_bars: HashMap<u64, QuoteBar> = subscriptions.iter()
+                    let minute_quote_bars: HashMap<u64, QuoteBar> = subscriptions
+                        .iter()
                         .filter_map(|sub| {
                             let sid = sub.symbol.id.sid;
-                            quote_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)).map(|q| (sid, q.clone()))
+                            quote_by_ts
+                                .get(&sid)
+                                .and_then(|m| m.get(&ts_ns))
+                                .map(|q| (sid, q.clone()))
                         })
                         .collect();
 
@@ -853,7 +1075,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     });
 
                     // Process orders at this minute using current (close) prices.
-                    let bars_for_orders: HashMap<u64, lean_data::TradeBar> = minute_slice.bars
+                    let bars_for_orders: HashMap<u64, lean_data::TradeBar> = minute_slice
+                        .bars
                         .iter()
                         .map(|(&k, v)| (k, v.clone()))
                         .collect();
@@ -862,10 +1085,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let ib_fee_model = InteractiveBrokersFeeModel::default();
                     for event in &fill_events {
                         if event.is_fill() {
-                            if let Some(order) = order_processor.transaction_manager.get_order(event.order_id) {
-                                let fee = ib_fee_model.get_order_fee(
-                                    &OrderFeeParameters::equity(&order, event.fill_price),
-                                ).amount;
+                            if let Some(order) = order_processor
+                                .transaction_manager
+                                .get_order(event.order_id)
+                            {
+                                let fee = ib_fee_model
+                                    .get_order_fee(&OrderFeeParameters::equity(
+                                        &order,
+                                        event.fill_price,
+                                    ))
+                                    .amount;
                                 portfolio.apply_fill(
                                     &order,
                                     event.fill_price,
@@ -875,7 +1104,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             }
                             let sid = event.symbol.id.sid;
                             let fill_qty = event.fill_quantity;
-                            if let Some((entry_time, entry_price, open_qty)) = open_positions.remove(&sid) {
+                            if let Some((entry_time, entry_price, open_qty)) =
+                                open_positions.remove(&sid)
+                            {
                                 let close_qty = open_qty.abs().min(fill_qty.abs());
                                 completed_trades.push(Trade::new(
                                     event.symbol.clone(),
@@ -887,7 +1118,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     rust_decimal_macros::dec!(0),
                                 ));
                             } else {
-                                open_positions.insert(sid, (event.utc_time, event.fill_price, fill_qty));
+                                open_positions
+                                    .insert(sid, (event.utc_time, event.fill_price, fill_qty));
                             }
                         }
                         adapter.on_order_event(event);
@@ -901,7 +1133,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 // Record benchmark close for this day.
                 let bm_close: Option<Decimal> = if benchmark_in_subs {
                     // Look up benchmark from last minute bar of the day.
-                    day_trade_bars.get(&benchmark_sid)
+                    day_trade_bars
+                        .get(&benchmark_sid)
                         .and_then(|bars| bars.last())
                         .map(|b| b.close)
                 } else {
@@ -936,8 +1169,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     } else {
                         day_bar.clone()
                     };
-                    adapter.inner.lock().unwrap()
-                        .securities.update_price(&bar.symbol, bar.close);
+                    adapter
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .securities
+                        .update_price(&bar.symbol, bar.close);
                     portfolio.update_prices(&bar.symbol, bar.close);
                     succeeded_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
                     slice.add_bar(bar);
@@ -963,26 +1200,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             trading_days += 1;
 
-            let bars_map: HashMap<u64, lean_data::TradeBar> = slice.bars
-                .iter()
-                .map(|(&k, v)| (k, v.clone()))
-                .collect();
+            let bars_map: HashMap<u64, lean_data::TradeBar> =
+                slice.bars.iter().map(|(&k, v)| (k, v.clone())).collect();
 
             let fill_events = order_processor.process_orders(&bars_map, utc_time);
             all_order_events.extend(fill_events.iter().cloned());
             let ib_fee_model = InteractiveBrokersFeeModel::default();
             for event in &fill_events {
                 if event.is_fill() {
-                    if let Some(order) = order_processor.transaction_manager.get_order(event.order_id) {
-                        let fee = ib_fee_model.get_order_fee(
-                            &OrderFeeParameters::equity(&order, event.fill_price),
-                        ).amount;
-                        portfolio.apply_fill(
-                            &order,
-                            event.fill_price,
-                            event.fill_quantity,
-                            fee,
-                        );
+                    if let Some(order) = order_processor
+                        .transaction_manager
+                        .get_order(event.order_id)
+                    {
+                        let fee = ib_fee_model
+                            .get_order_fee(&OrderFeeParameters::equity(&order, event.fill_price))
+                            .amount;
+                        portfolio.apply_fill(&order, event.fill_price, event.fill_quantity, fee);
                     }
 
                     let sid = event.symbol.id.sid;
@@ -1007,16 +1240,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             // Build option chains before calling on_data.
             {
-                let option_subs: Vec<Symbol> = {
-                    adapter.inner.lock().unwrap().option_subscriptions.clone()
-                };
+                let option_subs: Vec<Symbol> =
+                    { adapter.inner.lock().unwrap().option_subscriptions.clone() };
 
                 let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
                 for canonical in &option_subs {
                     let underlying_ticker = canonical.permtick.trim_start_matches('?');
                     let spot = {
-                        adapter.inner.lock().unwrap()
-                            .securities.all()
+                        adapter
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .securities
+                            .all()
                             .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
                             .map(|s| s.current_price())
                             .unwrap_or(Decimal::ZERO)
@@ -1027,8 +1263,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let bars = tokio::task::spawn_blocking({
                             let provider = config.history_provider.clone();
                             let data_root = config.data_root.clone();
-                            move || load_option_eod_bars(&data_root, &ticker, current_date, provider.as_ref())
-                        }).await.unwrap_or_default();
+                            move || {
+                                load_option_eod_bars(
+                                    &data_root,
+                                    &ticker,
+                                    current_date,
+                                    provider.as_ref(),
+                                )
+                            }
+                        })
+                        .await
+                        .unwrap_or_default();
                         if !bars.is_empty() {
                             build_option_chain_from_eod_bars(canonical, spot, current_date, &bars)
                         } else {
@@ -1046,13 +1291,20 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             let chains_snapshot: Vec<(String, OptionChain)> = {
                 let alg = adapter.inner.lock().unwrap();
-                alg.option_chains.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                alg.option_chains
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
             };
 
             // ── Custom data fetch (daily) ─────────────────────────────────
             let custom_subs: Vec<CustomDataSubscription> = {
-                adapter.inner.lock().unwrap()
-                    .custom_data_subscriptions.clone()
+                adapter
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .custom_data_subscriptions
+                    .clone()
             };
             let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
             for sub in &custom_subs {
@@ -1064,7 +1316,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 } else {
                     // Date-keyed source: per-day HTTP fetch with per-day Parquet cache.
-                    let source = config.custom_data_sources.iter()
+                    let source = config
+                        .custom_data_sources
+                        .iter()
                         .find(|s| s.name() == sub.source_type)
                         .cloned();
                     let data_root = config.data_root.clone();
@@ -1072,8 +1326,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let ticker = sub.ticker.clone();
                     let cfg = sub.config.clone();
                     let points = tokio::task::spawn_blocking(move || {
-                        load_custom_data_points(&data_root, &source_type, &ticker, current_date, source.as_ref(), &cfg)
-                    }).await.unwrap_or_default();
+                        load_custom_data_points(
+                            &data_root,
+                            &source_type,
+                            &ticker,
+                            current_date,
+                            source.as_ref(),
+                            &cfg,
+                        )
+                    })
+                    .await
+                    .unwrap_or_default();
                     if !points.is_empty() {
                         custom_data_for_day.insert(sub.ticker.clone(), points);
                     }
@@ -1102,7 +1365,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let sim_elapsed = sim_start.elapsed();
     let pts_per_sec = if sim_elapsed.as_secs_f64() > 0.0 {
         trading_days as f64 / sim_elapsed.as_secs_f64()
-    } else { f64::INFINITY };
+    } else {
+        f64::INFINITY
+    };
     println!(
         "Simulation: {:.0} trading days in {:.0}ms ({:.0} days/sec)",
         trading_days,
@@ -1116,7 +1381,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     };
     let total_return = if starting_cash > 0.0 {
         (final_value - starting_cash) / starting_cash
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let starting_cash_dec = Decimal::from_f64(starting_cash).unwrap_or(Decimal::ONE);
     // Use benchmark_curve only when it aligns with the equity curve length;
@@ -1135,15 +1402,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         Decimal::from_f64(0.05 / 252.0).unwrap_or(Decimal::ZERO), // ~5% annual risk-free
     );
 
-    let equity_curve_f64: Vec<f64> = equity_curve.iter().map(|v| {
-        use rust_decimal::prelude::ToPrimitive;
-        v.to_f64().unwrap_or(0.0)
-    }).collect();
+    let equity_curve_f64: Vec<f64> = equity_curve
+        .iter()
+        .map(|v| {
+            use rust_decimal::prelude::ToPrimitive;
+            v.to_f64().unwrap_or(0.0)
+        })
+        .collect();
 
     // Collect charts from the strategy after the backtest completes.
-    let charts = adapter.charts.lock()
-        .map(|c| c.clone())
-        .unwrap_or_default();
+    let charts = adapter.charts.lock().map(|c| c.clone()).unwrap_or_default();
 
     Ok(BacktestResult {
         trading_days,
@@ -1186,8 +1454,9 @@ async fn pre_fetch_all(
 
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
-        let sec    = format!("{}", sub.symbol.security_type()).to_lowercase();
-        let factor_path = resolver.data_root
+        let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
+        let factor_path = resolver
+            .data_root
             .join(&sec)
             .join(&market)
             .join("factor_files")
@@ -1195,7 +1464,8 @@ async fn pre_fetch_all(
 
         let factor_valid = factor_path.exists() && {
             let r = ParquetReader::new();
-            r.read_factor_file(&factor_path).map_or(false, |rows| !rows.is_empty())
+            r.read_factor_file(&factor_path)
+                .is_ok_and(|rows| !rows.is_empty())
         };
 
         if bar_path.exists() && factor_valid {
@@ -1216,35 +1486,48 @@ async fn pre_fetch_all(
         };
 
         let start_dt = date_to_datetime(effective_start, 0, 0, 0);
-        let end_dt   = date_to_datetime(end, 23, 59, 59);
+        let end_dt = date_to_datetime(end, 23, 59, 59);
 
         if !bar_path.exists() {
-            info!("No local data for {} — fetching from provider ({} → {})", sub.symbol.value, effective_start, end);
+            info!(
+                "No local data for {} — fetching from provider ({} → {})",
+                sub.symbol.value, effective_start, end
+            );
             let bars = provider
                 .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
                 .await
-                .map_err(|e| anyhow::anyhow!(
-                    "historical provider failed for {}: {}", sub.symbol.value, e
-                ))?;
-            info!("Downloaded {} bars for {} and cached to disk", bars.len(), sub.symbol.value);
+                .map_err(|e| {
+                    anyhow::anyhow!("historical provider failed for {}: {}", sub.symbol.value, e)
+                })?;
+            info!(
+                "Downloaded {} bars for {} and cached to disk",
+                bars.len(),
+                sub.symbol.value
+            );
         }
 
         // Re-check after bar fetch — some providers write the factor file as a side-effect.
         if !factor_path.exists() {
             if let Some(ref fp) = factor_provider {
-                info!("Factor file missing for {} — requesting from provider", sub.symbol.value);
+                info!(
+                    "Factor file missing for {} — requesting from provider",
+                    sub.symbol.value
+                );
                 let fp = Arc::clone(fp);
                 let request = lean_data_providers::HistoryRequest {
-                    symbol:     sub.symbol.clone(),
+                    symbol: sub.symbol.clone(),
                     resolution: lean_core::Resolution::Daily,
-                    start:      start_dt,
-                    end:        end_dt,
-                    data_type:  lean_data_providers::DataType::FactorFile,
+                    start: start_dt,
+                    end: end_dt,
+                    data_type: lean_data_providers::DataType::FactorFile,
                 };
                 match tokio::task::spawn_blocking(move || fp.get_history(&request)).await {
-                    Ok(Ok(_))  => info!("Factor file generated for {}", sub.symbol.value),
-                    Ok(Err(e)) => warn!("Factor file generation failed for {}: {e}", sub.symbol.value),
-                    Err(e)     => warn!("Factor file task panicked for {}: {e}", sub.symbol.value),
+                    Ok(Ok(_)) => info!("Factor file generated for {}", sub.symbol.value),
+                    Ok(Err(e)) => warn!(
+                        "Factor file generation failed for {}: {e}",
+                        sub.symbol.value
+                    ),
+                    Err(e) => warn!("Factor file task panicked for {}: {e}", sub.symbol.value),
                 }
             }
         }
@@ -1260,7 +1543,8 @@ pub(crate) fn date_to_datetime(date: NaiveDate, h: u32, m: u32, s: u32) -> DateT
 }
 
 fn day_key(date: NaiveDate) -> i64 {
-    date.signed_duration_since(NaiveDate::from_ymd_opt(1, 1, 1).unwrap()).num_days()
+    date.signed_duration_since(NaiveDate::from_ymd_opt(1, 1, 1).unwrap())
+        .num_days()
 }
 
 /// Process option expirations for `current_date`.
@@ -1287,10 +1571,15 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
         let spot = {
             let alg = adapter.inner.lock().unwrap();
             // Try to find the underlying security by permtick.
-            let underlying_ticker = pos.symbol.underlying.as_ref()
+            let underlying_ticker = pos
+                .symbol
+                .underlying
+                .as_ref()
                 .map(|u| u.permtick.clone())
                 .unwrap_or_default();
-            let found: Option<Decimal> = alg.securities.all()
+            let found: Option<Decimal> = alg
+                .securities
+                .all()
                 .find(|s| s.symbol.permtick.eq_ignore_ascii_case(&underlying_ticker))
                 .map(|s| s.current_price());
             found.unwrap_or(pos.strike) // Conservative fallback: use strike
@@ -1302,7 +1591,10 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
         if exercised && pos.quantity > Decimal::ZERO {
             // Long position: auto-exercise
             let contracts = pos.quantity;
-            let underlying_sym = pos.symbol.underlying.as_ref()
+            let underlying_sym = pos
+                .symbol
+                .underlying
+                .as_ref()
                 .map(|u| *u.clone())
                 .unwrap_or_else(|| pos.symbol.clone());
 
@@ -1310,15 +1602,14 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
             // For a long call: caller buys 100*qty shares, pays strike*100*qty.
             // For a long put: caller sells 100*qty shares, receives strike*100*qty.
             let exercise_shares = get_exercise_quantity(contracts, pos.right, 100);
-            let shares_abs = exercise_shares.abs();
-
             {
                 let mut alg = adapter.inner.lock().unwrap();
                 // Settle the stock leg immediately at the strike price.
                 // apply_exercise atomically creates/updates the holding and
                 // adjusts cash — no market order queued, so the equity curve
                 // on the expiration day is correct.
-                alg.portfolio.apply_exercise(&underlying_sym, pos.strike, exercise_shares);
+                alg.portfolio
+                    .apply_exercise(&underlying_sym, pos.strike, exercise_shares);
                 alg.option_positions.remove(&pos.symbol.id.sid);
             }
 
@@ -1331,7 +1622,10 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
         } else if exercised && pos.quantity < Decimal::ZERO {
             // Short position: assignment
             let contracts = pos.quantity.abs();
-            let underlying_sym = pos.symbol.underlying.as_ref()
+            let underlying_sym = pos
+                .symbol
+                .underlying
+                .as_ref()
                 .map(|u| *u.clone())
                 .unwrap_or_else(|| pos.symbol.clone());
 
@@ -1342,10 +1636,11 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
                 // For a short call: we must sell 100*qty shares at the strike → negative quantity.
                 let shares = Decimal::from(100) * contracts;
                 let exercise_qty = match pos.right {
-                    OptionRight::Put  =>  shares,   // buy stock
-                    OptionRight::Call => -shares,   // sell (or short) stock
+                    OptionRight::Put => shares,   // buy stock
+                    OptionRight::Call => -shares, // sell (or short) stock
                 };
-                alg.portfolio.apply_exercise(&underlying_sym, pos.strike, exercise_qty);
+                alg.portfolio
+                    .apply_exercise(&underlying_sym, pos.strike, exercise_qty);
                 alg.option_positions.remove(&pos.symbol.id.sid);
             }
 
@@ -1386,18 +1681,24 @@ fn build_option_chain_from_eod_bars(
     bars: &[OptionEodBar],
 ) -> OptionChain {
     let mut chain = OptionChain::new(canonical_sym.clone(), spot);
-    let underlying_sym: Symbol = canonical_sym.underlying.as_ref()
+    let underlying_sym: Symbol = canonical_sym
+        .underlying
+        .as_ref()
         .map(|u| *u.clone())
         .unwrap_or_else(|| canonical_sym.clone());
     let market = Market::usa();
 
     for bar in bars {
-        if bar.expiration < today { continue; }  // include 0DTE (expiration == today)
-        if bar.strike < Decimal::ONE { continue; }
+        if bar.expiration < today {
+            continue;
+        } // include 0DTE (expiration == today)
+        if bar.strike < Decimal::ONE {
+            continue;
+        }
 
         let right = match bar.right.to_ascii_lowercase().as_str() {
             "c" | "call" => OptionRight::Call,
-            "p" | "put"  => OptionRight::Put,
+            "p" | "put" => OptionRight::Put,
             _ => continue,
         };
 
@@ -1415,7 +1716,11 @@ fn build_option_chain_from_eod_bars(
         } else {
             bar.close
         };
-        let last = if bar.close > Decimal::ZERO { bar.close } else { mid };
+        let last = if bar.close > Decimal::ZERO {
+            bar.close
+        } else {
+            mid
+        };
 
         let mut contract = OptionContract::new(sym);
         contract.data = OptionContractData {
@@ -1450,11 +1755,15 @@ fn load_option_eod_bars(
     // Cache hit — read and return.
     if cache_path.exists() {
         let reader = ParquetReader::new();
-        return reader.read_option_eod_bars(&[cache_path]).unwrap_or_default();
+        return reader
+            .read_option_eod_bars(&[cache_path])
+            .unwrap_or_default();
     }
 
     // Cache miss — fetch from provider.
-    let Some(provider) = provider else { return vec![]; };
+    let Some(provider) = provider else {
+        return vec![];
+    };
     let bars = match provider.get_option_eod_bars(ticker, date) {
         Ok(b) => b,
         Err(e) => {
@@ -1502,11 +1811,15 @@ fn load_custom_data_points(
     // Cache hit — read and return.
     if cache_path.exists() {
         let reader = ParquetReader::new();
-        return reader.read_custom_data_points(&cache_path).unwrap_or_default();
+        return reader
+            .read_custom_data_points(&cache_path)
+            .unwrap_or_default();
     }
 
     // Cache miss — need a source plugin to fetch.
-    let Some(source) = source else { return vec![]; };
+    let Some(source) = source else {
+        return vec![];
+    };
 
     // Ask plugin where to fetch data for this date.
     let data_source = match source.get_source(ticker, date, config) {
@@ -1526,25 +1839,32 @@ fn load_custom_data_points(
                 Ok(resp) => match resp.text() {
                     Ok(text) => text,
                     Err(e) => {
-                        warn!("custom data fetch body error for {}/{} {}: {}", source_type, ticker, date, e);
+                        warn!(
+                            "custom data fetch body error for {}/{} {}: {}",
+                            source_type, ticker, date, e
+                        );
                         return vec![];
                     }
                 },
                 Err(e) => {
-                    warn!("custom data HTTP fetch failed for {}/{} {}: {}", source_type, ticker, date, e);
+                    warn!(
+                        "custom data HTTP fetch failed for {}/{} {}: {}",
+                        source_type, ticker, date, e
+                    );
                     return vec![];
                 }
             }
         }
-        CustomDataTransport::LocalFile => {
-            match std::fs::read_to_string(&data_source.uri) {
-                Ok(content) => content,
-                Err(e) => {
-                    warn!("custom data file read failed for {}/{} {}: {}", source_type, ticker, date, e);
-                    return vec![];
-                }
+        CustomDataTransport::LocalFile => match std::fs::read_to_string(&data_source.uri) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!(
+                    "custom data file read failed for {}/{} {}: {}",
+                    source_type, ticker, date, e
+                );
+                return vec![];
             }
-        }
+        },
     };
 
     // Parse content using the plugin's reader() method.
@@ -1553,7 +1873,9 @@ fn load_custom_data_points(
         CustomDataFormat::Csv | CustomDataFormat::JsonLines => {
             // Line-by-line: call reader() on each non-empty line.
             for line in raw_content.lines() {
-                if line.trim().is_empty() { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 if let Some(point) = source.reader(line, date, config) {
                     points.push(point);
                 }
@@ -1577,7 +1899,10 @@ fn load_custom_data_points(
                     }
                 }
                 Err(e) => {
-                    warn!("custom data JSON parse error for {}/{} {}: {}", source_type, ticker, date, e);
+                    warn!(
+                        "custom data JSON parse error for {}/{} {}: {}",
+                        source_type, ticker, date, e
+                    );
                 }
             }
         }
@@ -1590,7 +1915,10 @@ fn load_custom_data_points(
     // Write to Parquet cache.
     let writer = ParquetWriter::new(WriterConfig::default());
     if let Err(e) = writer.write_custom_data_points(&points, &cache_path) {
-        warn!("failed to cache custom data for {}/{} {}: {}", source_type, ticker, date, e);
+        warn!(
+            "failed to cache custom data for {}/{} {}: {}",
+            source_type, ticker, date, e
+        );
     }
 
     points
@@ -1603,34 +1931,32 @@ fn load_custom_data_points(
 /// inversely (more shares at lower prices after a split).
 /// Return the `(price_factor, split_factor)` that applies to `bar_date`.
 ///
-/// Mirrors LEAN C# `FactorFile.GetPriceFactor`: find the first row (ordered
-/// ascending by date) whose date is >= bar_date.  That is the "current period"
-/// factor row.  If no such row exists (bar is after the last factor entry),
-/// return (1.0, 1.0) — identical to LEAN returning 1 for the most-recent row.
+/// Mirrors the LEAN behavior exercised by the tests here: use the most recent
+/// factor-file row whose date is strictly earlier than `bar_date`.
+/// If no such row exists, return `(1.0, 1.0)`.
 fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64) {
-    if rows.is_empty() { return (1.0, 1.0); }
-    // rows are ordered ascending by date; find the first row where date >= bar_date
-    let mut sorted: Vec<&FactorFileEntry> = rows.iter().collect();
-    sorted.sort_by_key(|r| r.date);
-    for r in &sorted {
-        if r.date >= bar_date {
-            return (r.price_factor, r.split_factor);
-        }
+    if rows.is_empty() {
+        return (1.0, 1.0);
     }
-    // bar_date is after all factor file entries → no adjustment (same as C# LEAN)
-    (1.0, 1.0)
+    rows.iter()
+        .filter(|r| r.date < bar_date)
+        .max_by_key(|r| r.date)
+        .map(|r| (r.price_factor, r.split_factor))
+        .unwrap_or((1.0, 1.0))
 }
 
 fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: NaiveDate) -> TradeBar {
     let (pf, sf) = factor_for_entry(rows, bar_date);
     let combined = pf * sf;
-    if (combined - 1.0).abs() < 1e-9 { return bar; } // fast-path: no adjustment
+    if (combined - 1.0).abs() < 1e-9 {
+        return bar;
+    } // fast-path: no adjustment
 
     let scale = Decimal::from_f64(combined).unwrap_or(Decimal::ONE);
-    bar.open   *= scale;
-    bar.high   *= scale;
-    bar.low    *= scale;
-    bar.close  *= scale;
+    bar.open *= scale;
+    bar.high *= scale;
+    bar.low *= scale;
+    bar.close *= scale;
     // Volume scales inversely to price for splits (more shares outstanding).
     if sf != 0.0 && (sf - 1.0).abs() > 1e-9 {
         let vol_scale = Decimal::from_f64(1.0 / sf).unwrap_or(Decimal::ONE);
@@ -1644,15 +1970,20 @@ fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: Naive
 #[cfg(test)]
 mod factor_tests {
     use super::*;
-    use lean_storage::schema::FactorFileEntry;
     use chrono::NaiveDate;
+    use lean_storage::schema::FactorFileEntry;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
     fn entry(y: i32, m: u32, day: u32, pf: f64) -> FactorFileEntry {
-        FactorFileEntry { date: d(y, m, day), price_factor: pf, split_factor: 1.0, reference_price: 0.0 }
+        FactorFileEntry {
+            date: d(y, m, day),
+            price_factor: pf,
+            split_factor: 1.0,
+            reference_price: 0.0,
+        }
     }
 
     /// SPY-like factor file: entries starting 2021-03-25.
@@ -1663,7 +1994,7 @@ mod factor_tests {
             entry(2021, 9, 16, 0.9370296),
             entry(2021, 12, 16, 0.9400318),
             entry(2022, 3, 17, 0.9433413),
-            entry(2026, 4,  9, 1.0),
+            entry(2026, 4, 9, 1.0),
         ]
     }
 
@@ -1672,8 +2003,11 @@ mod factor_tests {
     #[test]
     fn test_before_first_entry_returns_one() {
         let rows = spy_rows();
-        assert_eq!(factor_for_entry(&rows, d(2020, 10, 16)), (1.0, 1.0),
-            "bars before the factor file must get factor=1.0 (no adjustment)");
+        assert_eq!(
+            factor_for_entry(&rows, d(2020, 10, 16)),
+            (1.0, 1.0),
+            "bars before the factor file must get factor=1.0 (no adjustment)"
+        );
     }
 
     /// Bar exactly on the first entry date → still returns 1.0.
@@ -1682,8 +2016,11 @@ mod factor_tests {
     #[test]
     fn test_on_first_entry_date_returns_one() {
         let rows = spy_rows();
-        assert_eq!(factor_for_entry(&rows, d(2021, 3, 25)), (1.0, 1.0),
-            "bar on the first entry date must still return 1.0 (strict <)");
+        assert_eq!(
+            factor_for_entry(&rows, d(2021, 3, 25)),
+            (1.0, 1.0),
+            "bar on the first entry date must still return 1.0 (strict <)"
+        );
     }
 
     /// Bar one day after the first entry → picks the first entry's factor.
@@ -1701,8 +2038,10 @@ mod factor_tests {
         let rows = spy_rows();
         // Between 2021-09-16 (0.9370296) and 2021-12-16 (0.9400318)
         let (pf, _) = factor_for_entry(&rows, d(2021, 11, 1));
-        assert!((pf - 0.9370296).abs() < 1e-7,
-            "should pick the Sep-16 entry, not the Dec-16 one");
+        assert!(
+            (pf - 0.9370296).abs() < 1e-7,
+            "should pick the Sep-16 entry, not the Dec-16 one"
+        );
     }
 
     /// Bar exactly on a non-first entry date → picks the preceding entry.
@@ -1712,8 +2051,10 @@ mod factor_tests {
         // On 2021-09-16 exactly → the Sep-16 row itself has date = bar_date,
         // so strict < excludes it; we get the Jun-17 entry (0.9339743).
         let (pf, _) = factor_for_entry(&rows, d(2021, 9, 16));
-        assert!((pf - 0.9339743).abs() < 1e-7,
-            "bar ON an entry date picks the entry before it (strict <)");
+        assert!(
+            (pf - 0.9339743).abs() < 1e-7,
+            "bar ON an entry date picks the entry before it (strict <)"
+        );
     }
 
     /// Bar after the last entry (2026-04-09) → picks the 2026-04-09 entry (factor=1.0).
@@ -1721,8 +2062,10 @@ mod factor_tests {
     fn test_after_last_entry_picks_last() {
         let rows = spy_rows();
         let (pf, _) = factor_for_entry(&rows, d(2026, 4, 10));
-        assert!((pf - 1.0).abs() < 1e-9,
-            "bars after the last entry get factor=1.0");
+        assert!(
+            (pf - 1.0).abs() < 1e-9,
+            "bars after the last entry get factor=1.0"
+        );
     }
 
     /// Jan 4, 2022 must use the 2021-12-16 entry (0.9400318) — matches the
@@ -1731,8 +2074,10 @@ mod factor_tests {
     fn test_jan_2022_matches_lean_observed() {
         let rows = spy_rows();
         let (pf, _) = factor_for_entry(&rows, d(2022, 1, 4));
-        assert!((pf - 0.9400318).abs() < 1e-7,
-            "2022-01-04 must use the 2021-12-16 factor (0.9400318)");
+        assert!(
+            (pf - 0.9400318).abs() < 1e-7,
+            "2022-01-04 must use the 2021-12-16 factor (0.9400318)"
+        );
     }
 
     /// Empty rows → always 1.0.
@@ -1784,9 +2129,7 @@ mod tests {
         // A price series of [100, 110, 99] corresponds to daily returns of
         // [(110-100)/100 = 10%, (99-110)/110 ≈ -10%].
         let prices: Vec<Decimal> = vec![dec!(100), dec!(110), dec!(99)];
-        let returns: Vec<Decimal> = prices.windows(2)
-            .map(|w| (w[1] - w[0]) / w[0])
-            .collect();
+        let returns: Vec<Decimal> = prices.windows(2).map(|w| (w[1] - w[0]) / w[0]).collect();
 
         // 10% up
         let expected_up = dec!(10) / dec!(100);
@@ -1801,8 +2144,8 @@ mod tests {
     fn benchmark_symbol_appears_in_backtest_result_field() {
         // Verify the BacktestResult struct carries the benchmark ticker.
         // We build a minimal BacktestResult directly.
-        use lean_statistics::PortfolioStatistics;
         use crate::charting::ChartCollection;
+        use lean_statistics::PortfolioStatistics;
 
         let stats = PortfolioStatistics::compute(
             &[dec!(100_000), dec!(101_000)],
@@ -1813,19 +2156,21 @@ mod tests {
             dec!(0),
         );
         let result = BacktestResult {
-            trading_days:            1,
-            final_value:             101_000.0,
-            total_return:            0.01,
-            starting_cash:           100_000.0,
-            equity_curve:            vec![100_000.0, 101_000.0],
-            daily_dates:             vec!["2024-01-02".to_string(), "2024-01-03".to_string()],
-            statistics:              stats,
-            charts:                  ChartCollection::default(),
-            order_events:            vec![],
+            trading_days: 1,
+            final_value: 101_000.0,
+            total_return: 0.01,
+            starting_cash: 100_000.0,
+            start_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            end_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            equity_curve: vec![100_000.0, 101_000.0],
+            daily_dates: vec!["2024-01-02".to_string(), "2024-01-03".to_string()],
+            statistics: stats,
+            charts: ChartCollection::default(),
+            order_events: vec![],
             succeeded_data_requests: vec![],
-            failed_data_requests:    vec![],
-            backtest_id:             1_700_000_000,
-            benchmark_symbol:        "QQQ".to_string(),
+            failed_data_requests: vec![],
+            backtest_id: 1_700_000_000,
+            benchmark_symbol: "QQQ".to_string(),
         };
         assert_eq!(result.benchmark_symbol, "QQQ");
     }
@@ -1844,25 +2189,31 @@ mod tests {
 
     #[test]
     fn benchmark_in_subs_detected_correctly() {
-        use std::sync::Arc;
+        use lean_core::{Market, Resolution, Symbol};
         use lean_data::SubscriptionDataConfig;
-        use lean_core::{Resolution, Market, Symbol};
+        use std::sync::Arc;
 
         let market = Market::usa();
         let spy = Symbol::create_equity("SPY", &market);
-        let qqq = Symbol::create_equity("QQQ", &market);
 
-        let cfg_spy = Arc::new(SubscriptionDataConfig::new_equity(spy.clone(), Resolution::Daily));
-        let subs = vec![cfg_spy];
+        let cfg_spy = Arc::new(SubscriptionDataConfig::new_equity(
+            spy.clone(),
+            Resolution::Daily,
+        ));
+        let subs = [cfg_spy];
 
         // SPY is in subs → benchmark_in_subs = true
         let benchmark_ticker = "SPY";
-        let in_subs = subs.iter().any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker));
+        let in_subs = subs
+            .iter()
+            .any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker));
         assert!(in_subs);
 
         // QQQ is NOT in subs → benchmark_in_subs = false
         let benchmark_ticker2 = "QQQ";
-        let in_subs2 = subs.iter().any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker2));
+        let in_subs2 = subs
+            .iter()
+            .any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker2));
         assert!(!in_subs2);
     }
 }
