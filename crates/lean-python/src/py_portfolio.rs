@@ -1,40 +1,42 @@
-use std::sync::Arc;
-use pyo3::prelude::*;
+use crate::py_types::{PySecurity, PySymbol};
 use lean_algorithm::portfolio::{SecurityHolding, SecurityPortfolioManager};
+use pyo3::prelude::*;
 use rust_decimal::prelude::ToPrimitive;
-use crate::py_types::{PySymbol, PySecurity};
+use std::sync::Arc;
 
 /// Python-visible security holding (position in one symbol).
 #[pyclass(name = "SecurityHolding", frozen, get_all)]
 #[derive(Debug, Clone)]
 pub struct PySecurityHolding {
-    pub symbol:         PySymbol,
-    pub quantity:       f64,
-    pub average_price:  f64,
+    pub symbol: PySymbol,
+    pub quantity: f64,
+    pub average_price: f64,
     pub unrealized_pnl: f64,
-    pub realized_pnl:   f64,
-    pub total_fees:     f64,
-    pub last_price:     f64,
-    pub is_long:        bool,
-    pub is_short:       bool,
-    pub is_invested:    bool,
-    pub market_value:   f64,
+    pub realized_pnl: f64,
+    pub total_fees: f64,
+    pub last_price: f64,
+    pub is_long: bool,
+    pub is_short: bool,
+    pub is_invested: bool,
+    pub market_value: f64,
 }
 
 impl From<&SecurityHolding> for PySecurityHolding {
     fn from(h: &SecurityHolding) -> Self {
         PySecurityHolding {
-            symbol:         PySymbol { inner: h.symbol.clone() },
-            quantity:       h.quantity.to_f64().unwrap_or(0.0),
-            average_price:  h.average_price.to_f64().unwrap_or(0.0),
+            symbol: PySymbol {
+                inner: h.symbol.clone(),
+            },
+            quantity: h.quantity.to_f64().unwrap_or(0.0),
+            average_price: h.average_price.to_f64().unwrap_or(0.0),
             unrealized_pnl: h.unrealized_pnl.to_f64().unwrap_or(0.0),
-            realized_pnl:   h.realized_pnl.to_f64().unwrap_or(0.0),
-            total_fees:     h.total_fees.to_f64().unwrap_or(0.0),
-            last_price:     h.last_price.to_f64().unwrap_or(0.0),
-            is_long:        h.is_long(),
-            is_short:       h.is_short(),
-            is_invested:    h.is_invested(),
-            market_value:   h.market_value().to_f64().unwrap_or(0.0),
+            realized_pnl: h.realized_pnl.to_f64().unwrap_or(0.0),
+            total_fees: h.total_fees.to_f64().unwrap_or(0.0),
+            last_price: h.last_price.to_f64().unwrap_or(0.0),
+            is_long: h.is_long(),
+            is_short: h.is_short(),
+            is_invested: h.is_invested(),
+            market_value: h.market_value().to_f64().unwrap_or(0.0),
         }
     }
 }
@@ -43,15 +45,21 @@ impl From<&SecurityHolding> for PySecurityHolding {
 impl PySecurityHolding {
     /// LEAN API alias: `holding.invested`
     #[getter]
-    fn invested(&self) -> bool { self.is_invested }
+    fn invested(&self) -> bool {
+        self.is_invested
+    }
 
     /// LEAN API: `holding.unrealized_profit`
     #[getter]
-    fn unrealized_profit(&self) -> f64 { self.unrealized_pnl }
+    fn unrealized_profit(&self) -> f64 {
+        self.unrealized_pnl
+    }
 
     /// LEAN API: `holding.profit` — total of realized + unrealized P&L.
     #[getter]
-    fn profit(&self) -> f64 { self.unrealized_pnl + self.realized_pnl }
+    fn profit(&self) -> f64 {
+        self.unrealized_pnl + self.realized_pnl
+    }
 
     fn __repr__(&self) -> String {
         format!(
@@ -120,19 +128,25 @@ impl PyPortfolio {
 
     /// All current holdings as a list.
     fn holdings(&self) -> Vec<PySecurityHolding> {
-        self.inner.all_holdings().iter().map(PySecurityHolding::from).collect()
+        self.inner
+            .all_holdings()
+            .iter()
+            .map(PySecurityHolding::from)
+            .collect()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "Portfolio(value={:.2}, cash={:.2}, invested={})",
-            self.total_portfolio_value(), self.cash(), self.is_invested()
+            self.total_portfolio_value(),
+            self.cash(),
+            self.is_invested()
         )
     }
 }
 
 impl PyPortfolio {
-    fn resolve_symbol<'a>(&self, arg: &'a Bound<'_, PyAny>) -> PyResult<PySymbol> {
+    fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<PySymbol> {
         if let Ok(sym) = arg.downcast::<PySymbol>() {
             return Ok(sym.get().clone());
         }
@@ -144,6 +158,8 @@ impl PyPortfolio {
             let inner = lean_core::Symbol::create_equity(&ticker, &Market::usa());
             return Ok(PySymbol { inner });
         }
-        Err(pyo3::exceptions::PyTypeError::new_err("Expected Security, Symbol, or ticker string"))
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security, Symbol, or ticker string",
+        ))
     }
 }

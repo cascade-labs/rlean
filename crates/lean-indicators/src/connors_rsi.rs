@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, rsi::Rsi, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    rsi::Rsi,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -31,18 +35,30 @@ impl ConnorsRsi {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for ConnorsRsi {
+    fn default() -> Self {
         Self::new(3, 2, 100)
     }
 }
 
 impl Indicator for ConnorsRsi {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.rsi.is_ready() && self.streak_rsi.is_ready() && self.price_changes.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.rsi.is_ready() && self.streak_rsi.is_ready() && self.price_changes.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.rsi.reset();
@@ -61,17 +77,24 @@ impl Indicator for ConnorsRsi {
         // Compute trend streak
         if let Some(prev) = self.prev_value {
             let change = value - prev;
-            if (self.trend_streak > 0 && change < dec!(0)) || (self.trend_streak < 0 && change > dec!(0)) {
+            if (self.trend_streak > 0 && change < dec!(0))
+                || (self.trend_streak < 0 && change > dec!(0))
+            {
                 self.trend_streak = 0;
             }
-            if change > dec!(0) { self.trend_streak += 1; }
-            else if change < dec!(0) { self.trend_streak -= 1; }
+            if change > dec!(0) {
+                self.trend_streak += 1;
+            } else if change < dec!(0) {
+                self.trend_streak -= 1;
+            }
         }
 
-        self.streak_rsi.update_price(time, Decimal::from(self.trend_streak));
+        self.streak_rsi
+            .update_price(time, Decimal::from(self.trend_streak));
 
         // PercentRank
-        let pct_rank = if self.prev_value.is_some() && self.prev_value.unwrap_or(dec!(0)) != dec!(0) {
+        let pct_rank = if self.prev_value.is_some() && self.prev_value.unwrap_or(dec!(0)) != dec!(0)
+        {
             let prev = self.prev_value.unwrap();
             let ratio = (value - prev) / prev;
 
@@ -93,7 +116,8 @@ impl Indicator for ConnorsRsi {
         self.prev_value = Some(value);
 
         if self.is_ready() {
-            let v = (self.rsi.current().value + self.streak_rsi.current().value + pct_rank) / dec!(3);
+            let v =
+                (self.rsi.current().value + self.streak_rsi.current().value + pct_rank) / dec!(3);
             self.current = IndicatorResult::ready(v, time);
         }
 

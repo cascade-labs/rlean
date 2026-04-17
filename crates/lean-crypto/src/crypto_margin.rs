@@ -14,7 +14,7 @@ pub struct LeverageConfig {
     pub max_leverage: Decimal,
     pub default_leverage: Decimal,
     pub maintenance_margin_rate: Decimal, // 0.005 = 0.5%
-    pub initial_margin_rate: Decimal,    // 1/max_leverage
+    pub initial_margin_rate: Decimal,     // 1/max_leverage
 }
 
 impl LeverageConfig {

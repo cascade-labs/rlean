@@ -11,6 +11,11 @@ pub struct HistoryRequest {
 
 impl HistoryRequest {
     pub fn new(symbol: Symbol, resolution: Resolution, start: DateTime, end: DateTime) -> Self {
-        HistoryRequest { symbol, resolution, start, end }
+        HistoryRequest {
+            symbol,
+            resolution,
+            start,
+            end,
+        }
     }
 }

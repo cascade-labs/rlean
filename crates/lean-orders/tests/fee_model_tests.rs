@@ -1,12 +1,12 @@
 use lean_core::{Market, NanosecondTimestamp, SecurityType, Symbol};
+use lean_orders::fee_model::OrderFeeParameters;
 use lean_orders::{
     AlpacaFeeModel, BinanceFeeModel, BybitFeeModel, CharlesSchwabFeeModel, ConstantFeeModel,
-    EtradeFeeModel, ExchangeFeeModel, FidelityFeeModel, FlatFeeModel, FxcmFeeModel, GDAXFeeModel,
-    InteractiveBrokersFeeModel, KrakenFeeModel, NullFeeModel, OandaFeeModel, Order, OrderType,
-    PercentFeeModel, RobinhoodFeeModel, TDAmeritradeFeeModel, TradierFeeModel, ZeroFeeModel,
-    FeeModel,
+    EtradeFeeModel, ExchangeFeeModel, FeeModel, FidelityFeeModel, FlatFeeModel, FxcmFeeModel,
+    GDAXFeeModel, InteractiveBrokersFeeModel, KrakenFeeModel, NullFeeModel, OandaFeeModel, Order,
+    OrderType, PercentFeeModel, RobinhoodFeeModel, TDAmeritradeFeeModel, TradierFeeModel,
+    ZeroFeeModel,
 };
-use lean_orders::fee_model::OrderFeeParameters;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -242,14 +242,7 @@ fn ib_forex_minimum_fee() {
     // tiny notional → fee enforced at $2.00 minimum
     let model = InteractiveBrokersFeeModel::default();
     let order = Order::market(1, forex_sym("EURUSD"), dec!(1000), ts(0), "");
-    let p = params_full(
-        &order,
-        dec!(1.1),
-        SecurityType::Forex,
-        "USD",
-        None,
-        dec!(1),
-    );
+    let p = params_full(&order, dec!(1.1), SecurityType::Forex, "USD", None, dec!(1));
     let fee = model.get_order_fee(&p);
     // 1000 * 1.1 * 0.000002 = $0.0022, below min $2.00
     assert_eq!(fee.amount, dec!(2.00));
@@ -695,14 +688,7 @@ fn fidelity_options_per_contract() {
 fn oanda_always_zero() {
     let model = OandaFeeModel;
     let order = Order::market(1, forex_sym("EURUSD"), dec!(100_000), ts(0), "");
-    let p = params_full(
-        &order,
-        dec!(1.1),
-        SecurityType::Forex,
-        "USD",
-        None,
-        dec!(1),
-    );
+    let p = params_full(&order, dec!(1.1), SecurityType::Forex, "USD", None, dec!(1));
     let fee = model.get_order_fee(&p);
     assert_eq!(fee.amount, dec!(0));
 }
@@ -730,14 +716,7 @@ fn fxcm_major_pair_lower_rate() {
     // EURUSD is major: $0.04 / 1k lot; 10,000 units → fee = 10000 / 1000 * 0.04 = $0.40
     let model = FxcmFeeModel::default();
     let order = Order::market(1, forex_sym("EURUSD"), dec!(10_000), ts(0), "");
-    let p = params_full(
-        &order,
-        dec!(1.1),
-        SecurityType::Forex,
-        "USD",
-        None,
-        dec!(1),
-    );
+    let p = params_full(&order, dec!(1.1), SecurityType::Forex, "USD", None, dec!(1));
     let fee = model.get_order_fee(&p);
     assert!((fee.amount - dec!(0.40)).abs() < dec!(0.001));
 }

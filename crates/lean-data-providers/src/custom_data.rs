@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use chrono::NaiveDate;
 use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataSource};
+use std::sync::Arc;
 
 /// Trait implemented by custom data source plugins.
 ///

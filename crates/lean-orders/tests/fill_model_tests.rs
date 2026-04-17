@@ -1,14 +1,18 @@
-use lean_orders::{
-    Order,
-    fill_model::{FillModel, ImmediateFillModel},
-    slippage::ConstantSlippageModel,
-};
 use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
 use lean_data::TradeBar;
+use lean_orders::{
+    fill_model::{FillModel, ImmediateFillModel},
+    slippage::ConstantSlippageModel,
+    Order,
+};
 use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
-fn spy() -> Symbol { Symbol::create_equity("SPY", &Market::usa()) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
+fn spy() -> Symbol {
+    Symbol::create_equity("SPY", &Market::usa())
+}
 
 fn make_bar(open: f64, high: f64, low: f64, close: f64) -> TradeBar {
     use rust_decimal::Decimal;
@@ -66,7 +70,10 @@ fn buy_limit_does_not_fill_when_low_above_limit() {
     let order = Order::limit(1, spy(), dec!(100), dec!(97), ts(0), "");
 
     let fill = model.limit_fill(&order, &bar, ts(0));
-    assert!(fill.is_none(), "Limit order should not fill when low > limit");
+    assert!(
+        fill.is_none(),
+        "Limit order should not fill when low > limit"
+    );
 }
 
 #[test]
@@ -88,7 +95,10 @@ fn sell_limit_does_not_fill_when_high_below_limit() {
     let order = Order::limit(1, spy(), dec!(-100), dec!(110), ts(0), "");
 
     let fill = model.limit_fill(&order, &bar, ts(0));
-    assert!(fill.is_none(), "Sell limit should not fill when high < limit");
+    assert!(
+        fill.is_none(),
+        "Sell limit should not fill when high < limit"
+    );
 }
 
 // ─── Stop market fill ────────────────────────────────────────────────────────

@@ -49,8 +49,8 @@ pub enum RegistryCommand {
 
 pub fn run_registry(args: RegistryArgs) -> Result<()> {
     match args.command {
-        RegistryCommand::List           => cmd_list(),
-        RegistryCommand::Add { url }    => cmd_add(&url),
+        RegistryCommand::List => cmd_list(),
+        RegistryCommand::Add { url } => cmd_add(&url),
         RegistryCommand::Remove { url } => cmd_remove(&url),
     }
 }
@@ -59,7 +59,7 @@ pub fn run_registry(args: RegistryArgs) -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let user = load_user_registries()?;
-    println!("{:<10} {}", "TYPE", "URL");
+    println!("{:<10} URL", "TYPE");
     println!("{}", "-".repeat(80));
     println!("{:<10} {}", "built-in", OFFICIAL_REGISTRY_URL);
     for url in &user.urls {
@@ -97,4 +97,3 @@ fn cmd_remove(url: &str) -> Result<()> {
     println!("Removed registry: {url}");
     Ok(())
 }
-

@@ -1,24 +1,27 @@
+use lean_core::{CurrencyPair, Symbol};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use lean_core::{Symbol, CurrencyPair};
 
 /// Forex-specific position tracking.
 #[derive(Debug, Clone)]
 pub struct ForexHolding {
     pub symbol: Symbol,
     pub currency_pair: CurrencyPair,
-    pub quantity: Decimal,         // in base currency units
-    pub average_price: Decimal,    // average entry price
-    pub unrealized_pnl: Decimal,   // in quote currency
-    pub swap_pnl: Decimal,         // accumulated overnight swap
+    pub quantity: Decimal,       // in base currency units
+    pub average_price: Decimal,  // average entry price
+    pub unrealized_pnl: Decimal, // in quote currency
+    pub swap_pnl: Decimal,       // accumulated overnight swap
 }
 
 impl ForexHolding {
     pub fn new(symbol: Symbol, currency_pair: CurrencyPair) -> Self {
         Self {
-            symbol, currency_pair,
-            quantity: dec!(0), average_price: dec!(0),
-            unrealized_pnl: dec!(0), swap_pnl: dec!(0),
+            symbol,
+            currency_pair,
+            quantity: dec!(0),
+            average_price: dec!(0),
+            unrealized_pnl: dec!(0),
+            swap_pnl: dec!(0),
         }
     }
 

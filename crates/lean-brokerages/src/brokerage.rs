@@ -1,5 +1,5 @@
 use lean_core::{DateTime, Price, Result as LeanResult, Symbol};
-use lean_orders::{Order, OrderEvent, OrderTicket};
+use lean_orders::Order;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]

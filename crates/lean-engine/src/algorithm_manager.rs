@@ -1,8 +1,8 @@
 use lean_algorithm::algorithm::IAlgorithm;
-use lean_core::{DateTime, Result as LeanResult};
+use lean_core::Result as LeanResult;
 use lean_data::Slice;
 use lean_orders::OrderEvent;
-use tracing::{error, info};
+use tracing::info;
 
 pub struct AlgorithmManager {
     pub algorithm: Box<dyn IAlgorithm>,

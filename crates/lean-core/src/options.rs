@@ -1,7 +1,7 @@
 use crate::{Market, OptionRight, OptionStyle, Symbol};
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString, FromRepr};
 
@@ -10,21 +10,27 @@ use strum::{Display, EnumIter, EnumString, FromRepr};
 // ---------------------------------------------------------------------------
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
-    Display, EnumString, EnumIter, FromRepr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    EnumIter,
+    FromRepr,
+    Default,
 )]
 #[repr(u8)]
 pub enum SettlementType {
     #[strum(serialize = "PhysicalDelivery")]
+    #[default]
     PhysicalDelivery = 0,
     #[strum(serialize = "Cash")]
     Cash = 1,
-}
-
-impl Default for SettlementType {
-    fn default() -> Self {
-        SettlementType::PhysicalDelivery
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,15 +97,11 @@ pub fn format_option_ticker(
     right: OptionRight,
 ) -> String {
     let right_char = if right == OptionRight::Call { 'C' } else { 'P' };
-    let strike_int = (strike * Decimal::from(1000))
-        .to_u64()
-        .unwrap_or(0);
+    let strike_int = (strike * Decimal::from(1000)).to_u64().unwrap_or(0);
     format!(
-        "{}{}{}{}",
+        "{}{}{right_char}{strike_int:08}",
         underlying.to_uppercase(),
         expiry.format("%y%m%d"),
-        right_char,
-        format!("{:08}", strike_int),
     )
 }
 
@@ -183,7 +185,7 @@ impl SymbolOptionsExt for Symbol {
             // Sentinel date for canonical — chrono::NaiveDate::MIN equivalent
             chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap(),
             Decimal::ZERO,
-            OptionRight::Call,  // arbitrary; canonical has no right
+            OptionRight::Call, // arbitrary; canonical has no right
             OptionStyle::American,
         );
         // Override security_type — generate_option already sets it to Option.

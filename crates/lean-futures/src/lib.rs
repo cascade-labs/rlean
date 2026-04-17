@@ -1,11 +1,13 @@
-pub mod expiry;
-pub mod contract_series;
 pub mod continuous_contract;
-pub mod settlement;
+pub mod contract_series;
+pub mod expiry;
 pub mod known_futures;
+pub mod settlement;
 
-pub use expiry::{ExpiryRule, compute_expiry};
-pub use contract_series::{FuturesContract, FuturesContractSeries, MONTH_CODES, month_code, month_from_code};
 pub use continuous_contract::{ContinuousContract, ContinuousContractType};
-pub use settlement::{SettlementMethod, SettlementResult, settle_futures_position};
-pub use known_futures::{es, nq, cl, gc, zb};
+pub use contract_series::{
+    month_code, month_from_code, FuturesContract, FuturesContractSeries, MONTH_CODES,
+};
+pub use expiry::{compute_expiry, ExpiryRule};
+pub use known_futures::{cl, es, gc, nq, zb};
+pub use settlement::{settle_futures_position, SettlementMethod, SettlementResult};

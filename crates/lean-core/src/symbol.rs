@@ -1,4 +1,4 @@
-use crate::{Market, SecurityType, OptionRight, OptionStyle, Price};
+use crate::{Market, OptionRight, OptionStyle, Price, SecurityType};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -97,7 +97,13 @@ impl SecurityIdentifier {
 
     pub fn generate_future(ticker: &str, market: &Market, expiry: NaiveDate) -> Self {
         let sid = Self::hash_sid(
-            ticker, market, SecurityType::Future, Some(expiry), None, None, None,
+            ticker,
+            market,
+            SecurityType::Future,
+            Some(expiry),
+            None,
+            None,
+            None,
         );
         SecurityIdentifier {
             ticker: ticker.to_uppercase(),
@@ -125,10 +131,18 @@ impl SecurityIdentifier {
         ticker.to_uppercase().hash(&mut h);
         market.as_str().hash(&mut h);
         (sec_type as u8).hash(&mut h);
-        if let Some(e) = expiry { e.hash(&mut h); }
-        if let Some(s) = strike { s.to_string().hash(&mut h); }
-        if let Some(r) = right { (r as u8).hash(&mut h); }
-        if let Some(st) = style { (st as u8).hash(&mut h); }
+        if let Some(e) = expiry {
+            e.hash(&mut h);
+        }
+        if let Some(s) = strike {
+            s.to_string().hash(&mut h);
+        }
+        if let Some(r) = right {
+            (r as u8).hash(&mut h);
+        }
+        if let Some(st) = style {
+            (st as u8).hash(&mut h);
+        }
         std::hash::Hasher::finish(&h)
     }
 }
@@ -192,7 +206,12 @@ impl Symbol {
         style: OptionStyle,
     ) -> Self {
         let id = SecurityIdentifier::generate_option(
-            &underlying.value, market, expiry, strike, right, style,
+            &underlying.value,
+            market,
+            expiry,
+            strike,
+            right,
+            style,
         );
         let value = format!(
             "{} {} {} {} {}",

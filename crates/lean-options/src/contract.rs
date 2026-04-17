@@ -1,6 +1,6 @@
+use chrono::NaiveDate;
 use lean_core::{Greeks, OptionRight, OptionStyle, Symbol};
 use rust_decimal::Decimal;
-use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 /// Market data for a single option contract at a point in time.
@@ -55,7 +55,8 @@ pub struct OptionContract {
 impl OptionContract {
     pub fn new(symbol: Symbol) -> Self {
         use lean_core::SymbolOptionsExt;
-        let (strike, expiry, right, style) = symbol.option_symbol_id()
+        let (strike, expiry, right, style) = symbol
+            .option_symbol_id()
             .map(|id| (id.strike, id.expiry, id.right, id.style))
             .unwrap_or((
                 Decimal::ZERO,

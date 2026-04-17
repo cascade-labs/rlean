@@ -22,13 +22,13 @@ pub mod stacked;
 pub mod traits;
 
 pub use config::ProviderConfig;
+pub use custom_data::{ArcCustomDataSource, ICustomDataSource};
 pub use local::LocalHistoryProvider;
 pub use request::{DataType, DownloadRequest, HistoryRequest};
-pub use stacked::{StackedHistoryProvider, is_not_implemented};
-pub use custom_data::{ICustomDataSource, ArcCustomDataSource};
+pub use stacked::{is_not_implemented, StackedHistoryProvider};
 pub use traits::{
-    IDataDownloader, IFactorFileProvider, IHistoryProvider, ILiveDataProvider,
-    IMapFileProvider, IOptionChainProvider,
+    IDataDownloader, IFactorFileProvider, IHistoryProvider, ILiveDataProvider, IMapFileProvider,
+    IOptionChainProvider,
 };
 
 #[cfg(test)]

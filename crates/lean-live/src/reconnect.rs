@@ -22,8 +22,7 @@ impl Default for ReconnectPolicy {
 
 impl ReconnectPolicy {
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let secs =
-            self.initial_delay.as_secs_f64() * self.backoff_multiplier.powi(attempt as i32);
+        let secs = self.initial_delay.as_secs_f64() * self.backoff_multiplier.powi(attempt as i32);
         Duration::from_secs_f64(secs.min(self.max_delay.as_secs_f64()))
     }
 
@@ -48,7 +47,10 @@ where
             Err(e) => {
                 attempt += 1;
                 if !policy.should_retry(attempt) {
-                    error!("Max reconnect attempts ({}) reached: {e}", policy.max_attempts);
+                    error!(
+                        "Max reconnect attempts ({}) reached: {e}",
+                        policy.max_attempts
+                    );
                     break;
                 }
                 let delay = policy.delay_for_attempt(attempt);

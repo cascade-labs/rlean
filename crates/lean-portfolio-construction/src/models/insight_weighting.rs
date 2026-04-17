@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use rust_decimal::Decimal;
 use lean_core::Symbol;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{
     IPortfolioConstructionModel, InsightDirection, InsightForPcm,

@@ -32,8 +32,12 @@ impl IConsolidator for VolumeConsolidator {
                 self.accumulated_volume = bar.volume;
             }
             Some(w) => {
-                if bar.high > w.high { w.high = bar.high; }
-                if bar.low  < w.low  { w.low  = bar.low;  }
+                if bar.high > w.high {
+                    w.high = bar.high;
+                }
+                if bar.low < w.low {
+                    w.low = bar.low;
+                }
                 w.close = bar.close;
                 w.volume += bar.volume;
                 w.end_time = bar.end_time;

@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -25,11 +28,21 @@ impl MidPoint {
 }
 
 impl Indicator for MidPoint {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -42,8 +55,16 @@ impl Indicator for MidPoint {
         self.window.push(value);
 
         if self.window.is_full() {
-            let highest = self.window.iter().copied().fold(Decimal::MIN, |a, b| if b > a { b } else { a });
-            let lowest = self.window.iter().copied().fold(Decimal::MAX, |a, b| if b < a { b } else { a });
+            let highest = self
+                .window
+                .iter()
+                .copied()
+                .fold(Decimal::MIN, |a, b| if b > a { b } else { a });
+            let lowest = self
+                .window
+                .iter()
+                .copied()
+                .fold(Decimal::MAX, |a, b| if b < a { b } else { a });
             self.current = IndicatorResult::ready((highest + lowest) / dec!(2), time);
         }
 

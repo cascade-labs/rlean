@@ -43,11 +43,21 @@ impl Adx {
 }
 
 impl Indicator for Adx {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period * 2 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period * 2 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period * 2
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period * 2
+    }
 
     fn reset(&mut self) {
         self.prev_high = None;
@@ -75,8 +85,16 @@ impl Indicator for Adx {
             let up_move = bar.high - ph;
             let down_move = pl - bar.low;
 
-            let plus_dm = if up_move > down_move && up_move > dec!(0) { up_move } else { dec!(0) };
-            let minus_dm = if down_move > up_move && down_move > dec!(0) { down_move } else { dec!(0) };
+            let plus_dm = if up_move > down_move && up_move > dec!(0) {
+                up_move
+            } else {
+                dec!(0)
+            };
+            let minus_dm = if down_move > up_move && down_move > dec!(0) {
+                down_move
+            } else {
+                dec!(0)
+            };
 
             let tr = (bar.high - bar.low)
                 .max((bar.high - pc).abs())
@@ -91,8 +109,10 @@ impl Indicator for Adx {
             } else {
                 // Wilder smoothing
                 self.smoothed_tr = self.smoothed_tr - (self.smoothed_tr / n) + tr;
-                self.smoothed_plus_dm = self.smoothed_plus_dm - (self.smoothed_plus_dm / n) + plus_dm;
-                self.smoothed_minus_dm = self.smoothed_minus_dm - (self.smoothed_minus_dm / n) + minus_dm;
+                self.smoothed_plus_dm =
+                    self.smoothed_plus_dm - (self.smoothed_plus_dm / n) + plus_dm;
+                self.smoothed_minus_dm =
+                    self.smoothed_minus_dm - (self.smoothed_minus_dm / n) + minus_dm;
             }
 
             if !self.smoothed_tr.is_zero() {
@@ -101,7 +121,9 @@ impl Indicator for Adx {
             }
 
             let di_sum = self.plus_di + self.minus_di;
-            let dx = if di_sum.is_zero() { dec!(0) } else {
+            let dx = if di_sum.is_zero() {
+                dec!(0)
+            } else {
                 dec!(100) * (self.plus_di - self.minus_di).abs() / di_sum
             };
 

@@ -70,12 +70,16 @@ impl RenkoConsolidator {
             }
             let bar = self.make_bar(
                 symbol,
-                self.open_on.unwrap_or(data_time),
-                self.close_on.unwrap_or(data_time),
-                self.open_rate,
-                limit,        // close at limit
-                self.low_rate,
-                limit,        // high at limit (wicked)
+                (
+                    self.open_on.unwrap_or(data_time),
+                    self.close_on.unwrap_or(data_time),
+                ),
+                (
+                    self.open_rate,
+                    limit, // close at limit
+                    self.low_rate,
+                    limit, // high at limit (wicked)
+                ),
             );
             self.last_brick_open = Some(self.open_rate);
             self.last_brick_direction = Some(1);
@@ -96,12 +100,16 @@ impl RenkoConsolidator {
             }
             let bar = self.make_bar(
                 symbol,
-                self.open_on.unwrap_or(data_time),
-                self.close_on.unwrap_or(data_time),
-                self.open_rate,
-                limit,        // close at limit (down)
-                limit,        // low at limit (wicked)
-                self.high_rate,
+                (
+                    self.open_on.unwrap_or(data_time),
+                    self.close_on.unwrap_or(data_time),
+                ),
+                (
+                    self.open_rate,
+                    limit, // close at limit (down)
+                    limit, // low at limit (wicked)
+                    self.high_rate,
+                ),
             );
             self.last_brick_open = Some(self.open_rate);
             self.last_brick_direction = Some(-1);
@@ -118,13 +126,11 @@ impl RenkoConsolidator {
     fn make_bar(
         &self,
         symbol: &Symbol,
-        open_on: DateTime,
-        close_on: DateTime,
-        open_price: Decimal,
-        close_price: Decimal,
-        low_price: Decimal,
-        high_price: Decimal,
+        times: (DateTime, DateTime),
+        prices: (Decimal, Decimal, Decimal, Decimal),
     ) -> TradeBar {
+        let (open_on, close_on) = times;
+        let (open_price, close_price, low_price, high_price) = prices;
         let period_nanos = (close_on.0 - open_on.0).max(0);
         TradeBar {
             symbol: symbol.clone(),
@@ -166,8 +172,12 @@ impl IConsolidator for RenkoConsolidator {
         }
 
         self.close_on = Some(bar.time);
-        if rate > self.high_rate { self.high_rate = rate; }
-        if rate < self.low_rate  { self.low_rate  = rate; }
+        if rate > self.high_rate {
+            self.high_rate = rate;
+        }
+        if rate < self.low_rate {
+            self.low_rate = rate;
+        }
         self.close_rate = rate;
 
         if self.close_rate > self.open_rate {
@@ -183,12 +193,11 @@ impl IConsolidator for RenkoConsolidator {
                     if self.close_rate > limit {
                         let reversal_bar = self.make_bar(
                             symbol,
-                            self.open_on.unwrap_or(bar.time),
-                            self.close_on.unwrap_or(bar.time),
-                            last_open,
-                            limit,
-                            self.low_rate,
-                            limit,
+                            (
+                                self.open_on.unwrap_or(bar.time),
+                                self.close_on.unwrap_or(bar.time),
+                            ),
+                            (last_open, limit, self.low_rate, limit),
                         );
                         self.last_brick_open = Some(last_open);
                         self.last_brick_direction = Some(1);
@@ -214,12 +223,11 @@ impl IConsolidator for RenkoConsolidator {
                     if self.close_rate < limit {
                         let reversal_bar = self.make_bar(
                             symbol,
-                            self.open_on.unwrap_or(bar.time),
-                            self.close_on.unwrap_or(bar.time),
-                            last_open,
-                            limit,
-                            limit,
-                            self.high_rate,
+                            (
+                                self.open_on.unwrap_or(bar.time),
+                                self.close_on.unwrap_or(bar.time),
+                            ),
+                            (last_open, limit, limit, self.high_rate),
                         );
                         self.last_brick_open = Some(last_open);
                         self.last_brick_direction = Some(-1);

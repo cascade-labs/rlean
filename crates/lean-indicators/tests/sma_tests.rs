@@ -1,15 +1,25 @@
-use lean_indicators::{indicator::Indicator, Sma};
 use lean_core::NanosecondTimestamp;
+use lean_indicators::{indicator::Indicator, Sma};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 fn feed(sma: &mut Sma, values: &[Decimal]) -> Vec<Option<Decimal>> {
-    values.iter().enumerate().map(|(i, &v)| {
-        let r = sma.update_price(ts(i as i64), v);
-        if r.is_ready() { Some(r.value) } else { None }
-    }).collect()
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let r = sma.update_price(ts(i as i64), v);
+            if r.is_ready() {
+                Some(r.value)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ─── Ready state ─────────────────────────────────────────────────────────────
@@ -51,7 +61,15 @@ fn sample_count_increments_correctly() {
 #[test]
 fn sma_computes_correctly_period_4() {
     let mut sma = Sma::new(4);
-    let values = [dec!(1), dec!(10), dec!(100), dec!(1000), dec!(10000), dec!(1234), dec!(56789)];
+    let values = [
+        dec!(1),
+        dec!(10),
+        dec!(100),
+        dec!(1000),
+        dec!(10000),
+        dec!(1234),
+        dec!(56789),
+    ];
 
     let results = feed(&mut sma, &values);
 

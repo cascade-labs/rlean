@@ -8,7 +8,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Slice {
     pub time: DateTime,
-    pub bars: HashMap<u64, TradeBar>,          // keyed by symbol.id.sid
+    pub bars: HashMap<u64, TradeBar>, // keyed by symbol.id.sid
     pub quote_bars: HashMap<u64, QuoteBar>,
     pub ticks: HashMap<u64, Vec<Tick>>,
     pub dividends: HashMap<u64, Dividend>,

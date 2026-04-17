@@ -7,7 +7,7 @@ pub struct Predicate {
     pub start_time: Option<DateTime>,
     pub end_time: Option<DateTime>,
     pub symbol_sids: Option<Vec<u64>>,
-    pub min_close: Option<i64>,   // scaled price (×1e8)
+    pub min_close: Option<i64>, // scaled price (×1e8)
     pub max_close: Option<i64>,
     pub min_volume: Option<i64>,
 }
@@ -67,7 +67,8 @@ impl Predicate {
             if sids.len() == 1 {
                 exprs.push(col("symbol_sid").eq(lit(sids[0] as i64)));
             } else {
-                let sid_exprs: Vec<Expr> = sids.iter()
+                let sid_exprs: Vec<Expr> = sids
+                    .iter()
                     .map(|&s| col("symbol_sid").eq(lit(s as i64)))
                     .collect();
                 exprs.push(sid_exprs.into_iter().reduce(|a, b| a.or(b)).unwrap());

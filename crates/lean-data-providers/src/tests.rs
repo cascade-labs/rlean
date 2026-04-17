@@ -1,19 +1,23 @@
 /// Unit tests for lean-data-providers.
 #[cfg(test)]
 mod custom_data_tests {
-    use std::collections::HashMap;
+    use crate::custom_data::ICustomDataSource;
     use chrono::NaiveDate;
+    use lean_core::Resolution;
+    use lean_data::custom::{
+        CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataTransport,
+    };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use lean_core::Resolution;
-    use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataSource, CustomDataTransport, CustomDataFormat};
-    use crate::custom_data::ICustomDataSource;
+    use std::collections::HashMap;
 
     /// A minimal mock custom data source for testing.
     struct MockVixSource;
 
     impl ICustomDataSource for MockVixSource {
-        fn name(&self) -> &str { "mock_vix" }
+        fn name(&self) -> &str {
+            "mock_vix"
+        }
 
         fn get_source(
             &self,
@@ -27,7 +31,11 @@ mod custom_data_tests {
                 return None;
             }
             Some(CustomDataSource {
-                uri: format!("https://example.com/vix/{}/{}", ticker, date.format("%Y%m%d")),
+                uri: format!(
+                    "https://example.com/vix/{}/{}",
+                    ticker,
+                    date.format("%Y%m%d")
+                ),
                 transport: CustomDataTransport::Http,
                 format: CustomDataFormat::Csv,
             })
@@ -46,16 +54,22 @@ mod custom_data_tests {
             }
             // Parse "DATE,OPEN,HIGH,LOW,CLOSE" format.
             let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() < 5 { return None; }
+            if parts.len() < 5 {
+                return None;
+            }
             let close: Decimal = parts[4].trim().parse().ok()?;
-            let open:  Decimal = parts[1].trim().parse().ok()?;
-            let high:  Decimal = parts[2].trim().parse().ok()?;
-            let low:   Decimal = parts[3].trim().parse().ok()?;
+            let open: Decimal = parts[1].trim().parse().ok()?;
+            let high: Decimal = parts[2].trim().parse().ok()?;
+            let low: Decimal = parts[3].trim().parse().ok()?;
             let mut fields = HashMap::new();
-            fields.insert("open".to_string(),  serde_json::json!(open.to_string()));
-            fields.insert("high".to_string(),  serde_json::json!(high.to_string()));
-            fields.insert("low".to_string(),   serde_json::json!(low.to_string()));
-            Some(CustomDataPoint { time: date, value: close, fields })
+            fields.insert("open".to_string(), serde_json::json!(open.to_string()));
+            fields.insert("high".to_string(), serde_json::json!(high.to_string()));
+            fields.insert("low".to_string(), serde_json::json!(low.to_string()));
+            Some(CustomDataPoint {
+                time: date,
+                value: close,
+                fields,
+            })
         }
 
         fn default_resolution(&self) -> Resolution {
@@ -87,13 +101,17 @@ mod custom_data_tests {
 
         // 2024-01-06 is a Saturday.
         let sat = NaiveDate::from_ymd_opt(2024, 1, 6).unwrap();
-        assert!(source.get_source("VIX", sat, &config).is_none(),
-            "get_source should return None on Saturday");
+        assert!(
+            source.get_source("VIX", sat, &config).is_none(),
+            "get_source should return None on Saturday"
+        );
 
         // 2024-01-07 is a Sunday.
         let sun = NaiveDate::from_ymd_opt(2024, 1, 7).unwrap();
-        assert!(source.get_source("VIX", sun, &config).is_none(),
-            "get_source should return None on Sunday");
+        assert!(
+            source.get_source("VIX", sun, &config).is_none(),
+            "get_source should return None on Sunday"
+        );
     }
 
     #[test]
@@ -119,9 +137,20 @@ mod custom_data_tests {
         let config = make_config("VIX");
         let date = NaiveDate::from_ymd_opt(2024, 1, 8).unwrap();
 
-        assert!(source.reader("", date, &config).is_none(), "empty line should be skipped");
-        assert!(source.reader("# comment", date, &config).is_none(), "comment should be skipped");
-        assert!(source.reader("Date,Open,High,Low,Close", date, &config).is_none(), "header should be skipped");
+        assert!(
+            source.reader("", date, &config).is_none(),
+            "empty line should be skipped"
+        );
+        assert!(
+            source.reader("# comment", date, &config).is_none(),
+            "comment should be skipped"
+        );
+        assert!(
+            source
+                .reader("Date,Open,High,Low,Close", date, &config)
+                .is_none(),
+            "header should be skipped"
+        );
     }
 
     #[test]
@@ -137,9 +166,18 @@ mod custom_data_tests {
         let point = result.unwrap();
         assert_eq!(point.time, date);
         assert_eq!(point.value, dec!(13.85), "value should be close price");
-        assert!(point.fields.contains_key("open"), "fields should contain open");
-        assert!(point.fields.contains_key("high"), "fields should contain high");
-        assert!(point.fields.contains_key("low"), "fields should contain low");
+        assert!(
+            point.fields.contains_key("open"),
+            "fields should contain open"
+        );
+        assert!(
+            point.fields.contains_key("high"),
+            "fields should contain high"
+        );
+        assert!(
+            point.fields.contains_key("low"),
+            "fields should contain low"
+        );
     }
 
     #[test]
@@ -149,7 +187,9 @@ mod custom_data_tests {
         let date = NaiveDate::from_ymd_opt(2024, 1, 8).unwrap();
 
         assert!(source.reader("not,enough", date, &config).is_none());
-        assert!(source.reader("2024-01-08,abc,14.20,13.10,bad_close", date, &config).is_none());
+        assert!(source
+            .reader("2024-01-08,abc,14.20,13.10,bad_close", date, &config)
+            .is_none());
     }
 
     #[test]
@@ -162,14 +202,23 @@ mod custom_data_tests {
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("custom"), "path should contain 'custom'");
         assert!(path_str.contains("fred"), "path should contain source_type");
-        assert!(path_str.contains("unrate"), "path should contain ticker (lowercase)");
-        assert!(path_str.contains("20240108"), "path should contain YYYYMMDD date");
-        assert!(path_str.ends_with(".parquet"), "path should end with .parquet");
+        assert!(
+            path_str.contains("unrate"),
+            "path should contain ticker (lowercase)"
+        );
+        assert!(
+            path_str.contains("20240108"),
+            "path should contain YYYYMMDD date"
+        );
+        assert!(
+            path_str.ends_with(".parquet"),
+            "path should end with .parquet"
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod provider_tests {
     use std::path::PathBuf;
 
     use lean_core::{Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol};
@@ -181,23 +230,23 @@ mod tests {
 
     fn make_symbol() -> Symbol {
         Symbol {
-            id:         SecurityIdentifier::generate_equity("SPY", &Market::usa()),
-            value:      "SPY".to_string(),
-            permtick:   "SPY".to_string(),
+            id: SecurityIdentifier::generate_equity("SPY", &Market::usa()),
+            value: "SPY".to_string(),
+            permtick: "SPY".to_string(),
             underlying: None,
         }
     }
 
     fn make_history_request() -> HistoryRequest {
         // 2024-01-02 00:00:00 UTC and 2024-01-03 00:00:00 UTC (nanos since epoch)
-        let start = NanosecondTimestamp(1704153600_000_000_000_i64);
-        let end   = NanosecondTimestamp(1704240000_000_000_000_i64);
+        let start = NanosecondTimestamp(1_704_153_600_000_000_000_i64);
+        let end = NanosecondTimestamp(1_704_240_000_000_000_000_i64);
         HistoryRequest {
-            symbol:     make_symbol(),
+            symbol: make_symbol(),
             resolution: Resolution::Daily,
             start,
             end,
-            data_type:  DataType::TradeBar,
+            data_type: DataType::TradeBar,
         }
     }
 
@@ -215,10 +264,10 @@ mod tests {
     #[test]
     fn provider_config_fields() {
         let cfg = ProviderConfig {
-            data_root:           PathBuf::from("/data"),
-            api_key:             Some("key".into()),
+            data_root: PathBuf::from("/data"),
+            api_key: Some("key".into()),
             requests_per_second: 5.0,
-            max_concurrent:      4,
+            max_concurrent: 4,
         };
         assert_eq!(cfg.data_root, PathBuf::from("/data"));
         assert_eq!(cfg.api_key.as_deref(), Some("key"));

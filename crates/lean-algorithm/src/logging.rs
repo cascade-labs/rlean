@@ -9,7 +9,12 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel { Debug, Info, Warning, Error }
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
 
 pub struct AlgorithmLogging {
     entries: Mutex<Vec<LogEntry>>,
@@ -18,20 +23,29 @@ pub struct AlgorithmLogging {
 
 impl AlgorithmLogging {
     pub fn new(max_entries: usize) -> Self {
-        AlgorithmLogging { entries: Mutex::new(Vec::new()), max_entries }
+        AlgorithmLogging {
+            entries: Mutex::new(Vec::new()),
+            max_entries,
+        }
     }
 
     pub fn log(&self, time: DateTime, message: String, level: LogLevel) {
         // Emit immediately via tracing so the message appears in real-time output.
         match level {
-            LogLevel::Debug   => tracing::debug!("[Algorithm] {}", message),
-            LogLevel::Info    => tracing::info!(target: "algorithm", "{}", message),
+            LogLevel::Debug => tracing::debug!("[Algorithm] {}", message),
+            LogLevel::Info => tracing::info!(target: "algorithm", "{}", message),
             LogLevel::Warning => tracing::warn!("[Algorithm] {}", message),
-            LogLevel::Error   => tracing::error!("[Algorithm] {}", message),
+            LogLevel::Error => tracing::error!("[Algorithm] {}", message),
         }
         let mut entries = self.entries.lock();
-        if entries.len() >= self.max_entries { entries.remove(0); }
-        entries.push(LogEntry { time, message, level });
+        if entries.len() >= self.max_entries {
+            entries.remove(0);
+        }
+        entries.push(LogEntry {
+            time,
+            message,
+            level,
+        });
     }
 
     pub fn debug(&self, time: DateTime, msg: impl Into<String>) {
@@ -53,5 +67,7 @@ impl AlgorithmLogging {
 }
 
 impl Default for AlgorithmLogging {
-    fn default() -> Self { AlgorithmLogging::new(100_000) }
+    fn default() -> Self {
+        AlgorithmLogging::new(100_000)
+    }
 }

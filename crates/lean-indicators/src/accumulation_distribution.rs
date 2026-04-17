@@ -24,15 +24,27 @@ impl AccumulationDistribution {
 }
 
 impl Default for AccumulationDistribution {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Indicator for AccumulationDistribution {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > 0 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > 0
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        1
+    }
 
     fn reset(&mut self) {
         self.ad = dec!(0);

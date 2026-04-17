@@ -1,15 +1,19 @@
-use crate::parameter::{ParameterDefinition, ParameterSet, OptimizationResult};
 use crate::objective::ObjectiveFunction;
+use crate::parameter::{OptimizationResult, ParameterDefinition, ParameterSet};
 
 pub struct GridSearchOptimizer {
     pub parameters: Vec<ParameterDefinition>,
     pub objective: ObjectiveFunction,
-    pub max_concurrent: usize,  // max parallel backtests
+    pub max_concurrent: usize, // max parallel backtests
 }
 
 impl GridSearchOptimizer {
     pub fn new(parameters: Vec<ParameterDefinition>, objective: ObjectiveFunction) -> Self {
-        Self { parameters, objective, max_concurrent: 1 }
+        Self {
+            parameters,
+            objective,
+            max_concurrent: 1,
+        }
     }
 
     /// Generate all parameter combinations
@@ -38,7 +42,8 @@ impl GridSearchOptimizer {
     {
         let combos = self.all_combinations();
         let total = combos.len();
-        let mut results: Vec<OptimizationResult> = combos.iter()
+        let mut results: Vec<OptimizationResult> = combos
+            .iter()
             .enumerate()
             .map(|(i, params)| {
                 tracing::info!("Running backtest {}/{}: {:?}", i + 1, total, params);

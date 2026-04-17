@@ -13,7 +13,12 @@ pub struct ParameterDefinition {
 
 impl ParameterDefinition {
     pub fn new(name: &str, min: Decimal, max: Decimal, step: Decimal) -> Self {
-        Self { name: name.to_string(), min, max, step }
+        Self {
+            name: name.to_string(),
+            min,
+            max,
+            step,
+        }
     }
     /// All discrete values in this parameter's range
     pub fn values(&self) -> Vec<Decimal> {

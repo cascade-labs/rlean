@@ -2,12 +2,12 @@
 // Mirrors the C# EqualWeightingPortfolioConstructionModelTests and
 // InsightWeightingPortfolioConstructionModelTests from LEAN.
 
-use lean_portfolio_construction::{
-    EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel,
-    InsightDirection, InsightForPcm, InsightWeightingPortfolioConstructionModel,
-    NullPortfolioConstructionModel, PortfolioTarget,
-};
 use lean_core::{Market, Symbol};
+use lean_portfolio_construction::{
+    EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel, InsightDirection,
+    InsightForPcm, InsightWeightingPortfolioConstructionModel, NullPortfolioConstructionModel,
+    PortfolioTarget,
+};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -94,8 +94,14 @@ mod equal_weighting_tests {
 
         assert_eq!(find("AIG"), aig_qty);
         assert_eq!(find("IBM"), ibm_qty);
-        assert!(aig_qty > Decimal::ZERO, "AIG quantity must be positive (long)");
-        assert!(ibm_qty > Decimal::ZERO, "IBM quantity must be positive (long)");
+        assert!(
+            aig_qty > Decimal::ZERO,
+            "AIG quantity must be positive (long)"
+        );
+        assert!(
+            ibm_qty > Decimal::ZERO,
+            "IBM quantity must be positive (long)"
+        );
     }
 
     /// One Up + one Down: each gets 50 %, long and short respectively.
@@ -130,7 +136,10 @@ mod equal_weighting_tests {
         let ibm_qty = get_qty("IBM");
 
         assert!(spy_qty > Decimal::ZERO, "SPY should be long (Up insight)");
-        assert!(ibm_qty < Decimal::ZERO, "IBM should be short (Down insight)");
+        assert!(
+            ibm_qty < Decimal::ZERO,
+            "IBM should be short (Down insight)"
+        );
     }
 
     /// A Flat insight should result in a zero-quantity target (liquidate).

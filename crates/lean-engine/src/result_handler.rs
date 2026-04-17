@@ -1,6 +1,5 @@
 use lean_core::{DateTime, Price};
-use lean_statistics::{PortfolioStatistics, TradeStatistics};
-use serde::{Deserialize, Serialize};
+use lean_statistics::PortfolioStatistics;
 use std::collections::BTreeMap;
 
 /// Accumulates equity curve and final results during a backtest.
@@ -49,11 +48,20 @@ impl ResultHandler {
             println!("═══════════════════════════════════════════════");
             println!("  BACKTEST RESULTS");
             println!("═══════════════════════════════════════════════");
-            println!("  Annual Return:     {:.2}%", stats.compounding_annual_return * rust_decimal_macros::dec!(100));
-            println!("  Max Drawdown:      {:.2}%", stats.drawdown * rust_decimal_macros::dec!(100));
+            println!(
+                "  Annual Return:     {:.2}%",
+                stats.compounding_annual_return * rust_decimal_macros::dec!(100)
+            );
+            println!(
+                "  Max Drawdown:      {:.2}%",
+                stats.drawdown * rust_decimal_macros::dec!(100)
+            );
             println!("  Sharpe Ratio:      {:.3}", stats.sharpe_ratio);
             println!("  Sortino Ratio:     {:.3}", stats.sortino_ratio);
-            println!("  Win Rate:          {:.1}%", stats.win_rate * rust_decimal_macros::dec!(100));
+            println!(
+                "  Win Rate:          {:.1}%",
+                stats.win_rate * rust_decimal_macros::dec!(100)
+            );
             println!("  Profit/Loss:       {:.2}", stats.profit_loss_ratio);
             println!("  Alpha:             {:.4}", stats.alpha);
             println!("  Beta:              {:.4}", stats.beta);

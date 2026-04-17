@@ -1,11 +1,13 @@
-use crate::{indicator::{Indicator, IndicatorResult}, wma::Wma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    wma::Wma,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal_macros::dec;
 
 /// Hull Moving Average. HMA = WMA(2*WMA(n/2) - WMA(n), sqrt(n)).
 pub struct Hma {
     name: String,
-    period: usize,
     fast_wma: Wma,
     slow_wma: Wma,
     hull_wma: Wma,
@@ -22,7 +24,6 @@ impl Hma {
         let warm_up = period + k - 1;
         Hma {
             name: format!("HMA({})", period),
-            period,
             fast_wma: Wma::new(fast_period),
             slow_wma: Wma::new(period),
             hull_wma: Wma::new(k),
@@ -34,11 +35,21 @@ impl Hma {
 }
 
 impl Indicator for Hma {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.hull_wma.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.hull_wma.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.fast_wma.reset();

@@ -1,9 +1,13 @@
-use lean_orders::{Order, OrderType, OrderStatus, OrderDirection, TimeInForce};
 use lean_core::{Market, NanosecondTimestamp, Symbol};
+use lean_orders::{Order, OrderDirection, OrderStatus, OrderType, TimeInForce};
 use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
-fn spy() -> Symbol { Symbol::create_equity("SPY", &Market::usa()) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
+fn spy() -> Symbol {
+    Symbol::create_equity("SPY", &Market::usa())
+}
 
 // ─── Market order ─────────────────────────────────────────────────────────────
 

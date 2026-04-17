@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -35,17 +38,29 @@ impl Wma {
             let weight = Decimal::from(n - i);
             numerator += weight * self.window.get(i).copied().unwrap_or(dec!(0));
         }
-        if self.denominator == dec!(0) { return dec!(0); }
+        if self.denominator == dec!(0) {
+            return dec!(0);
+        }
         numerator / self.denominator
     }
 }
 
 impl Indicator for Wma {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();

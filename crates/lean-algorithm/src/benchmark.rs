@@ -2,7 +2,9 @@ use lean_core::{DateTime, Price, Symbol};
 
 pub trait BenchmarkProvider: Send + Sync {
     fn evaluate(&self, time: DateTime) -> Price;
-    fn symbol(&self) -> Option<&Symbol> { None }
+    fn symbol(&self) -> Option<&Symbol> {
+        None
+    }
 }
 
 pub struct FunctionBenchmark {
@@ -16,5 +18,7 @@ impl FunctionBenchmark {
 }
 
 impl BenchmarkProvider for FunctionBenchmark {
-    fn evaluate(&self, time: DateTime) -> Price { (self.func)(time) }
+    fn evaluate(&self, time: DateTime) -> Price {
+        (self.func)(time)
+    }
 }

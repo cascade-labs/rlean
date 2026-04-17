@@ -1,5 +1,4 @@
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorStatus {
@@ -18,7 +17,11 @@ pub struct IndicatorResult {
 
 impl IndicatorResult {
     pub fn ready(value: Price, time: DateTime) -> Self {
-        IndicatorResult { value, time, status: IndicatorStatus::Ready }
+        IndicatorResult {
+            value,
+            time,
+            status: IndicatorStatus::Ready,
+        }
     }
 
     pub fn not_ready() -> Self {

@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal_macros::dec;
 
@@ -25,13 +28,30 @@ impl MoneyFlowIndex {
 }
 
 impl Indicator for MoneyFlowIndex {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period + 1 }
-    fn reset(&mut self) { self.window.clear(); self.prev_typical = None; self.samples = 0; self.current = IndicatorResult::not_ready(); }
-    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult { self.current.clone() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period + 1
+    }
+    fn reset(&mut self) {
+        self.window.clear();
+        self.prev_typical = None;
+        self.samples = 0;
+        self.current = IndicatorResult::not_ready();
+    }
+    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult {
+        self.current.clone()
+    }
 
     fn update_bar(&mut self, bar: &lean_data::TradeBar) -> IndicatorResult {
         self.samples += 1;
@@ -48,9 +68,11 @@ impl Indicator for MoneyFlowIndex {
         self.window.push((pos_mf, neg_mf));
 
         if self.window.is_full() {
-            let total_pos: Price = self.window.iter().map(|(p,_)| *p).sum();
-            let total_neg: Price = self.window.iter().map(|(_,n)| *n).sum();
-            let mfi = if total_neg.is_zero() { dec!(100) } else {
+            let total_pos: Price = self.window.iter().map(|(p, _)| *p).sum();
+            let total_neg: Price = self.window.iter().map(|(_, n)| *n).sum();
+            let mfi = if total_neg.is_zero() {
+                dec!(100)
+            } else {
                 let mfr = total_pos / total_neg;
                 dec!(100) - dec!(100) / (dec!(1) + mfr)
             };

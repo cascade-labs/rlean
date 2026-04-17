@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -27,11 +30,21 @@ impl Cci {
 }
 
 impl Indicator for Cci {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -39,7 +52,9 @@ impl Indicator for Cci {
         self.current = IndicatorResult::not_ready();
     }
 
-    fn update_price(&mut self, _time: DateTime, _value: Price) -> IndicatorResult { self.current.clone() }
+    fn update_price(&mut self, _time: DateTime, _value: Price) -> IndicatorResult {
+        self.current.clone()
+    }
 
     fn update_bar(&mut self, bar: &lean_data::TradeBar) -> IndicatorResult {
         self.samples += 1;
@@ -49,11 +64,11 @@ impl Indicator for Cci {
         if self.window.is_full() {
             let n = Decimal::from(self.period);
             let mean: Price = self.window.iter().sum::<Price>() / n;
-            let mean_dev: Price = self.window.iter()
-                .map(|&p| (p - mean).abs())
-                .sum::<Price>() / n;
+            let mean_dev: Price = self.window.iter().map(|&p| (p - mean).abs()).sum::<Price>() / n;
 
-            let cci = if mean_dev.is_zero() { dec!(0) } else {
+            let cci = if mean_dev.is_zero() {
+                dec!(0)
+            } else {
                 (typical - mean) / (self.constant * mean_dev)
             };
 

@@ -55,7 +55,10 @@ impl ILiveDataFeed for PollingLiveDataFeed {
         symbol: Symbol,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            info!("PollingLiveDataFeed: unsubscribing from {}", symbol.id.ticker);
+            info!(
+                "PollingLiveDataFeed: unsubscribing from {}",
+                symbol.id.ticker
+            );
             self.symbols.retain(|s| s != &symbol);
             Ok(())
         })

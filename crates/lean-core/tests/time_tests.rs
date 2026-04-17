@@ -1,5 +1,5 @@
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use lean_core::time::{NanosecondTimestamp, TimeSpan};
-use chrono::{Datelike, Timelike, TimeZone, Utc};
 
 #[test]
 fn from_millis_and_back() {

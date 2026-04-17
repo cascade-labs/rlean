@@ -30,17 +30,34 @@ impl Vwap {
 }
 
 impl Default for Vwap {
-    fn default() -> Self { Vwap::new() }
+    fn default() -> Self {
+        Vwap::new()
+    }
 }
 
 impl Indicator for Vwap {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > 0 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 1 }
-    fn reset(&mut self) { self.reset_session(); self.samples = 0; }
-    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult { self.current.clone() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > 0
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        1
+    }
+    fn reset(&mut self) {
+        self.reset_session();
+        self.samples = 0;
+    }
+    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult {
+        self.current.clone()
+    }
 
     fn update_bar(&mut self, bar: &lean_data::TradeBar) -> IndicatorResult {
         self.samples += 1;

@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal_macros::dec;
 
@@ -7,7 +11,6 @@ use rust_decimal_macros::dec;
 pub struct Dpo {
     name: String,
     period: usize,
-    lag: usize,
     sma: Sma,
     lag_buf: RollingWindow<Price>,
     samples: usize,
@@ -20,7 +23,6 @@ impl Dpo {
         Dpo {
             name: format!("DPO({})", period),
             period,
-            lag,
             sma: Sma::new(period),
             lag_buf: RollingWindow::new(lag),
             samples: 0,
@@ -30,11 +32,21 @@ impl Dpo {
 }
 
 impl Indicator for Dpo {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.sma.is_ready() && self.lag_buf.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.sma.is_ready() && self.lag_buf.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.sma.reset();

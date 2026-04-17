@@ -1,5 +1,5 @@
+use crate::charting::ChartCollection;
 use pyo3::prelude::*;
-use crate::charting::{ChartCollection, SeriesType};
 use std::sync::{Arc, Mutex};
 
 /// Thread-safe chart collection for use from Python
@@ -12,7 +12,9 @@ pub struct PyChartCollection {
 impl PyChartCollection {
     #[new]
     fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(ChartCollection::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(ChartCollection::new())),
+        }
     }
 
     /// Plot a value on a line chart.

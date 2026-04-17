@@ -92,8 +92,7 @@ impl IExecutionModel for TwapExecutionModel {
 
             // Each slice is 1/num_slices of total; round to reasonable precision
             // Use ceiling for positive, floor for negative to avoid under-execution
-            let slice_qty = remaining
-                / Decimal::from(slices_left);
+            let slice_qty = remaining / Decimal::from(slices_left);
 
             // Truncate to avoid tiny fractional shares
             // (round toward zero)

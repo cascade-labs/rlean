@@ -30,11 +30,21 @@ impl Cmo {
 }
 
 impl Indicator for Cmo {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period + 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period + 1
+    }
 
     fn reset(&mut self) {
         self.prev_value = None;

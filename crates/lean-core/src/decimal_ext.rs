@@ -18,10 +18,18 @@ impl DecimalExt for Decimal {
     }
 
     fn clamp_min(&self, min: Decimal) -> Decimal {
-        if *self < min { min } else { *self }
+        if *self < min {
+            min
+        } else {
+            *self
+        }
     }
 
     fn clamp_max(&self, max: Decimal) -> Decimal {
-        if *self > max { max } else { *self }
+        if *self > max {
+            max
+        } else {
+            *self
+        }
     }
 }

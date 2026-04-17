@@ -21,9 +21,17 @@ pub struct OrderFee {
 }
 
 impl OrderFee {
-    pub fn zero() -> Self { OrderFee { value: dec!(0), currency: "USD".into() } }
+    pub fn zero() -> Self {
+        OrderFee {
+            value: dec!(0),
+            currency: "USD".into(),
+        }
+    }
     pub fn flat(amount: Price, currency: &str) -> Self {
-        OrderFee { value: amount, currency: currency.to_string() }
+        OrderFee {
+            value: amount,
+            currency: currency.to_string(),
+        }
     }
 }
 
@@ -42,7 +50,6 @@ pub struct InteractiveBrokersFeeModel;
 
 impl SecurityTransactionModel for InteractiveBrokersFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters) -> OrderFee {
-        use rust_decimal::prelude::Signed;
         let qty = params.order_quantity.abs();
         let raw_fee = qty * dec!(0.005);
         let min_fee = dec!(1.0);
@@ -82,8 +89,12 @@ pub struct FlatFeeModel {
 }
 
 impl FlatFeeModel {
-    pub fn zero() -> Self { FlatFeeModel { fee: dec!(0) } }
-    pub fn new(fee: Price) -> Self { FlatFeeModel { fee } }
+    pub fn zero() -> Self {
+        FlatFeeModel { fee: dec!(0) }
+    }
+    pub fn new(fee: Price) -> Self {
+        FlatFeeModel { fee }
+    }
 }
 
 impl SecurityTransactionModel for FlatFeeModel {

@@ -1,7 +1,7 @@
 use lean_optimization::*;
 use rust_decimal::prelude::*;
-use rust_decimal_macros::dec;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 
 fn simple_result(params: &ParameterSet, sharpe: f64, ret: f64, dd: f64) -> OptimizationResult {
@@ -208,7 +208,8 @@ mod random_search_tests {
             ParameterDefinition::new("X", dec!(5), dec!(20), dec!(1)),
             ParameterDefinition::new("Y", dec!(0.1), dec!(0.9), dec!(0.1)),
         ];
-        let opt = RandomSearchOptimizer::new(params.clone(), ObjectiveFunction::MaximizeSharpeRatio, 50);
+        let opt =
+            RandomSearchOptimizer::new(params.clone(), ObjectiveFunction::MaximizeSharpeRatio, 50);
         let samples = opt.sample_parameters();
         for sample in &samples {
             for p in &params {
@@ -239,7 +240,8 @@ mod random_search_tests {
     fn random_search_deterministic_with_same_seed() {
         // Two optimizers with identical seed must produce identical samples
         let params = vec![ParameterDefinition::new("X", dec!(1), dec!(50), dec!(1))];
-        let opt1 = RandomSearchOptimizer::new(params.clone(), ObjectiveFunction::MaximizeSharpeRatio, 15);
+        let opt1 =
+            RandomSearchOptimizer::new(params.clone(), ObjectiveFunction::MaximizeSharpeRatio, 15);
         let opt2 = RandomSearchOptimizer::new(params, ObjectiveFunction::MaximizeSharpeRatio, 15);
         assert_eq!(opt1.sample_parameters(), opt2.sample_parameters());
     }
@@ -335,7 +337,10 @@ mod walk_forward_tests {
             let advance_months = (next.in_sample_start.year() - prev.in_sample_start.year()) * 12
                 + next.in_sample_start.month() as i32
                 - prev.in_sample_start.month() as i32;
-            assert_eq!(advance_months, 3, "window start should advance by oos_months=3");
+            assert_eq!(
+                advance_months, 3,
+                "window start should advance by oos_months=3"
+            );
         }
     }
 
@@ -379,7 +384,10 @@ mod objective_function_tests {
     fn minimize_drawdown_negates_max_drawdown() {
         let r = make_result(1.0, 0.1, 0.3);
         let score = ObjectiveFunction::MinimizeMaxDrawdown.evaluate(&r);
-        assert!(score < dec!(0), "MinimizeMaxDrawdown score must be negative");
+        assert!(
+            score < dec!(0),
+            "MinimizeMaxDrawdown score must be negative"
+        );
         assert_eq!(score, -r.max_drawdown);
     }
 

@@ -1,5 +1,5 @@
-use lean_core::{Resolution, SecurityType, Symbol};
 use chrono::NaiveDate;
+use lean_core::{Resolution, Symbol};
 use std::path::{Path, PathBuf};
 
 /// Returns the canonical path for a date-partitioned option EOD Parquet file.
@@ -45,7 +45,12 @@ pub struct DataPath {
 }
 
 impl DataPath {
-    pub fn trade_bar(root: impl AsRef<Path>, symbol: &Symbol, resolution: Resolution, date: NaiveDate) -> Self {
+    pub fn trade_bar(
+        root: impl AsRef<Path>,
+        symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> Self {
         DataPath {
             root: root.as_ref().to_path_buf(),
             symbol: symbol.clone(),
@@ -57,7 +62,12 @@ impl DataPath {
         }
     }
 
-    pub fn quote_bar(root: impl AsRef<Path>, symbol: &Symbol, resolution: Resolution, date: NaiveDate) -> Self {
+    pub fn quote_bar(
+        root: impl AsRef<Path>,
+        symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> Self {
         DataPath {
             root: root.as_ref().to_path_buf(),
             symbol: symbol.clone(),
@@ -176,7 +186,11 @@ impl DataPath {
                 // All resolutions use ticker subdirectory + date prefix
                 // (daily is date-partitioned: one file per date per underlying)
                 p.push(ticker);
-                p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
+                p.push(format!(
+                    "{}_{}.parquet",
+                    self.date.format("%Y%m%d"),
+                    self.suffix
+                ));
             }
         } else {
             // Standard path layout
@@ -190,7 +204,11 @@ impl DataPath {
 
             if self.resolution.is_high_resolution() {
                 p.push(&ticker);
-                p.push(format!("{}_{}.parquet", self.date.format("%Y%m%d"), self.suffix));
+                p.push(format!(
+                    "{}_{}.parquet",
+                    self.date.format("%Y%m%d"),
+                    self.suffix
+                ));
             } else {
                 p.push(format!("{}_{}.parquet", ticker, self.suffix));
             }
@@ -214,14 +232,20 @@ impl DataPath {
             if self.is_universe {
                 format!(
                     "{}/option/{}/universes/{}/*_universe.parquet",
-                    self.root.display(), market, ticker
+                    self.root.display(),
+                    market,
+                    ticker
                 )
             } else {
                 let res = self.resolution.folder_name();
                 // All resolutions: ticker subdirectory + date-partitioned files
                 format!(
                     "{}/option/{}/{}/{}/*_{}.parquet",
-                    self.root.display(), market, res, ticker, self.suffix
+                    self.root.display(),
+                    market,
+                    res,
+                    ticker,
+                    self.suffix
                 )
             }
         } else {
@@ -232,12 +256,22 @@ impl DataPath {
             if self.resolution.is_high_resolution() {
                 format!(
                     "{}/{}/{}/{}/{}/**/*_{}.parquet",
-                    self.root.display(), sec_type, market, res, ticker, self.suffix
+                    self.root.display(),
+                    sec_type,
+                    market,
+                    res,
+                    ticker,
+                    self.suffix
                 )
             } else {
                 format!(
                     "{}/{}/{}/{}/{}_{}.parquet",
-                    self.root.display(), sec_type, market, res, ticker, self.suffix
+                    self.root.display(),
+                    sec_type,
+                    market,
+                    res,
+                    ticker,
+                    self.suffix
                 )
             }
         }
@@ -252,7 +286,9 @@ pub struct PathResolver {
 
 impl PathResolver {
     pub fn new(data_root: impl AsRef<Path>) -> Self {
-        PathResolver { data_root: data_root.as_ref().to_path_buf() }
+        PathResolver {
+            data_root: data_root.as_ref().to_path_buf(),
+        }
     }
 
     pub fn trade_bar(&self, symbol: &Symbol, resolution: Resolution, date: NaiveDate) -> DataPath {
@@ -308,7 +344,12 @@ impl PathResolver {
 ///
 /// One file per trading date per source per ticker — cache check is a single
 /// `file.exists()` syscall; reads return all rows for that date.
-pub fn custom_data_path(root: impl AsRef<Path>, source_type: &str, ticker: &str, date: NaiveDate) -> PathBuf {
+pub fn custom_data_path(
+    root: impl AsRef<Path>,
+    source_type: &str,
+    ticker: &str,
+    date: NaiveDate,
+) -> PathBuf {
     let mut p = root.as_ref().to_path_buf();
     p.push("custom");
     p.push(source_type.to_lowercase());
@@ -323,7 +364,11 @@ pub fn custom_data_path(root: impl AsRef<Path>, source_type: &str, ticker: &str,
 /// entire series is stored in one file rather than one file per trading date.
 ///
 /// Layout: `{root}/custom/{source_type_lower}/{ticker_lower}/history.parquet`
-pub fn custom_data_history_path(root: impl AsRef<Path>, source_type: &str, ticker: &str) -> PathBuf {
+pub fn custom_data_history_path(
+    root: impl AsRef<Path>,
+    source_type: &str,
+    ticker: &str,
+) -> PathBuf {
     let mut p = root.as_ref().to_path_buf();
     p.push("custom");
     p.push(source_type.to_lowercase());

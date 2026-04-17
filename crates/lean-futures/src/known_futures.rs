@@ -1,14 +1,17 @@
 use crate::{contract_series::FuturesContractSeries, expiry::ExpiryRule};
 
-pub fn es() -> FuturesContractSeries {  // S&P 500 E-mini
+pub fn es() -> FuturesContractSeries {
+    // S&P 500 E-mini
     FuturesContractSeries::quarterly("ES")
 }
 
-pub fn nq() -> FuturesContractSeries {  // Nasdaq E-mini
+pub fn nq() -> FuturesContractSeries {
+    // Nasdaq E-mini
     FuturesContractSeries::quarterly("NQ")
 }
 
-pub fn cl() -> FuturesContractSeries {  // Crude Oil (monthly, 3rd-last business day)
+pub fn cl() -> FuturesContractSeries {
+    // Crude Oil (monthly, 3rd-last business day)
     FuturesContractSeries {
         underlying: "CL".to_string(),
         expiry_rule: ExpiryRule::NthFromEnd(3),
@@ -16,7 +19,8 @@ pub fn cl() -> FuturesContractSeries {  // Crude Oil (monthly, 3rd-last business
     }
 }
 
-pub fn gc() -> FuturesContractSeries {  // Gold (bi-monthly)
+pub fn gc() -> FuturesContractSeries {
+    // Gold (bi-monthly)
     FuturesContractSeries {
         underlying: "GC".to_string(),
         expiry_rule: ExpiryRule::ThirdFriday,
@@ -24,6 +28,7 @@ pub fn gc() -> FuturesContractSeries {  // Gold (bi-monthly)
     }
 }
 
-pub fn zb() -> FuturesContractSeries {  // 30-yr Treasury Bond (quarterly)
+pub fn zb() -> FuturesContractSeries {
+    // 30-yr Treasury Bond (quarterly)
     FuturesContractSeries::quarterly("ZB")
 }

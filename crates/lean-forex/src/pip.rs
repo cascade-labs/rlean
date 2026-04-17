@@ -7,7 +7,11 @@ use rust_decimal_macros::dec;
 /// JPY pairs: 0.01 (2 decimal places)
 pub fn pip_size(pair: &CurrencyPair) -> Decimal {
     let quote = pair.quote.to_uppercase();
-    if quote.contains("JPY") { dec!(0.01) } else { dec!(0.0001) }
+    if quote.contains("JPY") {
+        dec!(0.01)
+    } else {
+        dec!(0.0001)
+    }
 }
 
 /// Convert pips to price units
@@ -17,7 +21,9 @@ pub fn pips_to_price(pips: Decimal, pair: &CurrencyPair) -> Decimal {
 
 /// Convert price to pips
 pub fn price_to_pips(price_diff: Decimal, pair: &CurrencyPair) -> Decimal {
-    if pip_size(pair).is_zero() { return dec!(0); }
+    if pip_size(pair).is_zero() {
+        return dec!(0);
+    }
     price_diff / pip_size(pair)
 }
 
@@ -35,7 +41,9 @@ pub fn pip_value_usd(
     if quote == "USD" {
         ps * lot_size
     } else if pair.base.to_uppercase() == "USD" {
-        if current_price.is_zero() { return dec!(0); }
+        if current_price.is_zero() {
+            return dec!(0);
+        }
         ps / current_price * lot_size
     } else {
         // cross pair — approximate

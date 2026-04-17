@@ -32,7 +32,7 @@ pub trait IAlgorithm: Send + Sync {
     fn on_data(&mut self, slice: &Slice);
 
     /// Called when an order is filled, partially filled, or canceled.
-    fn on_order_event(&mut self, order_event: &OrderEvent) {}
+    fn on_order_event(&mut self, _order_event: &OrderEvent) {}
 
     /// Called at end of day.
     fn on_end_of_day(&mut self, _symbol: Option<lean_core::Symbol>) {}
@@ -53,11 +53,15 @@ pub trait IAlgorithm: Send + Sync {
 
     /// Current total portfolio value (cash + holdings market value).
     /// Defaults to 0 — implementors backed by QcAlgorithm should override.
-    fn portfolio_value(&self) -> Price { dec!(0) }
+    fn portfolio_value(&self) -> Price {
+        dec!(0)
+    }
 
     /// Starting cash set during initialize().
     /// Defaults to 100,000 — implementors backed by QcAlgorithm should override.
-    fn starting_cash(&self) -> Price { dec!(100_000) }
+    fn starting_cash(&self) -> Price {
+        dec!(100_000)
+    }
 }
 
 /// Security additions/removals from universe changes.
@@ -69,7 +73,10 @@ pub struct SecurityChanges {
 
 impl SecurityChanges {
     pub fn empty() -> Self {
-        SecurityChanges { added: vec![], removed: vec![] }
+        SecurityChanges {
+            added: vec![],
+            removed: vec![],
+        }
     }
 
     pub fn has_changes(&self) -> bool {

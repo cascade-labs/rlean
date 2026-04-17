@@ -16,9 +16,15 @@ use rust_decimal_macros::dec;
 // After fix: apply_exercise() atomically creates the holding AND adjusts cash
 // so the equity is always consistent.
 
-fn ts() -> NanosecondTimestamp { NanosecondTimestamp::from_secs(0) }
-fn spy() -> Symbol { Symbol::create_equity("SPY", &Market::usa()) }
-fn aapl() -> Symbol { Symbol::create_equity("AAPL", &Market::usa()) }
+fn ts() -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(0)
+}
+fn spy() -> Symbol {
+    Symbol::create_equity("SPY", &Market::usa())
+}
+fn aapl() -> Symbol {
+    Symbol::create_equity("AAPL", &Market::usa())
+}
 
 // ─── SecurityHolding ─────────────────────────────────────────────────────────
 
@@ -223,7 +229,11 @@ fn short_put_assignment_preserves_equity() {
     // Cash must be reduced by exactly strike × shares.
     assert_eq!(cash, dec!(15_400), "cash after put assignment");
     // Holdings must be worth strike × shares immediately.
-    assert_eq!(pm.total_holdings_value(), dec!(45_600), "holdings after put assignment");
+    assert_eq!(
+        pm.total_holdings_value(),
+        dec!(45_600),
+        "holdings after put assignment"
+    );
     // Total portfolio value must equal starting + premium (no phantom drawdown).
     assert_eq!(total, dec!(61_000), "total equity after put assignment");
 }
@@ -258,8 +268,6 @@ fn short_call_assignment_preserves_equity() {
 
     // Credit call premium.
     *pm.cash.write() += dec!(1_100);
-
-    let equity_before = pm.total_portfolio_value();
 
     // Call assigned: sell 100 shares at K=$435 (below cost — small loss on shares, offset by premium).
     pm.apply_exercise(&spy(), dec!(435), dec!(-100));

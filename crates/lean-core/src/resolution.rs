@@ -3,8 +3,21 @@ use std::time::Duration;
 use strum::{Display, EnumIter, EnumString, FromRepr};
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
-    Serialize, Deserialize, Display, EnumString, EnumIter, FromRepr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    EnumIter,
+    FromRepr,
+    Default,
 )]
 #[repr(u8)]
 pub enum Resolution {
@@ -17,6 +30,7 @@ pub enum Resolution {
     #[strum(serialize = "Hour")]
     Hour = 3,
     #[strum(serialize = "Daily")]
+    #[default]
     Daily = 4,
 }
 
@@ -44,17 +58,20 @@ impl Resolution {
 
     /// Lower resolutions use daily files; higher use per-date files.
     pub fn is_high_resolution(&self) -> bool {
-        matches!(self, Resolution::Tick | Resolution::Second | Resolution::Minute)
+        matches!(
+            self,
+            Resolution::Tick | Resolution::Second | Resolution::Minute
+        )
     }
 
     /// Duration as a `TimeSpan` for non-tick resolutions.
     pub fn to_time_span(&self) -> Option<crate::TimeSpan> {
         match self {
-            Resolution::Tick   => None,
+            Resolution::Tick => None,
             Resolution::Second => Some(crate::TimeSpan::from_nanos(1_000_000_000)),
             Resolution::Minute => Some(crate::TimeSpan::from_nanos(60_000_000_000)),
-            Resolution::Hour   => Some(crate::TimeSpan::from_nanos(3_600_000_000_000)),
-            Resolution::Daily  => Some(crate::TimeSpan::from_nanos(86_400_000_000_000)),
+            Resolution::Hour => Some(crate::TimeSpan::from_nanos(3_600_000_000_000)),
+            Resolution::Daily => Some(crate::TimeSpan::from_nanos(86_400_000_000_000)),
         }
     }
 
@@ -67,11 +84,5 @@ impl Resolution {
             Resolution::Hour => "hour",
             Resolution::Daily => "daily",
         }
-    }
-}
-
-impl Default for Resolution {
-    fn default() -> Self {
-        Resolution::Daily
     }
 }

@@ -1,7 +1,10 @@
-use crate::{indicator::{Indicator, IndicatorResult}, variance::Variance};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    variance::Variance,
+};
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 /// Rolling population standard deviation (sqrt of variance).
 pub struct StandardDeviation {
@@ -23,11 +26,21 @@ impl StandardDeviation {
 }
 
 impl Indicator for StandardDeviation {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.variance.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.variance.warm_up_period() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.variance.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.variance.warm_up_period()
+    }
 
     fn reset(&mut self) {
         self.variance.reset();

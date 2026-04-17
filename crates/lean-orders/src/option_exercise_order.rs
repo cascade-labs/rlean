@@ -1,5 +1,5 @@
-use lean_core::{DateTime, Quantity, Symbol};
 use crate::order::{Order, OrderType};
+use lean_core::{DateTime, Quantity, Symbol};
 
 /// Order used to exercise or assign an option contract.
 /// Generated automatically by the engine at expiration, or manually by the algorithm.

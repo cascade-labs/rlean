@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -22,53 +26,97 @@ pub struct Kst {
     current: IndicatorResult,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct KstPeriods {
+    pub roc1: usize,
+    pub sma1: usize,
+    pub roc2: usize,
+    pub sma2: usize,
+    pub roc3: usize,
+    pub sma3: usize,
+    pub roc4: usize,
+    pub sma4: usize,
+    pub signal: usize,
+}
+
+impl Default for KstPeriods {
+    fn default() -> Self {
+        Self {
+            roc1: 10,
+            sma1: 10,
+            roc2: 13,
+            sma2: 13,
+            roc3: 14,
+            sma3: 15,
+            roc4: 15,
+            sma4: 20,
+            signal: 9,
+        }
+    }
+}
+
 impl Kst {
-    pub fn new(
-        roc1: usize, sma1: usize,
-        roc2: usize, sma2: usize,
-        roc3: usize, sma3: usize,
-        roc4: usize, sma4: usize,
-        signal: usize,
-    ) -> Self {
-        let warm_up = (roc1 + sma1).max(roc2 + sma2).max(roc3 + sma3).max(roc4 + sma4);
+    pub fn new(periods: KstPeriods) -> Self {
+        let warm_up = (periods.roc1 + periods.sma1)
+            .max(periods.roc2 + periods.sma2)
+            .max(periods.roc3 + periods.sma3)
+            .max(periods.roc4 + periods.sma4);
         Kst {
-            name: format!("KST"),
-            roc1_buf: RollingWindow::new(roc1 + 1),
-            roc2_buf: RollingWindow::new(roc2 + 1),
-            roc3_buf: RollingWindow::new(roc3 + 1),
-            roc4_buf: RollingWindow::new(roc4 + 1),
-            sma1: Sma::new(sma1),
-            sma2: Sma::new(sma2),
-            sma3: Sma::new(sma3),
-            sma4: Sma::new(sma4),
-            signal_sma: Sma::new(signal),
+            name: "KST".to_string(),
+            roc1_buf: RollingWindow::new(periods.roc1 + 1),
+            roc2_buf: RollingWindow::new(periods.roc2 + 1),
+            roc3_buf: RollingWindow::new(periods.roc3 + 1),
+            roc4_buf: RollingWindow::new(periods.roc4 + 1),
+            sma1: Sma::new(periods.sma1),
+            sma2: Sma::new(periods.sma2),
+            sma3: Sma::new(periods.sma3),
+            sma4: Sma::new(periods.sma4),
+            signal_sma: Sma::new(periods.signal),
             warm_up,
             samples: 0,
             current: IndicatorResult::not_ready(),
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(10, 10, 13, 13, 14, 15, 15, 20, 9)
-    }
-
     fn roc(buf: &RollingWindow<Price>) -> Decimal {
-        if !buf.is_full() { return dec!(0); }
+        if !buf.is_full() {
+            return dec!(0);
+        }
         let newest = buf.newest().copied().unwrap_or(dec!(0));
         let oldest = buf.oldest().copied().unwrap_or(dec!(0));
-        if oldest == dec!(0) { return dec!(0); }
+        if oldest == dec!(0) {
+            return dec!(0);
+        }
         (newest - oldest) / oldest * dec!(100)
     }
 }
 
-impl Indicator for Kst {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool {
-        self.sma1.is_ready() && self.sma2.is_ready() && self.sma3.is_ready() && self.sma4.is_ready() && self.signal_sma.is_ready()
+impl Default for Kst {
+    fn default() -> Self {
+        Self::new(KstPeriods::default())
     }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+}
+
+impl Indicator for Kst {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.sma1.is_ready()
+            && self.sma2.is_ready()
+            && self.sma3.is_ready()
+            && self.sma4.is_ready()
+            && self.signal_sma.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.roc1_buf.clear();

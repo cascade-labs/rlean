@@ -1,15 +1,15 @@
-use crate::{convert, path_resolver::DataPath, schema};
-use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
-use lean_core::Result as LeanResult;
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
+use crate::{convert, path_resolver::DataPath, schema};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use lean_core::Result as LeanResult;
+use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
-use arrow_array::{Float64Array, Int64Array, StringArray, RecordBatch};
 use std::{fs, path::Path, sync::Arc};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Configuration for Parquet output.
 #[derive(Debug, Clone)]
@@ -67,7 +67,9 @@ impl ParquetWriter {
 
     /// Write trade bars to a parquet file at the given path.
     pub fn write_trade_bars(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
-        if bars.is_empty() { return Ok(()); }
+        if bars.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let batch = convert::trade_bars_to_record_batch(bars);
@@ -77,9 +79,11 @@ impl ParquetWriter {
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         debug!("Wrote {} trade bars to {}", bars.len(), path.display());
@@ -88,7 +92,9 @@ impl ParquetWriter {
 
     /// Write quote bars to a parquet file at the given path.
     pub fn write_quote_bars(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
-        if bars.is_empty() { return Ok(()); }
+        if bars.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let batch = convert::quote_bars_to_record_batch(bars);
@@ -98,9 +104,11 @@ impl ParquetWriter {
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         debug!("Wrote {} quote bars to {}", bars.len(), path.display());
@@ -109,7 +117,9 @@ impl ParquetWriter {
 
     /// Write ticks to a parquet file at the given path.
     pub fn write_ticks(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
-        if ticks.is_empty() { return Ok(()); }
+        if ticks.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let batch = convert::ticks_to_record_batch(ticks);
@@ -119,9 +129,11 @@ impl ParquetWriter {
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         debug!("Wrote {} ticks to {}", ticks.len(), path.display());
@@ -130,7 +142,9 @@ impl ParquetWriter {
 
     /// Write option EOD bars to a parquet file at the given path.
     pub fn write_option_eod_bars(&self, rows: &[OptionEodBar], path: &Path) -> LeanResult<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let batch = convert::option_eod_bars_to_record_batch(rows);
@@ -140,9 +154,11 @@ impl ParquetWriter {
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         debug!("Wrote {} option EOD bars to {}", rows.len(), path.display());
@@ -151,7 +167,9 @@ impl ParquetWriter {
 
     /// Write option universe rows to a parquet file at the given path.
     pub fn write_option_universe(&self, rows: &[OptionUniverseRow], path: &Path) -> LeanResult<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let batch = convert::option_universe_rows_to_record_batch(rows);
@@ -161,12 +179,18 @@ impl ParquetWriter {
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        debug!("Wrote {} option universe rows to {}", rows.len(), path.display());
+        debug!(
+            "Wrote {} option universe rows to {}",
+            rows.len(),
+            path.display()
+        );
         Ok(())
     }
 
@@ -183,11 +207,19 @@ impl ParquetWriter {
         self.write_ticks(ticks, &data_path.to_path())
     }
 
-    pub fn write_option_eod_bars_at(&self, rows: &[OptionEodBar], data_path: &DataPath) -> LeanResult<()> {
+    pub fn write_option_eod_bars_at(
+        &self,
+        rows: &[OptionEodBar],
+        data_path: &DataPath,
+    ) -> LeanResult<()> {
         self.write_option_eod_bars(rows, &data_path.to_path())
     }
 
-    pub fn write_option_universe_at(&self, rows: &[OptionUniverseRow], data_path: &DataPath) -> LeanResult<()> {
+    pub fn write_option_universe_at(
+        &self,
+        rows: &[OptionUniverseRow],
+        data_path: &DataPath,
+    ) -> LeanResult<()> {
         self.write_option_universe(rows, &data_path.to_path())
     }
 
@@ -196,32 +228,44 @@ impl ParquetWriter {
     /// Schema: `date_ns` (Int64 ns UTC), `price_factor` (Float64),
     ///         `split_factor` (Float64), `reference_price` (Float64).
     pub fn write_factor_file(&self, entries: &[FactorFileEntry], path: &Path) -> LeanResult<()> {
-        if entries.is_empty() { return Ok(()); }
+        if entries.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let schema = schema::factor_file_schema();
 
-        let dates:  Vec<i64> = entries.iter().map(|e| e.date_ns()).collect();
+        let dates: Vec<i64> = entries.iter().map(|e| e.date_ns()).collect();
         let prices: Vec<f64> = entries.iter().map(|e| e.price_factor).collect();
         let splits: Vec<f64> = entries.iter().map(|e| e.split_factor).collect();
-        let refs:   Vec<f64> = entries.iter().map(|e| e.reference_price).collect();
+        let refs: Vec<f64> = entries.iter().map(|e| e.reference_price).collect();
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(Int64Array::from(dates)),
-            Arc::new(Float64Array::from(prices)),
-            Arc::new(Float64Array::from(splits)),
-            Arc::new(Float64Array::from(refs)),
-        ]).map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(dates)),
+                Arc::new(Float64Array::from(prices)),
+                Arc::new(Float64Array::from(splits)),
+                Arc::new(Float64Array::from(refs)),
+            ],
+        )
+        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         let file = fs::File::create(path)?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        debug!("Wrote {} factor file entries to {}", entries.len(), path.display());
+        debug!(
+            "Wrote {} factor file entries to {}",
+            entries.len(),
+            path.display()
+        );
         Ok(())
     }
 
@@ -229,65 +273,97 @@ impl ParquetWriter {
     ///
     /// Schema: `date_ns` (Int64 ns UTC), `ticker` (Utf8).
     pub fn write_map_file(&self, entries: &[MapFileEntry], path: &Path) -> LeanResult<()> {
-        if entries.is_empty() { return Ok(()); }
+        if entries.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let schema = schema::map_file_schema();
 
-        let dates:   Vec<i64>   = entries.iter().map(|e| e.date_ns()).collect();
-        let tickers: Vec<&str>  = entries.iter().map(|e| e.ticker.as_str()).collect();
+        let dates: Vec<i64> = entries.iter().map(|e| e.date_ns()).collect();
+        let tickers: Vec<&str> = entries.iter().map(|e| e.ticker.as_str()).collect();
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(Int64Array::from(dates)),
-            Arc::new(StringArray::from(tickers)),
-        ]).map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(dates)),
+                Arc::new(StringArray::from(tickers)),
+            ],
+        )
+        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         let file = fs::File::create(path)?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        debug!("Wrote {} map file entries to {}", entries.len(), path.display());
+        debug!(
+            "Wrote {} map file entries to {}",
+            entries.len(),
+            path.display()
+        );
         Ok(())
     }
 
     /// Write custom data points to a parquet cache file.
     ///
     /// Schema: `date_ns` (Int64 ns UTC), `value` (Float64), `fields_json` (Utf8).
-    pub fn write_custom_data_points(&self, points: &[CustomDataPoint], path: &Path) -> LeanResult<()> {
-        if points.is_empty() { return Ok(()); }
+    pub fn write_custom_data_points(
+        &self,
+        points: &[CustomDataPoint],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir(path)?;
 
         let schema = schema::custom_data_schema();
 
         let dates: Vec<i64> = points.iter().map(|p| schema::date_to_ns(p.time)).collect();
-        let values: Vec<f64> = points.iter().map(|p| {
-            use rust_decimal::prelude::ToPrimitive;
-            p.value.to_f64().unwrap_or(0.0)
-        }).collect();
-        let fields_json: Vec<String> = points.iter()
+        let values: Vec<f64> = points
+            .iter()
+            .map(|p| {
+                use rust_decimal::prelude::ToPrimitive;
+                p.value.to_f64().unwrap_or(0.0)
+            })
+            .collect();
+        let fields_json: Vec<String> = points
+            .iter()
             .map(|p| serde_json::to_string(&p.fields).unwrap_or_else(|_| "{}".to_string()))
             .collect();
         let fields_json_refs: Vec<&str> = fields_json.iter().map(|s| s.as_str()).collect();
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(Int64Array::from(dates)),
-            Arc::new(arrow_array::Float64Array::from(values)),
-            Arc::new(StringArray::from(fields_json_refs)),
-        ]).map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(dates)),
+                Arc::new(arrow_array::Float64Array::from(values)),
+                Arc::new(StringArray::from(fields_json_refs)),
+            ],
+        )
+        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         let file = fs::File::create(path)?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.write(&batch)
+        writer
+            .write(&batch)
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer.close()
+        writer
+            .close()
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-        debug!("Wrote {} custom data points to {}", points.len(), path.display());
+        debug!(
+            "Wrote {} custom data points to {}",
+            points.len(),
+            path.display()
+        );
         Ok(())
     }
 

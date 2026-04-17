@@ -28,7 +28,9 @@ pub struct DaySchedule {
 
 impl DaySchedule {
     pub fn open(session: MarketSession) -> Self {
-        DaySchedule { sessions: vec![session] }
+        DaySchedule {
+            sessions: vec![session],
+        }
     }
     pub fn closed() -> Self {
         DaySchedule { sessions: vec![] }
@@ -54,13 +56,13 @@ impl ExchangeHours {
         ExchangeHours {
             timezone: "America/New_York".into(),
             schedule: [
-                DaySchedule::closed(),          // Sunday
-                DaySchedule::open(regular),      // Monday
-                DaySchedule::open(regular),      // Tuesday
-                DaySchedule::open(regular),      // Wednesday
-                DaySchedule::open(regular),      // Thursday
-                DaySchedule::open(regular),      // Friday
-                DaySchedule::closed(),           // Saturday
+                DaySchedule::closed(),      // Sunday
+                DaySchedule::open(regular), // Monday
+                DaySchedule::open(regular), // Tuesday
+                DaySchedule::open(regular), // Wednesday
+                DaySchedule::open(regular), // Thursday
+                DaySchedule::open(regular), // Friday
+                DaySchedule::closed(),      // Saturday
             ],
             holidays: Self::us_equity_holidays(),
             early_closes: std::collections::HashMap::new(),
@@ -73,13 +75,13 @@ impl ExchangeHours {
         ExchangeHours {
             timezone: "UTC".into(),
             schedule: [
-                DaySchedule::closed(),       // Sunday (forex opens Sunday 5pm ET)
+                DaySchedule::closed(), // Sunday (forex opens Sunday 5pm ET)
                 DaySchedule::open(session),
                 DaySchedule::open(session),
                 DaySchedule::open(session),
                 DaySchedule::open(session),
                 DaySchedule::open(session),
-                DaySchedule::closed(),       // Saturday
+                DaySchedule::closed(), // Saturday
             ],
             holidays: HashSet::new(),
             early_closes: std::collections::HashMap::new(),
@@ -151,12 +153,12 @@ impl ExchangeHours {
             let schedule = &self.schedule[dow];
             if let Some(session) = schedule.sessions.first() {
                 let open_nanos = session.open.nanos;
-                let local_dt = tz.from_local_datetime(&candidate_date.and_hms_opt(0, 0, 0).unwrap())
+                let local_dt = tz
+                    .from_local_datetime(&candidate_date.and_hms_opt(0, 0, 0).unwrap())
                     .unwrap();
                 let utc_dt: chrono::DateTime<chrono::Utc> = local_dt.with_timezone(&chrono::Utc);
-                let candidate = NanosecondTimestamp(
-                    NanosecondTimestamp::from(utc_dt).0 + open_nanos,
-                );
+                let candidate =
+                    NanosecondTimestamp(NanosecondTimestamp::from(utc_dt).0 + open_nanos);
                 if candidate > from {
                     return Some(candidate);
                 }

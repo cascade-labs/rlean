@@ -42,8 +42,8 @@ pub enum ConfigCommand {
 pub fn run_config(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Set { key, value } => cmd_set(&key, &value),
-        ConfigCommand::Get { key }        => cmd_get(&key),
-        ConfigCommand::List               => cmd_list(),
+        ConfigCommand::Get { key } => cmd_get(&key),
+        ConfigCommand::List => cmd_list(),
     }
 }
 
@@ -128,12 +128,12 @@ fn cmd_get(key: &str) -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let global      = GlobalConfig::load()?;
-    let ws          = std::env::current_dir()?;
-    let ws_cfg      = WorkspaceConfig::load(&ws).ok();
+    let global = GlobalConfig::load()?;
+    let ws = std::env::current_dir()?;
+    let ws_cfg = WorkspaceConfig::load(&ws).ok();
     let plugin_cfgs = PluginConfigs::load()?;
 
-    println!("{:<30} {}", "KEY", "VALUE");
+    println!("{:<30} VALUE", "KEY");
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
@@ -178,5 +178,5 @@ fn mask(s: &str) -> String {
     if s.len() <= 4 {
         return "*".repeat(s.len());
     }
-    format!("{}{}",  &s[..4], "*".repeat(s.len() - 4))
+    format!("{}{}", &s[..4], "*".repeat(s.len() - 4))
 }

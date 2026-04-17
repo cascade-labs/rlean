@@ -41,7 +41,10 @@ pub struct Ichimoku {
 impl Ichimoku {
     pub fn new(tenkan: usize, kijun: usize, senkou_b: usize, displacement: usize) -> Self {
         Ichimoku {
-            name: format!("ICHIMOKU({},{},{},{})", tenkan, kijun, senkou_b, displacement),
+            name: format!(
+                "ICHIMOKU({},{},{},{})",
+                tenkan, kijun, senkou_b, displacement
+            ),
             tenkan_period: tenkan,
             kijun_period: kijun,
             senkou_b_period: senkou_b,
@@ -58,17 +61,22 @@ impl Ichimoku {
             samples: 0,
             current: IndicatorResult::not_ready(),
             last_result: IchimokuResult {
-                tenkan: None, kijun: None, senkou_a: None, senkou_b: None, chikou: None
+                tenkan: None,
+                kijun: None,
+                senkou_a: None,
+                senkou_b: None,
+                chikou: None,
             },
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(9, 26, 52, 26)
-    }
-
-    fn window_midpoint(highs: &RollingWindow<Decimal>, lows: &RollingWindow<Decimal>) -> Option<Decimal> {
-        if !highs.is_full() { return None; }
+    fn window_midpoint(
+        highs: &RollingWindow<Decimal>,
+        lows: &RollingWindow<Decimal>,
+    ) -> Option<Decimal> {
+        if !highs.is_full() {
+            return None;
+        }
         let max_h = highs.iter().copied().fold(Decimal::MIN, Decimal::max);
         let min_l = lows.iter().copied().fold(Decimal::MAX, Decimal::min);
         Some((max_h + min_l) / dec!(2))
@@ -104,18 +112,30 @@ impl Ichimoku {
 
         let senkou_a = if self.senkou_a_buf.is_full() {
             self.senkou_a_buf.oldest().copied()
-        } else { None };
+        } else {
+            None
+        };
 
         let senkou_b = if self.senkou_b_buf.is_full() {
             self.senkou_b_buf.oldest().copied()
-        } else { None };
+        } else {
+            None
+        };
 
         // chikou: close displaced back by kijun period
         let chikou = if self.chikou_buf.is_full() {
             self.chikou_buf.oldest().copied()
-        } else { None };
+        } else {
+            None
+        };
 
-        self.last_result = IchimokuResult { tenkan, kijun, senkou_a, senkou_b, chikou };
+        self.last_result = IchimokuResult {
+            tenkan,
+            kijun,
+            senkou_a,
+            senkou_b,
+            chikou,
+        };
 
         if tenkan.is_some() && kijun.is_some() {
             self.current = IndicatorResult::ready(tenkan.unwrap_or(dec!(0)), bar.time);
@@ -125,11 +145,25 @@ impl Ichimoku {
     }
 }
 
+impl Default for Ichimoku {
+    fn default() -> Self {
+        Self::new(9, 26, 52, 26)
+    }
+}
+
 impl Indicator for Ichimoku {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.tenkan_highs.is_full() && self.kijun_highs.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.tenkan_highs.is_full() && self.kijun_highs.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
     fn warm_up_period(&self) -> usize {
         let a = self.tenkan_period + self.displacement;
         let b = self.kijun_period + self.displacement;

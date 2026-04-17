@@ -33,7 +33,7 @@ impl CompositeAlphaModel {
         Self { models: Vec::new() }
     }
 
-    pub fn add(mut self, model: impl IAlphaModel + 'static) -> Self {
+    pub fn with_model(mut self, model: impl IAlphaModel + 'static) -> Self {
         self.models.push(Box::new(model));
         self
     }

@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -25,7 +28,9 @@ impl Alma {
         let sum: f64 = raw.iter().sum();
 
         // weights[0] = oldest, weights[period-1] = newest (reversed from raw)
-        let weights: Vec<Decimal> = raw.iter().rev()
+        let weights: Vec<Decimal> = raw
+            .iter()
+            .rev()
             .map(|w| Decimal::from_f64_retain(w / sum).unwrap_or(dec!(0)))
             .collect();
 
@@ -45,11 +50,21 @@ impl Alma {
 }
 
 impl Indicator for Alma {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();

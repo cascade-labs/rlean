@@ -58,11 +58,21 @@ impl SuperTrend {
 }
 
 impl Indicator for SuperTrend {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.initialized }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.initialized
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.atr = dec!(0);
@@ -108,16 +118,18 @@ impl Indicator for SuperTrend {
         let basic_upper = (bar.high + bar.low) / dec!(2) + self.multiplier * self.atr;
 
         let prev_close = self.prev_close.unwrap_or(bar.close);
-        self.trailing_lower = if basic_lower > self.prev_trailing_lower || prev_close < self.prev_trailing_lower {
-            basic_lower
-        } else {
-            self.prev_trailing_lower
-        };
-        self.trailing_upper = if basic_upper < self.prev_trailing_upper || prev_close > self.prev_trailing_upper {
-            basic_upper
-        } else {
-            self.prev_trailing_upper
-        };
+        self.trailing_lower =
+            if basic_lower > self.prev_trailing_lower || prev_close < self.prev_trailing_lower {
+                basic_lower
+            } else {
+                self.prev_trailing_lower
+            };
+        self.trailing_upper =
+            if basic_upper < self.prev_trailing_upper || prev_close > self.prev_trailing_upper {
+                basic_upper
+            } else {
+                self.prev_trailing_upper
+            };
 
         if self.prev_super == dec!(-1) || self.prev_super == self.prev_trailing_upper {
             self.super_trend = if bar.close <= self.trailing_upper {

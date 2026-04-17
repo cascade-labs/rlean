@@ -24,7 +24,9 @@ pub struct ConstantSlippageModel {
 }
 
 impl ConstantSlippageModel {
-    pub fn new(slippage: Price) -> Self { ConstantSlippageModel { slippage } }
+    pub fn new(slippage: Price) -> Self {
+        ConstantSlippageModel { slippage }
+    }
 }
 
 impl SlippageModel for ConstantSlippageModel {
@@ -48,7 +50,9 @@ impl SpreadSlippageModel {
 }
 
 impl Default for SpreadSlippageModel {
-    fn default() -> Self { SpreadSlippageModel::new(dec!(0.02)) }
+    fn default() -> Self {
+        SpreadSlippageModel::new(dec!(0.02))
+    }
 }
 
 impl SlippageModel for SpreadSlippageModel {
@@ -66,7 +70,10 @@ pub struct VolumeShareSlippageModel {
 
 impl VolumeShareSlippageModel {
     pub fn new(price_impact: Decimal, volume_exponent: Decimal) -> Self {
-        VolumeShareSlippageModel { price_impact, volume_exponent }
+        VolumeShareSlippageModel {
+            price_impact,
+            volume_exponent,
+        }
     }
 }
 
@@ -81,7 +88,9 @@ impl Default for VolumeShareSlippageModel {
 
 impl SlippageModel for VolumeShareSlippageModel {
     fn get_slippage_amount(&self, order: &Order, bar: &TradeBar) -> Price {
-        if bar.volume.is_zero() { return dec!(0); }
+        if bar.volume.is_zero() {
+            return dec!(0);
+        }
 
         use rust_decimal::prelude::ToPrimitive;
         let qty_f = order.abs_quantity().to_f64().unwrap_or(0.0);

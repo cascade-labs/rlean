@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema};
+use crate::{
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use rust_decimal_macros::dec;
 
@@ -28,11 +31,21 @@ impl Tema {
 }
 
 impl Indicator for Tema {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.ema3.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 3 * (self.period - 1) + 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.ema3.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        3 * (self.period - 1) + 1
+    }
 
     fn reset(&mut self) {
         self.ema1.reset();

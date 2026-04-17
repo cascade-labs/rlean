@@ -30,12 +30,7 @@ pub struct Tick {
 }
 
 impl Tick {
-    pub fn trade(
-        symbol: Symbol,
-        time: DateTime,
-        price: Price,
-        quantity: Quantity,
-    ) -> Self {
+    pub fn trade(symbol: Symbol, time: DateTime, price: Price, quantity: Quantity) -> Self {
         Tick {
             symbol,
             time,
@@ -62,7 +57,11 @@ impl Tick {
     ) -> Self {
         let mid = if bid > dec!(0) && ask > dec!(0) {
             (bid + ask) / dec!(2)
-        } else if bid > dec!(0) { bid } else { ask };
+        } else if bid > dec!(0) {
+            bid
+        } else {
+            ask
+        };
 
         Tick {
             symbol,
@@ -105,14 +104,24 @@ impl Tick {
         }
     }
 
-    pub fn is_trade(&self) -> bool { self.tick_type == TickType::Trade }
-    pub fn is_quote(&self) -> bool { self.tick_type == TickType::Quote }
+    pub fn is_trade(&self) -> bool {
+        self.tick_type == TickType::Trade
+    }
+    pub fn is_quote(&self) -> bool {
+        self.tick_type == TickType::Quote
+    }
 
     /// Parse from LEAN tick CSV (trade):
     /// `milliseconds,price*10000,quantity`
-    pub fn from_lean_trade_csv(line: &str, symbol: Symbol, date: chrono::NaiveDate) -> Option<Self> {
+    pub fn from_lean_trade_csv(
+        line: &str,
+        symbol: Symbol,
+        date: chrono::NaiveDate,
+    ) -> Option<Self> {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 3 { return None; }
+        if parts.len() < 3 {
+            return None;
+        }
 
         let ms: i64 = parts[0].trim().parse().ok()?;
         let price = parts[1].trim().parse::<rust_decimal::Decimal>().ok()? / dec!(10000);
@@ -122,14 +131,25 @@ impl Tick {
         let midnight = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
         let nanos = midnight.timestamp() * 1_000_000_000 + ms * 1_000_000;
 
-        Some(Tick::trade(symbol, lean_core::NanosecondTimestamp(nanos), price, quantity))
+        Some(Tick::trade(
+            symbol,
+            lean_core::NanosecondTimestamp(nanos),
+            price,
+            quantity,
+        ))
     }
 
     /// Parse from LEAN tick CSV (quote):
     /// `milliseconds,bid*10000,ask*10000,bid_size,ask_size`
-    pub fn from_lean_quote_csv(line: &str, symbol: Symbol, date: chrono::NaiveDate) -> Option<Self> {
+    pub fn from_lean_quote_csv(
+        line: &str,
+        symbol: Symbol,
+        date: chrono::NaiveDate,
+    ) -> Option<Self> {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 5 { return None; }
+        if parts.len() < 5 {
+            return None;
+        }
 
         let ms: i64 = parts[0].trim().parse().ok()?;
         let bid = parts[1].trim().parse::<rust_decimal::Decimal>().ok()? / dec!(10000);
@@ -141,15 +161,34 @@ impl Tick {
         let midnight = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
         let nanos = midnight.timestamp() * 1_000_000_000 + ms * 1_000_000;
 
-        Some(Tick::quote(symbol, lean_core::NanosecondTimestamp(nanos), bid, ask, bid_size, ask_size))
+        Some(Tick::quote(
+            symbol,
+            lean_core::NanosecondTimestamp(nanos),
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+        ))
     }
 }
 
 impl BaseData for Tick {
-    fn data_type(&self) -> BaseDataType { BaseDataType::Tick }
-    fn symbol(&self) -> &Symbol { &self.symbol }
-    fn time(&self) -> DateTime { self.time }
-    fn end_time(&self) -> DateTime { self.time }
-    fn price(&self) -> Price { self.value }
-    fn clone_box(&self) -> Box<dyn BaseData> { Box::new(self.clone()) }
+    fn data_type(&self) -> BaseDataType {
+        BaseDataType::Tick
+    }
+    fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+    fn time(&self) -> DateTime {
+        self.time
+    }
+    fn end_time(&self) -> DateTime {
+        self.time
+    }
+    fn price(&self) -> Price {
+        self.value
+    }
+    fn clone_box(&self) -> Box<dyn BaseData> {
+        Box::new(self.clone())
+    }
 }

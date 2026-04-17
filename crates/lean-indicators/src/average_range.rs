@@ -1,7 +1,9 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
-use rust_decimal_macros::dec;
 
 /// Average Range = SMA(High - Low, period).
 pub struct AverageRange {
@@ -23,11 +25,21 @@ impl AverageRange {
 }
 
 impl Indicator for AverageRange {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.sma.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.sma.warm_up_period() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.sma.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.sma.warm_up_period()
+    }
 
     fn reset(&mut self) {
         self.sma.reset();

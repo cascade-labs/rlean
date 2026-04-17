@@ -16,19 +16,19 @@ pub enum DataType {
 /// A request for historical data — mirrors C# `HistoryRequest`.
 #[derive(Debug, Clone)]
 pub struct HistoryRequest {
-    pub symbol:     Symbol,
+    pub symbol: Symbol,
     pub resolution: Resolution,
-    pub start:      DateTime,
-    pub end:        DateTime,
-    pub data_type:  DataType,
+    pub start: DateTime,
+    pub end: DateTime,
+    pub data_type: DataType,
 }
 
 /// A request to download data to the local store — mirrors C# `DataDownloaderGetParameters`.
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
-    pub symbol:     Symbol,
+    pub symbol: Symbol,
     pub resolution: Resolution,
-    pub start:      chrono::NaiveDate,
-    pub end:        chrono::NaiveDate,
-    pub data_root:  std::path::PathBuf,
+    pub start: chrono::NaiveDate,
+    pub end: chrono::NaiveDate,
+    pub data_root: std::path::PathBuf,
 }

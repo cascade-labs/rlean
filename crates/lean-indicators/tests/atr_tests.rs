@@ -1,10 +1,12 @@
-use lean_indicators::{indicator::Indicator, Atr};
 use lean_core::{Market, NanosecondTimestamp, Symbol};
 use lean_data::TradeBar;
-use rust_decimal_macros::dec;
+use lean_indicators::{indicator::Indicator, Atr};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 fn make_bar(i: i64, high: Decimal, low: Decimal, close: Decimal) -> TradeBar {
     TradeBar {

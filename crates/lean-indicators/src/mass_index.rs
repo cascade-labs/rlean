@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema, window::RollingWindow};
+use crate::{
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
@@ -29,18 +33,30 @@ impl MassIndex {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for MassIndex {
+    fn default() -> Self {
         Self::new(9, 25)
     }
 }
 
 impl Indicator for MassIndex {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.sum_window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.sum_window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.ema1.reset();
@@ -63,7 +79,11 @@ impl Indicator for MassIndex {
         if r1.is_ready() {
             let r2 = self.ema2.update_price(bar.time, r1.value);
             if r2.is_ready() {
-                let ratio = if r2.value != dec!(0) { r1.value / r2.value } else { dec!(0) };
+                let ratio = if r2.value != dec!(0) {
+                    r1.value / r2.value
+                } else {
+                    dec!(0)
+                };
 
                 if self.sum_window.is_full() {
                     if let Some(oldest) = self.sum_window.oldest() {

@@ -1,7 +1,7 @@
+use crate::contract::OptionContract;
 use lean_core::{OptionRight, OptionStyle};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use crate::contract::OptionContract;
 
 pub struct OptionAssignmentResult {
     pub quantity: Decimal,
@@ -10,15 +10,20 @@ pub struct OptionAssignmentResult {
 
 impl OptionAssignmentResult {
     pub fn new(quantity: Decimal, tag: impl Into<String>) -> Self {
-        OptionAssignmentResult { quantity, tag: tag.into() }
+        OptionAssignmentResult {
+            quantity,
+            tag: tag.into(),
+        }
     }
 
-    pub fn is_null(&self) -> bool { self.quantity == Decimal::ZERO }
+    pub fn is_null(&self) -> bool {
+        self.quantity == Decimal::ZERO
+    }
 }
 
 pub struct OptionAssignmentParameters<'a> {
     pub contract: &'a OptionContract,
-    pub holding_quantity: Decimal,  // negative = short
+    pub holding_quantity: Decimal, // negative = short
     pub underlying_price: Decimal,
     pub current_time: chrono::NaiveDate,
 }
@@ -58,7 +63,9 @@ impl IOptionAssignmentModel for DefaultOptionAssignmentModel {
             OptionStyle::American => days_to_expiry <= self.prior_expiration_days,
             OptionStyle::European => days_to_expiry == 0,
         };
-        if !within_window { return OptionAssignmentResult::new(Decimal::ZERO, ""); }
+        if !within_window {
+            return OptionAssignmentResult::new(Decimal::ZERO, "");
+        }
 
         // Check if deep ITM
         if !self.is_deep_in_the_money(contract, params.underlying_price) {
@@ -66,8 +73,11 @@ impl IOptionAssignmentModel for DefaultOptionAssignmentModel {
         }
 
         // Check arbitrage P&L is positive
-        let pnl = self.estimate_arbitrage_pnl(contract, params.holding_quantity, params.underlying_price);
-        if pnl <= Decimal::ZERO { return OptionAssignmentResult::new(Decimal::ZERO, ""); }
+        let pnl =
+            self.estimate_arbitrage_pnl(contract, params.holding_quantity, params.underlying_price);
+        if pnl <= Decimal::ZERO {
+            return OptionAssignmentResult::new(Decimal::ZERO, "");
+        }
 
         OptionAssignmentResult::new(
             params.holding_quantity.abs(),
@@ -78,10 +88,12 @@ impl IOptionAssignmentModel for DefaultOptionAssignmentModel {
 
 impl DefaultOptionAssignmentModel {
     fn is_deep_in_the_money(&self, contract: &OptionContract, underlying_price: Decimal) -> bool {
-        if underlying_price.is_zero() { return false; }
+        if underlying_price.is_zero() {
+            return false;
+        }
         let itm_pct = match contract.right {
             OptionRight::Call => (underlying_price - contract.strike) / underlying_price,
-            OptionRight::Put  => (contract.strike - underlying_price) / underlying_price,
+            OptionRight::Put => (contract.strike - underlying_price) / underlying_price,
         };
         itm_pct > self.required_itm_percent
     }
@@ -94,7 +106,8 @@ impl DefaultOptionAssignmentModel {
     ) -> Decimal {
         // Simplified: compare option bid vs intrinsic value
         // If intrinsic > bid, exercise is more profitable
-        let intrinsic = crate::payoff::intrinsic_value(underlying_price, contract.strike, contract.right);
+        let intrinsic =
+            crate::payoff::intrinsic_value(underlying_price, contract.strike, contract.right);
         let bid = contract.data.bid_price;
         // For short positions, assignment profit = (strike - underlying) for puts, etc.
         (intrinsic - bid) * holding_quantity.abs()

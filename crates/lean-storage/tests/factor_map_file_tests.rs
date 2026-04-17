@@ -3,13 +3,10 @@
 /// These tests verify:
 /// 1. Parquet round-trips (write → read) preserve all field values.
 /// 2. Path generation matches LEAN's canonical directory layout.
-
 use chrono::NaiveDate;
 use lean_storage::{
-    FactorFileEntry, MapFileEntry,
+    factor_file_path, map_file_path, path_resolver::PathResolver, FactorFileEntry, MapFileEntry,
     ParquetReader, ParquetWriter, WriterConfig,
-    factor_file_path, map_file_path,
-    path_resolver::PathResolver,
 };
 use tempfile::TempDir;
 
@@ -27,9 +24,24 @@ fn factor_file_parquet_round_trip() {
     let path = dir.path().join("spy.parquet");
 
     let entries = vec![
-        FactorFileEntry { date: date(2024, 1, 1), price_factor: 1.0,  split_factor: 1.0,  reference_price: 0.0 },
-        FactorFileEntry { date: date(2020, 8, 31), price_factor: 1.0,  split_factor: 0.25, reference_price: 128.96 },
-        FactorFileEntry { date: date(2014, 6, 9),  price_factor: 1.0,  split_factor: 1.0 / 28.0, reference_price: 92.44 },
+        FactorFileEntry {
+            date: date(2024, 1, 1),
+            price_factor: 1.0,
+            split_factor: 1.0,
+            reference_price: 0.0,
+        },
+        FactorFileEntry {
+            date: date(2020, 8, 31),
+            price_factor: 1.0,
+            split_factor: 0.25,
+            reference_price: 128.96,
+        },
+        FactorFileEntry {
+            date: date(2014, 6, 9),
+            price_factor: 1.0,
+            split_factor: 1.0 / 28.0,
+            reference_price: 92.44,
+        },
     ];
 
     let writer = ParquetWriter::new(WriterConfig::default());
@@ -43,9 +55,18 @@ fn factor_file_parquet_round_trip() {
     assert_eq!(read_back.len(), entries.len());
     for (orig, got) in entries.iter().zip(read_back.iter()) {
         assert_eq!(orig.date, got.date, "date mismatch");
-        assert!((orig.price_factor - got.price_factor).abs() < 1e-9, "price_factor mismatch");
-        assert!((orig.split_factor - got.split_factor).abs() < 1e-9, "split_factor mismatch");
-        assert!((orig.reference_price - got.reference_price).abs() < 1e-4, "reference_price mismatch");
+        assert!(
+            (orig.price_factor - got.price_factor).abs() < 1e-9,
+            "price_factor mismatch"
+        );
+        assert!(
+            (orig.split_factor - got.split_factor).abs() < 1e-9,
+            "split_factor mismatch"
+        );
+        assert!(
+            (orig.reference_price - got.reference_price).abs() < 1e-4,
+            "reference_price mismatch"
+        );
     }
 }
 
@@ -65,9 +86,12 @@ fn factor_file_write_creates_parent_directories() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("equity/usa/factor_files/spy.parquet");
 
-    let entries = vec![
-        FactorFileEntry { date: date(2024, 1, 1), price_factor: 1.0, split_factor: 1.0, reference_price: 0.0 },
-    ];
+    let entries = vec![FactorFileEntry {
+        date: date(2024, 1, 1),
+        price_factor: 1.0,
+        split_factor: 1.0,
+        reference_price: 0.0,
+    }];
     let writer = ParquetWriter::new(WriterConfig::default());
     writer.write_factor_file(&entries, &path).unwrap();
     assert!(path.exists());
@@ -81,8 +105,14 @@ fn map_file_parquet_round_trip() {
     let path = dir.path().join("spy.parquet");
 
     let entries = vec![
-        MapFileEntry { date: date(1993, 1, 29), ticker: "SPY".to_string() },
-        MapFileEntry { date: date(2050, 12, 31), ticker: "SPY".to_string() },
+        MapFileEntry {
+            date: date(1993, 1, 29),
+            ticker: "SPY".to_string(),
+        },
+        MapFileEntry {
+            date: date(2050, 12, 31),
+            ticker: "SPY".to_string(),
+        },
     ];
 
     let writer = ParquetWriter::new(WriterConfig::default());
@@ -116,9 +146,10 @@ fn map_file_write_creates_parent_directories() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("equity/usa/map_files/spy.parquet");
 
-    let entries = vec![
-        MapFileEntry { date: date(1993, 1, 29), ticker: "SPY".to_string() },
-    ];
+    let entries = vec![MapFileEntry {
+        date: date(1993, 1, 29),
+        ticker: "SPY".to_string(),
+    }];
     let writer = ParquetWriter::new(WriterConfig::default());
     writer.write_map_file(&entries, &path).unwrap();
     assert!(path.exists());
@@ -132,7 +163,10 @@ fn factor_file_path_matches_lean_convention() {
     use std::path::PathBuf;
     let root = PathBuf::from("/data");
     let p = factor_file_path(&root, "usa", "SPY");
-    assert_eq!(p, PathBuf::from("/data/equity/usa/factor_files/spy.parquet"));
+    assert_eq!(
+        p,
+        PathBuf::from("/data/equity/usa/factor_files/spy.parquet")
+    );
 }
 
 /// Factor file path with lowercase ticker input.
@@ -141,7 +175,10 @@ fn factor_file_path_lowercases_ticker() {
     use std::path::PathBuf;
     let root = PathBuf::from("/data");
     let p = factor_file_path(&root, "usa", "AAPL");
-    assert_eq!(p, PathBuf::from("/data/equity/usa/factor_files/aapl.parquet"));
+    assert_eq!(
+        p,
+        PathBuf::from("/data/equity/usa/factor_files/aapl.parquet")
+    );
 }
 
 /// Map file path: `{root}/equity/{market}/map_files/{ticker_lower}.parquet`
@@ -159,7 +196,10 @@ fn path_resolver_factor_file_matches_free_function() {
     use std::path::PathBuf;
     let root = PathBuf::from("/data");
     let resolver = PathResolver::new(&root);
-    assert_eq!(resolver.factor_file("usa", "SPY"), factor_file_path(&root, "usa", "SPY"));
+    assert_eq!(
+        resolver.factor_file("usa", "SPY"),
+        factor_file_path(&root, "usa", "SPY")
+    );
 }
 
 /// `PathResolver::map_file` returns the same path as the free function.
@@ -168,5 +208,8 @@ fn path_resolver_map_file_matches_free_function() {
     use std::path::PathBuf;
     let root = PathBuf::from("/data");
     let resolver = PathResolver::new(&root);
-    assert_eq!(resolver.map_file("usa", "SPY"), map_file_path(&root, "usa", "SPY"));
+    assert_eq!(
+        resolver.map_file("usa", "SPY"),
+        map_file_path(&root, "usa", "SPY")
+    );
 }

@@ -38,18 +38,30 @@ impl Psar {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for Psar {
+    fn default() -> Self {
         Self::new(dec!(0.02), dec!(0.02), dec!(0.2))
     }
 }
 
 impl Indicator for Psar {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > 1 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 2 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > 1
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        2
+    }
 
     fn reset(&mut self) {
         self.is_long = false;

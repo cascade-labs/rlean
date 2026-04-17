@@ -21,10 +21,8 @@ pub fn compute_expiry(rule: ExpiryRule, year: i32, month: u32) -> NaiveDate {
         ExpiryRule::ThirdFriday => third_friday(year, month),
         ExpiryRule::LastBusinessDay => last_business_day(year, month),
         ExpiryRule::NthFromEnd(n) => nth_business_day_from_end(year, month, n),
-        ExpiryRule::MonthlyFixed(day) => {
-            NaiveDate::from_ymd_opt(year, month, day)
-                .unwrap_or_else(|| last_business_day(year, month))
-        }
+        ExpiryRule::MonthlyFixed(day) => NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap_or_else(|| last_business_day(year, month)),
         ExpiryRule::LastThursday => last_weekday(year, month, Weekday::Thu),
     }
 }

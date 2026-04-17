@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ProjectConfig;
 use crate::project::research_notebook;
-use crate::research_daemon::session_dir;
+use crate::research_daemon::sock_path;
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
 
@@ -85,71 +86,71 @@ pub enum ResearchCommand {
 
 #[derive(Serialize)]
 struct Req<'a> {
-    op:   &'a str,
+    op: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     code: &'a str,
 }
 
 #[derive(Deserialize, Default)]
 struct Resp {
-    status:  String,
-    #[serde(default)] stdout:  String,
-    #[serde(default)] stderr:  String,
-    #[serde(default)] figures: Vec<String>,
-    #[serde(default)] message: String,
+    status: String,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    figures: Vec<String>,
+    #[serde(default)]
+    message: String,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run_research(args: ResearchArgs) -> Result<()> {
-    let project_dir = args.project.canonicalize().with_context(|| {
-        format!("Project directory not found: {}", args.project.display())
-    })?;
+    let project_dir = args
+        .project
+        .canonicalize()
+        .with_context(|| format!("Project directory not found: {}", args.project.display()))?;
 
-    if !project_dir.join("config.json").exists() {
+    if let Err(err) = ProjectConfig::load(&project_dir) {
         bail!(
-            "'{}' is not a valid project (missing config.json).\n\
+            "'{}' is not a valid project ({err}).\n\
              Create one first: rlean create-project <name>",
-            project_dir.display()
+            project_dir.display(),
         );
     }
 
     // Ensure research.ipynb exists.
     let notebook = project_dir.join("research.ipynb");
     if !notebook.exists() {
-        let name = project_dir.file_name().unwrap_or_default().to_string_lossy();
+        let name = project_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         std::fs::write(&notebook, research_notebook(&name))
             .context("Failed to create research.ipynb")?;
         println!("Created research.ipynb in '{}'", project_dir.display());
     }
 
     let session = session_name(&project_dir);
-    let sdir    = session_dir(&session)?;
-    let sock    = sdir.join("server.sock");
+    let sock = sock_path(&session)?;
 
     match args.command {
-        None =>
-            kernel_start(&project_dir, &session, &sock),
-        Some(ResearchCommand::AddCell { at, code }) =>
-            cmd_add_cell(&session, &sock, &notebook, at, &code),
-        Some(ResearchCommand::UpsertCell { index, code }) =>
-            cmd_upsert_cell(&session, &sock, &notebook, index, &code),
-        Some(ResearchCommand::RunCell { index }) =>
-            cmd_run_cell(&session, &sock, &notebook, index),
-        Some(ResearchCommand::RunAll) =>
-            cmd_run_all(&session, &sock, &notebook),
-        Some(ResearchCommand::Cells) =>
-            cmd_cells(&notebook),
-        Some(ResearchCommand::GetCell { index }) =>
-            cmd_get_cell(&notebook, index),
-        Some(ResearchCommand::DeleteCell { index }) =>
-            cmd_delete_cell(&notebook, index),
-        Some(ResearchCommand::ClearOutputs) =>
-            cmd_clear_outputs(&notebook),
-        Some(ResearchCommand::Vars) =>
-            kernel_vars(&sock),
-        Some(ResearchCommand::Shutdown) =>
-            kernel_shutdown(&sock),
+        None => kernel_start(&project_dir, &session, &sock),
+        Some(ResearchCommand::AddCell { at, code }) => {
+            cmd_add_cell(&session, &sock, &notebook, at, &code)
+        }
+        Some(ResearchCommand::UpsertCell { index, code }) => {
+            cmd_upsert_cell(&session, &sock, &notebook, index, &code)
+        }
+        Some(ResearchCommand::RunCell { index }) => cmd_run_cell(&session, &sock, &notebook, index),
+        Some(ResearchCommand::RunAll) => cmd_run_all(&session, &sock, &notebook),
+        Some(ResearchCommand::Cells) => cmd_cells(&notebook),
+        Some(ResearchCommand::GetCell { index }) => cmd_get_cell(&notebook, index),
+        Some(ResearchCommand::DeleteCell { index }) => cmd_delete_cell(&notebook, index),
+        Some(ResearchCommand::ClearOutputs) => cmd_clear_outputs(&notebook),
+        Some(ResearchCommand::Vars) => kernel_vars(&sock),
+        Some(ResearchCommand::Shutdown) => kernel_shutdown(&sock),
     }
 }
 
@@ -168,17 +169,20 @@ fn kernel_start(project_dir: &Path, session: &str, sock: &Path) -> Result<()> {
     wait_for_daemon(sock, 60)?;
 
     println!("Kernel ready.  Session: {session}");
-    println!("Run code:  rlean research {} exec \"<python>\"", project_dir.display());
+    println!(
+        "Run code:  rlean research {} exec \"<python>\"",
+        project_dir.display()
+    );
     Ok(())
 }
 
 /// Insert a new cell at `at` (or append), execute it, store outputs.
 fn cmd_add_cell(
-    session:  &str,
-    sock:     &Path,
+    session: &str,
+    sock: &Path,
     notebook: &Path,
-    at:       Option<usize>,
-    code:     &str,
+    at: Option<usize>,
+    code: &str,
 ) -> Result<()> {
     ensure_alive(sock, session)?;
 
@@ -186,22 +190,26 @@ fn cmd_add_cell(
     print_response(&resp);
 
     let fig_paths = save_figures(session, &resp.figures)?;
-    for p in &fig_paths { let _ = std::process::Command::new("open").arg(p).spawn(); }
+    for p in &fig_paths {
+        let _ = std::process::Command::new("open").arg(p).spawn();
+    }
 
     insert_notebook_cell(notebook, at, code, &resp.stdout, &resp.figures)?;
 
-    let idx = at.map(|n| n.to_string()).unwrap_or_else(|| "end".to_string());
+    let idx = at
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "end".to_string());
     println!("Cell added at [{idx}].");
     Ok(())
 }
 
 /// Replace cell N's source with new code, re-execute, update its outputs.
 fn cmd_upsert_cell(
-    session:  &str,
-    sock:     &Path,
+    session: &str,
+    sock: &Path,
     notebook: &Path,
-    index:    usize,
-    code:     &str,
+    index: usize,
+    code: &str,
 ) -> Result<()> {
     ensure_alive(sock, session)?;
 
@@ -209,7 +217,10 @@ fn cmd_upsert_cell(
     {
         let cells = read_cells(notebook)?;
         if index >= cells.len() {
-            bail!("Cell index {index} out of range (notebook has {} cells)", cells.len());
+            bail!(
+                "Cell index {index} out of range (notebook has {} cells)",
+                cells.len()
+            );
         }
     }
 
@@ -217,7 +228,9 @@ fn cmd_upsert_cell(
     print_response(&resp);
 
     let fig_paths = save_figures(session, &resp.figures)?;
-    for p in &fig_paths { let _ = std::process::Command::new("open").arg(p).spawn(); }
+    for p in &fig_paths {
+        let _ = std::process::Command::new("open").arg(p).spawn();
+    }
 
     replace_cell_source_and_outputs(notebook, index, code, &resp.stdout, &resp.figures)?;
     println!("Cell [{index}] updated.");
@@ -253,11 +266,15 @@ fn cmd_cells(notebook: &Path) -> Result<()> {
     println!("{total} cell(s) in {}:", notebook.display());
     println!();
     for (i, cell) in cells.iter().enumerate() {
-        let kind    = &cell.cell_type;
-        let source  = cell.source.join("");
+        let kind = &cell.cell_type;
+        let source = cell.source.join("");
         let preview = first_line_preview(&source, 70);
         let outputs = cell.outputs.len();
-        let out_str = if outputs > 0 { format!("  [{outputs} output(s)]") } else { String::new() };
+        let out_str = if outputs > 0 {
+            format!("  [{outputs} output(s)]")
+        } else {
+            String::new()
+        };
         println!("  [{i:>3}] {kind:<4}  {preview}{out_str}");
     }
     Ok(())
@@ -266,13 +283,21 @@ fn cmd_cells(notebook: &Path) -> Result<()> {
 /// Print the full source of cell N.
 fn cmd_get_cell(notebook: &Path, index: usize) -> Result<()> {
     let cells = read_cells(notebook)?;
-    let cell  = cells.get(index).with_context(|| format!(
-        "Cell index {index} out of range (notebook has {} cells)", cells.len()
-    ))?;
+    let cell = cells.get(index).with_context(|| {
+        format!(
+            "Cell index {index} out of range (notebook has {} cells)",
+            cells.len()
+        )
+    })?;
     let source = cell.source.join("");
-    println!("── Cell {index} ({}) ────────────────────────────────", cell.cell_type);
+    println!(
+        "── Cell {index} ({}) ────────────────────────────────",
+        cell.cell_type
+    );
     print!("{source}");
-    if !source.ends_with('\n') { println!(); }
+    if !source.ends_with('\n') {
+        println!();
+    }
     Ok(())
 }
 
@@ -280,10 +305,13 @@ fn cmd_get_cell(notebook: &Path, index: usize) -> Result<()> {
 fn cmd_run_cell(session: &str, sock: &Path, notebook: &Path, index: usize) -> Result<()> {
     ensure_alive(sock, session)?;
 
-    let cells  = read_cells(notebook)?;
-    let cell   = cells.get(index).with_context(|| format!(
-        "Cell index {index} out of range (notebook has {} cells)", cells.len()
-    ))?;
+    let cells = read_cells(notebook)?;
+    let cell = cells.get(index).with_context(|| {
+        format!(
+            "Cell index {index} out of range (notebook has {} cells)",
+            cells.len()
+        )
+    })?;
 
     if cell.cell_type != "code" {
         bail!("Cell {index} is a markdown cell — nothing to execute");
@@ -310,11 +338,15 @@ fn cmd_delete_cell(notebook: &Path, index: usize) -> Result<()> {
     let text = read_notebook_raw(notebook)?;
     let mut nb: serde_json::Value = serde_json::from_str(&text)?;
 
-    let cells = nb["cells"].as_array_mut()
+    let cells = nb["cells"]
+        .as_array_mut()
         .context("notebook missing cells array")?;
 
     if index >= cells.len() {
-        bail!("Cell index {index} out of range (notebook has {} cells)", cells.len());
+        bail!(
+            "Cell index {index} out of range (notebook has {} cells)",
+            cells.len()
+        );
     }
 
     let removed = cells.remove(index);
@@ -334,7 +366,7 @@ fn cmd_clear_outputs(notebook: &Path) -> Result<()> {
     if let Some(cells) = nb["cells"].as_array_mut() {
         for cell in cells.iter_mut() {
             if cell["cell_type"].as_str() == Some("code") {
-                cell["outputs"]         = serde_json::json!([]);
+                cell["outputs"] = serde_json::json!([]);
                 cell["execution_count"] = serde_json::Value::Null;
                 cleared += 1;
             }
@@ -364,17 +396,25 @@ fn cmd_run_all(session: &str, sock: &Path, notebook: &Path) -> Result<()> {
     println!("Running {} code cell(s)...", cells.len());
     for (i, cell) in &cells {
         let code = cell.source.join("");
-        if code.trim().is_empty() { continue; }
+        if code.trim().is_empty() {
+            continue;
+        }
 
         let preview = first_line_preview(&code, 50);
         println!("  [{i}] {preview}");
 
         let resp = send_request(sock, "exec", &code)?;
-        if !resp.stdout.is_empty() { print!("{}", resp.stdout); }
-        if !resp.stderr.is_empty() { eprint!("{}", resp.stderr); }
+        if !resp.stdout.is_empty() {
+            print!("{}", resp.stdout);
+        }
+        if !resp.stderr.is_empty() {
+            eprint!("{}", resp.stderr);
+        }
 
         let fig_paths = save_figures(session, &resp.figures)?;
-        for p in &fig_paths { let _ = std::process::Command::new("open").arg(p).spawn(); }
+        for p in &fig_paths {
+            let _ = std::process::Command::new("open").arg(p).spawn();
+        }
 
         update_cell_outputs(notebook, *i, &resp.stdout, &resp.figures)?;
     }
@@ -389,13 +429,13 @@ fn send_request(sock: &Path, op: &str, code: &str) -> Result<Resp> {
     let mut stream = UnixStream::connect(sock)
         .with_context(|| format!("Cannot connect to kernel: {}", sock.display()))?;
 
-    let req  = Req { op, code };
+    let req = Req { op, code };
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    let mut reader    = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
     reader.read_line(&mut resp_line)?;
 
@@ -428,8 +468,8 @@ fn spawn_daemon(session: &str, project: &Path, data_folder: Option<&Path>) -> Re
         cmd.args(["--data-folder", &df.to_string_lossy()]);
     }
     cmd.stdin(std::process::Stdio::null())
-       .stdout(std::process::Stdio::null())
-       .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     cmd.spawn().context("Failed to spawn research daemon")?;
     Ok(())
@@ -441,7 +481,9 @@ fn wait_for_daemon(sock: &Path, timeout_secs: u64) -> Result<()> {
     while Instant::now() < deadline {
         if daemon_is_alive(sock) {
             if let Ok(r) = send_request(sock, "ping", "") {
-                if r.status == "pong" { return Ok(()); }
+                if r.status == "pong" {
+                    return Ok(());
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -453,9 +495,15 @@ fn wait_for_daemon(sock: &Path, timeout_secs: u64) -> Result<()> {
 // ── Output helpers ────────────────────────────────────────────────────────────
 
 fn print_response(resp: &Resp) {
-    if !resp.stdout.is_empty()  { print!("{}", resp.stdout); }
-    if !resp.stderr.is_empty()  { eprint!("{}", resp.stderr); }
-    if !resp.message.is_empty() { eprintln!("Kernel error: {}", resp.message); }
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+    if !resp.message.is_empty() {
+        eprintln!("Kernel error: {}", resp.message);
+    }
     if !resp.figures.is_empty() {
         println!("[{} figure(s) generated]", resp.figures.len());
     }
@@ -489,7 +537,7 @@ fn find_data_folder(project_dir: &Path) -> Option<PathBuf> {
         }
         match dir.parent() {
             Some(p) if p != dir => dir = p.to_path_buf(),
-            _                   => break,
+            _ => break,
         }
     }
     None
@@ -497,12 +545,16 @@ fn find_data_folder(project_dir: &Path) -> Option<PathBuf> {
 
 /// Decode base64 PNG figures and save to the session plots directory.
 fn save_figures(session: &str, figures: &[String]) -> Result<Vec<PathBuf>> {
-    if figures.is_empty() { return Ok(vec![]); }
+    if figures.is_empty() {
+        return Ok(vec![]);
+    }
 
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
 
-    let home      = std::env::var("HOME").map(PathBuf::from).context("HOME not set")?;
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME not set")?;
     let plots_dir = home
         .join(".lean-research")
         .join("sessions")
@@ -518,7 +570,7 @@ fn save_figures(session: &str, figures: &[String]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for (i, b64) in figures.iter().enumerate() {
         let bytes = engine.decode(b64).context("Failed to decode figure PNG")?;
-        let path  = plots_dir.join(format!("{ts}_{i}.png"));
+        let path = plots_dir.join(format!("{ts}_{i}.png"));
         std::fs::write(&path, &bytes)?;
         println!("  Saved: {}", path.display());
         paths.push(path);
@@ -531,13 +583,12 @@ fn save_figures(session: &str, figures: &[String]) -> Result<Vec<PathBuf>> {
 /// Minimal cell representation for reading the notebook.
 struct Cell {
     cell_type: String,
-    source:    Vec<String>,
-    outputs:   Vec<serde_json::Value>,
+    source: Vec<String>,
+    outputs: Vec<serde_json::Value>,
 }
 
 fn read_notebook_raw(notebook: &Path) -> Result<String> {
-    std::fs::read_to_string(notebook)
-        .with_context(|| format!("Cannot read {}", notebook.display()))
+    std::fs::read_to_string(notebook).with_context(|| format!("Cannot read {}", notebook.display()))
 }
 
 fn read_cells(notebook: &Path) -> Result<Vec<Cell>> {
@@ -550,16 +601,19 @@ fn read_cells(notebook: &Path) -> Result<Vec<Cell>> {
         for cell in arr {
             let cell_type = cell["cell_type"].as_str().unwrap_or("code").to_string();
             let source = match cell["source"].as_array() {
-                Some(lines) => lines.iter()
+                Some(lines) => lines
+                    .iter()
                     .filter_map(|l| l.as_str())
                     .map(|s| s.to_string())
                     .collect(),
                 None => vec![cell["source"].as_str().unwrap_or("").to_string()],
             };
-            let outputs = cell["outputs"].as_array()
-                .cloned()
-                .unwrap_or_default();
-            out.push(Cell { cell_type, source, outputs });
+            let outputs = cell["outputs"].as_array().cloned().unwrap_or_default();
+            out.push(Cell {
+                cell_type,
+                source,
+                outputs,
+            });
         }
     }
     Ok(out)
@@ -573,10 +627,10 @@ fn write_notebook(notebook: &Path, nb: &serde_json::Value) -> Result<()> {
 /// Insert a new code cell at `at` (append if None) with outputs.
 fn insert_notebook_cell(
     notebook: &Path,
-    at:       Option<usize>,
-    code:     &str,
-    stdout:   &str,
-    figures:  &[String],
+    at: Option<usize>,
+    code: &str,
+    stdout: &str,
+    figures: &[String],
 ) -> Result<()> {
     let text = read_notebook_raw(notebook)?;
     let mut nb: serde_json::Value = serde_json::from_str(&text)?;
@@ -585,7 +639,7 @@ fn insert_notebook_cell(
 
     if let Some(cells) = nb["cells"].as_array_mut() {
         match at {
-            None    => cells.push(cell),
+            None => cells.push(cell),
             Some(i) => {
                 let i = i.min(cells.len());
                 cells.insert(i, cell);
@@ -598,27 +652,35 @@ fn insert_notebook_cell(
 /// Replace cell N's source and outputs entirely.
 fn replace_cell_source_and_outputs(
     notebook: &Path,
-    index:    usize,
-    code:     &str,
-    stdout:   &str,
-    figures:  &[String],
+    index: usize,
+    code: &str,
+    stdout: &str,
+    figures: &[String],
 ) -> Result<()> {
     let text = read_notebook_raw(notebook)?;
     let mut nb: serde_json::Value = serde_json::from_str(&text)?;
 
-    let cells = nb["cells"].as_array_mut()
+    let cells = nb["cells"]
+        .as_array_mut()
         .context("notebook missing cells array")?;
-    let cell = cells.get_mut(index)
+    let cell = cells
+        .get_mut(index)
         .with_context(|| format!("Cell {index} not found"))?;
 
-    let source: Vec<serde_json::Value> = code.lines().enumerate()
-        .map(|(i, l)| serde_json::Value::String(
-            if i == 0 { l.to_string() } else { format!("\n{l}") }
-        ))
+    let source: Vec<serde_json::Value> = code
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::Value::String(if i == 0 {
+                l.to_string()
+            } else {
+                format!("\n{l}")
+            })
+        })
         .collect();
 
-    cell["source"]          = serde_json::Value::Array(source);
-    cell["outputs"]         = serde_json::Value::Array(build_outputs(stdout, figures));
+    cell["source"] = serde_json::Value::Array(source);
+    cell["outputs"] = serde_json::Value::Array(build_outputs(stdout, figures));
     cell["execution_count"] = serde_json::Value::Null;
 
     write_notebook(notebook, &nb)
@@ -627,29 +689,37 @@ fn replace_cell_source_and_outputs(
 /// Replace the outputs of cell at `index` in the notebook.
 fn update_cell_outputs(
     notebook: &Path,
-    index:    usize,
-    stdout:   &str,
-    figures:  &[String],
+    index: usize,
+    stdout: &str,
+    figures: &[String],
 ) -> Result<()> {
     let text = read_notebook_raw(notebook)?;
     let mut nb: serde_json::Value = serde_json::from_str(&text)?;
 
-    let cells = nb["cells"].as_array_mut()
+    let cells = nb["cells"]
+        .as_array_mut()
         .context("notebook missing cells array")?;
-    let cell = cells.get_mut(index)
+    let cell = cells
+        .get_mut(index)
         .with_context(|| format!("Cell {index} not found"))?;
 
-    cell["outputs"]         = serde_json::Value::Array(build_outputs(stdout, figures));
+    cell["outputs"] = serde_json::Value::Array(build_outputs(stdout, figures));
     cell["execution_count"] = serde_json::Value::Null;
 
     write_notebook(notebook, &nb)
 }
 
 fn make_cell(code: &str, stdout: &str, figures: &[String]) -> serde_json::Value {
-    let source: Vec<serde_json::Value> = code.lines().enumerate()
-        .map(|(i, l)| serde_json::Value::String(
-            if i == 0 { l.to_string() } else { format!("\n{l}") }
-        ))
+    let source: Vec<serde_json::Value> = code
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::Value::String(if i == 0 {
+                l.to_string()
+            } else {
+                format!("\n{l}")
+            })
+        })
         .collect();
     serde_json::json!({
         "cell_type":       "code",
@@ -683,7 +753,8 @@ fn build_outputs(stdout: &str, figures: &[String]) -> Vec<serde_json::Value> {
 
 /// First non-empty line of `src`, truncated to `max_chars`.
 fn first_line_preview(src: &str, max_chars: usize) -> String {
-    let line = src.lines()
+    let line = src
+        .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim();
@@ -696,7 +767,8 @@ fn first_line_preview(src: &str, max_chars: usize) -> String {
 
 fn cell_source_preview(cell: &serde_json::Value, max_chars: usize) -> String {
     let src = match cell["source"].as_array() {
-        Some(lines) => lines.iter()
+        Some(lines) => lines
+            .iter()
             .filter_map(|l| l.as_str())
             .collect::<Vec<_>>()
             .join(""),

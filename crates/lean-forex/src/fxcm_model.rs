@@ -8,7 +8,10 @@ pub struct FxcmBrokerageModel {
 
 impl Default for FxcmBrokerageModel {
     fn default() -> Self {
-        Self { default_leverage: dec!(100), commission_per_lot: dec!(4) } // $4/lot roundtrip
+        Self {
+            default_leverage: dec!(100),
+            commission_per_lot: dec!(4),
+        } // $4/lot roundtrip
     }
 }
 

@@ -7,8 +7,8 @@ pub enum ObjectiveFunction {
     MaximizeSharpeRatio,
     MaximizeTotalReturn,
     MinimizeMaxDrawdown,
-    MaximizeCalmarRatio,    // return / max_drawdown
-    MaximizeProfitFactor,   // win_rate * avg_win / (loss_rate * avg_loss)
+    MaximizeCalmarRatio,  // return / max_drawdown
+    MaximizeProfitFactor, // win_rate * avg_win / (loss_rate * avg_loss)
     Custom,
 }
 
@@ -20,9 +20,12 @@ impl ObjectiveFunction {
             Self::MaximizeTotalReturn => result.total_return,
             Self::MinimizeMaxDrawdown => -result.max_drawdown,
             Self::MaximizeCalmarRatio => {
-                if result.max_drawdown.is_zero() { dec!(0) }
-                else { result.total_return / result.max_drawdown }
-            },
+                if result.max_drawdown.is_zero() {
+                    dec!(0)
+                } else {
+                    result.total_return / result.max_drawdown
+                }
+            }
             Self::MaximizeProfitFactor => result.objective_value,
             Self::Custom => result.objective_value,
         }

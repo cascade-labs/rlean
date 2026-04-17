@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
@@ -7,15 +10,12 @@ use rust_decimal_macros::dec;
 /// Ultimate Oscillator (7, 14, 28 default).
 pub struct UltimateOscillator {
     name: String,
-    period1: usize,
-    period2: usize,
-    period3: usize,
     max_period: usize,
     prev_close: Option<Decimal>,
-    bp1: RollingWindow<Decimal>,  // buying pressure
+    bp1: RollingWindow<Decimal>, // buying pressure
     bp2: RollingWindow<Decimal>,
     bp3: RollingWindow<Decimal>,
-    tr1: RollingWindow<Decimal>,  // true range
+    tr1: RollingWindow<Decimal>, // true range
     tr2: RollingWindow<Decimal>,
     tr3: RollingWindow<Decimal>,
     samples: usize,
@@ -27,9 +27,6 @@ impl UltimateOscillator {
         let max_period = period1.max(period2).max(period3);
         UltimateOscillator {
             name: format!("ULTOSC({},{},{})", period1, period2, period3),
-            period1,
-            period2,
-            period3,
             max_period,
             prev_close: None,
             bp1: RollingWindow::new(period1),
@@ -43,21 +40,33 @@ impl UltimateOscillator {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(7, 14, 28)
-    }
-
     fn sum_window(w: &RollingWindow<Decimal>) -> Decimal {
         w.iter().copied().sum()
     }
 }
 
+impl Default for UltimateOscillator {
+    fn default() -> Self {
+        Self::new(7, 14, 28)
+    }
+}
+
 impl Indicator for UltimateOscillator {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > self.max_period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.max_period + 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > self.max_period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.max_period + 1
+    }
 
     fn reset(&mut self) {
         self.prev_close = None;

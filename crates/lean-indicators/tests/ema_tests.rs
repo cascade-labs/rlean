@@ -1,15 +1,25 @@
-use lean_indicators::{indicator::Indicator, Ema};
 use lean_core::NanosecondTimestamp;
+use lean_indicators::{indicator::Indicator, Ema};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 fn feed(ema: &mut Ema, values: &[Decimal]) -> Vec<Option<Decimal>> {
-    values.iter().enumerate().map(|(i, &v)| {
-        let r = ema.update_price(ts(i as i64), v);
-        if r.is_ready() { Some(r.value) } else { None }
-    }).collect()
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let r = ema.update_price(ts(i as i64), v);
+            if r.is_ready() {
+                Some(r.value)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ─── Ready state ─────────────────────────────────────────────────────────────

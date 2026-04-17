@@ -27,16 +27,16 @@ impl StackedHistoryProvider {
     /// Create a new stacked provider.  `providers` must be non-empty and are
     /// tried left-to-right (index 0 = highest priority).
     pub fn new(providers: Vec<Arc<dyn IHistoryProvider>>) -> Self {
-        assert!(!providers.is_empty(), "StackedHistoryProvider requires at least one provider");
+        assert!(
+            !providers.is_empty(),
+            "StackedHistoryProvider requires at least one provider"
+        );
         StackedHistoryProvider { providers }
     }
 }
 
 impl IHistoryProvider for StackedHistoryProvider {
-    fn get_history(
-        &self,
-        request: &HistoryRequest,
-    ) -> anyhow::Result<Vec<TradeBar>> {
+    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
         for provider in &self.providers {
             match provider.get_history(request) {
                 Ok(data) if !data.is_empty() => return Ok(data),

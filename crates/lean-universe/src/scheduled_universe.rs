@@ -1,5 +1,5 @@
-use lean_core::Symbol;
 use chrono::NaiveDate;
+use lean_core::Symbol;
 
 /// How often the universe is re-evaluated
 #[derive(Debug, Clone, Copy)]
@@ -22,7 +22,11 @@ impl ScheduledUniverseSelectionModel {
         schedule: UniverseSchedule,
         selector: impl Fn(NaiveDate) -> Vec<Symbol> + Send + Sync + 'static,
     ) -> Self {
-        Self { schedule, selector: Box::new(selector), last_selection_date: None }
+        Self {
+            schedule,
+            selector: Box::new(selector),
+            last_selection_date: None,
+        }
     }
 
     /// Returns true if the universe should be re-evaluated on the given date
@@ -32,14 +36,17 @@ impl ScheduledUniverseSelectionModel {
             None => true,
             Some(last) => match self.schedule {
                 UniverseSchedule::Daily => date > last,
-                UniverseSchedule::Weekly => date.iso_week().week() != last.iso_week().week()
-                    || date.year() != last.year(),
-                UniverseSchedule::Monthly => date.month() != last.month() || date.year() != last.year(),
+                UniverseSchedule::Weekly => {
+                    date.iso_week().week() != last.iso_week().week() || date.year() != last.year()
+                }
+                UniverseSchedule::Monthly => {
+                    date.month() != last.month() || date.year() != last.year()
+                }
                 UniverseSchedule::Quarterly => {
                     let quarter = |d: NaiveDate| (d.month() - 1) / 3;
                     quarter(date) != quarter(last) || date.year() != last.year()
                 }
-            }
+            },
         }
     }
 

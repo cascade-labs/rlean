@@ -1,7 +1,9 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
 /// Rolling minimum over n bars.
 pub struct Minimum {
@@ -29,11 +31,21 @@ impl Minimum {
 }
 
 impl Indicator for Minimum {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -55,10 +67,17 @@ impl Indicator for Minimum {
         {
             // Need to rescan
             self.window.push(value);
-            let (min_val, min_idx) = self.window.iter().enumerate()
-                .fold((Decimal::MAX, 0), |(mv, mi), (i, &v)| {
-                    if i == 0 || v <= mv { (v, i) } else { (mv, mi) }
-                });
+            let (min_val, min_idx) =
+                self.window
+                    .iter()
+                    .enumerate()
+                    .fold((Decimal::MAX, 0), |(mv, mi), (i, &v)| {
+                        if i == 0 || v <= mv {
+                            (v, i)
+                        } else {
+                            (mv, mi)
+                        }
+                    });
             self.current_min = min_val;
             self.periods_since_min = min_idx;
             if self.is_ready() {

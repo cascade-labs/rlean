@@ -2,8 +2,8 @@ use crate::{order::Order, order_event::OrderEvent, order_ticket::OrderTicket};
 use dashmap::DashMap;
 use lean_core::DateTime;
 use parking_lot::RwLock;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 /// Thread-safe store for all orders in a strategy run.
 pub struct TransactionManager {
@@ -83,14 +83,15 @@ impl TransactionManager {
     }
 
     pub fn get_all_orders(&self) -> Vec<Order> {
-        self.orders.iter().map(|entry| entry.read().clone()).collect()
+        self.orders
+            .iter()
+            .map(|entry| entry.read().clone())
+            .collect()
     }
 
     pub fn get_all_order_events(&self) -> Vec<OrderEvent> {
-        let mut events: Vec<OrderEvent> = self.tickets
-            .iter()
-            .flat_map(|t| t.order_events())
-            .collect();
+        let mut events: Vec<OrderEvent> =
+            self.tickets.iter().flat_map(|t| t.order_events()).collect();
         events.sort_by_key(|e| e.utc_time);
         events
     }

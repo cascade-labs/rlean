@@ -7,7 +7,7 @@ use rust_decimal_macros::dec;
 pub struct Ema {
     name: String,
     period: usize,
-    multiplier: Decimal,  // 2 / (period + 1)
+    multiplier: Decimal, // 2 / (period + 1)
     samples: usize,
     current_value: Price,
     current: IndicatorResult,
@@ -26,15 +26,27 @@ impl Ema {
         }
     }
 
-    pub fn multiplier(&self) -> Decimal { self.multiplier }
+    pub fn multiplier(&self) -> Decimal {
+        self.multiplier
+    }
 }
 
 impl Indicator for Ema {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.samples = 0;
@@ -50,7 +62,8 @@ impl Indicator for Ema {
             self.current_value = value;
         } else {
             // EMA = (value - prev_ema) * multiplier + prev_ema
-            self.current_value = (value - self.current_value) * self.multiplier + self.current_value;
+            self.current_value =
+                (value - self.current_value) * self.multiplier + self.current_value;
         }
 
         if self.is_ready() {

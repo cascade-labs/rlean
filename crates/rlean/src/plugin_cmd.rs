@@ -60,15 +60,15 @@ pub enum PluginCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryEntry {
-    pub name:        String,
-    pub version:     String,
-    pub kind:        String,
+    pub name: String,
+    pub version: String,
+    pub kind: String,
     pub description: String,
     /// Git URL used to clone + build the plugin
-    pub git_url:     String,
+    pub git_url: String,
     /// Optional: subdirectory inside the repo containing the plugin crate
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subdir:      Option<String>,
+    pub subdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,12 +93,12 @@ struct InstalledManifest {
 #[derive(Debug, Serialize, Deserialize)]
 struct InstalledEntry {
     #[serde(flatten)]
-    pub info:         RegistryEntry,
+    pub info: RegistryEntry,
     pub installed_at: String,
     /// Absolute path to the compiled .dylib/.so
-    pub lib_path:     String,
+    pub lib_path: String,
     /// Checkout path (for upgrade)
-    pub src_path:     String,
+    pub src_path: String,
 }
 
 // ── Registry fetch ────────────────────────────────────────────────────────────
@@ -127,8 +127,7 @@ fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
             bail!("Failed to fetch registry from {url}: {stderr}");
         }
 
-        String::from_utf8(output.stdout)
-            .context("Registry response is not valid UTF-8")?
+        String::from_utf8(output.stdout).context("Registry response is not valid UTF-8")?
     };
 
     // Support both wrapped {"version":…,"plugins":[…]} and bare […] formats.
@@ -136,8 +135,8 @@ fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
         serde_json::from_str::<Vec<RegistryEntry>>(&body)
             .context("Failed to parse registry JSON array")
     } else {
-        let r: RemoteRegistry = serde_json::from_str(&body)
-            .context("Failed to parse registry JSON")?;
+        let r: RemoteRegistry =
+            serde_json::from_str(&body).context("Failed to parse registry JSON")?;
         Ok(r.plugins)
     }
 }
@@ -173,11 +172,15 @@ fn fetch_all_registries() -> Vec<RegistryEntry> {
 pub fn run_plugin(args: PluginArgs) -> Result<()> {
     match args.command {
         PluginCommand::List { installed } => {
-            if installed { cmd_list_installed() } else { cmd_list_registry() }
+            if installed {
+                cmd_list_installed()
+            } else {
+                cmd_list_registry()
+            }
         }
-        PluginCommand::Install { name }  => cmd_install(&name),
-        PluginCommand::Upgrade { name }  => cmd_upgrade(&name),
-        PluginCommand::Remove  { name }  => cmd_remove(&name),
+        PluginCommand::Install { name } => cmd_install(&name),
+        PluginCommand::Upgrade { name } => cmd_upgrade(&name),
+        PluginCommand::Remove { name } => cmd_remove(&name),
     }
 }
 
@@ -195,16 +198,17 @@ fn cmd_list_registry() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<16} {:<55} {}", "NAME", "KIND", "DESCRIPTION", "STATUS");
+    println!("{:<22} {:<16} {:<55} STATUS", "NAME", "KIND", "DESCRIPTION");
     println!("{}", "-".repeat(100));
     for entry in &plugins {
-        let status = if installed_names.contains(entry.name.as_str()) { "installed" } else { "" };
+        let status = if installed_names.contains(entry.name.as_str()) {
+            "installed"
+        } else {
+            ""
+        };
         println!(
             "{:<22} {:<16} {:<55} {}",
-            entry.name,
-            entry.kind,
-            entry.description,
-            status
+            entry.name, entry.kind, entry.description, status
         );
     }
     println!();
@@ -218,7 +222,7 @@ fn cmd_list_installed() -> Result<()> {
         println!("No plugins installed. Run `rlean plugin list` to see available plugins.");
         return Ok(());
     }
-    println!("{:<22} {:<10} {:<28} {}", "NAME", "VERSION", "KIND", "INSTALLED");
+    println!("{:<22} {:<10} {:<28} INSTALLED", "NAME", "VERSION", "KIND");
     println!("{}", "-".repeat(78));
     for entry in &manifest.plugins {
         println!(
@@ -234,10 +238,14 @@ fn cmd_install(name: &str) -> Result<()> {
 
     let mut manifest = load_manifest()?;
     if manifest.plugins.iter().any(|e| e.info.name == entry.name) {
-        bail!("Plugin '{}' is already installed. Use `rlean plugin upgrade {}` to update.", name, name);
+        bail!(
+            "Plugin '{}' is already installed. Use `rlean plugin upgrade {}` to update.",
+            name,
+            name
+        );
     }
 
-    let src_dir  = plugin_src_dir(&entry.name)?;
+    let src_dir = plugin_src_dir(&entry.name)?;
     let lib_path = plugin_lib_path(&entry.name)?;
 
     println!("Cloning {} ...", entry.git_url);
@@ -251,15 +259,20 @@ fn cmd_install(name: &str) -> Result<()> {
     cargo_build(&src_dir, &package_name)?;
 
     let built = find_built_lib(&src_dir, &entry.name)?;
-    std::fs::copy(&built, &lib_path)
-        .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
+    std::fs::copy(&built, &lib_path).with_context(|| {
+        format!(
+            "Failed to copy {} → {}",
+            built.display(),
+            lib_path.display()
+        )
+    })?;
     adhoc_codesign(&lib_path);
 
     manifest.plugins.push(InstalledEntry {
-        info:         entry.clone(),
+        info: entry.clone(),
         installed_at: now_utc(),
-        lib_path:     lib_path.display().to_string(),
-        src_path:     src_dir.display().to_string(),
+        lib_path: lib_path.display().to_string(),
+        src_path: src_dir.display().to_string(),
     });
     save_manifest(&manifest)?;
 
@@ -269,10 +282,13 @@ fn cmd_install(name: &str) -> Result<()> {
 
 fn cmd_upgrade(name: &str) -> Result<()> {
     let mut manifest = load_manifest()?;
-    let idx = manifest.plugins.iter().position(|e| e.info.name == name)
+    let idx = manifest
+        .plugins
+        .iter()
+        .position(|e| e.info.name == name)
         .ok_or_else(|| anyhow::anyhow!("Plugin '{}' is not installed.", name))?;
 
-    let src_dir  = PathBuf::from(&manifest.plugins[idx].src_path);
+    let src_dir = PathBuf::from(&manifest.plugins[idx].src_path);
     let lib_path = PathBuf::from(&manifest.plugins[idx].lib_path);
 
     println!("Pulling latest source for '{}' ...", name);
@@ -286,8 +302,13 @@ fn cmd_upgrade(name: &str) -> Result<()> {
     cargo_build(&src_dir, &package_name)?;
 
     let built = find_built_lib(&src_dir, name)?;
-    std::fs::copy(&built, &lib_path)
-        .with_context(|| format!("Failed to copy {} → {}", built.display(), lib_path.display()))?;
+    std::fs::copy(&built, &lib_path).with_context(|| {
+        format!(
+            "Failed to copy {} → {}",
+            built.display(),
+            lib_path.display()
+        )
+    })?;
     adhoc_codesign(&lib_path);
 
     manifest.plugins[idx].installed_at = now_utc();
@@ -299,7 +320,10 @@ fn cmd_upgrade(name: &str) -> Result<()> {
 
 fn cmd_remove(name: &str) -> Result<()> {
     let mut manifest = load_manifest()?;
-    let idx = manifest.plugins.iter().position(|e| e.info.name == name)
+    let idx = manifest
+        .plugins
+        .iter()
+        .position(|e| e.info.name == name)
         .ok_or_else(|| anyhow::anyhow!("Plugin '{}' is not installed.", name))?;
 
     let lib_path = PathBuf::from(&manifest.plugins[idx].lib_path);
@@ -343,23 +367,25 @@ fn resolve_entry(name_or_url: &str) -> Result<RegistryEntry> {
             .trim_start_matches("rlean-plugin-")
             .to_string();
         return Ok(RegistryEntry {
-            name:        inferred_name,
-            version:     "unknown".to_string(),
-            kind:        "unknown".to_string(),
+            name: inferred_name,
+            version: "unknown".to_string(),
+            kind: "unknown".to_string(),
             description: String::new(),
-            git_url:     name_or_url.to_string(),
-            subdir:      None,
+            git_url: name_or_url.to_string(),
+            subdir: None,
         });
     }
 
     fetch_all_registries()
         .into_iter()
         .find(|e| e.name == name_or_url)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Plugin '{}' not found in any registry.\n\
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Plugin '{}' not found in any registry.\n\
              Run `rlean plugin list` to see available plugins, or pass a git URL directly.",
-            name_or_url
-        ))
+                name_or_url
+            )
+        })
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -395,7 +421,11 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 }
 
 fn dylib_ext() -> &'static str {
-    if cfg!(target_os = "macos") { "dylib" } else { "so" }
+    if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
 }
 
 fn package_name_for(plugin_name: &str) -> String {
@@ -542,4 +572,3 @@ pub(crate) fn save_user_registries(r: &UserRegistries) -> Result<()> {
 fn now_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
-

@@ -38,25 +38,19 @@ impl CalendarConsolidator {
         match self.period {
             CalendarPeriod::Daily => {
                 // Unique per calendar day: YYYYMMDD
-                date.year() as i64 * 10_000
-                    + date.month() as i64 * 100
-                    + date.day() as i64
+                date.year() as i64 * 10_000 + date.month() as i64 * 100 + date.day() as i64
             }
             CalendarPeriod::Weekly => {
                 // ISO week: year * 100 + week_number
                 let iso = date.iso_week();
                 iso.year() as i64 * 100 + iso.week() as i64
             }
-            CalendarPeriod::Monthly => {
-                date.year() as i64 * 100 + date.month() as i64
-            }
+            CalendarPeriod::Monthly => date.year() as i64 * 100 + date.month() as i64,
             CalendarPeriod::Quarterly => {
                 let q = ((date.month() - 1) / 3 + 1) as i64;
                 date.year() as i64 * 10 + q
             }
-            CalendarPeriod::Annual => {
-                date.year() as i64
-            }
+            CalendarPeriod::Annual => date.year() as i64,
         }
     }
 }
@@ -81,8 +75,12 @@ impl IConsolidator for CalendarConsolidator {
                     emitted
                 } else {
                     // Same period — merge
-                    if bar.high > w.high { w.high = bar.high; }
-                    if bar.low  < w.low  { w.low  = bar.low;  }
+                    if bar.high > w.high {
+                        w.high = bar.high;
+                    }
+                    if bar.low < w.low {
+                        w.low = bar.low;
+                    }
                     w.close = bar.close;
                     w.volume += bar.volume;
                     w.end_time = bar.end_time;
@@ -100,11 +98,11 @@ impl IConsolidator for CalendarConsolidator {
 
     fn name(&self) -> &str {
         match self.period {
-            CalendarPeriod::Daily     => "CalendarConsolidator(Daily)",
-            CalendarPeriod::Weekly    => "CalendarConsolidator(Weekly)",
-            CalendarPeriod::Monthly   => "CalendarConsolidator(Monthly)",
+            CalendarPeriod::Daily => "CalendarConsolidator(Daily)",
+            CalendarPeriod::Weekly => "CalendarConsolidator(Weekly)",
+            CalendarPeriod::Monthly => "CalendarConsolidator(Monthly)",
             CalendarPeriod::Quarterly => "CalendarConsolidator(Quarterly)",
-            CalendarPeriod::Annual    => "CalendarConsolidator(Annual)",
+            CalendarPeriod::Annual => "CalendarConsolidator(Annual)",
         }
     }
 }

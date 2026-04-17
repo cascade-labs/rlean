@@ -1,15 +1,16 @@
 use crate::{fine_fundamental::FineFundamental, CoarseFundamental};
 use lean_core::Symbol;
 
+pub type CoarseFilter = dyn Fn(&[CoarseFundamental]) -> Vec<Symbol> + Send + Sync;
 pub type FineFilter = dyn Fn(&[FineFundamental]) -> Vec<Symbol> + Send + Sync;
 
 /// Universe that first runs a coarse filter, then passes coarse survivors
 /// through a fine fundamental filter. Mirrors C# FineFundamentalUniverseSelectionModel.
 pub struct FineFundamentalUniverseSelectionModel {
     /// Coarse filter: given market cap + dollar volume data, return symbols to keep
-    pub coarse_filter: Box<dyn Fn(&[CoarseFundamental]) -> Vec<Symbol> + Send + Sync>,
+    pub coarse_filter: Box<CoarseFilter>,
     /// Fine filter: given full fundamental data for coarse survivors, return final symbols
-    pub fine_filter: Box<dyn Fn(&[FineFundamental]) -> Vec<Symbol> + Send + Sync>,
+    pub fine_filter: Box<FineFilter>,
 }
 
 impl FineFundamentalUniverseSelectionModel {

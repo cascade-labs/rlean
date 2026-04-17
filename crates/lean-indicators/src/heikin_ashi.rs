@@ -54,22 +54,39 @@ impl HeikinAshi {
             self.current = IndicatorResult::ready(ha_close, bar.time);
         }
 
-        let result = HeikinAshiBar { open: ha_open, high: ha_high, low: ha_low, close: ha_close };
+        let result = HeikinAshiBar {
+            open: ha_open,
+            high: ha_high,
+            low: ha_low,
+            close: ha_close,
+        };
         self.last_bar = Some(result.clone());
         result
     }
 }
 
 impl Default for HeikinAshi {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Indicator for HeikinAshi {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > 1 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 2 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > 1
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        2
+    }
 
     fn reset(&mut self) {
         self.prev_ha_open = dec!(0);

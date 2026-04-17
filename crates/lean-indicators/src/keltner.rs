@@ -1,4 +1,8 @@
-use crate::{atr::Atr, ema::Ema, indicator::{Indicator, IndicatorResult}};
+use crate::{
+    atr::Atr,
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -30,20 +34,36 @@ impl KeltnerChannel {
         }
     }
 
-    pub fn standard(period: usize) -> Self { Self::new(period, dec!(2)) }
+    pub fn standard(period: usize) -> Self {
+        Self::new(period, dec!(2))
+    }
 }
 
 impl Indicator for KeltnerChannel {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.ema.is_ready() && self.atr.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.ema.warm_up_period() + 1 }
-    fn reset(&mut self) {
-        self.ema.reset(); self.atr.reset();
-        self.samples = 0; self.current = IndicatorResult::not_ready();
+    fn name(&self) -> &str {
+        &self.name
     }
-    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult { self.current.clone() }
+    fn is_ready(&self) -> bool {
+        self.ema.is_ready() && self.atr.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.ema.warm_up_period() + 1
+    }
+    fn reset(&mut self) {
+        self.ema.reset();
+        self.atr.reset();
+        self.samples = 0;
+        self.current = IndicatorResult::not_ready();
+    }
+    fn update_price(&mut self, _: DateTime, _: Price) -> IndicatorResult {
+        self.current.clone()
+    }
 
     fn update_bar(&mut self, bar: &lean_data::TradeBar) -> IndicatorResult {
         self.samples += 1;

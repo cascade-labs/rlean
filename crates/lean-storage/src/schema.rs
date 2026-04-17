@@ -83,20 +83,20 @@ pub fn open_interest_schema() -> Arc<Schema> {
 pub fn option_eod_bar_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("date_ns", DataType::Int64, false),
-        Field::new("symbol_value", DataType::Utf8, false),   // full OSI ticker
-        Field::new("underlying", DataType::Utf8, false),      // underlying ticker
+        Field::new("symbol_value", DataType::Utf8, false), // full OSI ticker
+        Field::new("underlying", DataType::Utf8, false),   // underlying ticker
         Field::new("expiration_ns", DataType::Int64, false),
-        Field::new("strike", DataType::Int64, false),         // ×1e8
-        Field::new("right", DataType::Utf8, false),           // "C" or "P"
-        Field::new("open", DataType::Int64, false),           // ×1e8
-        Field::new("high", DataType::Int64, false),           // ×1e8
-        Field::new("low", DataType::Int64, false),            // ×1e8
-        Field::new("close", DataType::Int64, false),          // ×1e8
-        Field::new("volume", DataType::Int64, false),         // raw shares
-        Field::new("bid", DataType::Int64, false),            // ×1e8
-        Field::new("ask", DataType::Int64, false),            // ×1e8
-        Field::new("bid_size", DataType::Int64, false),       // raw contracts
-        Field::new("ask_size", DataType::Int64, false),       // raw contracts
+        Field::new("strike", DataType::Int64, false), // ×1e8
+        Field::new("right", DataType::Utf8, false),   // "C" or "P"
+        Field::new("open", DataType::Int64, false),   // ×1e8
+        Field::new("high", DataType::Int64, false),   // ×1e8
+        Field::new("low", DataType::Int64, false),    // ×1e8
+        Field::new("close", DataType::Int64, false),  // ×1e8
+        Field::new("volume", DataType::Int64, false), // raw shares
+        Field::new("bid", DataType::Int64, false),    // ×1e8
+        Field::new("ask", DataType::Int64, false),    // ×1e8
+        Field::new("bid_size", DataType::Int64, false), // raw contracts
+        Field::new("ask_size", DataType::Int64, false), // raw contracts
     ]))
 }
 
@@ -107,11 +107,11 @@ pub fn option_eod_bar_schema() -> Arc<Schema> {
 pub fn option_universe_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("date_ns", DataType::Int64, false),
-        Field::new("symbol_value", DataType::Utf8, false),   // full OSI ticker
+        Field::new("symbol_value", DataType::Utf8, false), // full OSI ticker
         Field::new("underlying", DataType::Utf8, false),
         Field::new("expiration_ns", DataType::Int64, false),
-        Field::new("strike", DataType::Int64, false),         // ×1e8
-        Field::new("right", DataType::Utf8, false),           // "C" or "P"
+        Field::new("strike", DataType::Int64, false), // ×1e8
+        Field::new("right", DataType::Utf8, false),   // "C" or "P"
     ]))
 }
 
@@ -218,9 +218,9 @@ pub struct OptionUniverseRow {
 /// - `fields_json`— JSON-encoded extra fields map (Utf8)
 pub fn custom_data_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("date_ns",     DataType::Int64,   false),
-        Field::new("value",       DataType::Float64, false),
-        Field::new("fields_json", DataType::Utf8,    false),
+        Field::new("date_ns", DataType::Int64, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("fields_json", DataType::Utf8, false),
     ]))
 }
 
@@ -235,9 +235,9 @@ pub fn custom_data_schema() -> Arc<Schema> {
 /// Factors are `Float64` to preserve the 7–8 decimal places that LEAN uses.
 pub fn factor_file_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("date_ns",         DataType::Int64,   false),
-        Field::new("price_factor",    DataType::Float64, false),
-        Field::new("split_factor",    DataType::Float64, false),
+        Field::new("date_ns", DataType::Int64, false),
+        Field::new("price_factor", DataType::Float64, false),
+        Field::new("split_factor", DataType::Float64, false),
         Field::new("reference_price", DataType::Float64, false),
     ]))
 }
@@ -251,7 +251,7 @@ pub fn factor_file_schema() -> Arc<Schema> {
 pub fn map_file_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("date_ns", DataType::Int64, false),
-        Field::new("ticker",  DataType::Utf8,  false),
+        Field::new("ticker", DataType::Utf8, false),
     ]))
 }
 

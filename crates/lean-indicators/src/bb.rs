@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -43,9 +47,12 @@ impl BollingerBands {
 
     fn std_dev(&self, mean: Price) -> Price {
         let n = Decimal::from(self.period);
-        let variance: Price = self.window.iter()
+        let variance: Price = self
+            .window
+            .iter()
             .map(|&x| (x - mean) * (x - mean))
-            .sum::<Price>() / n;
+            .sum::<Price>()
+            / n;
 
         // Integer square root approximation via Newton's method on Decimal
         use rust_decimal::prelude::ToPrimitive;
@@ -55,11 +62,21 @@ impl BollingerBands {
 }
 
 impl Indicator for BollingerBands {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.sma.reset();
@@ -87,7 +104,9 @@ impl Indicator for BollingerBands {
 
             let range = self.upper - self.lower;
             self.bandwidth = if mid.is_zero() { dec!(0) } else { range / mid };
-            self.percent_b = if range.is_zero() { dec!(0.5) } else {
+            self.percent_b = if range.is_zero() {
+                dec!(0.5)
+            } else {
                 (value - self.lower) / range
             };
 

@@ -1,6 +1,5 @@
 use lean_core::{DateTime, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 use crate::order::{Order, OrderDirection, OrderType};
@@ -24,6 +23,15 @@ pub struct TrailingStopOrder {
     pub stop_price: Price,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TrailingStopOrderParams<'a> {
+    pub trailing_amount: Price,
+    pub trailing_as_percentage: bool,
+    pub stop_price: Price,
+    pub time: DateTime,
+    pub tag: &'a str,
+}
+
 impl TrailingStopOrder {
     /// Create a new trailing stop order.
     ///
@@ -33,22 +41,22 @@ impl TrailingStopOrder {
         id: i64,
         symbol: Symbol,
         quantity: Quantity,
-        trailing_amount: Price,
-        trailing_as_percentage: bool,
-        stop_price: Price,
-        time: DateTime,
-        tag: &str,
+        params: TrailingStopOrderParams<'_>,
     ) -> Self {
-        let mut order = Order::market(id, symbol, quantity, time, tag);
+        let mut order = Order::market(id, symbol, quantity, params.time, params.tag);
         order.order_type = OrderType::TrailingStop;
-        order.trailing_amount = Some(trailing_amount);
-        order.trailing_as_percent = trailing_as_percentage;
-        order.stop_price = if stop_price.is_zero() { None } else { Some(stop_price) };
+        order.trailing_amount = Some(params.trailing_amount);
+        order.trailing_as_percent = params.trailing_as_percentage;
+        order.stop_price = if params.stop_price.is_zero() {
+            None
+        } else {
+            Some(params.stop_price)
+        };
         Self {
             order,
-            trailing_amount,
-            trailing_as_percentage,
-            stop_price,
+            trailing_amount: params.trailing_amount,
+            trailing_as_percentage: params.trailing_as_percentage,
+            stop_price: params.stop_price,
         }
     }
 
@@ -86,8 +94,12 @@ impl TrailingStopOrder {
 
         // Initialize stop price if it hasn't been set yet.
         if self.stop_price.is_zero() {
-            self.stop_price =
-                Self::calculate_stop_price(market_price, self.trailing_amount, self.trailing_as_percentage, direction);
+            self.stop_price = Self::calculate_stop_price(
+                market_price,
+                self.trailing_amount,
+                self.trailing_as_percentage,
+                direction,
+            );
             self.order.stop_price = Some(self.stop_price);
             return true;
         }
@@ -107,8 +119,12 @@ impl TrailingStopOrder {
             return false;
         }
 
-        let new_stop =
-            Self::calculate_stop_price(market_price, self.trailing_amount, self.trailing_as_percentage, direction);
+        let new_stop = Self::calculate_stop_price(
+            market_price,
+            self.trailing_amount,
+            self.trailing_as_percentage,
+            direction,
+        );
         self.stop_price = new_stop;
         self.order.stop_price = Some(new_stop);
         true
@@ -136,7 +152,18 @@ mod tests {
 
     fn make_order(qty: Quantity, trail: Price, as_pct: bool) -> TrailingStopOrder {
         let symbol = Symbol::create_equity("AAPL", &lean_core::Market::usa());
-        TrailingStopOrder::new(1, symbol, qty, trail, as_pct, dec!(0), DateTime::EPOCH, "test")
+        TrailingStopOrder::new(
+            1,
+            symbol,
+            qty,
+            TrailingStopOrderParams {
+                trailing_amount: trail,
+                trailing_as_percentage: as_pct,
+                stop_price: dec!(0),
+                time: DateTime::EPOCH,
+                tag: "test",
+            },
+        )
     }
 
     #[test]
@@ -144,7 +171,7 @@ mod tests {
         // Sell order (negative qty) = trailing stop protecting a long position.
         // Stop is placed BELOW market price and rises as price rises.
         let mut order = make_order(dec!(-10), dec!(2), false); // sell stop, $2 trail
-        // First update at $100: stop = 100 - 2 = $98.
+                                                               // First update at $100: stop = 100 - 2 = $98.
         assert!(order.try_update_stop_price(dec!(100)));
         assert_eq!(order.stop_price, dec!(98));
 
@@ -163,8 +190,8 @@ mod tests {
         let mut order = make_order(dec!(-10), dec!(2), false);
         order.try_update_stop_price(dec!(100)); // stop = $98
         assert!(!order.is_triggered(dec!(99))); // 99 > 98, not triggered
-        assert!(order.is_triggered(dec!(98)));  // at stop
-        assert!(order.is_triggered(dec!(95)));  // below stop
+        assert!(order.is_triggered(dec!(98))); // at stop
+        assert!(order.is_triggered(dec!(95))); // below stop
     }
 
     #[test]

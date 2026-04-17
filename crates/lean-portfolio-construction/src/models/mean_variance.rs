@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use rust_decimal::Decimal;
 use lean_core::Symbol;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{
     IPortfolioConstructionModel, InsightDirection, InsightForPcm,
@@ -52,7 +52,12 @@ impl MeanVariancePortfolioConstructionModel {
         let default_magnitude = 0.01_f64;
         let magnitude = insight
             .magnitude
-            .map(|m| m.abs().to_string().parse::<f64>().unwrap_or(default_magnitude))
+            .map(|m| {
+                m.abs()
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(default_magnitude)
+            })
             .unwrap_or(default_magnitude);
 
         match insight.direction {

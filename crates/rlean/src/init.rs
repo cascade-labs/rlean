@@ -1,11 +1,3 @@
-/// `rlean init` — bootstrap a Lean workspace in the current directory
-///
-/// Creates:
-///   rlean.json          — LEAN engine workspace config (data-folder, default-language)
-///   data/              — local Parquet data root
-///   ~/.rlean/config    — global CLI config (updated with workspace path)
-use std::path::PathBuf;
-
 use anyhow::{bail, Result};
 
 use crate::config::{GlobalConfig, WorkspaceConfig};

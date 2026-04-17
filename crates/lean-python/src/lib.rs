@@ -1,27 +1,33 @@
 pub mod charting;
+pub mod py_adapter;
 pub mod py_charting;
-pub mod py_types;
 pub mod py_data;
-pub mod py_orders;
 pub mod py_indicators;
-pub mod py_portfolio;
 pub mod py_options;
+pub mod py_orders;
+pub mod py_portfolio;
 pub mod py_qc_algorithm;
 pub mod py_quant_book;
-pub mod py_adapter;
-pub mod runner;
+pub mod py_types;
 pub mod report;
+pub mod runner;
 
 use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
-use py_types::{PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PyOptionSecurity, PySymbol, PyIndicatorResult};
-use py_data::{PySlice, PyTradeBar, PyTradeBars, PyQuoteBar, PyQuoteBars, PyBar, PyCustomDataPoint, PyCustomData};
+use py_data::{
+    PyBar, PyCustomData, PyCustomDataPoint, PyQuoteBar, PyQuoteBars, PySlice, PyTradeBar,
+    PyTradeBars,
+};
+use py_indicators::{PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyRsi, PySma};
 use py_orders::PyOrderEvent;
-use py_indicators::{PySma, PyEma, PyRsi, PyMacd, PyBollingerBands, PyAtr, PyIndicatorDataPoint};
 use py_portfolio::{PyPortfolio, PySecurityHolding};
 use py_qc_algorithm::PyQcAlgorithm;
 use py_quant_book::PyQuantBook;
+use py_types::{
+    PyIndicatorResult, PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry,
+    PySecurityManager, PySymbol,
+};
 
 // ─── Additional enums matching LEAN's Python API ──────────────────────────────
 
@@ -29,29 +35,29 @@ use py_quant_book::PyQuantBook;
 #[pyclass(name = "SecurityType", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PySecurityType {
-    Base    = 0,
-    Equity  = 1,
-    Option  = 2,
-    Forex   = 3,
-    Future  = 4,
-    Cfd     = 5,
-    Crypto  = 7,
-    Index   = 8,
+    Base = 0,
+    Equity = 1,
+    Option = 2,
+    Forex = 3,
+    Future = 4,
+    Cfd = 5,
+    Crypto = 7,
+    Index = 8,
 }
 
 /// LEAN OrderType enum values.
 #[pyclass(name = "OrderType", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyOrderType {
-    Market      = 0,
-    Limit       = 1,
-    StopMarket  = 2,
-    StopLimit   = 3,
+    Market = 0,
+    Limit = 1,
+    StopMarket = 2,
+    StopLimit = 3,
     MarketOnClose = 4,
     OptionExercise = 5,
     LimitIfTouched = 6,
     ComboMarket = 7,
-    ComboLimit  = 8,
+    ComboLimit = 8,
     ComboLegLimit = 9,
     TrailingStop = 10,
 }
@@ -60,13 +66,13 @@ pub enum PyOrderType {
 #[pyclass(name = "OrderStatus", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyOrderStatus {
-    New             = 0,
-    Submitted       = 1,
+    New = 0,
+    Submitted = 1,
     PartiallyFilled = 2,
-    Filled          = 3,
-    Canceled        = 5,
-    Invalid         = 6,
-    CancelPending   = 7,
+    Filled = 3,
+    Canceled = 5,
+    Invalid = 6,
+    CancelPending = 7,
     UpdateSubmitted = 8,
 }
 
@@ -74,7 +80,7 @@ pub enum PyOrderStatus {
 #[pyclass(name = "OrderDirection", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyOrderDirection {
-    Buy  = 0,
+    Buy = 0,
     Sell = 1,
     Hold = 2,
 }
@@ -97,8 +103,8 @@ pub enum PyOrderDirection {
 ///         self.fast = SimpleMovingAverage(50)
 /// ```
 #[pymodule]
-#[allow(non_snake_case)]
-pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "AlgorithmImports")]
+pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core types
     m.add_class::<PyResolution>()?;
     m.add_class::<PySymbol>()?;
@@ -163,13 +169,12 @@ pub fn AlgorithmImports(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Backward compatibility alias — `lean_rust` was the old module name.
 /// Keep this so existing internal code that calls `pyo3::append_to_inittab!(lean_rust)`
 /// still compiles, though new code should use `AlgorithmImports`.
-#[allow(non_snake_case)]
-pub use AlgorithmImports as lean_rust;
+pub use algorithm_imports as AlgorithmImports;
+pub use algorithm_imports as lean_rust;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyo3::prelude::*;
 
     /// Integration test: verify that the AlgorithmImports module exposes the
     /// correct LEAN-compatible API surface from Python.
@@ -202,7 +207,11 @@ assert not sma.is_ready, 'new SMA should not be ready'
                 None,
                 None,
             );
-            assert!(result.is_ok(), "SimpleMovingAverage creation test failed: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "SimpleMovingAverage creation test failed: {:?}",
+                result
+            );
 
             // Test 3: .update(datetime, value) works with time arg
             let result = py.run(
@@ -218,7 +227,11 @@ assert sma.is_ready, 'SMA with period=3 should be ready after 3 updates'
                 None,
                 None,
             );
-            assert!(result.is_ok(), "SMA update(time, value) test failed: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "SMA update(time, value) test failed: {:?}",
+                result
+            );
 
             // Test 4: .current.value returns a float
             let result = py.run(

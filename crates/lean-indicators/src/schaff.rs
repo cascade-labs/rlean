@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema, window::RollingWindow};
+use crate::{
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -38,22 +42,38 @@ impl SchaffTrendCycle {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(10, 23, 50)
-    }
-
     fn stoch(value: Decimal, highest: Decimal, lowest: Decimal) -> Decimal {
         let denom = highest - lowest;
-        if denom > dec!(0) { (value - lowest) / denom * dec!(100) } else { dec!(0) }
+        if denom > dec!(0) {
+            (value - lowest) / denom * dec!(100)
+        } else {
+            dec!(0)
+        }
+    }
+}
+
+impl Default for SchaffTrendCycle {
+    fn default() -> Self {
+        Self::new(10, 23, 50)
     }
 }
 
 impl Indicator for SchaffTrendCycle {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.fast_ema.is_ready() && self.slow_ema.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.fast_ema.is_ready() && self.slow_ema.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.fast_ema.reset();
@@ -78,8 +98,16 @@ impl Indicator for SchaffTrendCycle {
         let macd = self.fast_ema.current().value - self.slow_ema.current().value;
         self.macd_win.push(macd);
 
-        let max_macd = self.macd_win.iter().copied().fold(Decimal::MIN, Decimal::max);
-        let min_macd = self.macd_win.iter().copied().fold(Decimal::MAX, Decimal::min);
+        let max_macd = self
+            .macd_win
+            .iter()
+            .copied()
+            .fold(Decimal::MIN, Decimal::max);
+        let min_macd = self
+            .macd_win
+            .iter()
+            .copied()
+            .fold(Decimal::MAX, Decimal::min);
         let k_raw = Self::stoch(macd, max_macd, min_macd);
         let k = self.k_ema.update_price(time, k_raw).value;
         self.d_win.push(k);

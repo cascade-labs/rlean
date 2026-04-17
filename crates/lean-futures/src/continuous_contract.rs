@@ -1,6 +1,6 @@
+use crate::contract_series::FuturesContract;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use crate::contract_series::FuturesContract;
 
 /// How to stitch contracts together
 #[derive(Debug, Clone, Copy)]
@@ -17,7 +17,7 @@ pub enum ContinuousContractType {
 pub struct ContinuousContract {
     pub underlying: String,
     pub contract_type: ContinuousContractType,
-    pub roll_days_before_expiry: i32,  // how many days before expiry to roll (default 3)
+    pub roll_days_before_expiry: i32, // how many days before expiry to roll (default 3)
     pub current_contract: Option<FuturesContract>,
     pub next_contract: Option<FuturesContract>,
     pub cumulative_adjustment: Decimal, // for Panama Canal method

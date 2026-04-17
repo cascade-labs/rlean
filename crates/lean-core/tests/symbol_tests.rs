@@ -1,6 +1,6 @@
+use chrono::NaiveDate;
 use lean_core::{Market, OptionRight, OptionStyle, SecurityType, Symbol};
 use rust_decimal_macros::dec;
-use chrono::NaiveDate;
 
 #[test]
 fn create_equity_symbol_has_correct_type() {

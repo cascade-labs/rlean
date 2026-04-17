@@ -1,6 +1,6 @@
 use lean_statistics::statistics::Statistics;
-use rust_decimal_macros::dec;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 // ─── Max drawdown ─────────────────────────────────────────────────────────────
 
@@ -60,9 +60,14 @@ fn sharpe_ratio_positive_for_consistent_gains() {
 
 #[test]
 fn sharpe_ratio_negative_for_consistent_losses() {
-    let returns: Vec<Decimal> = (0..100).map(|i| if i % 2 == 0 { dec!(-0.02) } else { dec!(0.01) }).collect();
+    let returns: Vec<Decimal> = (0..100)
+        .map(|i| if i % 2 == 0 { dec!(-0.02) } else { dec!(0.01) })
+        .collect();
     let sharpe = Statistics::sharpe_ratio(&returns, dec!(0));
-    assert!(sharpe < dec!(0), "Sharpe should be negative for net-losing returns");
+    assert!(
+        sharpe < dec!(0),
+        "Sharpe should be negative for net-losing returns"
+    );
 }
 
 #[test]
@@ -152,7 +157,11 @@ fn annual_performance_one_year() {
     let annual = Statistics::annual_performance(dec!(0.10), 252);
     // Should be very close to 0.10
     let diff = (annual - dec!(0.10)).abs();
-    assert!(diff < dec!(0.001), "Annual performance should be ~10% for 1-year 10% return, got {}", annual);
+    assert!(
+        diff < dec!(0.001),
+        "Annual performance should be ~10% for 1-year 10% return, got {}",
+        annual
+    );
 }
 
 #[test]

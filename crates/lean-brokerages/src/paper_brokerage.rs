@@ -3,10 +3,9 @@ use dashmap::DashMap;
 use lean_algorithm::portfolio::SecurityPortfolioManager;
 use lean_core::{Price, Quantity, Result as LeanResult, Symbol};
 use lean_orders::{Order, OrderStatus};
-use rust_decimal_macros::dec;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 /// Paper trading brokerage — simulates order execution with no real capital.
 pub struct PaperBrokerage {
@@ -28,19 +27,27 @@ impl PaperBrokerage {
         }
     }
 
-    pub fn cash_balance(&self) -> Price { *self.cash.lock() }
+    pub fn cash_balance(&self) -> Price {
+        *self.cash.lock()
+    }
 }
 
 impl Brokerage for PaperBrokerage {
-    fn name(&self) -> &str { &self.name }
-    fn is_connected(&self) -> bool { self.connected }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
 
     fn connect(&mut self) -> LeanResult<()> {
         self.connected = true;
         Ok(())
     }
 
-    fn disconnect(&mut self) { self.connected = false; }
+    fn disconnect(&mut self) {
+        self.connected = false;
+    }
 
     fn place_order(&mut self, order: Order) -> LeanResult<bool> {
         self.orders.insert(order.id, order);
@@ -66,7 +73,8 @@ impl Brokerage for PaperBrokerage {
     }
 
     fn get_open_orders(&self) -> Vec<Order> {
-        self.orders.iter()
+        self.orders
+            .iter()
             .filter(|e| e.is_open())
             .map(|e| e.clone())
             .collect()
