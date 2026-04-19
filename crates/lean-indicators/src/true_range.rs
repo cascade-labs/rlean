@@ -2,7 +2,6 @@ use crate::indicator::{Indicator, IndicatorResult};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
 /// True Range = max(H-L, |H-prevC|, |L-prevC|).
 pub struct TrueRange {
@@ -42,11 +41,21 @@ impl Default for TrueRange {
 }
 
 impl Indicator for TrueRange {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= 1 }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= 1
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        1
+    }
 
     fn reset(&mut self) {
         self.prev_close = None;

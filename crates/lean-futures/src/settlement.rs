@@ -3,8 +3,8 @@ use rust_decimal_macros::dec;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SettlementMethod {
-    Physical,   // actual delivery of commodity
-    Cash,       // mark-to-market cash settlement
+    Physical, // actual delivery of commodity
+    Cash,     // mark-to-market cash settlement
 }
 
 #[derive(Debug, Clone)]
@@ -24,9 +24,7 @@ pub fn settle_futures_position(
 ) -> SettlementResult {
     match method {
         SettlementMethod::Cash => {
-            let pnl = (settlement_price - average_price)
-                * position_quantity
-                * contract_multiplier;
+            let pnl = (settlement_price - average_price) * position_quantity * contract_multiplier;
             SettlementResult {
                 cash_change: pnl,
                 underlying_change: dec!(0),

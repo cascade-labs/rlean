@@ -3,10 +3,9 @@
 /// Covers TradeBarConsolidator (count + time-period), RenkoConsolidator (rising,
 /// falling, reversal, multi-brick), VolumeConsolidator, HeikinAshiConsolidator,
 /// and CalendarConsolidator (daily, weekly, monthly).
-
 use lean_consolidators::{
-    CalendarConsolidator, CalendarPeriod, HeikinAshiConsolidator, IConsolidator,
-    RenkoConsolidator, TradeBarConsolidator, VolumeConsolidator,
+    CalendarConsolidator, CalendarPeriod, HeikinAshiConsolidator, IConsolidator, RenkoConsolidator,
+    TradeBarConsolidator, VolumeConsolidator,
 };
 use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
 use lean_data::TradeBar;
@@ -95,27 +94,87 @@ mod trade_bar_consolidator_tests {
     fn count_consolidator_no_emit_before_n_bars() {
         // n=3: first two updates should return None
         let mut c = TradeBarConsolidator::new_count(3);
-        assert!(c.update(&spy_bar(0, dec!(1), dec!(2), dec!(0.5), dec!(1.0), dec!(100))).is_none());
-        assert!(c.update(&spy_bar(1, dec!(2), dec!(3), dec!(1.5), dec!(2.0), dec!(200))).is_none());
+        assert!(c
+            .update(&spy_bar(
+                0,
+                dec!(1),
+                dec!(2),
+                dec!(0.5),
+                dec!(1.0),
+                dec!(100)
+            ))
+            .is_none());
+        assert!(c
+            .update(&spy_bar(
+                1,
+                dec!(2),
+                dec!(3),
+                dec!(1.5),
+                dec!(2.0),
+                dec!(200)
+            ))
+            .is_none());
     }
 
     #[test]
     fn count_consolidator_emits_on_nth_bar() {
         // n=3: third update should return Some
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(1), dec!(2), dec!(0.5), dec!(1.0), dec!(100)));
-        c.update(&spy_bar(1, dec!(2), dec!(3), dec!(1.5), dec!(2.0), dec!(200)));
-        let result = c.update(&spy_bar(2, dec!(3), dec!(4), dec!(2.5), dec!(3.0), dec!(300)));
+        c.update(&spy_bar(
+            0,
+            dec!(1),
+            dec!(2),
+            dec!(0.5),
+            dec!(1.0),
+            dec!(100),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(2),
+            dec!(3),
+            dec!(1.5),
+            dec!(2.0),
+            dec!(200),
+        ));
+        let result = c.update(&spy_bar(
+            2,
+            dec!(3),
+            dec!(4),
+            dec!(2.5),
+            dec!(3.0),
+            dec!(300),
+        ));
         assert!(result.is_some(), "should emit after 3rd bar");
     }
 
     #[test]
     fn consolidated_open_is_first_bars_open() {
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(10), dec!(100), dec!(1), dec!(50), dec!(75)));
-        c.update(&spy_bar(1, dec!(50), dec!(123), dec!(35), dec!(75), dec!(100)));
+        c.update(&spy_bar(
+            0,
+            dec!(10),
+            dec!(100),
+            dec!(1),
+            dec!(50),
+            dec!(75),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(50),
+            dec!(123),
+            dec!(35),
+            dec!(75),
+            dec!(100),
+        ));
         let out = c
-            .update(&spy_bar(2, dec!(75), dec!(100), dec!(50), dec!(83), dec!(125)))
+            .update(&spy_bar(
+                2,
+                dec!(75),
+                dec!(100),
+                dec!(50),
+                dec!(83),
+                dec!(125),
+            ))
             .expect("should emit");
         assert_eq!(out.open, dec!(10), "open must be first bar's open");
     }
@@ -123,10 +182,31 @@ mod trade_bar_consolidator_tests {
     #[test]
     fn consolidated_high_is_max_of_all_highs() {
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(10), dec!(100), dec!(1), dec!(50), dec!(75)));
-        c.update(&spy_bar(1, dec!(50), dec!(123), dec!(35), dec!(75), dec!(100)));
+        c.update(&spy_bar(
+            0,
+            dec!(10),
+            dec!(100),
+            dec!(1),
+            dec!(50),
+            dec!(75),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(50),
+            dec!(123),
+            dec!(35),
+            dec!(75),
+            dec!(100),
+        ));
         let out = c
-            .update(&spy_bar(2, dec!(75), dec!(100), dec!(50), dec!(83), dec!(125)))
+            .update(&spy_bar(
+                2,
+                dec!(75),
+                dec!(100),
+                dec!(50),
+                dec!(83),
+                dec!(125),
+            ))
             .expect("should emit");
         assert_eq!(out.high, dec!(123), "high must be max of all input highs");
     }
@@ -134,10 +214,31 @@ mod trade_bar_consolidator_tests {
     #[test]
     fn consolidated_low_is_min_of_all_lows() {
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(10), dec!(100), dec!(1), dec!(50), dec!(75)));
-        c.update(&spy_bar(1, dec!(50), dec!(123), dec!(35), dec!(75), dec!(100)));
+        c.update(&spy_bar(
+            0,
+            dec!(10),
+            dec!(100),
+            dec!(1),
+            dec!(50),
+            dec!(75),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(50),
+            dec!(123),
+            dec!(35),
+            dec!(75),
+            dec!(100),
+        ));
         let out = c
-            .update(&spy_bar(2, dec!(75), dec!(100), dec!(50), dec!(83), dec!(125)))
+            .update(&spy_bar(
+                2,
+                dec!(75),
+                dec!(100),
+                dec!(50),
+                dec!(83),
+                dec!(125),
+            ))
             .expect("should emit");
         assert_eq!(out.low, dec!(1), "low must be min of all input lows");
     }
@@ -145,10 +246,31 @@ mod trade_bar_consolidator_tests {
     #[test]
     fn consolidated_close_is_last_bars_close() {
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(10), dec!(100), dec!(1), dec!(50), dec!(75)));
-        c.update(&spy_bar(1, dec!(50), dec!(123), dec!(35), dec!(75), dec!(100)));
+        c.update(&spy_bar(
+            0,
+            dec!(10),
+            dec!(100),
+            dec!(1),
+            dec!(50),
+            dec!(75),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(50),
+            dec!(123),
+            dec!(35),
+            dec!(75),
+            dec!(100),
+        ));
         let out = c
-            .update(&spy_bar(2, dec!(75), dec!(100), dec!(50), dec!(83), dec!(125)))
+            .update(&spy_bar(
+                2,
+                dec!(75),
+                dec!(100),
+                dec!(50),
+                dec!(83),
+                dec!(125),
+            ))
             .expect("should emit");
         assert_eq!(out.close, dec!(83), "close must be last bar's close");
     }
@@ -156,12 +278,37 @@ mod trade_bar_consolidator_tests {
     #[test]
     fn consolidated_volume_is_sum_of_all_volumes() {
         let mut c = TradeBarConsolidator::new_count(3);
-        c.update(&spy_bar(0, dec!(10), dec!(100), dec!(1), dec!(50), dec!(75)));
-        c.update(&spy_bar(1, dec!(50), dec!(123), dec!(35), dec!(75), dec!(100)));
+        c.update(&spy_bar(
+            0,
+            dec!(10),
+            dec!(100),
+            dec!(1),
+            dec!(50),
+            dec!(75),
+        ));
+        c.update(&spy_bar(
+            1,
+            dec!(50),
+            dec!(123),
+            dec!(35),
+            dec!(75),
+            dec!(100),
+        ));
         let out = c
-            .update(&spy_bar(2, dec!(75), dec!(100), dec!(50), dec!(83), dec!(125)))
+            .update(&spy_bar(
+                2,
+                dec!(75),
+                dec!(100),
+                dec!(50),
+                dec!(83),
+                dec!(125),
+            ))
             .expect("should emit");
-        assert_eq!(out.volume, dec!(300), "volume must be sum of all input volumes");
+        assert_eq!(
+            out.volume,
+            dec!(300),
+            "volume must be sum of all input volumes"
+        );
     }
 
     #[test]
@@ -170,8 +317,12 @@ mod trade_bar_consolidator_tests {
         for i in 0..3 {
             c.update(&spy_bar(i, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)));
         }
-        assert!(c.update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
-        assert!(c.update(&spy_bar(4, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
+        assert!(c
+            .update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
+        assert!(c
+            .update(&spy_bar(4, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
         let out = c.update(&spy_bar(5, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)));
         assert!(out.is_some(), "should emit again after 3 more bars");
     }
@@ -188,20 +339,42 @@ mod trade_bar_consolidator_tests {
     #[test]
     fn count_two_emits_every_other_bar() {
         let mut c = TradeBarConsolidator::new_count(2);
-        assert!(c.update(&spy_bar(0, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
-        assert!(c.update(&spy_bar(1, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_some());
-        assert!(c.update(&spy_bar(2, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
-        assert!(c.update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_some());
+        assert!(c
+            .update(&spy_bar(0, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
+        assert!(c
+            .update(&spy_bar(1, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_some());
+        assert!(c
+            .update(&spy_bar(2, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
+        assert!(c
+            .update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_some());
     }
 
     #[test]
     fn count_five_emits_on_fifth_bar_and_not_before() {
         let mut c = TradeBarConsolidator::new_count(5);
         for i in 0..4_i64 {
-            let r = c.update(&spy_bar(i, dec!(10), dec!(11), dec!(9), dec!(10), dec!(100)));
+            let r = c.update(&spy_bar(
+                i,
+                dec!(10),
+                dec!(11),
+                dec!(9),
+                dec!(10),
+                dec!(100),
+            ));
             assert!(r.is_none(), "no emit before bar 5 (bar {i})");
         }
-        let out = c.update(&spy_bar(4, dec!(10), dec!(11), dec!(9), dec!(10), dec!(100)));
+        let out = c.update(&spy_bar(
+            4,
+            dec!(10),
+            dec!(11),
+            dec!(9),
+            dec!(10),
+            dec!(100),
+        ));
         assert!(out.is_some(), "should emit on bar 5");
         assert_eq!(out.unwrap().volume, dec!(500));
     }
@@ -230,10 +403,24 @@ mod trade_bar_consolidator_tests {
         let mut c = TradeBarConsolidator::new_period(period.as_chrono_duration());
 
         let b0 = bar_at(spy(), 0, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10));
-        let b4 = bar_at(spy(), 4 * 60_000_000_000, dec!(2), dec!(3), dec!(1.5), dec!(2), dec!(20));
+        let b4 = bar_at(
+            spy(),
+            4 * 60_000_000_000,
+            dec!(2),
+            dec!(3),
+            dec!(1.5),
+            dec!(2),
+            dec!(20),
+        );
 
-        assert!(c.update(&b0).is_none(), "first bar in period should not emit");
-        assert!(c.update(&b4).is_none(), "second bar in same period should not emit");
+        assert!(
+            c.update(&b0).is_none(),
+            "first bar in period should not emit"
+        );
+        assert!(
+            c.update(&b4).is_none(),
+            "second bar in same period should not emit"
+        );
     }
 
     #[test]
@@ -242,10 +429,20 @@ mod trade_bar_consolidator_tests {
         let mut c = TradeBarConsolidator::new_period(period.as_chrono_duration());
 
         let b0 = bar_at(spy(), 0, dec!(10), dec!(12), dec!(9), dec!(11), dec!(50));
-        let b5 = bar_at(spy(), 5 * 60_000_000_000, dec!(11), dec!(13), dec!(10), dec!(12), dec!(60));
+        let b5 = bar_at(
+            spy(),
+            5 * 60_000_000_000,
+            dec!(11),
+            dec!(13),
+            dec!(10),
+            dec!(12),
+            dec!(60),
+        );
 
         assert!(c.update(&b0).is_none());
-        let out = c.update(&b5).expect("crossing into new period should emit previous period's bar");
+        let out = c
+            .update(&b5)
+            .expect("crossing into new period should emit previous period's bar");
         assert_eq!(out.open, dec!(10));
         assert_eq!(out.close, dec!(11));
     }
@@ -256,8 +453,24 @@ mod trade_bar_consolidator_tests {
         let mut c = TradeBarConsolidator::new_period(period.as_chrono_duration());
 
         let b0 = bar_at(spy(), 0, dec!(10), dec!(15), dec!(9), dec!(12), dec!(100));
-        let b3 = bar_at(spy(), 3 * 60_000_000_000, dec!(12), dec!(20), dec!(11), dec!(14), dec!(200));
-        let b5 = bar_at(spy(), 5 * 60_000_000_000, dec!(14), dec!(16), dec!(13), dec!(15), dec!(50));
+        let b3 = bar_at(
+            spy(),
+            3 * 60_000_000_000,
+            dec!(12),
+            dec!(20),
+            dec!(11),
+            dec!(14),
+            dec!(200),
+        );
+        let b5 = bar_at(
+            spy(),
+            5 * 60_000_000_000,
+            dec!(14),
+            dec!(16),
+            dec!(13),
+            dec!(15),
+            dec!(50),
+        );
 
         assert!(c.update(&b0).is_none());
         assert!(c.update(&b3).is_none());
@@ -279,11 +492,43 @@ mod trade_bar_consolidator_tests {
         // day 0 bars at hours 0, 1, 2 (nanos from Unix epoch)
         let h = 3_600_000_000_000_i64;
         let d = 86_400_000_000_000_i64;
-        let b_h0 = bar_at(spy(), 0 * h, dec!(100), dec!(105), dec!(98), dec!(103), dec!(500));
-        let b_h1 = bar_at(spy(), 1 * h, dec!(103), dec!(108), dec!(101), dec!(106), dec!(600));
-        let b_h2 = bar_at(spy(), 2 * h, dec!(106), dec!(110), dec!(104), dec!(109), dec!(700));
+        let b_h0 = bar_at(
+            spy(),
+            0,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(500),
+        );
+        let b_h1 = bar_at(
+            spy(),
+            h,
+            dec!(103),
+            dec!(108),
+            dec!(101),
+            dec!(106),
+            dec!(600),
+        );
+        let b_h2 = bar_at(
+            spy(),
+            2 * h,
+            dec!(106),
+            dec!(110),
+            dec!(104),
+            dec!(109),
+            dec!(700),
+        );
         // day 1 bar triggers emit
-        let b_d1 = bar_at(spy(), 1 * d, dec!(109), dec!(115), dec!(107), dec!(113), dec!(800));
+        let b_d1 = bar_at(
+            spy(),
+            d,
+            dec!(109),
+            dec!(115),
+            dec!(107),
+            dec!(113),
+            dec!(800),
+        );
 
         assert!(c.update(&b_h0).is_none());
         assert!(c.update(&b_h1).is_none());
@@ -303,8 +548,12 @@ mod trade_bar_consolidator_tests {
         c.update(&spy_bar(0, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)));
         c.update(&spy_bar(1, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)));
         c.reset();
-        assert!(c.update(&spy_bar(2, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
-        assert!(c.update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10))).is_none());
+        assert!(c
+            .update(&spy_bar(2, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
+        assert!(c
+            .update(&spy_bar(3, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)))
+            .is_none());
         let out = c.update(&spy_bar(4, dec!(1), dec!(2), dec!(0.5), dec!(1), dec!(10)));
         assert!(out.is_some(), "should emit exactly 3 bars after reset");
     }
@@ -327,21 +576,30 @@ mod renko_consolidator_tests {
     #[test]
     fn first_bar_seeds_and_returns_none() {
         let mut r = RenkoConsolidator::new(dec!(1));
-        assert!(r.update(&price_bar(0, dec!(10))).is_none(), "first tick should never emit");
+        assert!(
+            r.update(&price_bar(0, dec!(10))).is_none(),
+            "first tick should never emit"
+        );
     }
 
     #[test]
     fn no_emit_below_brick_size() {
         let mut r = RenkoConsolidator::new(dec!(1));
         r.update(&price_bar(0, dec!(10)));
-        assert!(r.update(&price_bar(MIN, dec!(10.9))).is_none(), "sub-brick move should not emit");
+        assert!(
+            r.update(&price_bar(MIN, dec!(10.9))).is_none(),
+            "sub-brick move should not emit"
+        );
     }
 
     #[test]
     fn no_emit_exact_open_rate_no_move() {
         let mut r = RenkoConsolidator::new(dec!(1));
         r.update(&price_bar(0, dec!(10)));
-        assert!(r.update(&price_bar(MIN, dec!(10))).is_none(), "zero move should not emit");
+        assert!(
+            r.update(&price_bar(MIN, dec!(10))).is_none(),
+            "zero move should not emit"
+        );
     }
 
     #[test]
@@ -350,7 +608,10 @@ mod renko_consolidator_tests {
         let mut r = RenkoConsolidator::new(dec!(1));
         r.update(&price_bar(0, dec!(10)));
         let result = r.update(&price_bar(MIN, dec!(11.1)));
-        assert!(result.is_some(), "price move > brick_size should emit a brick");
+        assert!(
+            result.is_some(),
+            "price move > brick_size should emit a brick"
+        );
         let brick = result.unwrap();
         assert_eq!(brick.open, dec!(10));
         assert_eq!(brick.close, dec!(11));
@@ -362,7 +623,10 @@ mod renko_consolidator_tests {
         r.update(&price_bar(0, dec!(10)));
         // 8.9 < 10-1=9 → emits [10→9]
         let result = r.update(&price_bar(MIN, dec!(8.9)));
-        assert!(result.is_some(), "downward move >= brick_size should emit a brick");
+        assert!(
+            result.is_some(),
+            "downward move >= brick_size should emit a brick"
+        );
         let brick = result.unwrap();
         assert_eq!(brick.open, dec!(10));
         assert_eq!(brick.close, dec!(9));
@@ -381,7 +645,11 @@ mod renko_consolidator_tests {
         assert!(first.is_some(), "large move should emit at least one brick");
         let mut all = r.drain_pending();
         all.insert(0, first.unwrap());
-        assert_eq!(all.len(), 3, "a >3× brick_size move should produce exactly 3 bricks");
+        assert_eq!(
+            all.len(),
+            3,
+            "a >3× brick_size move should produce exactly 3 bricks"
+        );
         for (i, brick) in all.iter().enumerate() {
             let expected_open = dec!(10) + rust_decimal::Decimal::from(i as u64);
             let expected_close = expected_open + dec!(1);
@@ -426,9 +694,15 @@ mod renko_consolidator_tests {
         assert!(r.drain_pending().is_empty());
 
         // Price 11.1 > 10+1=11 triggers reversal
-        let reversal = r.update(&price_bar(2 * MIN, dec!(11.1))).expect("reversal brick");
+        let reversal = r
+            .update(&price_bar(2 * MIN, dec!(11.1)))
+            .expect("reversal brick");
         assert_eq!(reversal.open, dec!(10), "reversal opens at last_open");
-        assert_eq!(reversal.close, dec!(11), "reversal closes at last_open + brick_size");
+        assert_eq!(
+            reversal.close,
+            dec!(11),
+            "reversal closes at last_open + brick_size"
+        );
     }
 
     #[test]
@@ -445,9 +719,15 @@ mod renko_consolidator_tests {
         assert!(r.drain_pending().is_empty());
 
         // Price 8.9 < 10-1=9 triggers reversal
-        let reversal = r.update(&price_bar(2 * MIN, dec!(8.9))).expect("reversal brick");
+        let reversal = r
+            .update(&price_bar(2 * MIN, dec!(8.9)))
+            .expect("reversal brick");
         assert_eq!(reversal.open, dec!(10), "reversal opens at last_open");
-        assert_eq!(reversal.close, dec!(9), "reversal closes at last_open - brick_size");
+        assert_eq!(
+            reversal.close,
+            dec!(9),
+            "reversal closes at last_open - brick_size"
+        );
     }
 
     #[test]
@@ -467,31 +747,68 @@ mod renko_consolidator_tests {
     #[test]
     fn get_closest_multiple_rounds_correctly() {
         // 103 / 10 → floor=10, modulus=3, round(0.3)=0 → 10*10=100
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(103), dec!(10)), dec!(100));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(103), dec!(10)),
+            dec!(100)
+        );
         // 97 / 10 → floor=9, modulus=7, round(0.7)=1 → 10*10=100
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(97), dec!(10)), dec!(100));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(97), dec!(10)),
+            dec!(100)
+        );
         // 10 / 5 → floor=2, modulus=0, round(0)=0 → 5*2=10
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(10), dec!(5)), dec!(10));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(10), dec!(5)),
+            dec!(10)
+        );
         // 106 / 10 → floor=10, modulus=6, round(0.6)=1 → 10*11=110
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(106), dec!(10)), dec!(110));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(106), dec!(10)),
+            dec!(110)
+        );
         // 104 / 10 → floor=10, modulus=4, round(0.4)=0 → 10*10=100
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(104), dec!(10)), dec!(100));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(104), dec!(10)),
+            dec!(100)
+        );
         // 105 / 10 → floor=10, modulus=5, round(0.5)=0 (banker's: half rounds to even=0) → 10*10=100
-        assert_eq!(RenkoConsolidator::get_closest_multiple(dec!(105), dec!(10)), dec!(100));
+        assert_eq!(
+            RenkoConsolidator::get_closest_multiple(dec!(105), dec!(10)),
+            dec!(100)
+        );
     }
 
     #[test]
     fn brick_high_gte_close_for_rising_brick() {
         let mut r = RenkoConsolidator::new(dec!(10));
         // Seed at 100
-        r.update(&bar_at(spy(), 0, dec!(100), dec!(100), dec!(100), dec!(100), dec!(0)));
+        r.update(&bar_at(
+            spy(),
+            0,
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(0),
+        ));
         // Bar with high=125, low=95, close=115 — produces brick 100→110
         let brick = r
-            .update(&bar_at(spy(), MIN, dec!(115), dec!(125), dec!(95), dec!(115), dec!(0)))
+            .update(&bar_at(
+                spy(),
+                MIN,
+                dec!(115),
+                dec!(125),
+                dec!(95),
+                dec!(115),
+                dec!(0),
+            ))
             .expect("brick");
         assert_eq!(brick.open, dec!(100));
         assert_eq!(brick.close, dec!(110));
-        assert!(brick.high >= dec!(110), "wicked high must be >= brick close");
+        assert!(
+            brick.high >= dec!(110),
+            "wicked high must be >= brick close"
+        );
     }
 
     #[test]
@@ -563,11 +880,23 @@ mod heikin_ashi_consolidator_tests {
         ha.update(&b1).expect("HA always emits");
 
         // Bar 2
-        let b2 = bar_at(spy(), 60_000_000_000, dec!(15), dec!(25), dec!(12), dec!(20), dec!(200));
+        let b2 = bar_at(
+            spy(),
+            60_000_000_000,
+            dec!(15),
+            dec!(25),
+            dec!(12),
+            dec!(20),
+            dec!(200),
+        );
         let out2 = ha.update(&b2).expect("HA always emits");
 
         // prev_HA_Open=12.5, prev_HA_Close=12.5 → HA_Open2 = (12.5+12.5)/2 = 12.5
-        assert_eq!(out2.open, dec!(12.5), "second bar HA open = (prev_HA_Open + prev_HA_Close)/2");
+        assert_eq!(
+            out2.open,
+            dec!(12.5),
+            "second bar HA open = (prev_HA_Open + prev_HA_Close)/2"
+        );
         // HA_Close2 = (15+25+12+20)/4 = 72/4 = 18
         assert_eq!(out2.close, dec!(18), "second bar HA close = (O+H+L+C)/4");
     }
@@ -575,9 +904,33 @@ mod heikin_ashi_consolidator_tests {
     #[test]
     fn third_bar_ha_open_smoothing_chain() {
         let mut ha = HeikinAshiConsolidator::new();
-        let b1 = bar_at(spy(), 0, dec!(100), dec!(110), dec!(95), dec!(105), dec!(1000));
-        let b2 = bar_at(spy(), 60_000_000_000, dec!(105), dec!(115), dec!(100), dec!(110), dec!(1200));
-        let b3 = bar_at(spy(), 120_000_000_000, dec!(110), dec!(120), dec!(108), dec!(118), dec!(900));
+        let b1 = bar_at(
+            spy(),
+            0,
+            dec!(100),
+            dec!(110),
+            dec!(95),
+            dec!(105),
+            dec!(1000),
+        );
+        let b2 = bar_at(
+            spy(),
+            60_000_000_000,
+            dec!(105),
+            dec!(115),
+            dec!(100),
+            dec!(110),
+            dec!(1200),
+        );
+        let b3 = bar_at(
+            spy(),
+            120_000_000_000,
+            dec!(110),
+            dec!(120),
+            dec!(108),
+            dec!(118),
+            dec!(900),
+        );
 
         let ha1 = ha.update(&b1).expect("HA1");
         let ha2 = ha.update(&b2).expect("HA2");
@@ -585,23 +938,43 @@ mod heikin_ashi_consolidator_tests {
 
         // ha3.open = (ha2.open + ha2.close) / 2
         let expected_ha3_open = (ha2.open + ha2.close) / dec!(2);
-        assert_eq!(ha3.open, expected_ha3_open, "ha3 open = (ha2.open + ha2.close)/2");
+        assert_eq!(
+            ha3.open, expected_ha3_open,
+            "ha3 open = (ha2.open + ha2.close)/2"
+        );
 
         // ha3.close = (110+120+108+118)/4 = 114
         assert_eq!(ha3.close, dec!(114));
 
         // Verify HA High/Low invariants on ha2 (using actual ha2 values from ha1's output)
         let _ = ha1; // ensure it was computed
-        assert!(ha2.high >= ha2.open && ha2.high >= ha2.close, "HA_High >= both opens/closes");
-        assert!(ha2.low <= ha2.open && ha2.low <= ha2.close, "HA_Low <= both opens/closes");
+        assert!(
+            ha2.high >= ha2.open && ha2.high >= ha2.close,
+            "HA_High >= both opens/closes"
+        );
+        assert!(
+            ha2.low <= ha2.open && ha2.low <= ha2.close,
+            "HA_Low <= both opens/closes"
+        );
     }
 
     #[test]
     fn ha_emits_on_every_update() {
         let mut ha = HeikinAshiConsolidator::new();
         for i in 0..5_i64 {
-            let b = bar_at(spy(), i * 60_000_000_000, dec!(10), dec!(12), dec!(9), dec!(11), dec!(50));
-            assert!(ha.update(&b).is_some(), "HA should emit on every bar (bar {i})");
+            let b = bar_at(
+                spy(),
+                i * 60_000_000_000,
+                dec!(10),
+                dec!(12),
+                dec!(9),
+                dec!(11),
+                dec!(50),
+            );
+            assert!(
+                ha.update(&b).is_some(),
+                "HA should emit on every bar (bar {i})"
+            );
         }
     }
 
@@ -617,16 +990,35 @@ mod heikin_ashi_consolidator_tests {
     #[test]
     fn ha_reset_restores_first_bar_seed_behavior() {
         let mut ha = HeikinAshiConsolidator::new();
-        let b = bar_at(spy(), 0, dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000));
+        let b = bar_at(
+            spy(),
+            0,
+            dec!(100),
+            dec!(110),
+            dec!(90),
+            dec!(105),
+            dec!(1000),
+        );
         let ha1 = ha.update(&b).expect("first bar HA");
         let open_before_reset = ha1.open;
 
         ha.reset();
 
         // After reset, same input should produce identical output
-        let b2 = bar_at(spy(), 60_000_000_000, dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000));
+        let b2 = bar_at(
+            spy(),
+            60_000_000_000,
+            dec!(100),
+            dec!(110),
+            dec!(90),
+            dec!(105),
+            dec!(1000),
+        );
         let ha_after = ha.update(&b2).expect("HA after reset");
-        assert_eq!(ha_after.open, open_before_reset, "reset restores first-bar seed formula");
+        assert_eq!(
+            ha_after.open, open_before_reset,
+            "reset restores first-bar seed formula"
+        );
     }
 }
 
@@ -642,8 +1034,14 @@ mod volume_consolidator_tests {
         let mut v = VolumeConsolidator::new(dec!(500));
         let b1 = spy_bar(0, dec!(10), dec!(12), dec!(9), dec!(11), dec!(200));
         let b2 = spy_bar(1, dec!(11), dec!(13), dec!(10), dec!(12), dec!(200));
-        assert!(v.update(&b1).is_none(), "accumulated volume < threshold → no emit");
-        assert!(v.update(&b2).is_none(), "accumulated volume still < threshold → no emit");
+        assert!(
+            v.update(&b1).is_none(),
+            "accumulated volume < threshold → no emit"
+        );
+        assert!(
+            v.update(&b2).is_none(),
+            "accumulated volume still < threshold → no emit"
+        );
     }
 
     #[test]
@@ -654,7 +1052,10 @@ mod volume_consolidator_tests {
         let b3 = spy_bar(2, dec!(12), dec!(14), dec!(11), dec!(13), dec!(100));
         assert!(v.update(&b1).is_none());
         assert!(v.update(&b2).is_none());
-        assert!(v.update(&b3).is_some(), "should emit when accumulated volume reaches threshold");
+        assert!(
+            v.update(&b3).is_some(),
+            "should emit when accumulated volume reaches threshold"
+        );
     }
 
     #[test]
@@ -695,14 +1096,19 @@ mod volume_consolidator_tests {
         let b3 = spy_bar(2, dec!(12), dec!(14), dec!(11), dec!(13), dec!(100));
         let b4 = spy_bar(3, dec!(13), dec!(15), dec!(12), dec!(14), dec!(100));
         assert!(v.update(&b3).is_none(), "no emit mid-window");
-        assert!(v.update(&b4).is_some(), "should emit again after second 200-volume window");
+        assert!(
+            v.update(&b4).is_some(),
+            "should emit again after second 200-volume window"
+        );
     }
 
     #[test]
     fn single_bar_exceeding_threshold_emits_immediately() {
         let mut v = VolumeConsolidator::new(dec!(100));
         let b = spy_bar(0, dec!(10), dec!(12), dec!(9), dec!(11), dec!(500));
-        let out = v.update(&b).expect("single bar volume >= threshold should emit immediately");
+        let out = v
+            .update(&b)
+            .expect("single bar volume >= threshold should emit immediately");
         assert_eq!(out.volume, dec!(500));
     }
 
@@ -714,7 +1120,10 @@ mod volume_consolidator_tests {
         v.reset();
 
         let b2 = spy_bar(1, dec!(10), dec!(11), dec!(9), dec!(10), dec!(400));
-        assert!(v.update(&b2).is_none(), "no emit after reset with partial volume");
+        assert!(
+            v.update(&b2).is_none(),
+            "no emit after reset with partial volume"
+        );
         let b3 = spy_bar(2, dec!(10), dec!(11), dec!(9), dec!(10), dec!(600));
         let out = v.update(&b3).expect("should emit after accumulating 1000");
         assert_eq!(out.volume, dec!(1000));
@@ -752,8 +1161,22 @@ mod calendar_daily_tests {
     #[test]
     fn no_emit_within_same_day() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Daily);
-        let b1 = daily_bar_at(JAN2_2020, dec!(100), dec!(105), dec!(98), dec!(103), dec!(500));
-        let b2 = daily_bar_at(JAN2_2020 + ONE_HOUR_NS, dec!(103), dec!(108), dec!(100), dec!(106), dec!(600));
+        let b1 = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(500),
+        );
+        let b2 = daily_bar_at(
+            JAN2_2020 + ONE_HOUR_NS,
+            dec!(103),
+            dec!(108),
+            dec!(100),
+            dec!(106),
+            dec!(600),
+        );
         assert!(c.update(&b1).is_none());
         assert!(c.update(&b2).is_none(), "same day should not emit");
     }
@@ -761,9 +1184,30 @@ mod calendar_daily_tests {
     #[test]
     fn emits_at_day_boundary() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Daily);
-        let b1 = daily_bar_at(JAN2_2020, dec!(100), dec!(105), dec!(98), dec!(103), dec!(500));
-        let b2 = daily_bar_at(JAN2_2020 + ONE_HOUR_NS, dec!(103), dec!(108), dec!(100), dec!(106), dec!(600));
-        let b3 = daily_bar_at(JAN3_2020, dec!(106), dec!(110), dec!(104), dec!(109), dec!(700));
+        let b1 = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(500),
+        );
+        let b2 = daily_bar_at(
+            JAN2_2020 + ONE_HOUR_NS,
+            dec!(103),
+            dec!(108),
+            dec!(100),
+            dec!(106),
+            dec!(600),
+        );
+        let b3 = daily_bar_at(
+            JAN3_2020,
+            dec!(106),
+            dec!(110),
+            dec!(104),
+            dec!(109),
+            dec!(700),
+        );
 
         c.update(&b1);
         c.update(&b2);
@@ -780,10 +1224,38 @@ mod calendar_daily_tests {
     fn three_days_emit_two_bars() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Daily);
 
-        let d1 = daily_bar_at(JAN2_2020, dec!(100), dec!(110), dec!(95), dec!(108), dec!(1000));
-        let d2a = daily_bar_at(JAN3_2020, dec!(108), dec!(115), dec!(105), dec!(113), dec!(1200));
-        let d2b = daily_bar_at(JAN3_2020 + ONE_HOUR_NS, dec!(113), dec!(118), dec!(110), dec!(116), dec!(800));
-        let d3 = daily_bar_at(JAN4_2020, dec!(116), dec!(120), dec!(112), dec!(118), dec!(900));
+        let d1 = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(110),
+            dec!(95),
+            dec!(108),
+            dec!(1000),
+        );
+        let d2a = daily_bar_at(
+            JAN3_2020,
+            dec!(108),
+            dec!(115),
+            dec!(105),
+            dec!(113),
+            dec!(1200),
+        );
+        let d2b = daily_bar_at(
+            JAN3_2020 + ONE_HOUR_NS,
+            dec!(113),
+            dec!(118),
+            dec!(110),
+            dec!(116),
+            dec!(800),
+        );
+        let d3 = daily_bar_at(
+            JAN4_2020,
+            dec!(116),
+            dec!(120),
+            dec!(112),
+            dec!(118),
+            dec!(900),
+        );
 
         c.update(&d1);
         let e1 = c.update(&d2a).expect("day 2 starts — emit day 1");
@@ -818,8 +1290,22 @@ mod calendar_monthly_tests {
     #[test]
     fn no_emit_within_same_month() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Monthly);
-        let b1 = daily_bar_at(JAN2_2020, dec!(100), dec!(105), dec!(98), dec!(103), dec!(1000));
-        let b2 = daily_bar_at(JAN15_2020, dec!(103), dec!(108), dec!(101), dec!(106), dec!(1200));
+        let b1 = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(1000),
+        );
+        let b2 = daily_bar_at(
+            JAN15_2020,
+            dec!(103),
+            dec!(108),
+            dec!(101),
+            dec!(106),
+            dec!(1200),
+        );
         assert!(c.update(&b1).is_none());
         assert!(c.update(&b2).is_none(), "same month should not emit");
     }
@@ -827,13 +1313,36 @@ mod calendar_monthly_tests {
     #[test]
     fn emits_when_month_changes() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Monthly);
-        let b_jan1 = daily_bar_at(JAN2_2020, dec!(100), dec!(105), dec!(98), dec!(103), dec!(1000));
-        let b_jan2 = daily_bar_at(JAN15_2020, dec!(103), dec!(108), dec!(101), dec!(106), dec!(1200));
-        let b_feb = daily_bar_at(FEB1_2020, dec!(106), dec!(112), dec!(104), dec!(110), dec!(1500));
+        let b_jan1 = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(1000),
+        );
+        let b_jan2 = daily_bar_at(
+            JAN15_2020,
+            dec!(103),
+            dec!(108),
+            dec!(101),
+            dec!(106),
+            dec!(1200),
+        );
+        let b_feb = daily_bar_at(
+            FEB1_2020,
+            dec!(106),
+            dec!(112),
+            dec!(104),
+            dec!(110),
+            dec!(1500),
+        );
 
         c.update(&b_jan1);
         c.update(&b_jan2);
-        let emitted = c.update(&b_feb).expect("February bar should emit January bar");
+        let emitted = c
+            .update(&b_feb)
+            .expect("February bar should emit January bar");
 
         assert_eq!(emitted.open, dec!(100));
         assert_eq!(emitted.high, dec!(108));
@@ -846,10 +1355,38 @@ mod calendar_monthly_tests {
     fn two_months_emit_two_bars() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Monthly);
 
-        let jan = daily_bar_at(JAN2_2020, dec!(100), dec!(110), dec!(95), dec!(108), dec!(5000));
-        let feb_a = daily_bar_at(FEB1_2020, dec!(108), dec!(115), dec!(105), dec!(112), dec!(6000));
-        let feb_b = daily_bar_at(FEB15_2020, dec!(112), dec!(120), dec!(108), dec!(118), dec!(4000));
-        let mar = daily_bar_at(MAR1_2020, dec!(118), dec!(125), dec!(115), dec!(122), dec!(7000));
+        let jan = daily_bar_at(
+            JAN2_2020,
+            dec!(100),
+            dec!(110),
+            dec!(95),
+            dec!(108),
+            dec!(5000),
+        );
+        let feb_a = daily_bar_at(
+            FEB1_2020,
+            dec!(108),
+            dec!(115),
+            dec!(105),
+            dec!(112),
+            dec!(6000),
+        );
+        let feb_b = daily_bar_at(
+            FEB15_2020,
+            dec!(112),
+            dec!(120),
+            dec!(108),
+            dec!(118),
+            dec!(4000),
+        );
+        let mar = daily_bar_at(
+            MAR1_2020,
+            dec!(118),
+            dec!(125),
+            dec!(115),
+            dec!(122),
+            dec!(7000),
+        );
 
         c.update(&jan);
         let e1 = c.update(&feb_a).expect("feb triggers jan emit");
@@ -878,8 +1415,22 @@ mod calendar_weekly_tests {
     #[test]
     fn no_emit_within_same_week() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Weekly);
-        let b1 = daily_bar_at(WEEK2_MON, dec!(100), dec!(105), dec!(98), dec!(103), dec!(1000));
-        let b2 = daily_bar_at(WEEK2_TUE, dec!(103), dec!(108), dec!(100), dec!(106), dec!(1200));
+        let b1 = daily_bar_at(
+            WEEK2_MON,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(1000),
+        );
+        let b2 = daily_bar_at(
+            WEEK2_TUE,
+            dec!(103),
+            dec!(108),
+            dec!(100),
+            dec!(106),
+            dec!(1200),
+        );
         assert!(c.update(&b1).is_none());
         assert!(c.update(&b2).is_none(), "same week should not emit");
     }
@@ -888,9 +1439,30 @@ mod calendar_weekly_tests {
     fn emits_at_week_boundary() {
         let mut c = CalendarConsolidator::new(CalendarPeriod::Weekly);
 
-        let b1 = daily_bar_at(WEEK2_MON, dec!(100), dec!(105), dec!(98), dec!(103), dec!(1000));
-        let b2 = daily_bar_at(WEEK2_TUE, dec!(103), dec!(107), dec!(100), dec!(106), dec!(1200));
-        let b3 = daily_bar_at(WEEK3_MON, dec!(106), dec!(110), dec!(104), dec!(108), dec!(900));
+        let b1 = daily_bar_at(
+            WEEK2_MON,
+            dec!(100),
+            dec!(105),
+            dec!(98),
+            dec!(103),
+            dec!(1000),
+        );
+        let b2 = daily_bar_at(
+            WEEK2_TUE,
+            dec!(103),
+            dec!(107),
+            dec!(100),
+            dec!(106),
+            dec!(1200),
+        );
+        let b3 = daily_bar_at(
+            WEEK3_MON,
+            dec!(106),
+            dec!(110),
+            dec!(104),
+            dec!(108),
+            dec!(900),
+        );
 
         c.update(&b1);
         c.update(&b2);

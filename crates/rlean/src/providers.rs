@@ -10,24 +10,30 @@
 /// is safe to pass even when all data is cached: if `pre_fetch_all` finds
 /// existing Parquet files it skips fetching entirely and the dylibs are
 /// never loaded.
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
-use lean_data_providers::{config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider};
+use lean_data_providers::{
+    config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider,
+};
 
 /// A lazy wrapper around a named plugin provider.
 ///
 /// The dylib is not loaded until the first call to `get_history`.
 struct LazyPluginProvider {
-    name:  String,
-    args:  ProviderArgs,
+    name: String,
+    args: ProviderArgs,
     inner: OnceLock<Result<Arc<dyn IHistoryProvider>, String>>,
 }
 
 impl LazyPluginProvider {
     fn new(name: &str, args: ProviderArgs) -> Self {
-        Self { name: name.to_string(), args, inner: OnceLock::new() }
+        Self {
+            name: name.to_string(),
+            args,
+            inner: OnceLock::new(),
+        }
     }
 
     fn get(&self) -> anyhow::Result<Arc<dyn IHistoryProvider>> {
@@ -54,17 +60,29 @@ impl IHistoryProvider for LazyPluginProvider {
 /// ~/.rlean/plugin-configs.json and is loaded separately in `load_plugin_provider`.
 #[derive(Clone, Default)]
 pub struct ProviderArgs {
-    pub data_root:            std::path::PathBuf,
-    pub polygon_rate:         f64,
-    pub thetadata_rate:       f64,
+    pub data_root: std::path::PathBuf,
+    pub polygon_rate: f64,
+    pub thetadata_rate: f64,
     pub thetadata_concurrent: usize,
 }
 
 impl ProviderArgs {
     fn rps_for(&self, provider: &str) -> f64 {
         match provider {
-            "thetadata" => if self.thetadata_rate > 0.0 { self.thetadata_rate } else { 4.0 },
-            _           => if self.polygon_rate > 0.0 { self.polygon_rate } else { 5.0 },
+            "thetadata" => {
+                if self.thetadata_rate > 0.0 {
+                    self.thetadata_rate
+                } else {
+                    4.0
+                }
+            }
+            _ => {
+                if self.polygon_rate > 0.0 {
+                    self.polygon_rate
+                } else {
+                    5.0
+                }
+            }
         }
     }
 }
@@ -104,10 +122,7 @@ pub fn build_history_provider(
 ///
 /// Plugin providers are returned as [`LazyPluginProvider`] wrappers so the
 /// dylib is not loaded until a fetch is actually needed.
-fn build_single_provider(
-    name: &str,
-    args: &ProviderArgs,
-) -> Result<Arc<dyn IHistoryProvider>> {
+fn build_single_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHistoryProvider>> {
     match name {
         "local" | "" => {
             let config = ProviderConfig {
@@ -119,16 +134,13 @@ fn build_single_provider(
         name => {
             // Validate plugin path exists before accepting the name, so the user
             // gets a clear error at startup rather than at first fetch.
-            let lib_name = format!(
-                "librlean_plugin_{}.{}",
-                name.replace('-', "_"),
-                dylib_ext()
-            );
+            let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
             let plugin_path = home_dir()?.join(".rlean").join("plugins").join(&lib_name);
             if !plugin_path.exists() {
                 bail!(
                     "Plugin '{}' is not installed. Run: rlean plugin install {}",
-                    name, name
+                    name,
+                    name
                 );
             }
             Ok(Arc::new(LazyPluginProvider::new(name, args.clone())))
@@ -143,11 +155,7 @@ fn build_single_provider(
 fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHistoryProvider>> {
     use libloading::{Library, Symbol};
 
-    let lib_name = format!(
-        "librlean_plugin_{}.{}",
-        name.replace('-', "_"),
-        dylib_ext()
-    );
+    let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
     let plugin_path = home_dir()?.join(".rlean").join("plugins").join(&lib_name);
 
     if !plugin_path.exists() {
@@ -158,7 +166,11 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         );
     }
 
-    let max_concurrent = if args.thetadata_concurrent > 0 { args.thetadata_concurrent } else { 4 };
+    let max_concurrent = if args.thetadata_concurrent > 0 {
+        args.thetadata_concurrent
+    } else {
+        4
+    };
 
     // Start with stored plugin config from ~/.rlean/plugin-configs.json.
     // This lets users set plugin-specific keys (e.g. api_key, base_url) via
@@ -178,15 +190,14 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         .entry("max_concurrent".to_string())
         .or_insert_with(|| serde_json::json!(max_concurrent));
 
-
-
     let config_json = serde_json::Value::Object(plugin_cfg).to_string();
 
     // Leak the library so it lives for the process lifetime.
     // Providers are long-lived (process-scoped) so this is intentional.
-    let lib = Box::leak(Box::new(unsafe { Library::new(&plugin_path) }.with_context(|| {
-        format!("Failed to load plugin library: {}", plugin_path.display())
-    })?));
+    let lib = Box::leak(Box::new(
+        unsafe { Library::new(&plugin_path) }
+            .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
+    ));
 
     let create: Symbol<unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut ()> =
         unsafe { lib.get(b"rlean_create_history_provider\0") }.map_err(|_| {
@@ -258,7 +269,10 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
 
         let raw = unsafe { factory() };
         if raw.is_null() {
-            tracing::warn!("Plugin {} returned null from rlean_custom_data_factory", path.display());
+            tracing::warn!(
+                "Plugin {} returned null from rlean_custom_data_factory",
+                path.display()
+            );
             continue;
         }
 
@@ -268,7 +282,11 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
             unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
         let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
 
-        tracing::info!("Loaded custom data plugin: {} ({})", source.name(), path.display());
+        tracing::info!(
+            "Loaded custom data plugin: {} ({})",
+            source.name(),
+            path.display()
+        );
         sources.push(source);
 
         // Leak the library so the vtable stays valid for the process lifetime.
@@ -279,7 +297,11 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
 }
 
 fn dylib_ext() -> &'static str {
-    if cfg!(target_os = "macos") { "dylib" } else { "so" }
+    if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
 }
 
 fn home_dir() -> Result<std::path::PathBuf> {

@@ -23,7 +23,11 @@ pub struct ComboLegDetails {
 
 impl ComboLegDetails {
     pub fn new(symbol: Symbol, quantity: Quantity, order_id: i64) -> Self {
-        Self { symbol, quantity, order_id }
+        Self {
+            symbol,
+            quantity,
+            order_id,
+        }
     }
 }
 
@@ -105,7 +109,11 @@ impl ComboLimitOrder {
         let mut order = Order::market(id, symbol, quantity, time, tag);
         order.order_type = OrderType::ComboLimit;
         order.limit_price = Some(limit_price);
-        Self { order, limit_price, legs }
+        Self {
+            order,
+            limit_price,
+            legs,
+        }
     }
 
     /// Returns `true` if the given net market price satisfies the limit condition.
@@ -156,7 +164,11 @@ impl ComboLegLimitOrder {
         let mut order = Order::market(id, symbol, quantity, time, tag);
         order.order_type = OrderType::ComboLegLimit;
         order.limit_price = Some(limit_price);
-        Self { order, limit_price, legs }
+        Self {
+            order,
+            limit_price,
+            legs,
+        }
     }
 }
 
@@ -185,18 +197,27 @@ mod tests {
 
     #[test]
     fn combo_limit_would_fill_debit() {
-        let order = ComboLimitOrder::new(1, sym("SPY"), dec!(1), dec!(5), DateTime::EPOCH, "", vec![]);
-        assert!(order.would_fill(dec!(4)));   // cheaper than limit
-        assert!(order.would_fill(dec!(5)));   // at limit
-        assert!(!order.would_fill(dec!(6)));  // too expensive
+        let order =
+            ComboLimitOrder::new(1, sym("SPY"), dec!(1), dec!(5), DateTime::EPOCH, "", vec![]);
+        assert!(order.would_fill(dec!(4))); // cheaper than limit
+        assert!(order.would_fill(dec!(5))); // at limit
+        assert!(!order.would_fill(dec!(6))); // too expensive
     }
 
     #[test]
     fn combo_limit_would_fill_credit() {
         // Negative qty = credit spread (we want more credit)
-        let order = ComboLimitOrder::new(1, sym("SPY"), dec!(-1), dec!(3), DateTime::EPOCH, "", vec![]);
-        assert!(order.would_fill(dec!(4)));   // more credit than limit
-        assert!(order.would_fill(dec!(3)));   // at limit
-        assert!(!order.would_fill(dec!(2)));  // less credit
+        let order = ComboLimitOrder::new(
+            1,
+            sym("SPY"),
+            dec!(-1),
+            dec!(3),
+            DateTime::EPOCH,
+            "",
+            vec![],
+        );
+        assert!(order.would_fill(dec!(4))); // more credit than limit
+        assert!(order.would_fill(dec!(3))); // at limit
+        assert!(!order.would_fill(dec!(2))); // less credit
     }
 }

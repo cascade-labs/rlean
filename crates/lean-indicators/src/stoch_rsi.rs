@@ -1,4 +1,9 @@
-use crate::{indicator::{Indicator, IndicatorResult}, rsi::Rsi, window::RollingWindow, sma::Sma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    rsi::Rsi,
+    sma::Sma,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -19,7 +24,10 @@ impl StochasticRsi {
     pub fn new(rsi_period: usize, stoch_period: usize, k_period: usize, d_period: usize) -> Self {
         let warm_up = rsi_period + stoch_period + k_period.max(d_period);
         StochasticRsi {
-            name: format!("SRSI({},{},{},{})", rsi_period, stoch_period, k_period, d_period),
+            name: format!(
+                "SRSI({},{},{},{})",
+                rsi_period, stoch_period, k_period, d_period
+            ),
             rsi: Rsi::new(rsi_period),
             rsi_window: RollingWindow::new(stoch_period),
             k_sma: Sma::new(k_period),
@@ -29,18 +37,30 @@ impl StochasticRsi {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for StochasticRsi {
+    fn default() -> Self {
         Self::new(14, 14, 3, 3)
     }
 }
 
 impl Indicator for StochasticRsi {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.warm_up }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.warm_up
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.rsi.reset();
@@ -60,8 +80,16 @@ impl Indicator for StochasticRsi {
             return self.current.clone();
         }
 
-        let max_rsi = self.rsi_window.iter().copied().fold(Decimal::MIN, Decimal::max);
-        let min_rsi = self.rsi_window.iter().copied().fold(Decimal::MAX, Decimal::min);
+        let max_rsi = self
+            .rsi_window
+            .iter()
+            .copied()
+            .fold(Decimal::MIN, Decimal::max);
+        let min_rsi = self
+            .rsi_window
+            .iter()
+            .copied()
+            .fold(Decimal::MAX, Decimal::min);
 
         let k = if max_rsi != min_rsi {
             dec!(100) * (rr.value - min_rsi) / (max_rsi - min_rsi)
@@ -70,7 +98,7 @@ impl Indicator for StochasticRsi {
         };
 
         let rk = self.k_sma.update_price(time, k);
-        let rd = self.d_sma.update_price(time, rk.value);
+        self.d_sma.update_price(time, rk.value);
 
         if rk.is_ready() {
             self.current = IndicatorResult::ready(rk.value, time);

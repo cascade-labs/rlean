@@ -1,9 +1,11 @@
-use lean_indicators::{indicator::Indicator, Macd};
 use lean_core::NanosecondTimestamp;
-use rust_decimal_macros::dec;
+use lean_indicators::{indicator::Indicator, Macd};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 // ─── Ready state ─────────────────────────────────────────────────────────────
 
@@ -34,8 +36,16 @@ fn macd_flat_prices_gives_zero_line() {
     for i in 0..10 {
         let r = macd.update_price(ts(i), dec!(42));
         if r.is_ready() {
-            assert_eq!(macd.macd_line, dec!(0), "MACD line should be 0 for flat prices");
-            assert_eq!(macd.histogram, dec!(0), "Histogram should be 0 for flat prices");
+            assert_eq!(
+                macd.macd_line,
+                dec!(0),
+                "MACD line should be 0 for flat prices"
+            );
+            assert_eq!(
+                macd.histogram,
+                dec!(0),
+                "Histogram should be 0 for flat prices"
+            );
         }
     }
 }
@@ -47,7 +57,10 @@ fn macd_rising_prices_positive_line() {
     for i in 0..15 {
         let r = macd.update_price(ts(i), Decimal::from(i * 10));
         if r.is_ready() {
-            assert!(macd.macd_line > dec!(0), "MACD should be positive for rising prices");
+            assert!(
+                macd.macd_line > dec!(0),
+                "MACD should be positive for rising prices"
+            );
         }
     }
 }
@@ -59,7 +72,10 @@ fn macd_falling_prices_negative_line() {
     for i in 0..15 {
         let r = macd.update_price(ts(i), Decimal::from((14 - i) * 10));
         if r.is_ready() {
-            assert!(macd.macd_line < dec!(0), "MACD should be negative for falling prices");
+            assert!(
+                macd.macd_line < dec!(0),
+                "MACD should be negative for falling prices"
+            );
         }
     }
 }

@@ -16,7 +16,6 @@
 /// rlean loads all `.dylib`/`.so` files in `~/.rlean/plugins/` at startup,
 /// calls `rlean_plugin_descriptor()` on each, and routes provider/brokerage
 /// registration accordingly.
-
 /// The type of capability a plugin provides.
 ///
 /// A single plugin crate may implement multiple kinds by exporting multiple
@@ -26,25 +25,25 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginKind {
     /// Brokerage integration (order routing, account management)
-    Brokerage              = 0,
+    Brokerage = 0,
     /// Historical data provider
     DataProviderHistorical = 1,
     /// Live data / quote stream
-    DataProviderLive       = 2,
+    DataProviderLive = 2,
     /// Custom data source (alternative data, news, etc.)
-    CustomData             = 3,
+    CustomData = 3,
     /// AI / ML skill (signal generation, model inference)
-    AiSkill                = 4,
+    AiSkill = 4,
 }
 
 impl PluginKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Brokerage              => "brokerage",
+            Self::Brokerage => "brokerage",
             Self::DataProviderHistorical => "data-provider-historical",
-            Self::DataProviderLive       => "data-provider-live",
-            Self::CustomData             => "custom-data",
-            Self::AiSkill                => "ai-skill",
+            Self::DataProviderLive => "data-provider-live",
+            Self::CustomData => "custom-data",
+            Self::AiSkill => "ai-skill",
         }
     }
 }
@@ -151,9 +150,9 @@ macro_rules! rlean_plugin {
         #[no_mangle]
         pub extern "C" fn rlean_plugin_descriptor() -> $crate::PluginDescriptor {
             $crate::PluginDescriptor {
-                name:    concat!($name, "\0").as_ptr(),
-                version: concat!($ver,  "\0").as_ptr(),
-                kind:    $kind,
+                name: concat!($name, "\0").as_ptr(),
+                version: concat!($ver, "\0").as_ptr(),
+                kind: $kind,
             }
         }
     };

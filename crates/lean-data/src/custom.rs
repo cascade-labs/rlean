@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use chrono::NaiveDate;
+use lean_core::Resolution;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use lean_core::Resolution;
+use std::collections::HashMap;
 
 /// Configuration for a custom data subscription.
 #[derive(Debug, Clone, Serialize, Deserialize)]

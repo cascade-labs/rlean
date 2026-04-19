@@ -1,8 +1,8 @@
-use lean_core::{DateTime, OptionRight, SettlementType};
-use lean_orders::{OrderEvent, OptionExerciseOrder, OrderStatus, OrderDirection};
-use rust_decimal::Decimal;
 use crate::contract::OptionContract;
-use crate::payoff::{is_auto_exercised, get_exercise_quantity};
+use crate::payoff::{get_exercise_quantity, is_auto_exercised};
+use lean_core::{DateTime, SettlementType};
+use lean_orders::{OptionExerciseOrder, OrderDirection, OrderEvent, OrderStatus};
+use rust_decimal::Decimal;
 
 pub trait IOptionExerciseModel: Send + Sync {
     /// Generate fill events for an option exercise/assignment.
@@ -37,43 +37,46 @@ impl IOptionExerciseModel for DefaultExerciseModel {
 
         // Event 1: close the option position at $0
         let option_direction = if quantity >= Decimal::ZERO {
-            OrderDirection::Sell  // closing short position
+            OrderDirection::Sell // closing short position
         } else {
-            OrderDirection::Buy   // closing long position
+            OrderDirection::Buy // closing long position
         };
 
-        let mut events = vec![
-            OrderEvent {
-                id: 0,
-                order_id: order.order.id,
-                symbol: contract.symbol.clone(),
-                utc_time,
-                status: OrderStatus::Filled,
-                direction: option_direction,
-                fill_price: Decimal::ZERO,
-                fill_price_currency: "USD".to_string(),
-                fill_quantity: quantity,
-                is_assignment,
-                is_in_the_money: in_the_money,
-                quantity,
-                message: format!(
-                    "Option {} {}",
-                    if in_the_money { "exercised" } else { "expired worthless" },
-                    if is_assignment { "(assignment)" } else { "" }
-                ),
-                shortable_inventory: None,
-                order_fee: Decimal::ZERO,
-                limit_price: None,
-                stop_price: None,
-                trigger_price: None,
-                trailing_amount: None,
-                trailing_as_percentage: false,
-            }
-        ];
+        let mut events = vec![OrderEvent {
+            id: 0,
+            order_id: order.order.id,
+            symbol: contract.symbol.clone(),
+            utc_time,
+            status: OrderStatus::Filled,
+            direction: option_direction,
+            fill_price: Decimal::ZERO,
+            fill_price_currency: "USD".to_string(),
+            fill_quantity: quantity,
+            is_assignment,
+            is_in_the_money: in_the_money,
+            quantity,
+            message: format!(
+                "Option {} {}",
+                if in_the_money {
+                    "exercised"
+                } else {
+                    "expired worthless"
+                },
+                if is_assignment { "(assignment)" } else { "" }
+            ),
+            shortable_inventory: None,
+            order_fee: Decimal::ZERO,
+            limit_price: None,
+            stop_price: None,
+            trigger_price: None,
+            trailing_amount: None,
+            trailing_as_percentage: false,
+        }];
 
         // Event 2: physical delivery — create/close underlying position at strike
         if in_the_money && settlement == SettlementType::PhysicalDelivery {
-            let exercise_qty = get_exercise_quantity(quantity, contract.right, contract.contract_unit_of_trade);
+            let exercise_qty =
+                get_exercise_quantity(quantity, contract.right, contract.contract_unit_of_trade);
             let underlying_direction = if exercise_qty >= Decimal::ZERO {
                 OrderDirection::Buy
             } else {

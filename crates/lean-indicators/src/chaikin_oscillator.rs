@@ -1,7 +1,10 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema, accumulation_distribution::AccumulationDistribution};
+use crate::{
+    accumulation_distribution::AccumulationDistribution,
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
-use rust_decimal_macros::dec;
 
 /// Chaikin Oscillator. fast EMA(AD) - slow EMA(AD).
 pub struct ChaikinOscillator {
@@ -29,11 +32,21 @@ impl ChaikinOscillator {
 }
 
 impl Indicator for ChaikinOscillator {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.slow_period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.slow_period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.slow_period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.slow_period
+    }
 
     fn reset(&mut self) {
         self.ad.reset();

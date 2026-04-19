@@ -1,9 +1,10 @@
-use lean_indicators::{indicator::Indicator, BollingerBands};
 use lean_core::NanosecondTimestamp;
+use lean_indicators::{indicator::Indicator, BollingerBands};
 use rust_decimal_macros::dec;
-use rust_decimal::Decimal;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 // ─── Ready state ─────────────────────────────────────────────────────────────
 

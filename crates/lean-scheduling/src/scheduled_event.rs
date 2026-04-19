@@ -8,7 +8,11 @@ pub struct ScheduledEvent {
 }
 
 impl ScheduledEvent {
-    pub fn new(name: impl Into<String>, callback: impl FnMut() + Send + Sync + 'static, next_fire: DateTime) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        callback: impl FnMut() + Send + Sync + 'static,
+        next_fire: DateTime,
+    ) -> Self {
         ScheduledEvent {
             name: name.into(),
             callback: Box::new(callback),
@@ -18,7 +22,9 @@ impl ScheduledEvent {
     }
 
     pub fn fire(&mut self) {
-        if self.enabled { (self.callback)(); }
+        if self.enabled {
+            (self.callback)();
+        }
     }
 }
 

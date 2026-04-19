@@ -88,7 +88,10 @@ impl LiveEngine {
         }
 
         feed.stop().await?;
-        info!("Live trading engine stopped: {}", self.config.algorithm_name);
+        info!(
+            "Live trading engine stopped: {}",
+            self.config.algorithm_name
+        );
         Ok(())
     }
 }

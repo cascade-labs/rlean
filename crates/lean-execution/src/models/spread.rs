@@ -49,8 +49,7 @@ impl IExecutionModel for SpreadExecutionModel {
                 .map(|s| s.current_quantity)
                 .unwrap_or(Decimal::ZERO);
             let delta = target.quantity - current_qty;
-            self.pending
-                .insert(key, (target.symbol.clone(), delta));
+            self.pending.insert(key, (target.symbol.clone(), delta));
         }
 
         let mut orders = Vec::new();

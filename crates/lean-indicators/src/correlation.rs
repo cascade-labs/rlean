@@ -1,7 +1,10 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Rolling Pearson correlation between two series.
@@ -53,7 +56,11 @@ impl Correlation {
         }
 
         let denom = ((n * sum_a2 - sum_a * sum_a) * (n * sum_b2 - sum_b * sum_b)).sqrt();
-        let corr = if denom == 0.0 { 0.0 } else { (n * sum_ab - sum_a * sum_b) / denom };
+        let corr = if denom == 0.0 {
+            0.0
+        } else {
+            (n * sum_ab - sum_a * sum_b) / denom
+        };
         let v = Decimal::from_f64_retain(corr).unwrap_or(dec!(0));
         self.current = IndicatorResult::ready(v, time);
         self.current.clone()
@@ -61,11 +68,21 @@ impl Correlation {
 }
 
 impl Indicator for Correlation {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.a_window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.a_window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.a_window.clear();

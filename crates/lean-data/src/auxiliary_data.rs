@@ -1,5 +1,5 @@
-use crate::{Delisting, Dividend, Split};
 use crate::symbol_changed::SymbolChangedEvent;
+use crate::{Delisting, Dividend, Split};
 use serde::{Deserialize, Serialize};
 
 /// Enum wrapping all corporate action / auxiliary event types.

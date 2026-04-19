@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, dema::Dema};
+use crate::{
+    dema::Dema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -12,7 +15,6 @@ pub struct T3 {
     gd1: Dema,
     gd2: Dema,
     gd3: Dema,
-    volume_factor: Decimal,
     samples: usize,
     current: IndicatorResult,
 }
@@ -25,7 +27,6 @@ impl T3 {
             gd1: Dema::new(period),
             gd2: Dema::new(period),
             gd3: Dema::new(period),
-            volume_factor,
             samples: 0,
             current: IndicatorResult::not_ready(),
         }
@@ -37,11 +38,21 @@ impl T3 {
 }
 
 impl Indicator for T3 {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples > 6 * (self.period - 1) }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { 1 + 6 * (self.period - 1) }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples > 6 * (self.period - 1)
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        1 + 6 * (self.period - 1)
+    }
 
     fn reset(&mut self) {
         self.gd1.reset();

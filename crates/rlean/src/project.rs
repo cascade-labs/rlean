@@ -1,14 +1,3 @@
-/// `rlean create-project <name>` — scaffold a new strategy project
-///
-/// Creates:
-///   <name>/
-///     config.json       — project metadata (language, parameters, local-id)
-///     main.py           — QCAlgorithm strategy template
-///     research.ipynb    — QuantBook Jupyter notebook
-///     backtests/        — backtest results (populated by `rlean backtest`)
-///     live/             — live results (populated by `rlean live`)
-use std::path::PathBuf;
-
 use anyhow::{bail, Result};
 
 use crate::config::{ProjectConfig, WorkspaceConfig};
@@ -42,11 +31,13 @@ pub fn run_create_project(args: CreateProjectArgs) -> Result<()> {
         WorkspaceConfig::load(&workspace)
             .ok()
             .map(|c| c.default_language)
-            .ok_or_else(|| anyhow::anyhow!(
-                "No --language specified and no rlean.json found in {}.\n\
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No --language specified and no rlean.json found in {}.\n\
                  Run `rlean init` first or pass --language python|csharp.",
-                workspace.display()
-            ))?
+                    workspace.display()
+                )
+            })?
     };
 
     // ── Directory skeleton ────────────────────────────────────────────────────
@@ -61,7 +52,12 @@ pub fn run_create_project(args: CreateProjectArgs) -> Result<()> {
 
     // ── main.py / Main.cs ─────────────────────────────────────────────────────
     match language.as_str() {
-        "python" | _ => {
+        "python" => {
+            let class_name = to_class_name(&args.name);
+            let main_py = python_template(&class_name);
+            std::fs::write(project_dir.join("main.py"), main_py)?;
+        }
+        _ => {
             let class_name = to_class_name(&args.name);
             let main_py = python_template(&class_name);
             std::fs::write(project_dir.join("main.py"), main_py)?;
@@ -89,7 +85,7 @@ pub fn run_create_project(args: CreateProjectArgs) -> Result<()> {
 
 /// Convert snake_case / kebab-case project name to PascalCase class name.
 fn to_class_name(name: &str) -> String {
-    name.split(|c: char| c == '_' || c == '-' || c == ' ')
+    name.split(['_', '-', ' '])
         .filter(|s| !s.is_empty())
         .map(|s| {
             let mut chars = s.chars();

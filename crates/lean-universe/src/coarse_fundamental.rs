@@ -1,5 +1,5 @@
-use crate::universe::{Universe, UniverseSelectionModel, UniverseSettings};
-use lean_core::{DateTime, Price, Symbol};
+use crate::universe::UniverseSettings;
+use lean_core::{Price, Symbol};
 
 #[derive(Debug, Clone)]
 pub struct CoarseFundamental {
@@ -35,7 +35,9 @@ pub struct FnCoarseFilter<F: Fn(&[CoarseFundamental]) -> Vec<Symbol> + Send + Sy
 }
 
 impl<F: Fn(&[CoarseFundamental]) -> Vec<Symbol> + Send + Sync> FnCoarseFilter<F> {
-    pub fn new(func: F) -> Self { FnCoarseFilter { func } }
+    pub fn new(func: F) -> Self {
+        FnCoarseFilter { func }
+    }
 }
 
 impl<F: Fn(&[CoarseFundamental]) -> Vec<Symbol> + Send + Sync> CoarseFilter for FnCoarseFilter<F> {

@@ -17,8 +17,7 @@ use crate::runner::BacktestResult;
 
 /// Write `<id>-order-events.json` — serialised list of all OrderEvent structs.
 pub fn write_order_events_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(&result.order_events)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&result.order_events).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
 
@@ -82,34 +81,33 @@ pub fn write_summary_json(result: &BacktestResult, path: &Path) -> std::io::Resu
     use rust_decimal::prelude::ToPrimitive;
     let s = &result.statistics;
     let summary = SummaryJson {
-        total_return:                result.total_return,
-        cagr:                        s.compounding_annual_return.to_f64().unwrap_or(0.0),
-        sharpe_ratio:                s.sharpe_ratio.to_f64().unwrap_or(0.0),
-        sortino_ratio:               s.sortino_ratio.to_f64().unwrap_or(0.0),
-        probabilistic_sharpe_ratio:  s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0),
-        max_drawdown:                s.drawdown.to_f64().unwrap_or(0.0),
-        calmar_ratio:                s.calmar_ratio.to_f64().unwrap_or(0.0),
-        omega_ratio:                 s.omega_ratio.to_f64().unwrap_or(0.0),
-        recovery_factor:             s.recovery_factor.to_f64().unwrap_or(0.0),
-        annual_standard_deviation:   s.annual_standard_deviation.to_f64().unwrap_or(0.0),
-        alpha:                       s.alpha.to_f64().unwrap_or(0.0),
-        beta:                        s.beta.to_f64().unwrap_or(0.0),
-        treynor_ratio:               s.treynor_ratio.to_f64().unwrap_or(0.0),
-        win_rate:                    s.win_rate.to_f64().unwrap_or(0.0),
-        loss_rate:                   s.loss_rate.to_f64().unwrap_or(0.0),
-        profit_loss_ratio:           s.profit_loss_ratio.to_f64().unwrap_or(0.0),
-        expectancy:                  s.expectancy.to_f64().unwrap_or(0.0),
-        total_net_profit:            s.total_net_profit.to_f64().unwrap_or(0.0),
-        total_trades:                s.total_trades,
-        winning_trades:              s.winning_trades,
-        losing_trades:               s.losing_trades,
+        total_return: result.total_return,
+        cagr: s.compounding_annual_return.to_f64().unwrap_or(0.0),
+        sharpe_ratio: s.sharpe_ratio.to_f64().unwrap_or(0.0),
+        sortino_ratio: s.sortino_ratio.to_f64().unwrap_or(0.0),
+        probabilistic_sharpe_ratio: s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0),
+        max_drawdown: s.drawdown.to_f64().unwrap_or(0.0),
+        calmar_ratio: s.calmar_ratio.to_f64().unwrap_or(0.0),
+        omega_ratio: s.omega_ratio.to_f64().unwrap_or(0.0),
+        recovery_factor: s.recovery_factor.to_f64().unwrap_or(0.0),
+        annual_standard_deviation: s.annual_standard_deviation.to_f64().unwrap_or(0.0),
+        alpha: s.alpha.to_f64().unwrap_or(0.0),
+        beta: s.beta.to_f64().unwrap_or(0.0),
+        treynor_ratio: s.treynor_ratio.to_f64().unwrap_or(0.0),
+        win_rate: s.win_rate.to_f64().unwrap_or(0.0),
+        loss_rate: s.loss_rate.to_f64().unwrap_or(0.0),
+        profit_loss_ratio: s.profit_loss_ratio.to_f64().unwrap_or(0.0),
+        expectancy: s.expectancy.to_f64().unwrap_or(0.0),
+        total_net_profit: s.total_net_profit.to_f64().unwrap_or(0.0),
+        total_trades: s.total_trades,
+        winning_trades: s.winning_trades,
+        losing_trades: s.losing_trades,
         average_trade_duration_days: s.average_trade_duration_days.to_f64().unwrap_or(0.0),
-        starting_cash:               result.starting_cash,
-        final_value:                 result.final_value,
-        trading_days:                result.trading_days,
+        starting_cash: result.starting_cash,
+        final_value: result.final_value,
+        trading_days: result.trading_days,
     };
-    let json = serde_json::to_string_pretty(&summary)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
 
@@ -138,11 +136,23 @@ pub fn write_log_txt(result: &BacktestResult, path: &Path) -> std::io::Result<()
     lines.push(format!("Starting Cash:     {:.2}", result.starting_cash));
     lines.push(format!("Final Value:       {:.2}", result.final_value));
     lines.push(format!("Total Return:      {:.4}", result.total_return));
-    lines.push(format!("CAGR:              {:.4}", s.compounding_annual_return.to_f64().unwrap_or(0.0)));
-    lines.push(format!("Sharpe Ratio:      {:.4}", s.sharpe_ratio.to_f64().unwrap_or(0.0)));
-    lines.push(format!("Max Drawdown:      {:.4}", s.drawdown.to_f64().unwrap_or(0.0)));
+    lines.push(format!(
+        "CAGR:              {:.4}",
+        s.compounding_annual_return.to_f64().unwrap_or(0.0)
+    ));
+    lines.push(format!(
+        "Sharpe Ratio:      {:.4}",
+        s.sharpe_ratio.to_f64().unwrap_or(0.0)
+    ));
+    lines.push(format!(
+        "Max Drawdown:      {:.4}",
+        s.drawdown.to_f64().unwrap_or(0.0)
+    ));
     lines.push(format!("Total Trades:      {}", s.total_trades));
-    lines.push(format!("Win Rate:          {:.4}", s.win_rate.to_f64().unwrap_or(0.0)));
+    lines.push(format!(
+        "Win Rate:          {:.4}",
+        s.win_rate.to_f64().unwrap_or(0.0)
+    ));
     std::fs::write(path, lines.join("\n"))
 }
 
@@ -183,17 +193,16 @@ pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Resu
         .collect();
 
     let json_obj = BacktestResultJson {
-        statistics:   &result.statistics,
-        charts:       &result.charts,
+        statistics: &result.statistics,
+        charts: &result.charts,
         equity,
         trading_days: result.trading_days,
         starting_cash: result.starting_cash,
-        final_value:  result.final_value,
+        final_value: result.final_value,
         total_return: result.total_return,
     };
 
-    let json = serde_json::to_string_pretty(&json_obj)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&json_obj).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
 
@@ -202,11 +211,15 @@ fn generate_html(r: &BacktestResult) -> String {
     let s = &r.statistics;
 
     // ── equity curve JSON arrays ──────────────────────────────────────────
-    let dates_json = r.daily_dates.iter()
+    let dates_json = r
+        .daily_dates
+        .iter()
         .map(|d| format!("\"{}\"", d))
         .collect::<Vec<_>>()
         .join(",");
-    let equity_json = r.equity_curve.iter()
+    let equity_json = r
+        .equity_curve
+        .iter()
         .map(|v| format!("{:.2}", v))
         .collect::<Vec<_>>()
         .join(",");
@@ -216,8 +229,14 @@ fn generate_html(r: &BacktestResult) -> String {
         let mut peak = r.equity_curve.first().copied().unwrap_or(r.starting_cash);
         let mut dd_series: Vec<String> = Vec::new();
         for &v in &r.equity_curve {
-            if v > peak { peak = v; }
-            let dd = if peak > 0.0 { -((peak - v) / peak * 100.0) } else { 0.0 };
+            if v > peak {
+                peak = v;
+            }
+            let dd = if peak > 0.0 {
+                -((peak - v) / peak * 100.0)
+            } else {
+                0.0
+            };
             dd_series.push(format!("{:.2}", dd));
         }
         dd_series.join(",")
@@ -230,13 +249,19 @@ fn generate_html(r: &BacktestResult) -> String {
         for (date_str, &equity) in r.daily_dates.iter().zip(r.equity_curve.iter()) {
             // date_str is "YYYY-MM-DD"
             let parts: Vec<&str> = date_str.splitn(3, '-').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let year: i32 = parts[0].parse().unwrap_or(0);
             let month: u32 = parts[1].parse().unwrap_or(0);
             let entry = map.entry((year, month)).or_insert((equity, equity));
-            if entry.0 > equity { entry.0 = equity; } // track minimum start
-            if entry.1 < equity { entry.1 = equity; } // track maximum end — use last
-            // Overwrite end with each day so final value = last day's value
+            if entry.0 > equity {
+                entry.0 = equity;
+            } // track minimum start
+            if entry.1 < equity {
+                entry.1 = equity;
+            } // track maximum end — use last
+              // Overwrite end with each day so final value = last day's value
             entry.1 = equity;
         }
         // First pass: fix start values — need chronological first value per month
@@ -245,7 +270,9 @@ fn generate_html(r: &BacktestResult) -> String {
         let mut prev_key: Option<(i32, u32)> = None;
         for (date_str, &equity) in r.daily_dates.iter().zip(r.equity_curve.iter()) {
             let parts: Vec<&str> = date_str.splitn(3, '-').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let year: i32 = parts[0].parse().unwrap_or(0);
             let month: u32 = parts[1].parse().unwrap_or(0);
             let key = (year, month);
@@ -256,10 +283,17 @@ fn generate_html(r: &BacktestResult) -> String {
             fixed.entry(key).and_modify(|e| e.1 = equity);
             prev_equity = equity;
         }
-        fixed.into_iter().map(|(k, (start, end))| {
-            let ret = if start > 0.0 { (end - start) / start * 100.0 } else { 0.0 };
-            (k, ret)
-        }).collect()
+        fixed
+            .into_iter()
+            .map(|(k, (start, end))| {
+                let ret = if start > 0.0 {
+                    (end - start) / start * 100.0
+                } else {
+                    0.0
+                };
+                (k, ret)
+            })
+            .collect()
     };
 
     let monthly_html = build_monthly_heatmap(&monthly_returns);
@@ -272,31 +306,36 @@ fn generate_html(r: &BacktestResult) -> String {
     let dollar = |v: f64| format!("${:.2}", v);
     let ratio = |v: f64| format!("{:.3}", v);
 
-    let cagr       = s.compounding_annual_return.to_f64().unwrap_or(0.0);
-    let sharpe     = s.sharpe_ratio.to_f64().unwrap_or(0.0);
-    let sortino    = s.sortino_ratio.to_f64().unwrap_or(0.0);
-    let psr        = s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0);
-    let calmar     = s.calmar_ratio.to_f64().unwrap_or(0.0);
-    let omega      = s.omega_ratio.to_f64().unwrap_or(0.0);
-    let drawdown   = s.drawdown.to_f64().unwrap_or(0.0);
-    let recovery   = s.recovery_factor.to_f64().unwrap_or(0.0);
-    let ann_std    = s.annual_standard_deviation.to_f64().unwrap_or(0.0);
-    let alpha      = s.alpha.to_f64().unwrap_or(0.0);
-    let beta       = s.beta.to_f64().unwrap_or(0.0);
-    let treynor    = s.treynor_ratio.to_f64().unwrap_or(0.0);
-    let win_rate   = s.win_rate.to_f64().unwrap_or(0.0);
-    let pl_ratio   = s.profit_loss_ratio.to_f64().unwrap_or(0.0);
+    let cagr = s.compounding_annual_return.to_f64().unwrap_or(0.0);
+    let sharpe = s.sharpe_ratio.to_f64().unwrap_or(0.0);
+    let sortino = s.sortino_ratio.to_f64().unwrap_or(0.0);
+    let psr = s.probabilistic_sharpe_ratio.to_f64().unwrap_or(0.0);
+    let calmar = s.calmar_ratio.to_f64().unwrap_or(0.0);
+    let omega = s.omega_ratio.to_f64().unwrap_or(0.0);
+    let drawdown = s.drawdown.to_f64().unwrap_or(0.0);
+    let recovery = s.recovery_factor.to_f64().unwrap_or(0.0);
+    let ann_std = s.annual_standard_deviation.to_f64().unwrap_or(0.0);
+    let alpha = s.alpha.to_f64().unwrap_or(0.0);
+    let beta = s.beta.to_f64().unwrap_or(0.0);
+    let treynor = s.treynor_ratio.to_f64().unwrap_or(0.0);
+    let win_rate = s.win_rate.to_f64().unwrap_or(0.0);
+    let pl_ratio = s.profit_loss_ratio.to_f64().unwrap_or(0.0);
     let expectancy = s.expectancy.to_f64().unwrap_or(0.0);
     let net_profit = s.total_net_profit.to_f64().unwrap_or(0.0);
-    let avg_win    = s.average_win_rate.to_f64().unwrap_or(0.0);
-    let avg_loss   = s.average_loss_rate.to_f64().unwrap_or(0.0);
-    let lg_win     = s.largest_win.to_f64().unwrap_or(0.0);
-    let lg_loss    = s.largest_loss.to_f64().unwrap_or(0.0);
-    let avg_dur    = s.average_trade_duration_days.to_f64().unwrap_or(0.0);
+    let avg_win = s.average_win_rate.to_f64().unwrap_or(0.0);
+    let avg_loss = s.average_loss_rate.to_f64().unwrap_or(0.0);
+    let lg_win = s.largest_win.to_f64().unwrap_or(0.0);
+    let lg_loss = s.largest_loss.to_f64().unwrap_or(0.0);
+    let avg_dur = s.average_trade_duration_days.to_f64().unwrap_or(0.0);
 
-    let return_color = if r.total_return >= 0.0 { "#4caf50" } else { "#f44336" };
+    let return_color = if r.total_return >= 0.0 {
+        "#4caf50"
+    } else {
+        "#f44336"
+    };
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -438,52 +477,52 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
 </script>
 </body>
 </html>"#,
-        trading_days   = r.trading_days,
-        starting_cash  = r.starting_cash,
-        return_color   = return_color,
-        final_value    = r.final_value,
-        total_return   = r.total_return * 100.0,
-        kpi_cards          = kpi_cards(r),
-        monthly_html       = monthly_html,
+        trading_days = r.trading_days,
+        starting_cash = r.starting_cash,
+        return_color = return_color,
+        final_value = r.final_value,
+        total_return = r.total_return * 100.0,
+        kpi_cards = kpi_cards(r),
+        monthly_html = monthly_html,
         custom_charts_html = custom_charts_html,
         total_return_pct = pct(r.total_return),
-        cagr           = pct(cagr),
-        ann_std        = pct(ann_std),
-        drawdown       = pct(drawdown),
-        sharpe         = ratio(sharpe),
-        sortino        = ratio(sortino),
-        calmar         = ratio(calmar),
-        omega          = ratio(omega),
-        psr            = pct(psr),
-        recovery       = ratio(recovery),
-        alpha          = pct(alpha),
-        beta           = ratio(beta),
-        treynor        = ratio(treynor),
-        total_trades   = s.total_trades,
-        win_rate       = pct(win_rate),
-        pl_ratio       = ratio(pl_ratio),
-        expectancy     = dollar(expectancy),
-        net_profit     = dollar(net_profit),
-        avg_win        = dollar(avg_win),
-        avg_loss       = dollar(avg_loss),
-        lg_win         = dollar(lg_win),
-        lg_loss        = dollar(lg_loss),
-        max_cons_wins  = s.max_consecutive_wins,
-        max_cons_losses= s.max_consecutive_losses,
-        avg_dur        = avg_dur,
-        dates_json     = dates_json,
-        equity_json    = equity_json,
-        drawdown_json  = drawdown_json,
+        cagr = pct(cagr),
+        ann_std = pct(ann_std),
+        drawdown = pct(drawdown),
+        sharpe = ratio(sharpe),
+        sortino = ratio(sortino),
+        calmar = ratio(calmar),
+        omega = ratio(omega),
+        psr = pct(psr),
+        recovery = ratio(recovery),
+        alpha = pct(alpha),
+        beta = ratio(beta),
+        treynor = ratio(treynor),
+        total_trades = s.total_trades,
+        win_rate = pct(win_rate),
+        pl_ratio = ratio(pl_ratio),
+        expectancy = dollar(expectancy),
+        net_profit = dollar(net_profit),
+        avg_win = dollar(avg_win),
+        avg_loss = dollar(avg_loss),
+        lg_win = dollar(lg_win),
+        lg_loss = dollar(lg_loss),
+        max_cons_wins = s.max_consecutive_wins,
+        max_cons_losses = s.max_consecutive_losses,
+        avg_dur = avg_dur,
+        dates_json = dates_json,
+        equity_json = equity_json,
+        drawdown_json = drawdown_json,
     )
 }
 
 fn kpi_cards(r: &BacktestResult) -> String {
     use rust_decimal::prelude::ToPrimitive;
     let s = &r.statistics;
-    let cagr    = s.compounding_annual_return.to_f64().unwrap_or(0.0);
-    let sharpe  = s.sharpe_ratio.to_f64().unwrap_or(0.0);
-    let dd      = s.drawdown.to_f64().unwrap_or(0.0);
-    let wr      = s.win_rate.to_f64().unwrap_or(0.0);
+    let cagr = s.compounding_annual_return.to_f64().unwrap_or(0.0);
+    let sharpe = s.sharpe_ratio.to_f64().unwrap_or(0.0);
+    let dd = s.drawdown.to_f64().unwrap_or(0.0);
+    let wr = s.win_rate.to_f64().unwrap_or(0.0);
 
     let card = |label: &str, value: &str, class: &str| -> String {
         format!(
@@ -494,14 +533,19 @@ fn kpi_cards(r: &BacktestResult) -> String {
 
     let color = |v: f64| if v >= 0.0 { "pos" } else { "neg" };
 
-    vec![
-        card("Total Return",  &format!("{:+.2}%", r.total_return * 100.0), color(r.total_return)),
-        card("CAGR",          &format!("{:+.2}%", cagr * 100.0),           color(cagr)),
-        card("Sharpe",        &format!("{:.3}", sharpe),                    color(sharpe)),
-        card("Max Drawdown",  &format!("-{:.2}%", dd * 100.0),             "neg"),
-        card("Win Rate",      &format!("{:.1}%", wr * 100.0),              "neu"),
-        card("Equity Legs",   &s.total_trades.to_string(),                  "neu"),
-    ].join("\n  ")
+    [
+        card(
+            "Total Return",
+            &format!("{:+.2}%", r.total_return * 100.0),
+            color(r.total_return),
+        ),
+        card("CAGR", &format!("{:+.2}%", cagr * 100.0), color(cagr)),
+        card("Sharpe", &format!("{:.3}", sharpe), color(sharpe)),
+        card("Max Drawdown", &format!("-{:.2}%", dd * 100.0), "neg"),
+        card("Win Rate", &format!("{:.1}%", wr * 100.0), "neu"),
+        card("Equity Legs", &s.total_trades.to_string(), "neu"),
+    ]
+    .join("\n  ")
 }
 
 fn build_monthly_heatmap(monthly: &BTreeMap<(i32, u32), f64>) -> String {
@@ -510,19 +554,31 @@ fn build_monthly_heatmap(monthly: &BTreeMap<(i32, u32), f64>) -> String {
     }
 
     let years: Vec<i32> = {
-        let mut ys: Vec<i32> = monthly.keys().map(|(y, _)| *y).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let mut ys: Vec<i32> = monthly
+            .keys()
+            .map(|(y, _)| *y)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         ys.sort();
         ys
     };
 
-    let month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let month_names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
 
     let mut html = String::from("<table class=\"hm-table\"><tr><th>Year</th>");
-    for m in &month_names { html.push_str(&format!("<th>{}</th>", m)); }
+    for m in &month_names {
+        html.push_str(&format!("<th>{}</th>", m));
+    }
     html.push_str("<th>Total</th></tr>");
 
     for year in &years {
-        html.push_str(&format!("<tr><td style=\"color:#aaa;font-weight:600\">{}</td>", year));
+        html.push_str(&format!(
+            "<tr><td style=\"color:#aaa;font-weight:600\">{}</td>",
+            year
+        ));
         let mut year_ret = 1.0f64;
         for month in 1u32..=12 {
             if let Some(&ret) = monthly.get(&(*year, month)) {
@@ -555,8 +611,7 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
 
     // Colour palette — cycled per series within each chart.
     const PALETTE: &[&str] = &[
-        "#2196F3", "#F44336", "#4CAF50", "#FF9800",
-        "#9C27B0", "#00BCD4", "#FF5722",
+        "#2196F3", "#F44336", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4", "#FF5722",
     ];
 
     let mut html = String::new();
@@ -573,7 +628,9 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
         let mut series_names: Vec<&String> = chart.series.keys().collect();
         series_names.sort();
 
-        if series_names.is_empty() { continue; }
+        if series_names.is_empty() {
+            continue;
+        }
 
         let canvas_id = format!("customChart_{}", chart_idx);
 
@@ -586,18 +643,22 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
         let mut datasets_js = String::new();
         for (series_idx, series_name) in series_names.iter().enumerate() {
             let series = &chart.series[*series_name];
-            let color = series.color.as_deref()
+            let color = series
+                .color
+                .as_deref()
                 .unwrap_or(PALETTE[series_idx % PALETTE.len()]);
 
             // Build labels and data arrays from sorted points.
             let mut points = series.points.clone();
             points.sort_by(|a, b| a.time.cmp(&b.time));
 
-            let labels_js: String = points.iter()
+            let labels_js: String = points
+                .iter()
                 .map(|p| format!("\"{}\"", p.time))
                 .collect::<Vec<_>>()
                 .join(",");
-            let data_js: String = points.iter()
+            let data_js: String = points
+                .iter()
                 .map(|p| format!("{:.6}", p.value))
                 .collect::<Vec<_>>()
                 .join(",");
@@ -609,7 +670,9 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
                 _ => "line",
             };
 
-            if series_idx > 0 { datasets_js.push(','); }
+            if series_idx > 0 {
+                datasets_js.push(',');
+            }
             datasets_js.push_str(&format!(
                 r#"{{
   label: "{}",
@@ -622,9 +685,12 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
   pointRadius: 0,
   fill: false
 }}"#,
-                escape_js(series_name), chart_type,
-                data_js, labels_js,
-                color, color
+                escape_js(series_name),
+                chart_type,
+                data_js,
+                labels_js,
+                color,
+                color
             ));
         }
 
@@ -633,7 +699,8 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
         let first_series = &chart.series[first_series_name];
         let mut first_points = first_series.points.clone();
         first_points.sort_by(|a, b| a.time.cmp(&b.time));
-        let shared_labels: String = first_points.iter()
+        let shared_labels: String = first_points
+            .iter()
             .map(|p| format!("\"{}\"", p.time))
             .collect::<Vec<_>>()
             .join(",");
@@ -682,7 +749,9 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
 }
 
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn escape_js(s: &str) -> String {
@@ -720,23 +789,25 @@ mod tests {
             dec!(0),
         );
         BacktestResult {
-            trading_days:             2,
-            final_value:              102_000.0,
-            total_return:             0.02,
-            starting_cash:            100_000.0,
-            equity_curve:             vec![100_000.0, 101_000.0, 102_000.0],
-            daily_dates:              vec![
+            trading_days: 2,
+            final_value: 102_000.0,
+            total_return: 0.02,
+            starting_cash: 100_000.0,
+            start_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            end_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 4).unwrap(),
+            equity_curve: vec![100_000.0, 101_000.0, 102_000.0],
+            daily_dates: vec![
                 "2026-01-02".to_string(),
                 "2026-01-03".to_string(),
                 "2026-01-04".to_string(),
             ],
-            statistics:               stats,
-            charts:                   crate::charting::ChartCollection::default(),
-            order_events:             vec![],
-            succeeded_data_requests:  vec!["SPY/2026-01-02".to_string()],
-            failed_data_requests:     vec!["SPY/2026-01-05".to_string()],
-            backtest_id:              1_744_000_000,
-            benchmark_symbol:         "SPY".to_string(),
+            statistics: stats,
+            charts: crate::charting::ChartCollection::default(),
+            order_events: vec![],
+            succeeded_data_requests: vec!["SPY/2026-01-02".to_string()],
+            failed_data_requests: vec!["SPY/2026-01-05".to_string()],
+            backtest_id: 1_744_000_000,
+            benchmark_symbol: "SPY".to_string(),
         }
     }
 
@@ -754,10 +825,10 @@ mod tests {
         assert!(path.exists(), "{id}.json should exist");
         let content = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(v.get("Statistics").is_some(),  "missing 'Statistics' key");
-        assert!(v.get("Equity").is_some(),       "missing 'Equity' key");
-        assert!(v.get("TradingDays").is_some(),  "missing 'TradingDays' key");
-        assert!(v.get("TotalReturn").is_some(),  "missing 'TotalReturn' key");
+        assert!(v.get("Statistics").is_some(), "missing 'Statistics' key");
+        assert!(v.get("Equity").is_some(), "missing 'Equity' key");
+        assert!(v.get("TradingDays").is_some(), "missing 'TradingDays' key");
+        assert!(v.get("TotalReturn").is_some(), "missing 'TotalReturn' key");
     }
 
     // ── write_order_events_json ────────────────────────────────────────────────
@@ -793,9 +864,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         let required_keys = [
-            "TotalReturn", "CAGR", "SharpeRatio", "SortinoRatio",
-            "MaxDrawdown", "CalmarRatio", "WinRate", "Expectancy",
-            "TotalNetProfit", "TotalTrades", "StartingCash", "FinalValue",
+            "TotalReturn",
+            "CAGR",
+            "SharpeRatio",
+            "SortinoRatio",
+            "MaxDrawdown",
+            "CalmarRatio",
+            "WinRate",
+            "Expectancy",
+            "TotalNetProfit",
+            "TotalTrades",
+            "StartingCash",
+            "FinalValue",
             "TradingDays",
         ];
         for key in &required_keys {
@@ -829,19 +909,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = make_result();
 
-        let succeeded = dir.path().join("succeeded-data-requests-20260401051450171.txt");
-        let failed    = dir.path().join("failed-data-requests-20260401051450171.txt");
+        let succeeded = dir
+            .path()
+            .join("succeeded-data-requests-20260401051450171.txt");
+        let failed = dir
+            .path()
+            .join("failed-data-requests-20260401051450171.txt");
 
         write_data_request_files(&result, &succeeded, &failed).unwrap();
 
-        assert!(succeeded.exists(), "succeeded-data-requests file should exist");
-        assert!(failed.exists(),    "failed-data-requests file should exist");
+        assert!(
+            succeeded.exists(),
+            "succeeded-data-requests file should exist"
+        );
+        assert!(failed.exists(), "failed-data-requests file should exist");
 
         let succ_content = std::fs::read_to_string(&succeeded).unwrap();
-        assert!(succ_content.contains("SPY/2026-01-02"), "succeeded file should list SPY data");
+        assert!(
+            succ_content.contains("SPY/2026-01-02"),
+            "succeeded file should list SPY data"
+        );
 
         let fail_content = std::fs::read_to_string(&failed).unwrap();
-        assert!(fail_content.contains("SPY/2026-01-05"), "failed file should list missing data");
+        assert!(
+            fail_content.contains("SPY/2026-01-05"),
+            "failed file should list missing data"
+        );
     }
 
     // ── full output directory structure ───────────────────────────────────────
@@ -855,19 +948,23 @@ mod tests {
         let id = result.backtest_id;
         let ts_ms = "20260410120000000";
 
-        write_results_json(&result,      &dir.path().join(format!("{id}.json"))).unwrap();
-        write_order_events_json(&result, &dir.path().join(format!("{id}-order-events.json"))).unwrap();
-        write_summary_json(&result,      &dir.path().join(format!("{id}-summary.json"))).unwrap();
-        write_log_txt(&result,           &dir.path().join(format!("{id}-log.txt"))).unwrap();
+        write_results_json(&result, &dir.path().join(format!("{id}.json"))).unwrap();
+        write_order_events_json(&result, &dir.path().join(format!("{id}-order-events.json")))
+            .unwrap();
+        write_summary_json(&result, &dir.path().join(format!("{id}-summary.json"))).unwrap();
+        write_log_txt(&result, &dir.path().join(format!("{id}-log.txt"))).unwrap();
         std::fs::copy(
             dir.path().join(format!("{id}-log.txt")),
             dir.path().join("log.txt"),
-        ).unwrap();
+        )
+        .unwrap();
         write_data_request_files(
             &result,
-            &dir.path().join(format!("succeeded-data-requests-{ts_ms}.txt")),
+            &dir.path()
+                .join(format!("succeeded-data-requests-{ts_ms}.txt")),
             &dir.path().join(format!("failed-data-requests-{ts_ms}.txt")),
-        ).unwrap();
+        )
+        .unwrap();
         write_report(&result, &dir.path().join("report.html")).unwrap();
 
         let expected = [

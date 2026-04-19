@@ -39,7 +39,10 @@ impl TradeBarConsolidator {
 
     /// Create a time-period consolidator that emits on period boundaries.
     pub fn new_period(period: Duration) -> Self {
-        assert!(period.num_nanoseconds().unwrap_or(0) > 0, "period must be > 0");
+        assert!(
+            period.num_nanoseconds().unwrap_or(0) > 0,
+            "period must be > 0"
+        );
         Self {
             mode: ConsolidationMode::TimePeriod(period),
             working: None,

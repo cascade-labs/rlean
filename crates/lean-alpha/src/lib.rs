@@ -3,9 +3,7 @@ pub mod insight;
 pub mod insight_collection;
 pub mod models;
 
-pub use alpha_model::{
-    CompositeAlphaModel, ConstantAlphaModel, IAlphaModel, NullAlphaModel,
-};
+pub use alpha_model::{CompositeAlphaModel, ConstantAlphaModel, IAlphaModel, NullAlphaModel};
 pub use insight::{Insight, InsightDirection, InsightType};
 pub use insight_collection::InsightCollection;
 pub use models::ema_cross::EmaCrossAlphaModel;

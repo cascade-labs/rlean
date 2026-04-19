@@ -1,5 +1,5 @@
 use lean_core::{Market, NanosecondTimestamp, Resolution, Symbol, TimeSpan};
-use lean_data::TradeBar;
+use lean_data::{TradeBar, TradeBarData};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -7,9 +7,20 @@ fn spy() -> Symbol {
     Symbol::create_equity("SPY", &Market::usa())
 }
 
-fn make_bar(open: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal) -> TradeBar {
+fn make_bar(
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
+) -> TradeBar {
     let time = NanosecondTimestamp::from_secs(1_700_000_000);
-    TradeBar::new(spy(), time, TimeSpan::ONE_DAY, open, high, low, close, volume)
+    TradeBar::new(
+        spy(),
+        time,
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(open, high, low, close, volume),
+    )
 }
 
 #[test]
@@ -22,7 +33,12 @@ fn bar_close_is_price() {
 #[test]
 fn end_time_is_time_plus_period() {
     let time = NanosecondTimestamp::from_secs(1_700_000_000);
-    let bar = TradeBar::new(spy(), time, TimeSpan::ONE_DAY, dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000));
+    let bar = TradeBar::new(
+        spy(),
+        time,
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000)),
+    );
     assert_eq!(bar.end_time.0, bar.time.0 + TimeSpan::ONE_DAY.nanos);
 }
 
@@ -70,16 +86,26 @@ fn update_extends_high_and_low() {
 #[test]
 fn merge_combines_two_bars() {
     let t1 = NanosecondTimestamp::from_secs(1_700_000_000);
-    let mut bar1 = TradeBar::new(spy(), t1, TimeSpan::ONE_DAY, dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000));
+    let mut bar1 = TradeBar::new(
+        spy(),
+        t1,
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000)),
+    );
 
     let t2 = t1 + TimeSpan::ONE_DAY;
-    let bar2 = TradeBar::new(spy(), t2, TimeSpan::ONE_DAY, dec!(105), dec!(120), dec!(85), dec!(115), dec!(2000));
+    let bar2 = TradeBar::new(
+        spy(),
+        t2,
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(dec!(105), dec!(120), dec!(85), dec!(115), dec!(2000)),
+    );
 
     bar1.merge(&bar2);
 
-    assert_eq!(bar1.open, dec!(100));  // keeps first open
-    assert_eq!(bar1.high, dec!(120));  // takes highest high
-    assert_eq!(bar1.low, dec!(85));    // takes lowest low
+    assert_eq!(bar1.open, dec!(100)); // keeps first open
+    assert_eq!(bar1.high, dec!(120)); // takes highest high
+    assert_eq!(bar1.low, dec!(85)); // takes lowest low
     assert_eq!(bar1.close, dec!(115)); // takes last close
     assert_eq!(bar1.volume, dec!(3000));
     assert_eq!(bar1.end_time, bar2.end_time);
@@ -102,7 +128,11 @@ fn from_lean_csv_line_parses_correctly() {
 
 #[test]
 fn from_lean_csv_line_returns_none_for_bad_input() {
-    let bar = TradeBar::from_lean_csv_line("bad,data", spy(),
-        chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), Resolution::Daily);
+    let bar = TradeBar::from_lean_csv_line(
+        "bad,data",
+        spy(),
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        Resolution::Daily,
+    );
     assert!(bar.is_none());
 }

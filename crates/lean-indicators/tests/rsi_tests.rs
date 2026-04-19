@@ -1,9 +1,11 @@
-use lean_indicators::{indicator::Indicator, Rsi};
 use lean_core::NanosecondTimestamp;
-use rust_decimal_macros::dec;
+use lean_indicators::{indicator::Indicator, Rsi};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
-fn ts(i: i64) -> NanosecondTimestamp { NanosecondTimestamp::from_secs(i * 86400) }
+fn ts(i: i64) -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(i * 86400)
+}
 
 // ─── Ready state ─────────────────────────────────────────────────────────────
 
@@ -38,7 +40,9 @@ fn all_gains_gives_rsi_100() {
     let mut last_result = None;
     for (i, &v) in values.iter().enumerate() {
         let r = rsi.update_price(ts(i as i64), v);
-        if r.is_ready() { last_result = Some(r.value); }
+        if r.is_ready() {
+            last_result = Some(r.value);
+        }
     }
     assert_eq!(last_result.unwrap(), dec!(100));
 }
@@ -51,7 +55,9 @@ fn all_losses_gives_rsi_0() {
     let mut last_result = None;
     for (i, &v) in values.iter().enumerate() {
         let r = rsi.update_price(ts(i as i64), v);
-        if r.is_ready() { last_result = Some(r.value); }
+        if r.is_ready() {
+            last_result = Some(r.value);
+        }
     }
     assert_eq!(last_result.unwrap(), dec!(0));
 }
@@ -64,7 +70,9 @@ fn flat_prices_gives_rsi_100() {
     let mut last_result = None;
     for (i, &v) in values.iter().enumerate() {
         let r = rsi.update_price(ts(i as i64), v);
-        if r.is_ready() { last_result = Some(r.value); }
+        if r.is_ready() {
+            last_result = Some(r.value);
+        }
     }
     assert_eq!(last_result.unwrap(), dec!(100));
 }
@@ -74,8 +82,16 @@ fn flat_prices_gives_rsi_100() {
 fn rsi_bounded_0_to_100() {
     let mut rsi = Rsi::new(5);
     let values = [
-        dec!(10), dec!(20), dec!(15), dec!(25), dec!(18),
-        dec!(30), dec!(22), dec!(35), dec!(28), dec!(40),
+        dec!(10),
+        dec!(20),
+        dec!(15),
+        dec!(25),
+        dec!(18),
+        dec!(30),
+        dec!(22),
+        dec!(35),
+        dec!(28),
+        dec!(40),
     ];
     for (i, &v) in values.iter().enumerate() {
         let r = rsi.update_price(ts(i as i64), v);

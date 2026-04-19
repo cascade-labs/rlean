@@ -77,8 +77,14 @@ mod insight_tests {
 
         // At the exact generation time the insight should be active.
         let check_time = insight.generated_time_utc;
-        assert!(insight.is_active(check_time), "insight should be active at generation time");
-        assert!(!insight.is_expired(check_time), "insight should not be expired at generation time");
+        assert!(
+            insight.is_active(check_time),
+            "insight should be active at generation time"
+        );
+        assert!(
+            !insight.is_expired(check_time),
+            "insight should not be expired at generation time"
+        );
     }
 
     #[test]
@@ -89,8 +95,14 @@ mod insight_tests {
 
         // Check at close_time_utc + 1 ns — must be expired.
         let after_expiry = NanosecondTimestamp(insight.close_time_utc.0 + 1);
-        assert!(insight.is_expired(after_expiry), "insight should be expired after period elapses");
-        assert!(!insight.is_active(after_expiry), "insight should not be active after expiry");
+        assert!(
+            insight.is_expired(after_expiry),
+            "insight should be expired after period elapses"
+        );
+        assert!(
+            !insight.is_active(after_expiry),
+            "insight should not be active after expiry"
+        );
     }
 
     #[test]
@@ -101,7 +113,10 @@ mod insight_tests {
 
         // At exactly close_time_utc the insight is considered expired (>=).
         let at_close = insight.close_time_utc;
-        assert!(insight.is_expired(at_close), "insight should be expired at close_time_utc");
+        assert!(
+            insight.is_expired(at_close),
+            "insight should be expired at close_time_utc"
+        );
     }
 
     #[test]
@@ -263,7 +278,9 @@ mod insight_collection_tests {
         col.add(Insight::up(sym.clone(), period));
         col.add(Insight::down(sym.clone(), period)); // added last
 
-        let latest = col.latest_for_symbol(&sym).expect("should have a latest insight");
+        let latest = col
+            .latest_for_symbol(&sym)
+            .expect("should have a latest insight");
         assert_eq!(
             latest.direction,
             InsightDirection::Down,
@@ -334,7 +351,10 @@ mod alpha_model_tests {
         let slice = empty_slice(0);
         let securities = vec![spy(), aapl()];
         let insights = model.update(&slice, &securities);
-        assert!(insights.is_empty(), "NullAlphaModel must return no insights");
+        assert!(
+            insights.is_empty(),
+            "NullAlphaModel must return no insights"
+        );
     }
 
     #[test]
@@ -477,15 +497,19 @@ mod alpha_model_tests {
         };
 
         let mut composite = CompositeAlphaModel::new()
-            .add(model_a)
-            .add(model_b);
+            .with_model(model_a)
+            .with_model(model_b);
 
         let slice = empty_slice(0);
         let securities = vec![spy()];
         let insights = composite.update(&slice, &securities);
 
         // Each sub-model emits one insight for SPY → 2 total.
-        assert_eq!(insights.len(), 2, "composite should aggregate insights from both models");
+        assert_eq!(
+            insights.len(),
+            2,
+            "composite should aggregate insights from both models"
+        );
 
         let directions: Vec<InsightDirection> = insights.iter().map(|i| i.direction).collect();
         assert!(directions.contains(&InsightDirection::Up));
@@ -503,10 +527,13 @@ mod alpha_model_tests {
     #[test]
     fn composite_single_sub_model() {
         let sub = NullAlphaModel;
-        let mut composite = CompositeAlphaModel::new().add(sub);
+        let mut composite = CompositeAlphaModel::new().with_model(sub);
         let slice = empty_slice(0);
         let insights = composite.update(&slice, &[spy(), aapl()]);
-        assert!(insights.is_empty(), "NullAlphaModel sub-model yields no insights");
+        assert!(
+            insights.is_empty(),
+            "NullAlphaModel sub-model yields no insights"
+        );
     }
 
     #[test]
@@ -517,7 +544,7 @@ mod alpha_model_tests {
             period: TimeSpan::ONE_DAY,
             magnitude: None,
         };
-        let mut composite = CompositeAlphaModel::new().add(model_a);
+        let mut composite = CompositeAlphaModel::new().with_model(model_a);
         let added = vec![spy()];
         let removed: Vec<Symbol> = vec![];
         // Should not panic.
@@ -589,8 +616,8 @@ mod round_trip_tests {
             magnitude: None,
         };
         let mut composite = CompositeAlphaModel::new()
-            .add(fast_model)
-            .add(slow_model);
+            .with_model(fast_model)
+            .with_model(slow_model);
 
         let slice = empty_slice(0);
         let securities = vec![spy()];

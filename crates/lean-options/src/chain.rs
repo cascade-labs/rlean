@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use lean_core::Symbol;
-use rust_decimal::Decimal;
 use crate::contract::OptionContract;
 use crate::filter_universe::OptionFilterUniverse;
+use lean_core::Symbol;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 /// Collection of option contracts for a single underlying at a point in time.
 #[derive(Debug, Clone)]
@@ -17,7 +17,11 @@ pub struct OptionChain {
 
 impl OptionChain {
     pub fn new(canonical_symbol: Symbol, underlying_price: Decimal) -> Self {
-        OptionChain { canonical_symbol, underlying_price, contracts: HashMap::new() }
+        OptionChain {
+            canonical_symbol,
+            underlying_price,
+            contracts: HashMap::new(),
+        }
     }
 
     pub fn add_contract(&mut self, contract: OptionContract) {

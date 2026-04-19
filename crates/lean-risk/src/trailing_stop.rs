@@ -5,16 +5,16 @@ use std::collections::HashMap;
 
 pub struct TrailingStopRiskManagementModel {
     pub trailing_pct: Decimal,
-    high_prices: HashMap<u64, Price>,
-    low_prices: HashMap<u64, Price>,
+    _high_prices: HashMap<u64, Price>,
+    _low_prices: HashMap<u64, Price>,
 }
 
 impl TrailingStopRiskManagementModel {
     pub fn new(trailing_pct: Decimal) -> Self {
         TrailingStopRiskManagementModel {
             trailing_pct,
-            high_prices: HashMap::new(),
-            low_prices: HashMap::new(),
+            _high_prices: HashMap::new(),
+            _low_prices: HashMap::new(),
         }
     }
 }

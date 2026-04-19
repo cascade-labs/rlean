@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, atr::Atr};
+use crate::{
+    atr::Atr,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal_macros::dec;
@@ -25,11 +28,21 @@ impl Natr {
 }
 
 impl Indicator for Natr {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.atr.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period + 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.atr.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period + 1
+    }
 
     fn reset(&mut self) {
         self.atr.reset();

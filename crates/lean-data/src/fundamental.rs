@@ -3,7 +3,6 @@ use lean_core::{DateTime, Price, Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Fundamental data point — wraps financial statement and valuation metrics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,10 +88,22 @@ impl FundamentalData {
 }
 
 impl BaseData for FundamentalData {
-    fn data_type(&self) -> BaseDataType { BaseDataType::Fundamental }
-    fn symbol(&self) -> &Symbol { &self.symbol }
-    fn time(&self) -> DateTime { self.time }
-    fn end_time(&self) -> DateTime { self.time + TimeSpan::ONE_DAY }
-    fn price(&self) -> Price { dec!(0) }
-    fn clone_box(&self) -> Box<dyn BaseData> { Box::new(self.clone()) }
+    fn data_type(&self) -> BaseDataType {
+        BaseDataType::Fundamental
+    }
+    fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+    fn time(&self) -> DateTime {
+        self.time
+    }
+    fn end_time(&self) -> DateTime {
+        self.time + TimeSpan::ONE_DAY
+    }
+    fn price(&self) -> Price {
+        dec!(0)
+    }
+    fn clone_box(&self) -> Box<dyn BaseData> {
+        Box::new(self.clone())
+    }
 }

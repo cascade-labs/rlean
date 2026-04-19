@@ -87,7 +87,9 @@ impl Sub<TimeSpan> for NanosecondTimestamp {
 impl Sub<NanosecondTimestamp> for NanosecondTimestamp {
     type Output = TimeSpan;
     fn sub(self, rhs: NanosecondTimestamp) -> TimeSpan {
-        TimeSpan { nanos: self.0 - rhs.0 }
+        TimeSpan {
+            nanos: self.0 - rhs.0,
+        }
     }
 }
 
@@ -105,23 +107,57 @@ pub struct TimeSpan {
 
 impl TimeSpan {
     pub const ZERO: Self = TimeSpan { nanos: 0 };
-    pub const ONE_SECOND: Self = TimeSpan { nanos: 1_000_000_000 };
-    pub const ONE_MINUTE: Self = TimeSpan { nanos: 60_000_000_000 };
-    pub const ONE_HOUR: Self = TimeSpan { nanos: 3_600_000_000_000 };
-    pub const ONE_DAY: Self = TimeSpan { nanos: 86_400_000_000_000 };
+    pub const ONE_SECOND: Self = TimeSpan {
+        nanos: 1_000_000_000,
+    };
+    pub const ONE_MINUTE: Self = TimeSpan {
+        nanos: 60_000_000_000,
+    };
+    pub const ONE_HOUR: Self = TimeSpan {
+        nanos: 3_600_000_000_000,
+    };
+    pub const ONE_DAY: Self = TimeSpan {
+        nanos: 86_400_000_000_000,
+    };
 
-    pub fn from_nanos(n: i64) -> Self { TimeSpan { nanos: n } }
-    pub fn from_micros(us: i64) -> Self { TimeSpan { nanos: us * 1_000 } }
-    pub fn from_millis(ms: i64) -> Self { TimeSpan { nanos: ms * 1_000_000 } }
-    pub fn from_secs(s: i64) -> Self { TimeSpan { nanos: s * 1_000_000_000 } }
-    pub fn from_mins(m: i64) -> Self { TimeSpan::from_secs(m * 60) }
-    pub fn from_hours(h: i64) -> Self { TimeSpan::from_secs(h * 3600) }
-    pub fn from_days(d: i64) -> Self { TimeSpan::from_secs(d * 86400) }
+    pub fn from_nanos(n: i64) -> Self {
+        TimeSpan { nanos: n }
+    }
+    pub fn from_micros(us: i64) -> Self {
+        TimeSpan { nanos: us * 1_000 }
+    }
+    pub fn from_millis(ms: i64) -> Self {
+        TimeSpan {
+            nanos: ms * 1_000_000,
+        }
+    }
+    pub fn from_secs(s: i64) -> Self {
+        TimeSpan {
+            nanos: s * 1_000_000_000,
+        }
+    }
+    pub fn from_mins(m: i64) -> Self {
+        TimeSpan::from_secs(m * 60)
+    }
+    pub fn from_hours(h: i64) -> Self {
+        TimeSpan::from_secs(h * 3600)
+    }
+    pub fn from_days(d: i64) -> Self {
+        TimeSpan::from_secs(d * 86400)
+    }
 
-    pub fn total_seconds(&self) -> f64 { self.nanos as f64 / 1e9 }
-    pub fn total_minutes(&self) -> f64 { self.nanos as f64 / 60e9 }
-    pub fn total_hours(&self) -> f64 { self.nanos as f64 / 3600e9 }
-    pub fn total_days(&self) -> f64 { self.nanos as f64 / 86400e9 }
+    pub fn total_seconds(&self) -> f64 {
+        self.nanos as f64 / 1e9
+    }
+    pub fn total_minutes(&self) -> f64 {
+        self.nanos as f64 / 60e9
+    }
+    pub fn total_hours(&self) -> f64 {
+        self.nanos as f64 / 3600e9
+    }
+    pub fn total_days(&self) -> f64 {
+        self.nanos as f64 / 86400e9
+    }
 
     pub fn as_chrono_duration(&self) -> Duration {
         Duration::nanoseconds(self.nanos)
@@ -130,12 +166,20 @@ impl TimeSpan {
 
 impl Add for TimeSpan {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self { TimeSpan { nanos: self.nanos + rhs.nanos } }
+    fn add(self, rhs: Self) -> Self {
+        TimeSpan {
+            nanos: self.nanos + rhs.nanos,
+        }
+    }
 }
 
 impl Sub for TimeSpan {
     type Output = Self;
-    fn sub(self, rhs: Self) -> Self { TimeSpan { nanos: self.nanos - rhs.nanos } }
+    fn sub(self, rhs: Self) -> Self {
+        TimeSpan {
+            nanos: self.nanos - rhs.nanos,
+        }
+    }
 }
 
 impl std::fmt::Display for TimeSpan {
@@ -145,9 +189,13 @@ impl std::fmt::Display for TimeSpan {
         let m = (total_secs % 3600) / 60;
         let s = total_secs % 60;
         let ns = self.nanos.abs() % 1_000_000_000;
-        if self.nanos < 0 { write!(f, "-")?; }
+        if self.nanos < 0 {
+            write!(f, "-")?;
+        }
         write!(f, "{:02}:{:02}:{:02}", h, m, s)?;
-        if ns > 0 { write!(f, ".{:09}", ns)?; }
+        if ns > 0 {
+            write!(f, ".{:09}", ns)?;
+        }
         Ok(())
     }
 }

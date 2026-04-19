@@ -1,4 +1,3 @@
-use lean_core::DateTime;
 use chrono::{Datelike, NaiveDate};
 
 pub enum DateRule {
@@ -13,12 +12,24 @@ pub enum DateRule {
 pub struct DateRules;
 
 impl DateRules {
-    pub fn every_day() -> DateRule { DateRule::EveryDay }
-    pub fn every_week_day() -> DateRule { DateRule::EveryWeekDay }
-    pub fn every(weekdays: Vec<chrono::Weekday>) -> DateRule { DateRule::Every(weekdays) }
-    pub fn month_start() -> DateRule { DateRule::MonthStart { days_offset: 0 } }
-    pub fn month_end() -> DateRule { DateRule::MonthEnd { days_offset: 0 } }
-    pub fn on(dates: Vec<NaiveDate>) -> DateRule { DateRule::On(dates) }
+    pub fn every_day() -> DateRule {
+        DateRule::EveryDay
+    }
+    pub fn every_week_day() -> DateRule {
+        DateRule::EveryWeekDay
+    }
+    pub fn every(weekdays: Vec<chrono::Weekday>) -> DateRule {
+        DateRule::Every(weekdays)
+    }
+    pub fn month_start() -> DateRule {
+        DateRule::MonthStart { days_offset: 0 }
+    }
+    pub fn month_end() -> DateRule {
+        DateRule::MonthEnd { days_offset: 0 }
+    }
+    pub fn on(dates: Vec<NaiveDate>) -> DateRule {
+        DateRule::On(dates)
+    }
 }
 
 impl DateRule {
@@ -36,11 +47,13 @@ impl DateRule {
                 } else {
                     NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)
                 };
-                next_month.map(|nm| {
-                    let last = nm - chrono::Duration::days(1);
-                    let target = last - chrono::Duration::days((-*days_offset) as u64 as i64);
-                    date == target
-                }).unwrap_or(false)
+                next_month
+                    .map(|nm| {
+                        let last = nm - chrono::Duration::days(1);
+                        let target = last - chrono::Duration::days((-*days_offset) as u64 as i64);
+                        date == target
+                    })
+                    .unwrap_or(false)
             }
             DateRule::On(dates) => dates.contains(&date),
         }

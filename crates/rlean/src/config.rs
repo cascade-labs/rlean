@@ -15,7 +15,6 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(rlean_dir()?.join("config"))
 }
 
-
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -48,8 +47,7 @@ impl GlobalConfig {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -62,7 +60,6 @@ impl GlobalConfig {
 
 // ── Credentials (~/.rlean/credentials) ────────────────────────────────────────
 
-
 // ── Workspace config (rlean.json) ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +70,6 @@ pub struct WorkspaceConfig {
 
     #[serde(default = "default_language")]
     pub default_language: String,
-
 }
 
 fn default_data_folder() -> String {
@@ -97,8 +93,7 @@ impl WorkspaceConfig {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     pub fn save(&self, workspace: &Path) -> Result<()> {
@@ -140,8 +135,7 @@ impl ProjectConfig {
         let path = project_dir.join("config.json");
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     pub fn save(&self, project_dir: &Path) -> Result<()> {
@@ -162,7 +156,9 @@ pub fn plugin_configs_path() -> Result<PathBuf> {
 /// The outer map key is the plugin name (e.g. `"thetadata"`).
 /// The inner map holds arbitrary key/value pairs defined by that plugin.
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct PluginConfigs(pub std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>);
+pub struct PluginConfigs(
+    pub std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>,
+);
 
 impl PluginConfigs {
     pub fn load() -> Result<Self> {
@@ -172,8 +168,7 @@ impl PluginConfigs {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -202,8 +197,7 @@ impl PluginConfigs {
 /// Write to a temp file then rename (atomic on same filesystem).
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    std::fs::write(&tmp, content).with_context(|| format!("Failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("Failed to rename {} → {}", tmp.display(), path.display()))
 }

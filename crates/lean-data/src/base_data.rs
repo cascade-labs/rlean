@@ -1,4 +1,4 @@
-use lean_core::{DateTime, Price, Quantity, Resolution, Symbol};
+use lean_core::{DateTime, Price, Symbol};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -42,10 +42,14 @@ pub trait BaseData: Send + Sync + fmt::Debug + 'static {
     fn time(&self) -> DateTime;
     fn end_time(&self) -> DateTime;
     fn price(&self) -> Price;
-    fn value(&self) -> Price { self.price() }
+    fn value(&self) -> Price {
+        self.price()
+    }
 
     /// True if this data point is "live" (not from historical replay).
-    fn is_live(&self) -> bool { false }
+    fn is_live(&self) -> bool {
+        false
+    }
 
     /// Clone into a boxed trait object.
     fn clone_box(&self) -> Box<dyn BaseData>;

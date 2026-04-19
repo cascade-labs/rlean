@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal_macros::dec;
 
@@ -24,11 +27,21 @@ impl Roc {
 }
 
 impl Indicator for Roc {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period + 1 }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period + 1
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -42,7 +55,9 @@ impl Indicator for Roc {
 
         if self.window.is_full() {
             let old = self.window.oldest().copied().unwrap_or(dec!(1));
-            let roc = if old.is_zero() { dec!(0) } else {
+            let roc = if old.is_zero() {
+                dec!(0)
+            } else {
                 (value - old) / old * dec!(100)
             };
             self.current = IndicatorResult::ready(roc, time);

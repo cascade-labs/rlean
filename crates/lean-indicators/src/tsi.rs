@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema};
+use crate::{
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -7,12 +10,10 @@ use rust_decimal_macros::dec;
 /// TSI = 100 * double_smoothed_momentum / double_smoothed_abs_momentum
 pub struct Tsi {
     name: String,
-    long_period: usize,
-    short_period: usize,
-    ema_pc: Ema,       // EMA of price change
-    ema_pc_pc: Ema,    // EMA of EMA of price change
-    ema_apc: Ema,      // EMA of |price change|
-    ema_apc_pc: Ema,   // EMA of EMA of |price change|
+    ema_pc: Ema,     // EMA of price change
+    ema_pc_pc: Ema,  // EMA of EMA of price change
+    ema_apc: Ema,    // EMA of |price change|
+    ema_apc_pc: Ema, // EMA of EMA of |price change|
     prev_close: Option<Decimal>,
     samples: usize,
     warm_up: usize,
@@ -23,8 +24,6 @@ impl Tsi {
     pub fn new(long_period: usize, short_period: usize) -> Self {
         Tsi {
             name: format!("TSI({},{})", long_period, short_period),
-            long_period,
-            short_period,
             ema_pc: Ema::new(long_period),
             ema_pc_pc: Ema::new(short_period),
             ema_apc: Ema::new(long_period),
@@ -35,18 +34,30 @@ impl Tsi {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for Tsi {
+    fn default() -> Self {
         Self::new(25, 13)
     }
 }
 
 impl Indicator for Tsi {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.warm_up }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.warm_up
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.ema_pc.reset();

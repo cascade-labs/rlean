@@ -1,10 +1,14 @@
 use lean_core::{Market, NanosecondTimestamp, Symbol};
-use lean_data::Tick;
 use lean_data::base_data::BaseData;
+use lean_data::Tick;
 use rust_decimal_macros::dec;
 
-fn spy() -> Symbol { Symbol::create_equity("SPY", &Market::usa()) }
-fn now() -> NanosecondTimestamp { NanosecondTimestamp::from_secs(1_700_000_000) }
+fn spy() -> Symbol {
+    Symbol::create_equity("SPY", &Market::usa())
+}
+fn now() -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(1_700_000_000)
+}
 
 #[test]
 fn trade_tick_type_and_price() {
@@ -17,7 +21,14 @@ fn trade_tick_type_and_price() {
 
 #[test]
 fn quote_tick_mid_price() {
-    let t = Tick::quote(spy(), now(), dec!(449.98), dec!(450.02), dec!(500), dec!(300));
+    let t = Tick::quote(
+        spy(),
+        now(),
+        dec!(449.98),
+        dec!(450.02),
+        dec!(500),
+        dec!(300),
+    );
     assert!(t.is_quote());
     // Mid = (449.98 + 450.02) / 2 = 450
     assert_eq!(t.price(), dec!(450));

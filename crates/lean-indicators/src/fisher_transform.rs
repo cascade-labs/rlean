@@ -1,8 +1,11 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Fisher Transform. Normalizes price into a Gaussian distribution.
@@ -28,25 +31,43 @@ impl FisherTransform {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new(10)
-    }
-
     fn highest(&self) -> Decimal {
-        self.high_window.iter().copied().fold(Decimal::MIN, |a, b| if b > a { b } else { a })
+        self.high_window
+            .iter()
+            .copied()
+            .fold(Decimal::MIN, |a, b| if b > a { b } else { a })
     }
 
     fn lowest(&self) -> Decimal {
-        self.low_window.iter().copied().fold(Decimal::MAX, |a, b| if b < a { b } else { a })
+        self.low_window
+            .iter()
+            .copied()
+            .fold(Decimal::MAX, |a, b| if b < a { b } else { a })
+    }
+}
+
+impl Default for FisherTransform {
+    fn default() -> Self {
+        Self::new(10)
     }
 }
 
 impl Indicator for FisherTransform {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.high_window.clear();

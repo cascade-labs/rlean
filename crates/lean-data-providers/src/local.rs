@@ -21,21 +21,18 @@ impl LocalHistoryProvider {
 }
 
 impl IHistoryProvider for LocalHistoryProvider {
-    fn get_history(
-        &self,
-        request: &HistoryRequest,
-    ) -> anyhow::Result<Vec<TradeBar>> {
+    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
         let resolver = PathResolver::new(&self.data_root);
 
         let start_date = request.start.date_utc();
-        let end_date   = request.end.date_utc();
+        let end_date = request.end.date_utc();
 
         let paths: Vec<std::path::PathBuf> = if request.resolution.is_high_resolution() {
             let mut current = start_date;
             let mut v = Vec::new();
             while current <= end_date {
                 let dp = resolver.trade_bar(&request.symbol, request.resolution, current);
-                let p  = dp.to_path();
+                let p = dp.to_path();
                 if p.exists() {
                     v.push(p);
                 }
@@ -44,8 +41,12 @@ impl IHistoryProvider for LocalHistoryProvider {
             v
         } else {
             let dp = resolver.trade_bar(&request.symbol, request.resolution, start_date);
-            let p  = dp.to_path();
-            if p.exists() { vec![p] } else { vec![] }
+            let p = dp.to_path();
+            if p.exists() {
+                vec![p]
+            } else {
+                vec![]
+            }
         };
 
         if paths.is_empty() {
@@ -64,7 +65,8 @@ impl IHistoryProvider for LocalHistoryProvider {
         let params = QueryParams::new().with_time_range(request.start, request.end);
         let symbol = request.symbol.clone();
 
-        let bars = rt.block_on(reader.read_trade_bars(&paths, symbol, &params))
+        let bars = rt
+            .block_on(reader.read_trade_bars(&paths, symbol, &params))
             .unwrap_or_default();
 
         Ok(bars)

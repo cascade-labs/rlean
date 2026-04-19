@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, lsma::Lsma, standard_deviation::StandardDeviation};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    lsma::Lsma,
+    standard_deviation::StandardDeviation,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -32,17 +36,31 @@ impl RegressionChannel {
             std: StandardDeviation::new(period),
             samples: 0,
             current: IndicatorResult::not_ready(),
-            last_result: RegressionChannelResult { middle: dec!(0), upper: dec!(0), lower: dec!(0) },
+            last_result: RegressionChannelResult {
+                middle: dec!(0),
+                upper: dec!(0),
+                lower: dec!(0),
+            },
         }
     }
 }
 
 impl Indicator for RegressionChannel {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.lsma.is_ready() && self.std.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.lsma.is_ready() && self.std.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.lsma.reset();
@@ -60,7 +78,11 @@ impl Indicator for RegressionChannel {
             let mid = rl.value;
             let upper = mid + self.k * rs.value;
             let lower = mid - self.k * rs.value;
-            self.last_result = RegressionChannelResult { middle: mid, upper, lower };
+            self.last_result = RegressionChannelResult {
+                middle: mid,
+                upper,
+                lower,
+            };
             self.current = IndicatorResult::ready(mid, time);
         }
 

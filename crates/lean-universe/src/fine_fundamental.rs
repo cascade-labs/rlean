@@ -65,6 +65,9 @@ pub struct FineFundamental {
 
 impl FineFundamental {
     pub fn new(symbol: Symbol) -> Self {
-        Self { symbol: Some(symbol), ..Default::default() }
+        Self {
+            symbol: Some(symbol),
+            ..Default::default()
+        }
     }
 }

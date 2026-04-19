@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+};
 use lean_core::{DateTime, Price};
 
 /// Triangular Moving Average. SMA of SMA.
@@ -15,10 +18,11 @@ pub struct Trima {
 
 impl Trima {
     pub fn new(period: usize) -> Self {
-        let (p1, p2) = if period % 2 == 0 {
+        let half = period.div_ceil(2);
+        let (p1, p2) = if period.is_multiple_of(2) {
             (period / 2, period / 2 + 1)
         } else {
-            ((period + 1) / 2, (period + 1) / 2)
+            (half, half)
         };
         Trima {
             name: format!("TRIMA({})", period),
@@ -32,11 +36,21 @@ impl Trima {
 }
 
 impl Indicator for Trima {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.sma1.reset();

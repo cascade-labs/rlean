@@ -36,7 +36,9 @@ fn make_target(ticker: &str, qty: f64) -> ExecutionTarget {
 }
 
 fn securities_map(data: Vec<SecurityData>) -> HashMap<String, SecurityData> {
-    data.into_iter().map(|s| (s.symbol.value.clone(), s)).collect()
+    data.into_iter()
+        .map(|s| (s.symbol.value.clone(), s))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +72,10 @@ mod immediate_execution_tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(100));
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
-        assert!(orders[0].quantity > Decimal::ZERO, "Should be a buy (positive qty)");
+        assert!(
+            orders[0].quantity > Decimal::ZERO,
+            "Should be a buy (positive qty)"
+        );
     }
 
     /// Target=100, current=60 → market buy 40 (delta only).
@@ -97,7 +102,10 @@ mod immediate_execution_tests {
 
         let orders = model.execute(&targets, &securities);
 
-        assert!(orders.is_empty(), "No order should be generated when already at target");
+        assert!(
+            orders.is_empty(),
+            "No order should be generated when already at target"
+        );
     }
 
     /// Target=-100, current=0 → market sell 100 (short).
@@ -112,7 +120,10 @@ mod immediate_execution_tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(-100));
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
-        assert!(orders[0].quantity < Decimal::ZERO, "Should be a sell (negative qty)");
+        assert!(
+            orders[0].quantity < Decimal::ZERO,
+            "Should be a sell (negative qty)"
+        );
     }
 
     /// Target=0, current=50 → market sell 50 (liquidate).
@@ -287,7 +298,10 @@ mod null_execution_tests {
 
         let orders = model.execute(&targets, &securities);
 
-        assert!(orders.is_empty(), "NullExecutionModel should never emit orders");
+        assert!(
+            orders.is_empty(),
+            "NullExecutionModel should never emit orders"
+        );
     }
 
     /// NullExecutionModel: multiple targets → still empty.
@@ -345,10 +359,16 @@ mod order_type_tests {
     fn order_type_variants_are_distinct() {
         assert_ne!(ExecutionOrderType::Market, ExecutionOrderType::Limit);
         assert_ne!(ExecutionOrderType::Market, ExecutionOrderType::MarketOnOpen);
-        assert_ne!(ExecutionOrderType::Market, ExecutionOrderType::MarketOnClose);
+        assert_ne!(
+            ExecutionOrderType::Market,
+            ExecutionOrderType::MarketOnClose
+        );
         assert_ne!(ExecutionOrderType::Limit, ExecutionOrderType::MarketOnOpen);
         assert_ne!(ExecutionOrderType::Limit, ExecutionOrderType::MarketOnClose);
-        assert_ne!(ExecutionOrderType::MarketOnOpen, ExecutionOrderType::MarketOnClose);
+        assert_ne!(
+            ExecutionOrderType::MarketOnOpen,
+            ExecutionOrderType::MarketOnClose
+        );
     }
 
     /// ExecutionOrderType copies correctly.

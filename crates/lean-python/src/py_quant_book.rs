@@ -31,10 +31,7 @@ use tracing::warn;
 
 use lean_core::{DateTime, Market, Resolution, Symbol};
 use lean_data::TradeBar;
-use lean_indicators::{
-    indicator::Indicator,
-    Atr, BollingerBands, Ema, Macd, Rsi, Sma,
-};
+use lean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi, Sma};
 use lean_storage::{DataPath, ParquetReader, QueryParams};
 
 use crate::py_types::{PyResolution, PySecurity, PySymbol};
@@ -131,15 +128,17 @@ impl PyQuantBook {
         } else {
             // Single file for the whole range.
             let p = DataPath::trade_bar(&self.data_folder, symbol, resolution, start).to_path();
-            if p.exists() { vec![p] } else { vec![] }
+            if p.exists() {
+                vec![p]
+            } else {
+                vec![]
+            }
         };
 
         if paths.is_empty() {
             warn!(
                 "No local data found for {} ({:?}) in {:?}",
-                symbol.value,
-                resolution,
-                self.data_folder,
+                symbol.value, resolution, self.data_folder,
             );
             return vec![];
         }
@@ -188,17 +187,14 @@ impl PyQuantBook {
 
 fn date_to_datetime(date: NaiveDate, h: u32, m: u32, s: u32) -> DateTime {
     use chrono::{TimeZone, Utc};
-    DateTime::from(Utc.from_utc_datetime(
-        &date.and_hms_opt(h, m, s).unwrap_or_default(),
-    ))
+    DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(h, m, s).unwrap_or_default()))
 }
 
 fn ns_to_date_str(ns: i64) -> String {
     use chrono::{DateTime as ChrDt, Utc};
     let secs = ns / 1_000_000_000;
     let nsub = (ns % 1_000_000_000) as u32;
-    let dt: ChrDt<Utc> =
-        chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
+    let dt: ChrDt<Utc> = chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
     dt.format("%Y-%m-%d").to_string()
 }
 
@@ -388,7 +384,7 @@ impl PyQuantBook {
             let dict = PyDict::new(py);
             dict.set_item("time", PyList::empty(py))?;
             dict.set_item("value", PyList::empty(py))?;
-            return Ok(dict.into_py(py));
+            return Ok(dict.into());
         }
 
         run_indicator(py, name, period, &bars)
@@ -412,7 +408,7 @@ impl PyQuantBook {
              returning empty list",
             ticker
         );
-        Ok(PyList::empty(py).into_py(py))
+        Ok(PyList::empty(py).into())
     }
 
     // ── Last price ────────────────────────────────────────────────────────────
@@ -422,10 +418,7 @@ impl PyQuantBook {
     /// Loads the last bar from the local data store and returns its close.
     /// Returns `None` when data is not available.
     #[pyo3(signature = (symbol))]
-    fn get_last_price(
-        &self,
-        symbol: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<f64>> {
+    fn get_last_price(&self, symbol: &Bound<'_, PyAny>) -> PyResult<Option<f64>> {
         let sym = self.resolve_symbol(symbol)?;
         let bars = self.load_bars_count(&sym, 1, Resolution::Daily);
         Ok(bars.last().and_then(|b| b.close.to_f64()))
@@ -444,6 +437,12 @@ impl PyQuantBook {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+}
+
+impl Default for PyQuantBook {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -473,7 +472,7 @@ fn bars_to_pydict(py: Python<'_>, bars: &[TradeBar]) -> PyResult<PyObject> {
     dict.set_item("low", lows)?;
     dict.set_item("close", closes)?;
     dict.set_item("volume", volumes)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into())
 }
 
 // ─── Helper: run indicator over bars ─────────────────────────────────────────
@@ -496,25 +495,19 @@ fn run_indicator(
             let signal = (period / 2).max(1);
             run_macd(py, bars, period, slow, signal)
         }
-        "BB" | "BOLLINGERBANDS" | "BOLLINGER" => {
-            run_bb(py, bars, period, f2d(2.0))
-        }
+        "BB" | "BOLLINGERBANDS" | "BOLLINGER" => run_bb(py, bars, period, f2d(2.0)),
         other => {
             warn!("Unknown indicator '{}' — returning empty result", other);
             let dict = PyDict::new(py);
             dict.set_item("time", PyList::empty(py))?;
             dict.set_item("value", PyList::empty(py))?;
-            Ok(dict.into_py(py))
+            Ok(dict.into())
         }
     }
 }
 
 /// Run any single-value indicator and collect ready results into a dict.
-fn run_single(
-    py: Python<'_>,
-    bars: &[TradeBar],
-    ind: &mut dyn Indicator,
-) -> PyResult<PyObject> {
+fn run_single(py: Python<'_>, bars: &[TradeBar], ind: &mut dyn Indicator) -> PyResult<PyObject> {
     let mut times: Vec<String> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
 
@@ -529,7 +522,7 @@ fn run_single(
     let dict = PyDict::new(py);
     dict.set_item("time", times)?;
     dict.set_item("value", values)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into())
 }
 
 fn run_macd(
@@ -560,15 +553,10 @@ fn run_macd(
     dict.set_item("value", values)?;
     dict.set_item("signal", signals)?;
     dict.set_item("histogram", histograms)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into())
 }
 
-fn run_bb(
-    py: Python<'_>,
-    bars: &[TradeBar],
-    period: usize,
-    k: Decimal,
-) -> PyResult<PyObject> {
+fn run_bb(py: Python<'_>, bars: &[TradeBar], period: usize, k: Decimal) -> PyResult<PyObject> {
     let mut ind = BollingerBands::new(period, k);
     let mut times: Vec<String> = Vec::new();
     let mut middles: Vec<f64> = Vec::new();
@@ -590,5 +578,5 @@ fn run_bb(
     dict.set_item("value", middles)?;
     dict.set_item("upper", uppers)?;
     dict.set_item("lower", lowers)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into())
 }

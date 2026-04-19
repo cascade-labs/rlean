@@ -8,13 +8,13 @@
 /// - Place market orders based on signals
 /// - Run through the BacktestEngine
 use lean_algorithm::{
-    algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges},
+    algorithm::{AlgorithmStatus, IAlgorithm},
     qc_algorithm::QcAlgorithm,
 };
-use lean_core::{DateTime, Market, Resolution, Symbol, TimeSpan};
+use lean_core::{DateTime, Resolution, Symbol};
 use lean_data::Slice;
 use lean_engine::{BacktestEngine, EngineConfig};
-use lean_indicators::{indicator::Indicator, Ema, Sma};
+use lean_indicators::{indicator::Indicator, Sma};
 use lean_orders::OrderEvent;
 use rust_decimal_macros::dec;
 
@@ -65,9 +65,9 @@ impl IAlgorithm for SmaCrossover {
         let fast = self.fast.update_bar(bar);
         let slow = self.slow.update_bar(bar);
 
-        if !fast.is_ready() || !slow.is_ready() { return; }
-
-        let prev_invested = self.invested;
+        if !fast.is_ready() || !slow.is_ready() {
+            return;
+        }
 
         if fast.value > slow.value && !self.invested {
             // Golden cross — go long
@@ -102,19 +102,29 @@ impl IAlgorithm for SmaCrossover {
         println!("Cash: ${:.2}", self.algo.cash());
     }
 
-    fn name(&self) -> &str { "SmaCrossover" }
-    fn start_date(&self) -> DateTime { self.algo.start_date }
-    fn end_date(&self) -> DateTime { self.algo.end_date }
-    fn status(&self) -> AlgorithmStatus { self.algo.status }
-    fn portfolio_value(&self) -> lean_core::Price { self.algo.portfolio_value() }
-    fn starting_cash(&self) -> lean_core::Price { self.algo.cash() }
+    fn name(&self) -> &str {
+        "SmaCrossover"
+    }
+    fn start_date(&self) -> DateTime {
+        self.algo.start_date
+    }
+    fn end_date(&self) -> DateTime {
+        self.algo.end_date
+    }
+    fn status(&self) -> AlgorithmStatus {
+        self.algo.status
+    }
+    fn portfolio_value(&self) -> lean_core::Price {
+        self.algo.portfolio_value()
+    }
+    fn starting_cash(&self) -> lean_core::Price {
+        self.algo.cash()
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let config = EngineConfig {
         data_root: std::path::PathBuf::from("data"),

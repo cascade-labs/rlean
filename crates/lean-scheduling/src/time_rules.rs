@@ -14,15 +14,23 @@ impl TimeRules {
         TimeRule::At(TimeSpan::from_secs(hour as i64 * 3600 + minute as i64 * 60))
     }
 
-    pub fn at_midnight() -> TimeRule { TimeRules::at(0, 0) }
-    pub fn at_noon() -> TimeRule { TimeRules::at(12, 0) }
+    pub fn at_midnight() -> TimeRule {
+        TimeRules::at(0, 0)
+    }
+    pub fn at_noon() -> TimeRule {
+        TimeRules::at(12, 0)
+    }
 
     pub fn after_market_open(offset_minutes: i64) -> TimeRule {
-        TimeRule::AfterMarketOpen { offset: TimeSpan::from_mins(offset_minutes) }
+        TimeRule::AfterMarketOpen {
+            offset: TimeSpan::from_mins(offset_minutes),
+        }
     }
 
     pub fn before_market_close(offset_minutes: i64) -> TimeRule {
-        TimeRule::BeforeMarketClose { offset: TimeSpan::from_mins(offset_minutes) }
+        TimeRule::BeforeMarketClose {
+            offset: TimeSpan::from_mins(offset_minutes),
+        }
     }
 
     pub fn every(minutes: i64) -> TimeRule {

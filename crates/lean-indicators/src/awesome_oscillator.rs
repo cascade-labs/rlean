@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal_macros::dec;
@@ -22,18 +25,30 @@ impl AwesomeOscillator {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for AwesomeOscillator {
+    fn default() -> Self {
         Self::new(5, 34)
     }
 }
 
 impl Indicator for AwesomeOscillator {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.fast.is_ready() && self.slow.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.slow.warm_up_period() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.fast.is_ready() && self.slow.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.slow.warm_up_period()
+    }
 
     fn reset(&mut self) {
         self.fast.reset();

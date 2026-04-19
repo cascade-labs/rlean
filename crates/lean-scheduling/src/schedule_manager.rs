@@ -8,7 +8,9 @@ pub struct ScheduleManager {
 
 impl ScheduleManager {
     pub fn new() -> Self {
-        ScheduleManager { events: Mutex::new(Vec::new()) }
+        ScheduleManager {
+            events: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn add(&self, event: ScheduledEvent) {
@@ -30,5 +32,7 @@ impl ScheduleManager {
 }
 
 impl Default for ScheduleManager {
-    fn default() -> Self { ScheduleManager::new() }
+    fn default() -> Self {
+        ScheduleManager::new()
+    }
 }

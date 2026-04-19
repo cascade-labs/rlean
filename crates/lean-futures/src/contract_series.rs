@@ -1,5 +1,5 @@
+use crate::expiry::{compute_expiry, ExpiryRule};
 use chrono::{Datelike, NaiveDate};
-use crate::expiry::{ExpiryRule, compute_expiry};
 
 /// Month codes used in futures tickers (Jan=F, Feb=G, ... Dec=Z)
 pub const MONTH_CODES: [char; 12] = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z'];
@@ -9,15 +9,18 @@ pub fn month_code(month: u32) -> char {
 }
 
 pub fn month_from_code(code: char) -> Option<u32> {
-    MONTH_CODES.iter().position(|&c| c == code).map(|i| i as u32 + 1)
+    MONTH_CODES
+        .iter()
+        .position(|&c| c == code)
+        .map(|i| i as u32 + 1)
 }
 
 /// A futures contract in a series.
 #[derive(Debug, Clone)]
 pub struct FuturesContract {
-    pub underlying: String,     // e.g. "ES"
+    pub underlying: String, // e.g. "ES"
     pub expiry: NaiveDate,
-    pub ticker: String,         // e.g. "ES H25"
+    pub ticker: String, // e.g. "ES H25"
     pub is_active: bool,
     pub open_interest: Option<u64>,
 }
@@ -70,7 +73,8 @@ impl FuturesContractSeries {
 
         while result.len() < count {
             if self.active_months.contains(&month) {
-                let contract = FuturesContract::new(&self.underlying, year, month, self.expiry_rule);
+                let contract =
+                    FuturesContract::new(&self.underlying, year, month, self.expiry_rule);
                 if contract.expiry > from {
                     result.push(contract);
                 }

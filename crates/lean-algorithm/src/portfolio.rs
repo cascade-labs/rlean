@@ -1,15 +1,20 @@
 use lean_core::{Price, Quantity, Symbol};
-use lean_orders::{Order, OrderEvent};
+use lean_orders::Order;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 fn signum(d: Decimal) -> Decimal {
-    if d > dec!(0) { dec!(1) } else if d < dec!(0) { dec!(-1) } else { dec!(0) }
+    if d > dec!(0) {
+        dec!(1)
+    } else if d < dec!(0) {
+        dec!(-1)
+    } else {
+        dec!(0)
+    }
 }
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Tracks position in a single security.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,10 +41,18 @@ impl SecurityHolding {
         }
     }
 
-    pub fn is_long(&self) -> bool { self.quantity > dec!(0) }
-    pub fn is_short(&self) -> bool { self.quantity < dec!(0) }
-    pub fn is_invested(&self) -> bool { self.quantity != dec!(0) }
-    pub fn abs_quantity(&self) -> Quantity { self.quantity.abs() }
+    pub fn is_long(&self) -> bool {
+        self.quantity > dec!(0)
+    }
+    pub fn is_short(&self) -> bool {
+        self.quantity < dec!(0)
+    }
+    pub fn is_invested(&self) -> bool {
+        self.quantity != dec!(0)
+    }
+    pub fn abs_quantity(&self) -> Quantity {
+        self.quantity.abs()
+    }
 
     pub fn market_value(&self) -> Price {
         self.quantity * self.last_price
@@ -61,8 +74,8 @@ impl SecurityHolding {
             self.average_price = fill_price;
         } else if signum(current_qty) == signum(fill_quantity) {
             // Adding to existing position — update VWAP
-            self.average_price = (self.average_price * current_qty + fill_price * fill_quantity)
-                / new_qty;
+            self.average_price =
+                (self.average_price * current_qty + fill_price * fill_quantity) / new_qty;
         } else {
             // Reducing or reversing position
             let qty_closed = current_qty.abs().min(fill_quantity.abs());
@@ -120,20 +133,27 @@ impl SecurityPortfolioManager {
 
     pub fn total_portfolio_value(&self) -> Price {
         let cash = *self.cash.read();
-        let holdings_value: Price = self.holdings.read().values()
+        let holdings_value: Price = self
+            .holdings
+            .read()
+            .values()
             .map(|h| h.market_value())
             .sum();
         cash + holdings_value
     }
 
     pub fn unrealized_profit(&self) -> Price {
-        self.holdings.read().values()
+        self.holdings
+            .read()
+            .values()
             .map(|h| h.unrealized_pnl)
             .sum()
     }
 
     pub fn total_holdings_value(&self) -> Price {
-        self.holdings.read().values()
+        self.holdings
+            .read()
+            .values()
             .map(|h| h.market_value())
             .sum()
     }
@@ -157,7 +177,13 @@ impl SecurityPortfolioManager {
         *self.cash.write() += cash_delta;
     }
 
-    pub fn apply_fill(&self, order: &Order, fill_price: Price, fill_quantity: Quantity, fee: Price) {
+    pub fn apply_fill(
+        &self,
+        order: &Order,
+        fill_price: Price,
+        fill_quantity: Quantity,
+        fee: Price,
+    ) {
         let symbol = &order.symbol;
         let mut holdings = self.holdings.write();
         let h = holdings
@@ -183,7 +209,9 @@ impl SecurityPortfolioManager {
     }
 
     pub fn invested_symbols(&self) -> Vec<Symbol> {
-        self.holdings.read().values()
+        self.holdings
+            .read()
+            .values()
             .filter(|h| h.is_invested())
             .map(|h| h.symbol.clone())
             .collect()
@@ -191,7 +219,9 @@ impl SecurityPortfolioManager {
 
     /// Percentage return from starting portfolio value.
     pub fn total_return_pct(&self) -> Price {
-        if self.starting_cash.is_zero() { return dec!(0); }
+        if self.starting_cash.is_zero() {
+            return dec!(0);
+        }
         (self.total_portfolio_value() - self.starting_cash) / self.starting_cash
     }
 }

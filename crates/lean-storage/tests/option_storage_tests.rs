@@ -3,7 +3,6 @@
 /// These tests mirror the spirit of LEAN's C# LeanData path-generation
 /// unit tests (found in Lean/Tests/Common/Data/LeanDataTests.cs) translated
 /// to Rust, plus round-trip Parquet write/read tests.
-
 use chrono::NaiveDate;
 use lean_core::{Market, Resolution, Symbol};
 use lean_storage::{
@@ -125,10 +124,7 @@ fn test_option_path_uses_underlying_not_osi() {
 fn test_option_dir() {
     let spy = spy_equity();
     let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
-    assert_eq!(
-        dp.dir(),
-        PathBuf::from("/data/option/usa/daily/spy")
-    );
+    assert_eq!(dp.dir(), PathBuf::from("/data/option/usa/daily/spy"));
 }
 
 /// glob_all_dates for daily option bars — all dates under ticker subdirectory.
@@ -137,10 +133,7 @@ fn test_option_glob_all_dates_daily() {
     let spy = spy_equity();
     let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
     let glob = dp.glob_all_dates();
-    assert_eq!(
-        glob,
-        "/data/option/usa/daily/spy/*_trade.parquet"
-    );
+    assert_eq!(glob, "/data/option/usa/daily/spy/*_trade.parquet");
 }
 
 /// glob_all_dates for minute option bars.
@@ -149,10 +142,7 @@ fn test_option_glob_all_dates_minute() {
     let spy = spy_equity();
     let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Minute, date(2021, 4, 30));
     let glob = dp.glob_all_dates();
-    assert_eq!(
-        glob,
-        "/data/option/usa/minute/spy/*_trade.parquet"
-    );
+    assert_eq!(glob, "/data/option/usa/minute/spy/*_trade.parquet");
 }
 
 /// glob_all_dates for universe files.
@@ -161,10 +151,7 @@ fn test_option_universe_glob() {
     let spy = spy_equity();
     let dp = DataPath::option_universe("/data", &spy, date(2021, 1, 1));
     let glob = dp.glob_all_dates();
-    assert_eq!(
-        glob,
-        "/data/option/usa/universes/spy/*_universe.parquet"
-    );
+    assert_eq!(glob, "/data/option/usa/universes/spy/*_universe.parquet");
 }
 
 /// PathResolver convenience methods produce the same results as DataPath static methods.
@@ -176,8 +163,8 @@ fn test_path_resolver_option_methods() {
     let via_resolver = pr
         .option_eod_bar(&spy, Resolution::Daily, date(2021, 4, 30))
         .to_path();
-    let via_static = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30))
-        .to_path();
+    let via_static =
+        DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30)).to_path();
 
     assert_eq!(via_resolver, via_static);
 
@@ -293,13 +280,24 @@ fn test_write_option_eod_bars_at_data_path() {
     let spy = spy_equity();
 
     let dp = DataPath::option_eod_bar(tmp.path(), &spy, Resolution::Daily, date(2021, 4, 30));
-    let expected_path = tmp.path().join("option/usa/daily/spy/20210430_trade.parquet");
+    let expected_path = tmp
+        .path()
+        .join("option/usa/daily/spy/20210430_trade.parquet");
 
-    let bars = vec![sample_eod_bar("SPY", "SPY210430P00480000", date(2021, 4, 30), "P")];
+    let bars = vec![sample_eod_bar(
+        "SPY",
+        "SPY210430P00480000",
+        date(2021, 4, 30),
+        "P",
+    )];
     let writer = ParquetWriter::new(WriterConfig::default());
     writer.write_option_eod_bars_at(&bars, &dp).unwrap();
 
-    assert!(expected_path.exists(), "file should be at {}", expected_path.display());
+    assert!(
+        expected_path.exists(),
+        "file should be at {}",
+        expected_path.display()
+    );
 }
 
 /// Writing an empty slice should be a no-op (no file created).

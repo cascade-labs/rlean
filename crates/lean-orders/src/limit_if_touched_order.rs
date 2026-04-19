@@ -1,5 +1,4 @@
 use lean_core::{DateTime, Price, Quantity, Symbol};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::order::{Order, OrderDirection, OrderType};
@@ -41,7 +40,7 @@ impl LimitIfTouchedOrder {
     ) -> Self {
         let mut order = Order::market(id, symbol, quantity, time, tag);
         order.order_type = OrderType::LimitIfTouched;
-        order.stop_price = Some(trigger_price);   // reuse stop_price slot for trigger
+        order.stop_price = Some(trigger_price); // reuse stop_price slot for trigger
         order.limit_price = Some(limit_price);
         Self {
             order,
@@ -98,7 +97,7 @@ mod tests {
     fn buy_trigger_fires_when_price_drops() {
         let mut order = make_lit(dec!(10), dec!(95), dec!(94));
         assert!(!order.check_trigger(dec!(96))); // above trigger, no fire
-        assert!(order.check_trigger(dec!(95)));  // at trigger, fires
+        assert!(order.check_trigger(dec!(95))); // at trigger, fires
         assert!(!order.check_trigger(dec!(94))); // already triggered
     }
 
@@ -114,8 +113,8 @@ mod tests {
         let mut order = make_lit(dec!(10), dec!(95), dec!(94));
         assert!(!order.would_fill(dec!(93))); // not yet triggered
         order.check_trigger(dec!(95));
-        assert!(order.would_fill(dec!(94)));  // at limit
-        assert!(order.would_fill(dec!(90)));  // below limit
+        assert!(order.would_fill(dec!(94))); // at limit
+        assert!(order.would_fill(dec!(90))); // below limit
         assert!(!order.would_fill(dec!(96))); // above limit
     }
 }

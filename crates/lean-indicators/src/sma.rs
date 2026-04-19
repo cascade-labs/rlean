@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -27,11 +30,21 @@ impl Sma {
 }
 
 impl Indicator for Sma {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();

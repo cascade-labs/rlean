@@ -1,5 +1,8 @@
 # rlean
 
+[![Tests Passing](https://github.com/cascade-labs/rlean/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cascade-labs/rlean/actions/workflows/test.yml)
+[![gitcgr](https://gitcgr.com/badge/cascade-labs/rlean.svg)](https://gitcgr.com/cascade-labs/rlean)
+
 A Rust rewrite of [QuantConnect LEAN](https://github.com/QuantConnect/Lean), the open-source algorithmic trading engine. rlean targets the same strategy API as LEAN's C# Python bindings — existing `QCAlgorithm`-based strategies run unmodified — while adding a native Rust library for writing high-performance strategies directly. All market data is backed by [Apache Parquet](https://parquet.apache.org/), replacing LEAN's CSV-based data layer.
 
 ## Features
@@ -9,6 +12,14 @@ A Rust rewrite of [QuantConnect LEAN](https://github.com/QuantConnect/Lean), the
 - **Parquet data layer** — trade bars, factor files, map files, and option chains all stored in Parquet. No CSV.
 - **Plugin system** — brokerages and data providers are runtime plugins, installed and managed via `rlean plugin`.
 - **Research mode** — launches a Jupyter environment wired to the same engine used in backtests.
+
+---
+
+## CI
+
+GitHub Actions runs `cargo fmt --all --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` on every push to `main` and on every pull request.
+
+To enforce merge gates on GitHub, configure branch protection or a ruleset for `main` and mark these checks as required: `format`, `check`, `clippy`, and `test`.
 
 ---
 
@@ -256,6 +267,10 @@ Factor and map files are used for split/dividend adjustment, exactly as in LEAN.
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](./LICENSE).

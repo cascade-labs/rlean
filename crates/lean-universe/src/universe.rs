@@ -47,5 +47,7 @@ impl Universe for ManualUniverse {
         self.symbols.clone()
     }
 
-    fn settings(&self) -> &UniverseSettings { &self.settings }
+    fn settings(&self) -> &UniverseSettings {
+        &self.settings
+    }
 }

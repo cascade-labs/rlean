@@ -1,15 +1,17 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Kaufman Adaptive Moving Average.
 pub struct Kama {
     name: String,
     period: usize,
-    fast_sc: Decimal,  // fast EMA smoothing constant (2/(2+1))
-    slow_sc: Decimal,  // slow EMA smoothing constant (2/(30+1))
+    slow_sc: Decimal, // slow EMA smoothing constant (2/(30+1))
     diff_sc: Decimal,
     window: RollingWindow<Price>,
     prev_kama: Decimal,
@@ -25,7 +27,6 @@ impl Kama {
         Kama {
             name: format!("KAMA({},{},{})", period, fast_period, slow_period),
             period,
-            fast_sc,
             slow_sc,
             diff_sc,
             window: RollingWindow::new(period),
@@ -41,11 +42,21 @@ impl Kama {
 }
 
 impl Indicator for Kama {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -78,7 +89,11 @@ impl Indicator for Kama {
             volatility += (a - b).abs();
         }
 
-        let er = if volatility == dec!(0) { dec!(0) } else { direction / volatility };
+        let er = if volatility == dec!(0) {
+            dec!(0)
+        } else {
+            direction / volatility
+        };
         let sc_base = er * self.diff_sc + self.slow_sc;
         let sc_f = sc_base.to_f64().unwrap_or(0.0).powi(2);
         let sc = Decimal::from_f64_retain(sc_f).unwrap_or(dec!(0));

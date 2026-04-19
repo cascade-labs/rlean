@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
@@ -28,18 +31,30 @@ impl EaseOfMovement {
             current: IndicatorResult::not_ready(),
         }
     }
+}
 
-    pub fn default() -> Self {
+impl Default for EaseOfMovement {
+    fn default() -> Self {
         Self::new(1, 10000)
     }
 }
 
 impl Indicator for EaseOfMovement {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.sma.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.sma.warm_up_period() }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.sma.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.sma.warm_up_period()
+    }
 
     fn reset(&mut self) {
         self.sma.reset();
@@ -56,14 +71,19 @@ impl Indicator for EaseOfMovement {
     fn update_bar(&mut self, bar: &TradeBar) -> IndicatorResult {
         self.samples += 1;
 
-        let emv = if self.prev_high == dec!(0) && self.prev_low == dec!(0) {
-            dec!(0)
-        } else if bar.volume == dec!(0) || bar.high == bar.low {
+        let emv = if (self.prev_high == dec!(0) && self.prev_low == dec!(0))
+            || bar.volume == dec!(0)
+            || bar.high == bar.low
+        {
             dec!(0)
         } else {
             let mid = (bar.high + bar.low) / dec!(2) - (self.prev_high + self.prev_low) / dec!(2);
             let ratio = (bar.volume / self.scale) / (bar.high - bar.low);
-            if ratio == dec!(0) { dec!(0) } else { mid / ratio }
+            if ratio == dec!(0) {
+                dec!(0)
+            } else {
+                mid / ratio
+            }
         };
 
         self.prev_high = bar.high;

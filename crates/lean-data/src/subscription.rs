@@ -1,7 +1,7 @@
-use lean_core::{DataNormalizationMode, Resolution, SecurityType, Symbol, TickType};
+use lean_core::{DataNormalizationMode, Resolution, Symbol, TickType};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// All configuration needed to subscribe to a data stream.
@@ -66,8 +66,8 @@ impl SubscriptionDataConfig {
     }
 
     pub fn unique_id(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hash;
         let mut h = DefaultHasher::new();
         self.symbol.id.sid.hash(&mut h);
         (self.resolution as u8).hash(&mut h);

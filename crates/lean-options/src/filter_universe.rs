@@ -1,7 +1,7 @@
+use crate::contract::OptionContract;
+use chrono::{Datelike, NaiveDate};
 use lean_core::OptionRight;
 use rust_decimal::Decimal;
-use chrono::{Datelike, NaiveDate};
-use crate::contract::OptionContract;
 
 /// Fluent filter builder for selecting option contracts from a universe.
 /// Mirrors C# `OptionFilterUniverse`.
@@ -12,19 +12,23 @@ pub struct OptionFilterUniverse {
 
 impl OptionFilterUniverse {
     pub fn new(contracts: Vec<OptionContract>, underlying_price: Decimal) -> Self {
-        OptionFilterUniverse { contracts, underlying_price }
+        OptionFilterUniverse {
+            contracts,
+            underlying_price,
+        }
     }
 
     /// Finish filtering and return the selected contracts.
-    pub fn into_contracts(self) -> Vec<OptionContract> { self.contracts }
+    pub fn into_contracts(self) -> Vec<OptionContract> {
+        self.contracts
+    }
 
     /// Filter by strike distance from ATM.
     /// minStrike=-1, maxStrike=+1 means 1 strike below and above ATM.
     pub fn strikes(mut self, min_strike: i32, max_strike: i32) -> Self {
         let unique_strikes: Vec<Decimal> = {
-            let set: std::collections::BTreeSet<_> = self.contracts.iter()
-                .map(|c| c.strike)
-                .collect();
+            let set: std::collections::BTreeSet<_> =
+                self.contracts.iter().map(|c| c.strike).collect();
             set.into_iter().collect()
         };
 
@@ -35,7 +39,11 @@ impl OptionFilterUniverse {
 
         // Find ATM index
         let atm_idx = unique_strikes.partition_point(|&s| s < self.underlying_price);
-        let atm_idx = if atm_idx == unique_strikes.len() { atm_idx.saturating_sub(1) } else { atm_idx };
+        let atm_idx = if atm_idx == unique_strikes.len() {
+            atm_idx.saturating_sub(1)
+        } else {
+            atm_idx
+        };
 
         let min_idx = (atm_idx as i32 + min_strike).max(0) as usize;
         let max_idx = ((atm_idx as i32 + max_strike).max(0) as usize)
@@ -49,7 +57,8 @@ impl OptionFilterUniverse {
         let min_price = unique_strikes[min_idx];
         let max_price = unique_strikes[max_idx];
 
-        self.contracts.retain(|c| c.strike >= min_price && c.strike <= max_price);
+        self.contracts
+            .retain(|c| c.strike >= min_price && c.strike <= max_price);
         self
     }
 
@@ -65,7 +74,8 @@ impl OptionFilterUniverse {
 
     /// Filter by expiry date range directly.
     pub fn expiration_dates(mut self, min_date: NaiveDate, max_date: NaiveDate) -> Self {
-        self.contracts.retain(|c| c.expiry >= min_date && c.expiry <= max_date);
+        self.contracts
+            .retain(|c| c.expiry >= min_date && c.expiry <= max_date);
         self
     }
 
@@ -110,7 +120,9 @@ impl OptionFilterUniverse {
     }
 
     /// Include weekly contracts (non-standard expiries).
-    pub fn include_weeklys(self) -> Self { self } // no-op: all contracts included by default
+    pub fn include_weeklys(self) -> Self {
+        self
+    } // no-op: all contracts included by default
 
     /// Apply a custom predicate.
     pub fn where_contract<F: Fn(&OptionContract) -> bool>(mut self, f: F) -> Self {
@@ -122,7 +134,9 @@ impl OptionFilterUniverse {
 /// Returns true if the expiry falls on the standard monthly expiry (3rd Friday).
 pub fn is_standard_contract(expiry: NaiveDate) -> bool {
     use chrono::Weekday;
-    if expiry.weekday() != Weekday::Fri { return false; }
+    if expiry.weekday() != Weekday::Fri {
+        return false;
+    }
     let first_day = NaiveDate::from_ymd_opt(expiry.year(), expiry.month(), 1).unwrap();
     let first_friday_offset = (Weekday::Fri.num_days_from_monday() as i32
         - first_day.weekday().num_days_from_monday() as i32)

@@ -1,5 +1,5 @@
-use crate::parameter::{ParameterDefinition, ParameterSet, OptimizationResult};
 use crate::objective::ObjectiveFunction;
+use crate::parameter::{OptimizationResult, ParameterDefinition, ParameterSet};
 
 pub struct RandomSearchOptimizer {
     pub parameters: Vec<ParameterDefinition>,
@@ -14,7 +14,12 @@ impl RandomSearchOptimizer {
         objective: ObjectiveFunction,
         n_samples: usize,
     ) -> Self {
-        Self { parameters, objective, n_samples, seed: 42 }
+        Self {
+            parameters,
+            objective,
+            n_samples,
+            seed: 42,
+        }
     }
 
     pub fn sample_parameters(&self) -> Vec<ParameterSet> {

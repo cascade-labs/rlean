@@ -24,7 +24,10 @@ pub struct RangeBarConsolidator {
 impl RangeBarConsolidator {
     pub fn new(range: Decimal) -> Self {
         assert!(range > dec!(0), "range must be > 0");
-        Self { range, working: None }
+        Self {
+            range,
+            working: None,
+        }
     }
 }
 
@@ -35,29 +38,33 @@ impl IConsolidator for RangeBarConsolidator {
                 // Seed a new working bar with the incoming bar's close as a single point.
                 let mut seed = bar.clone();
                 // Normalise to a single-price point so range is 0 at start
-                seed.open  = bar.close;
-                seed.high  = bar.close;
-                seed.low   = bar.close;
+                seed.open = bar.close;
+                seed.high = bar.close;
+                seed.low = bar.close;
                 self.working = Some(seed);
                 None
             }
             Some(w) => {
                 // Update running extremes
-                if bar.high > w.high { w.high = bar.high; }
-                if bar.low  < w.low  { w.low  = bar.low;  }
-                w.close    = bar.close;
-                w.volume  += bar.volume;
+                if bar.high > w.high {
+                    w.high = bar.high;
+                }
+                if bar.low < w.low {
+                    w.low = bar.low;
+                }
+                w.close = bar.close;
+                w.volume += bar.volume;
                 w.end_time = bar.end_time;
-                w.period   = TimeSpan::from_nanos(w.end_time.0 - w.time.0);
+                w.period = TimeSpan::from_nanos(w.end_time.0 - w.time.0);
 
                 let current_range = w.high - w.low;
                 if current_range >= self.range {
                     let emitted = self.working.take();
                     // Seed next bar from current close
                     let mut seed = bar.clone();
-                    seed.open  = bar.close;
-                    seed.high  = bar.close;
-                    seed.low   = bar.close;
+                    seed.open = bar.close;
+                    seed.high = bar.close;
+                    seed.low = bar.close;
                     self.working = Some(seed);
                     emitted
                 } else {

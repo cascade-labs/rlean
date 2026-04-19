@@ -1,4 +1,7 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
@@ -35,7 +38,10 @@ impl Vortex {
             prev_bar: None,
             samples: 0,
             current: IndicatorResult::not_ready(),
-            last_result: VortexResult { plus: dec!(0), minus: dec!(0) },
+            last_result: VortexResult {
+                plus: dec!(0),
+                minus: dec!(0),
+            },
         }
     }
 
@@ -45,11 +51,21 @@ impl Vortex {
 }
 
 impl Indicator for Vortex {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.samples >= self.period }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.samples >= self.period
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.tr_window.clear();
@@ -58,7 +74,10 @@ impl Indicator for Vortex {
         self.prev_bar = None;
         self.samples = 0;
         self.current = IndicatorResult::not_ready();
-        self.last_result = VortexResult { plus: dec!(0), minus: dec!(0) };
+        self.last_result = VortexResult {
+            plus: dec!(0),
+            minus: dec!(0),
+        };
     }
 
     fn update_price(&mut self, _time: DateTime, _value: Price) -> IndicatorResult {

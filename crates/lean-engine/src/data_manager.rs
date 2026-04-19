@@ -1,7 +1,6 @@
 use lean_core::{DateTime, Resolution, Result as LeanResult, Symbol};
-use lean_data::{Slice, SubscriptionDataConfig, TradeBar};
+use lean_data::{Slice, SubscriptionDataConfig};
 use lean_storage::{DataCache, ParquetReader, PathResolver, QueryParams};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
@@ -38,7 +37,9 @@ impl DataManager {
 
         for sub in &self.subscriptions {
             let sid = sub.symbol.id.sid;
-            let day_key = date.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap()).num_days() as i64;
+            let day_key = date
+                .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap())
+                .num_days();
 
             // Check cache first
             if let Some(cached) = self.cache.get_bars(sid, day_key) {
@@ -54,7 +55,8 @@ impl DataManager {
 
             if path.exists() {
                 let params = QueryParams::new().with_time_range(start, end);
-                let bars = self.reader
+                let bars = self
+                    .reader
                     .read_trade_bars(&[path], sub.symbol.clone(), &params)
                     .await?;
 
@@ -69,7 +71,13 @@ impl DataManager {
     }
 
     /// Preload bars for a date range into cache (parallel).
-    pub async fn warm_cache(&self, symbol: &Symbol, resolution: Resolution, start: chrono::NaiveDate, end: chrono::NaiveDate) -> LeanResult<usize> {
+    pub async fn warm_cache(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> LeanResult<usize> {
         use chrono::Duration;
         let mut loaded = 0usize;
         let mut date = start;
@@ -78,15 +86,22 @@ impl DataManager {
             let data_path = self.resolver.trade_bar(symbol, resolution, date);
             let path = data_path.to_path();
             let sid = symbol.id.sid;
-            let day_key = date.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap()).num_days() as i64;
+            let day_key = date
+                .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap())
+                .num_days();
 
             if path.exists() && self.cache.get_bars(sid, day_key).is_none() {
                 use chrono::{TimeZone, Utc};
-                let day_start = DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
-                let day_end = DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(23, 59, 59).unwrap()));
+                let day_start =
+                    DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
+                let day_end =
+                    DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(23, 59, 59).unwrap()));
 
                 let params = QueryParams::new().with_time_range(day_start, day_end);
-                let bars = self.reader.read_trade_bars(&[path], symbol.clone(), &params).await?;
+                let bars = self
+                    .reader
+                    .read_trade_bars(&[path], symbol.clone(), &params)
+                    .await?;
                 loaded += bars.len();
                 self.cache.insert_bars(sid, day_key, bars);
             }

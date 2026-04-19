@@ -6,7 +6,7 @@ use rust_decimal_macros::dec;
 pub fn intrinsic_value(underlying_price: Decimal, strike: Decimal, right: OptionRight) -> Decimal {
     match right {
         OptionRight::Call => (underlying_price - strike).max(dec!(0)),
-        OptionRight::Put  => (strike - underlying_price).max(dec!(0)),
+        OptionRight::Put => (strike - underlying_price).max(dec!(0)),
     }
 }
 
@@ -34,7 +34,7 @@ pub fn get_exercise_quantity(
 ) -> Decimal {
     let sign = match right {
         OptionRight::Call => dec!(-1),
-        OptionRight::Put  => dec!(1),
+        OptionRight::Put => dec!(1),
     };
     sign * exercise_order_quantity * Decimal::from(contract_unit_of_trade)
 }

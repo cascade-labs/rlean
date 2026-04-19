@@ -10,22 +10,34 @@ fn tick_has_no_duration() {
 
 #[test]
 fn second_resolution_is_one_second() {
-    assert_eq!(Resolution::Second.to_duration(), Some(Duration::from_secs(1)));
+    assert_eq!(
+        Resolution::Second.to_duration(),
+        Some(Duration::from_secs(1))
+    );
 }
 
 #[test]
 fn minute_resolution_is_60_seconds() {
-    assert_eq!(Resolution::Minute.to_duration(), Some(Duration::from_secs(60)));
+    assert_eq!(
+        Resolution::Minute.to_duration(),
+        Some(Duration::from_secs(60))
+    );
 }
 
 #[test]
 fn hour_resolution_is_3600_seconds() {
-    assert_eq!(Resolution::Hour.to_duration(), Some(Duration::from_secs(3600)));
+    assert_eq!(
+        Resolution::Hour.to_duration(),
+        Some(Duration::from_secs(3600))
+    );
 }
 
 #[test]
 fn daily_resolution_is_86400_seconds() {
-    assert_eq!(Resolution::Daily.to_duration(), Some(Duration::from_secs(86400)));
+    assert_eq!(
+        Resolution::Daily.to_duration(),
+        Some(Duration::from_secs(86400))
+    );
 }
 
 #[test]

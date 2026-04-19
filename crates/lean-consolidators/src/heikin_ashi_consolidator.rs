@@ -45,30 +45,30 @@ impl IConsolidator for HeikinAshiConsolidator {
 
         let ha_open = match (self.prev_ha_open, self.prev_ha_close) {
             (Some(po), Some(pc)) => (po + pc) / two,
-            _ => (bar.open + bar.close) / two,  // first bar seed
+            _ => (bar.open + bar.close) / two, // first bar seed
         };
 
         let ha_high = bar.high.max(ha_open).max(ha_close);
-        let ha_low  = bar.low.min(ha_open).min(ha_close);
+        let ha_low = bar.low.min(ha_open).min(ha_close);
 
-        self.prev_ha_open  = Some(ha_open);
+        self.prev_ha_open = Some(ha_open);
         self.prev_ha_close = Some(ha_close);
 
         Some(TradeBar {
-            symbol:   bar.symbol.clone(),
-            time:     bar.time,
+            symbol: bar.symbol.clone(),
+            time: bar.time,
             end_time: bar.end_time,
-            open:     ha_open,
-            high:     ha_high,
-            low:      ha_low,
-            close:    ha_close,
-            volume:   bar.volume,
-            period:   bar.period,
+            open: ha_open,
+            high: ha_high,
+            low: ha_low,
+            close: ha_close,
+            volume: bar.volume,
+            period: bar.period,
         })
     }
 
     fn reset(&mut self) {
-        self.prev_ha_open  = None;
+        self.prev_ha_open = None;
         self.prev_ha_close = None;
     }
 

@@ -63,8 +63,13 @@ impl<T: Clone> RollingWindow<T> {
     }
 }
 
-impl<T: Clone + std::ops::Add<Output = T> + std::ops::Div<Output = T> + Default + From<u32>> RollingWindow<T> {
-    pub fn sum(&self) -> T where T: std::iter::Sum {
+impl<T: Clone + std::ops::Add<Output = T> + std::ops::Div<Output = T> + Default + From<u32>>
+    RollingWindow<T>
+{
+    pub fn sum(&self) -> T
+    where
+        T: std::iter::Sum,
+    {
         self.data.iter().cloned().sum()
     }
 }

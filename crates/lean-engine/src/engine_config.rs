@@ -1,4 +1,4 @@
-use lean_core::{DateTime, Resolution};
+use lean_core::DateTime;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

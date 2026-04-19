@@ -1,13 +1,24 @@
 use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use lean_data::{Slice, TradeBar, Tick};
+use lean_data::{Slice, Tick, TradeBar, TradeBarData};
 use rust_decimal_macros::dec;
 
-fn spy() -> Symbol { Symbol::create_equity("SPY", &Market::usa()) }
-fn aapl() -> Symbol { Symbol::create_equity("AAPL", &Market::usa()) }
-fn t() -> NanosecondTimestamp { NanosecondTimestamp::from_secs(1_700_000_000) }
+fn spy() -> Symbol {
+    Symbol::create_equity("SPY", &Market::usa())
+}
+fn aapl() -> Symbol {
+    Symbol::create_equity("AAPL", &Market::usa())
+}
+fn t() -> NanosecondTimestamp {
+    NanosecondTimestamp::from_secs(1_700_000_000)
+}
 
 fn make_bar(sym: Symbol, close: rust_decimal::Decimal) -> TradeBar {
-    TradeBar::new(sym, t(), TimeSpan::ONE_DAY, close, close, close, close, dec!(1000))
+    TradeBar::new(
+        sym,
+        t(),
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(close, close, close, close, dec!(1000)),
+    )
 }
 
 #[test]

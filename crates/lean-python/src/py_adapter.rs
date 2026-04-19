@@ -1,14 +1,14 @@
-use std::sync::{Arc, Mutex};
-use pyo3::prelude::*;
+use crate::charting::ChartCollection;
+use crate::py_data::{PySlice, SliceProxy};
+use crate::py_orders::PyOrderEvent;
+use crate::py_qc_algorithm::PyQcAlgorithm;
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
 use lean_data::Slice;
 use lean_orders::{Order, OrderEvent};
-use crate::charting::ChartCollection;
-use crate::py_data::{PySlice, SliceProxy};
-use crate::py_orders::PyOrderEvent;
-use crate::py_qc_algorithm::PyQcAlgorithm;
+use pyo3::prelude::*;
+use std::sync::{Arc, Mutex};
 
 /// Bridges a Python strategy object to the Rust `IAlgorithm` trait.
 /// Holds both the Python object (for calling `on_data` etc.) and
@@ -32,7 +32,10 @@ impl PyAlgorithmAdapter {
     /// Must be called with the GIL already held via `Python::with_gil`.
     pub fn on_data_proxy(&mut self, py: Python<'_>, proxy: &SliceProxy, slice: &Slice) {
         proxy.update(py, slice);
-        if let Err(e) = self.py_obj.call_method1(py, "on_data", (proxy.py_slice.bind(py),)) {
+        if let Err(e) = self
+            .py_obj
+            .call_method1(py, "on_data", (proxy.py_slice.bind(py),))
+        {
             e.print(py);
         }
     }
@@ -46,12 +49,19 @@ impl PyAlgorithmAdapter {
         let inner = qc_ref.borrow().inner_arc();
         let charts = qc_ref.borrow().charts_arc();
         let name = inner.lock().unwrap().name.clone();
-        Ok(PyAlgorithmAdapter { py_obj: instance, inner, charts, name })
+        Ok(PyAlgorithmAdapter {
+            py_obj: instance,
+            inner,
+            charts,
+            name,
+        })
     }
 }
 
 impl IAlgorithm for PyAlgorithmAdapter {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     fn start_date(&self) -> DateTime {
         self.inner.lock().unwrap().start_date
@@ -67,11 +77,10 @@ impl IAlgorithm for PyAlgorithmAdapter {
 
     fn initialize(&mut self) -> LeanResult<()> {
         Python::with_gil(|py| {
-            self.py_obj.call_method0(py, "initialize")
-                .map_err(|e| {
-                    e.print(py);
-                    anyhow::anyhow!("Python initialize() failed")
-                })?;
+            self.py_obj.call_method0(py, "initialize").map_err(|e| {
+                e.print(py);
+                anyhow::anyhow!("Python initialize() failed")
+            })?;
             // Update cached name in case set_name was called
             self.name = self.inner.lock().unwrap().name.clone();
             Ok(())
@@ -79,15 +88,13 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn on_data(&mut self, slice: &Slice) {
-        Python::with_gil(|py| {
-            match PySlice::from_slice(py, slice) {
-                Ok(py_slice) => {
-                    if let Err(e) = self.py_obj.call_method1(py, "on_data", (py_slice,)) {
-                        e.print(py);
-                    }
+        Python::with_gil(|py| match PySlice::from_slice(py, slice) {
+            Ok(py_slice) => {
+                if let Err(e) = self.py_obj.call_method1(py, "on_data", (py_slice,)) {
+                    e.print(py);
                 }
-                Err(e) => e.print(py),
             }
+            Err(e) => e.print(py),
         });
     }
 
@@ -163,7 +170,9 @@ impl PyAlgorithmAdapter {
             utc_ns,
             quantity,
             underlying_price.to_f64().unwrap_or(0.0),
-            (entry_premium * quantity * rust_decimal_macros::dec!(100)).to_f64().unwrap_or(0.0),
+            (entry_premium * quantity * rust_decimal_macros::dec!(100))
+                .to_f64()
+                .unwrap_or(0.0),
         );
         let result = Python::with_gil(|py| -> PyResult<()> {
             self.py_obj.call_method1(py, "on_order_event", (event,))?;
@@ -190,7 +199,8 @@ impl PyAlgorithmAdapter {
             is_assignment,
         );
         let result = Python::with_gil(|py| -> PyResult<()> {
-            self.py_obj.call_method1(py, "on_assignment_order_event", (event,))?;
+            self.py_obj
+                .call_method1(py, "on_assignment_order_event", (event,))?;
             Ok(())
         });
         if let Err(e) = result {

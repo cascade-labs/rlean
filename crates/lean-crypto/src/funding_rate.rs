@@ -38,7 +38,6 @@ impl FundingRate {
     }
 
     pub fn advance(&mut self) {
-        self.next_funding_time = self.next_funding_time
-            + chrono::Duration::hours(self.interval_hours as i64);
+        self.next_funding_time += chrono::Duration::hours(self.interval_hours as i64);
     }
 }

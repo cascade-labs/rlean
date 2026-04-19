@@ -69,12 +69,24 @@ impl Market {
     market_const!(TSE, "tse");
     market_const!(UNKNOWN, "unknown");
 
-    pub fn usa() -> Self { Market::new(Self::USA) }
-    pub fn forex() -> Self { Market::new(Self::FOREX) }
-    pub fn binance() -> Self { Market::new(Self::BINANCE) }
-    pub fn coinbase() -> Self { Market::new(Self::COINBASE) }
-    pub fn cme() -> Self { Market::new(Self::CME) }
-    pub fn cboe() -> Self { Market::new(Self::CBOE) }
+    pub fn usa() -> Self {
+        Market::new(Self::USA)
+    }
+    pub fn forex() -> Self {
+        Market::new(Self::FOREX)
+    }
+    pub fn binance() -> Self {
+        Market::new(Self::BINANCE)
+    }
+    pub fn coinbase() -> Self {
+        Market::new(Self::COINBASE)
+    }
+    pub fn cme() -> Self {
+        Market::new(Self::CME)
+    }
+    pub fn cboe() -> Self {
+        Market::new(Self::CBOE)
+    }
 }
 
 static MARKET_CODES: Lazy<RwLock<HashMap<String, u32>>> = Lazy::new(|| {

@@ -1,33 +1,26 @@
 use crate::{
-    algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges},
-    benchmark::BenchmarkProvider,
-    logging::{AlgorithmLogging, LogLevel},
-    portfolio::SecurityPortfolioManager,
-    runtime_statistics::RuntimeStatistics,
-    securities::SecurityManager,
-};
-use lean_core::{
-    DateTime, Market, Price, Quantity, Resolution,
-    SecurityType, Symbol, SymbolProperties, TimeSpan,
-    OptionRight, OptionStyle, SettlementType, SymbolOptionsExt,
+    algorithm::AlgorithmStatus, logging::AlgorithmLogging, portfolio::SecurityPortfolioManager,
+    runtime_statistics::RuntimeStatistics, securities::SecurityManager,
 };
 use lean_core::exchange_hours::ExchangeHours;
-use lean_data::{CustomDataSubscription, Slice, SubscriptionDataConfig, SubscriptionManager};
-use lean_indicators::Indicator;
+use lean_core::{
+    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SettlementType,
+    Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
+};
+use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionManager};
 use lean_options::OptionChain;
 use lean_orders::{
-    order::{Order, OrderType, TimeInForce},
+    combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
+    order::{Order, OrderType},
     order_ticket::OrderTicket,
+    trailing_stop_order::TrailingStopOrderParams,
     transaction_manager::TransactionManager,
-    TrailingStopOrder, LimitIfTouchedOrder,
-    combo_orders::{ComboLegDetails, ComboMarketOrder, ComboLimitOrder, ComboLegLimitOrder},
+    LimitIfTouchedOrder, TrailingStopOrder,
 };
-use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
 
 /// Represents an open option position held by the algorithm.
 #[derive(Debug, Clone)]
@@ -136,8 +129,7 @@ impl QcAlgorithm {
 
     pub fn set_start_date(&mut self, year: i32, month: u32, day: u32) {
         use chrono::NaiveDate;
-        let date = NaiveDate::from_ymd_opt(year, month, day)
-            .expect("invalid date");
+        let date = NaiveDate::from_ymd_opt(year, month, day).expect("invalid date");
         use chrono::{TimeZone, Utc};
         let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
         self.start_date = DateTime::from(dt);
@@ -145,8 +137,7 @@ impl QcAlgorithm {
 
     pub fn set_end_date(&mut self, year: i32, month: u32, day: u32) {
         use chrono::NaiveDate;
-        let date = NaiveDate::from_ymd_opt(year, month, day)
-            .expect("invalid date");
+        let date = NaiveDate::from_ymd_opt(year, month, day).expect("invalid date");
         use chrono::{TimeZone, Utc};
         let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
         self.end_date = DateTime::from(dt);
@@ -161,7 +152,10 @@ impl QcAlgorithm {
     }
 
     pub fn set_warmup_periods(&mut self, periods: i64, resolution: Resolution) {
-        let nanos = resolution.to_nanos().unwrap_or(TimeSpan::ONE_DAY.nanos as u64) as i64 * periods;
+        let nanos = resolution
+            .to_nanos()
+            .unwrap_or(TimeSpan::ONE_DAY.nanos as u64) as i64
+            * periods;
         self.warmup_period = Some(TimeSpan::from_nanos(nanos));
     }
 
@@ -195,7 +189,10 @@ impl QcAlgorithm {
         let hours = ExchangeHours::us_equity();
         let props = SymbolProperties::default();
         self.securities.add(crate::securities::Security::new(
-            symbol.clone(), resolution, props, hours,
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
         ));
         symbol
     }
@@ -207,7 +204,10 @@ impl QcAlgorithm {
         let hours = ExchangeHours::forex_24h();
         let props = SymbolProperties::default();
         self.securities.add(crate::securities::Security::new(
-            symbol.clone(), resolution, props, hours,
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
         ));
         symbol
     }
@@ -219,7 +219,10 @@ impl QcAlgorithm {
         let hours = ExchangeHours::crypto_24_7();
         let props = SymbolProperties::default();
         self.securities.add(crate::securities::Security::new(
-            symbol.clone(), resolution, props, hours,
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
         ));
         symbol
     }
@@ -237,21 +240,45 @@ impl QcAlgorithm {
         self.transactions.add_order(order)
     }
 
-    pub fn limit_order(&mut self, symbol: &Symbol, quantity: Quantity, limit_price: Price) -> OrderTicket {
+    pub fn limit_order(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+    ) -> OrderTicket {
         let id = self.next_order_id();
         let order = Order::limit(id, symbol.clone(), quantity, limit_price, self.utc_time, "");
         self.transactions.add_order(order)
     }
 
-    pub fn stop_market_order(&mut self, symbol: &Symbol, quantity: Quantity, stop_price: Price) -> OrderTicket {
+    pub fn stop_market_order(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+    ) -> OrderTicket {
         let id = self.next_order_id();
         let order = Order::stop_market(id, symbol.clone(), quantity, stop_price, self.utc_time, "");
         self.transactions.add_order(order)
     }
 
-    pub fn stop_limit_order(&mut self, symbol: &Symbol, quantity: Quantity, stop_price: Price, limit_price: Price) -> OrderTicket {
+    pub fn stop_limit_order(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        limit_price: Price,
+    ) -> OrderTicket {
         let id = self.next_order_id();
-        let order = Order::stop_limit(id, symbol.clone(), quantity, stop_price, limit_price, self.utc_time, "");
+        let order = Order::stop_limit(
+            id,
+            symbol.clone(),
+            quantity,
+            stop_price,
+            limit_price,
+            self.utc_time,
+            "",
+        );
         self.transactions.add_order(order)
     }
 
@@ -290,11 +317,13 @@ impl QcAlgorithm {
             id,
             symbol.clone(),
             quantity,
-            trailing_amount,
-            trailing_as_percentage,
-            stop_price,
-            self.utc_time,
-            "",
+            TrailingStopOrderParams {
+                trailing_amount,
+                trailing_as_percentage,
+                stop_price,
+                time: self.utc_time,
+                tag: "",
+            },
         );
         self.transactions.add_order(tso.order)
     }
@@ -346,7 +375,15 @@ impl QcAlgorithm {
         legs: Vec<ComboLegDetails>,
     ) -> OrderTicket {
         let id = self.next_order_id();
-        let clo = ComboLimitOrder::new(id, symbol.clone(), quantity, limit_price, self.utc_time, "", legs);
+        let clo = ComboLimitOrder::new(
+            id,
+            symbol.clone(),
+            quantity,
+            limit_price,
+            self.utc_time,
+            "",
+            legs,
+        );
         self.transactions.add_order(clo.order)
     }
 
@@ -359,7 +396,15 @@ impl QcAlgorithm {
         legs: Vec<ComboLegDetails>,
     ) -> OrderTicket {
         let id = self.next_order_id();
-        let cll = ComboLegLimitOrder::new(id, symbol.clone(), quantity, limit_price, self.utc_time, "", legs);
+        let cll = ComboLegLimitOrder::new(
+            id,
+            symbol.clone(),
+            quantity,
+            limit_price,
+            self.utc_time,
+            "",
+            legs,
+        );
         self.transactions.add_order(cll.order)
     }
 
@@ -368,20 +413,26 @@ impl QcAlgorithm {
         let portfolio_value = self.portfolio.total_portfolio_value();
         let current_price = self.securities.get(symbol)?.current_price();
 
-        if current_price.is_zero() { return None; }
+        if current_price.is_zero() {
+            return None;
+        }
 
         let target_value = portfolio_value * target;
         let current_holding = self.portfolio.get_holding(symbol);
         let current_value = current_holding.market_value();
         let delta_value = target_value - current_value;
 
-        if delta_value.abs() < dec!(1) { return None; } // avoid tiny orders
+        if delta_value.abs() < dec!(1) {
+            return None;
+        } // avoid tiny orders
 
         let qty = delta_value / current_price;
         // Truncate (floor toward zero) to integer, matching C# LEAN's lot-size behavior
         let qty_rounded = qty.trunc();
 
-        if qty_rounded.is_zero() { return None; }
+        if qty_rounded.is_zero() {
+            return None;
+        }
 
         Some(self.market_order(symbol, qty_rounded))
     }
@@ -478,9 +529,15 @@ impl QcAlgorithm {
 
     // ─── Portfolio Helpers ───────────────────────────────────────────────────
 
-    pub fn cash(&self) -> Price { *self.portfolio.cash.read() }
-    pub fn portfolio_value(&self) -> Price { self.portfolio.total_portfolio_value() }
-    pub fn is_invested(&self, symbol: &Symbol) -> bool { self.portfolio.is_invested(symbol) }
+    pub fn cash(&self) -> Price {
+        *self.portfolio.cash.read()
+    }
+    pub fn portfolio_value(&self) -> Price {
+        self.portfolio.total_portfolio_value()
+    }
+    pub fn is_invested(&self, symbol: &Symbol) -> bool {
+        self.portfolio.is_invested(symbol)
+    }
 
     // ─── Options ─────────────────────────────────────────────────────────────
 
@@ -519,23 +576,29 @@ impl QcAlgorithm {
         *self.portfolio.cash.write() += total_premium;
 
         if let Some(option_id) = symbol.option_symbol_id() {
-            self.option_positions.insert(symbol.id.sid, OpenOptionPosition {
-                symbol: symbol.clone(),
-                strike: option_id.strike,
-                expiry: option_id.expiry,
-                right: option_id.right,
-                style: option_id.style,
-                settlement: SettlementType::PhysicalDelivery,
-                quantity: -quantity,  // negative = short
-                entry_price: premium_per_contract,
-                contract_unit_of_trade: 100,
-            });
+            self.option_positions.insert(
+                symbol.id.sid,
+                OpenOptionPosition {
+                    symbol: symbol.clone(),
+                    strike: option_id.strike,
+                    expiry: option_id.expiry,
+                    right: option_id.right,
+                    style: option_id.style,
+                    settlement: SettlementType::PhysicalDelivery,
+                    quantity: -quantity, // negative = short
+                    entry_price: premium_per_contract,
+                    contract_unit_of_trade: 100,
+                },
+            );
         }
 
         let order_id = self.next_order_id();
         tracing::info!(
             "SELL TO OPEN {} x{} @ {} (premium: {})",
-            symbol.value, quantity, premium_per_contract, total_premium
+            symbol.value,
+            quantity,
+            premium_per_contract,
+            total_premium
         );
         order_id
     }
@@ -553,23 +616,29 @@ impl QcAlgorithm {
         *self.portfolio.cash.write() -= total_cost;
 
         if let Some(option_id) = symbol.option_symbol_id() {
-            self.option_positions.insert(symbol.id.sid, OpenOptionPosition {
-                symbol: symbol.clone(),
-                strike: option_id.strike,
-                expiry: option_id.expiry,
-                right: option_id.right,
-                style: option_id.style,
-                settlement: SettlementType::PhysicalDelivery,
-                quantity,   // positive = long
-                entry_price: premium_per_contract,
-                contract_unit_of_trade: 100,
-            });
+            self.option_positions.insert(
+                symbol.id.sid,
+                OpenOptionPosition {
+                    symbol: symbol.clone(),
+                    strike: option_id.strike,
+                    expiry: option_id.expiry,
+                    right: option_id.right,
+                    style: option_id.style,
+                    settlement: SettlementType::PhysicalDelivery,
+                    quantity, // positive = long
+                    entry_price: premium_per_contract,
+                    contract_unit_of_trade: 100,
+                },
+            );
         }
 
         let order_id = self.next_order_id();
         tracing::info!(
             "BUY TO OPEN {} x{} @ {} (cost: {})",
-            symbol.value, quantity, premium_per_contract, total_cost
+            symbol.value,
+            quantity,
+            premium_per_contract,
+            total_cost
         );
         order_id
     }
@@ -589,7 +658,9 @@ impl QcAlgorithm {
         let order_id = self.next_order_id();
         tracing::info!(
             "BUY TO CLOSE {} x{} @ {}",
-            symbol.value, quantity, premium_per_contract
+            symbol.value,
+            quantity,
+            premium_per_contract
         );
         order_id
     }
@@ -609,7 +680,9 @@ impl QcAlgorithm {
         let order_id = self.next_order_id();
         tracing::info!(
             "SELL TO CLOSE {} x{} @ {}",
-            symbol.value, quantity, premium_per_contract
+            symbol.value,
+            quantity,
+            premium_per_contract
         );
         order_id
     }

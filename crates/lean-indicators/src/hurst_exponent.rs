@@ -1,14 +1,16 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Hurst Exponent using R/S log-log regression.
 pub struct HurstExponent {
     name: String,
     period: usize,
-    max_lag: usize,
     window: RollingWindow<Price>,
     time_lags: Vec<usize>,
     sum_x: f64,
@@ -32,7 +34,6 @@ impl HurstExponent {
         HurstExponent {
             name: format!("HE({},{})", period, max_lag),
             period,
-            max_lag,
             window: RollingWindow::new(period),
             time_lags,
             sum_x,
@@ -48,11 +49,21 @@ impl HurstExponent {
 }
 
 impl Indicator for HurstExponent {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();
@@ -79,7 +90,11 @@ impl Indicator for HurstExponent {
 
             for i in 0..count {
                 let a = self.window.get(i).and_then(|v| v.to_f64()).unwrap_or(0.0);
-                let b = self.window.get(i + lag).and_then(|v| v.to_f64()).unwrap_or(0.0);
+                let b = self
+                    .window
+                    .get(i + lag)
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
                 let diff = b - a;
                 sum_sq += diff * diff;
                 mean += diff;

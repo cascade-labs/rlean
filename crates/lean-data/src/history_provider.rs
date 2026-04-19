@@ -1,7 +1,7 @@
+use crate::TradeBar;
+use lean_core::{DateTime, Resolution, Result as LeanResult, Symbol};
 use std::future::Future;
 use std::pin::Pin;
-use lean_core::{DateTime, Resolution, Result as LeanResult, Symbol};
-use crate::TradeBar;
 
 /// Provides historical market data on demand.
 ///

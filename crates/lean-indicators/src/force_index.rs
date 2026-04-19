@@ -1,8 +1,10 @@
-use crate::{indicator::{Indicator, IndicatorResult}, ema::Ema};
+use crate::{
+    ema::Ema,
+    indicator::{Indicator, IndicatorResult},
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
 /// Force Index. (close - prev_close) * volume, smoothed by EMA.
 pub struct ForceIndex {
@@ -28,11 +30,21 @@ impl ForceIndex {
 }
 
 impl Indicator for ForceIndex {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.ema.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.ema.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.ema.reset();

@@ -245,7 +245,12 @@ mod fine_fundamental_tests {
             .map(|i| {
                 let ticker = format!("C{i}");
                 // First 5 have large market cap, last 5 small
-                make_coarse(&ticker, (i as f64) * 1_000_000_000.0, (i as f64) * 100_000.0, 50.0)
+                make_coarse(
+                    &ticker,
+                    (i as f64) * 1_000_000_000.0,
+                    (i as f64) * 100_000.0,
+                    50.0,
+                )
             })
             .collect();
 
@@ -351,7 +356,7 @@ mod liquid_universe_tests {
     #[test]
     fn liquid_universe_filters_low_price() {
         let data = vec![
-            make_coarse("CHEAP", 1e9, 10_000_000.0, 2.0),  // highest DV but very cheap
+            make_coarse("CHEAP", 1e9, 10_000_000.0, 2.0), // highest DV but very cheap
             make_coarse("OK1", 1e9, 5_000_000.0, 50.0),
             make_coarse("OK2", 1e9, 4_000_000.0, 60.0),
             make_coarse("OK3", 1e9, 3_000_000.0, 70.0),
@@ -424,10 +429,8 @@ mod market_cap_universe_tests {
             make_coarse("SMALL", 50_000_000.0, 100_000.0, 10.0),
         ];
 
-        let model = MarketCapUniverseSelectionModel::mid_cap(
-            dec!(500_000_000),
-            dec!(1_000_000_000),
-        );
+        let model =
+            MarketCapUniverseSelectionModel::mid_cap(dec!(500_000_000), dec!(1_000_000_000));
         let result = model.select(&data);
 
         assert_eq!(result.len(), 2);
@@ -455,7 +458,7 @@ mod sector_universe_tests {
     fn sector_universe_with_min_dv_filters_correctly() {
         let data = vec![
             make_coarse("TECH1", 2e9, 5_000_000.0, 100.0),
-            make_coarse("TECH2", 1e9, 50_000.0, 20.0),   // low DV
+            make_coarse("TECH2", 1e9, 50_000.0, 20.0), // low DV
             make_coarse("HLTH1", 1_500_000_000.0, 2_000_000.0, 80.0),
         ];
 
@@ -540,9 +543,7 @@ mod etf_universe_tests {
     fn etf_constituent_weight_lookup() {
         let spy = make_symbol("SPY");
         let mut universe = EtfConstituentsUniverse::new(spy);
-        universe.load_constituents(vec![
-            make_constituent("AAPL", dec!(0.07)),
-        ]);
+        universe.load_constituents(vec![make_constituent("AAPL", dec!(0.07))]);
 
         let weight = universe.constituent_weight("AAPL");
         assert_eq!(weight, Some(dec!(0.07)));
@@ -591,15 +592,13 @@ mod scheduled_universe_tests {
 
     #[test]
     fn daily_schedule_fires_on_first_call() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
         assert!(u.select(date(2024, 1, 2)).is_some());
     }
 
     #[test]
     fn daily_schedule_fires_every_day() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
         let d1 = date(2024, 1, 2);
         let d2 = date(2024, 1, 3);
         let d3 = date(2024, 1, 4);
@@ -611,8 +610,7 @@ mod scheduled_universe_tests {
 
     #[test]
     fn daily_schedule_does_not_fire_same_day_twice() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Daily, |_| vec![]);
         let d = date(2024, 1, 2);
         assert!(u.select(d).is_some());
         assert!(u.select(d).is_none()); // same day — no re-fire
@@ -620,11 +618,10 @@ mod scheduled_universe_tests {
 
     #[test]
     fn monthly_schedule_fires_once_per_month() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Monthly, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Monthly, |_| vec![]);
         let d1 = date(2024, 1, 5);
         let d2 = date(2024, 1, 20); // same month as d1
-        let d3 = date(2024, 2, 5);  // next month
+        let d3 = date(2024, 2, 5); // next month
 
         assert!(u.select(d1).is_some());
         assert!(u.select(d2).is_none()); // same month — no re-fire
@@ -633,8 +630,7 @@ mod scheduled_universe_tests {
 
     #[test]
     fn monthly_schedule_fires_in_new_year_same_month_name() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Monthly, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Monthly, |_| vec![]);
         let jan_2024 = date(2024, 1, 5);
         let jan_2025 = date(2025, 1, 5); // same month number, different year
 
@@ -644,12 +640,11 @@ mod scheduled_universe_tests {
 
     #[test]
     fn weekly_schedule_fires_once_per_week() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Weekly, |_| vec![]);
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Weekly, |_| vec![]);
         // Week of Jan 1, 2024 (Mon) and Jan 8, 2024 (Mon) are different ISO weeks
-        let d1 = date(2024, 1, 2);  // Tue, week 1
-        let d2 = date(2024, 1, 4);  // Thu, same week 1 — no fire
-        let d3 = date(2024, 1, 8);  // Mon, week 2 — fires
+        let d1 = date(2024, 1, 2); // Tue, week 1
+        let d2 = date(2024, 1, 4); // Thu, same week 1 — no fire
+        let d3 = date(2024, 1, 8); // Mon, week 2 — fires
 
         assert!(u.select(d1).is_some());
         assert!(u.select(d2).is_none());
@@ -658,13 +653,12 @@ mod scheduled_universe_tests {
 
     #[test]
     fn quarterly_schedule_fires_once_per_quarter() {
-        let mut u =
-            ScheduledUniverseSelectionModel::new(UniverseSchedule::Quarterly, |_| vec![]);
-        let q1 = date(2024, 1, 5);   // Q1
+        let mut u = ScheduledUniverseSelectionModel::new(UniverseSchedule::Quarterly, |_| vec![]);
+        let q1 = date(2024, 1, 5); // Q1
         let q1b = date(2024, 3, 25); // still Q1 — no fire
-        let q2 = date(2024, 4, 5);   // Q2 — fires
-        let q3 = date(2024, 7, 1);   // Q3 — fires
-        let q4 = date(2024, 10, 1);  // Q4 — fires
+        let q2 = date(2024, 4, 5); // Q2 — fires
+        let q3 = date(2024, 7, 1); // Q3 — fires
+        let q4 = date(2024, 10, 1); // Q4 — fires
 
         assert!(u.select(q1).is_some());
         assert!(u.select(q1b).is_none());

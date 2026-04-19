@@ -1,8 +1,6 @@
-use lean_core::{Market, Price, Resolution, SecurityType, Symbol, SymbolProperties};
 use lean_core::exchange_hours::ExchangeHours;
-use lean_orders::security_transaction_model::SecurityTransactionModel;
+use lean_core::{Price, Resolution, Symbol, SymbolProperties};
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -54,7 +52,9 @@ pub struct SecurityManager {
 }
 
 impl SecurityManager {
-    pub fn new() -> Self { Default::default() }
+    pub fn new() -> Self {
+        Default::default()
+    }
 
     pub fn add(&mut self, security: Security) -> Arc<Security> {
         let sid = security.symbol.id.sid;

@@ -1,6 +1,5 @@
 use lean_core::{DateTime, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
@@ -19,15 +18,32 @@ pub struct Trade {
 }
 
 impl Trade {
-    pub fn new(symbol: Symbol, entry_time: DateTime, exit_time: DateTime,
-               entry_price: Price, exit_price: Price, quantity: Quantity, fees: Price) -> Self {
+    pub fn new(
+        symbol: Symbol,
+        entry_time: DateTime,
+        exit_time: DateTime,
+        entry_price: Price,
+        exit_price: Price,
+        quantity: Quantity,
+        fees: Price,
+    ) -> Self {
         let pnl = (exit_price - entry_price) * quantity - fees;
-        let pnl_pct = if entry_price.is_zero() { dec!(0) } else {
+        let pnl_pct = if entry_price.is_zero() {
+            dec!(0)
+        } else {
             (exit_price - entry_price) / entry_price
         };
         Trade {
-            symbol, entry_time, exit_time, entry_price, exit_price,
-            quantity, pnl, pnl_pct, fees, is_win: pnl > dec!(0),
+            symbol,
+            entry_time,
+            exit_time,
+            entry_price,
+            exit_price,
+            quantity,
+            pnl,
+            pnl_pct,
+            fees,
+            is_win: pnl > dec!(0),
         }
     }
 }
@@ -53,7 +69,9 @@ pub struct TradeStatistics {
 
 impl TradeStatistics {
     pub fn compute(trades: &[Trade]) -> Self {
-        if trades.is_empty() { return Default::default(); }
+        if trades.is_empty() {
+            return Default::default();
+        }
 
         let total = trades.len();
         let wins: Vec<&Trade> = trades.iter().filter(|t| t.is_win).collect();
@@ -63,30 +81,45 @@ impl TradeStatistics {
         let loss_count = losses.len();
 
         let n = Decimal::from(total);
-        let win_rate = if total == 0 { dec!(0) } else { Decimal::from(win_count) / n };
+        let win_rate = if total == 0 {
+            dec!(0)
+        } else {
+            Decimal::from(win_count) / n
+        };
         let loss_rate = dec!(1) - win_rate;
 
-        let avg_win = if win_count == 0 { dec!(0) } else {
+        let avg_win = if win_count == 0 {
+            dec!(0)
+        } else {
             wins.iter().map(|t| t.pnl).sum::<Price>() / Decimal::from(win_count)
         };
-        let avg_loss = if loss_count == 0 { dec!(0) } else {
+        let avg_loss = if loss_count == 0 {
+            dec!(0)
+        } else {
             losses.iter().map(|t| t.pnl).sum::<Price>() / Decimal::from(loss_count)
         };
 
         let largest_win = wins.iter().map(|t| t.pnl).fold(dec!(0), |a, x| a.max(x));
         let largest_loss = losses.iter().map(|t| t.pnl).fold(dec!(0), |a, x| a.min(x));
 
-        let profit_loss_ratio = if avg_loss.is_zero() { dec!(0) } else { (avg_win / avg_loss.abs()).abs() };
+        let profit_loss_ratio = if avg_loss.is_zero() {
+            dec!(0)
+        } else {
+            (avg_win / avg_loss.abs()).abs()
+        };
 
         let expectancy = (win_rate * avg_win) + (loss_rate * avg_loss);
         let total_net_profit = trades.iter().map(|t| t.pnl).sum();
 
         // Average trade duration in calendar days.
-        let avg_duration_days = if total == 0 { dec!(0) } else {
+        let avg_duration_days = if total == 0 {
+            dec!(0)
+        } else {
             const NANOS_PER_DAY: f64 = 86_400.0 * 1_000_000_000.0;
-            let total_days: f64 = trades.iter().map(|t| {
-                (t.exit_time.0 - t.entry_time.0).abs() as f64 / NANOS_PER_DAY
-            }).sum();
+            let total_days: f64 = trades
+                .iter()
+                .map(|t| (t.exit_time.0 - t.entry_time.0).abs() as f64 / NANOS_PER_DAY)
+                .sum();
             Decimal::from_f64_retain(total_days / total as f64).unwrap_or(dec!(0))
         };
 
@@ -100,11 +133,15 @@ impl TradeStatistics {
                 if t.is_win {
                     cur_w += 1;
                     cur_l = 0;
-                    if cur_w > max_w { max_w = cur_w; }
+                    if cur_w > max_w {
+                        max_w = cur_w;
+                    }
                 } else {
                     cur_l += 1;
                     cur_w = 0;
-                    if cur_l > max_l { max_l = cur_l; }
+                    if cur_l > max_l {
+                        max_l = cur_l;
+                    }
                 }
             }
             (max_w, max_l)

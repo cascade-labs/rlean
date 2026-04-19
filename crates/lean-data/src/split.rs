@@ -28,17 +28,37 @@ impl Split {
         reference_price: Price,
         split_type: SplitType,
     ) -> Self {
-        Split { symbol, time, split_factor, reference_price, split_type }
+        Split {
+            symbol,
+            time,
+            split_factor,
+            reference_price,
+            split_type,
+        }
     }
 
-    pub fn is_warning(&self) -> bool { self.split_type == SplitType::Warning }
+    pub fn is_warning(&self) -> bool {
+        self.split_type == SplitType::Warning
+    }
 }
 
 impl BaseData for Split {
-    fn data_type(&self) -> BaseDataType { BaseDataType::Split }
-    fn symbol(&self) -> &Symbol { &self.symbol }
-    fn time(&self) -> DateTime { self.time }
-    fn end_time(&self) -> DateTime { self.time + TimeSpan::ONE_DAY }
-    fn price(&self) -> Price { self.split_factor }
-    fn clone_box(&self) -> Box<dyn BaseData> { Box::new(self.clone()) }
+    fn data_type(&self) -> BaseDataType {
+        BaseDataType::Split
+    }
+    fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+    fn time(&self) -> DateTime {
+        self.time
+    }
+    fn end_time(&self) -> DateTime {
+        self.time + TimeSpan::ONE_DAY
+    }
+    fn price(&self) -> Price {
+        self.split_factor
+    }
+    fn clone_box(&self) -> Box<dyn BaseData> {
+        Box::new(self.clone())
+    }
 }

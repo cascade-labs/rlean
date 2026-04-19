@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use rust_decimal::Decimal;
 use lean_core::Symbol;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{
     IPortfolioConstructionModel, InsightDirection, InsightForPcm,
@@ -53,7 +53,7 @@ impl IPortfolioConstructionModel for SectorWeightingPortfolioConstructionModel {
 
         // Compute per-insight weight: market_weight / group_size
         let mut per_insight_weight: HashMap<usize, Decimal> = HashMap::new();
-        for (_market, indices) in &market_groups {
+        for indices in market_groups.values() {
             let group_size = indices.len();
             let w = if group_size == 0 {
                 Decimal::ZERO
@@ -70,7 +70,10 @@ impl IPortfolioConstructionModel for SectorWeightingPortfolioConstructionModel {
             .enumerate()
             .map(|(idx, insight)| {
                 let direction_sign = Decimal::from(insight.direction.as_i32());
-                let w = per_insight_weight.get(&idx).copied().unwrap_or(Decimal::ZERO);
+                let w = per_insight_weight
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 let pct = direction_sign * w;
 
                 let ticker = insight.symbol.value.clone();

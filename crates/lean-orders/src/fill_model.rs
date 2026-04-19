@@ -79,7 +79,10 @@ fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price
         fill_price,
         order.quantity,
     );
-    Fill { order_event: event, slippage }
+    Fill {
+        order_event: event,
+        slippage,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -111,8 +114,17 @@ impl FillModel for ImmediateFillModel {
             bar.open - slip
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Fill { order_event: event, slippage: slip }
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Fill {
+            order_event: event,
+            slippage: slip,
+        }
     }
 
     fn limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -125,7 +137,9 @@ impl FillModel for ImmediateFillModel {
             bar.high >= limit
         };
 
-        if !fills { return None; }
+        if !fills {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
             limit.min(bar.open)
@@ -133,8 +147,17 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.open)
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Some(Fill { order_event: event, slippage: dec!(0) })
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Some(Fill {
+            order_event: event,
+            slippage: dec!(0),
+        })
     }
 
     fn stop_market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -146,7 +169,9 @@ impl FillModel for ImmediateFillModel {
             bar.low <= stop
         };
 
-        if !triggered { return None; }
+        if !triggered {
+            return None;
+        }
 
         let slip = self.slippage.get_slippage_amount(order, bar);
         let fill_price = if order.quantity > dec!(0) {
@@ -155,8 +180,17 @@ impl FillModel for ImmediateFillModel {
             stop.min(bar.open) - slip
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Some(Fill { order_event: event, slippage: slip })
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Some(Fill {
+            order_event: event,
+            slippage: slip,
+        })
     }
 
     fn stop_limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -169,7 +203,9 @@ impl FillModel for ImmediateFillModel {
             bar.low <= stop
         };
 
-        if !stop_triggered { return None; }
+        if !stop_triggered {
+            return None;
+        }
 
         // Now check if limit is also triggered
         let limit_fills = if order.quantity > dec!(0) {
@@ -178,7 +214,9 @@ impl FillModel for ImmediateFillModel {
             bar.high >= limit
         };
 
-        if !limit_fills { return None; }
+        if !limit_fills {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
             limit.min(bar.high)
@@ -186,8 +224,17 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.low)
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Some(Fill { order_event: event, slippage: dec!(0) })
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Some(Fill {
+            order_event: event,
+            slippage: dec!(0),
+        })
     }
 
     fn market_on_open_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -198,8 +245,17 @@ impl FillModel for ImmediateFillModel {
             bar.open - slip
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Fill { order_event: event, slippage: slip }
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Fill {
+            order_event: event,
+            slippage: slip,
+        }
     }
 
     fn market_on_close_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -210,8 +266,17 @@ impl FillModel for ImmediateFillModel {
             bar.close - slip
         };
 
-        let event = OrderEvent::filled(order.id, order.symbol.clone(), time, fill_price, order.quantity);
-        Fill { order_event: event, slippage: slip }
+        let event = OrderEvent::filled(
+            order.id,
+            order.symbol.clone(),
+            time,
+            fill_price,
+            order.quantity,
+        );
+        Fill {
+            order_event: event,
+            slippage: slip,
+        }
     }
 }
 
@@ -286,13 +351,21 @@ impl FillModel for EquityFillModel {
             bar.high > limit
         };
 
-        if !fills { return None; }
+        if !fills {
+            return None;
+        }
 
         // Favourable gap: bar opens beyond limit, fill at open.
         let fill_price = if order.quantity > dec!(0) {
-            if bar.open < limit { bar.open } else { limit }
+            if bar.open < limit {
+                bar.open
+            } else {
+                limit
+            }
+        } else if bar.open > limit {
+            bar.open
         } else {
-            if bar.open > limit { bar.open } else { limit }
+            limit
         };
 
         Some(make_filled(order, time, fill_price, dec!(0)))
@@ -399,11 +472,17 @@ pub struct FuturesFillModel {
 
 impl FuturesFillModel {
     pub fn new(slippage: Box<dyn SlippageModel>) -> Self {
-        FuturesFillModel { slippage, extended_hours: true }
+        FuturesFillModel {
+            slippage,
+            extended_hours: true,
+        }
     }
 
     pub fn with_extended_hours(slippage: Box<dyn SlippageModel>, extended: bool) -> Self {
-        FuturesFillModel { slippage, extended_hours: extended }
+        FuturesFillModel {
+            slippage,
+            extended_hours: extended,
+        }
     }
 }
 
@@ -428,12 +507,20 @@ impl FillModel for FuturesFillModel {
             bar.high > limit
         };
 
-        if !fills { return None; }
+        if !fills {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
-            if bar.open < limit { bar.open } else { limit }
+            if bar.open < limit {
+                bar.open
+            } else {
+                limit
+            }
+        } else if bar.open > limit {
+            bar.open
         } else {
-            if bar.open > limit { bar.open } else { limit }
+            limit
         };
 
         Some(make_filled(order, time, fill_price, dec!(0)))
@@ -467,19 +554,13 @@ impl FillModel for FuturesFillModel {
         let limit = order.limit_price?;
 
         if order.quantity > dec!(0) {
-            if bar.high > stop {
-                if bar.close < limit {
-                    let fill_price = bar.high.min(limit);
-                    return Some(make_filled(order, time, fill_price, dec!(0)));
-                }
+            if bar.high > stop && bar.close < limit {
+                let fill_price = bar.high.min(limit);
+                return Some(make_filled(order, time, fill_price, dec!(0)));
             }
-        } else {
-            if bar.low < stop {
-                if bar.close > limit {
-                    let fill_price = bar.low.max(limit);
-                    return Some(make_filled(order, time, fill_price, dec!(0)));
-                }
-            }
+        } else if bar.low < stop && bar.close > limit {
+            let fill_price = bar.low.max(limit);
+            return Some(make_filled(order, time, fill_price, dec!(0)));
         }
 
         None
@@ -572,7 +653,9 @@ impl FillModel for OptionFillModel {
             bar.high > limit
         };
 
-        if !fills { return None; }
+        if !fills {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
             limit.min(bar.close)
@@ -593,7 +676,9 @@ impl FillModel for OptionFillModel {
             bar.low <= stop
         };
 
-        if !triggered { return None; }
+        if !triggered {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
             stop.max(bar.close) + slip
@@ -611,23 +696,29 @@ impl FillModel for OptionFillModel {
             if bar.high >= stop && bar.close < limit {
                 return Some(make_filled(order, time, limit, dec!(0)));
             }
-        } else {
-            if bar.low <= stop && bar.close > limit {
-                return Some(make_filled(order, time, limit, dec!(0)));
-            }
+        } else if bar.low <= stop && bar.close > limit {
+            return Some(make_filled(order, time, limit, dec!(0)));
         }
         None
     }
 
     fn market_on_open_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        let fill_price = if order.quantity > dec!(0) { bar.open + slip } else { bar.open - slip };
+        let fill_price = if order.quantity > dec!(0) {
+            bar.open + slip
+        } else {
+            bar.open - slip
+        };
         make_filled(order, time, fill_price, slip)
     }
 
     fn market_on_close_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        let fill_price = if order.quantity > dec!(0) { bar.close + slip } else { bar.close - slip };
+        let fill_price = if order.quantity > dec!(0) {
+            bar.close + slip
+        } else {
+            bar.close - slip
+        };
         make_filled(order, time, fill_price, slip)
     }
 }
@@ -730,7 +821,9 @@ impl FillModel for ForexFillModel {
             bar.high > limit
         };
 
-        if !fills { return None; }
+        if !fills {
+            return None;
+        }
 
         let fill_price = if order.quantity > dec!(0) {
             limit.min(bar.open)
@@ -750,11 +843,9 @@ impl FillModel for ForexFillModel {
                 let fill_price = stop.max(bar.close) + slip;
                 return Some(make_filled(order, time, fill_price, slip));
             }
-        } else {
-            if bar.low <= stop {
-                let fill_price = stop.min(bar.close) - slip;
-                return Some(make_filled(order, time, fill_price, slip));
-            }
+        } else if bar.low <= stop {
+            let fill_price = stop.min(bar.close) - slip;
+            return Some(make_filled(order, time, fill_price, slip));
         }
 
         None
@@ -769,11 +860,9 @@ impl FillModel for ForexFillModel {
                 let fill_price = bar.high.min(limit);
                 return Some(make_filled(order, time, fill_price, dec!(0)));
             }
-        } else {
-            if bar.low <= stop && bar.close > limit {
-                let fill_price = bar.low.max(limit);
-                return Some(make_filled(order, time, fill_price, dec!(0)));
-            }
+        } else if bar.low <= stop && bar.close > limit {
+            let fill_price = bar.low.max(limit);
+            return Some(make_filled(order, time, fill_price, dec!(0)));
         }
 
         None
@@ -782,14 +871,22 @@ impl FillModel for ForexFillModel {
     /// Forex markets are open 24/5; MOO fills at open.
     fn market_on_open_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        let fill_price = if order.quantity > dec!(0) { bar.open + slip } else { bar.open - slip };
+        let fill_price = if order.quantity > dec!(0) {
+            bar.open + slip
+        } else {
+            bar.open - slip
+        };
         make_filled(order, time, fill_price, slip)
     }
 
     /// MOC fills at close.
     fn market_on_close_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        let fill_price = if order.quantity > dec!(0) { bar.close + slip } else { bar.close - slip };
+        let fill_price = if order.quantity > dec!(0) {
+            bar.close + slip
+        } else {
+            bar.close - slip
+        };
         make_filled(order, time, fill_price, slip)
     }
 }
@@ -885,8 +982,6 @@ impl LatencyFillModel {
         let emit_at = current_bar + self.bars_delay;
         self.pending.lock().push_back((emit_at, fill));
     }
-
-
 }
 
 /// `LatencyFillModel` proxies to the inner model but delays all resulting fills.
@@ -900,11 +995,10 @@ impl LatencyFillModel {
 /// Alternatively, wrap the model and poll `tick()` on each bar to collect fills.
 impl FillModel for LatencyFillModel {
     fn market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
-        let fill = self.inner.market_fill(order, bar, time);
         // We return the fill immediately here (compatible with existing trait
         // callers), but also enqueue it — callers using the latency model
         // should pick it up via `tick()` instead and ignore the direct return.
-        fill
+        self.inner.market_fill(order, bar, time)
     }
 
     fn limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -931,24 +1025,48 @@ impl FillModel for LatencyFillModel {
 /// Extended API that properly enqueues fills and returns `None` to the caller,
 /// forcing use of `tick()` to retrieve them.
 impl LatencyFillModel {
-    pub fn market_fill_delayed(&self, order: &Order, bar: &TradeBar, time: DateTime, current_bar: usize) {
+    pub fn market_fill_delayed(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        time: DateTime,
+        current_bar: usize,
+    ) {
         let fill = self.inner.market_fill(order, bar, time);
         self.enqueue(current_bar, fill);
     }
 
-    pub fn limit_fill_delayed(&self, order: &Order, bar: &TradeBar, time: DateTime, current_bar: usize) {
+    pub fn limit_fill_delayed(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        time: DateTime,
+        current_bar: usize,
+    ) {
         if let Some(fill) = self.inner.limit_fill(order, bar, time) {
             self.enqueue(current_bar, fill);
         }
     }
 
-    pub fn stop_market_fill_delayed(&self, order: &Order, bar: &TradeBar, time: DateTime, current_bar: usize) {
+    pub fn stop_market_fill_delayed(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        time: DateTime,
+        current_bar: usize,
+    ) {
         if let Some(fill) = self.inner.stop_market_fill(order, bar, time) {
             self.enqueue(current_bar, fill);
         }
     }
 
-    pub fn stop_limit_fill_delayed(&self, order: &Order, bar: &TradeBar, time: DateTime, current_bar: usize) {
+    pub fn stop_limit_fill_delayed(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        time: DateTime,
+        current_bar: usize,
+    ) {
         if let Some(fill) = self.inner.stop_limit_fill(order, bar, time) {
             self.enqueue(current_bar, fill);
         }

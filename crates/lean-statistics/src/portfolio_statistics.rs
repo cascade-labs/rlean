@@ -49,17 +49,33 @@ impl PortfolioStatistics {
     ) -> Self {
         let trade_stats = crate::trade_statistics::TradeStatistics::compute(trades);
 
-        let total_return = if starting_cash.is_zero() { dec!(0) } else {
+        let total_return = if starting_cash.is_zero() {
+            dec!(0)
+        } else {
             let final_equity = equity_curve.last().copied().unwrap_or(starting_cash);
             (final_equity - starting_cash) / starting_cash
         };
 
-        let daily_returns: Vec<Decimal> = equity_curve.windows(2)
-            .map(|w| if w[0].is_zero() { dec!(0) } else { (w[1] - w[0]) / w[0] })
+        let daily_returns: Vec<Decimal> = equity_curve
+            .windows(2)
+            .map(|w| {
+                if w[0].is_zero() {
+                    dec!(0)
+                } else {
+                    (w[1] - w[0]) / w[0]
+                }
+            })
             .collect();
 
-        let benchmark_returns: Vec<Decimal> = benchmark_curve.windows(2)
-            .map(|w| if w[0].is_zero() { dec!(0) } else { (w[1] - w[0]) / w[0] })
+        let benchmark_returns: Vec<Decimal> = benchmark_curve
+            .windows(2)
+            .map(|w| {
+                if w[0].is_zero() {
+                    dec!(0)
+                } else {
+                    (w[1] - w[0]) / w[0]
+                }
+            })
             .collect();
 
         let annual_return = Statistics::annual_performance(total_return, trading_days);
@@ -73,7 +89,9 @@ impl PortfolioStatistics {
                 benchmark_returns.iter().product::<Decimal>(),
                 trading_days,
             )
-        } else { dec!(0) };
+        } else {
+            dec!(0)
+        };
         let alpha = Statistics::alpha(annual_return, beta, bench_annual, risk_free_rate);
         let tracking_error = Statistics::tracking_error(&daily_returns, &benchmark_returns);
         let information_ratio = Statistics::information_ratio(&daily_returns, &benchmark_returns);
@@ -82,9 +100,19 @@ impl PortfolioStatistics {
 
         use rust_decimal::prelude::ToPrimitive;
         let n = Decimal::from(daily_returns.len());
-        let mean_r = if n.is_zero() { dec!(0) } else { daily_returns.iter().sum::<Decimal>() / n };
-        let variance = if n <= dec!(1) { dec!(0) } else {
-            daily_returns.iter().map(|r| (r - mean_r) * (r - mean_r)).sum::<Decimal>() / (n - dec!(1))
+        let mean_r = if n.is_zero() {
+            dec!(0)
+        } else {
+            daily_returns.iter().sum::<Decimal>() / n
+        };
+        let variance = if n <= dec!(1) {
+            dec!(0)
+        } else {
+            daily_returns
+                .iter()
+                .map(|r| (r - mean_r) * (r - mean_r))
+                .sum::<Decimal>()
+                / (n - dec!(1))
         };
         let ann_std = variance.to_f64().unwrap_or(0.0).sqrt() * 252_f64.sqrt();
         let annual_std = Decimal::from_f64_retain(ann_std).unwrap_or(dec!(0));
@@ -94,9 +122,13 @@ impl PortfolioStatistics {
             let mut peak = equity_curve.first().copied().unwrap_or(starting_cash);
             let mut max_loss = dec!(0);
             for &eq in equity_curve {
-                if eq > peak { peak = eq; }
+                if eq > peak {
+                    peak = eq;
+                }
                 let loss = peak - eq;
-                if loss > max_loss { max_loss = loss; }
+                if loss > max_loss {
+                    max_loss = loss;
+                }
             }
             max_loss
         };
@@ -106,10 +138,13 @@ impl PortfolioStatistics {
         // Portfolio turnover: total trading value (both legs) / (average equity * 2).
         // Clamped to [0, 1].
         let portfolio_turnover = {
-            let total_trading_value: Decimal = trades.iter().map(|t| {
-                let qty_abs = t.quantity.abs();
-                (t.entry_price * qty_abs) + (t.exit_price * qty_abs)
-            }).sum();
+            let total_trading_value: Decimal = trades
+                .iter()
+                .map(|t| {
+                    let qty_abs = t.quantity.abs();
+                    (t.entry_price * qty_abs) + (t.exit_price * qty_abs)
+                })
+                .sum();
 
             let n_eq = Decimal::from(equity_curve.len());
             let average_equity = if n_eq.is_zero() {
@@ -146,7 +181,11 @@ impl PortfolioStatistics {
             annual_variance: annual_std * annual_std,
             information_ratio,
             tracking_error,
-            treynor_ratio: if beta.is_zero() { dec!(0) } else { (annual_return - risk_free_rate) / beta },
+            treynor_ratio: if beta.is_zero() {
+                dec!(0)
+            } else {
+                (annual_return - risk_free_rate) / beta
+            },
             portfolio_turnover,
             omega_ratio: omega,
             recovery_factor: recovery,

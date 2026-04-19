@@ -67,19 +67,36 @@ pub struct Resp {
 
 impl Resp {
     pub fn ok(stdout: String, stderr: String, figures: Vec<String>) -> Self {
-        Resp { status: "ok".into(), stdout, stderr, figures, ..Default::default() }
+        Resp {
+            status: "ok".into(),
+            stdout,
+            stderr,
+            figures,
+            ..Default::default()
+        }
     }
-    pub fn pong() -> Self { Resp { status: "pong".into(), ..Default::default() } }
+    pub fn pong() -> Self {
+        Resp {
+            status: "pong".into(),
+            ..Default::default()
+        }
+    }
     pub fn error(msg: impl Into<String>) -> Self {
-        Resp { status: "error".into(), message: msg.into(), ..Default::default() }
+        Resp {
+            status: "error".into(),
+            message: msg.into(),
+            ..Default::default()
+        }
     }
 }
 
 // ── Session directory helpers (also used by research.rs) ─────────────────────
 
 pub fn session_dir(name: &str) -> Result<PathBuf> {
-    let home = std::env::var("HOME").map(PathBuf::from).context("HOME not set")?;
-    let dir  = home.join(".lean-research").join("sessions").join(name);
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME not set")?;
+    let dir = home.join(".lean-research").join("sessions").join(name);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create session dir: {}", dir.display()))?;
     Ok(dir)
@@ -94,7 +111,7 @@ pub fn sock_path(session: &str) -> Result<PathBuf> {
 fn startup_code(data_folder: Option<&Path>) -> String {
     let set_data = match data_folder {
         Some(p) => format!(r#"qb.set_data_folder(r"{}")"#, p.display()),
-        None     => String::new(),
+        None => String::new(),
     };
 
     // NOTE: All private names use _-prefix so they don't pollute `vars` output.
@@ -186,16 +203,15 @@ del _vd, _k, _v, _t
 pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
     use lean_python::AlgorithmImports;
 
-    let sdir     = session_dir(&args.session)?;
-    let sock     = sdir.join("server.sock");
+    let sdir = session_dir(&args.session)?;
+    let sock = sdir.join("server.sock");
     let pid_path = sdir.join("pid");
 
     // Remove stale socket from a previous run.
     let _ = std::fs::remove_file(&sock);
 
     // Write PID so the client can check liveness.
-    std::fs::write(&pid_path, std::process::id().to_string())
-        .context("Failed to write PID")?;
+    std::fs::write(&pid_path, std::process::id().to_string()).context("Failed to write PID")?;
 
     // Register AlgorithmImports before Python initialises.
     pyo3::append_to_inittab!(AlgorithmImports);
@@ -203,10 +219,10 @@ pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
 
     // Create persistent globals dict and run startup.
     let globals: Py<PyDict> = Python::with_gil(|py| {
-        let d       = PyDict::new(py);
-        let code    = startup_code(args.data_folder.as_deref());
+        let d = PyDict::new(py);
+        let code = startup_code(args.data_folder.as_deref());
         let builtins = PyModule::import(py, "builtins")?;
-        let exec_fn  = builtins.getattr("exec")?;
+        let exec_fn = builtins.getattr("exec")?;
         exec_fn.call1((&code as &str, &d))?;
         Ok::<_, PyErr>(d.unbind())
     })?;
@@ -224,16 +240,21 @@ pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
     // ── Accept loop ───────────────────────────────────────────────────────────
     for incoming in listener.incoming() {
         let mut stream = match incoming {
-            Ok(s)  => s,
-            Err(e) => { eprintln!("accept error: {e}"); continue; }
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
         };
 
-        let mut line   = String::new();
+        let mut line = String::new();
         let mut reader = BufReader::new(stream.try_clone()?);
-        if reader.read_line(&mut line).is_err() { continue; }
+        if reader.read_line(&mut line).is_err() {
+            continue;
+        }
 
         let req: Req = match serde_json::from_str(line.trim()) {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 let _ = write_resp(&mut stream, &Resp::error(format!("bad JSON: {e}")));
                 continue;
@@ -281,19 +302,18 @@ fn exec_in_globals(globals: &Py<PyDict>, code: &str) -> Resp {
 
         let capture_fn = match g.get_item("_rlean_exec_capture") {
             Ok(Some(f)) => f,
-            _           => return Resp::error("_rlean_exec_capture not found — startup may have failed"),
+            _ => return Resp::error("_rlean_exec_capture not found — startup may have failed"),
         };
 
         match capture_fn.call1((code, g)) {
-            Ok(result) => {
-                match result.extract::<(String, String, Vec<String>)>() {
-                    Ok((out, err, figs)) => Resp::ok(out, err, figs),
-                    Err(e)               => Resp::error(format!("extract error: {e}")),
-                }
-            }
+            Ok(result) => match result.extract::<(String, String, Vec<String>)>() {
+                Ok((out, err, figs)) => Resp::ok(out, err, figs),
+                Err(e) => Resp::error(format!("extract error: {e}")),
+            },
             Err(e) => {
                 // Python exception escaped capture — shouldn't happen, but handle gracefully.
-                let tb = e.traceback(py)
+                let tb = e
+                    .traceback(py)
                     .and_then(|t| t.format().ok())
                     .unwrap_or_default();
                 Resp {

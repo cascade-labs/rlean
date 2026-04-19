@@ -65,7 +65,13 @@ impl OrderEvent {
         }
     }
 
-    pub fn filled(order_id: i64, symbol: Symbol, time: DateTime, fill_price: Price, fill_quantity: Quantity) -> Self {
+    pub fn filled(
+        order_id: i64,
+        symbol: Symbol,
+        time: DateTime,
+        fill_price: Price,
+        fill_quantity: Quantity,
+    ) -> Self {
         let direction = crate::order::OrderDirection::from_quantity(fill_quantity);
         OrderEvent {
             id: 0,
@@ -92,6 +98,9 @@ impl OrderEvent {
     }
 
     pub fn is_fill(&self) -> bool {
-        matches!(self.status, OrderStatus::Filled | OrderStatus::PartiallyFilled)
+        matches!(
+            self.status,
+            OrderStatus::Filled | OrderStatus::PartiallyFilled
+        )
     }
 }

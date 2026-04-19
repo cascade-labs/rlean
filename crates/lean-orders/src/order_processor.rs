@@ -16,11 +16,18 @@ pub struct OrderProcessor {
 
 impl OrderProcessor {
     pub fn new(fill_model: Box<dyn FillModel>, tm: Arc<TransactionManager>) -> Self {
-        OrderProcessor { fill_model, transaction_manager: tm }
+        OrderProcessor {
+            fill_model,
+            transaction_manager: tm,
+        }
     }
 
     /// Scan all open orders and attempt fills against `bars`.
-    pub fn process_orders(&self, bars: &std::collections::HashMap<u64, TradeBar>, time: DateTime) -> Vec<OrderEvent> {
+    pub fn process_orders(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
         let open = self.transaction_manager.get_open_orders();
         let mut events = Vec::new();
 
@@ -43,18 +50,18 @@ impl OrderProcessor {
                 let fill = self.fill_model.market_fill(order, bar, time);
                 Some(fill.order_event)
             }
-            OrderType::Limit => {
-                self.fill_model.limit_fill(order, bar, time)
-                    .map(|f| f.order_event)
-            }
-            OrderType::StopMarket => {
-                self.fill_model.stop_market_fill(order, bar, time)
-                    .map(|f| f.order_event)
-            }
-            OrderType::StopLimit => {
-                self.fill_model.stop_limit_fill(order, bar, time)
-                    .map(|f| f.order_event)
-            }
+            OrderType::Limit => self
+                .fill_model
+                .limit_fill(order, bar, time)
+                .map(|f| f.order_event),
+            OrderType::StopMarket => self
+                .fill_model
+                .stop_market_fill(order, bar, time)
+                .map(|f| f.order_event),
+            OrderType::StopLimit => self
+                .fill_model
+                .stop_limit_fill(order, bar, time)
+                .map(|f| f.order_event),
             OrderType::MarketOnOpen => {
                 let fill = self.fill_model.market_on_open_fill(order, bar, time);
                 Some(fill.order_event)

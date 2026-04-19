@@ -16,7 +16,7 @@
 ///   rlean create-project my_strategy
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -37,14 +37,19 @@ mod research;
 mod research_daemon;
 mod stubs_cmd;
 
-use config_cmd::{ConfigArgs, run_config};
-use init::{InitArgs, run_init};
-use plugin_cmd::{PluginArgs, run_plugin};
-use project::{CreateProjectArgs, run_create_project};
-use registry_cmd::{RegistryArgs, run_registry};
-use research::{ResearchArgs, run_research};
-use research_daemon::{ResearchDaemonArgs, run_daemon};
-use stubs_cmd::{StubsArgs, run_stubs};
+use config_cmd::{run_config, ConfigArgs};
+use init::{run_init, InitArgs};
+use plugin_cmd::{run_plugin, PluginArgs};
+use project::{run_create_project, CreateProjectArgs};
+use registry_cmd::{run_registry, RegistryArgs};
+use research::{run_research, ResearchArgs};
+use research_daemon::{run_daemon, ResearchDaemonArgs};
+use stubs_cmd::{run_stubs, StubsArgs};
+
+type ProviderPair = (
+    Option<Arc<dyn IHistoricalDataProvider>>,
+    Option<Arc<dyn IHistoryProvider>>,
+);
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -159,25 +164,22 @@ async fn main() -> Result<()> {
     let filter = if verbose {
         EnvFilter::new("debug")
     } else {
-        EnvFilter::from_default_env()
-            .add_directive("info".parse().unwrap())
+        EnvFilter::from_default_env().add_directive("info".parse().unwrap())
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match cli.command {
-        Command::Init(args)            => run_init(args),
-        Command::CreateProject(args)   => run_create_project(args),
-        Command::Config(args)          => run_config(args),
-        Command::Plugin(args)          => run_plugin(args),
-        Command::Registry(args)        => run_registry(args),
-        Command::Backtest(args)        => run_backtest(args).await,
-        Command::Live(args)            => run_live(args).await,
-        Command::Research(args)        => run_research(args),
-        Command::Stubs(args)           => run_stubs(args),
-        Command::ResearchDaemon(args)  => run_daemon(args),
+        Command::Init(args) => run_init(args),
+        Command::CreateProject(args) => run_create_project(args),
+        Command::Config(args) => run_config(args),
+        Command::Plugin(args) => run_plugin(args),
+        Command::Registry(args) => run_registry(args),
+        Command::Backtest(args) => run_backtest(args).await,
+        Command::Live(args) => run_live(args).await,
+        Command::Research(args) => run_research(args),
+        Command::Stubs(args) => run_stubs(args),
+        Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
 
@@ -202,7 +204,11 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
 
     let (historical_provider, history_provider) = build_providers(&args)?;
 
-    let ext = args.strategy.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = args
+        .strategy
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
 
     match ext {
         "py" => run_python_backtest(args, historical_provider, history_provider).await,
@@ -219,25 +225,24 @@ async fn run_python_backtest(
     historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
     history_provider: Option<Arc<dyn IHistoryProvider>>,
 ) -> Result<()> {
-    use lean_python::AlgorithmImports;
-    use lean_python::runner::{run_strategy, RunConfig};
     use lean_python::report::{
-        write_report, write_results_json, write_order_events_json,
-        write_summary_json, write_log_txt, write_data_request_files,
+        write_data_request_files, write_log_txt, write_order_events_json, write_report,
+        write_results_json, write_summary_json,
     };
+    use lean_python::runner::{run_strategy, RunConfig};
+    use lean_python::AlgorithmImports;
 
     // Register the AlgorithmImports PyO3 module before starting Python.
     // Must be called before prepare_freethreaded_python.
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::prepare_freethreaded_python();
 
-
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .map_err(|_| anyhow::anyhow!("invalid date '{}', expected YYYY-MM-DD", s))
     };
     let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
-    let end_date_override   = args.end_date.as_deref().map(parse_date).transpose()?;
+    let end_date_override = args.end_date.as_deref().map(parse_date).transpose()?;
 
     // Each backtest creates a LEAN-compatible output directory:
     //   <project>/backtests/YYYY-MM-DD_<strategy-name>/
@@ -247,11 +252,12 @@ async fn run_python_backtest(
     let backtest_dir: PathBuf = if let Some(p) = args.report.clone() {
         p
     } else {
-        let backtests_root = args.strategy
-            .parent()           // <project>/
+        let backtests_root = args
+            .strategy
+            .parent() // <project>/
             .map(|p| p.join("backtests"))
             .unwrap_or_else(|| PathBuf::from("backtests"));
-        let now  = chrono::Utc::now();
+        let now = chrono::Utc::now();
         let name = strategy_name_from_path(&args.strategy);
         backtests_root.join(backtest_dir_name(now, &name))
     };
@@ -281,30 +287,42 @@ async fn run_python_backtest(
     let ts_ms = chrono::Utc::now().format("%Y%m%d%H%M%S%3f");
 
     // ── write all output files ────────────────────────────────────────────────
-    let json_path      = backtest_dir.join(format!("{id}.json"));
+    let json_path = backtest_dir.join(format!("{id}.json"));
     let order_events_path = backtest_dir.join(format!("{id}-order-events.json"));
-    let summary_path   = backtest_dir.join(format!("{id}-summary.json"));
-    let id_log_path    = backtest_dir.join(format!("{id}-log.txt"));
-    let top_log_path   = backtest_dir.join("log.txt");
+    let summary_path = backtest_dir.join(format!("{id}-summary.json"));
+    let id_log_path = backtest_dir.join(format!("{id}-log.txt"));
+    let top_log_path = backtest_dir.join("log.txt");
     let succeeded_path = backtest_dir.join(format!("succeeded-data-requests-{ts_ms}.txt"));
-    let failed_path    = backtest_dir.join(format!("failed-data-requests-{ts_ms}.txt"));
-    let report_path    = backtest_dir.join("report.html");
+    let failed_path = backtest_dir.join(format!("failed-data-requests-{ts_ms}.txt"));
+    let report_path = backtest_dir.join("report.html");
 
-    if let Err(e) = write_results_json(&results, &json_path)           { eprintln!("Failed to write results: {e}"); }
-    if let Err(e) = write_order_events_json(&results, &order_events_path) { eprintln!("Failed to write order events: {e}"); }
-    if let Err(e) = write_summary_json(&results, &summary_path)        { eprintln!("Failed to write summary: {e}"); }
-    if let Err(e) = write_log_txt(&results, &id_log_path)              { eprintln!("Failed to write log: {e}"); }
+    if let Err(e) = write_results_json(&results, &json_path) {
+        eprintln!("Failed to write results: {e}");
+    }
+    if let Err(e) = write_order_events_json(&results, &order_events_path) {
+        eprintln!("Failed to write order events: {e}");
+    }
+    if let Err(e) = write_summary_json(&results, &summary_path) {
+        eprintln!("Failed to write summary: {e}");
+    }
+    if let Err(e) = write_log_txt(&results, &id_log_path) {
+        eprintln!("Failed to write log: {e}");
+    }
     let _ = std::fs::copy(&id_log_path, &top_log_path);
-    if let Err(e) = write_data_request_files(&results, &succeeded_path, &failed_path) { eprintln!("Failed to write data requests: {e}"); }
-    if let Err(e) = write_report(&results, &report_path)               { eprintln!("Failed to write report: {e}"); }
+    if let Err(e) = write_data_request_files(&results, &succeeded_path, &failed_path) {
+        eprintln!("Failed to write data requests: {e}");
+    }
+    if let Err(e) = write_report(&results, &report_path) {
+        eprintln!("Failed to write report: {e}");
+    }
 
     println!("Results: {}", backtest_dir.display());
     Ok(())
 }
 
 fn run_rust_plugin_backtest(args: RunArgs) -> Result<()> {
-    use lean_engine::{BacktestEngine, EngineConfig};
     use lean_algorithm::algorithm::IAlgorithm;
+    use lean_engine::{BacktestEngine, EngineConfig};
     use libloading::{Library, Symbol};
 
     // Safety: the plugin must export `create_algorithm` with C ABI.
@@ -361,7 +379,8 @@ async fn run_live(_args: RunArgs) -> Result<()> {
 ///  - `my_algo/my_algo.py`        → `"my_algo"`
 ///  - `/absolute/path/signal.py`  → `"signal"`
 pub(crate) fn strategy_name_from_path(strategy: &std::path::Path) -> String {
-    let stem = strategy.file_stem()
+    let stem = strategy
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("strategy")
         .to_string();
@@ -379,30 +398,30 @@ pub(crate) fn strategy_name_from_path(strategy: &std::path::Path) -> String {
 
 /// Build the backtest output directory path in LEAN format:
 ///   `<backtests_root>/YYYY-MM-DD_HHMMSS_<strategy_name>`
-pub(crate) fn backtest_dir_name(datetime: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
+pub(crate) fn backtest_dir_name(
+    datetime: chrono::DateTime<chrono::Utc>,
+    strategy_name: &str,
+) -> String {
     format!("{}_{}", datetime.format("%Y-%m-%d_%H%M%S"), strategy_name)
 }
 
-fn validate_strategy_path(path: &PathBuf) -> Result<()> {
+fn validate_strategy_path(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("Strategy file not found: {}", path.display());
     }
     Ok(())
 }
 
-fn build_providers(args: &RunArgs) -> Result<(
-    Option<Arc<dyn IHistoricalDataProvider>>,
-    Option<Arc<dyn IHistoryProvider>>,
-)> {
+fn build_providers(args: &RunArgs) -> Result<ProviderPair> {
     let names = match args.data_provider_historical.as_deref() {
         Some(n) => n,
         None => return Ok((None, None)),
     };
 
     let provider_args = providers::ProviderArgs {
-        data_root:            args.data.clone(),
-        polygon_rate:         args.polygon_rate,
-        thetadata_rate:       args.thetadata_rate,
+        data_root: args.data.clone(),
+        polygon_rate: args.polygon_rate,
+        thetadata_rate: args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
     };
 
@@ -422,15 +441,20 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
         resolution: lean_core::Resolution,
         start: lean_core::DateTime,
         end: lean_core::DateTime,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lean_core::Result<Vec<lean_data::TradeBar>>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = lean_core::Result<Vec<lean_data::TradeBar>>>
+                + Send
+                + '_,
+        >,
+    > {
         let provider = Arc::clone(&self.0);
         let request = lean_data_providers::HistoryRequest {
-            symbol:     symbol.clone(),
+            symbol: symbol.clone(),
             resolution,
             start,
             end,
-            data_type:  lean_data_providers::DataType::TradeBar,
+            data_type: lean_data_providers::DataType::TradeBar,
         };
         // IHistoryProvider::get_history is synchronous so that plugins (cdylibs
         // with their own tokio copy) can block internally without conflicting
@@ -439,7 +463,9 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || provider.get_history(&request))
                 .await
-                .map_err(|e| lean_core::LeanError::DataError(format!("provider task panicked: {e}")))?
+                .map_err(|e| {
+                    lean_core::LeanError::DataError(format!("provider task panicked: {e}"))
+                })?
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
         })
     }
@@ -506,8 +532,8 @@ mod tests {
         use chrono::{TimeZone, Utc};
         let dt1 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
         let dt2 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 5).unwrap();
-        let d1  = backtest_dir_name(dt1, "spy_wheel");
-        let d2  = backtest_dir_name(dt2, "spy_wheel");
+        let d1 = backtest_dir_name(dt1, "spy_wheel");
+        let d2 = backtest_dir_name(dt2, "spy_wheel");
         assert_ne!(d1, d2, "runs on same day must produce different dirs");
     }
 

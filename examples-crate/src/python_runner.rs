@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use lean_data::IHistoricalDataProvider;
 use lean_python::report::write_report;
 use lean_python::runner::{run_strategy, RunConfig};
-use lean_python::AlgorithmImports;  // the #[pymodule] fn — needed for append_to_inittab!
+use lean_python::AlgorithmImports; // the #[pymodule] fn — needed for append_to_inittab!
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -38,7 +38,10 @@ fn main() {
 
     let strategy_path = PathBuf::from(&args[1]);
     if !strategy_path.exists() {
-        eprintln!("Error: strategy file not found: {}", strategy_path.display());
+        eprintln!(
+            "Error: strategy file not found: {}",
+            strategy_path.display()
+        );
         std::process::exit(1);
     }
 
@@ -47,8 +50,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("data"));
 
-    let _provider_name = find_arg(&args, "--data-provider-historical")
-        .unwrap_or_default();
+    let _provider_name = find_arg(&args, "--data-provider-historical").unwrap_or_default();
 
     // Providers are now loaded as plugins via rlean plugin install.
     // For backwards compatibility, we accept the old flags but always use local.
@@ -56,10 +58,7 @@ fn main() {
 
     // ── logging ──────────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("info".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
     // ── CRITICAL: register AlgorithmImports module BEFORE starting Python ────
@@ -98,7 +97,5 @@ fn main() {
 
 /// Find the value that follows a flag in the args list.
 fn find_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }

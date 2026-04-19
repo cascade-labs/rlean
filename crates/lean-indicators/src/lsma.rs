@@ -1,7 +1,10 @@
-use crate::{indicator::{Indicator, IndicatorResult}, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Least Squares Moving Average. Linear regression over n bars, value at current bar.
@@ -42,7 +45,9 @@ impl Lsma {
         }
 
         let denom = n * sum_x2 - sum_x * sum_x;
-        if denom == 0.0 { return dec!(0); }
+        if denom == 0.0 {
+            return dec!(0);
+        }
         let b = (n * sum_xy - sum_x * sum_y) / denom;
         let a = (sum_y - b * sum_x) / n;
         // value at current bar = a + b * period
@@ -52,11 +57,21 @@ impl Lsma {
 }
 
 impl Indicator for Lsma {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.window.is_full() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.period }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.window.is_full()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.period
+    }
 
     fn reset(&mut self) {
         self.window.clear();

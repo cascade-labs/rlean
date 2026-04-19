@@ -18,10 +18,7 @@ use crate::request::{DownloadRequest, HistoryRequest};
 /// `tokio::task::spawn_blocking`.
 pub trait IHistoryProvider: Send + Sync {
     /// Fetch historical trade bars for the symbol described in `request`.
-    fn get_history(
-        &self,
-        request: &HistoryRequest,
-    ) -> anyhow::Result<Vec<TradeBar>>;
+    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>>;
 
     /// Fetch all option EOD bars for `ticker` on `date`.
     ///
@@ -54,10 +51,7 @@ pub trait IHistoryProvider: Send + Sync {
 pub trait IDataDownloader: Send + Sync {
     /// Download data for the given request and write it to the local store.
     /// Returns the number of bars written.
-    async fn download(
-        &self,
-        request: &DownloadRequest,
-    ) -> anyhow::Result<usize>;
+    async fn download(&self, request: &DownloadRequest) -> anyhow::Result<usize>;
 }
 
 /// Provides the full option contract list for an underlying on a given date.

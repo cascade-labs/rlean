@@ -1,14 +1,14 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use pyo3::prelude::*;
-use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{Market, Resolution, SymbolOptionsExt};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use rust_decimal_macros::dec;
 use crate::charting::ChartCollection;
 use crate::py_portfolio::PyPortfolio;
-use crate::py_types::{PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol};
+use crate::py_types::{PyResolution, PySecurity, PySecurityManager, PySymbol};
+use lean_algorithm::qc_algorithm::QcAlgorithm;
+use lean_core::{Market, Resolution, SymbolOptionsExt};
+use pyo3::prelude::*;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
@@ -57,12 +57,21 @@ impl PyQcAlgorithm {
     }
 }
 
+impl Default for PyQcAlgorithm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl PyQcAlgorithm {
     #[new]
     pub fn new() -> Self {
         PyQcAlgorithm {
-            inner: Arc::new(Mutex::new(QcAlgorithm::new("PythonStrategy", dec!(100_000)))),
+            inner: Arc::new(Mutex::new(QcAlgorithm::new(
+                "PythonStrategy",
+                dec!(100_000),
+            ))),
             symbols: HashMap::new(),
             charts: Arc::new(Mutex::new(ChartCollection::new())),
         }
@@ -114,12 +123,18 @@ impl PyQcAlgorithm {
     fn set_warm_up(&mut self, bars_or_days: i64) -> PyResult<()> {
         if bars_or_days > 365 {
             // treat as bar count
-            self.inner.lock().unwrap().set_warm_up_bars(bars_or_days as usize);
+            self.inner
+                .lock()
+                .unwrap()
+                .set_warm_up_bars(bars_or_days as usize);
         } else {
             // treat as days
             use lean_core::TimeSpan;
             let nanos = bars_or_days * 86_400 * 1_000_000_000i64;
-            self.inner.lock().unwrap().set_warm_up(TimeSpan::from_nanos(nanos));
+            self.inner
+                .lock()
+                .unwrap()
+                .set_warm_up(TimeSpan::from_nanos(nanos));
         }
         Ok(())
     }
@@ -130,14 +145,18 @@ impl PyQcAlgorithm {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_equity(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity { inner: PySymbol { inner: sym } }
+        PySecurity {
+            inner: PySymbol { inner: sym },
+        }
     }
 
     fn add_forex(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_forex(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity { inner: PySymbol { inner: sym } }
+        PySecurity {
+            inner: PySymbol { inner: sym },
+        }
     }
 
     fn add_crypto(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
@@ -145,7 +164,9 @@ impl PyQcAlgorithm {
         let market = Market::usa(); // default; crypto can override
         let sym = self.inner.lock().unwrap().add_crypto(ticker, &market, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity { inner: PySymbol { inner: sym } }
+        PySecurity {
+            inner: PySymbol { inner: sym },
+        }
     }
 
     // ─── Ordering ─────────────────────────────────────────────────────────────
@@ -178,16 +199,32 @@ impl PyQcAlgorithm {
     }
 
     /// Place a limit order.
-    fn limit_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64, limit_price: f64) -> PyResult<()> {
+    fn limit_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        limit_price: f64,
+    ) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner.lock().unwrap().limit_order(&sym, f2d(quantity), f2d(limit_price));
+        self.inner
+            .lock()
+            .unwrap()
+            .limit_order(&sym, f2d(quantity), f2d(limit_price));
         Ok(())
     }
 
     /// Place a stop-market order.
-    fn stop_market_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64, stop_price: f64) -> PyResult<()> {
+    fn stop_market_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        stop_price: f64,
+    ) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner.lock().unwrap().stop_market_order(&sym, f2d(quantity), f2d(stop_price));
+        self.inner
+            .lock()
+            .unwrap()
+            .stop_market_order(&sym, f2d(quantity), f2d(stop_price));
         Ok(())
     }
 
@@ -234,7 +271,12 @@ impl PyQcAlgorithm {
     /// self.vix    = self.add_data("cboe_vix", "VIX", Resolution.Daily)
     /// ```
     #[pyo3(signature = (source_type, ticker, resolution=None))]
-    fn add_data(&mut self, source_type: &str, ticker: &str, resolution: Option<&Bound<'_, PyAny>>) -> PyResult<PySecurity> {
+    fn add_data(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PySecurity> {
         use lean_core::Resolution;
         use lean_data::{CustomDataConfig, CustomDataSubscription};
         use std::collections::HashMap;
@@ -269,14 +311,20 @@ impl PyQcAlgorithm {
             config,
         };
 
-        self.inner.lock().unwrap().custom_data_subscriptions.push(sub);
+        self.inner
+            .lock()
+            .unwrap()
+            .custom_data_subscriptions
+            .push(sub);
 
         // Return a synthetic security object so callers can do:
         //   self.unrate = self.add_data("fred", "UNRATE").symbol
         let market = lean_core::Market::usa();
         let sym = lean_core::Symbol::create_equity(ticker, &market);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        Ok(PySecurity { inner: PySymbol { inner: sym } })
+        Ok(PySecurity {
+            inner: PySymbol { inner: sym },
+        })
     }
 
     // ─── Options ──────────────────────────────────────────────────────────────
@@ -285,7 +333,11 @@ impl PyQcAlgorithm {
     /// Returns a LEAN-compatible `Option` security object with `.symbol` and `.set_filter()`.
     /// Accepts `Resolution.Daily`, `Resolution.Minute`, etc. or a string, defaulting to Daily.
     #[pyo3(signature = (ticker, resolution=None))]
-    fn add_option(&mut self, ticker: &str, resolution: Option<&Bound<'_, PyAny>>) -> PyResult<crate::py_types::PyOptionSecurity> {
+    fn add_option(
+        &mut self,
+        ticker: &str,
+        resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::py_types::PyOptionSecurity> {
         use lean_core::Resolution;
         let res = match resolution {
             Some(r) => {
@@ -319,10 +371,13 @@ impl PyQcAlgorithm {
         let mut entries = HashMap::new();
         for sec in alg.securities.all() {
             let sid = sec.symbol.id.sid;
-            entries.insert(sid, PySecurityManager::build_entry(
-                sec.symbol.clone(),
-                sec.current_price().to_f64().unwrap_or(0.0),
-            ));
+            entries.insert(
+                sid,
+                PySecurityManager::build_entry(
+                    sec.symbol.clone(),
+                    sec.current_price().to_f64().unwrap_or(0.0),
+                ),
+            );
         }
         PySecurityManager::from_entries(entries)
     }
@@ -332,7 +387,9 @@ impl PyQcAlgorithm {
     #[getter]
     fn portfolio(&self) -> PyPortfolio {
         let inner = self.inner.lock().unwrap();
-        PyPortfolio { inner: inner.portfolio.clone() }
+        PyPortfolio {
+            inner: inner.portfolio.clone(),
+        }
     }
 
     #[getter]
@@ -344,7 +401,12 @@ impl PyQcAlgorithm {
     #[getter]
     fn portfolio_value(&self) -> f64 {
         use rust_decimal::prelude::ToPrimitive;
-        self.inner.lock().unwrap().portfolio_value().to_f64().unwrap_or(0.0)
+        self.inner
+            .lock()
+            .unwrap()
+            .portfolio_value()
+            .to_f64()
+            .unwrap_or(0.0)
     }
 
     fn is_invested(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -393,7 +455,10 @@ impl PyQcAlgorithm {
     /// LEAN API: `self.error(message)` — log an error-level message.
     fn error(&self, message: &str) {
         tracing::error!("Algorithm: {message}");
-        self.inner.lock().unwrap().log_message(&format!("ERROR: {message}"));
+        self.inner
+            .lock()
+            .unwrap()
+            .log_message(format!("ERROR: {message}"));
     }
 
     // ─── Market Hours ─────────────────────────────────────────────────────────
@@ -439,7 +504,11 @@ impl PyQcAlgorithm {
 
     fn __repr__(&self) -> String {
         let inner = self.inner.lock().unwrap();
-        format!("QCAlgorithm(name='{}', value={:.2})", inner.name, inner.portfolio_value())
+        format!(
+            "QCAlgorithm(name='{}', value={:.2})",
+            inner.name,
+            inner.portfolio_value()
+        )
     }
 }
 
@@ -448,7 +517,8 @@ fn ns_to_py_datetime(ns: i64) -> PyResult<PyObject> {
         let secs = ns / 1_000_000_000;
         let micros = (ns % 1_000_000_000) / 1_000;
         let timestamp = secs as f64 + micros as f64 / 1_000_000.0;
-        let datetime = py.import("datetime")?
+        let datetime = py
+            .import("datetime")?
             .getattr("datetime")?
             .call_method1("utcfromtimestamp", (timestamp,))?;
         Ok(datetime.into())
@@ -459,8 +529,7 @@ fn lean_datetime_to_iso(ns: i64) -> String {
     use chrono::{DateTime as ChronoDateTime, Utc};
     let secs = ns / 1_000_000_000;
     let nsub = (ns % 1_000_000_000) as u32;
-    let dt: ChronoDateTime<Utc> = chrono::DateTime::from_timestamp(secs, nsub)
-        .unwrap_or_default();
+    let dt: ChronoDateTime<Utc> = chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
     dt.format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
@@ -469,8 +538,7 @@ fn lean_datetime_to_date(ns: i64) -> String {
     use chrono::{DateTime as ChronoDateTime, Utc};
     let secs = ns / 1_000_000_000;
     let nsub = (ns % 1_000_000_000) as u32;
-    let dt: ChronoDateTime<Utc> = chrono::DateTime::from_timestamp(secs, nsub)
-        .unwrap_or_default();
+    let dt: ChronoDateTime<Utc> = chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
     dt.format("%Y-%m-%d").to_string()
 }
 
@@ -496,7 +564,7 @@ impl PyQcAlgorithm {
             return Ok(lean_core::Symbol::create_equity(&ticker, &Market::usa()));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "Expected Security, Symbol, OptionContract, or ticker string"
+            "Expected Security, Symbol, OptionContract, or ticker string",
         ))
     }
 
@@ -504,7 +572,9 @@ impl PyQcAlgorithm {
     /// Looks up the mid price from the current option chain.
     fn option_market_order(&mut self, sym: lean_core::Symbol, quantity: Decimal) -> PyResult<()> {
         // Determine canonical permtick: ?UNDERLYING
-        let canonical = sym.underlying.as_ref()
+        let canonical = sym
+            .underlying
+            .as_ref()
             .map(|u| format!("?{}", u.permtick))
             .unwrap_or_default();
 
@@ -521,7 +591,9 @@ impl PyQcAlgorithm {
 
         // Determine if opening or closing based on existing position
         let existing_qty = {
-            self.inner.lock().unwrap()
+            self.inner
+                .lock()
+                .unwrap()
                 .option_positions
                 .get(&sym.id.sid)
                 .map(|p| p.quantity)
@@ -530,15 +602,27 @@ impl PyQcAlgorithm {
         let abs_qty = quantity.abs();
         if quantity < Decimal::ZERO {
             if existing_qty.map(|q| q > Decimal::ZERO).unwrap_or(false) {
-                self.inner.lock().unwrap().sell_to_close(sym, abs_qty, premium);
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .sell_to_close(sym, abs_qty, premium);
             } else {
-                self.inner.lock().unwrap().sell_to_open(sym, abs_qty, premium);
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .sell_to_open(sym, abs_qty, premium);
             }
         } else if quantity > Decimal::ZERO {
             if existing_qty.map(|q| q < Decimal::ZERO).unwrap_or(false) {
-                self.inner.lock().unwrap().buy_to_close(sym, abs_qty, premium);
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .buy_to_close(sym, abs_qty, premium);
             } else {
-                self.inner.lock().unwrap().buy_to_open(sym, abs_qty, premium);
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .buy_to_open(sym, abs_qty, premium);
             }
         }
         Ok(())

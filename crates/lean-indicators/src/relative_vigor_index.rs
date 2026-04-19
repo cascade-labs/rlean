@@ -1,4 +1,8 @@
-use crate::{indicator::{Indicator, IndicatorResult}, sma::Sma, window::RollingWindow};
+use crate::{
+    indicator::{Indicator, IndicatorResult},
+    sma::Sma,
+    window::RollingWindow,
+};
 use lean_core::{DateTime, Price};
 use lean_data::TradeBar;
 use rust_decimal::Decimal;
@@ -9,7 +13,6 @@ use rust_decimal_macros::dec;
 /// RVI = SMA(NUM)/SMA(DENOM)
 pub struct RelativeVigorIndex {
     name: String,
-    period: usize,
     close_sma: Sma,
     range_sma: Sma,
     prev_bars: RollingWindow<(Decimal, Decimal, Decimal, Decimal)>, // (open,high,low,close)
@@ -22,7 +25,6 @@ impl RelativeVigorIndex {
     pub fn new(period: usize) -> Self {
         RelativeVigorIndex {
             name: format!("RVI({})", period),
-            period,
             close_sma: Sma::new(period),
             range_sma: Sma::new(period),
             prev_bars: RollingWindow::new(3),
@@ -34,11 +36,21 @@ impl RelativeVigorIndex {
 }
 
 impl Indicator for RelativeVigorIndex {
-    fn name(&self) -> &str { &self.name }
-    fn is_ready(&self) -> bool { self.close_sma.is_ready() && self.range_sma.is_ready() }
-    fn current(&self) -> IndicatorResult { self.current.clone() }
-    fn samples(&self) -> usize { self.samples }
-    fn warm_up_period(&self) -> usize { self.warm_up }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_ready(&self) -> bool {
+        self.close_sma.is_ready() && self.range_sma.is_ready()
+    }
+    fn current(&self) -> IndicatorResult {
+        self.current.clone()
+    }
+    fn samples(&self) -> usize {
+        self.samples
+    }
+    fn warm_up_period(&self) -> usize {
+        self.warm_up
+    }
 
     fn reset(&mut self) {
         self.close_sma.reset();
@@ -82,7 +94,8 @@ impl Indicator for RelativeVigorIndex {
             }
         }
 
-        self.prev_bars.push((bar.open, bar.high, bar.low, bar.close));
+        self.prev_bars
+            .push((bar.open, bar.high, bar.low, bar.close));
         self.current.clone()
     }
 }

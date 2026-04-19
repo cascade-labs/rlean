@@ -2,14 +2,26 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString, FromRepr};
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
-    Display, EnumString, EnumIter, FromRepr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    EnumIter,
+    FromRepr,
+    Default,
 )]
 #[repr(u8)]
 pub enum SecurityType {
     #[strum(serialize = "Base")]
     Base = 0,
     #[strum(serialize = "Equity")]
+    #[default]
     Equity = 1,
     #[strum(serialize = "Option")]
     Option = 2,
@@ -35,16 +47,16 @@ pub enum SecurityType {
 
 impl SecurityType {
     pub fn is_option_like(&self) -> bool {
-        matches!(self, SecurityType::Option | SecurityType::FutureOption | SecurityType::IndexOption)
+        matches!(
+            self,
+            SecurityType::Option | SecurityType::FutureOption | SecurityType::IndexOption
+        )
     }
 
     pub fn is_future_like(&self) -> bool {
-        matches!(self, SecurityType::Future | SecurityType::FutureOption | SecurityType::CryptoFuture)
-    }
-}
-
-impl Default for SecurityType {
-    fn default() -> Self {
-        SecurityType::Equity
+        matches!(
+            self,
+            SecurityType::Future | SecurityType::FutureOption | SecurityType::CryptoFuture
+        )
     }
 }

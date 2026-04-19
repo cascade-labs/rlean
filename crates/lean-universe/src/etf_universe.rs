@@ -1,7 +1,7 @@
 use lean_core::Symbol;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Holding information for an ETF constituent
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,27 +12,37 @@ pub struct EtfConstituent {
     pub market_value: Option<Decimal>,
 }
 
+type EtfConstituentFilter = dyn Fn(&[EtfConstituent]) -> Vec<Symbol> + Send + Sync;
+
 /// Universe that selects constituents of an ETF.
 /// Mirrors C# ETFConstituentsUniverseSelectionModel.
 pub struct EtfConstituentsUniverse {
     pub etf_symbol: Symbol,
     constituents: HashMap<String, EtfConstituent>,
-    filter: Option<Box<dyn Fn(&[EtfConstituent]) -> Vec<Symbol> + Send + Sync>>,
+    filter: Option<Box<EtfConstituentFilter>>,
 }
 
 impl EtfConstituentsUniverse {
     pub fn new(etf_symbol: Symbol) -> Self {
-        Self { etf_symbol, constituents: HashMap::new(), filter: None }
+        Self {
+            etf_symbol,
+            constituents: HashMap::new(),
+            filter: None,
+        }
     }
 
-    pub fn with_filter(mut self, f: impl Fn(&[EtfConstituent]) -> Vec<Symbol> + Send + Sync + 'static) -> Self {
+    pub fn with_filter(
+        mut self,
+        f: impl Fn(&[EtfConstituent]) -> Vec<Symbol> + Send + Sync + 'static,
+    ) -> Self {
         self.filter = Some(Box::new(f));
         self
     }
 
     /// Load constituent data (call this with fetched data)
     pub fn load_constituents(&mut self, constituents: Vec<EtfConstituent>) {
-        self.constituents = constituents.into_iter()
+        self.constituents = constituents
+            .into_iter()
             .map(|c| (c.symbol.value.clone(), c))
             .collect();
     }

@@ -1,8 +1,6 @@
 use lean_core::{DateTime, Price, Quantity, Symbol};
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderType {
@@ -35,7 +33,13 @@ pub enum OrderStatus {
 
 impl OrderStatus {
     pub fn is_open(&self) -> bool {
-        matches!(self, OrderStatus::New | OrderStatus::Submitted | OrderStatus::PartiallyFilled | OrderStatus::UpdateSubmitted)
+        matches!(
+            self,
+            OrderStatus::New
+                | OrderStatus::Submitted
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::UpdateSubmitted
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -57,9 +61,13 @@ pub enum OrderDirection {
 
 impl OrderDirection {
     pub fn from_quantity(qty: Quantity) -> Self {
-        if qty > dec!(0) { OrderDirection::Buy }
-        else if qty < dec!(0) { OrderDirection::Sell }
-        else { OrderDirection::Hold }
+        if qty > dec!(0) {
+            OrderDirection::Buy
+        } else if qty < dec!(0) {
+            OrderDirection::Sell
+        } else {
+            OrderDirection::Hold
+        }
     }
 
     pub fn opposite(&self) -> Self {
@@ -72,9 +80,10 @@ impl OrderDirection {
 }
 
 /// Time-in-force controls how long an order stays active.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum TimeInForce {
     /// Good until canceled (default).
+    #[default]
     GoodTilCanceled,
     /// Day — cancel at end of session.
     Day,
@@ -84,10 +93,6 @@ pub enum TimeInForce {
     ImmediateOrCancel,
     /// Fill or kill — fill completely or cancel entirely.
     FillOrKill,
-}
-
-impl Default for TimeInForce {
-    fn default() -> Self { TimeInForce::GoodTilCanceled }
 }
 
 /// Core order struct. Immutable after submission; updates create new versions.
@@ -154,7 +159,14 @@ impl Order {
         }
     }
 
-    pub fn limit(id: i64, symbol: Symbol, quantity: Quantity, limit_price: Price, time: DateTime, tag: &str) -> Self {
+    pub fn limit(
+        id: i64,
+        symbol: Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+        time: DateTime,
+        tag: &str,
+    ) -> Self {
         let mut o = Self::market(id, symbol, quantity, time, tag);
         o.order_type = OrderType::Limit;
         o.price = limit_price;
@@ -162,14 +174,29 @@ impl Order {
         o
     }
 
-    pub fn stop_market(id: i64, symbol: Symbol, quantity: Quantity, stop_price: Price, time: DateTime, tag: &str) -> Self {
+    pub fn stop_market(
+        id: i64,
+        symbol: Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        time: DateTime,
+        tag: &str,
+    ) -> Self {
         let mut o = Self::market(id, symbol, quantity, time, tag);
         o.order_type = OrderType::StopMarket;
         o.stop_price = Some(stop_price);
         o
     }
 
-    pub fn stop_limit(id: i64, symbol: Symbol, quantity: Quantity, stop_price: Price, limit_price: Price, time: DateTime, tag: &str) -> Self {
+    pub fn stop_limit(
+        id: i64,
+        symbol: Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        limit_price: Price,
+        time: DateTime,
+        tag: &str,
+    ) -> Self {
         let mut o = Self::market(id, symbol, quantity, time, tag);
         o.order_type = OrderType::StopLimit;
         o.stop_price = Some(stop_price);
