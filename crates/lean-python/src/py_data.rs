@@ -1,7 +1,9 @@
 use crate::py_options::{PyOptionChain, PyOptionChains};
 use crate::py_types::{PySecurity, PySymbol};
+use lean_core::TickType;
 use lean_data::QuoteBar;
-use lean_data::{CustomDataPoint, Slice, SubscriptionDataConfig, TradeBar};
+use lean_data::{CustomDataPoint, Delisting, DelistingType, Slice, SubscriptionDataConfig,
+    SymbolChangedEvent, Tick, TradeBar};
 use lean_options::OptionChain;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
@@ -66,6 +68,24 @@ impl From<&TradeBar> for PyTradeBar {
 
 #[pymethods]
 impl PyTradeBar {
+    /// `Value` matches C# `BaseData.Value` which returns `Close` for TradeBar.
+    #[getter]
+    fn value(&self) -> f64 {
+        self.close
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'TradeBar' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "TradeBar({} O={:.2} H={:.2} L={:.2} C={:.2} V={:.0})",
@@ -135,6 +155,23 @@ impl PyTradeBars {
 
     fn values(&self, py: Python<'_>) -> Vec<Py<PyTradeBar>> {
         self.bars.values().map(|b| b.clone_ref(py)).collect()
+    }
+
+    /// LEAN C# API: `data.Bars.ContainsKey(symbol)` — alias for `__contains__`.
+    fn contains_key(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.__contains__(symbol)
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'TradeBars' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self) -> String {
@@ -340,6 +377,404 @@ impl PyQuoteBars {
     }
 }
 
+/// Python-visible Tick.
+#[pyclass(name = "Tick")]
+#[derive(Debug, Clone)]
+pub struct PyTick {
+    #[pyo3(get)]
+    pub symbol: PySymbol,
+    #[pyo3(get)]
+    pub time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub value: f64,
+    #[pyo3(get)]
+    pub quantity: f64,
+    #[pyo3(get)]
+    pub bid_price: f64,
+    #[pyo3(get)]
+    pub ask_price: f64,
+    #[pyo3(get)]
+    pub bid_size: f64,
+    #[pyo3(get)]
+    pub ask_size: f64,
+    tick_type: TickType,
+}
+
+impl From<&Tick> for PyTick {
+    fn from(tick: &Tick) -> Self {
+        PyTick {
+            symbol: PySymbol {
+                inner: tick.symbol.clone(),
+            },
+            time: ns_to_naive(tick.time.0),
+            value: tick.value.to_f64().unwrap_or(0.0),
+            quantity: tick.quantity.to_f64().unwrap_or(0.0),
+            bid_price: tick.bid_price.to_f64().unwrap_or(0.0),
+            ask_price: tick.ask_price.to_f64().unwrap_or(0.0),
+            bid_size: tick.bid_size.to_f64().unwrap_or(0.0),
+            ask_size: tick.ask_size.to_f64().unwrap_or(0.0),
+            tick_type: tick.tick_type,
+        }
+    }
+}
+
+#[pymethods]
+impl PyTick {
+    #[getter]
+    fn tick_type(&self) -> &str {
+        match self.tick_type {
+            TickType::Trade => "Trade",
+            TickType::Quote => "Quote",
+            TickType::OpenInterest => "OpenInterest",
+        }
+    }
+
+    fn is_trade(&self) -> bool {
+        self.tick_type == TickType::Trade
+    }
+
+    fn is_quote(&self) -> bool {
+        self.tick_type == TickType::Quote
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Tick' object has no attribute '{name}'"
+        )))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Tick({} type={} value={:.4})",
+            self.symbol.inner.value,
+            self.tick_type(),
+            self.value
+        )
+    }
+}
+
+/// LEAN API: `data.ticks` — dict-like tick collection keyed by symbol.
+#[pyclass(name = "Ticks")]
+pub struct PyTicks {
+    ticks: HashMap<u64, Vec<Py<PyTick>>>,
+    ticker_to_sid: HashMap<String, u64>,
+}
+
+impl PyTicks {
+    pub fn empty() -> Self {
+        PyTicks {
+            ticks: HashMap::new(),
+            ticker_to_sid: HashMap::new(),
+        }
+    }
+
+    fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        if let Ok(sym) = arg.downcast::<PySymbol>() {
+            return Ok(Some(sym.get().inner.id.sid));
+        }
+        if let Ok(sec) = arg.downcast::<PySecurity>() {
+            return Ok(Some(sec.get().inner.inner.id.sid));
+        }
+        if let Ok(ticker) = arg.extract::<String>() {
+            return Ok(self.ticker_to_sid.get(&ticker).copied());
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security, Symbol, or str",
+        ))
+    }
+}
+
+#[pymethods]
+impl PyTicks {
+    fn get(&self, py: Python<'_>, symbol: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyTick>>> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .and_then(|sid| self.ticks.get(&sid))
+            .map(|ticks| ticks.iter().map(|t| t.clone_ref(py)).collect())
+            .unwrap_or_default())
+    }
+
+    fn __getitem__(&self, py: Python<'_>, symbol: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyTick>>> {
+        self.get(py, symbol)
+    }
+
+    fn __contains__(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .map(|sid| self.ticks.contains_key(&sid))
+            .unwrap_or(false))
+    }
+
+    fn __len__(&self) -> usize {
+        self.ticks.len()
+    }
+
+    fn values(&self, py: Python<'_>) -> Vec<Vec<Py<PyTick>>> {
+        self.ticks
+            .values()
+            .map(|ticks| ticks.iter().map(|t| t.clone_ref(py)).collect())
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Ticks(count={})", self.ticks.len())
+    }
+}
+
+/// Python-visible Delisting event.
+///
+/// LEAN API: `data.Delistings[symbol]` → Delisting
+#[pyclass(name = "Delisting")]
+#[derive(Debug, Clone)]
+pub struct PyDelisting {
+    #[pyo3(get)]
+    pub symbol: PySymbol,
+    #[pyo3(get)]
+    pub time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub price: f64,
+    delisting_type: DelistingType,
+}
+
+impl From<&Delisting> for PyDelisting {
+    fn from(d: &Delisting) -> Self {
+        PyDelisting {
+            symbol: PySymbol {
+                inner: d.symbol.clone(),
+            },
+            time: ns_to_naive(d.time.0),
+            price: d.price.to_f64().unwrap_or(0.0),
+            delisting_type: d.delisting_type,
+        }
+    }
+}
+
+#[pymethods]
+impl PyDelisting {
+    /// LEAN API: `delisting.Type` → "Warning" or "Delisted"
+    #[getter(r#type)]
+    fn delisting_type_str(&self) -> &str {
+        match self.delisting_type {
+            DelistingType::Warning => "Warning",
+            DelistingType::Delisted => "Delisted",
+        }
+    }
+
+    fn is_warning(&self) -> bool {
+        self.delisting_type == DelistingType::Warning
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Delisting' object has no attribute '{name}'"
+        )))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Delisting({} type={} price={:.2})",
+            self.symbol.inner.value,
+            self.delisting_type_str(),
+            self.price
+        )
+    }
+}
+
+/// LEAN API: `data.Delistings` — dict-like collection of delisting events.
+#[pyclass(name = "Delistings")]
+pub struct PyDelistings {
+    events: HashMap<u64, Py<PyDelisting>>,
+}
+
+impl PyDelistings {
+    pub fn empty() -> Self {
+        PyDelistings {
+            events: HashMap::new(),
+        }
+    }
+
+    fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        if let Ok(sym) = arg.downcast::<PySymbol>() {
+            return Ok(Some(sym.get().inner.id.sid));
+        }
+        if let Ok(sec) = arg.downcast::<PySecurity>() {
+            return Ok(Some(sec.get().inner.inner.id.sid));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security or Symbol",
+        ))
+    }
+}
+
+#[pymethods]
+impl PyDelistings {
+    fn get(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyDelisting>>> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .and_then(|sid| self.events.get(&sid).map(|e| e.clone_ref(py))))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyDelisting>>> {
+        self.get(py, symbol)
+    }
+
+    fn __contains__(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .map(|sid| self.events.contains_key(&sid))
+            .unwrap_or(false))
+    }
+
+    fn __len__(&self) -> usize {
+        self.events.len()
+    }
+
+    fn values(&self, py: Python<'_>) -> Vec<Py<PyDelisting>> {
+        self.events.values().map(|e| e.clone_ref(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Delistings(count={})", self.events.len())
+    }
+}
+
+/// Python-visible SymbolChangedEvent.
+///
+/// LEAN API: `data.SymbolChangedEvents[symbol]` → SymbolChangedEvent
+#[pyclass(name = "SymbolChangedEvent")]
+#[derive(Debug, Clone)]
+pub struct PySymbolChangedEvent {
+    #[pyo3(get)]
+    pub symbol: PySymbol,
+    #[pyo3(get)]
+    pub time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub old_symbol: String,
+    #[pyo3(get)]
+    pub new_symbol: String,
+}
+
+impl From<&SymbolChangedEvent> for PySymbolChangedEvent {
+    fn from(ev: &SymbolChangedEvent) -> Self {
+        PySymbolChangedEvent {
+            symbol: PySymbol {
+                inner: ev.symbol.clone(),
+            },
+            time: ns_to_naive(ev.time.0),
+            old_symbol: ev.old_symbol.clone(),
+            new_symbol: ev.new_symbol.clone(),
+        }
+    }
+}
+
+#[pymethods]
+impl PySymbolChangedEvent {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'SymbolChangedEvent' object has no attribute '{name}'"
+        )))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SymbolChangedEvent({} → {})",
+            self.old_symbol, self.new_symbol
+        )
+    }
+}
+
+/// LEAN API: `data.SymbolChangedEvents` — dict-like collection of rename events.
+#[pyclass(name = "SymbolChangedEvents")]
+pub struct PySymbolChangedEvents {
+    events: HashMap<u64, Py<PySymbolChangedEvent>>,
+}
+
+impl PySymbolChangedEvents {
+    pub fn empty() -> Self {
+        PySymbolChangedEvents {
+            events: HashMap::new(),
+        }
+    }
+
+    fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        if let Ok(sym) = arg.downcast::<PySymbol>() {
+            return Ok(Some(sym.get().inner.id.sid));
+        }
+        if let Ok(sec) = arg.downcast::<PySecurity>() {
+            return Ok(Some(sec.get().inner.inner.id.sid));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security or Symbol",
+        ))
+    }
+}
+
+#[pymethods]
+impl PySymbolChangedEvents {
+    fn get(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PySymbolChangedEvent>>> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .and_then(|sid| self.events.get(&sid).map(|e| e.clone_ref(py))))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PySymbolChangedEvent>>> {
+        self.get(py, symbol)
+    }
+
+    fn __contains__(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .map(|sid| self.events.contains_key(&sid))
+            .unwrap_or(false))
+    }
+
+    fn __len__(&self) -> usize {
+        self.events.len()
+    }
+
+    fn values(&self, py: Python<'_>) -> Vec<Py<PySymbolChangedEvent>> {
+        self.events.values().map(|e| e.clone_ref(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SymbolChangedEvents(count={})", self.events.len())
+    }
+}
+
 /// Python-visible Slice — the object delivered to `on_data`.
 ///
 /// Holds a `Py<PyTradeBars>` reference rather than owning bar data, so the
@@ -348,8 +783,11 @@ impl PyQuoteBars {
 pub struct PySlice {
     bars_obj: Py<PyTradeBars>,
     quote_bars_obj: Py<PyQuoteBars>,
+    ticks_obj: Py<PyTicks>,
     option_chains_obj: Py<PyOptionChains>,
     custom_data_obj: Py<PyCustomData>,
+    delistings_obj: Py<PyDelistings>,
+    symbol_changed_events_obj: Py<PySymbolChangedEvents>,
     #[pyo3(get)]
     pub has_data: bool,
 }
@@ -374,13 +812,66 @@ impl PySlice {
             },
         )?;
         let py_chains = Py::new(py, PyOptionChains::empty())?;
-        let py_quote_bars = Py::new(py, PyQuoteBars::empty())?;
+        let mut py_quote_map: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
+        let mut quote_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        for (&sid, bar) in &slice.quote_bars {
+            let py_bar = Py::new(py, PyQuoteBar::from(bar))?;
+            quote_ticker_to_sid.insert(bar.symbol.value.clone(), sid);
+            quote_ticker_to_sid.insert(bar.symbol.permtick.clone(), sid);
+            py_quote_map.insert(sid, py_bar);
+        }
+        let py_quote_bars = Py::new(
+            py,
+            PyQuoteBars {
+                bars: py_quote_map,
+                ticker_to_sid: quote_ticker_to_sid,
+            },
+        )?;
+        let mut py_ticks_map: HashMap<u64, Vec<Py<PyTick>>> = HashMap::new();
+        let mut tick_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        for (&sid, ticks) in &slice.ticks {
+            let Some(first) = ticks.first() else {
+                continue;
+            };
+            tick_ticker_to_sid.insert(first.symbol.value.clone(), sid);
+            tick_ticker_to_sid.insert(first.symbol.permtick.clone(), sid);
+            let py_ticks = ticks
+                .iter()
+                .map(PyTick::from)
+                .map(|tick| Py::new(py, tick))
+                .collect::<PyResult<Vec<_>>>()?;
+            py_ticks_map.insert(sid, py_ticks);
+        }
+        let py_ticks = Py::new(
+            py,
+            PyTicks {
+                ticks: py_ticks_map,
+                ticker_to_sid: tick_ticker_to_sid,
+            },
+        )?;
         let py_custom = Py::new(py, PyCustomData::empty())?;
+        let py_delistings = {
+            let mut events: HashMap<u64, Py<PyDelisting>> = HashMap::new();
+            for (&sid, d) in &slice.delistings {
+                events.insert(sid, Py::new(py, PyDelisting::from(d))?);
+            }
+            Py::new(py, PyDelistings { events })?
+        };
+        let py_sce = {
+            let mut events: HashMap<u64, Py<PySymbolChangedEvent>> = HashMap::new();
+            for (&sid, ev) in &slice.symbol_changed_events {
+                events.insert(sid, Py::new(py, PySymbolChangedEvent::from(ev))?);
+            }
+            Py::new(py, PySymbolChangedEvents { events })?
+        };
         Ok(PySlice {
             bars_obj: py_bars,
             quote_bars_obj: py_quote_bars,
+            ticks_obj: py_ticks,
             option_chains_obj: py_chains,
             custom_data_obj: py_custom,
+            delistings_obj: py_delistings,
+            symbol_changed_events_obj: py_sce,
             has_data: slice.has_data,
         })
     }
@@ -400,6 +891,12 @@ impl PySlice {
         self.quote_bars_obj.clone_ref(py)
     }
 
+    /// LEAN API: `data.ticks` — returns the Ticks collection (refcount bump only).
+    #[getter]
+    fn ticks(&self, py: Python<'_>) -> Py<PyTicks> {
+        self.ticks_obj.clone_ref(py)
+    }
+
     /// LEAN API: `data.option_chains` — returns the OptionChains dict (refcount bump only).
     #[getter]
     fn option_chains(&self, py: Python<'_>) -> Py<PyOptionChains> {
@@ -410,6 +907,18 @@ impl PySlice {
     #[getter]
     fn custom(&self, py: Python<'_>) -> Py<PyCustomData> {
         self.custom_data_obj.clone_ref(py)
+    }
+
+    /// LEAN API: `data.Delistings` / `data.delistings` — returns the Delistings dict.
+    #[getter]
+    fn delistings(&self, py: Python<'_>) -> Py<PyDelistings> {
+        self.delistings_obj.clone_ref(py)
+    }
+
+    /// LEAN API: `data.SymbolChangedEvents` / `data.symbol_changed_events`.
+    #[getter]
+    fn symbol_changed_events(&self, py: Python<'_>) -> Py<PySymbolChangedEvents> {
+        self.symbol_changed_events_obj.clone_ref(py)
     }
 
     /// LEAN API: `data.get(symbol)` — delegates to bars.get().
@@ -438,6 +947,15 @@ impl PySlice {
         }
     }
 
+    /// LEAN API: `symbol in data` — true if this slice has a bar for `symbol`.
+    ///
+    /// Without this, Python falls back to the legacy `__getitem__(0, 1, 2 …)`
+    /// sequence protocol.  `__getitem__` returns `Ok(None)` rather than raising
+    /// `IndexError`, so Python never terminates the loop → 100 % CPU spin.
+    fn __contains__(&self, py: Python<'_>, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.bars_obj.borrow(py).__contains__(symbol)
+    }
+
     fn tickers(&self, py: Python<'_>) -> Vec<String> {
         self.bars_obj
             .borrow(py)
@@ -445,6 +963,18 @@ impl PySlice {
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Slice' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {
@@ -484,6 +1014,18 @@ impl PyCustomDataPoint {
             dict.set_item(k, py_val)?;
         }
         Ok(dict.into())
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'CustomDataPoint' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self) -> String {
@@ -529,10 +1071,12 @@ fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject>
 ///
 /// Keyed by ticker string (e.g. `"UNRATE"`, `"VIX"`).
 /// Each value is the latest `CustomDataPoint` for that ticker on this date.
+/// For multi-row sources (e.g. snapshot files with one row per symbol), use
+/// `get_all(ticker)` to retrieve all points delivered for that ticker today.
 #[pyclass(name = "CustomData")]
 pub struct PyCustomData {
-    /// ticker (uppercase) → latest data point for this bar
-    points: HashMap<String, Py<PyCustomDataPoint>>,
+    /// ticker (uppercase) → all data points for this bar (last = most recent)
+    points: HashMap<String, Vec<Py<PyCustomDataPoint>>>,
 }
 
 impl PyCustomData {
@@ -545,13 +1089,31 @@ impl PyCustomData {
 
 #[pymethods]
 impl PyCustomData {
+    /// Returns the LAST (most recent) point for the ticker — LEAN-compatible single-point API.
     fn __getitem__(&self, py: Python<'_>, ticker: &str) -> PyResult<Option<Py<PyCustomDataPoint>>> {
         let key = ticker.to_uppercase();
-        Ok(self.points.get(&key).map(|p| p.clone_ref(py)))
+        Ok(self
+            .points
+            .get(&key)
+            .and_then(|v| v.last())
+            .map(|p| p.clone_ref(py)))
     }
 
+    /// Returns the LAST (most recent) point for the ticker — LEAN-compatible single-point API.
     fn get(&self, py: Python<'_>, ticker: &str) -> PyResult<Option<Py<PyCustomDataPoint>>> {
         self.__getitem__(py, ticker)
+    }
+
+    /// Returns ALL points for the ticker delivered today.
+    ///
+    /// Use this for snapshot/universe sources that push one row per symbol per day
+    /// (e.g. `data.custom.get_all("snapshot")` → list of CustomDataPoint).
+    fn get_all(&self, py: Python<'_>, ticker: &str) -> Vec<Py<PyCustomDataPoint>> {
+        let key = ticker.to_uppercase();
+        match self.points.get(&key) {
+            Some(v) => v.iter().map(|p| p.clone_ref(py)).collect(),
+            None => vec![],
+        }
     }
 
     fn __contains__(&self, ticker: &str) -> bool {
@@ -586,14 +1148,22 @@ pub struct SliceProxy {
     pub py_slice: Py<PySlice>,
     /// Per-symbol mutable bar cells, keyed by symbol SID.
     bar_cells: HashMap<u64, Py<PyTradeBar>>,
+    /// The TradeBars container object (shared with py_slice).
+    bars_cell: Py<PyTradeBars>,
     /// Per-symbol mutable quote bar cells, keyed by symbol SID.
     quote_bar_cells: HashMap<u64, Py<PyQuoteBar>>,
     /// The QuoteBars container object (shared with py_slice).
     quote_bars_cell: Py<PyQuoteBars>,
+    /// The Ticks container object (shared with py_slice).
+    ticks_cell: Py<PyTicks>,
     /// Mutable option chains cell — updated in-place each bar.
     option_chains_cell: Py<PyOptionChains>,
     /// Mutable custom data cell — updated once per trading day.
     custom_data_cell: Py<PyCustomData>,
+    /// Mutable delistings cell — updated each day.
+    pub delistings_cell: Py<PyDelistings>,
+    /// Mutable symbol changed events cell — updated each day.
+    pub symbol_changed_events_cell: Py<PySymbolChangedEvents>,
 }
 
 impl SliceProxy {
@@ -601,9 +1171,7 @@ impl SliceProxy {
     /// the main loop; amortised over all trading days.
     pub fn new(py: Python<'_>, subscriptions: &[Arc<SubscriptionDataConfig>]) -> PyResult<Self> {
         let mut bar_cells: HashMap<u64, Py<PyTradeBar>> = HashMap::new();
-        let mut bars_map: HashMap<u64, Py<PyTradeBar>> = HashMap::new();
         let mut quote_bar_cells: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
-        let mut quote_bars_map: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
         let mut ticker_to_sid: HashMap<String, u64> = HashMap::new();
         let mut qb_ticker_to_sid: HashMap<String, u64> = HashMap::new();
 
@@ -626,7 +1194,6 @@ impl SliceProxy {
             )?;
             ticker_to_sid.insert(sub.symbol.value.clone(), sid);
             ticker_to_sid.insert(sub.symbol.permtick.clone(), sid);
-            bars_map.insert(sid, py_bar.clone_ref(py));
             bar_cells.insert(sid, py_bar);
 
             let py_qbar = Py::new(
@@ -651,14 +1218,13 @@ impl SliceProxy {
             )?;
             qb_ticker_to_sid.insert(sub.symbol.value.clone(), sid);
             qb_ticker_to_sid.insert(sub.symbol.permtick.clone(), sid);
-            quote_bars_map.insert(sid, py_qbar.clone_ref(py));
             quote_bar_cells.insert(sid, py_qbar);
         }
 
-        let py_bars = Py::new(
+        let py_bars_obj = Py::new(
             py,
             PyTradeBars {
-                bars: bars_map,
+                bars: HashMap::new(),
                 ticker_to_sid,
             },
         )?;
@@ -666,18 +1232,24 @@ impl SliceProxy {
         let py_qbars_obj = Py::new(
             py,
             PyQuoteBars {
-                bars: quote_bars_map,
+                bars: HashMap::new(),
                 ticker_to_sid: qb_ticker_to_sid,
             },
         )?;
+        let py_ticks_obj = Py::new(py, PyTicks::empty())?;
         let py_custom = Py::new(py, PyCustomData::empty())?;
+        let py_delistings = Py::new(py, PyDelistings::empty())?;
+        let py_sce = Py::new(py, PySymbolChangedEvents::empty())?;
         let py_slice = Py::new(
             py,
             PySlice {
-                bars_obj: py_bars,
+                bars_obj: py_bars_obj.clone_ref(py),
                 quote_bars_obj: py_qbars_obj.clone_ref(py),
+                ticks_obj: py_ticks_obj.clone_ref(py),
                 option_chains_obj: py_chains.clone_ref(py),
                 custom_data_obj: py_custom.clone_ref(py),
+                delistings_obj: py_delistings.clone_ref(py),
+                symbol_changed_events_obj: py_sce.clone_ref(py),
                 has_data: false,
             },
         )?;
@@ -685,10 +1257,14 @@ impl SliceProxy {
         Ok(SliceProxy {
             py_slice,
             bar_cells,
+            bars_cell: py_bars_obj,
             quote_bar_cells,
             quote_bars_cell: py_qbars_obj,
+            ticks_cell: py_ticks_obj,
             option_chains_cell: py_chains,
             custom_data_cell: py_custom,
+            delistings_cell: py_delistings,
+            symbol_changed_events_cell: py_sce,
         })
     }
 
@@ -696,6 +1272,7 @@ impl SliceProxy {
     /// formats per symbol.  Must be called with the GIL held and no active Python
     /// borrows on the bar objects (guaranteed safe between `on_data` calls).
     pub fn update(&self, py: Python<'_>, slice: &Slice) {
+        let mut active_sids = Vec::with_capacity(slice.bars.len());
         for (&sid, bar) in &slice.bars {
             if let Some(py_bar) = self.bar_cells.get(&sid) {
                 let mut b = py_bar.borrow_mut(py);
@@ -706,9 +1283,41 @@ impl SliceProxy {
                 b.volume = bar.volume.to_f64().unwrap_or(0.0);
                 b.time = ns_to_naive(bar.time.0);
                 b.end_time = ns_to_naive(bar.end_time.0);
+                active_sids.push(sid);
+            }
+        }
+        {
+            let mut bars_obj = self.bars_cell.borrow_mut(py);
+            bars_obj.bars.clear();
+            for sid in active_sids {
+                if let Some(cell) = self.bar_cells.get(&sid) {
+                    bars_obj.bars.insert(sid, cell.clone_ref(py));
+                }
             }
         }
         self.py_slice.borrow_mut(py).has_data = slice.has_data;
+
+        // Update delistings for this bar.
+        {
+            let mut dl = self.delistings_cell.borrow_mut(py);
+            dl.events.clear();
+            for (&sid, d) in &slice.delistings {
+                if let Ok(py_d) = Py::new(py, PyDelisting::from(d)) {
+                    dl.events.insert(sid, py_d);
+                }
+            }
+        }
+
+        // Update symbol changed events for this bar.
+        {
+            let mut sce = self.symbol_changed_events_cell.borrow_mut(py);
+            sce.events.clear();
+            for (&sid, ev) in &slice.symbol_changed_events {
+                if let Ok(py_ev) = Py::new(py, PySymbolChangedEvent::from(ev)) {
+                    sce.events.insert(sid, py_ev);
+                }
+            }
+        }
     }
 
     /// Write new quote bar values in-place for a set of bars.
@@ -749,6 +1358,36 @@ impl SliceProxy {
         }
     }
 
+    /// Replace the `data.ticks` container for this slice.
+    pub fn update_ticks(&self, py: Python<'_>, ticks: &HashMap<u64, Vec<Tick>>) {
+        let mut ticks_obj = self.ticks_cell.borrow_mut(py);
+        ticks_obj.ticks.clear();
+        ticks_obj.ticker_to_sid.clear();
+
+        for (&sid, tick_vec) in ticks {
+            if tick_vec.is_empty() {
+                continue;
+            }
+
+            if let Some(first) = tick_vec.first() {
+                ticks_obj
+                    .ticker_to_sid
+                    .insert(first.symbol.value.clone(), sid);
+                ticks_obj
+                    .ticker_to_sid
+                    .insert(first.symbol.permtick.clone(), sid);
+            }
+
+            let py_ticks = tick_vec
+                .iter()
+                .filter_map(|tick| Py::new(py, PyTick::from(tick)).ok())
+                .collect::<Vec<_>>();
+            if !py_ticks.is_empty() {
+                ticks_obj.ticks.insert(sid, py_ticks);
+            }
+        }
+    }
+
     /// Write the option chains for this bar in-place.
     /// Called once per trading day before `on_data` when option subscriptions exist.
     pub fn update_option_chains(&self, py: Python<'_>, chains: &[(String, OptionChain)]) {
@@ -764,33 +1403,144 @@ impl SliceProxy {
 
     /// Write custom data points for this bar in-place.
     ///
-    /// Replaces the `data.custom` dict with the latest points for each ticker.
+    /// Replaces the `data.custom` dict with ALL points for each ticker.
     /// Called once per trading day (or once per minute in minute-mode) before `on_data`.
     ///
     /// `data`: ticker (any case) → list of `CustomDataPoint`s for this date.
-    /// The last point in each list is used as the representative value.
+    /// All points are stored; `get()` returns the last, `get_all()` returns the full list.
     pub fn update_custom_data(&self, py: Python<'_>, data: &HashMap<String, Vec<CustomDataPoint>>) {
         let mut custom_obj = self.custom_data_cell.borrow_mut(py);
         custom_obj.points.clear();
 
         for (ticker, points) in data {
-            // Use the last point as the current value (most recent intraday bar,
-            // or the single daily point).
-            let Some(last) = points.last() else {
+            if points.is_empty() {
                 continue;
-            };
-            let py_point = match Py::new(
-                py,
-                PyCustomDataPoint {
-                    value: last.value.to_f64().unwrap_or(0.0),
-                    time: last.time,
-                    fields_inner: last.fields.clone(),
-                },
-            ) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            custom_obj.points.insert(ticker.to_uppercase(), py_point);
+            }
+            let mut py_points = Vec::with_capacity(points.len());
+            for pt in points {
+                match Py::new(
+                    py,
+                    PyCustomDataPoint {
+                        value: pt.value.to_f64().unwrap_or(0.0),
+                        time: pt.time,
+                        fields_inner: pt.fields.clone(),
+                    },
+                ) {
+                    Ok(p) => py_points.push(p),
+                    Err(_) => continue,
+                }
+            }
+            custom_obj.points.insert(ticker.to_uppercase(), py_points);
         }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::py_qc_algorithm::pascal_to_snake;
+    use lean_core::{Market, Symbol};
+
+    fn make_trade_bar() -> PyTradeBar {
+        PyTradeBar {
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 102.0,
+            volume: 1_000_000.0,
+            symbol: PySymbol {
+                inner: Symbol::create_equity("SPY", &Market::usa()),
+            },
+            time: chrono::NaiveDateTime::default(),
+            end_time: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    /// C# LEAN TradeBar.Value == Close (BaseData convention).
+    #[test]
+    fn tradebar_value_equals_close() {
+        let bar = make_trade_bar();
+        assert!((bar.value() - bar.close).abs() < 1e-9, "bar.value must equal bar.close");
+    }
+
+    /// All TradeBar PascalCase names must convert to valid snake_case properties
+    /// so __getattr__ forwarding will find them at runtime.
+    #[test]
+    fn tradebar_pascal_names_convert_to_snake() {
+        for (pascal, snake) in &[
+            ("Close", "close"),
+            ("Open", "open"),
+            ("High", "high"),
+            ("Low", "low"),
+            ("Volume", "volume"),
+            ("Symbol", "symbol"),
+            ("Time", "time"),
+            ("EndTime", "end_time"),
+            ("Value", "value"),
+        ] {
+            assert_eq!(
+                pascal_to_snake(pascal), *snake,
+                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+            );
+        }
+    }
+
+    /// All OrderEvent PascalCase names must convert to valid snake_case.
+    #[test]
+    fn order_event_pascal_names_convert_to_snake() {
+        for (pascal, snake) in &[
+            ("FillPrice", "fill_price"),
+            ("FillQuantity", "fill_quantity"),
+            ("AbsoluteFillQuantity", "absolute_fill_quantity"),
+            ("OrderId", "order_id"),
+            ("Symbol", "symbol"),
+            ("UtcTime", "utc_time"),
+            ("Status", "status"),
+            ("Direction", "direction"),
+            ("Message", "message"),
+            ("IsAssignment", "is_assignment"),
+            ("IsFill", "is_fill"),
+            ("OrderFee", "order_fee"),
+            ("FillPriceCurrency", "fill_price_currency"),
+        ] {
+            assert_eq!(
+                pascal_to_snake(pascal), *snake,
+                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+            );
+        }
+    }
+
+    /// All OptionContract PascalCase names must convert to valid snake_case.
+    #[test]
+    fn option_contract_pascal_names_convert_to_snake() {
+        for (pascal, snake) in &[
+            ("Strike", "strike"),
+            ("Expiry", "expiry"),
+            ("Right", "right"),
+            ("Style", "style"),
+            ("BidPrice", "bid_price"),
+            ("AskPrice", "ask_price"),
+            ("LastPrice", "last_price"),
+            ("ImpliedVolatility", "implied_volatility"),
+            ("OpenInterest", "open_interest"),
+            ("Greeks", "greeks"),
+            ("Symbol", "symbol"),
+            ("UnderlyingLastPrice", "underlying_last_price"),
+            ("TheoreticalPrice", "theoretical_price"),
+        ] {
+            assert_eq!(
+                pascal_to_snake(pascal), *snake,
+                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+            );
+        }
+    }
+
+    /// Symbol.Value must map correctly.
+    #[test]
+    fn symbol_pascal_names_convert_to_snake() {
+        assert_eq!(pascal_to_snake("Value"), "value");
+        assert_eq!(pascal_to_snake("Ticker"), "ticker");
     }
 }

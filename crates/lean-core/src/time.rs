@@ -59,7 +59,9 @@ impl NanosecondTimestamp {
 
 impl From<ChronoDateTime<Utc>> for NanosecondTimestamp {
     fn from(dt: ChronoDateTime<Utc>) -> Self {
-        NanosecondTimestamp(dt.timestamp_nanos_opt().unwrap_or(0))
+        // timestamp_nanos_opt() returns None for dates beyond ~year 2262 (i64 overflow).
+        // Use i64::MAX so far-future end dates don't become 0 and exclude all bars.
+        NanosecondTimestamp(dt.timestamp_nanos_opt().unwrap_or(i64::MAX))
     }
 }
 

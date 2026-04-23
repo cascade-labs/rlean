@@ -2,7 +2,7 @@ use crate::py_data::PyTradeBar;
 use crate::py_types::PyIndicatorResult;
 use lean_core::NanosecondTimestamp;
 use lean_indicators::indicator::Indicator;
-use lean_indicators::{Atr, BollingerBands, Ema, Macd, Rsi, Sma};
+use lean_indicators::{Atr, BollingerBands, Ema, Macd, MomentumPct, Rsi, Sma, StandardDeviation};
 use pyo3::prelude::*;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -21,6 +21,19 @@ fn make_result(r: lean_indicators::indicator::IndicatorResult) -> PyIndicatorRes
         is_ready: r.is_ready(),
         value: r.value.to_f64().unwrap_or(0.0),
     }
+}
+
+/// PascalCase → snake_case forwarding helper shared by all indicator classes.
+fn indicator_getattr(py: Python<'_>, obj: &Bound<'_, PyAny>, name: &str) -> PyResult<PyObject> {
+    let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+    if snake != name {
+        if let Ok(attr) = obj.getattr(snake.as_str()) {
+            return Ok(attr.into());
+        }
+    }
+    Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+        "indicator has no attribute '{name}'"
+    )))
 }
 
 fn bar_from_py(bar: &PyTradeBar) -> lean_data::TradeBar {
@@ -67,6 +80,18 @@ impl PyIndicatorDataPoint {
         })
     }
 
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'IndicatorDataPoint' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!("IndicatorDataPoint(value={:.6})", self.value)
     }
@@ -77,6 +102,12 @@ impl PyIndicatorDataPoint {
 #[pyclass(name = "SimpleMovingAverage")]
 pub struct PySma {
     inner: Sma,
+}
+
+impl PySma {
+    pub fn create(period: usize) -> Self {
+        PySma { inner: Sma::new(period) }
+    }
 }
 
 #[pymethods]
@@ -142,6 +173,9 @@ impl PySma {
             self.inner.is_ready()
         )
     }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
+    }
 }
 
 // ─── EMA ─────────────────────────────────────────────────────────────────────
@@ -149,6 +183,12 @@ impl PySma {
 #[pyclass(name = "ExponentialMovingAverage")]
 pub struct PyEma {
     inner: Ema,
+}
+
+impl PyEma {
+    pub fn create(period: usize) -> Self {
+        PyEma { inner: Ema::new(period) }
+    }
 }
 
 #[pymethods]
@@ -214,6 +254,9 @@ impl PyEma {
             self.inner.is_ready()
         )
     }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
+    }
 }
 
 // ─── RSI ─────────────────────────────────────────────────────────────────────
@@ -221,6 +264,12 @@ impl PyEma {
 #[pyclass(name = "RelativeStrengthIndex")]
 pub struct PyRsi {
     inner: Rsi,
+}
+
+impl PyRsi {
+    pub fn create(period: usize) -> Self {
+        PyRsi { inner: Rsi::new(period) }
+    }
 }
 
 #[pymethods]
@@ -289,6 +338,9 @@ impl PyRsi {
             self.inner.current().value,
             self.inner.is_ready()
         )
+    }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
     }
 }
 
@@ -362,6 +414,9 @@ impl PyMacd {
 
     fn reset(&mut self) {
         self.inner.reset()
+    }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
     }
 }
 
@@ -441,6 +496,9 @@ impl PyBollingerBands {
     fn reset(&mut self) {
         self.inner.reset()
     }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
+    }
 }
 
 // ─── ATR ─────────────────────────────────────────────────────────────────────
@@ -487,5 +545,164 @@ impl PyAtr {
 
     fn reset(&mut self) {
         self.inner.reset()
+    }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
+    }
+}
+
+// ─── MomentumPct ─────────────────────────────────────────────────────────────
+
+#[pyclass(name = "MomentumPercent")]
+pub struct PyMomp {
+    inner: MomentumPct,
+}
+
+impl PyMomp {
+    pub fn create(period: usize) -> Self {
+        PyMomp { inner: MomentumPct::new(period) }
+    }
+}
+
+#[pymethods]
+impl PyMomp {
+    #[new]
+    fn new(period: usize) -> Self {
+        PyMomp {
+            inner: MomentumPct::new(period),
+        }
+    }
+
+    /// LEAN API: update(time, value) or update(value)
+    #[pyo3(signature = (time_or_value, value=None))]
+    fn update(
+        &mut self,
+        time_or_value: &Bound<'_, PyAny>,
+        value: Option<f64>,
+    ) -> PyResult<PyIndicatorResult> {
+        let price = if let Some(v) = value {
+            v
+        } else {
+            time_or_value.extract::<f64>()?
+        };
+        Ok(make_result(self.inner.update_price(dummy_ts(), f2d(price))))
+    }
+
+    fn update_bar(&mut self, bar: &PyTradeBar) -> PyIndicatorResult {
+        make_result(self.inner.update_price(dummy_ts(), f2d(bar.close)))
+    }
+
+    #[getter]
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+    #[getter]
+    fn value(&self) -> f64 {
+        self.inner.current().value.to_f64().unwrap_or(0.0)
+    }
+    #[getter]
+    fn samples(&self) -> usize {
+        self.inner.samples()
+    }
+    #[getter]
+    fn warm_up_period(&self) -> usize {
+        self.inner.warm_up_period()
+    }
+    #[getter]
+    fn current(&self) -> PyIndicatorDataPoint {
+        PyIndicatorDataPoint {
+            value: self.inner.current().value.to_f64().unwrap_or(0.0),
+        }
+    }
+    fn reset(&mut self) {
+        self.inner.reset()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "MomentumPercent(period={}, ready={})",
+            self.inner.warm_up_period(),
+            self.inner.is_ready()
+        )
+    }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
+    }
+}
+
+// ─── StandardDeviation ───────────────────────────────────────────────────────
+
+#[pyclass(name = "StandardDeviation")]
+pub struct PyStd {
+    inner: StandardDeviation,
+}
+
+impl PyStd {
+    pub fn create(period: usize) -> Self {
+        PyStd { inner: StandardDeviation::new(period) }
+    }
+}
+
+#[pymethods]
+impl PyStd {
+    #[new]
+    fn new(period: usize) -> Self {
+        PyStd {
+            inner: StandardDeviation::new(period),
+        }
+    }
+
+    /// LEAN API: update(time, value) or update(value)
+    #[pyo3(signature = (time_or_value, value=None))]
+    fn update(
+        &mut self,
+        time_or_value: &Bound<'_, PyAny>,
+        value: Option<f64>,
+    ) -> PyResult<PyIndicatorResult> {
+        let price = if let Some(v) = value {
+            v
+        } else {
+            time_or_value.extract::<f64>()?
+        };
+        Ok(make_result(self.inner.update_price(dummy_ts(), f2d(price))))
+    }
+
+    fn update_bar(&mut self, bar: &PyTradeBar) -> PyIndicatorResult {
+        make_result(self.inner.update_price(dummy_ts(), f2d(bar.close)))
+    }
+
+    #[getter]
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+    #[getter]
+    fn value(&self) -> f64 {
+        self.inner.current().value.to_f64().unwrap_or(0.0)
+    }
+    #[getter]
+    fn samples(&self) -> usize {
+        self.inner.samples()
+    }
+    #[getter]
+    fn warm_up_period(&self) -> usize {
+        self.inner.warm_up_period()
+    }
+    #[getter]
+    fn current(&self) -> PyIndicatorDataPoint {
+        PyIndicatorDataPoint {
+            value: self.inner.current().value.to_f64().unwrap_or(0.0),
+        }
+    }
+    fn reset(&mut self) {
+        self.inner.reset()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "StandardDeviation(period={}, ready={})",
+            self.inner.warm_up_period(),
+            self.inner.is_ready()
+        )
+    }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        indicator_getattr(slf.py(), slf.as_any(), name)
     }
 }

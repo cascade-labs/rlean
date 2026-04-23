@@ -17,5 +17,7 @@ pub use filter_universe::OptionFilterUniverse;
 pub use margin_model::OptionMarginModel;
 pub use payoff::{get_exercise_quantity, intrinsic_value, is_auto_exercised, payoff};
 pub use price_model::{
-    BlackScholesPriceModel, CurrentPricePriceModel, IOptionPriceModel, OptionPriceModelResult,
+    evaluate_contract_with_market_iv, implied_volatility, infer_implied_volatility,
+    time_to_expiry_years, BlackScholesPriceModel, CurrentPricePriceModel, IOptionPriceModel,
+    OptionPriceModelResult,
 };

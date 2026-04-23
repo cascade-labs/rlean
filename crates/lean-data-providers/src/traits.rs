@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lean_core::Symbol;
-use lean_data::TradeBar;
-use lean_storage::{FactorFileEntry, OptionEodBar};
+use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
 
 use crate::request::{DownloadRequest, HistoryRequest};
 
@@ -20,6 +20,16 @@ pub trait IHistoryProvider: Send + Sync {
     /// Fetch historical trade bars for the symbol described in `request`.
     fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>>;
 
+    /// Fetch historical quote bars for the symbol described in `request`.
+    fn get_quote_bars(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
+        Ok(vec![])
+    }
+
+    /// Fetch historical ticks for the symbol described in `request`.
+    fn get_ticks(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+        Ok(vec![])
+    }
+
     /// Fetch all option EOD bars for `ticker` on `date`.
     ///
     /// Returns an empty vec if this provider does not support option data.
@@ -31,6 +41,48 @@ pub trait IHistoryProvider: Send + Sync {
         _ticker: &str,
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionEodBar>> {
+        Ok(vec![])
+    }
+
+    /// Fetch the option universe for `ticker` on `date`.
+    ///
+    /// Returned rows identify which contracts existed for the underlying on the
+    /// requested date. Intraday option minute/tick paths use this to reconstruct
+    /// symbols and build chains without falling back to daily EOD snapshots.
+    fn get_option_universe(
+        &self,
+        _ticker: &str,
+        _date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionUniverseRow>> {
+        Ok(vec![])
+    }
+
+    /// Fetch intraday option trade bars for all contracts of `ticker` on `date`.
+    fn get_option_trade_bars(
+        &self,
+        _ticker: &str,
+        _resolution: lean_core::Resolution,
+        _date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        Ok(vec![])
+    }
+
+    /// Fetch intraday option quote bars for all contracts of `ticker` on `date`.
+    fn get_option_quote_bars(
+        &self,
+        _ticker: &str,
+        _resolution: lean_core::Resolution,
+        _date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        Ok(vec![])
+    }
+
+    /// Fetch option ticks for all contracts of `ticker` on `date`.
+    fn get_option_ticks(
+        &self,
+        _ticker: &str,
+        _date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<Tick>> {
         Ok(vec![])
     }
 

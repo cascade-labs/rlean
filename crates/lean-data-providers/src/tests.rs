@@ -154,14 +154,14 @@ mod custom_data_tests {
     }
 
     #[test]
-    fn test_reader_parses_valid_csv_line() {
+    fn test_reader_parses_valid_data_line() {
         let source = MockVixSource;
         let config = make_config("VIX");
         let date = NaiveDate::from_ymd_opt(2024, 1, 8).unwrap();
 
         let line = "2024-01-08,13.50,14.20,13.10,13.85";
         let result = source.reader(line, date, &config);
-        assert!(result.is_some(), "valid CSV line should parse");
+        assert!(result.is_some(), "valid data line should parse");
 
         let point = result.unwrap();
         assert_eq!(point.time, date);
@@ -220,12 +220,17 @@ mod custom_data_tests {
 #[cfg(test)]
 mod provider_tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use chrono::NaiveDate;
     use lean_core::{Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol};
+    use lean_storage::OptionEodBar;
+    use rust_decimal::Decimal;
 
     use crate::config::ProviderConfig;
     use crate::local::LocalHistoryProvider;
     use crate::request::{DataType, HistoryRequest};
+    use crate::stacked::StackedHistoryProvider;
     use crate::traits::IHistoryProvider;
 
     fn make_symbol() -> Symbol {
@@ -259,6 +264,87 @@ mod provider_tests {
         assert!(cfg.api_key.is_none());
         assert_eq!(cfg.requests_per_second, 0.0);
         assert_eq!(cfg.max_concurrent, 0);
+    }
+
+    #[derive(Clone)]
+    struct MockOptionProvider {
+        option_rows: Vec<OptionEodBar>,
+        earliest: Option<NaiveDate>,
+    }
+
+    impl IHistoryProvider for MockOptionProvider {
+        fn get_history(
+            &self,
+            _request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            Ok(vec![])
+        }
+
+        fn get_option_eod_bars(
+            &self,
+            _ticker: &str,
+            _date: NaiveDate,
+        ) -> anyhow::Result<Vec<OptionEodBar>> {
+            Ok(self.option_rows.clone())
+        }
+
+        fn earliest_date(&self) -> Option<NaiveDate> {
+            self.earliest
+        }
+    }
+
+    fn sample_option_row() -> OptionEodBar {
+        OptionEodBar {
+            date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
+            symbol_value: "TLT260515P00100000".to_string(),
+            underlying: "TLT".to_string(),
+            expiration: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
+            strike: Decimal::new(1000, 1),
+            right: "P".to_string(),
+            open: Decimal::new(100, 2),
+            high: Decimal::new(125, 2),
+            low: Decimal::new(95, 2),
+            close: Decimal::new(110, 2),
+            volume: 10,
+            bid: Decimal::new(105, 2),
+            ask: Decimal::new(115, 2),
+            bid_size: 3,
+            ask_size: 4,
+        }
+    }
+
+    #[test]
+    fn stacked_provider_forwards_option_eod_requests() {
+        let provider = StackedHistoryProvider::new(vec![Arc::new(MockOptionProvider {
+            option_rows: vec![sample_option_row()],
+            earliest: Some(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap()),
+        })]);
+
+        let rows = provider
+            .get_option_eod_bars("TLT", NaiveDate::from_ymd_opt(2026, 4, 17).unwrap())
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].underlying, "TLT");
+    }
+
+    #[test]
+    fn stacked_provider_uses_earliest_child_date() {
+        let provider = StackedHistoryProvider::new(vec![
+            Arc::new(MockOptionProvider {
+                option_rows: vec![],
+                earliest: Some(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()),
+            }),
+            Arc::new(MockOptionProvider {
+                option_rows: vec![],
+                earliest: Some(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap()),
+            }),
+        ]);
+
+        assert_eq!(
+            provider.earliest_date(),
+            Some(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap())
+        );
     }
 
     #[test]

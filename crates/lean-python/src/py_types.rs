@@ -1,4 +1,4 @@
-use lean_core::{Market, Resolution, Symbol};
+use lean_core::{DataNormalizationMode, Market, Resolution, Symbol};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
@@ -59,6 +59,18 @@ impl PySymbol {
     fn __eq__(&self, other: &PySymbol) -> bool {
         self.inner.id.sid == other.inner.id.sid
     }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Symbol' object has no attribute '{name}'"
+        )))
+    }
 }
 
 impl From<Symbol> for PySymbol {
@@ -95,6 +107,12 @@ pub struct PySecurity {
     pub inner: PySymbol,
 }
 
+impl PySecurity {
+    pub fn from_symbol(sym: PySymbol) -> Self {
+        Self { inner: sym }
+    }
+}
+
 #[pymethods]
 impl PySecurity {
     #[getter]
@@ -102,8 +120,54 @@ impl PySecurity {
         self.inner.clone()
     }
 
+    /// LEAN API: ``security.SetDataNormalizationMode(DataNormalizationMode.Adjusted)``
+    /// rlean applies Adjusted normalization by default; this is a no-op for API compatibility.
+    fn set_data_normalization_mode(&self, _mode: PyDataNormalizationMode) {}
+
+    /// LEAN API: ``security.SetLeverage(2.0)`` — no-op; rlean does not support leverage multipliers.
+    fn set_leverage(&self, _leverage: f64) {}
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Security' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!("Security('{}')", self.inner.inner.value)
+    }
+}
+
+// ─── PyAlgorithmSettings ──────────────────────────────────────────────────────
+
+/// LEAN API: `self.Settings` — algorithm settings bag.
+/// rlean does not act on these settings; they are accepted for API compatibility.
+#[pyclass(name = "AlgorithmSettings")]
+#[derive(Debug, Clone, Default)]
+pub struct PyAlgorithmSettings {}
+
+#[pymethods]
+impl PyAlgorithmSettings {
+    #[new]
+    pub fn new() -> Self {
+        PyAlgorithmSettings {}
+    }
+
+    /// Accept any attribute set without error.
+    fn __setattr__(&mut self, _name: &str, _value: &Bound<'_, PyAny>) {}
+
+    /// Accept any attribute get; return 0 as default.
+    fn __getattr__(&self, name: &str) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            Ok(0i64.into_pyobject(py).unwrap().into_any().unbind())
+        })
+        .map_err(|e: PyErr| e)
     }
 }
 
@@ -161,6 +225,18 @@ impl PySecurityEntry {
     #[getter]
     fn symbol(&self) -> PySymbol {
         self.symbol_inner.clone()
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Security' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self) -> String {
@@ -230,4 +306,108 @@ fn resolve_sid(arg: &Bound<'_, PyAny>) -> PyResult<u64> {
     Err(pyo3::exceptions::PyTypeError::new_err(
         "Expected Symbol or str",
     ))
+}
+
+// ─── DataNormalizationMode ────────────────────────────────────────────────────
+
+/// LEAN DataNormalizationMode — controls how historical prices are adjusted.
+#[pyclass(name = "DataNormalizationMode", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyDataNormalizationMode {
+    Raw = 0,
+    Adjusted = 1,
+    SplitAdjusted = 2,
+    TotalReturn = 3,
+    ForwardPanamaCanal = 4,
+    BackwardPanamaCanal = 5,
+}
+
+impl From<PyDataNormalizationMode> for DataNormalizationMode {
+    fn from(m: PyDataNormalizationMode) -> Self {
+        match m {
+            PyDataNormalizationMode::Raw => DataNormalizationMode::Raw,
+            PyDataNormalizationMode::Adjusted => DataNormalizationMode::Adjusted,
+            PyDataNormalizationMode::SplitAdjusted => DataNormalizationMode::SplitAdjusted,
+            PyDataNormalizationMode::TotalReturn => DataNormalizationMode::TotalReturn,
+            PyDataNormalizationMode::ForwardPanamaCanal => DataNormalizationMode::ForwardPanamaCanal,
+            PyDataNormalizationMode::BackwardPanamaCanal => DataNormalizationMode::BackwardPanamaCanal,
+        }
+    }
+}
+
+// ─── MovingAverageType ────────────────────────────────────────────────────────
+
+/// LEAN MovingAverageType — selects which moving average calculation is used by
+/// an indicator (e.g., ExponentialMovingAverage vs SimpleMovingAverage smoothing).
+#[pyclass(name = "MovingAverageType", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyMovingAverageType {
+    Simple = 0,
+    Exponential = 1,
+    Weighted = 2,
+    DoubleExponential = 3,
+    TripleExponential = 4,
+    Triangular = 5,
+    Kama = 6,
+    Adaptive = 7,
+    LinearWeightedMovingAverage = 8,
+    Alma = 9,
+    T3 = 10,
+    Vwap = 11,
+    Hull = 12,
+    MidPoint = 13,
+    MidPrice = 14,
+    Dema = 15,
+    Tema = 16,
+    Hma = 17,
+    Wilders = 18,
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::py_qc_algorithm::pascal_to_snake;
+    use lean_core::{Market, Symbol};
+
+    fn make_spy_symbol() -> PySymbol {
+        PySymbol {
+            inner: Symbol::create_equity("SPY", &Market::usa()),
+        }
+    }
+
+    /// C# LEAN: symbol.Value (PascalCase) must map to snake_case via __getattr__.
+    #[test]
+    fn symbol_value_getter_returns_value_string() {
+        let sym = make_spy_symbol();
+        assert_eq!(sym.value(), "SPY");
+        assert_eq!(sym.ticker(), "SPY");
+        assert_eq!(sym.__str__(), "SPY");
+    }
+
+    /// pascal_to_snake("Value") == "value" — required for __getattr__ forwarding.
+    #[test]
+    fn symbol_pascal_names_convert_correctly() {
+        assert_eq!(pascal_to_snake("Value"), "value", "Symbol.Value → value");
+        assert_eq!(pascal_to_snake("Ticker"), "ticker", "Symbol.Ticker → ticker");
+        assert_eq!(pascal_to_snake("HasUnderlying"), "has_underlying");
+        assert_eq!(pascal_to_snake("SecurityType"), "security_type");
+    }
+
+    /// `symbol == symbol` comparison is by SID.
+    #[test]
+    fn symbol_eq_by_sid() {
+        let a = make_spy_symbol();
+        let b = make_spy_symbol();
+        assert_eq!(a.inner.id.sid, b.inner.id.sid);
+        assert!(a.__eq__(&b));
+    }
+
+    /// Symbol hash is stable and based on SID.
+    #[test]
+    fn symbol_hash_is_sid() {
+        let sym = make_spy_symbol();
+        assert_eq!(sym.__hash__(), sym.inner.id.sid);
+    }
 }

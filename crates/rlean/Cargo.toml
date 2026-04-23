@@ -16,6 +16,7 @@ lean-data-providers = { path = "../lean-data-providers" }
 lean-engine         = { path = "../lean-engine" }
 lean-algorithm      = { path = "../lean-algorithm" }
 lean-python         = { path = "../lean-python" }
+lean-storage        = { path = "../lean-storage" }
 
 clap               = { workspace = true }
 tokio              = { workspace = true }

@@ -269,9 +269,7 @@ impl PyQuantBook {
     fn add_equity(&mut self, ticker: &str) -> PySecurity {
         let sym = Symbol::create_equity(ticker, &Market::usa());
         self.securities.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     /// Subscribe to an option chain.  Returns a `Security` for the canonical
@@ -283,9 +281,7 @@ impl PyQuantBook {
         let canonical = format!("?{}", ticker.to_uppercase());
         let sym = Symbol::create_equity(&canonical, &Market::usa());
         self.securities.insert(canonical.clone(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     /// Subscribe to a futures contract.  Returns a `Security` for the ticker.
@@ -293,9 +289,7 @@ impl PyQuantBook {
     fn add_future(&mut self, ticker: &str) -> PySecurity {
         let sym = Symbol::create_equity(ticker, &Market::usa());
         self.securities.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     // ── History ───────────────────────────────────────────────────────────────

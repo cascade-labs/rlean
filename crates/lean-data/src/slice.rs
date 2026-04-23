@@ -1,4 +1,5 @@
 use crate::{Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
+use crate::symbol_changed::SymbolChangedEvent;
 use lean_core::{DateTime, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ pub struct Slice {
     pub dividends: HashMap<u64, Dividend>,
     pub splits: HashMap<u64, Split>,
     pub delistings: HashMap<u64, Delisting>,
+    pub symbol_changed_events: HashMap<u64, SymbolChangedEvent>,
     pub has_data: bool,
 }
 
@@ -27,6 +29,7 @@ impl Slice {
             dividends: std::collections::HashMap::new(),
             splits: std::collections::HashMap::new(),
             delistings: std::collections::HashMap::new(),
+            symbol_changed_events: std::collections::HashMap::new(),
             has_data: false,
         }
     }
@@ -58,6 +61,11 @@ impl Slice {
 
     pub fn add_delisting(&mut self, d: Delisting) {
         self.delistings.insert(d.symbol.id.sid, d);
+        self.has_data = true;
+    }
+
+    pub fn add_symbol_changed(&mut self, ev: SymbolChangedEvent) {
+        self.symbol_changed_events.insert(ev.symbol.id.sid, ev);
         self.has_data = true;
     }
 

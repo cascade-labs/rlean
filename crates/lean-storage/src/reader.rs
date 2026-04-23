@@ -3,9 +3,9 @@ use crate::{convert, predicate::Predicate, schema};
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use datafusion::prelude::*;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
-use lean_data::CustomDataPoint;
-use lean_data::TradeBar;
+use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
@@ -161,6 +161,214 @@ impl ParquetReader {
             .collect();
 
         self.read_trade_bars(&paths, symbol, params).await
+    }
+
+    /// Read quote bars from one or more parquet files.
+    pub fn read_quote_bars(
+        &self,
+        paths: &[PathBuf],
+        symbol: Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<QuoteBar>> {
+        self.read_quote_bars_with_symbols(
+            paths,
+            &HashMap::from([(symbol.value.clone(), symbol)]),
+            params,
+        )
+    }
+
+    /// Read ticks from one or more parquet files.
+    pub fn read_ticks(
+        &self,
+        paths: &[PathBuf],
+        symbol: Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<Tick>> {
+        self.read_ticks_with_symbols(
+            paths,
+            &HashMap::from([(symbol.value.clone(), symbol)]),
+            params,
+        )
+    }
+
+    /// Read trade bars from files that may contain multiple symbols.
+    ///
+    /// Used for option-underlying intraday files where all contracts for an
+    /// underlying are stored together and resolved via `symbol_value`.
+    pub fn read_trade_bars_with_symbols(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_value: &HashMap<String, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<TradeBar>> {
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::new();
+
+        for path in paths {
+            let file = std::fs::File::open(path).map_err(|e| {
+                lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
+            })?;
+
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                .build()
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            for batch_result in reader {
+                let batch =
+                    batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+                let symbol_values = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("symbol_value column missing".into())
+                    })?;
+                let time_ns = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("time_ns column missing".into())
+                    })?;
+
+                for row_idx in 0..batch.num_rows() {
+                    let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                    if !matches_time_filter(time, params) {
+                        continue;
+                    }
+                    let Some(symbol) = symbols_by_value.get(symbol_values.value(row_idx)) else {
+                        continue;
+                    };
+                    let single = batch.slice(row_idx, 1);
+                    result.extend(convert::record_batch_to_trade_bars(&single, symbol.clone()));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read quote bars from files that may contain multiple symbols.
+    pub fn read_quote_bars_with_symbols(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_value: &HashMap<String, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<QuoteBar>> {
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::new();
+
+        for path in paths {
+            let file = std::fs::File::open(path).map_err(|e| {
+                lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
+            })?;
+
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                .build()
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            for batch_result in reader {
+                let batch =
+                    batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+                let symbol_values = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("symbol_value column missing".into())
+                    })?;
+                let time_ns = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("time_ns column missing".into())
+                    })?;
+
+                for row_idx in 0..batch.num_rows() {
+                    let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                    if !matches_time_filter(time, params) {
+                        continue;
+                    }
+                    let Some(symbol) = symbols_by_value.get(symbol_values.value(row_idx)) else {
+                        continue;
+                    };
+                    let single = batch.slice(row_idx, 1);
+                    result.extend(convert::record_batch_to_quote_bars(&single, symbol.clone()));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read ticks from files that may contain multiple symbols.
+    pub fn read_ticks_with_symbols(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_value: &HashMap<String, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<Tick>> {
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::new();
+
+        for path in paths {
+            let file = std::fs::File::open(path).map_err(|e| {
+                lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
+            })?;
+
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                .build()
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            for batch_result in reader {
+                let batch =
+                    batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+                let symbol_values = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("symbol_value column missing".into())
+                    })?;
+                let time_ns = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("time_ns column missing".into())
+                    })?;
+
+                for row_idx in 0..batch.num_rows() {
+                    let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                    if !matches_time_filter(time, params) {
+                        continue;
+                    }
+                    let Some(symbol) = symbols_by_value.get(symbol_values.value(row_idx)) else {
+                        continue;
+                    };
+                    let single = batch.slice(row_idx, 1);
+                    result.extend(convert::record_batch_to_ticks(&single, symbol.clone()));
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Read option EOD bars from one or more parquet files.
@@ -408,6 +616,20 @@ impl ParquetReader {
         );
         Ok(result)
     }
+}
+
+fn matches_time_filter(time: DateTime, params: &QueryParams) -> bool {
+    if let Some(start) = params.predicate.start_time {
+        if time.0 < start.0 {
+            return false;
+        }
+    }
+    if let Some(end) = params.predicate.end_time {
+        if time.0 >= end.0 {
+            return false;
+        }
+    }
+    true
 }
 
 impl Default for ParquetReader {

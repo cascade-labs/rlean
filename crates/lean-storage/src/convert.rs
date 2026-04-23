@@ -2,7 +2,7 @@ use crate::schema::{
     date_to_ns, i64_to_price, ns_to_date, price_to_i64, OptionEodBar, OptionUniverseRow,
 };
 use arrow_array::*;
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{Bar, QuoteBar, Tick, TradeBar};
 use std::sync::Arc;
 
 // ─── TradeBar ────────────────────────────────────────────────────────────────
@@ -148,6 +148,102 @@ pub fn ticks_to_record_batch(ticks: &[Tick]) -> arrow_array::RecordBatch {
     .expect("schema/column count mismatch — this is a bug")
 }
 
+pub fn record_batch_to_ticks(
+    batch: &arrow_array::RecordBatch,
+    symbol: lean_core::Symbol,
+) -> Vec<Tick> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return vec![];
+    }
+
+    let time_ns = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let tick_type = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    let value_col = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let quantity_col = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_price_col = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_price_col = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_size_col = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_size_col = batch
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let exchange_col = batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sale_condition_col = batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let suspicious_col = batch
+        .column(12)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+
+    (0..n)
+        .map(|i| Tick {
+            symbol: symbol.clone(),
+            time: lean_core::NanosecondTimestamp(time_ns.value(i)),
+            tick_type: match tick_type.value(i) {
+                0 => lean_core::TickType::Trade,
+                1 => lean_core::TickType::Quote,
+                2 => lean_core::TickType::OpenInterest,
+                _ => lean_core::TickType::Trade,
+            },
+            value: i64_to_price(value_col.value(i)),
+            quantity: i64_to_price(quantity_col.value(i)),
+            bid_price: i64_to_price(bid_price_col.value(i)),
+            ask_price: i64_to_price(ask_price_col.value(i)),
+            bid_size: i64_to_price(bid_size_col.value(i)),
+            ask_size: i64_to_price(ask_size_col.value(i)),
+            exchange: if exchange_col.is_null(i) {
+                None
+            } else {
+                Some(exchange_col.value(i).to_string())
+            },
+            sale_condition: if sale_condition_col.is_null(i) {
+                None
+            } else {
+                Some(sale_condition_col.value(i).to_string())
+            },
+            suspicious: suspicious_col.value(i),
+        })
+        .collect()
+}
+
 // ─── QuoteBar ─────────────────────────────────────────────────────────────────
 
 pub fn quote_bars_to_record_batch(bars: &[QuoteBar]) -> arrow_array::RecordBatch {
@@ -220,6 +316,117 @@ pub fn quote_bars_to_record_batch(bars: &[QuoteBar]) -> arrow_array::RecordBatch
         ],
     )
     .expect("schema/column count mismatch — this is a bug")
+}
+
+pub fn record_batch_to_quote_bars(
+    batch: &arrow_array::RecordBatch,
+    symbol: lean_core::Symbol,
+) -> Vec<QuoteBar> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return vec![];
+    }
+
+    let time_ns = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let end_ns = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_open_col = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_high_col = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_low_col = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let bid_close_col = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_open_col = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_high_col = batch
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_low_col = batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ask_close_col = batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let last_bid_size_col = batch
+        .column(12)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let last_ask_size_col = batch
+        .column(13)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let period_col = batch
+        .column(14)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    (0..n)
+        .map(|i| {
+            let bid = if bid_open_col.is_null(i) {
+                None
+            } else {
+                Some(Bar {
+                    open: i64_to_price(bid_open_col.value(i)),
+                    high: i64_to_price(bid_high_col.value(i)),
+                    low: i64_to_price(bid_low_col.value(i)),
+                    close: i64_to_price(bid_close_col.value(i)),
+                })
+            };
+            let ask = if ask_open_col.is_null(i) {
+                None
+            } else {
+                Some(Bar {
+                    open: i64_to_price(ask_open_col.value(i)),
+                    high: i64_to_price(ask_high_col.value(i)),
+                    low: i64_to_price(ask_low_col.value(i)),
+                    close: i64_to_price(ask_close_col.value(i)),
+                })
+            };
+            QuoteBar {
+                symbol: symbol.clone(),
+                time: lean_core::NanosecondTimestamp(time_ns.value(i)),
+                end_time: lean_core::NanosecondTimestamp(end_ns.value(i)),
+                bid,
+                ask,
+                last_bid_size: i64_to_price(last_bid_size_col.value(i)),
+                last_ask_size: i64_to_price(last_ask_size_col.value(i)),
+                period: lean_core::TimeSpan::from_nanos(period_col.value(i)),
+            }
+        })
+        .collect()
 }
 
 // ─── OptionEodBar ─────────────────────────────────────────────────────────────

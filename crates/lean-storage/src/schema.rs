@@ -228,7 +228,7 @@ pub fn custom_data_schema() -> Arc<Schema> {
 
 /// Arrow schema for factor file parquet files.
 ///
-/// One row per date entry, mirroring LEAN's CSV format:
+/// One row per date entry, Parquet schema (mirrors original LEAN data format):
 ///   `{yyyyMMdd},{price_factor},{split_factor},{reference_price}`
 ///
 /// Dates are stored as nanoseconds since Unix epoch (midnight UTC).
@@ -244,7 +244,7 @@ pub fn factor_file_schema() -> Arc<Schema> {
 
 /// Arrow schema for map file parquet files.
 ///
-/// One row per date/ticker pair, mirroring LEAN's CSV format:
+/// One row per date/ticker pair, Parquet schema (mirrors original LEAN data format):
 ///   `{yyyyMMdd},{ticker}`
 ///
 /// Dates are stored as nanoseconds since Unix epoch (midnight UTC).
@@ -257,7 +257,7 @@ pub fn map_file_schema() -> Arc<Schema> {
 
 /// One row in a LEAN factor file (equity price-adjustment factors).
 ///
-/// LEAN CSV format per row:
+/// Parquet schema (mirrors LEAN data format) per row:
 ///   `{yyyyMMdd},{price_factor},{split_factor},{reference_price}`
 ///
 /// - `price_factor`    – cumulative dividend price-adjustment factor
@@ -284,7 +284,7 @@ impl FactorFileEntry {
 
 /// One row in a LEAN map file (ticker rename / mapping history).
 ///
-/// LEAN CSV format per row:
+/// Parquet schema (mirrors LEAN data format) per row:
 ///   `{yyyyMMdd},{ticker}` (ticker is lowercase in the file)
 ///
 /// Semantics: this ticker was valid FROM this date forward (until the next row's date).

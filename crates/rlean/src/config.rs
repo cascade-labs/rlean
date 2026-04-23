@@ -30,6 +30,10 @@ pub struct GlobalConfig {
     #[serde(default = "default_language")]
     pub default_language: String,
 
+    /// Global Parquet data root directory
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_folder: Option<String>,
+
     /// Last workspace initialised with `rlean init`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,

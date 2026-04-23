@@ -11,6 +11,10 @@ pub enum DataType {
     /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
     /// Providers that do not support corporate actions return `NotImplemented:`.
     FactorFile,
+    /// Request a provider to generate/cache a map file for the symbol.
+    /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
+    /// Providers that do not support ticker details return `NotImplemented:`.
+    MapFile,
 }
 
 /// A request for historical data — mirrors C# `HistoryRequest`.

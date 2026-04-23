@@ -21,7 +21,7 @@ pub use custom::{
     CustomDataTransport,
 };
 pub use data_queue::DataQueueHandler;
-pub use delisting::Delisting;
+pub use delisting::{Delisting, DelistingType};
 pub use dividend::Dividend;
 pub use history_provider::IHistoricalDataProvider;
 pub use open_interest::OpenInterest;
@@ -29,5 +29,6 @@ pub use quote_bar::{Bar, QuoteBar};
 pub use slice::Slice;
 pub use split::Split;
 pub use subscription::{SubscriptionDataConfig, SubscriptionManager};
+pub use symbol_changed::SymbolChangedEvent;
 pub use tick::Tick;
 pub use trade_bar::{TradeBar, TradeBarData};

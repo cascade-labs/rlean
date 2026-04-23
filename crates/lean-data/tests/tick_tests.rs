@@ -48,31 +48,6 @@ fn trade_tick_has_zero_spread() {
     assert_eq!(t.spread(), dec!(0));
 }
 
-#[test]
-fn from_lean_trade_csv_parses_correctly() {
-    // format: ms,price*10000,quantity
-    let line = "34200000,4500000,100";
-    let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-    let tick = Tick::from_lean_trade_csv(line, spy(), date);
-    let tick = tick.expect("parse failed");
-
-    assert_eq!(tick.value, dec!(450));
-    assert_eq!(tick.quantity, dec!(100));
-}
-
-#[test]
-fn from_lean_quote_csv_parses_correctly() {
-    // format: ms,bid*10000,ask*10000,bid_size,ask_size
-    let line = "34200000,4499800,4500200,500,300";
-    let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-    let tick = Tick::from_lean_quote_csv(line, spy(), date);
-    let tick = tick.expect("parse failed");
-
-    assert_eq!(tick.bid_price, dec!(449.98));
-    assert_eq!(tick.ask_price, dec!(450.02));
-    assert_eq!(tick.bid_size, dec!(500));
-    assert_eq!(tick.ask_size, dec!(300));
-}
 
 #[test]
 fn open_interest_tick() {

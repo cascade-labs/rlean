@@ -106,45 +106,6 @@ impl TradeBar {
         self.period = TimeSpan::from_nanos(self.end_time.0 - self.time.0);
     }
 
-    /// Parse from LEAN's CSV line format:
-    /// `milliseconds_since_midnight,open*10000,high*10000,low*10000,close*10000,volume`
-    pub fn from_lean_csv_line(
-        line: &str,
-        symbol: Symbol,
-        date: chrono::NaiveDate,
-        resolution: Resolution,
-    ) -> Option<Self> {
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 6 {
-            return None;
-        }
-
-        let ms: i64 = parts[0].trim().parse().ok()?;
-        let scale = dec!(10000);
-
-        let open: Price = parts[1].trim().parse::<Decimal>().ok()? / scale;
-        let high: Price = parts[2].trim().parse::<Decimal>().ok()? / scale;
-        let low: Price = parts[3].trim().parse::<Decimal>().ok()? / scale;
-        let close: Price = parts[4].trim().parse::<Decimal>().ok()? / scale;
-        let volume: Quantity = parts[5].trim().parse().ok()?;
-
-        use chrono::{TimeZone, Utc};
-        let midnight = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
-        let bar_nanos = midnight.timestamp() * 1_000_000_000 + ms * 1_000_000;
-        let time = lean_core::NanosecondTimestamp(bar_nanos);
-
-        let period = resolution
-            .to_duration()
-            .map(|d| TimeSpan::from_nanos(d.as_nanos() as i64))
-            .unwrap_or(TimeSpan::ONE_MINUTE);
-
-        Some(TradeBar::new(
-            symbol,
-            time,
-            period,
-            TradeBarData::new(open, high, low, close, volume),
-        ))
-    }
 }
 
 impl BaseData for TradeBar {

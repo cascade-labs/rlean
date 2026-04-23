@@ -77,14 +77,10 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set default-language = {value}");
         }
         "data-folder" => {
-            let ws = std::env::current_dir()?;
-            if !ws.join("rlean.json").exists() {
-                bail!("No rlean.json in current directory. Run `rlean init` first.");
-            }
-            let mut ws_cfg = WorkspaceConfig::load(&ws)?;
-            ws_cfg.data_folder = value.to_string();
-            ws_cfg.save(&ws)?;
-            println!("Set data-folder = {value} in rlean.json");
+            let mut cfg = GlobalConfig::load()?;
+            cfg.data_folder = Some(value.to_string());
+            cfg.save()?;
+            println!("Set data-folder = {value} in ~/.rlean/config");
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \
@@ -114,9 +110,11 @@ fn cmd_get(key: &str) -> Result<()> {
             println!("{}", cfg.default_language);
         }
         "data-folder" => {
-            let ws = std::env::current_dir()?;
-            let cfg = WorkspaceConfig::load(&ws)?;
-            println!("{}", cfg.data_folder);
+            let cfg = GlobalConfig::load()?;
+            println!(
+                "{}",
+                cfg.data_folder.as_deref().unwrap_or("data")
+            );
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \
@@ -129,20 +127,17 @@ fn cmd_get(key: &str) -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let global = GlobalConfig::load()?;
-    let ws = std::env::current_dir()?;
-    let ws_cfg = WorkspaceConfig::load(&ws).ok();
     let plugin_cfgs = PluginConfigs::load()?;
 
     println!("{:<30} VALUE", "KEY");
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
-
-    if let Some(ws_cfg) = ws_cfg {
-        println!("{:<30} {}", "data-folder", ws_cfg.data_folder);
-    } else {
-        println!("{:<30} (no rlean.json in cwd)", "data-folder");
-    }
+    println!(
+        "{:<30} {}",
+        "data-folder",
+        global.data_folder.as_deref().unwrap_or("data")
+    );
 
     // Plugin configs
     let mut plugin_names: Vec<&str> = plugin_cfgs.0.keys().map(String::as_str).collect();

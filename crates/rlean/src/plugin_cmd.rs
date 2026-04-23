@@ -109,6 +109,31 @@ struct InstalledEntry {
 /// - `https://` / `http://` — fetched via curl
 /// - `file:///path/to/registry.json` — read directly from disk
 /// - `/absolute/path/to/registry.json` — read directly from disk
+/// Try to get a GitHub token for authenticating requests to private repos.
+/// Checks (in order): GH_TOKEN env var, GITHUB_TOKEN env var, `gh auth token`.
+fn github_token() -> Option<String> {
+    if let Ok(t) = std::env::var("GH_TOKEN") {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    // Try the gh CLI
+    if let Ok(out) = Command::new("gh").args(["auth", "token"]).output() {
+        if out.status.success() {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
 fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
     let body = if let Some(path) = url.strip_prefix("file://") {
         std::fs::read_to_string(path)
@@ -117,8 +142,21 @@ fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
         std::fs::read_to_string(url)
             .with_context(|| format!("Failed to read registry file: {url}"))?
     } else {
+        let is_github = url.contains("raw.githubusercontent.com") || url.contains("github.com");
+        let mut curl_args = vec!["--silent", "--fail", "--location", "--max-time", "10"];
+
+        // Collect token into a local binding so it lives long enough
+        let token_str;
+        if is_github {
+            if let Some(token) = github_token() {
+                token_str = format!("Authorization: Bearer {token}");
+                curl_args.extend(["-H", token_str.as_str()]);
+            }
+        }
+
         let output = Command::new("curl")
-            .args(["--silent", "--fail", "--location", "--max-time", "10", url])
+            .args(&curl_args)
+            .arg(url)
             .output()
             .context("Failed to run curl — is it installed?")?;
 
@@ -142,22 +180,27 @@ fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
 }
 
 /// Fetch plugins from all configured registries (official + user-added).
+/// Returns `(registry_label, entry)` pairs.
 /// Entries from later registries that share a name with an earlier one are skipped
 /// so the official registry takes precedence for name collisions.
-fn fetch_all_registries() -> Vec<RegistryEntry> {
-    let mut urls = vec![OFFICIAL_REGISTRY_URL.to_string()];
+fn fetch_all_registries() -> Vec<(String, RegistryEntry)> {
+    let mut sources: Vec<(String, String)> =
+        vec![("built-in".to_string(), OFFICIAL_REGISTRY_URL.to_string())];
     if let Ok(user) = load_user_registries() {
-        urls.extend(user.urls);
+        for url in user.urls {
+            let label = registry_label(&url);
+            sources.push((label, url));
+        }
     }
 
     let mut seen = std::collections::HashSet::new();
     let mut all = vec![];
-    for url in &urls {
+    for (label, url) in &sources {
         match fetch_registry(url) {
             Ok(entries) => {
                 for entry in entries {
                     if seen.insert(entry.name.clone()) {
-                        all.push(entry);
+                        all.push((label.clone(), entry));
                     }
                 }
             }
@@ -165,6 +208,32 @@ fn fetch_all_registries() -> Vec<RegistryEntry> {
         }
     }
     all
+}
+
+/// Derive a short human-readable label from a registry URL.
+fn registry_label(url: &str) -> String {
+    // Strip raw.githubusercontent.com prefix to just "owner/repo"
+    if let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") {
+        let parts: Vec<&str> = rest.splitn(4, '/').collect();
+        if parts.len() >= 2 {
+            return format!("{}/{}", parts[0], parts[1]);
+        }
+    }
+    // For file:// or absolute paths use just the filename
+    if let Some(rest) = url.strip_prefix("file://").or_else(|| {
+        if url.starts_with('/') {
+            Some(url)
+        } else {
+            None
+        }
+    }) {
+        return std::path::Path::new(rest)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(url)
+            .to_string();
+    }
+    url.to_string()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -198,17 +267,34 @@ fn cmd_list_registry() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<16} {:<55} STATUS", "NAME", "KIND", "DESCRIPTION");
-    println!("{}", "-".repeat(100));
-    for entry in &plugins {
+    const NAME_W: usize = 22;
+    const KIND_W: usize = 16;
+    const DESC_W: usize = 50;
+    const REG_W: usize = 24;
+
+    println!(
+        "{:<NAME_W$} {:<KIND_W$} {:<DESC_W$} {:<REG_W$} STATUS",
+        "NAME", "KIND", "DESCRIPTION", "REGISTRY"
+    );
+    println!(
+        "{}",
+        "-".repeat(NAME_W + 1 + KIND_W + 1 + DESC_W + 1 + REG_W + 1 + 9)
+    );
+    for (registry, entry) in &plugins {
         let status = if installed_names.contains(entry.name.as_str()) {
             "installed"
         } else {
             ""
         };
+        // Truncate description so STATUS column stays aligned
+        let desc = if entry.description.len() > DESC_W {
+            format!("{}…", &entry.description[..DESC_W - 1])
+        } else {
+            entry.description.clone()
+        };
         println!(
-            "{:<22} {:<16} {:<55} {}",
-            entry.name, entry.kind, entry.description, status
+            "{:<NAME_W$} {:<KIND_W$} {:<DESC_W$} {:<REG_W$} {}",
+            entry.name, entry.kind, desc, registry, status
         );
     }
     println!();
@@ -378,7 +464,8 @@ fn resolve_entry(name_or_url: &str) -> Result<RegistryEntry> {
 
     fetch_all_registries()
         .into_iter()
-        .find(|e| e.name == name_or_url)
+        .find(|(_reg, e)| e.name == name_or_url)
+        .map(|(_reg, e)| e)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Plugin '{}' not found in any registry.\n\

@@ -4,25 +4,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json;
 use tracing::{info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan,
+    DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TickType,
+    TimeSpan,
 };
 use lean_data::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
-    CustomDataTransport, IHistoricalDataProvider, QuoteBar, Slice, SubscriptionDataConfig,
-    TradeBar,
+    CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice,
+    SubscriptionDataConfig, SymbolChangedEvent, Tick, TradeBar, TradeBarData,
 };
 use lean_options::payoff::{get_exercise_quantity, intrinsic_value};
-use lean_options::{OptionChain, OptionContract, OptionContractData};
+use lean_options::{
+    evaluate_contract_with_market_iv, BlackScholesPriceModel, OptionChain, OptionContract,
+    OptionContractData,
+};
 use lean_orders::{
     fee_model::{FeeModel, InteractiveBrokersFeeModel, OrderFeeParameters},
     fill_model::ImmediateFillModel,
@@ -33,12 +38,15 @@ use lean_orders::{
 use lean_statistics::{PortfolioStatistics, Trade};
 use lean_storage::{
     custom_data_history_path, custom_data_path, option_eod_path, DataCache, FactorFileEntry,
-    OptionEodBar, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig,
+    MapFileEntry, OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver,
+    QueryParams, WriterConfig,
 };
 
 use crate::charting::ChartCollection;
 use crate::py_adapter::{set_algorithm_time, PyAlgorithmAdapter};
 use crate::py_data::SliceProxy;
+use crate::py_framework::run_framework_pipeline;
+use lean_data_providers::IHistoryProvider as SyncHistoryProvider;
 
 pub struct RunConfig {
     pub data_root: PathBuf,
@@ -289,7 +297,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     };
 
     // ── gather subscriptions ────────────────────────────────────────────────
-    let subscriptions: Vec<Arc<SubscriptionDataConfig>> =
+    let mut subscriptions: Vec<Arc<SubscriptionDataConfig>> =
         { adapter.inner.lock().unwrap().subscription_manager.get_all() };
 
     if subscriptions.is_empty() {
@@ -389,6 +397,29 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         }
     }
 
+    // ── map files: load ticker rename history ───────────────────────────────
+    // Map files are Parquet; key = symbol SID → rows sorted newest first.
+    // Used to fire SymbolChangedEvent (rename) and Delisting events each day.
+    let mut map_file_map: HashMap<u64, Vec<lean_storage::MapFileEntry>> = HashMap::new();
+    for sub in &subscriptions {
+        let ticker = sub.symbol.permtick.to_lowercase();
+        let market = sub.symbol.market().as_str().to_lowercase();
+        let map_path = config
+            .data_root
+            .join("equity")
+            .join(&market)
+            .join("map_files")
+            .join(format!("{ticker}.parquet"));
+
+        match factor_reader.read_map_file(&map_path) {
+            Ok(rows) if !rows.is_empty() => {
+                info!("Loaded {} map rows for {}", rows.len(), sub.symbol.value);
+                map_file_map.insert(sub.symbol.id.sid, rows);
+            }
+            _ => {} // no map file = no rename/delist info; silent
+        }
+    }
+
     // ── option underlying SIDs: skip factor adjustment for these ─────────────
     // When a strategy subscribes to options, LEAN uses raw (unadjusted) prices
     // for the underlying equity so that strike selection matches live market
@@ -433,9 +464,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let warmup_start: Option<NaiveDate> = {
         let alg = adapter.inner.lock().unwrap();
         if let Some(bar_count) = alg.warmup_bar_count {
-            // Simple heuristic: 1 bar ≈ 1 calendar day for daily data.
-            let days = bar_count as i64;
-            Some(start_date - chrono::Duration::days(days))
+            // C# LEAN counts back N trading days using exchange calendar.
+            // For daily data: 5 trading days per 7 calendar days → multiply by 7/5.
+            // Add a small buffer (+10) to ensure we never undershoot.
+            let calendar_days = (bar_count as i64 * 7 + 4) / 5 + 10;
+            Some(start_date - chrono::Duration::days(calendar_days))
         } else if let Some(dur) = alg.warmup_duration {
             let days = (dur.nanos / TimeSpan::ONE_DAY.nanos).max(1);
             Some(start_date - chrono::Duration::days(days))
@@ -533,11 +566,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // For daily (and other single-file) resolutions the same parquet file would
     // be opened and scanned once per trading day in the loop.  Pre-loading the
     // full date range up front reduces 629 file reads to 1 per subscription.
-    let bar_map: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>> = if !is_intraday {
-        let full_params = QueryParams::new().with_time_range(
-            date_to_datetime(start_date, 0, 0, 0),
-            date_to_datetime(end_date, 23, 59, 59),
-        );
+    //
+    // bar_map and subscriptions are mut because strategies may call add_equity()
+    // mid-backtest (dynamic universe selection).  New subscriptions are detected
+    // at the start of each trading day and their bars are lazy-loaded here.
+    let daily_full_params = QueryParams::new().with_time_range(
+        date_to_datetime(start_date, 0, 0, 0),
+        date_to_datetime(end_date, 23, 59, 59),
+    );
+    let mut bar_map: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>> = if !is_intraday
+    {
         let mut map = HashMap::new();
         for sub in &subscriptions {
             let sid = sub.symbol.id.sid;
@@ -546,7 +584,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 .to_path();
             if path.exists() {
                 let bars = reader
-                    .read_trade_bars(&[path], sub.symbol.clone(), &full_params)
+                    .read_trade_bars(&[path], sub.symbol.clone(), &daily_full_params)
                     .await
                     .unwrap_or_default();
                 let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
@@ -563,6 +601,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     } else {
         HashMap::new()
     };
+    // Track which SIDs have been loaded to detect new dynamic subscriptions.
+    let mut loaded_sids: std::collections::HashSet<u64> =
+        subscriptions.iter().map(|s| s.symbol.id.sid).collect();
 
     // ── pre-allocate proxy objects for the hot path ──────────────────────────
     // One PyTradeBar per subscription is allocated here and reused every day.
@@ -768,8 +809,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     if let Some(parent) = hp.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(e) = ParquetWriter::new(WriterConfig::default())
-                        .write_custom_data_points(&pts_clone, &hp)
+                    // Disable bloom filters AND page statistics: parquet-rs 53.x
+                    // reader panics on TType::Set in metadata written with these
+                    // features (read_set_begin is unimplemented). Custom data caches
+                    // are always read fully so these features provide no benefit.
+                    if let Err(e) = ParquetWriter::new(WriterConfig {
+                        bloom_filter: false,
+                        write_statistics: false,
+                        ..WriterConfig::default()
+                    })
+                    .write_custom_data_points(&pts_clone, &hp)
                     {
                         warn!("custom data: failed to cache history: {}", e);
                     }
@@ -802,19 +851,27 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut equity_curve: Vec<Decimal> = Vec::new();
     let mut daily_dates: Vec<String> = Vec::new();
 
+    let resolution_label = if subscriptions
+        .iter()
+        .any(|s| s.resolution == Resolution::Tick)
+    {
+        "tick"
+    } else if is_intraday {
+        "minute"
+    } else {
+        "daily"
+    };
     info!(
         "Backtest: {} → {} ({})",
-        start_date,
-        end_date,
-        if is_intraday { "minute" } else { "daily" }
+        start_date, end_date, resolution_label
     );
 
     while current_date <= end_date {
         if is_intraday {
-            // ── MINUTE LOOP ──────────────────────────────────────────────────
-            // Load minute trade and quote bars from Parquet for each subscription.
-            let mut day_trade_bars: HashMap<u64, Vec<lean_data::TradeBar>> = HashMap::new();
-            let day_quote_bars: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+            // ── INTRADAY LOOP ────────────────────────────────────────────────
+            let mut day_trade_bars: HashMap<u64, Vec<TradeBar>> = HashMap::new();
+            let mut day_quote_bars: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+            let mut day_ticks: HashMap<u64, Vec<Tick>> = HashMap::new();
 
             let day_params = QueryParams::new().with_time_range(
                 date_to_datetime(current_date, 0, 0, 0),
@@ -831,57 +888,166 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
 
                 let sid = sub.symbol.id.sid;
-                let trade_path = resolver
-                    .trade_bar(&sub.symbol, sub.resolution, current_date)
-                    .to_path();
-                if trade_path.exists() {
-                    match reader
-                        .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
-                        .await
-                    {
-                        Ok(mut bars) if !bars.is_empty() => {
-                            // Filter pre-market / after-hours bars for subscriptions where
-                            // extended_market_hours=false (the default for US equity).
-                            if let Some(hours) = market_hours_filter.get(&sid) {
-                                bars.retain(|b| hours.is_open_at(b.time));
+                let mut had_data = false;
+
+                if sub.resolution == Resolution::Tick {
+                    let tick_path = resolver.tick(&sub.symbol, current_date).to_path();
+                    if tick_path.exists() {
+                        match reader.read_ticks(&[tick_path], sub.symbol.clone(), &day_params) {
+                            Ok(mut ticks) if !ticks.is_empty() => {
+                                if let Some(hours) = market_hours_filter.get(&sid) {
+                                    ticks.retain(|tick| hours.is_open_at(tick.time));
+                                }
+                                ticks.retain(|tick| match tick.tick_type {
+                                    TickType::Trade => tick.value > Decimal::ZERO,
+                                    TickType::Quote => {
+                                        tick.bid_price > Decimal::ZERO
+                                            || tick.ask_price > Decimal::ZERO
+                                    }
+                                    TickType::OpenInterest => true,
+                                });
+                                if !ticks.is_empty() {
+                                    had_data = true;
+                                    day_ticks.insert(sid, ticks);
+                                }
                             }
-                            // Drop zero-price bars — these are placeholder rows written for
-                            // non-trading days (weekends/holidays) by the data provider.
-                            bars.retain(|b| b.close > rust_decimal::Decimal::ZERO);
-                            if !bars.is_empty() {
-                                succeeded_data_requests
-                                    .push(format!("{}/{}", sub.symbol.value, current_date));
-                                day_trade_bars.insert(sid, bars);
-                            } else {
-                                failed_data_requests
-                                    .push(format!("{}/{}", sub.symbol.value, current_date));
-                            }
-                        }
-                        Ok(_) => {
-                            failed_data_requests
-                                .push(format!("{}/{}", sub.symbol.value, current_date));
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to read minute bars for {} on {}: {}",
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "Failed to read ticks for {} on {}: {}",
                                 sub.symbol.value, current_date, e
-                            );
+                            ),
                         }
                     }
                 } else {
-                    failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
+                    let trade_path = resolver
+                        .trade_bar(&sub.symbol, sub.resolution, current_date)
+                        .to_path();
+                    if trade_path.exists() {
+                        match reader
+                            .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
+                            .await
+                        {
+                            Ok(mut bars) if !bars.is_empty() => {
+                                if let Some(hours) = market_hours_filter.get(&sid) {
+                                    bars.retain(|bar| hours.is_open_at(bar.time));
+                                }
+                                bars.retain(|bar| bar.close > Decimal::ZERO);
+                                if !bars.is_empty() {
+                                    had_data = true;
+                                    day_trade_bars.insert(sid, bars);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "Failed to read intraday bars for {} on {}: {}",
+                                sub.symbol.value, current_date, e
+                            ),
+                        }
+                    }
+
+                    let quote_path = resolver
+                        .quote_bar(&sub.symbol, sub.resolution, current_date)
+                        .to_path();
+                    if quote_path.exists() {
+                        match reader.read_quote_bars(&[quote_path], sub.symbol.clone(), &day_params)
+                        {
+                            Ok(mut bars) if !bars.is_empty() => {
+                                if let Some(hours) = market_hours_filter.get(&sid) {
+                                    bars.retain(|bar| hours.is_open_at(bar.time));
+                                }
+                                bars.retain(|bar| bar.mid_close() > Decimal::ZERO);
+                                if !bars.is_empty() {
+                                    had_data = true;
+                                    day_quote_bars.insert(sid, bars);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "Failed to read quote bars for {} on {}: {}",
+                                sub.symbol.value, current_date, e
+                            ),
+                        }
+                    }
                 }
 
-                // Quote bar loading via ParquetReader not yet implemented; day_quote_bars remains empty.
+                if had_data {
+                    succeeded_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
+                } else {
+                    failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
+                }
             }
 
-            // Collect union of all minute timestamps across subscriptions.
+            let option_subs: Vec<Symbol> =
+                { adapter.inner.lock().unwrap().option_subscriptions.clone() };
+            let mut option_runtimes: Vec<OptionChainRuntime> = Vec::new();
+            for canonical in &option_subs {
+                let underlying_ticker = canonical.permtick.trim_start_matches('?');
+                let option_resolution = subscriptions
+                    .iter()
+                    .find(|sub| {
+                        sub.resolution.is_high_resolution()
+                            && sub.symbol.permtick.eq_ignore_ascii_case(underlying_ticker)
+                    })
+                    .map(|sub| sub.resolution)
+                    .unwrap_or(Resolution::Minute);
+                let spot = {
+                    adapter
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .securities
+                        .all()
+                        .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
+                        .map(|s| s.current_price())
+                        .unwrap_or(Decimal::ZERO)
+                };
+                let ticker = underlying_ticker.to_uppercase();
+                let runtime = tokio::task::spawn_blocking({
+                    let provider = config.history_provider.clone();
+                    let data_root = config.data_root.clone();
+                    let canonical = canonical.clone();
+                    move || {
+                        load_option_chain_runtime(
+                            &data_root,
+                            &ticker,
+                            &canonical,
+                            option_resolution,
+                            current_date,
+                            spot,
+                            provider.as_ref(),
+                        )
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| OptionChainRuntime {
+                    permtick: canonical.permtick.clone(),
+                    chain: OptionChain::new(canonical.clone(), spot),
+                    trade_updates: HashMap::new(),
+                    quote_updates: HashMap::new(),
+                    tick_updates: HashMap::new(),
+                });
+                option_runtimes.push(runtime);
+            }
+
             let mut all_timestamps: std::collections::BTreeSet<i64> =
                 std::collections::BTreeSet::new();
             for bars in day_trade_bars.values() {
-                for b in bars {
-                    all_timestamps.insert(b.time.0);
+                for bar in bars {
+                    all_timestamps.insert(bar.time.0);
                 }
+            }
+            for bars in day_quote_bars.values() {
+                for bar in bars {
+                    all_timestamps.insert(bar.time.0);
+                }
+            }
+            for ticks in day_ticks.values() {
+                for tick in ticks {
+                    all_timestamps.insert(tick.time.0);
+                }
+            }
+            for runtime in &option_runtimes {
+                all_timestamps.extend(runtime.timestamps());
             }
 
             let has_data = !all_timestamps.is_empty();
@@ -889,13 +1055,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             if has_data {
                 trading_days += 1;
 
-                // Build per-timestamp lookup: sid → bar at that timestamp
-                let mut trade_by_ts: HashMap<u64, HashMap<i64, lean_data::TradeBar>> =
-                    HashMap::new();
+                let mut trade_by_ts: HashMap<u64, HashMap<i64, TradeBar>> = HashMap::new();
                 for (&sid, bars) in &day_trade_bars {
-                    let mut ts_map: HashMap<i64, lean_data::TradeBar> = HashMap::new();
-                    for b in bars {
-                        ts_map.insert(b.time.0, b.clone());
+                    let mut ts_map: HashMap<i64, TradeBar> = HashMap::new();
+                    for bar in bars {
+                        ts_map.insert(bar.time.0, bar.clone());
                     }
                     trade_by_ts.insert(sid, ts_map);
                 }
@@ -908,72 +1072,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                     quote_by_ts.insert(sid, ts_map);
                 }
-
-                // Fetch and deliver option chains once at the start of each trading day.
-                {
-                    let option_subs: Vec<Symbol> =
-                        { adapter.inner.lock().unwrap().option_subscriptions.clone() };
-
-                    let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
-                    for canonical in &option_subs {
-                        let underlying_ticker = canonical.permtick.trim_start_matches('?');
-                        let spot = {
-                            adapter
-                                .inner
-                                .lock()
-                                .unwrap()
-                                .securities
-                                .all()
-                                .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
-                                .map(|s| s.current_price())
-                                .unwrap_or(Decimal::ZERO)
-                        };
-
-                        let chain = {
-                            let ticker = underlying_ticker.to_uppercase();
-                            let bars = tokio::task::spawn_blocking({
-                                let provider = config.history_provider.clone();
-                                let data_root = config.data_root.clone();
-                                move || {
-                                    load_option_eod_bars(
-                                        &data_root,
-                                        &ticker,
-                                        current_date,
-                                        provider.as_ref(),
-                                    )
-                                }
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !bars.is_empty() {
-                                build_option_chain_from_eod_bars(
-                                    canonical,
-                                    spot,
-                                    current_date,
-                                    &bars,
-                                )
-                            } else {
-                                OptionChain::new(canonical.clone(), spot)
-                            }
-                        };
-                        chains_for_day.push((canonical.permtick.clone(), chain));
+                let mut ticks_by_ts: HashMap<u64, HashMap<i64, Vec<Tick>>> = HashMap::new();
+                for (&sid, ticks) in &day_ticks {
+                    let mut ts_map: HashMap<i64, Vec<Tick>> = HashMap::new();
+                    for tick in ticks {
+                        ts_map.entry(tick.time.0).or_default().push(tick.clone());
                     }
-
-                    let mut alg = adapter.inner.lock().unwrap();
-                    for (permtick, chain) in chains_for_day {
-                        alg.option_chains.insert(permtick, chain);
-                    }
+                    ticks_by_ts.insert(sid, ts_map);
                 }
 
-                let chains_snapshot: Vec<(String, OptionChain)> = {
-                    let alg = adapter.inner.lock().unwrap();
-                    alg.option_chains
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                };
-
-                // Fetch custom data once per day for minute-mode too.
                 let custom_subs: Vec<CustomDataSubscription> = {
                     adapter
                         .inner
@@ -1019,17 +1126,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 }
 
-                // Iterate minute by minute.
                 for &ts_ns in &all_timestamps {
                     let utc_time = lean_core::NanosecondTimestamp(ts_ns);
                     set_algorithm_time(&adapter, utc_time);
 
-                    // Build a Rust Slice for this minute (used for order processing).
                     let mut minute_slice = Slice::new(utc_time);
+                    let mut minute_quote_bars: HashMap<u64, QuoteBar> = HashMap::new();
+                    let mut minute_ticks: HashMap<u64, Vec<Tick>> = HashMap::new();
+                    let mut bars_for_orders: HashMap<u64, TradeBar> = HashMap::new();
+
                     for sub in &subscriptions {
                         let sid = sub.symbol.id.sid;
                         if let Some(raw_bar) = trade_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
-                            // Apply factor adjustment (splits/dividends) for non-option-underlying equities.
                             let bar = if !option_underlying_sids.contains(&sid) {
                                 if let Some(rows) = factor_map.get(&sid) {
                                     apply_factor_row(raw_bar.clone(), rows, current_date)
@@ -1046,40 +1154,125 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 .securities
                                 .update_price(&bar.symbol, bar.close);
                             portfolio.update_prices(&bar.symbol, bar.close);
+                            bars_for_orders.insert(sid, bar.clone());
                             minute_slice.add_bar(bar);
+                        }
+
+                        if let Some(qbar) = quote_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
+                            let qbar = qbar.clone();
+                            let mid = qbar.mid_close();
+                            if mid > Decimal::ZERO && !bars_for_orders.contains_key(&sid) {
+                                adapter
+                                    .inner
+                                    .lock()
+                                    .unwrap()
+                                    .securities
+                                    .update_price(&qbar.symbol, mid);
+                                portfolio.update_prices(&qbar.symbol, mid);
+                            }
+                            if !bars_for_orders.contains_key(&sid) {
+                                if let Some(synth) = synthesize_trade_bar_from_quote_bar(&qbar) {
+                                    bars_for_orders.insert(sid, synth);
+                                }
+                            }
+                            minute_quote_bars.insert(sid, qbar.clone());
+                            minute_slice.add_quote_bar(qbar);
+                        }
+
+                        if let Some(ticks) = ticks_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
+                            if !ticks.is_empty() {
+                                if !bars_for_orders.contains_key(&sid) {
+                                    if let Some(synth) = synthesize_trade_bar_from_ticks(
+                                        &sub.symbol,
+                                        utc_time,
+                                        ticks,
+                                    ) {
+                                        adapter
+                                            .inner
+                                            .lock()
+                                            .unwrap()
+                                            .securities
+                                            .update_price(&synth.symbol, synth.close);
+                                        portfolio.update_prices(&synth.symbol, synth.close);
+                                        bars_for_orders.insert(sid, synth);
+                                    }
+                                }
+                                for tick in ticks {
+                                    minute_slice.add_tick(tick.clone());
+                                }
+                                minute_ticks.insert(sid, ticks.clone());
+                            }
                         }
                     }
 
-                    // Gather quote bars for this minute.
-                    let minute_quote_bars: HashMap<u64, QuoteBar> = subscriptions
-                        .iter()
-                        .filter_map(|sub| {
-                            let sid = sub.symbol.id.sid;
-                            quote_by_ts
-                                .get(&sid)
-                                .and_then(|m| m.get(&ts_ns))
-                                .map(|q| (sid, q.clone()))
-                        })
-                        .collect();
+                    for runtime in &mut option_runtimes {
+                        let underlying_ticker = runtime.permtick.trim_start_matches('?');
+                        let spot = {
+                            adapter
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .securities
+                                .all()
+                                .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
+                                .map(|s| s.current_price())
+                                .unwrap_or(Decimal::ZERO)
+                        };
+                        runtime.apply_timestamp(utc_time, spot);
+                    }
 
-                    // ── ImmediateFillModel semantics (matches C# LEAN default) ──────────────
-                    // Deliver the bar to Python first so the algorithm sees the bar's close
-                    // price and can submit orders.  Then process those orders immediately at
-                    // the current bar's close — identical to C# LEAN's ImmediateFillModel
-                    // which fills at `security.Price` (= bar.Close) when SetHoldings is called.
+                    let chains_snapshot: Vec<(String, OptionChain)> = option_runtimes
+                        .iter()
+                        .map(|runtime| (runtime.permtick.clone(), runtime.chain.clone()))
+                        .collect();
+                    {
+                        let mut alg = adapter.inner.lock().unwrap();
+                        alg.option_chains.clear();
+                        for (permtick, chain) in &chains_snapshot {
+                            alg.option_chains.insert(permtick.clone(), chain.clone());
+                        }
+                    }
+                    sync_option_holdings_to_chain_prices(&adapter, &portfolio, &chains_snapshot);
+
                     Python::with_gil(|py| {
                         slice_proxy.update_option_chains(py, &chains_snapshot);
                         slice_proxy.update_quote_bars(py, &minute_quote_bars);
+                        slice_proxy.update_ticks(py, &minute_ticks);
                         slice_proxy.update_custom_data(py, &custom_data_for_day);
                         adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
                     });
 
-                    // Process orders at this minute using current (close) prices.
-                    let bars_for_orders: HashMap<u64, lean_data::TradeBar> = minute_slice
-                        .bars
-                        .iter()
-                        .map(|(&k, v)| (k, v.clone()))
-                        .collect();
+                    // ── Algorithm Framework pipeline (intraday) ───────────
+                    {
+                        let order_requests = run_framework_pipeline(
+                            &adapter.framework,
+                            &adapter.inner,
+                            &minute_slice,
+                        );
+                        if !order_requests.is_empty() {
+                            let mut alg = adapter.inner.lock().unwrap();
+                            for req in order_requests {
+                                use lean_execution::ExecutionOrderType;
+                                match req.order_type {
+                                    ExecutionOrderType::Market => {
+                                        alg.market_order(&req.symbol, req.quantity);
+                                    }
+                                    ExecutionOrderType::Limit => {
+                                        if let Some(lp) = req.limit_price {
+                                            alg.limit_order(&req.symbol, req.quantity, lp);
+                                        }
+                                    }
+                                    ExecutionOrderType::MarketOnOpen => {
+                                        alg.market_on_open_order(&req.symbol, req.quantity);
+                                    }
+                                    ExecutionOrderType::MarketOnClose => {
+                                        alg.market_on_close_order(&req.symbol, req.quantity);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let fill_events = order_processor.process_orders(&bars_for_orders, utc_time);
                     all_order_events.extend(fill_events.iter().cloned());
                     let ib_fee_model = InteractiveBrokersFeeModel::default();
@@ -1095,11 +1288,30 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                         event.fill_price,
                                     ))
                                     .amount;
-                                portfolio.apply_fill(
-                                    &order,
+                                let contract_multiplier = adapter
+                                    .inner
+                                    .lock()
+                                    .unwrap()
+                                    .securities
+                                    .get(&order.symbol)
+                                    .and_then(|sec| {
+                                        Decimal::from_f64_retain(
+                                            sec.symbol_properties.contract_multiplier,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        if order.symbol.option_symbol_id().is_some() {
+                                            rust_decimal_macros::dec!(100)
+                                        } else {
+                                            Decimal::ONE
+                                        }
+                                    });
+                                portfolio.apply_fill_with_multiplier(
+                                    &order.symbol,
                                     event.fill_price,
                                     event.fill_quantity,
                                     fee,
+                                    contract_multiplier,
                                 );
                             }
                             let sid = event.symbol.id.sid;
@@ -1128,15 +1340,32 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                 // End-of-day calls.
                 adapter.on_end_of_day(None);
-                process_option_expirations(&mut adapter, current_date);
+                process_option_expirations(&mut adapter, current_date, &HashMap::new());
 
-                // Record benchmark close for this day.
                 let bm_close: Option<Decimal> = if benchmark_in_subs {
-                    // Look up benchmark from last minute bar of the day.
                     day_trade_bars
                         .get(&benchmark_sid)
                         .and_then(|bars| bars.last())
                         .map(|b| b.close)
+                        .or_else(|| {
+                            day_quote_bars
+                                .get(&benchmark_sid)
+                                .and_then(|bars| bars.last())
+                                .map(|bar| bar.mid_close())
+                        })
+                        .or_else(|| {
+                            day_ticks.get(&benchmark_sid).and_then(|ticks| {
+                                ticks.iter().rev().find_map(|tick| match tick.tick_type {
+                                    TickType::Trade if tick.value > Decimal::ZERO => {
+                                        Some(tick.value)
+                                    }
+                                    TickType::Quote if tick.value > Decimal::ZERO => {
+                                        Some(tick.value)
+                                    }
+                                    _ => None,
+                                })
+                            })
+                        })
                 } else {
                     benchmark_price_map.get(&current_date).copied()
                 };
@@ -1144,7 +1373,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     benchmark_curve.push(close);
                 }
 
-                // Record daily equity snapshot.
                 let day_equity = portfolio.total_portfolio_value();
                 equity_curve.push(day_equity);
                 daily_dates.push(current_date.to_string());
@@ -1153,8 +1381,116 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             current_date += chrono::Duration::days(1);
         } else {
             // ── DAILY LOOP ───────────────────────────────────────────────────
+
+            // ── lazy-load bars for dynamically added subscriptions ────────────
+            // Strategies may call add_equity() mid-backtest (universe selection).
+            // Detect new subscriptions and load their full bar history so that
+            // security prices are available when set_holdings() is called.
+            if !is_intraday {
+                let current_subs = { adapter.inner.lock().unwrap().subscription_manager.get_all() };
+                for sub in &current_subs {
+                    let sid = sub.symbol.id.sid;
+                    if !loaded_sids.contains(&sid) {
+                        loaded_sids.insert(sid);
+                        let path = resolver
+                            .trade_bar(&sub.symbol, sub.resolution, start_date)
+                            .to_path();
+                        // If the bar file isn't cached locally, fetch it now from
+                        // the historical provider (same as pre_fetch_all does at startup).
+                        if !path.exists() {
+                            if let Some(ref provider) = config.historical_provider {
+                                if let Err(e) = pre_fetch_all(
+                                    provider.as_ref(),
+                                    config.history_provider.clone(),
+                                    &[sub.clone()],
+                                    start_date,
+                                    end_date,
+                                    &resolver,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "Failed to fetch data for dynamic subscription {}: {}",
+                                        sub.symbol.value, e
+                                    );
+                                }
+                            }
+                        }
+                        if path.exists() {
+                            let bars = reader
+                                .read_trade_bars(&[path], sub.symbol.clone(), &daily_full_params)
+                                .await
+                                .unwrap_or_default();
+                            let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
+                                bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+                            if !date_map.is_empty() {
+                                bar_map.insert(sid, date_map);
+                            }
+                        }
+                        subscriptions.push(sub.clone());
+                    }
+                }
+            }
+
             let utc_time = date_to_datetime(current_date, 16, 0, 0);
             set_algorithm_time(&adapter, utc_time);
+
+            // ── split adjustment for option-underlying equities ───────────────
+            // Option-underlying equities skip factor adjustment (raw prices used
+            // so that the strategy sees prices on the same scale as ThetaData
+            // option strikes).  When a split occurs, the raw price halves but
+            // holding quantities don't change — causing a 50% portfolio cliff.
+            //
+            // Fix: detect when the split_factor boundary crosses into a new era
+            // and adjust holding quantity / average_price exactly as C# LEAN's
+            // SecurityPortfolioManager.ApplySplit does in live/raw mode.
+            //
+            // Also record split ratios for use by process_option_expirations so
+            // that option contracts written in the pre-split era are correctly
+            // evaluated OTM/ITM against the post-split spot price.
+            let mut split_ratios_today: HashMap<u64, f64> = HashMap::new();
+            for sid in &option_underlying_sids {
+                if let Some(rows) = factor_map.get(sid) {
+                    let (_, sf_today) = factor_for_entry(rows, current_date);
+                    let prev_date = current_date - chrono::Duration::days(1);
+                    let (_, sf_prev) = factor_for_entry(rows, prev_date);
+                    if (sf_today - sf_prev).abs() > 1e-9 && sf_prev > 0.0 {
+                        // Split factor changed — adjust equity holding quantities.
+                        // ratio > 1 = forward split (more shares at lower price).
+                        let ratio = sf_today / sf_prev;
+                        split_ratios_today.insert(*sid, ratio);
+                        let holding = portfolio.get_holding_by_sid(*sid);
+                        if holding.is_invested() {
+                            let new_qty = holding.quantity
+                                * Decimal::from_f64(ratio).unwrap_or(Decimal::ONE);
+                            let new_avg = if ratio != 0.0 {
+                                holding.average_price
+                                    / Decimal::from_f64(ratio).unwrap_or(Decimal::ONE)
+                            } else {
+                                holding.average_price
+                            };
+                            portfolio.set_holdings(
+                                &holding.symbol,
+                                new_avg,
+                                new_qty,
+                                holding.contract_multiplier,
+                            );
+                            info!(
+                                "Split adjustment: {} sf {:.4}→{:.4} (×{:.4}): \
+                                 qty {:.0}→{:.0} avg_px {:.4}→{:.4}",
+                                holding.symbol.value,
+                                sf_prev,
+                                sf_today,
+                                ratio,
+                                holding.quantity.to_f64().unwrap_or(0.0),
+                                new_qty.to_f64().unwrap_or(0.0),
+                                holding.average_price.to_f64().unwrap_or(0.0),
+                                new_avg.to_f64().unwrap_or(0.0),
+                            );
+                        }
+                    }
+                }
+            }
 
             let mut slice = Slice::new(utc_time);
             for sub in &subscriptions {
@@ -1215,7 +1551,29 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let fee = ib_fee_model
                             .get_order_fee(&OrderFeeParameters::equity(&order, event.fill_price))
                             .amount;
-                        portfolio.apply_fill(&order, event.fill_price, event.fill_quantity, fee);
+                        let contract_multiplier = adapter
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .securities
+                            .get(&order.symbol)
+                            .and_then(|sec| {
+                                Decimal::from_f64_retain(sec.symbol_properties.contract_multiplier)
+                            })
+                            .unwrap_or_else(|| {
+                                if order.symbol.option_symbol_id().is_some() {
+                                    rust_decimal_macros::dec!(100)
+                                } else {
+                                    Decimal::ONE
+                                }
+                            });
+                        portfolio.apply_fill_with_multiplier(
+                            &order.symbol,
+                            event.fill_price,
+                            event.fill_quantity,
+                            fee,
+                            contract_multiplier,
+                        );
                     }
 
                     let sid = event.symbol.id.sid;
@@ -1275,7 +1633,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         .await
                         .unwrap_or_default();
                         if !bars.is_empty() {
-                            build_option_chain_from_eod_bars(canonical, spot, current_date, &bars)
+                            build_option_chain_from_eod_bars(canonical, spot, utc_time, &bars)
                         } else {
                             OptionChain::new(canonical.clone(), spot)
                         }
@@ -1296,6 +1654,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             };
+            sync_option_holdings_to_chain_prices(&adapter, &portfolio, &chains_snapshot);
 
             // ── Custom data fetch (daily) ─────────────────────────────────
             let custom_subs: Vec<CustomDataSubscription> = {
@@ -1343,14 +1702,118 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
+            // ── Map file: check for ticker renames and delistings ────────────
+            for sub in &subscriptions {
+                let sid = sub.symbol.id.sid;
+                let Some(rows) = map_file_map.get(&sid) else {
+                    continue;
+                };
+
+                // Check for rename (ticker change between yesterday and today)
+                let today_ticker = ticker_at_date(rows, current_date);
+                let yesterday_ticker = ticker_at_date(
+                    rows,
+                    current_date - chrono::Duration::days(1),
+                );
+                if let (Some(old), Some(new)) = (yesterday_ticker, today_ticker) {
+                    if old != new {
+                        let ev = SymbolChangedEvent::new(
+                            sub.symbol.clone(),
+                            utc_time,
+                            old.to_string(),
+                            new.to_string(),
+                        );
+                        slice.add_symbol_changed(ev);
+                        info!(
+                            "Symbol rename: {} → {} on {}",
+                            old, new, current_date
+                        );
+                    }
+                }
+
+                // Check for delisting
+                if let Some(delist_date) = delisting_date(rows) {
+                    let last_price = portfolio.get_holding(&sub.symbol).last_price;
+                    if current_date == delist_date {
+                        // Warning: last day of trading
+                        slice.add_delisting(Delisting::new(
+                            sub.symbol.clone(),
+                            utc_time,
+                            last_price,
+                            DelistingType::Warning,
+                        ));
+                        // Auto-liquidate: place market order to close position
+                        if portfolio.is_invested(&sub.symbol) {
+                            let holding = portfolio.get_holding(&sub.symbol);
+                            let qty = -holding.quantity;
+                            adapter.inner.lock().unwrap().market_order(&sub.symbol, qty);
+                        }
+                    } else if current_date
+                        == delist_date + chrono::Duration::days(1)
+                    {
+                        slice.add_delisting(Delisting::new(
+                            sub.symbol.clone(),
+                            utc_time,
+                            last_price,
+                            DelistingType::Delisted,
+                        ));
+                    }
+                }
+            }
+
             Python::with_gil(|py| {
                 slice_proxy.update_option_chains(py, &chains_snapshot);
+                slice_proxy.update_quote_bars(py, &HashMap::new());
+                slice_proxy.update_ticks(py, &HashMap::new());
                 slice_proxy.update_custom_data(py, &custom_data_for_day);
                 adapter.on_data_proxy(py, &slice_proxy, &slice);
+
+                // Fire on_delistings if the slice contains delisting events.
+                if !slice.delistings.is_empty() {
+                    let delistings = slice_proxy.delistings_cell.clone_ref(py);
+                    adapter.on_delistings(py, delistings);
+                }
+
+                // Fire on_symbol_changed_events if the slice contains rename events.
+                if !slice.symbol_changed_events.is_empty() {
+                    let sce = slice_proxy.symbol_changed_events_cell.clone_ref(py);
+                    adapter.on_symbol_changed_events(py, sce);
+                }
             });
+
+            // ── Algorithm Framework pipeline ──────────────────────────────
+            // Run alpha → PCM → risk → execution after on_data, outside GIL.
+            // Only fires when at least one alpha model has been registered.
+            {
+                let order_requests =
+                    run_framework_pipeline(&adapter.framework, &adapter.inner, &slice);
+                if !order_requests.is_empty() {
+                    let mut alg = adapter.inner.lock().unwrap();
+                    for req in order_requests {
+                        use lean_execution::ExecutionOrderType;
+                        match req.order_type {
+                            ExecutionOrderType::Market => {
+                                alg.market_order(&req.symbol, req.quantity);
+                            }
+                            ExecutionOrderType::Limit => {
+                                if let Some(lp) = req.limit_price {
+                                    alg.limit_order(&req.symbol, req.quantity, lp);
+                                }
+                            }
+                            ExecutionOrderType::MarketOnOpen => {
+                                alg.market_on_open_order(&req.symbol, req.quantity);
+                            }
+                            ExecutionOrderType::MarketOnClose => {
+                                alg.market_on_close_order(&req.symbol, req.quantity);
+                            }
+                        }
+                    }
+                }
+            }
+
             adapter.on_end_of_day(None);
 
-            process_option_expirations(&mut adapter, current_date);
+            process_option_expirations(&mut adapter, current_date, &split_ratios_today);
 
             let day_equity = portfolio.total_portfolio_value();
             equity_curve.push(day_equity);
@@ -1448,9 +1911,17 @@ async fn pre_fetch_all(
     resolver: &PathResolver,
 ) -> Result<()> {
     for sub in subscriptions {
-        let bar_path = resolver
-            .trade_bar(&sub.symbol, sub.resolution, start)
-            .to_path();
+        let data_path = if sub.resolution == Resolution::Tick {
+            resolver.tick(&sub.symbol, start).to_path()
+        } else if sub.tick_type == TickType::Quote {
+            resolver
+                .quote_bar(&sub.symbol, sub.resolution, start)
+                .to_path()
+        } else {
+            resolver
+                .trade_bar(&sub.symbol, sub.resolution, start)
+                .to_path()
+        };
 
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
@@ -1462,13 +1933,22 @@ async fn pre_fetch_all(
             .join("factor_files")
             .join(format!("{ticker}.parquet"));
 
+        // A factor file is valid if it exists, is non-empty, AND the sentinel row
+        // (row 0, dated when the file was last generated) covers the backtest end.
+        // If the sentinel is older than `end`, a new corporate action may have
+        // occurred since then and we need to re-fetch.
         let factor_valid = factor_path.exists() && {
             let r = ParquetReader::new();
-            r.read_factor_file(&factor_path)
-                .is_ok_and(|rows| !rows.is_empty())
+            r.read_factor_file(&factor_path).is_ok_and(|rows| {
+                if rows.is_empty() {
+                    return false;
+                }
+                // rows are newest-first; row 0 is the sentinel (date = generation date).
+                rows[0].date >= end
+            })
         };
 
-        if bar_path.exists() && factor_valid {
+        if data_path.exists() && factor_valid {
             continue;
         }
 
@@ -1488,29 +1968,107 @@ async fn pre_fetch_all(
         let start_dt = date_to_datetime(effective_start, 0, 0, 0);
         let end_dt = date_to_datetime(end, 23, 59, 59);
 
-        if !bar_path.exists() {
+        if !data_path.exists() {
             info!(
                 "No local data for {} — fetching from provider ({} → {})",
                 sub.symbol.value, effective_start, end
             );
-            let bars = provider
-                .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("historical provider failed for {}: {}", sub.symbol.value, e)
-                })?;
-            info!(
-                "Downloaded {} bars for {} and cached to disk",
-                bars.len(),
-                sub.symbol.value
-            );
+            if sub.resolution == Resolution::Tick || sub.tick_type == TickType::Quote {
+                let Some(fp) = factor_provider.clone() else {
+                    warn!(
+                        "No sync history provider configured for {} {} download",
+                        sub.symbol.value, sub.resolution
+                    );
+                    continue;
+                };
+                let request = lean_data_providers::HistoryRequest {
+                    symbol: sub.symbol.clone(),
+                    resolution: sub.resolution,
+                    start: start_dt,
+                    end: end_dt,
+                    data_type: if sub.resolution == Resolution::Tick {
+                        lean_data_providers::DataType::Tick
+                    } else {
+                        lean_data_providers::DataType::QuoteBar
+                    },
+                };
+                let rows_downloaded = if sub.resolution == Resolution::Tick {
+                    match tokio::task::spawn_blocking(move || fp.get_ticks(&request)).await {
+                        Ok(Ok(rows)) => rows.len(),
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!(
+                                "historical provider failed for {}: {}",
+                                sub.symbol.value,
+                                e
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "historical provider task failed for {}: {}",
+                                sub.symbol.value,
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    match tokio::task::spawn_blocking(move || fp.get_quote_bars(&request)).await {
+                        Ok(Ok(rows)) => rows.len(),
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!(
+                                "historical provider failed for {}: {}",
+                                sub.symbol.value,
+                                e
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "historical provider task failed for {}: {}",
+                                sub.symbol.value,
+                                e
+                            ));
+                        }
+                    }
+                };
+                info!(
+                    "Downloaded {} {} rows for {} and cached to disk",
+                    rows_downloaded,
+                    if sub.resolution == Resolution::Tick {
+                        "tick"
+                    } else {
+                        "quote"
+                    },
+                    sub.symbol.value
+                );
+            } else {
+                let bars = provider
+                    .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "historical provider failed for {}: {}",
+                            sub.symbol.value,
+                            e
+                        )
+                    })?;
+                info!(
+                    "Downloaded {} bars for {} and cached to disk",
+                    bars.len(),
+                    sub.symbol.value
+                );
+            }
         }
 
         // Re-check after bar fetch — some providers write the factor file as a side-effect.
-        if !factor_path.exists() {
+        // Also re-fetch if the file exists but the sentinel date is before `end` (stale).
+        let factor_needs_update = !factor_path.exists() || {
+            let r = ParquetReader::new();
+            r.read_factor_file(&factor_path)
+                .is_ok_and(|rows| rows.is_empty() || rows[0].date < end)
+        };
+        if factor_needs_update {
             if let Some(ref fp) = factor_provider {
                 info!(
-                    "Factor file missing for {} — requesting from provider",
+                    "Factor file missing or stale for {} — requesting from provider",
                     sub.symbol.value
                 );
                 let fp = Arc::clone(fp);
@@ -1547,20 +2105,417 @@ fn day_key(date: NaiveDate) -> i64 {
         .num_days()
 }
 
+#[derive(Debug, Clone)]
+struct OptionChainRuntime {
+    permtick: String,
+    chain: OptionChain,
+    trade_updates: HashMap<i64, Vec<TradeBar>>,
+    quote_updates: HashMap<i64, Vec<QuoteBar>>,
+    tick_updates: HashMap<i64, Vec<Tick>>,
+}
+
+impl OptionChainRuntime {
+    fn apply_timestamp(&mut self, valuation_time: DateTime, spot: Decimal) {
+        self.chain.underlying_price = spot;
+        for contract in self.chain.contracts.values_mut() {
+            contract.data.underlying_last_price = spot;
+        }
+
+        if let Some(bars) = self.trade_updates.get(&valuation_time.0) {
+            for bar in bars {
+                apply_option_trade_bar(&mut self.chain, bar, spot);
+            }
+        }
+        if let Some(bars) = self.quote_updates.get(&valuation_time.0) {
+            for bar in bars {
+                apply_option_quote_bar(&mut self.chain, bar, spot);
+            }
+        }
+        if let Some(ticks) = self.tick_updates.get(&valuation_time.0) {
+            for tick in ticks {
+                apply_option_tick(&mut self.chain, tick, spot);
+            }
+        }
+
+        reprice_option_chain(&mut self.chain, valuation_time);
+    }
+
+    fn timestamps(&self) -> Vec<i64> {
+        let mut out = std::collections::BTreeSet::new();
+        out.extend(self.trade_updates.keys().copied());
+        out.extend(self.quote_updates.keys().copied());
+        out.extend(self.tick_updates.keys().copied());
+        out.into_iter().collect()
+    }
+}
+
+fn load_option_chain_runtime(
+    data_root: &Path,
+    ticker: &str,
+    canonical: &Symbol,
+    resolution: Resolution,
+    date: NaiveDate,
+    spot: Decimal,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> OptionChainRuntime {
+    let universe_rows = load_option_universe_rows(data_root, ticker, date, provider);
+    let chain = build_option_chain_from_universe_rows(canonical, spot, &universe_rows);
+
+    let (trade_updates, quote_updates, tick_updates) = match resolution {
+        Resolution::Minute => (
+            group_trade_bars_by_time(load_option_trade_bars(
+                data_root, ticker, resolution, date, provider,
+            )),
+            group_quote_bars_by_time(load_option_quote_bars(
+                data_root, ticker, resolution, date, provider,
+            )),
+            HashMap::new(),
+        ),
+        Resolution::Tick => (
+            HashMap::new(),
+            HashMap::new(),
+            group_ticks_by_time(load_option_ticks(data_root, ticker, date, provider)),
+        ),
+        _ => (HashMap::new(), HashMap::new(), HashMap::new()),
+    };
+
+    OptionChainRuntime {
+        permtick: canonical.permtick.clone(),
+        chain,
+        trade_updates,
+        quote_updates,
+        tick_updates,
+    }
+}
+
+fn load_option_universe_rows(
+    data_root: &Path,
+    ticker: &str,
+    date: NaiveDate,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> Vec<OptionUniverseRow> {
+    let result = if let Some(provider) = provider {
+        provider.get_option_universe(ticker, date)
+    } else {
+        lean_data_providers::LocalHistoryProvider::new(data_root).get_option_universe(ticker, date)
+    };
+
+    result.unwrap_or_else(|e| {
+        warn!("option universe fetch failed for {ticker} {date}: {e}");
+        vec![]
+    })
+}
+
+fn load_option_trade_bars(
+    data_root: &Path,
+    ticker: &str,
+    resolution: Resolution,
+    date: NaiveDate,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> Vec<TradeBar> {
+    let result = if let Some(provider) = provider {
+        provider.get_option_trade_bars(ticker, resolution, date)
+    } else {
+        lean_data_providers::LocalHistoryProvider::new(data_root)
+            .get_option_trade_bars(ticker, resolution, date)
+    };
+
+    result.unwrap_or_else(|e| {
+        warn!("option trade-bar fetch failed for {ticker} {date}: {e}");
+        vec![]
+    })
+}
+
+fn load_option_quote_bars(
+    data_root: &Path,
+    ticker: &str,
+    resolution: Resolution,
+    date: NaiveDate,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> Vec<QuoteBar> {
+    let result = if let Some(provider) = provider {
+        provider.get_option_quote_bars(ticker, resolution, date)
+    } else {
+        lean_data_providers::LocalHistoryProvider::new(data_root)
+            .get_option_quote_bars(ticker, resolution, date)
+    };
+
+    result.unwrap_or_else(|e| {
+        warn!("option quote-bar fetch failed for {ticker} {date}: {e}");
+        vec![]
+    })
+}
+
+fn load_option_ticks(
+    data_root: &Path,
+    ticker: &str,
+    date: NaiveDate,
+    provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
+) -> Vec<Tick> {
+    let result = if let Some(provider) = provider {
+        provider.get_option_ticks(ticker, date)
+    } else {
+        lean_data_providers::LocalHistoryProvider::new(data_root).get_option_ticks(ticker, date)
+    };
+
+    result.unwrap_or_else(|e| {
+        warn!("option tick fetch failed for {ticker} {date}: {e}");
+        vec![]
+    })
+}
+
+fn build_option_chain_from_universe_rows(
+    canonical_sym: &Symbol,
+    spot: Decimal,
+    rows: &[OptionUniverseRow],
+) -> OptionChain {
+    let mut chain = OptionChain::new(canonical_sym.clone(), spot);
+    let underlying_sym = canonical_sym
+        .underlying
+        .as_ref()
+        .map(|u| *u.clone())
+        .unwrap_or_else(|| {
+            Symbol::create_equity(
+                canonical_sym.permtick.trim_start_matches('?'),
+                &Market::usa(),
+            )
+        });
+
+    for row in rows {
+        let right = match row.right.to_ascii_uppercase().as_str() {
+            "C" | "CALL" => OptionRight::Call,
+            "P" | "PUT" => OptionRight::Put,
+            _ => continue,
+        };
+        let sym = Symbol::create_option_osi(
+            underlying_sym.clone(),
+            row.strike,
+            row.expiration,
+            right,
+            OptionStyle::American,
+            &Market::usa(),
+        );
+        let mut contract = OptionContract::new(sym);
+        contract.data.underlying_last_price = spot;
+        chain.add_contract(contract);
+    }
+
+    chain
+}
+
+fn reprice_option_chain(chain: &mut OptionChain, valuation_time: DateTime) {
+    let model = BlackScholesPriceModel;
+    for contract in chain.contracts.values_mut() {
+        evaluate_contract_with_market_iv(&model, contract, valuation_time, 0.0, 0.0);
+    }
+}
+
+fn apply_option_trade_bar(chain: &mut OptionChain, bar: &TradeBar, spot: Decimal) {
+    use rust_decimal::prelude::ToPrimitive;
+
+    if let Some(contract) = chain.contracts.get_mut(&bar.symbol) {
+        contract.data.underlying_last_price = spot;
+        contract.data.last_price = bar.close;
+        contract.data.volume = bar.volume.to_i64().unwrap_or(contract.data.volume);
+    }
+}
+
+fn apply_option_quote_bar(chain: &mut OptionChain, bar: &QuoteBar, spot: Decimal) {
+    use rust_decimal_macros::dec;
+
+    if let Some(contract) = chain.contracts.get_mut(&bar.symbol) {
+        contract.data.underlying_last_price = spot;
+        contract.data.bid_price = bar.bid.as_ref().map(|b| b.close).unwrap_or(Decimal::ZERO);
+        contract.data.ask_price = bar.ask.as_ref().map(|a| a.close).unwrap_or(Decimal::ZERO);
+        contract.data.bid_size = bar
+            .last_bid_size
+            .round()
+            .to_i64()
+            .unwrap_or(contract.data.bid_size);
+        contract.data.ask_size = bar
+            .last_ask_size
+            .round()
+            .to_i64()
+            .unwrap_or(contract.data.ask_size);
+        if contract.data.last_price <= Decimal::ZERO
+            && contract.data.bid_price > Decimal::ZERO
+            && contract.data.ask_price > Decimal::ZERO
+        {
+            contract.data.last_price =
+                (contract.data.bid_price + contract.data.ask_price) / dec!(2);
+        }
+    }
+}
+
+fn apply_option_tick(chain: &mut OptionChain, tick: &Tick, spot: Decimal) {
+    use rust_decimal::prelude::ToPrimitive;
+
+    if let Some(contract) = chain.contracts.get_mut(&tick.symbol) {
+        contract.data.underlying_last_price = spot;
+        match tick.tick_type {
+            TickType::Trade => {
+                contract.data.last_price = tick.value;
+                contract.data.volume = tick
+                    .quantity
+                    .round()
+                    .to_i64()
+                    .unwrap_or(contract.data.volume);
+            }
+            TickType::Quote => {
+                contract.data.bid_price = tick.bid_price;
+                contract.data.ask_price = tick.ask_price;
+                contract.data.bid_size = tick
+                    .bid_size
+                    .round()
+                    .to_i64()
+                    .unwrap_or(contract.data.bid_size);
+                contract.data.ask_size = tick
+                    .ask_size
+                    .round()
+                    .to_i64()
+                    .unwrap_or(contract.data.ask_size);
+                if contract.data.last_price <= Decimal::ZERO && tick.value > Decimal::ZERO {
+                    contract.data.last_price = tick.value;
+                }
+            }
+            TickType::OpenInterest => {
+                contract.data.open_interest = tick.value;
+            }
+        }
+    }
+}
+
+fn group_trade_bars_by_time(bars: Vec<TradeBar>) -> HashMap<i64, Vec<TradeBar>> {
+    let mut by_time: HashMap<i64, Vec<TradeBar>> = HashMap::new();
+    for bar in bars {
+        by_time.entry(bar.time.0).or_default().push(bar);
+    }
+    by_time
+}
+
+fn group_quote_bars_by_time(bars: Vec<QuoteBar>) -> HashMap<i64, Vec<QuoteBar>> {
+    let mut by_time: HashMap<i64, Vec<QuoteBar>> = HashMap::new();
+    for bar in bars {
+        by_time.entry(bar.time.0).or_default().push(bar);
+    }
+    by_time
+}
+
+fn group_ticks_by_time(ticks: Vec<Tick>) -> HashMap<i64, Vec<Tick>> {
+    let mut by_time: HashMap<i64, Vec<Tick>> = HashMap::new();
+    for tick in ticks {
+        by_time.entry(tick.time.0).or_default().push(tick);
+    }
+    by_time
+}
+
+fn quote_bar_mid_ohlc(bar: &QuoteBar) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
+    let open = match (&bar.bid, &bar.ask) {
+        (Some(bid), Some(ask)) => (bid.open + ask.open) / Decimal::from(2),
+        (Some(bid), None) => bid.open,
+        (None, Some(ask)) => ask.open,
+        (None, None) => return None,
+    };
+    let high = match (&bar.bid, &bar.ask) {
+        (Some(bid), Some(ask)) => (bid.high + ask.high) / Decimal::from(2),
+        (Some(bid), None) => bid.high,
+        (None, Some(ask)) => ask.high,
+        (None, None) => return None,
+    };
+    let low = match (&bar.bid, &bar.ask) {
+        (Some(bid), Some(ask)) => (bid.low + ask.low) / Decimal::from(2),
+        (Some(bid), None) => bid.low,
+        (None, Some(ask)) => ask.low,
+        (None, None) => return None,
+    };
+    let close = match (&bar.bid, &bar.ask) {
+        (Some(bid), Some(ask)) => (bid.close + ask.close) / Decimal::from(2),
+        (Some(bid), None) => bid.close,
+        (None, Some(ask)) => ask.close,
+        (None, None) => return None,
+    };
+    Some((open, high, low, close))
+}
+
+fn synthesize_trade_bar_from_quote_bar(bar: &QuoteBar) -> Option<TradeBar> {
+    let (open, high, low, close) = quote_bar_mid_ohlc(bar)?;
+    Some(TradeBar::new(
+        bar.symbol.clone(),
+        bar.time,
+        bar.period,
+        TradeBarData::new(open, high, low, close, Decimal::ZERO),
+    ))
+}
+
+fn synthesize_trade_bar_from_ticks(
+    symbol: &Symbol,
+    time: DateTime,
+    ticks: &[Tick],
+) -> Option<TradeBar> {
+    if ticks.is_empty() {
+        return None;
+    }
+
+    let trade_prices: Vec<Decimal> = ticks
+        .iter()
+        .filter(|tick| tick.tick_type == TickType::Trade && tick.value > Decimal::ZERO)
+        .map(|tick| tick.value)
+        .collect();
+
+    let volume = ticks
+        .iter()
+        .filter(|tick| tick.tick_type == TickType::Trade)
+        .fold(Decimal::ZERO, |acc, tick| acc + tick.quantity);
+
+    let prices = if !trade_prices.is_empty() {
+        trade_prices
+    } else {
+        ticks
+            .iter()
+            .filter_map(|tick| match tick.tick_type {
+                TickType::Trade if tick.value > Decimal::ZERO => Some(tick.value),
+                TickType::Quote if tick.value > Decimal::ZERO => Some(tick.value),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let open = *prices.first()?;
+    let close = *prices.last()?;
+    let high = prices.iter().copied().max()?;
+    let low = prices.iter().copied().min()?;
+
+    Some(TradeBar::new(
+        symbol.clone(),
+        time,
+        TimeSpan::ZERO,
+        TradeBarData::new(open, high, low, close, volume),
+    ))
+}
+
 /// Process option expirations for `current_date`.
 ///
 /// Scans all open option positions for contracts expiring today, computes
 /// intrinsic value, and handles exercise (long) or assignment (short).
-fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: NaiveDate) {
+///
+/// `split_ratios` — map of underlying SID → forward split ratio for splits that
+/// occurred on `current_date`.  When an option underlying had a split today, the
+/// option's strike is divided by the ratio before the ITM/OTM comparison so that
+/// pre-split strikes are evaluated against the post-split spot price correctly.
+fn process_option_expirations(
+    adapter: &mut PyAlgorithmAdapter,
+    current_date: NaiveDate,
+    split_ratios: &HashMap<u64, f64>,
+) {
     // Collect expiring positions — we need to drop the lock before calling market_order.
-    let expiring: Vec<lean_algorithm::qc_algorithm::OpenOptionPosition> = {
-        let alg = adapter.inner.lock().unwrap();
-        alg.option_positions
-            .values()
-            .filter(|pos| pos.expiry == current_date)
-            .cloned()
-            .collect()
-    };
+    let expiring: Vec<lean_algorithm::qc_algorithm::OpenOptionPosition> = adapter
+        .inner
+        .lock()
+        .unwrap()
+        .get_option_positions()
+        .into_iter()
+        .filter(|pos| pos.expiry == current_date)
+        .collect();
 
     if expiring.is_empty() {
         return;
@@ -1585,7 +2540,31 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
             found.unwrap_or(pos.strike) // Conservative fallback: use strike
         };
 
-        let intrinsic = intrinsic_value(spot, pos.strike, pos.right);
+        // If the option's underlying had a forward split today, options written in
+        // the pre-split era carry a strike in pre-split price terms while `spot` is
+        // in post-split terms.  Divide the strike by the split ratio so the
+        // comparison is in a consistent price space.
+        let effective_strike = if let Some(underlying) = &pos.symbol.underlying {
+            if let Some(&ratio) = split_ratios.get(&underlying.id.sid) {
+                let ratio_dec = Decimal::from_f64(ratio).unwrap_or(Decimal::ONE);
+                if ratio_dec > Decimal::ZERO {
+                    let adj = pos.strike / ratio_dec;
+                    info!(
+                        "Split-adjusted strike for {}: {:.4} → {:.4} (÷{:.4})",
+                        pos.symbol.value, pos.strike, adj, ratio
+                    );
+                    adj
+                } else {
+                    pos.strike
+                }
+            } else {
+                pos.strike
+            }
+        } else {
+            pos.strike
+        };
+
+        let intrinsic = intrinsic_value(spot, effective_strike, pos.right);
         let exercised = intrinsic >= rust_decimal_macros::dec!(0.01);
 
         if exercised && pos.quantity > Decimal::ZERO {
@@ -1603,19 +2582,24 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
             // For a long put: caller sells 100*qty shares, receives strike*100*qty.
             let exercise_shares = get_exercise_quantity(contracts, pos.right, 100);
             {
-                let mut alg = adapter.inner.lock().unwrap();
-                // Settle the stock leg immediately at the strike price.
-                // apply_exercise atomically creates/updates the holding and
-                // adjusts cash — no market order queued, so the equity curve
-                // on the expiration day is correct.
-                alg.portfolio
-                    .apply_exercise(&underlying_sym, pos.strike, exercise_shares);
-                alg.option_positions.remove(&pos.symbol.id.sid);
+                let alg = adapter.inner.lock().unwrap();
+                alg.portfolio.settle_fill_without_cash(
+                    &pos.symbol,
+                    Decimal::ZERO,
+                    -contracts,
+                    Decimal::from(pos.contract_unit_of_trade),
+                );
+                alg.portfolio.apply_exercise_with_market_price(
+                    &underlying_sym,
+                    effective_strike,
+                    exercise_shares,
+                    spot,
+                );
             }
 
             info!(
-                "Option exercised: {} x{} K={} expiry={}",
-                pos.symbol.value, contracts, pos.strike, pos.expiry
+                "Option exercised: {} x{} K={} (effective={}) expiry={}",
+                pos.symbol.value, contracts, pos.strike, effective_strike, pos.expiry
             );
             let contract = OptionContract::new(pos.symbol.clone());
             adapter.on_assignment_order_event(contract, contracts, true);
@@ -1630,33 +2614,46 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
                 .unwrap_or_else(|| pos.symbol.clone());
 
             {
-                let mut alg = adapter.inner.lock().unwrap();
-                // Settle the stock leg immediately at the strike price.
-                // For a short put: we must buy 100*qty shares at the strike → positive quantity.
-                // For a short call: we must sell 100*qty shares at the strike → negative quantity.
+                let alg = adapter.inner.lock().unwrap();
+                alg.portfolio.settle_fill_without_cash(
+                    &pos.symbol,
+                    Decimal::ZERO,
+                    contracts,
+                    Decimal::from(pos.contract_unit_of_trade),
+                );
                 let shares = Decimal::from(100) * contracts;
                 let exercise_qty = match pos.right {
                     OptionRight::Put => shares,   // buy stock
                     OptionRight::Call => -shares, // sell (or short) stock
                 };
-                alg.portfolio
-                    .apply_exercise(&underlying_sym, pos.strike, exercise_qty);
-                alg.option_positions.remove(&pos.symbol.id.sid);
+                alg.portfolio.apply_exercise_with_market_price(
+                    &underlying_sym,
+                    effective_strike,
+                    exercise_qty,
+                    spot,
+                );
             }
 
             info!(
-                "Option assigned: {} x{} K={} expiry={}",
-                pos.symbol.value, pos.quantity, pos.strike, pos.expiry
+                "Option assigned: {} x{} K={} (effective={}) expiry={}",
+                pos.symbol.value, pos.quantity, pos.strike, effective_strike, pos.expiry
             );
             let contract = OptionContract::new(pos.symbol.clone());
             adapter.on_assignment_order_event(contract, contracts, true);
         } else {
             // Expired worthless — premium already booked at trade open.
             let entry_price = pos.entry_price;
-            {
-                let mut alg = adapter.inner.lock().unwrap();
-                alg.option_positions.remove(&pos.symbol.id.sid);
-            }
+            adapter
+                .inner
+                .lock()
+                .unwrap()
+                .portfolio
+                .settle_fill_without_cash(
+                    &pos.symbol,
+                    Decimal::ZERO,
+                    -pos.quantity,
+                    Decimal::from(pos.contract_unit_of_trade),
+                );
             info!(
                 "Option expired worthless: {} x{} K={} expiry={}",
                 pos.symbol.value, pos.quantity, pos.strike, pos.expiry
@@ -1665,6 +2662,55 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
             // LEAN fires on_order_event (not on_assignment_order_event) for OTM expiry.
             adapter.on_otm_expiry(contract, pos.quantity.abs(), spot, entry_price);
         }
+    }
+}
+
+fn sync_option_holdings_to_chain_prices(
+    adapter: &PyAlgorithmAdapter,
+    portfolio: &Arc<lean_algorithm::portfolio::SecurityPortfolioManager>,
+    chains: &[(String, OptionChain)],
+) {
+    let holdings = portfolio.all_holdings();
+    if holdings.is_empty() {
+        return;
+    }
+
+    let chain_map: HashMap<&str, &OptionChain> = chains
+        .iter()
+        .map(|(permtick, chain)| (permtick.as_str(), chain))
+        .collect();
+
+    for holding in holdings {
+        if !holding.is_invested() || holding.symbol.option_symbol_id().is_none() {
+            continue;
+        }
+        let Some(underlying) = holding.symbol.underlying.as_ref() else {
+            continue;
+        };
+        let canonical = format!("?{}", underlying.permtick);
+        let Some(chain) = chain_map.get(canonical.as_str()) else {
+            continue;
+        };
+        let Some((_, contract)) = chain
+            .contracts
+            .iter()
+            .find(|(symbol, _)| symbol.id.sid == holding.symbol.id.sid)
+        else {
+            continue;
+        };
+
+        let price = contract.mid_price();
+        if price <= Decimal::ZERO {
+            continue;
+        }
+
+        portfolio.update_prices(&holding.symbol, price);
+        adapter
+            .inner
+            .lock()
+            .unwrap()
+            .securities
+            .update_price(&holding.symbol, price);
     }
 }
 
@@ -1677,9 +2723,10 @@ fn process_option_expirations(adapter: &mut PyAlgorithmAdapter, current_date: Na
 fn build_option_chain_from_eod_bars(
     canonical_sym: &Symbol,
     spot: Decimal,
-    today: NaiveDate,
+    valuation_time: DateTime,
     bars: &[OptionEodBar],
 ) -> OptionChain {
+    let today = valuation_time.date_utc();
     let mut chain = OptionChain::new(canonical_sym.clone(), spot);
     let underlying_sym: Symbol = canonical_sym
         .underlying
@@ -1735,6 +2782,8 @@ fn build_option_chain_from_eod_bars(
         };
         chain.add_contract(contract);
     }
+
+    reprice_option_chain(&mut chain, valuation_time);
     chain
 }
 
@@ -1912,8 +2961,13 @@ fn load_custom_data_points(
         return vec![];
     }
 
-    // Write to Parquet cache.
-    let writer = ParquetWriter::new(WriterConfig::default());
+    // Write to Parquet cache (bloom filters AND page statistics disabled —
+    // parquet-rs 53.x reader panics on TType::Set in metadata with these features).
+    let writer = ParquetWriter::new(WriterConfig {
+        bloom_filter: false,
+        write_statistics: false,
+        ..WriterConfig::default()
+    });
     if let Err(e) = writer.write_custom_data_points(&points, &cache_path) {
         warn!(
             "failed to cache custom data for {}/{} {}: {}",
@@ -1932,17 +2986,45 @@ fn load_custom_data_points(
 /// Return the `(price_factor, split_factor)` that applies to `bar_date`.
 ///
 /// Mirrors the LEAN behavior exercised by the tests here: use the most recent
+/// Return the mapped ticker at `date` using LEAN's convention.
+///
+/// Rows are sorted newest-first; the first row whose date <= query_date is the
+/// active mapping for that date.
+fn ticker_at_date<'a>(rows: &'a [MapFileEntry], date: NaiveDate) -> Option<&'a str> {
+    rows.iter().find(|r| r.date <= date).map(|r| r.ticker.as_str())
+}
+
+/// Return the delisting date from a map file (first / newest row), if the
+/// security is delisted.
+///
+/// LEAN convention: if the newest row's date is before 2049, it is a real
+/// delisting date.  Far-future sentinels (year >= 2049) indicate active.
+fn delisting_date(rows: &[MapFileEntry]) -> Option<NaiveDate> {
+    rows.first()
+        .map(|r| r.date)
+        .filter(|d| d.year() < 2049)
+}
+
 /// factor-file row whose date is strictly earlier than `bar_date`.
 /// If no such row exists, return `(1.0, 1.0)`.
 fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64) {
     if rows.is_empty() {
         return (1.0, 1.0);
     }
-    rows.iter()
-        .filter(|r| r.date < bar_date)
-        .max_by_key(|r| r.date)
-        .map(|r| (r.price_factor, r.split_factor))
-        .unwrap_or((1.0, 1.0))
+    // Most-recent row strictly before bar_date.
+    if let Some(row) = rows.iter().filter(|r| r.date < bar_date).max_by_key(|r| r.date) {
+        return (row.price_factor, row.split_factor);
+    }
+    // bar_date predates every row in the factor file.  Extend the oldest
+    // cumulative factor backwards so there is no price discontinuity when the
+    // backtest crosses into the period covered by the factor file.
+    // Using (1.0, 1.0) here would cause a sudden apparent loss the moment the
+    // first factor row became active (holdings bought at raw prices would be
+    // re-marked at split/dividend-adjusted prices).
+    if let Some(row) = rows.iter().min_by_key(|r| r.date) {
+        return (row.price_factor, row.split_factor);
+    }
+    (1.0, 1.0)
 }
 
 fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: NaiveDate) -> TradeBar {
@@ -1986,6 +3068,40 @@ mod factor_tests {
         }
     }
 
+    fn entry_split(y: i32, m: u32, day: u32, pf: f64, sf: f64) -> FactorFileEntry {
+        FactorFileEntry {
+            date: d(y, m, day),
+            price_factor: pf,
+            split_factor: sf,
+            reference_price: 0.0,
+        }
+    }
+
+    /// Factor rows for `test_correctly_determines_price_factors`.
+    ///
+    /// rlean convention: a row at date D covers bars with `bar_date > D`
+    /// (strict).  The factor applies to the BAR AFTER the row date, not on
+    /// the row date itself.  This is the inverse of C# LEAN's CSV convention
+    /// where the row date is the FIRST day the factor applies.
+    ///
+    /// Row layout (oldest → newest):
+    ///   2023-01-14  pf=0.7  sf=0.125  → combined=0.0875  (split+div)
+    ///   2023-10-16  pf=0.8  sf=0.25   → combined=0.2     (split)
+    ///   2023-12-24  pf=0.8  sf=0.5    → combined=0.4     (split)
+    ///   2023-12-31  pf=0.8  sf=1.0    → combined=0.8     (div)
+    ///   2024-01-07  pf=0.9  sf=1.0    → combined=0.9     (div)
+    ///   2050-12-31  pf=1.0  sf=1.0    → combined=1.0     (end-of-time sentinel)
+    fn make_test_factor_rows() -> Vec<FactorFileEntry> {
+        vec![
+            entry_split(2023, 1, 14, 0.7, 0.125),
+            entry_split(2023, 10, 16, 0.8, 0.25),
+            entry_split(2023, 12, 24, 0.8, 0.5),
+            entry_split(2023, 12, 31, 0.8, 1.0),
+            entry_split(2024, 1, 7, 0.9, 1.0),
+            entry_split(2050, 12, 31, 1.0, 1.0),
+        ]
+    }
+
     /// SPY-like factor file: entries starting 2021-03-25.
     fn spy_rows() -> Vec<FactorFileEntry> {
         vec![
@@ -1998,29 +3114,31 @@ mod factor_tests {
         ]
     }
 
-    /// Bar before the first factor file entry → no adjustment (factor = 1.0).
-    /// Matches LEAN: no preceding row → returns 1.
+    /// Bar before the first factor file entry → returns oldest row's factor (backward extension).
+    /// Previously returned (1.0, 1.0), which caused a phantom loss the moment the backtest
+    /// crossed into the period covered by the factor file (prices would suddenly drop).
     #[test]
-    fn test_before_first_entry_returns_one() {
+    fn test_before_first_entry_returns_oldest_factor() {
         let rows = spy_rows();
-        assert_eq!(
-            factor_for_entry(&rows, d(2020, 10, 16)),
-            (1.0, 1.0),
-            "bars before the factor file must get factor=1.0 (no adjustment)"
+        let (pf, sf) = factor_for_entry(&rows, d(2020, 10, 16));
+        assert!(
+            (pf - 0.9339743).abs() < 1e-7,
+            "bars before the factor file must extend the oldest factor backward (not 1.0)"
         );
+        assert_eq!(sf, 1.0);
     }
 
-    /// Bar exactly on the first entry date → still returns 1.0.
-    /// LEAN's condition is strict `<`, so the row on 2021-03-25 does NOT apply
-    /// to a bar also dated 2021-03-25.
+    /// Bar exactly on the first entry date → no row strictly before it, so returns oldest
+    /// row's factor (same backward-extension path as pre-first-row bars).
     #[test]
-    fn test_on_first_entry_date_returns_one() {
+    fn test_on_first_entry_date_returns_oldest_factor() {
         let rows = spy_rows();
-        assert_eq!(
-            factor_for_entry(&rows, d(2021, 3, 25)),
-            (1.0, 1.0),
-            "bar on the first entry date must still return 1.0 (strict <)"
+        let (pf, sf) = factor_for_entry(&rows, d(2021, 3, 25));
+        assert!(
+            (pf - 0.9339743).abs() < 1e-7,
+            "bar on first entry date: no prior row exists, returns oldest row factor"
         );
+        assert_eq!(sf, 1.0);
     }
 
     /// Bar one day after the first entry → picks the first entry's factor.
@@ -2085,6 +3203,155 @@ mod factor_tests {
     fn test_empty_rows() {
         assert_eq!(factor_for_entry(&[], d(2020, 1, 1)), (1.0, 1.0));
     }
+
+    // ── C# LEAN parity tests ──────────────────────────────────────────────────
+    //
+    // These mirror the assertions in LEAN's FactorFileTests.CorrectlyDeterminesTimePriceFactors
+    // (Lean/Tests/Common/Data/Auxiliary/FactorFileTests.cs) adapted to rlean's Parquet
+    // convention.
+    //
+    // rlean convention vs C# CSV convention:
+    //   C# row at date D → factor applies to bars WHERE bar_date >= D
+    //   rlean row at date D → factor applies to bars WHERE bar_date > D  (strict)
+    //
+    // To obtain the same economic result, rlean row dates are one calendar day
+    // EARLIER than the corresponding C# CSV row date.  E.g., a C# row at 2024-01-08
+    // (dividend day) becomes a rlean row at 2024-01-07 (last pre-ex-div day).
+    //
+    // See make_test_factor_rows() for the data layout.
+
+    /// Mirrors C# CorrectlyDeterminesTimePriceFactors.
+    /// The combined price-scale factor (pf * sf) should match C#'s GetPriceFactor
+    /// for the adjusted normalization mode.
+    #[test]
+    fn test_correctly_determines_price_factors() {
+        let rows = make_test_factor_rows();
+
+        // Helper: combined PSF for bar on the given date
+        let psf = |y, m, day| {
+            let (pf, sf) = factor_for_entry(&rows, d(y, m, day));
+            pf * sf
+        };
+
+        // rlean convention: a row at date D applies to bars with bar_date > D (strictly).
+        // Factor ranges (see make_test_factor_rows doc):
+        //   bar > 2050-12-31 : 1.0   (sentinel kicks in)
+        //   bar 2024-01-08..2050-12-31 : 0.9  (2024-01-07 row)
+        //   bar 2024-01-01..2024-01-07 : 0.8  (2023-12-31 row)
+        //   bar 2023-12-25..2023-12-31 : 0.4  (2023-12-24 row, split 2:1 applied)
+        //   bar 2023-10-17..2023-12-24 : 0.2  (2023-10-16 row, split 4:1 applied)
+        //   bar <= 2023-01-14          : 0.0875 (oldest row, backward extension)
+
+        // After last real action (before sentinel) → still that action's factor
+        assert!((psf(2024, 1, 9) - 0.9).abs() < 1e-9, "bar after last action row → 0.9");
+        assert!((psf(2024, 1, 8) - 0.9).abs() < 1e-9, "day after last action row → 0.9");
+
+        // ON the last action row date → falls back to prev row
+        assert!((psf(2024, 1, 7) - 0.8).abs() < 1e-9, "ON 2024-01-07 row → prev row 0.8");
+
+        // Between 2023-12-31 and 2024-01-07 rows → 2023-12-31 row (div, sf=1.0)
+        assert!((psf(2024, 1, 6) - 0.8).abs() < 1e-9, "2024-01-06 → 2023-12-31 row 0.8");
+        assert!((psf(2024, 1, 1) - 0.8).abs() < 1e-9, "2024-01-01 → 2023-12-31 row 0.8");
+
+        // ON 2023-12-31 row → falls back to 2023-12-24 row (split 2:1, combined=0.4)
+        assert!((psf(2023, 12, 31) - 0.4).abs() < 1e-9, "ON 2023-12-31 row → 0.4");
+
+        // Between 2023-12-24 and 2023-12-31 rows → 2023-12-24 (split 2:1, combined=0.4)
+        assert!((psf(2023, 12, 30) - 0.4).abs() < 1e-9, "2023-12-30 → 2023-12-24 row 0.4");
+        assert!((psf(2023, 12, 25) - 0.4).abs() < 1e-9, "2023-12-25 → 2023-12-24 row 0.4");
+
+        // ON 2023-12-24 row → falls to 2023-10-16 (split 4:1, combined=0.2)
+        assert!((psf(2023, 12, 24) - 0.2).abs() < 1e-9, "ON 2023-12-24 row → 0.2");
+
+        // Between 2023-10-16 and 2023-12-24 rows → 2023-10-16 row (split 4:1, combined=0.2)
+        assert!((psf(2023, 12, 1) - 0.2).abs() < 1e-9, "2023-12-01 → 2023-10-16 row 0.2");
+        assert!((psf(2023, 10, 17) - 0.2).abs() < 1e-9, "2023-10-17 → 2023-10-16 row 0.2");
+
+        // ON 2023-10-16 row → falls to 2023-01-14 (oldest row, combined=0.0875)
+        assert!((psf(2023, 10, 16) - 0.0875).abs() < 1e-9, "ON 2023-10-16 row → 0.0875");
+
+        // Between first row and 2023-10-16 row → 2023-01-14 row (combined=0.0875)
+        assert!((psf(2023, 5, 1) - 0.0875).abs() < 1e-9, "2023-05-01 → first row 0.0875");
+        assert!((psf(2023, 1, 15) - 0.0875).abs() < 1e-9, "day after first row → 0.0875");
+
+        // ON first row date and before → backward extension of oldest factor
+        assert!((psf(2023, 1, 14) - 0.0875).abs() < 1e-9, "ON first row → backward ext 0.0875");
+        assert!((psf(2020, 1, 1) - 0.0875).abs() < 1e-9, "before first row → backward ext 0.0875");
+    }
+
+    /// Mirrors C# HasSplitEventOnNextTradingDay.
+    /// In rlean, a split row at date D (split_factor != 1) means the split
+    /// took effect for bars dated D+1 and later.  The bar ON date D still
+    /// uses the pre-split row (because `max(date < D)` = previous row).
+    /// So the bar date when split first appears is D+1.
+    #[test]
+    fn test_split_detected_at_correct_bar_dates() {
+        let rows = make_test_factor_rows();
+
+        // 2023-12-24 row: sf=0.5 (2:1 split).  Appears for the first time on bar 2023-12-25.
+        let (_, sf_before) = factor_for_entry(&rows, d(2023, 12, 24)); // ON row date → prev row
+        let (_, sf_on_plus_one) = factor_for_entry(&rows, d(2023, 12, 25)); // 1 day after → this row
+        assert!((sf_before - 0.25).abs() < 1e-9, "day before split takes effect: sf=0.25");
+        assert!((sf_on_plus_one - 0.5).abs() < 1e-9, "day split takes effect: sf=0.5");
+
+        // 2023-10-16 row: sf=0.25 (4:1 split).  First appears on bar 2023-10-17.
+        let (_, sf_before2) = factor_for_entry(&rows, d(2023, 10, 16));
+        let (_, sf_after2) = factor_for_entry(&rows, d(2023, 10, 17));
+        assert!((sf_before2 - 0.125).abs() < 1e-9, "before 4:1 split: sf=0.125");
+        assert!((sf_after2 - 0.25).abs() < 1e-9, "after 4:1 split: sf=0.25");
+    }
+
+    /// Mirrors C# HasDividendEventOnNextTradingDay.
+    /// Dividend rows have sf=1.0; the price_factor drops to reflect the dividend.
+    #[test]
+    fn test_dividend_detected_at_correct_bar_dates() {
+        let rows = make_test_factor_rows();
+
+        // 2024-01-07 row: pf=0.9, sf=1.0 (dividend).
+        // Bar on 2024-01-07 → uses prev row (pf=0.8), bar on 2024-01-08 → uses this row (pf=0.9).
+        let (pf_on_row, _) = factor_for_entry(&rows, d(2024, 1, 7));
+        let (pf_next_day, _) = factor_for_entry(&rows, d(2024, 1, 8));
+        assert!((pf_on_row - 0.8).abs() < 1e-9, "on div row date: still old pf=0.8");
+        assert!((pf_next_day - 0.9).abs() < 1e-9, "day after div row: new pf=0.9");
+    }
+
+    /// Split factor backward extension:  if the backtest starts before any split occurred,
+    /// price continuity requires extending the oldest cumulative factor (which already
+    /// encodes all historical splits) back to the dawn of time.
+    #[test]
+    fn test_split_factor_extends_backward_before_first_row() {
+        let rows = make_test_factor_rows();
+        // The oldest row (2023-01-14) has sf=0.125 (cumulative of all historical splits).
+        // Bars from 1990 through 2023-01-14 must also see sf=0.125, not sf=1.0.
+        let (pf, sf) = factor_for_entry(&rows, d(1990, 1, 1));
+        assert!((pf - 0.7).abs() < 1e-9);
+        assert!((sf - 0.125).abs() < 1e-9);
+    }
+
+    /// apply_factor_row: a 2:1 split (sf=0.5) on bar after row date halves the price
+    /// and doubles the volume.
+    #[test]
+    fn test_apply_factor_row_scales_volume_for_split() {
+        use lean_core::Market;
+        use lean_data::trade_bar::TradeBarData;
+        use rust_decimal_macros::dec;
+
+        // A 2:1 split (sf=0.5) should DOUBLE the volume on pre-split bars.
+        let rows = vec![entry_split(2023, 12, 24, 1.0, 0.5), entry_split(2050, 12, 31, 1.0, 1.0)];
+
+        let sym = lean_core::Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let bar = TradeBar::new(
+            sym,
+            lean_core::NanosecondTimestamp(0),
+            lean_core::TimeSpan::from_days(1),
+            TradeBarData::new(dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000)),
+        );
+
+        // bar on 2023-12-25 (one day after the row): split factor 0.5 applies.
+        let adjusted = apply_factor_row(bar.clone(), &rows, d(2023, 12, 25));
+        assert_eq!(adjusted.close, dec!(52.5)); // 105 * 0.5
+        assert_eq!(adjusted.volume, dec!(2000)); // 1000 / 0.5
+    }
 }
 
 // ─── benchmark unit tests ────────────────────────────────────────────────────
@@ -2092,7 +3359,10 @@ mod factor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use lean_algorithm::qc_algorithm::QcAlgorithm;
+    use lean_core::SymbolOptionsExt;
+    use lean_data::quote_bar::Bar;
     use rust_decimal_macros::dec;
 
     /// Helper: create a fresh QcAlgorithm with default (no) benchmark.
@@ -2215,5 +3485,111 @@ mod tests {
             .iter()
             .any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker2));
         assert!(!in_subs2);
+    }
+
+    #[test]
+    fn build_option_chain_from_eod_bars_populates_model_data() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let canonical = Symbol::create_canonical_option(&underlying, &market);
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let valuation_time = DateTime::from(
+            chrono::Utc
+                .with_ymd_and_hms(2024, 1, 18, 20, 0, 0)
+                .single()
+                .unwrap(),
+        );
+
+        let bars = vec![OptionEodBar {
+            date: valuation_time.date_utc(),
+            symbol_value: "SPY240119C00100000".to_string(),
+            underlying: "SPY".to_string(),
+            expiration: expiry,
+            strike: dec!(100),
+            right: "C".to_string(),
+            open: dec!(2.50),
+            high: dec!(2.60),
+            low: dec!(2.40),
+            close: dec!(2.50),
+            volume: 42,
+            bid: dec!(2.40),
+            ask: dec!(2.60),
+            bid_size: 10,
+            ask_size: 12,
+        }];
+
+        let chain = build_option_chain_from_eod_bars(&canonical, dec!(100), valuation_time, &bars);
+        let contract = chain.contracts.values().next().unwrap();
+
+        assert!(contract.data.implied_volatility > Decimal::ZERO);
+        assert!(contract.data.theoretical_price > Decimal::ZERO);
+        assert!(contract.data.greeks.delta > Decimal::ZERO);
+    }
+
+    #[test]
+    fn option_chain_runtime_reprices_from_latest_quote_and_current_underlying() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let canonical = Symbol::create_canonical_option(&underlying, &market);
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+
+        let rows = vec![OptionUniverseRow {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 18).unwrap(),
+            symbol_value: "SPY240119C00100000".to_string(),
+            underlying: "SPY".to_string(),
+            expiration: expiry,
+            strike: dec!(100),
+            right: "C".to_string(),
+        }];
+        let chain = build_option_chain_from_universe_rows(&canonical, dec!(100), &rows);
+        let contract_symbol = chain.contracts.keys().next().unwrap().clone();
+
+        let first_time = DateTime::from(
+            chrono::Utc
+                .with_ymd_and_hms(2024, 1, 18, 15, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let second_time = DateTime::from(
+            chrono::Utc
+                .with_ymd_and_hms(2024, 1, 18, 15, 1, 0)
+                .single()
+                .unwrap(),
+        );
+
+        let quote_bar = QuoteBar::new(
+            contract_symbol.clone(),
+            first_time,
+            TimeSpan::ONE_MINUTE,
+            Some(Bar::from_price(dec!(2.40))),
+            Some(Bar::from_price(dec!(2.60))),
+            dec!(10),
+            dec!(12),
+        );
+
+        let mut runtime = OptionChainRuntime {
+            permtick: canonical.permtick.clone(),
+            chain,
+            trade_updates: HashMap::new(),
+            quote_updates: HashMap::from([(first_time.0, vec![quote_bar])]),
+            tick_updates: HashMap::new(),
+        };
+
+        runtime.apply_timestamp(first_time, dec!(100));
+        let initial_delta = runtime
+            .chain
+            .contracts
+            .get(&contract_symbol)
+            .unwrap()
+            .data
+            .greeks
+            .delta;
+
+        runtime.apply_timestamp(second_time, dec!(105));
+        let repriced = runtime.chain.contracts.get(&contract_symbol).unwrap();
+
+        assert!(repriced.data.implied_volatility > Decimal::ZERO);
+        assert!(repriced.data.theoretical_price > Decimal::ZERO);
+        assert!(repriced.data.greeks.delta > initial_delta);
     }
 }

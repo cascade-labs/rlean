@@ -1,6 +1,10 @@
 use crate::charting::ChartCollection;
+use crate::py_framework::{
+    try_take_alpha, try_take_exec, try_take_pcm, try_take_risk, FrameworkState,
+};
+use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
 use crate::py_portfolio::PyPortfolio;
-use crate::py_types::{PyResolution, PySecurity, PySecurityManager, PySymbol};
+use crate::py_types::{PyAlgorithmSettings, PyResolution, PySecurity, PySecurityManager, PySymbol};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{Market, Resolution, SymbolOptionsExt};
 use pyo3::prelude::*;
@@ -9,6 +13,22 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Registry of auto-updating indicators keyed by symbol SID.
+/// Each entry maps a SID to a Python indicator object that will be updated
+/// with every new bar for that symbol (before `on_data` / `OnData` is called).
+pub struct IndicatorRegistry {
+    /// (sid, indicator_python_object) — updated via `update_bar(bar)` each day.
+    pub entries: Vec<(u64, Py<PyAny>)>,
+}
+
+impl IndicatorRegistry {
+    pub fn new() -> Self {
+        IndicatorRegistry {
+            entries: Vec::new(),
+        }
+    }
+}
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
@@ -46,6 +66,12 @@ pub struct PyQcAlgorithm {
     pub symbols: HashMap<String, lean_core::Symbol>,
     /// Shared chart collection — plotted from Python via self.plot(...)
     pub charts: Arc<Mutex<ChartCollection>>,
+    /// Algorithm Framework models (alpha, PCM, execution, risk).
+    /// Shared with PyAlgorithmAdapter so the runner can execute the pipeline.
+    pub framework: Arc<Mutex<FrameworkState>>,
+    /// Registry of indicators to auto-update each bar.
+    /// Shared with PyAlgorithmAdapter for pre-OnData updates.
+    pub indicators: Arc<Mutex<IndicatorRegistry>>,
 }
 
 impl PyQcAlgorithm {
@@ -54,6 +80,12 @@ impl PyQcAlgorithm {
     }
     pub fn charts_arc(&self) -> Arc<Mutex<ChartCollection>> {
         self.charts.clone()
+    }
+    pub fn framework_arc(&self) -> Arc<Mutex<FrameworkState>> {
+        self.framework.clone()
+    }
+    pub fn indicators_arc(&self) -> Arc<Mutex<IndicatorRegistry>> {
+        self.indicators.clone()
     }
 }
 
@@ -74,6 +106,8 @@ impl PyQcAlgorithm {
             ))),
             symbols: HashMap::new(),
             charts: Arc::new(Mutex::new(ChartCollection::new())),
+            framework: Arc::new(Mutex::new(FrameworkState::new())),
+            indicators: Arc::new(Mutex::new(IndicatorRegistry::new())),
         }
     }
 
@@ -120,21 +154,42 @@ impl PyQcAlgorithm {
     /// Examples (Python):
     ///   self.set_warm_up(200)   # 200 bars
     ///   self.set_warm_up(30)    # 30 days
-    fn set_warm_up(&mut self, bars_or_days: i64) -> PyResult<()> {
-        if bars_or_days > 365 {
-            // treat as bar count
-            self.inner
-                .lock()
-                .unwrap()
-                .set_warm_up_bars(bars_or_days as usize);
+    #[pyo3(signature = (bars_or_days_or_timespan, resolution=None))]
+    fn set_warm_up(
+        &mut self,
+        bars_or_days_or_timespan: &Bound<'_, PyAny>,
+        resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        // C# LEAN has two overload families:
+        //   SetWarmUp(int barCount[, Resolution resolution])
+        //     → count back N trading-day bars from start date
+        //   SetWarmUp(TimeSpan timeSpan[, Resolution resolution])
+        //     → subtract the span directly (calendar time, not trading days)
+        //
+        // Python passes either an int (bar count or day count) or a timedelta.
+        // When a Resolution is provided the int is always a bar count.
+        // When no Resolution is provided and the int is ≤ 365 it is treated as
+        // a TimeSpan of that many calendar days (legacy rlean snake_case behaviour).
+        use lean_core::TimeSpan;
+
+        // Check for timedelta first.
+        if let Ok(td) = bars_or_days_or_timespan.extract::<chrono::Duration>() {
+            let nanos = td.num_nanoseconds().unwrap_or(0);
+            self.inner.lock().unwrap().set_warm_up(TimeSpan::from_nanos(nanos));
+            return Ok(());
+        }
+
+        let n: i64 = bars_or_days_or_timespan.extract()?;
+
+        // With a resolution argument this is always a bar count (C# overload).
+        // Without a resolution, > 365 is a bar count; ≤ 365 is calendar days.
+        if resolution.is_some() || n > 365 {
+            // Bar count: stored as warmup_bar_count; runner converts to calendar days.
+            self.inner.lock().unwrap().set_warm_up_bars(n as usize);
         } else {
-            // treat as days
-            use lean_core::TimeSpan;
-            let nanos = bars_or_days * 86_400 * 1_000_000_000i64;
-            self.inner
-                .lock()
-                .unwrap()
-                .set_warm_up(TimeSpan::from_nanos(nanos));
+            // Calendar days (TimeSpan overload without resolution).
+            let nanos = n * 86_400 * 1_000_000_000i64;
+            self.inner.lock().unwrap().set_warm_up(TimeSpan::from_nanos(nanos));
         }
         Ok(())
     }
@@ -145,18 +200,14 @@ impl PyQcAlgorithm {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_equity(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     fn add_forex(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_forex(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     fn add_crypto(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
@@ -164,9 +215,7 @@ impl PyQcAlgorithm {
         let market = Market::usa(); // default; crypto can override
         let sym = self.inner.lock().unwrap().add_crypto(ticker, &market, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity {
-            inner: PySymbol { inner: sym },
-        }
+        PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
     // ─── Ordering ─────────────────────────────────────────────────────────────
@@ -287,6 +336,8 @@ impl PyQcAlgorithm {
                     Resolution::from(py_res)
                 } else if let Ok(s) = r.extract::<String>() {
                     match s.to_lowercase().as_str() {
+                        "tick" => Resolution::Tick,
+                        "second" => Resolution::Second,
                         "daily" => Resolution::Daily,
                         "hour" => Resolution::Hour,
                         "minute" => Resolution::Minute,
@@ -322,9 +373,7 @@ impl PyQcAlgorithm {
         let market = lean_core::Market::usa();
         let sym = lean_core::Symbol::create_equity(ticker, &market);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        Ok(PySecurity {
-            inner: PySymbol { inner: sym },
-        })
+        Ok(PySecurity::from_symbol(PySymbol { inner: sym }))
     }
 
     // ─── Options ──────────────────────────────────────────────────────────────
@@ -345,6 +394,8 @@ impl PyQcAlgorithm {
                     Resolution::from(py_res)
                 } else if let Ok(s) = r.extract::<String>() {
                     match s.to_lowercase().as_str() {
+                        "tick" => Resolution::Tick,
+                        "second" => Resolution::Second,
                         "daily" => Resolution::Daily,
                         "hour" => Resolution::Hour,
                         "minute" => Resolution::Minute,
@@ -493,14 +544,176 @@ impl PyQcAlgorithm {
         Ok(())
     }
 
-    // ─── Lifecycle hooks (overridden by Python subclasses) ────────────────────
+    // ─── Algorithm Framework ─────────────────────────────────────────────────
 
-    fn initialize(&mut self) {}
-    fn on_data(&mut self, _data: PyObject) {}
-    fn on_order_event(&mut self, _event: PyObject) {}
-    fn on_assignment_order_event(&mut self, _event: PyObject) {}
-    fn on_end_of_algorithm(&mut self) {}
-    fn on_warmup_finished(&mut self) {}
+    /// Register an alpha model. Multiple calls add models to a composite.
+    /// ```python
+    /// self.add_alpha(EmaCrossAlphaModel(50, 200))
+    /// self.add_alpha(RsiAlphaModel(14))
+    /// ```
+    fn add_alpha(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
+        let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
+        let fw = slf.borrow().framework.clone();
+        if let Some(m) = try_take_alpha(model, alg_py) {
+            fw.lock().unwrap().alpha_models.push(m);
+        }
+    }
+
+    /// Set the portfolio construction model.
+    /// ```python
+    /// self.set_portfolio_construction(EqualWeightingPortfolioConstructionModel())
+    /// ```
+    fn set_portfolio_construction(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
+        let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
+        let fw = slf.borrow().framework.clone();
+        if let Some(m) = try_take_pcm(model, alg_py) {
+            fw.lock().unwrap().pcm = m;
+        }
+    }
+
+    /// Set the execution model.
+    /// ```python
+    /// self.set_execution(ImmediateExecutionModel())
+    /// ```
+    fn set_execution(&mut self, model: &Bound<'_, PyAny>) {
+        if let Some(m) = try_take_exec(model) {
+            self.framework.lock().unwrap().exec_model = m;
+        }
+    }
+
+    /// Set the risk management model.
+    /// ```python
+    /// self.set_risk_management(MaximumDrawdownPercentPerSecurity(0.05))
+    /// ```
+    fn set_risk_management(&mut self, model: &Bound<'_, PyAny>) {
+        if let Some(m) = try_take_risk(model) {
+            self.framework.lock().unwrap().risk_model = m;
+        }
+    }
+
+    // ─── Algorithm settings ───────────────────────────────────────────────────
+
+    /// LEAN API: `self.Settings` — returns a settings bag (no-op in rlean).
+    #[getter]
+    fn settings(&self) -> PyAlgorithmSettings {
+        PyAlgorithmSettings::new()
+    }
+
+    // ─── Indicator factory methods ────────────────────────────────────────────
+    // LEAN API: self.SMA(symbol, period, resolution) etc.
+    // Creates the indicator, registers it for auto-update each bar, returns it.
+
+    /// `self.SMA(symbol, period[, resolution])` — Simple Moving Average.
+    #[pyo3(signature = (symbol, period, _resolution=None))]
+    fn sma(
+        slf: Bound<'_, Self>,
+        symbol: &Bound<'_, PyAny>,
+        period: usize,
+        _resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PySma>> {
+        let sid = resolve_symbol_sid(symbol)?;
+        let indicator = Py::new(slf.py(), PySma::create(period))?;
+        slf.borrow()
+            .indicators
+            .lock()
+            .unwrap()
+            .entries
+            .push((sid, indicator.clone_ref(slf.py()).into_any()));
+        Ok(indicator)
+    }
+
+    /// `self.EMA(symbol, period[, resolution])` — Exponential Moving Average.
+    #[pyo3(signature = (symbol, period, _resolution=None))]
+    fn ema(
+        slf: Bound<'_, Self>,
+        symbol: &Bound<'_, PyAny>,
+        period: usize,
+        _resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyEma>> {
+        let sid = resolve_symbol_sid(symbol)?;
+        let indicator = Py::new(slf.py(), PyEma::create(period))?;
+        slf.borrow()
+            .indicators
+            .lock()
+            .unwrap()
+            .entries
+            .push((sid, indicator.clone_ref(slf.py()).into_any()));
+        Ok(indicator)
+    }
+
+    /// `self.RSI(symbol, period[, moving_average_type, resolution])` — RSI.
+    #[pyo3(signature = (symbol, period, _moving_average_type=None, _resolution=None))]
+    fn rsi(
+        slf: Bound<'_, Self>,
+        symbol: &Bound<'_, PyAny>,
+        period: usize,
+        _moving_average_type: Option<&Bound<'_, PyAny>>,
+        _resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyRsi>> {
+        let sid = resolve_symbol_sid(symbol)?;
+        let indicator = Py::new(slf.py(), PyRsi::create(period))?;
+        slf.borrow()
+            .indicators
+            .lock()
+            .unwrap()
+            .entries
+            .push((sid, indicator.clone_ref(slf.py()).into_any()));
+        Ok(indicator)
+    }
+
+    /// `self.MOMP(symbol, period[, resolution])` — Momentum Percent.
+    #[pyo3(signature = (symbol, period, _resolution=None))]
+    fn momp(
+        slf: Bound<'_, Self>,
+        symbol: &Bound<'_, PyAny>,
+        period: usize,
+        _resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyMomp>> {
+        let sid = resolve_symbol_sid(symbol)?;
+        let indicator = Py::new(slf.py(), PyMomp::create(period))?;
+        slf.borrow()
+            .indicators
+            .lock()
+            .unwrap()
+            .entries
+            .push((sid, indicator.clone_ref(slf.py()).into_any()));
+        Ok(indicator)
+    }
+
+    /// `self.STD(symbol, period[, resolution])` — Standard Deviation.
+    #[pyo3(signature = (symbol, period, _resolution=None))]
+    fn std(
+        slf: Bound<'_, Self>,
+        symbol: &Bound<'_, PyAny>,
+        period: usize,
+        _resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyStd>> {
+        let sid = resolve_symbol_sid(symbol)?;
+        let indicator = Py::new(slf.py(), PyStd::create(period))?;
+        slf.borrow()
+            .indicators
+            .lock()
+            .unwrap()
+            .entries
+            .push((sid, indicator.clone_ref(slf.py()).into_any()));
+        Ok(indicator)
+    }
+
+    /// PascalCase → snake_case attribute forwarding so LEAN strategies can call
+    /// QCAlgorithm methods by their LEAN names (e.g. `self.SetStartDate(...)`).
+    /// Called only when normal attribute lookup fails, so snake_case always wins
+    /// for directly defined methods/properties.
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'QCAlgorithm' object has no attribute '{name}'"
+        )))
+    }
 
     fn __repr__(&self) -> String {
         let inner = self.inner.lock().unwrap();
@@ -510,6 +723,48 @@ impl PyQcAlgorithm {
             inner.portfolio_value()
         )
     }
+}
+
+/// Resolve a symbol/security/string argument to its SID (for indicator registry).
+fn resolve_symbol_sid(sym: &Bound<'_, PyAny>) -> PyResult<u64> {
+    use crate::py_types::{PySecurity, PySymbol};
+    if let Ok(s) = sym.downcast::<PySymbol>() {
+        return Ok(s.get().inner.id.sid);
+    }
+    if let Ok(s) = sym.downcast::<PySecurity>() {
+        return Ok(s.get().inner.inner.id.sid);
+    }
+    if let Ok(ticker) = sym.extract::<String>() {
+        let s = lean_core::Symbol::create_equity(&ticker, &Market::usa());
+        return Ok(s.id.sid);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "Expected Symbol, Security, or str",
+    ))
+}
+
+/// Convert PascalCase / CamelCase to snake_case.
+/// e.g. "SetStartDate" → "set_start_date", "TotalPortfolioValue" → "total_portfolio_value"
+pub(crate) fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                // Insert _ unless the previous char was already _ or uppercase
+                // (handles acronyms like "IV" → "iv" not "i_v")
+                let prev = chars[i - 1];
+                let next_is_lower = chars.get(i + 1).map(|c| c.is_lowercase()).unwrap_or(false);
+                if prev != '_' && (prev.is_lowercase() || next_is_lower) {
+                    out.push('_');
+                }
+            }
+            out.push(c.to_lowercase().next().unwrap());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn ns_to_py_datetime(ns: i64) -> PyResult<PyObject> {
@@ -589,19 +844,19 @@ impl PyQcAlgorithm {
                 .unwrap_or(Decimal::ZERO)
         };
 
-        // Determine if opening or closing based on existing position
+        // Determine if opening or closing from the portfolio holding, mirroring LEAN.
         let existing_qty = {
             self.inner
                 .lock()
                 .unwrap()
-                .option_positions
-                .get(&sym.id.sid)
-                .map(|p| p.quantity)
+                .portfolio
+                .get_holding(&sym)
+                .quantity
         };
 
         let abs_qty = quantity.abs();
         if quantity < Decimal::ZERO {
-            if existing_qty.map(|q| q > Decimal::ZERO).unwrap_or(false) {
+            if existing_qty > Decimal::ZERO {
                 self.inner
                     .lock()
                     .unwrap()
@@ -613,7 +868,7 @@ impl PyQcAlgorithm {
                     .sell_to_open(sym, abs_qty, premium);
             }
         } else if quantity > Decimal::ZERO {
-            if existing_qty.map(|q| q < Decimal::ZERO).unwrap_or(false) {
+            if existing_qty < Decimal::ZERO {
                 self.inner
                     .lock()
                     .unwrap()

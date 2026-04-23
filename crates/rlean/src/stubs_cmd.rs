@@ -41,6 +41,37 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple
 
+# ── DataNormalizationMode ─────────────────────────────────────────────────────
+
+class DataNormalizationMode:
+    """Controls how historical prices are adjusted for splits and dividends."""
+
+    Raw: DataNormalizationMode
+    Adjusted: DataNormalizationMode
+    SplitAdjusted: DataNormalizationMode
+    TotalReturn: DataNormalizationMode
+    ForwardPanamaCanal: DataNormalizationMode
+    BackwardPanamaCanal: DataNormalizationMode
+
+# ── MovingAverageType ─────────────────────────────────────────────────────────
+
+class MovingAverageType:
+    """Selects which smoothing method is used by an indicator."""
+
+    Simple: MovingAverageType
+    Exponential: MovingAverageType
+    Weighted: MovingAverageType
+    DoubleExponential: MovingAverageType
+    TripleExponential: MovingAverageType
+    Triangular: MovingAverageType
+    Kama: MovingAverageType
+    Adaptive: MovingAverageType
+    LinearWeightedMovingAverage: MovingAverageType
+    Alma: MovingAverageType
+    T3: MovingAverageType
+    Vwap: MovingAverageType
+    Hull: MovingAverageType
+
 # ── Resolution ────────────────────────────────────────────────────────────────
 
 class Resolution:
@@ -323,6 +354,8 @@ class OptionContract:
     @property
     def underlying_price(self) -> float: ...
     @property
+    def theoretical_price(self) -> float: ...
+    @property
     def implied_volatility(self) -> float: ...
     @property
     def open_interest(self) -> float: ...
@@ -548,6 +581,215 @@ class AverageTrueRange:
     def update_bar(self, bar: TradeBar) -> IndicatorResult: ...
     def reset(self) -> None: ...
 
+# ── Algorithm Framework — Insight types ──────────────────────────────────────
+
+class InsightDirection:
+    """Direction of an alpha insight."""
+    Up: InsightDirection
+    Flat: InsightDirection
+    Down: InsightDirection
+
+class Insight:
+    """A single alpha signal emitted by an AlphaModel.
+
+    Usage::
+
+        from datetime import timedelta
+        Insight(symbol, InsightDirection.Up, timedelta(days=1))
+        Insight.price(symbol, timedelta(days=1), InsightDirection.Up)
+    """
+
+    symbol: Symbol
+    direction: InsightDirection
+
+    def __init__(
+        self,
+        symbol: Symbol | str,
+        direction: InsightDirection,
+        period: Any,
+        magnitude: Optional[float] = None,
+        confidence: Optional[float] = None,
+        source_model: Optional[str] = None,
+    ) -> None: ...
+
+    @staticmethod
+    def price(
+        symbol: Symbol | str,
+        period: Any,
+        direction: InsightDirection,
+        magnitude: Optional[float] = None,
+        confidence: Optional[float] = None,
+        source_model: Optional[str] = None,
+    ) -> Insight: ...
+
+    @staticmethod
+    def Price(
+        symbol: Symbol | str,
+        period: Any,
+        direction: InsightDirection,
+        magnitude: Optional[float] = None,
+        confidence: Optional[float] = None,
+        source_model: Optional[str] = None,
+    ) -> Insight:
+        """LEAN PascalCase alias for :meth:`price`."""
+        ...
+
+# ── Algorithm Framework — Base Classes ────────────────────────────────────────
+
+class AlphaModel:
+    """Base class for Python-defined alpha models.
+
+    Subclass and override ``Update`` to emit :class:`Insight` objects
+    (LEAN uses PascalCase to match the C# API)::
+
+        class MyAlpha(AlphaModel):
+            def Update(self, algorithm, data):
+                return [Insight.Price(symbol, timedelta(days=1), InsightDirection.Up)]
+    """
+
+    def Update(self, algorithm: QCAlgorithm, data: Slice) -> List[Insight]: ...
+    def OnSecuritiesChanged(self, algorithm: QCAlgorithm, changes: Any) -> None: ...
+
+class PortfolioConstructionModel:
+    """Base class for Python-defined portfolio construction models."""
+
+class ExecutionModel:
+    """Base class for Python-defined execution models."""
+
+class RiskManagementModel:
+    """Base class for Python-defined risk management models."""
+
+# ── Algorithm Framework — Alpha Models ────────────────────────────────────────
+
+class ConstantAlphaModel(AlphaModel):
+    """Emits a constant directional insight for all subscribed securities."""
+    def __init__(self, direction: str, period_days: int, magnitude: Optional[float] = None) -> None: ...
+
+class EmaCrossAlphaModel(AlphaModel):
+    """EMA cross-over alpha model."""
+    def __init__(self, fast_period: int = 50, slow_period: int = 200, period_days: int = 1) -> None: ...
+
+class MacdAlphaModel(AlphaModel):
+    """MACD-based alpha model."""
+    def __init__(self, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9, period_days: int = 1) -> None: ...
+
+class RsiAlphaModel(AlphaModel):
+    """RSI mean-reversion alpha model."""
+    def __init__(self, period: int = 14, period_days: int = 1) -> None: ...
+
+class HistoricalReturnsAlphaModel(AlphaModel):
+    """Historical returns momentum/mean-reversion alpha model."""
+    def __init__(self, period: int = 1, insight_period_days: Optional[int] = None) -> None: ...
+
+class PearsonCorrelationPairsTradingAlphaModel(AlphaModel):
+    """Pearson correlation pairs trading alpha model."""
+    def __init__(self, lookback: int = 15, threshold: float = 1.0, minimum_correlation: float = 0.5, insight_period_days: Optional[int] = None) -> None: ...
+
+# ── PortfolioBias ─────────────────────────────────────────────────────────────
+
+class PortfolioBias:
+    """Controls whether a PCM may hold short positions."""
+
+    Short: PortfolioBias
+    LongShort: PortfolioBias
+    Long: PortfolioBias
+
+# ── Algorithm Framework — Portfolio Construction Models ───────────────────────
+
+class EqualWeightingPortfolioConstructionModel(PortfolioConstructionModel):
+    """Equal-weight PCM: splits portfolio evenly across all Up-insight symbols."""
+    def __init__(self) -> None: ...
+
+class InsightWeightingPortfolioConstructionModel(PortfolioConstructionModel):
+    """Weights positions by insight magnitude."""
+    def __init__(self) -> None: ...
+
+class MeanVarianceOptimizationPortfolioConstructionModel(PortfolioConstructionModel):
+    """Mean-variance optimization PCM."""
+    def __init__(self) -> None: ...
+
+class MaximumSharpeRatioPortfolioConstructionModel(PortfolioConstructionModel):
+    """Maximizes portfolio Sharpe ratio."""
+    def __init__(self) -> None: ...
+
+class BlackLittermanOptimizationPortfolioConstructionModel(PortfolioConstructionModel):
+    """Black-Litterman portfolio construction model."""
+    def __init__(
+        self,
+        rebalance: Any = None,
+        portfolio_bias: PortfolioBias = ...,
+        lookback: int = 1,
+        period: int = 63,
+        resolution: Resolution = ...,
+        risk_free_rate: float = 0.0,
+        delta: float = 2.5,
+        tau: float = 0.05,
+    ) -> None: ...
+
+class RiskParityPortfolioConstructionModel(PortfolioConstructionModel):
+    """Risk parity (equal risk contribution) PCM."""
+    def __init__(self, lookback: int = 1, period: int = 252) -> None: ...
+
+class ConfidenceWeightedPortfolioConstructionModel(PortfolioConstructionModel):
+    """Weights positions by insight confidence."""
+    def __init__(self) -> None: ...
+
+class AccumulativeInsightPortfolioConstructionModel(PortfolioConstructionModel):
+    """Accumulates per-insight allocations."""
+    def __init__(self, percent: float = 0.03) -> None: ...
+
+class MeanReversionPortfolioConstructionModel(PortfolioConstructionModel):
+    """OLMAR mean-reversion PCM."""
+    def __init__(self, reversion_threshold: float = 1.0, window_size: int = 20) -> None: ...
+
+# ── Algorithm Framework — Execution Models ────────────────────────────────────
+
+class ImmediateExecutionModel(ExecutionModel):
+    """Submits market orders immediately."""
+    def __init__(self) -> None: ...
+
+class NullExecutionModel(ExecutionModel):
+    """No-op execution model (for testing)."""
+    def __init__(self) -> None: ...
+
+class VolumeWeightedAveragePriceExecutionModel(ExecutionModel):
+    """VWAP execution — slices orders by volume participation rate."""
+    def __init__(self, participation_rate: float = 0.2) -> None: ...
+
+class SpreadExecutionModel(ExecutionModel):
+    """Only executes when bid-ask spread is within an acceptable threshold."""
+    def __init__(self, accepting_spread_percent: float = 0.005) -> None: ...
+
+class StandardDeviationExecutionModel(ExecutionModel):
+    """Executes when price deviates by N standard deviations from mean."""
+    def __init__(self, period: int = 60, deviations: float = 2.0) -> None: ...
+
+# ── Algorithm Framework — Risk Management Models ──────────────────────────────
+
+class NullRiskManagementModel(RiskManagementModel):
+    """Pass-through — no risk adjustments."""
+    def __init__(self) -> None: ...
+
+class MaximumDrawdownPercentPerSecurity(RiskManagementModel):
+    """Liquidates a security when its drawdown exceeds a threshold."""
+    def __init__(self, maximum_drawdown_percent: float = 0.05) -> None: ...
+
+class TrailingStopRiskManagementModel(RiskManagementModel):
+    """Trailing stop — exits when price falls X% from the high-water mark."""
+    def __init__(self, trailing_amount: float = 0.05) -> None: ...
+
+class MaximumSectorExposureRiskManagementModel(RiskManagementModel):
+    """Caps portfolio exposure to any single sector."""
+    def __init__(self, maximum_sector_exposure: float = 0.20) -> None: ...
+
+class MaximumDrawdownPercentPortfolio(RiskManagementModel):
+    """Liquidates all holdings when portfolio drawdown exceeds a threshold."""
+    def __init__(self, maximum_drawdown_percent: float = 0.05, is_trailing: bool = False) -> None: ...
+
+class MaximumUnrealizedProfitPercentPerSecurity(RiskManagementModel):
+    """Takes profit when a security's unrealized gain exceeds a threshold."""
+    def __init__(self, maximum_unrealized_profit_percent: float = 0.05) -> None: ...
+
 # ── QCAlgorithm ───────────────────────────────────────────────────────────────
 
 class QCAlgorithm:
@@ -656,6 +898,24 @@ class QCAlgorithm:
         ...
     def liquidate(self, symbol: Optional[Symbol | Security | str] = None) -> None:
         """Liquidate a position (or all positions when ``symbol`` is ``None``)."""
+        ...
+
+    # ── Algorithm Framework ───────────────────────────────────────────────────
+
+    def add_alpha(self, model: AlphaModel) -> None:
+        """Register an alpha model. Multiple calls compose models."""
+        ...
+
+    def set_portfolio_construction(self, model: PortfolioConstructionModel) -> None:
+        """Set the portfolio construction model."""
+        ...
+
+    def set_execution(self, model: ExecutionModel) -> None:
+        """Set the execution model."""
+        ...
+
+    def set_risk_management(self, model: RiskManagementModel) -> None:
+        """Set the risk management model."""
         ...
 
     # ── Charting ──────────────────────────────────────────────────────────────

@@ -43,6 +43,12 @@ pub trait IPortfolioConstructionModel: Send + Sync {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}
 
+    /// Called every bar with current security prices, even when no insights are
+    /// emitted by the alpha model.  Models that require a rolling price history
+    /// (e.g. Black-Litterman, Mean-Variance) override this to accumulate data
+    /// so their warm-up period runs concurrently with the alpha warm-up.
+    fn update_security_prices(&mut self, _prices: &HashMap<String, rust_decimal::Decimal>) {}
+
     fn name(&self) -> &str {
         "PortfolioConstructionModel"
     }

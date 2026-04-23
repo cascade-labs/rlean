@@ -111,65 +111,6 @@ impl Tick {
         self.tick_type == TickType::Quote
     }
 
-    /// Parse from LEAN tick CSV (trade):
-    /// `milliseconds,price*10000,quantity`
-    pub fn from_lean_trade_csv(
-        line: &str,
-        symbol: Symbol,
-        date: chrono::NaiveDate,
-    ) -> Option<Self> {
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 3 {
-            return None;
-        }
-
-        let ms: i64 = parts[0].trim().parse().ok()?;
-        let price = parts[1].trim().parse::<rust_decimal::Decimal>().ok()? / dec!(10000);
-        let quantity = parts[2].trim().parse().ok()?;
-
-        use chrono::{TimeZone, Utc};
-        let midnight = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
-        let nanos = midnight.timestamp() * 1_000_000_000 + ms * 1_000_000;
-
-        Some(Tick::trade(
-            symbol,
-            lean_core::NanosecondTimestamp(nanos),
-            price,
-            quantity,
-        ))
-    }
-
-    /// Parse from LEAN tick CSV (quote):
-    /// `milliseconds,bid*10000,ask*10000,bid_size,ask_size`
-    pub fn from_lean_quote_csv(
-        line: &str,
-        symbol: Symbol,
-        date: chrono::NaiveDate,
-    ) -> Option<Self> {
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 5 {
-            return None;
-        }
-
-        let ms: i64 = parts[0].trim().parse().ok()?;
-        let bid = parts[1].trim().parse::<rust_decimal::Decimal>().ok()? / dec!(10000);
-        let ask = parts[2].trim().parse::<rust_decimal::Decimal>().ok()? / dec!(10000);
-        let bid_size = parts[3].trim().parse().ok()?;
-        let ask_size = parts[4].trim().parse().ok()?;
-
-        use chrono::{TimeZone, Utc};
-        let midnight = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
-        let nanos = midnight.timestamp() * 1_000_000_000 + ms * 1_000_000;
-
-        Some(Tick::quote(
-            symbol,
-            lean_core::NanosecondTimestamp(nanos),
-            bid,
-            ask,
-            bid_size,
-            ask_size,
-        ))
-    }
 }
 
 impl BaseData for Tick {

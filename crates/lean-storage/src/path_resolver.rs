@@ -103,7 +103,7 @@ impl DataPath {
         }
     }
 
-    /// Path for option EOD bar data.
+    /// Path for option trade-bar data keyed by underlying + date.
     ///
     /// `underlying_symbol` must be the **equity** symbol whose ticker names
     /// the directory (e.g. the SPY equity symbol for SPY options).
@@ -113,7 +113,7 @@ impl DataPath {
     /// Produced paths mirror LEAN's canonical option layout:
     /// - Daily:   `{root}/option/{market}/daily/{ticker}_{suffix}.parquet`  (flat)
     /// - Minute+: `{root}/option/{market}/minute/{ticker}/{YYYYMMDD}_{suffix}.parquet`
-    pub fn option_eod_bar(
+    pub fn option_trade_bar(
         root: impl AsRef<Path>,
         underlying_symbol: &Symbol,
         resolution: Resolution,
@@ -126,6 +126,53 @@ impl DataPath {
             resolution,
             date,
             suffix: "trade",
+            option_underlying: Some(ticker),
+            is_universe: false,
+        }
+    }
+
+    /// Backward-compatible alias for option trade-bar paths.
+    pub fn option_eod_bar(
+        root: impl AsRef<Path>,
+        underlying_symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> Self {
+        Self::option_trade_bar(root, underlying_symbol, resolution, date)
+    }
+
+    /// Path for option quote-bar data keyed by underlying + date.
+    pub fn option_quote_bar(
+        root: impl AsRef<Path>,
+        underlying_symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> Self {
+        let ticker = underlying_symbol.value.to_lowercase();
+        DataPath {
+            root: root.as_ref().to_path_buf(),
+            symbol: underlying_symbol.clone(),
+            resolution,
+            date,
+            suffix: "quote",
+            option_underlying: Some(ticker),
+            is_universe: false,
+        }
+    }
+
+    /// Path for option tick data keyed by underlying + date.
+    pub fn option_tick(
+        root: impl AsRef<Path>,
+        underlying_symbol: &Symbol,
+        date: NaiveDate,
+    ) -> Self {
+        let ticker = underlying_symbol.value.to_lowercase();
+        DataPath {
+            root: root.as_ref().to_path_buf(),
+            symbol: underlying_symbol.clone(),
+            resolution: Resolution::Tick,
+            date,
+            suffix: "tick",
             option_underlying: Some(ticker),
             is_universe: false,
         }
@@ -309,13 +356,35 @@ impl PathResolver {
 
     /// Path for option EOD bar data.  `underlying_symbol` should be the equity
     /// (or index) symbol whose ticker names the storage directory.
+    pub fn option_trade_bar(
+        &self,
+        underlying_symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> DataPath {
+        DataPath::option_trade_bar(&self.data_root, underlying_symbol, resolution, date)
+    }
+
     pub fn option_eod_bar(
         &self,
         underlying_symbol: &Symbol,
         resolution: Resolution,
         date: NaiveDate,
     ) -> DataPath {
-        DataPath::option_eod_bar(&self.data_root, underlying_symbol, resolution, date)
+        DataPath::option_trade_bar(&self.data_root, underlying_symbol, resolution, date)
+    }
+
+    pub fn option_quote_bar(
+        &self,
+        underlying_symbol: &Symbol,
+        resolution: Resolution,
+        date: NaiveDate,
+    ) -> DataPath {
+        DataPath::option_quote_bar(&self.data_root, underlying_symbol, resolution, date)
+    }
+
+    pub fn option_tick(&self, underlying_symbol: &Symbol, date: NaiveDate) -> DataPath {
+        DataPath::option_tick(&self.data_root, underlying_symbol, date)
     }
 
     /// Path for the option universe snapshot for a given underlying + date.
@@ -395,7 +464,7 @@ pub fn factor_file_path(root: impl AsRef<Path>, market: &str, ticker: &str) -> P
 ///
 /// Layout: `{root}/equity/{market}/map_files/{ticker_lower}.parquet`
 ///
-/// We store all LEAN data as Parquet (converted from LEAN's CSV sources)
+/// All LEAN data is stored as Parquet and fetched directly from source providers.
 /// to enable fast predicate-pushdown reads.
 pub fn map_file_path(root: impl AsRef<Path>, market: &str, ticker: &str) -> PathBuf {
     let mut p = root.as_ref().to_path_buf();

@@ -87,6 +87,19 @@ impl PyGreeks {
     fn theta_per_day(&self) -> f64 {
         self.theta / 365.0
     }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Greeks' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Greeks(delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4})",
@@ -149,6 +162,10 @@ impl PyOptionContract {
             .unwrap_or(0.0)
     }
     #[getter]
+    fn theoretical_price(&self) -> f64 {
+        self.inner.data.theoretical_price.to_f64().unwrap_or(0.0)
+    }
+    #[getter]
     fn implied_volatility(&self) -> f64 {
         self.inner.data.implied_volatility.to_f64().unwrap_or(0.0)
     }
@@ -202,6 +219,18 @@ impl PyOptionContract {
     fn time_value(&self) -> f64 {
         self.inner.time_value().to_f64().unwrap_or(0.0)
     }
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'OptionContract' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "OptionContract({} {} K={:.2} exp={})",
@@ -331,6 +360,18 @@ impl PyOptionChain {
             .filter(|c| c.strike >= lo && c.strike <= hi)
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect()
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'OptionChain' object has no attribute '{name}'"
+        )))
     }
 
     /// LEAN API: for c in chain — iterate all contracts

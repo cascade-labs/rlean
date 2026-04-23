@@ -17,6 +17,10 @@ lean-storage    = { path = "../lean-storage" }
 lean-data-providers    = { path = "../lean-data-providers" }
 lean-options    = { path = "../lean-options" }
 lean-statistics = { path = "../lean-statistics" }
+lean-alpha      = { path = "../lean-alpha" }
+lean-portfolio-construction = { path = "../lean-portfolio-construction" }
+lean-execution  = { path = "../lean-execution" }
+lean-risk       = { path = "../lean-risk" }
 
 pyo3              = { workspace = true }
 rust_decimal      = { workspace = true }

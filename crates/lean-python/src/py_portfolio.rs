@@ -61,6 +61,18 @@ impl PySecurityHolding {
         self.unrealized_pnl + self.realized_pnl
     }
 
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'SecurityHolding' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Holding({} qty={:.0} avg={:.2} pnl={:.2})",
@@ -133,6 +145,18 @@ impl PyPortfolio {
             .iter()
             .map(PySecurityHolding::from)
             .collect()
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'Portfolio' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self) -> String {

@@ -1,6 +1,7 @@
 use crate::contract::OptionContract;
-use lean_core::Greeks;
-use lean_core::OptionRight;
+use chrono::{NaiveDate, TimeZone, Utc};
+use lean_core::time::tz;
+use lean_core::{DateTime, Greeks, OptionRight};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
@@ -15,6 +16,7 @@ pub trait IOptionPriceModel: Send + Sync {
     fn evaluate(
         &self,
         contract: &OptionContract,
+        valuation_time: DateTime,
         risk_free_rate: f64,
         dividend_yield: f64,
     ) -> OptionPriceModelResult;
@@ -24,7 +26,13 @@ pub trait IOptionPriceModel: Send + Sync {
 pub struct CurrentPricePriceModel;
 
 impl IOptionPriceModel for CurrentPricePriceModel {
-    fn evaluate(&self, contract: &OptionContract, _rf: f64, _dy: f64) -> OptionPriceModelResult {
+    fn evaluate(
+        &self,
+        contract: &OptionContract,
+        _valuation_time: DateTime,
+        _rf: f64,
+        _dy: f64,
+    ) -> OptionPriceModelResult {
         OptionPriceModelResult {
             theoretical_price: contract.mid_price(),
             ..Default::default()
@@ -39,13 +47,13 @@ impl IOptionPriceModel for BlackScholesPriceModel {
     fn evaluate(
         &self,
         contract: &OptionContract,
+        valuation_time: DateTime,
         risk_free_rate: f64,
         dividend_yield: f64,
     ) -> OptionPriceModelResult {
         let s = contract.data.underlying_last_price.to_f64().unwrap_or(0.0);
         let k = contract.strike.to_f64().unwrap_or(0.0);
-        let today = chrono::Utc::now().date_naive();
-        let t = (contract.expiry - today).num_days() as f64 / 365.0;
+        let t = time_to_expiry_years(contract.expiry, valuation_time);
         let r = risk_free_rate;
         let q = dividend_yield;
         let sigma = contract.data.implied_volatility.to_f64().unwrap_or(0.20);
@@ -119,6 +127,73 @@ impl IOptionPriceModel for BlackScholesPriceModel {
     }
 }
 
+pub fn time_to_expiry_years(expiry: NaiveDate, valuation_time: DateTime) -> f64 {
+    let expiry_local = expiry.and_hms_opt(16, 0, 0).unwrap();
+    let expiry_dt = match tz::NEW_YORK.from_local_datetime(&expiry_local) {
+        chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
+        chrono::LocalResult::Ambiguous(dt, _) => dt.with_timezone(&Utc),
+        chrono::LocalResult::None => return 0.0,
+    };
+
+    let Ok(duration) = (expiry_dt - valuation_time.to_utc()).to_std() else {
+        return 0.0;
+    };
+
+    duration.as_secs_f64() / (365.0 * 24.0 * 60.0 * 60.0)
+}
+
+pub fn infer_implied_volatility(
+    contract: &OptionContract,
+    valuation_time: DateTime,
+    risk_free_rate: f64,
+    dividend_yield: f64,
+) -> Option<Decimal> {
+    let market_price = contract.mid_price().to_f64().unwrap_or(0.0);
+    let s = contract.data.underlying_last_price.to_f64().unwrap_or(0.0);
+    let k = contract.strike.to_f64().unwrap_or(0.0);
+    let t = time_to_expiry_years(contract.expiry, valuation_time);
+
+    if market_price <= 0.0 || s <= 0.0 || k <= 0.0 || t <= 0.0 {
+        return None;
+    }
+
+    let sigma = implied_volatility(
+        market_price,
+        s,
+        k,
+        t,
+        risk_free_rate,
+        dividend_yield,
+        contract.right,
+    );
+
+    if sigma.is_finite() && sigma > 0.0 {
+        Decimal::from_f64(sigma)
+    } else {
+        None
+    }
+}
+
+pub fn evaluate_contract_with_market_iv<M: IOptionPriceModel>(
+    price_model: &M,
+    contract: &mut OptionContract,
+    valuation_time: DateTime,
+    risk_free_rate: f64,
+    dividend_yield: f64,
+) -> OptionPriceModelResult {
+    if let Some(iv) =
+        infer_implied_volatility(contract, valuation_time, risk_free_rate, dividend_yield)
+    {
+        contract.data.implied_volatility = iv;
+    }
+
+    let result = price_model.evaluate(contract, valuation_time, risk_free_rate, dividend_yield);
+    contract.data.theoretical_price = result.theoretical_price;
+    contract.data.implied_volatility = result.implied_volatility;
+    contract.data.greeks = result.greeks.clone();
+    result
+}
+
 /// Compute IV from market price using Newton-Raphson bisection.
 pub fn implied_volatility(
     market_price: f64,
@@ -161,19 +236,75 @@ fn bs_price(s: f64, k: f64, t: f64, r: f64, q: f64, sigma: f64, is_call: bool) -
 }
 
 fn norm_cdf(x: f64) -> f64 {
-    let a = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * a);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    let cdf = 1.0 - poly * (-a * a).exp();
-    if x >= 0.0 {
-        cdf
-    } else {
-        1.0 - cdf
-    }
+    let z = x.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * z);
+    let poly = (((((1.061405429 * t) - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+        + 0.254829592)
+        * t;
+    let erf = 1.0 - poly * (-z * z).exp();
+    let signed_erf = if x >= 0.0 { erf } else { -erf };
+    0.5 * (1.0 + signed_erf)
 }
 
 fn norm_pdf(x: f64) -> f64 {
     (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_core::{Market, OptionStyle, Symbol, SymbolOptionsExt};
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn black_scholes_uses_supplied_backtest_time() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let expiry = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let symbol = Symbol::create_option_osi(
+            underlying,
+            dec!(100),
+            expiry,
+            OptionRight::Call,
+            OptionStyle::American,
+            &market,
+        );
+
+        let mut contract = OptionContract::new(symbol);
+        contract.data.underlying_last_price = dec!(100);
+        contract.data.bid_price = dec!(2.40);
+        contract.data.ask_price = dec!(2.60);
+
+        let valuation_time = DateTime::from(
+            Utc.with_ymd_and_hms(2024, 1, 18, 19, 0, 0)
+                .single()
+                .unwrap(),
+        );
+
+        let model = BlackScholesPriceModel;
+        let result =
+            evaluate_contract_with_market_iv(&model, &mut contract, valuation_time, 0.0, 0.0);
+
+        assert!(result.implied_volatility > Decimal::ZERO);
+        assert!(result.theoretical_price > Decimal::ZERO);
+        assert!(result.greeks.delta > Decimal::ZERO);
+        assert!(result.greeks.gamma > Decimal::ZERO);
+    }
+
+    #[test]
+    fn time_to_expiry_keeps_intraday_value_on_expiry_date() {
+        let expiry = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let valuation_time = DateTime::from(
+            Utc.with_ymd_and_hms(2024, 1, 19, 17, 0, 0)
+                .single()
+                .unwrap(),
+        );
+
+        assert!(time_to_expiry_years(expiry, valuation_time) > 0.0);
+    }
+
+    #[test]
+    fn norm_cdf_is_centered_at_half() {
+        assert!((norm_cdf(0.0) - 0.5).abs() < 1e-9);
+    }
 }

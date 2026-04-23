@@ -265,6 +265,18 @@ impl PyOrderEvent {
         self.trailing_as_percentage
     }
 
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'OrderEvent' object has no attribute '{name}'"
+        )))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "OrderEvent(id={}, {} {} qty={:.0} @ {:.2} [{:?}])",
@@ -375,5 +387,33 @@ mod tests {
             (py_ev.absolute_fill_quantity() - 5.0).abs() < 1e-9,
             "absolute_fill_quantity must be positive for sell orders"
         );
+    }
+
+    /// C# LEAN PascalCase names must map to snake_case via pascal_to_snake —
+    /// this is what __getattr__ uses at runtime.
+    #[test]
+    fn test_order_event_pascal_names_convert_to_snake() {
+        use crate::py_qc_algorithm::pascal_to_snake;
+        let cases = [
+            ("FillPrice", "fill_price"),
+            ("FillQuantity", "fill_quantity"),
+            ("AbsoluteFillQuantity", "absolute_fill_quantity"),
+            ("OrderId", "order_id"),
+            ("Symbol", "symbol"),
+            ("UtcTime", "utc_time"),
+            ("Status", "status"),
+            ("Direction", "direction"),
+            ("Message", "message"),
+            ("IsAssignment", "is_assignment"),
+            ("IsFill", "is_fill"),
+            ("OrderFee", "order_fee"),
+            ("FillPriceCurrency", "fill_price_currency"),
+        ];
+        for (pascal, snake) in &cases {
+            assert_eq!(
+                pascal_to_snake(pascal), *snake,
+                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+            );
+        }
     }
 }

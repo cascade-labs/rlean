@@ -1,4 +1,4 @@
-use lean_core::{Market, NanosecondTimestamp, Resolution, Symbol, TimeSpan};
+use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
 use lean_data::{TradeBar, TradeBarData};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -109,30 +109,4 @@ fn merge_combines_two_bars() {
     assert_eq!(bar1.close, dec!(115)); // takes last close
     assert_eq!(bar1.volume, dec!(3000));
     assert_eq!(bar1.end_time, bar2.end_time);
-}
-
-#[test]
-fn from_lean_csv_line_parses_correctly() {
-    // LEAN daily format: ms_since_midnight,open*10000,high*10000,low*10000,close*10000,volume
-    let line = "34200000,4100000,4150000,4050000,4120000,5000000";
-    let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-    let bar = TradeBar::from_lean_csv_line(line, spy(), date, Resolution::Daily);
-    let bar = bar.expect("parse failed");
-
-    assert_eq!(bar.open, dec!(410));
-    assert_eq!(bar.high, dec!(415));
-    assert_eq!(bar.low, dec!(405));
-    assert_eq!(bar.close, dec!(412));
-    assert_eq!(bar.volume, dec!(5000000));
-}
-
-#[test]
-fn from_lean_csv_line_returns_none_for_bad_input() {
-    let bar = TradeBar::from_lean_csv_line(
-        "bad,data",
-        spy(),
-        chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
-        Resolution::Daily,
-    );
-    assert!(bar.is_none());
 }

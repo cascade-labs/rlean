@@ -1,7 +1,8 @@
 use crate::charting::ChartCollection;
-use crate::py_data::{PySlice, SliceProxy};
+use crate::py_data::{PySlice, PyTradeBar, SliceProxy};
+use crate::py_framework::FrameworkState;
 use crate::py_orders::PyOrderEvent;
-use crate::py_qc_algorithm::PyQcAlgorithm;
+use crate::py_qc_algorithm::{IndicatorRegistry, PyQcAlgorithm};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
@@ -11,7 +12,7 @@ use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
 
 /// Bridges a Python strategy object to the Rust `IAlgorithm` trait.
-/// Holds both the Python object (for calling `on_data` etc.) and
+/// Holds both the Python object (for calling `OnData` etc.) and
 /// the shared QcAlgorithm state (for reading dates, portfolio, etc.).
 pub struct PyAlgorithmAdapter {
     /// The Python strategy instance (subclass of QcAlgorithm).
@@ -20,39 +21,58 @@ pub struct PyAlgorithmAdapter {
     pub inner: Arc<Mutex<QcAlgorithm>>,
     /// Shared chart collection — populated by the Python strategy via self.plot().
     pub charts: Arc<Mutex<ChartCollection>>,
-    /// Cached after initialize().
+    /// Algorithm Framework models — shared with PyQcAlgorithm so that
+    /// models registered in Initialize() are visible to the runner.
+    pub framework: Arc<Mutex<FrameworkState>>,
+    /// Indicator registry — auto-updated before every OnData call.
+    pub indicators: Arc<Mutex<IndicatorRegistry>>,
+    /// Cached after Initialize().
     pub name: String,
 }
 
 impl PyAlgorithmAdapter {
-    /// Hot-path `on_data` using a pre-allocated `SliceProxy`.
+    /// Hot-path `OnData` using a pre-allocated `SliceProxy`.
     ///
     /// Updates the proxy's bar objects in-place (zero allocation), then calls
-    /// Python's `on_data` with the same stable Python object as every other day.
+    /// Python's `OnData` with the same stable Python object as every other day.
     /// Must be called with the GIL already held via `Python::with_gil`.
     pub fn on_data_proxy(&mut self, py: Python<'_>, proxy: &SliceProxy, slice: &Slice) {
         proxy.update(py, slice);
-        if let Err(e) = self
-            .py_obj
-            .call_method1(py, "on_data", (proxy.py_slice.bind(py),))
-        {
+        self.update_indicators(py, slice);
+        if let Err(e) = self.py_obj.call_method1(py, "OnData", (proxy.py_slice.bind(py),)) {
             e.print(py);
+        }
+    }
+
+    /// Update all registered indicators with bars from the current slice.
+    fn update_indicators(&self, py: Python<'_>, slice: &Slice) {
+        let registry = self.indicators.lock().unwrap();
+        for (sid, indicator) in &registry.entries {
+            if let Some(bar) = slice.bars.get(sid) {
+                let py_bar = PyTradeBar::from(bar);
+                if let Ok(py_bar_obj) = pyo3::Py::new(py, py_bar) {
+                    let _ = indicator.call_method1(py, "update_bar", (py_bar_obj,));
+                }
+            }
         }
     }
 
     /// Build an adapter from a Python strategy instance.
     /// The instance must be a subclass of `lean_rust.QcAlgorithm`.
     pub fn from_instance(py: Python<'_>, instance: Py<PyAny>) -> PyResult<Self> {
-        // Downcast to PyQcAlgorithm to extract the inner Arc
         let bound = instance.bind(py);
         let qc_ref = bound.downcast::<PyQcAlgorithm>()?;
         let inner = qc_ref.borrow().inner_arc();
         let charts = qc_ref.borrow().charts_arc();
+        let framework = qc_ref.borrow().framework_arc();
+        let indicators = qc_ref.borrow().indicators_arc();
         let name = inner.lock().unwrap().name.clone();
         Ok(PyAlgorithmAdapter {
             py_obj: instance,
             inner,
             charts,
+            framework,
+            indicators,
             name,
         })
     }
@@ -77,65 +97,67 @@ impl IAlgorithm for PyAlgorithmAdapter {
 
     fn initialize(&mut self) -> LeanResult<()> {
         Python::with_gil(|py| {
-            self.py_obj.call_method0(py, "initialize").map_err(|e| {
+            self.py_obj.call_method0(py, "Initialize").map_err(|e| {
                 e.print(py);
-                anyhow::anyhow!("Python initialize() failed")
+                anyhow::anyhow!("Python Initialize() failed")
             })?;
-            // Update cached name in case set_name was called
             self.name = self.inner.lock().unwrap().name.clone();
             Ok(())
         })
     }
 
     fn on_data(&mut self, slice: &Slice) {
-        Python::with_gil(|py| match PySlice::from_slice(py, slice) {
-            Ok(py_slice) => {
-                if let Err(e) = self.py_obj.call_method1(py, "on_data", (py_slice,)) {
-                    e.print(py);
+        Python::with_gil(|py| {
+            self.update_indicators(py, slice);
+            match PySlice::from_slice(py, slice) {
+                Ok(py_slice) => {
+                    if let Err(e) = self.py_obj.call_method1(py, "OnData", (py_slice,)) {
+                        e.print(py);
+                    }
                 }
+                Err(e) => e.print(py),
             }
-            Err(e) => e.print(py),
         });
     }
 
     fn on_order_event(&mut self, event: &OrderEvent) {
         Python::with_gil(|py| {
             let py_event = PyOrderEvent::from(event);
-            if let Err(e) = self.py_obj.call_method1(py, "on_order_event", (py_event,)) {
-                e.print(py);
+            if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (py_event,)) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                    e.print(py);
+                }
             }
         });
     }
 
     fn on_end_of_day(&mut self, _symbol: Option<Symbol>) {
         Python::with_gil(|py| {
-            let _ = self.py_obj.call_method1(py, "on_end_of_day", (py.None(),));
+            lean_call0(py, &self.py_obj, "OnEndOfDay");
         });
     }
 
     fn on_end_of_algorithm(&mut self) {
         Python::with_gil(|py| {
-            if let Err(e) = self.py_obj.call_method0(py, "on_end_of_algorithm") {
-                e.print(py);
-            }
+            lean_call0(py, &self.py_obj, "OnEndOfAlgorithm");
         });
     }
 
     fn on_warmup_finished(&mut self) {
         Python::with_gil(|py| {
-            let _ = self.py_obj.call_method0(py, "on_warmup_finished");
+            lean_call0(py, &self.py_obj, "OnWarmupFinished");
         });
     }
 
     fn on_margin_call(&mut self, _requests: &[Order]) {
         Python::with_gil(|py| {
-            let _ = self.py_obj.call_method0(py, "on_margin_call");
+            lean_call0(py, &self.py_obj, "OnMarginCall");
         });
     }
 
     fn on_securities_changed(&mut self, _changes: &SecurityChanges) {
         Python::with_gil(|py| {
-            let _ = self.py_obj.call_method0(py, "on_securities_changed");
+            lean_call0(py, &self.py_obj, "OnSecuritiesChanged");
         });
     }
 
@@ -149,13 +171,6 @@ impl IAlgorithm for PyAlgorithmAdapter {
 }
 
 impl PyAlgorithmAdapter {
-    /// Notify the Python strategy of an option assignment/expiry event.
-    ///
-    /// LEAN API (OTM expiry): `on_order_event` with fill_price=0 and "OTM." message.
-    ///
-    /// LEAN fires `on_order_event` (not `on_assignment_order_event`) when an option
-    /// expires worthless out-of-the-money.  This method constructs the matching event
-    /// and dispatches to the Python `on_order_event` hook.
     pub fn on_otm_expiry(
         &self,
         contract: lean_options::OptionContract,
@@ -174,17 +189,39 @@ impl PyAlgorithmAdapter {
                 .to_f64()
                 .unwrap_or(0.0),
         );
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            self.py_obj.call_method1(py, "on_order_event", (event,))?;
-            Ok(())
+        Python::with_gil(|py| {
+            if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (event,)) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                    tracing::warn!("OnOrderEvent (OTM expiry) error: {e}");
+                }
+            }
         });
-        if let Err(e) = result {
-            tracing::warn!("on_otm_expiry (on_order_event) error: {e}");
+    }
+
+    pub fn on_delistings(
+        &self,
+        py: Python<'_>,
+        delistings: pyo3::Py<crate::py_data::PyDelistings>,
+    ) {
+        if let Err(e) = self.py_obj.call_method1(py, "OnDelistings", (delistings,)) {
+            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                tracing::warn!("OnDelistings error: {e}");
+            }
         }
     }
 
-    /// LEAN API: `on_assignment_order_event(order_event: OrderEvent)`
-    /// where `order_event.is_assignment` distinguishes assignment vs worthless expiry.
+    pub fn on_symbol_changed_events(
+        &self,
+        py: Python<'_>,
+        events: pyo3::Py<crate::py_data::PySymbolChangedEvents>,
+    ) {
+        if let Err(e) = self.py_obj.call_method1(py, "OnSymbolChangedEvents", (events,)) {
+            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                tracing::warn!("OnSymbolChangedEvents error: {e}");
+            }
+        }
+    }
+
     pub fn on_assignment_order_event(
         &self,
         contract: lean_options::OptionContract,
@@ -198,13 +235,24 @@ impl PyAlgorithmAdapter {
             quantity,
             is_assignment,
         );
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            self.py_obj
-                .call_method1(py, "on_assignment_order_event", (event,))?;
-            Ok(())
+        Python::with_gil(|py| {
+            if let Err(e) = self.py_obj.call_method1(py, "OnAssignmentOrderEvent", (event,)) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                    tracing::warn!("OnAssignmentOrderEvent error: {e}");
+                }
+            }
         });
-        if let Err(e) = result {
-            tracing::warn!("on_assignment_order_event error: {e}");
+    }
+}
+
+// ─── Lifecycle dispatch helpers ───────────────────────────────────────────────
+
+/// Call `method` on `obj`.  AttributeError (method not defined — optional hook)
+/// is silently ignored; other errors are printed.
+fn lean_call0(py: Python<'_>, obj: &Py<PyAny>, method: &str) {
+    if let Err(e) = obj.call_method0(py, method) {
+        if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+            e.print(py);
         }
     }
 }

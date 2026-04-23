@@ -1,7 +1,7 @@
 use lean_core::{Market, Symbol};
 use lean_execution::{
     ExecutionOrderType, ExecutionTarget, IExecutionModel, ImmediateExecutionModel,
-    NullExecutionModel, SecurityData,
+    NullExecutionModel, SecurityData, SpreadExecutionModel, StandardDeviationExecutionModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -425,5 +425,389 @@ mod struct_tests {
 
         assert_eq!(orders.len(), 1);
         assert!(orders[0].limit_price.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpreadExecutionModel tests
+// ---------------------------------------------------------------------------
+// Based on C# SpreadExecutionModelTests:
+// - Orders are not submitted when no targets provided.
+// - Orders are submitted when spread <= acceptingSpreadPercent (bid/ask tight).
+// - Orders are deferred when spread > acceptingSpreadPercent (bid/ask wide).
+// - Pending targets are retried on subsequent execute calls.
+// - on_securities_changed removes pending targets for removed symbols.
+
+mod spread_execution_tests {
+    use super::*;
+
+    fn make_security_with_quotes(
+        ticker: &str,
+        price: f64,
+        bid: f64,
+        ask: f64,
+        current_qty: f64,
+    ) -> SecurityData {
+        SecurityData {
+            symbol: make_symbol(ticker),
+            price: Decimal::try_from(price).unwrap(),
+            bid: Some(Decimal::try_from(bid).unwrap()),
+            ask: Some(Decimal::try_from(ask).unwrap()),
+            volume: None,
+            average_volume: None,
+            daily_std_dev: None,
+            current_quantity: Decimal::try_from(current_qty).unwrap(),
+        }
+    }
+
+    /// No targets → no orders.
+    /// Mirrors: OrdersAreNotSubmittedWhenNoTargetsToExecute
+    #[test]
+    fn no_targets_no_orders() {
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 249.0, 251.0, 0.0)]);
+        let orders = model.execute(&[], &securities);
+        assert!(orders.is_empty(), "Expected no orders for empty targets");
+    }
+
+    /// Tight spread (ask == bid == price) → order submitted.
+    /// Mirrors: OrdersAreSubmittedWhenRequiredForTargetsToExecute (currentPrice=240, expectedOrders=1)
+    #[test]
+    fn tight_spread_submits_order() {
+        // price=250, bid=250, ask=250 → spread = 0/250 = 0% <= 0.5%
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "Tight spread should submit order");
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    /// Wide spread → order deferred (not submitted).
+    /// Mirrors: OrdersAreSubmittedWhenRequiredForTargetsToExecute (currentPrice=250, ask=250*1.1, expectedOrders=0)
+    #[test]
+    fn wide_spread_defers_order() {
+        // price=250, bid=250, ask=275 (10% above) → spread = 25/250 = 10% > 0.5%
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 275.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert!(orders.is_empty(), "Wide spread should defer order, got: {:?}", orders);
+    }
+
+    /// Deferred order retried when spread tightens.
+    #[test]
+    fn wide_spread_then_tight_spread_submits() {
+        let mut model = SpreadExecutionModel::default();
+
+        // First call: wide spread → deferred
+        let wide_sec = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 275.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_orders = model.execute(&targets, &wide_sec);
+        assert!(first_orders.is_empty(), "Should defer on wide spread");
+
+        // Second call: tight spread → order submitted for the pending target
+        let tight_sec = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 249.75, 250.25, 0.0)]);
+        let second_orders = model.execute(&[], &tight_sec); // no new targets, retry pending
+        assert_eq!(second_orders.len(), 1, "Should submit on tight spread");
+        assert_eq!(second_orders[0].quantity, dec!(10));
+    }
+
+    /// Spread exactly at threshold should be accepted (<=).
+    #[test]
+    fn spread_exactly_at_threshold_accepted() {
+        // acceptingSpreadPercent=0.005, price=200, bid=199, ask=200
+        // spread = (200 - 199) / 200 = 0.005 — exactly at threshold
+        let mut model = SpreadExecutionModel::new(dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 200.0, 199.0, 200.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 5.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "Spread exactly at threshold should be accepted");
+    }
+
+    /// Spread just above threshold should be deferred.
+    #[test]
+    fn spread_just_above_threshold_deferred() {
+        // acceptingSpreadPercent=0.005, price=200, bid=198.9, ask=200
+        // spread = 1.1 / 200 = 0.0055 > 0.005
+        let mut model = SpreadExecutionModel::new(dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 200.0, 198.9, 200.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 5.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert!(orders.is_empty(), "Spread just above threshold should be deferred");
+    }
+
+    /// No bid/ask data → execution is allowed (fallback).
+    #[test]
+    fn no_bid_ask_allows_execution() {
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "No bid/ask should fall back to allowing execution");
+    }
+
+    /// Delta ordering: target=100, current=60 → order 40 shares.
+    #[test]
+    fn delta_only_ordered() {
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 60.0)]);
+        let targets = vec![make_target("AAPL", 100.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(40));
+    }
+
+    /// on_securities_changed: removed symbol discards pending order.
+    #[test]
+    fn removed_security_clears_pending() {
+        let mut model = SpreadExecutionModel::default();
+
+        // Queue a pending order by executing with a wide spread
+        let wide_sec = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 275.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+        model.execute(&targets, &wide_sec);
+
+        // Remove the security
+        let removed = vec![make_symbol("AAPL")];
+        model.on_securities_changed(&[], &removed);
+
+        // Now tighten the spread — should produce no order (pending cleared)
+        let tight_sec = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 0.0)]);
+        let orders = model.execute(&[], &tight_sec);
+        assert!(orders.is_empty(), "Pending should be cleared after security removed");
+    }
+
+    /// model.name() returns expected string.
+    #[test]
+    fn model_name_is_correct() {
+        let model = SpreadExecutionModel::default();
+        assert_eq!(model.name(), "SpreadExecutionModel");
+    }
+
+    /// Order tag identifies the model.
+    #[test]
+    fn order_tag_identifies_model() {
+        let mut model = SpreadExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 5.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert!(
+            orders[0].tag.contains("SpreadExecutionModel"),
+            "Tag should identify model, got: {}",
+            orders[0].tag
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StandardDeviationExecutionModel tests
+// ---------------------------------------------------------------------------
+// Based on C# StandardDeviationExecutionModelTests:
+// - Orders are not submitted when no targets provided.
+// - Buy orders submitted when bid < SMA - (deviations * std_dev) (price dipped below mean).
+// - Sell orders submitted when ask > SMA + (deviations * std_dev) (price spiked above mean).
+// - No order when price is within the std dev band.
+// - No daily_std_dev → unconditional execution.
+// - on_securities_changed removes pending targets for removed symbols.
+
+mod standard_deviation_execution_tests {
+    use super::*;
+
+    fn make_security_with_std_dev(
+        ticker: &str,
+        price: f64,
+        bid: f64,
+        ask: f64,
+        daily_std_dev: f64,
+        current_qty: f64,
+    ) -> SecurityData {
+        SecurityData {
+            symbol: make_symbol(ticker),
+            price: Decimal::try_from(price).unwrap(),
+            bid: Some(Decimal::try_from(bid).unwrap()),
+            ask: Some(Decimal::try_from(ask).unwrap()),
+            volume: None,
+            average_volume: None,
+            daily_std_dev: Some(Decimal::try_from(daily_std_dev).unwrap()),
+            current_quantity: Decimal::try_from(current_qty).unwrap(),
+        }
+    }
+
+    /// No targets → no orders.
+    /// Mirrors: OrdersAreNotSubmittedWhenNoTargetsToExecute
+    #[test]
+    fn no_targets_no_orders() {
+        let mut model = StandardDeviationExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 245.0, 255.0, 10.0, 0.0)]);
+        let orders = model.execute(&[], &securities);
+        assert!(orders.is_empty(), "Expected no orders for empty targets");
+    }
+
+    /// Buy: bid well below SMA - N*std_dev → order submitted.
+    /// Scenario mirrors C#: historicalPrices=[270,260,250], currentPrice=240, deviations=1.5
+    /// SMA ≈ 260, STD ≈ 10. Threshold = 260 - 1.5*10 = 245. bid=240 < 245 → buy.
+    #[test]
+    fn buy_order_when_bid_below_lower_band() {
+        // price=260 (proxy SMA), std_dev=10, deviations=1.5 → lower band = 260 - 15 = 245
+        // bid=240 < 245 → execute buy
+        let mut model = StandardDeviationExecutionModel::new(dec!(1.5));
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 260.0, 240.0, 265.0, 10.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "Should submit buy when bid is below lower band");
+        assert!(orders[0].quantity > Decimal::ZERO, "Should be a buy");
+    }
+
+    /// Buy: bid within band → order deferred.
+    /// Mirrors C#: historicalPrices=[250,250,250], currentPrice=250, expectedOrders=0
+    #[test]
+    fn no_buy_order_when_bid_within_band() {
+        // price=250, std_dev=5, deviations=2 → lower band = 250 - 10 = 240
+        // bid=248 > 240 → within band, no order
+        let mut model = StandardDeviationExecutionModel::default(); // deviations=2
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 248.0, 252.0, 5.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert!(orders.is_empty(), "Should not buy when bid is within the band");
+    }
+
+    /// Sell: ask well above SMA + N*std_dev → order submitted.
+    #[test]
+    fn sell_order_when_ask_above_upper_band() {
+        // price=250 (SMA proxy), std_dev=10, deviations=2 → upper band = 250 + 20 = 270
+        // ask=280 > 270 → execute sell
+        let mut model = StandardDeviationExecutionModel::default(); // deviations=2
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 245.0, 280.0, 10.0, 100.0)]);
+        let targets = vec![make_target("AAPL", 0.0)]; // sell all (liquidate)
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "Should submit sell when ask is above upper band");
+        assert!(orders[0].quantity < Decimal::ZERO, "Should be a sell");
+    }
+
+    /// Sell: ask within band → order deferred.
+    #[test]
+    fn no_sell_order_when_ask_within_band() {
+        // price=250, std_dev=10, deviations=2 → upper band = 270
+        // ask=265 < 270 → within band, no order
+        let mut model = StandardDeviationExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 245.0, 265.0, 10.0, 100.0)]);
+        let targets = vec![make_target("AAPL", 0.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert!(orders.is_empty(), "Should not sell when ask is within the band");
+    }
+
+    /// No daily_std_dev data → unconditional execution.
+    #[test]
+    fn no_std_dev_allows_unconditional_execution() {
+        let mut model = StandardDeviationExecutionModel::default();
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1, "No std_dev data should allow unconditional execution");
+    }
+
+    /// Delta ordering: only the unmet quantity is ordered.
+    #[test]
+    fn delta_only_ordered() {
+        // price=250, std_dev=50, deviations=2 → lower band = 250 - 100 = 150
+        // bid=140 < 150 → execute buy for delta
+        let mut model = StandardDeviationExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 140.0, 260.0, 50.0, 60.0)]);
+        let targets = vec![make_target("AAPL", 100.0)]; // need 40 more
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(40));
+    }
+
+    /// Deferred order is retried when price moves into favorable range.
+    #[test]
+    fn deferred_then_favorable_submits() {
+        let mut model = StandardDeviationExecutionModel::new(dec!(2.0));
+
+        // First call: bid within band → defer
+        // price=250, std_dev=10, band=[230,270], bid=245 (within band)
+        let within_sec = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 245.0, 255.0, 10.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_orders = model.execute(&targets, &within_sec);
+        assert!(first_orders.is_empty(), "Should defer when within band");
+
+        // Second call: bid below band → submit
+        // price=250, std_dev=10, lower_band=230, bid=220 → execute
+        let favorable_sec = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 220.0, 255.0, 10.0, 0.0)]);
+        let second_orders = model.execute(&[], &favorable_sec);
+        assert_eq!(second_orders.len(), 1, "Should submit when bid falls below lower band");
+        assert_eq!(second_orders[0].quantity, dec!(10));
+    }
+
+    /// on_securities_changed: removed symbol discards pending order.
+    #[test]
+    fn removed_security_clears_pending() {
+        let mut model = StandardDeviationExecutionModel::default();
+
+        // Queue a pending order (bid within band → deferred)
+        let within_sec = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 248.0, 252.0, 5.0, 0.0)]);
+        model.execute(&[make_target("AAPL", 10.0)], &within_sec);
+
+        // Remove the security
+        model.on_securities_changed(&[], &[make_symbol("AAPL")]);
+
+        // Now provide favorable conditions — should produce no order
+        let favorable_sec = securities_map(vec![make_security_with_std_dev("AAPL", 250.0, 220.0, 255.0, 10.0, 0.0)]);
+        let orders = model.execute(&[], &favorable_sec);
+        assert!(orders.is_empty(), "Pending should be cleared after security removed");
+    }
+
+    /// model.name() returns expected string.
+    #[test]
+    fn model_name_is_correct() {
+        let model = StandardDeviationExecutionModel::default();
+        assert_eq!(model.name(), "StandardDeviationExecutionModel");
+    }
+
+    /// Order tag identifies the model and includes the deviations value.
+    #[test]
+    fn order_tag_identifies_model() {
+        let mut model = StandardDeviationExecutionModel::default();
+        // No std_dev → unconditional execution
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
+        let targets = vec![make_target("AAPL", 5.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert!(
+            orders[0].tag.contains("StandardDeviationExecutionModel"),
+            "Tag should identify model, got: {}",
+            orders[0].tag
+        );
     }
 }

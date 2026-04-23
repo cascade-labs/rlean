@@ -2,6 +2,7 @@ pub mod charting;
 pub mod py_adapter;
 pub mod py_charting;
 pub mod py_data;
+pub mod py_framework;
 pub mod py_indicators;
 pub mod py_options;
 pub mod py_orders;
@@ -15,18 +16,33 @@ pub mod runner;
 use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
-use py_data::{
-    PyBar, PyCustomData, PyCustomDataPoint, PyQuoteBar, PyQuoteBars, PySlice, PyTradeBar,
-    PyTradeBars,
+use py_framework::{
+    PyAccumulativeInsightPcm, PyAlphaModelBase, PyBlackLittermanPcm, PyConfidenceWeightingPcm, PyPortfolioBias,
+    PyConstantAlphaModel, PyEmaCrossAlphaModel, PyEqualWeightingPcm, PyExecutionModelBase,
+    PyHistoricalReturnsAlphaModel, PyImmediateExecutionModel, PyInsight, PyInsightDirection,
+    PyInsightWeightingPcm, PyMacdAlphaModel, PyMaxDrawdownPercentPerSecurity,
+    PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel, PyMaxSharpeRatioPcm,
+    PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm,
+    PyNullExecutionModel, PyNullRiskManagementModel,
+    PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioConstructionModelBase, PyPortfolioTarget,
+    PyRiskManagementModelBase, PyRiskParityPcm, PyRsiAlphaModel, PySpreadExecutionModel,
+    PyStandardDeviationExecutionModel, PyTrailingStopRiskModel, PyVwapExecutionModel,
 };
-use py_indicators::{PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyRsi, PySma};
+use py_data::{
+    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyQuoteBar, PyQuoteBars,
+    PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
+};
+use py_indicators::{
+    PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyMomp, PyRsi, PySma, PyStd,
+};
 use py_orders::PyOrderEvent;
 use py_portfolio::{PyPortfolio, PySecurityHolding};
 use py_qc_algorithm::PyQcAlgorithm;
 use py_quant_book::PyQuantBook;
 use py_types::{
-    PyIndicatorResult, PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry,
-    PySecurityManager, PySymbol,
+    PyAlgorithmSettings, PyDataNormalizationMode, PyIndicatorResult, PyMovingAverageType,
+    PyOptionSecurity,
+    PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol,
 };
 
 // ─── Additional enums matching LEAN's Python API ──────────────────────────────
@@ -107,6 +123,9 @@ pub enum PyOrderDirection {
 pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core types
     m.add_class::<PyResolution>()?;
+    m.add_class::<PyAlgorithmSettings>()?;
+    m.add_class::<PyDataNormalizationMode>()?;
+    m.add_class::<PyMovingAverageType>()?;
     m.add_class::<PySymbol>()?;
     m.add_class::<PySecurity>()?;
     m.add_class::<PySecurityEntry>()?;
@@ -120,9 +139,15 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBar>()?;
     m.add_class::<PyQuoteBar>()?;
     m.add_class::<PyQuoteBars>()?;
+    m.add_class::<PyTick>()?;
+    m.add_class::<PyTicks>()?;
     m.add_class::<PySlice>()?;
     m.add_class::<PyCustomDataPoint>()?;
     m.add_class::<PyCustomData>()?;
+    m.add_class::<PyDelisting>()?;
+    m.add_class::<PyDelistings>()?;
+    m.add_class::<PySymbolChangedEvent>()?;
+    m.add_class::<PySymbolChangedEvents>()?;
 
     // Orders
     m.add_class::<PyOrderEvent>()?;
@@ -156,12 +181,60 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMacd>()?;
     m.add_class::<PyBollingerBands>()?;
     m.add_class::<PyAtr>()?;
+    m.add_class::<PyMomp>()?;
+    m.add_class::<PyStd>()?;
 
     // Additional enums
     m.add_class::<PySecurityType>()?;
     m.add_class::<PyOrderType>()?;
     m.add_class::<PyOrderStatus>()?;
     m.add_class::<PyOrderDirection>()?;
+
+    // ── Insight types ─────────────────────────────────────────────────────────
+    m.add_class::<PyInsightDirection>()?;
+    m.add_class::<PyInsight>()?;
+    m.add_class::<PyPortfolioTarget>()?;
+
+    // ── Algorithm Framework — Base Classes (subclassable) ─────────────────────
+    m.add_class::<PyAlphaModelBase>()?;
+    m.add_class::<PyPortfolioConstructionModelBase>()?;
+    m.add_class::<PyExecutionModelBase>()?;
+    m.add_class::<PyRiskManagementModelBase>()?;
+
+    // ── Algorithm Framework — Alpha Models ────────────────────────────────────
+    m.add_class::<PyConstantAlphaModel>()?;
+    m.add_class::<PyEmaCrossAlphaModel>()?;
+    m.add_class::<PyMacdAlphaModel>()?;
+    m.add_class::<PyRsiAlphaModel>()?;
+    m.add_class::<PyHistoricalReturnsAlphaModel>()?;
+    m.add_class::<PyPearsonCorrelationPairsTradingAlphaModel>()?;
+
+    // ── Algorithm Framework — Portfolio Construction Models ───────────────────
+    m.add_class::<PyPortfolioBias>()?;
+    m.add_class::<PyEqualWeightingPcm>()?;
+    m.add_class::<PyInsightWeightingPcm>()?;
+    m.add_class::<PyMeanVariancePcm>()?;
+    m.add_class::<PyMaxSharpeRatioPcm>()?;
+    m.add_class::<PyBlackLittermanPcm>()?;
+    m.add_class::<PyRiskParityPcm>()?;
+    m.add_class::<PyConfidenceWeightingPcm>()?;
+    m.add_class::<PyAccumulativeInsightPcm>()?;
+    m.add_class::<PyMeanReversionPcm>()?;
+
+    // ── Algorithm Framework — Execution Models ────────────────────────────────
+    m.add_class::<PyImmediateExecutionModel>()?;
+    m.add_class::<PyNullExecutionModel>()?;
+    m.add_class::<PyVwapExecutionModel>()?;
+    m.add_class::<PySpreadExecutionModel>()?;
+    m.add_class::<PyStandardDeviationExecutionModel>()?;
+
+    // ── Algorithm Framework — Risk Management Models ──────────────────────────
+    m.add_class::<PyNullRiskManagementModel>()?;
+    m.add_class::<PyMaxDrawdownPercentPerSecurity>()?;
+    m.add_class::<PyTrailingStopRiskModel>()?;
+    m.add_class::<PyMaxSectorExposureRiskModel>()?;
+    m.add_class::<PyMaxDrawdownPercentPortfolio>()?;
+    m.add_class::<PyMaxUnrealizedProfitPerSecurity>()?;
 
     Ok(())
 }

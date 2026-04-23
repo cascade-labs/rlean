@@ -52,6 +52,75 @@ impl IHistoryProvider for LazyPluginProvider {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_history(request)
     }
+
+    fn get_quote_bars(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_quote_bars(request)
+    }
+
+    fn get_ticks(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_ticks(request)
+    }
+
+    fn get_option_eod_bars(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<lean_storage::OptionEodBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_eod_bars(ticker, date)
+    }
+
+    fn get_option_universe(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<lean_storage::OptionUniverseRow>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_universe(ticker, date)
+    }
+
+    fn get_option_trade_bars(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_trade_bars(ticker, resolution, date)
+    }
+
+    fn get_option_quote_bars(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_quote_bars(ticker, resolution, date)
+    }
+
+    fn get_option_ticks(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_ticks(ticker, date)
+    }
+
+    fn earliest_date(&self) -> Option<chrono::NaiveDate> {
+        self.get()
+            .ok()
+            .and_then(|provider| provider.earliest_date())
+    }
 }
 
 /// Rate-limit settings for the CLI — passed alongside plugin config.
@@ -100,16 +169,31 @@ impl ProviderArgs {
 /// - `"massive"`   — Massive.com historical data (installed plugin)
 /// - `"thetadata"` — ThetaData historical data (installed plugin)
 /// - `"local"` / `""` — local Parquet store only, no network calls
+///
+/// A `LocalHistoryProvider` is always prepended as the highest-priority
+/// provider (unless `local` is already listed first).  This ensures that any
+/// data already cached as Parquet on disk is served immediately without
+/// hitting the network on reruns.
 pub fn build_history_provider(
     names: &str,
     args: ProviderArgs,
 ) -> Result<Arc<dyn IHistoryProvider>> {
     let provider_names: Vec<&str> = names.split(',').map(str::trim).collect();
 
-    let providers: Vec<Arc<dyn IHistoryProvider>> = provider_names
-        .into_iter()
-        .map(|name| build_single_provider(name, &args))
-        .collect::<Result<_>>()?;
+    // Prepend local cache provider unless the user already put "local" first.
+    let has_local_first = matches!(provider_names.first(), Some(&"local") | Some(&""));
+    let mut providers: Vec<Arc<dyn IHistoryProvider>> = if !has_local_first {
+        vec![Arc::new(LocalHistoryProvider::new(&args.data_root))]
+    } else {
+        vec![]
+    };
+
+    providers.extend(
+        provider_names
+            .into_iter()
+            .map(|name| build_single_provider(name, &args))
+            .collect::<Result<Vec<_>>>()?,
+    );
 
     if providers.len() == 1 {
         Ok(providers.into_iter().next().unwrap())

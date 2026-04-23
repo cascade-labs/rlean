@@ -7,7 +7,9 @@
 /// and is returned immediately.
 use std::sync::Arc;
 
-use lean_data::TradeBar;
+use lean_core::Resolution;
+use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_storage::{OptionEodBar, OptionUniverseRow};
 
 use crate::{HistoryRequest, IHistoryProvider};
 
@@ -46,5 +48,114 @@ impl IHistoryProvider for StackedHistoryProvider {
             }
         }
         Ok(vec![])
+    }
+
+    fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
+        for provider in &self.providers {
+            match provider.get_quote_bars(request) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+        for provider in &self.providers {
+            match provider.get_ticks(request) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_option_eod_bars(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionEodBar>> {
+        for provider in &self.providers {
+            match provider.get_option_eod_bars(ticker, date) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_option_universe(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionUniverseRow>> {
+        for provider in &self.providers {
+            match provider.get_option_universe(ticker, date) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_option_trade_bars(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        for provider in &self.providers {
+            match provider.get_option_trade_bars(ticker, resolution, date) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_option_quote_bars(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        for provider in &self.providers {
+            match provider.get_option_quote_bars(ticker, resolution, date) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn get_option_ticks(&self, ticker: &str, date: chrono::NaiveDate) -> anyhow::Result<Vec<Tick>> {
+        for provider in &self.providers {
+            match provider.get_option_ticks(ticker, date) {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn earliest_date(&self) -> Option<chrono::NaiveDate> {
+        self.providers
+            .iter()
+            .filter_map(|p| p.earliest_date())
+            .min()
     }
 }

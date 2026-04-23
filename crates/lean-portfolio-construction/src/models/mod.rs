@@ -1,6 +1,12 @@
+pub mod accumulative_insight;
+pub mod black_litterman;
+pub mod confidence_weighting;
 pub mod equal_weighting;
 pub mod insight_weighting;
+pub mod matrix;
 pub mod maximum_sharpe_ratio;
+pub mod mean_reversion;
 pub mod mean_variance;
 pub mod null_pcm;
+pub mod risk_parity;
 pub mod sector_weighting;

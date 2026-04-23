@@ -186,6 +186,15 @@ async fn main() -> Result<()> {
 // ── Backtest ──────────────────────────────────────────────────────────────────
 
 async fn run_backtest(mut args: RunArgs) -> Result<()> {
+    // Apply global config data-folder when --data was not explicitly provided.
+    if args.data == PathBuf::from("data") {
+        if let Ok(cfg) = config::GlobalConfig::load() {
+            if let Some(folder) = cfg.data_folder {
+                args.data = PathBuf::from(folder);
+            }
+        }
+    }
+
     // If the user passed a directory, look for main.py inside it.
     if args.strategy.is_dir() {
         let candidate = args.strategy.join("main.py");
@@ -262,6 +271,22 @@ async fn run_python_backtest(
         backtests_root.join(backtest_dir_name(now, &name))
     };
     std::fs::create_dir_all(&backtest_dir)?;
+
+    // Snapshot the strategy source file into the backtest directory so there is
+    // a permanent record of the exact code that produced this backtest.
+    let code_dir = backtest_dir.join("code");
+    if let Err(e) = std::fs::create_dir_all(&code_dir) {
+        eprintln!("Warning: could not create code snapshot dir: {e}");
+    } else {
+        let dest = code_dir.join(
+            args.strategy
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("main.py")),
+        );
+        if let Err(e) = std::fs::copy(&args.strategy, &dest) {
+            eprintln!("Warning: could not snapshot strategy code: {e}");
+        }
+    }
 
     // Auto-load custom data source plugins from ~/.rlean/plugins/.
     let custom_data_sources = crate::providers::load_custom_data_plugins();

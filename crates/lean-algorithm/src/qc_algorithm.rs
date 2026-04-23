@@ -17,6 +17,7 @@ use lean_orders::{
     transaction_manager::TransactionManager,
     LimitIfTouchedOrder, TrailingStopOrder,
 };
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -73,8 +74,6 @@ pub struct QcAlgorithm {
     order_id_counter: i64,
 
     // Option tracking
-    /// Open option positions keyed by symbol SID.
-    pub option_positions: HashMap<u64, OpenOptionPosition>,
     /// Canonical option symbols (e.g. `?SPY`) for chain subscriptions.
     pub option_subscriptions: Vec<Symbol>,
     /// Specific option contracts that have been subscribed to.
@@ -110,7 +109,6 @@ impl QcAlgorithm {
             warmup_duration: None,
             is_warming_up: false,
             order_id_counter: 0,
-            option_positions: HashMap::new(),
             option_subscriptions: Vec::new(),
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
@@ -184,6 +182,12 @@ impl QcAlgorithm {
     pub fn add_equity(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
         let market = Market::usa();
         let symbol = Symbol::create_equity(ticker, &market);
+        // Idempotent: if the security already exists (e.g. called again during
+        // universe rebalancing), keep it as-is so the runner-updated price is
+        // not reset to zero.
+        if self.securities.contains(&symbol) {
+            return symbol;
+        }
         let config = SubscriptionDataConfig::new_equity(symbol.clone(), resolution);
         self.subscription_manager.add(config);
         let hours = ExchangeHours::us_equity();
@@ -559,8 +563,31 @@ impl QcAlgorithm {
                 self.add_equity(&u.permtick, resolution);
             }
         }
+        self.ensure_option_security(&symbol, resolution);
         self.open_option_contracts.push(symbol.clone());
         symbol
+    }
+
+    fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
+        if self.securities.contains(symbol) {
+            return;
+        }
+        let hours = ExchangeHours::us_equity();
+        let mut props = SymbolProperties::default();
+        props.contract_multiplier = 100.0;
+        self.securities.add(crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+        ));
+    }
+
+    fn option_contract_multiplier(&self, symbol: &Symbol) -> Decimal {
+        self.securities
+            .get(symbol)
+            .and_then(|sec| Decimal::from_f64_retain(sec.symbol_properties.contract_multiplier))
+            .unwrap_or(dec!(100))
     }
 
     /// Sell to open: short an option contract (collect premium).
@@ -572,25 +599,16 @@ impl QcAlgorithm {
         quantity: Decimal,
         premium_per_contract: Decimal,
     ) -> i64 {
-        let total_premium = premium_per_contract * quantity * Decimal::from(100i64);
-        *self.portfolio.cash.write() += total_premium;
-
-        if let Some(option_id) = symbol.option_symbol_id() {
-            self.option_positions.insert(
-                symbol.id.sid,
-                OpenOptionPosition {
-                    symbol: symbol.clone(),
-                    strike: option_id.strike,
-                    expiry: option_id.expiry,
-                    right: option_id.right,
-                    style: option_id.style,
-                    settlement: SettlementType::PhysicalDelivery,
-                    quantity: -quantity, // negative = short
-                    entry_price: premium_per_contract,
-                    contract_unit_of_trade: 100,
-                },
-            );
-        }
+        self.ensure_option_security(&symbol, Resolution::Minute);
+        let multiplier = self.option_contract_multiplier(&symbol);
+        let total_premium = premium_per_contract * quantity * multiplier;
+        self.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            premium_per_contract,
+            -quantity,
+            dec!(0),
+            multiplier,
+        );
 
         let order_id = self.next_order_id();
         tracing::info!(
@@ -612,25 +630,16 @@ impl QcAlgorithm {
         quantity: Decimal,
         premium_per_contract: Decimal,
     ) -> i64 {
-        let total_cost = premium_per_contract * quantity * Decimal::from(100i64);
-        *self.portfolio.cash.write() -= total_cost;
-
-        if let Some(option_id) = symbol.option_symbol_id() {
-            self.option_positions.insert(
-                symbol.id.sid,
-                OpenOptionPosition {
-                    symbol: symbol.clone(),
-                    strike: option_id.strike,
-                    expiry: option_id.expiry,
-                    right: option_id.right,
-                    style: option_id.style,
-                    settlement: SettlementType::PhysicalDelivery,
-                    quantity, // positive = long
-                    entry_price: premium_per_contract,
-                    contract_unit_of_trade: 100,
-                },
-            );
-        }
+        self.ensure_option_security(&symbol, Resolution::Minute);
+        let multiplier = self.option_contract_multiplier(&symbol);
+        let total_cost = premium_per_contract * quantity * multiplier;
+        self.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            premium_per_contract,
+            quantity,
+            dec!(0),
+            multiplier,
+        );
 
         let order_id = self.next_order_id();
         tracing::info!(
@@ -652,9 +661,15 @@ impl QcAlgorithm {
         quantity: Decimal,
         premium_per_contract: Decimal,
     ) -> i64 {
-        let total_cost = premium_per_contract * quantity * Decimal::from(100i64);
-        *self.portfolio.cash.write() -= total_cost;
-        self.option_positions.remove(&symbol.id.sid);
+        self.ensure_option_security(&symbol, Resolution::Minute);
+        let multiplier = self.option_contract_multiplier(&symbol);
+        self.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            premium_per_contract,
+            quantity,
+            dec!(0),
+            multiplier,
+        );
         let order_id = self.next_order_id();
         tracing::info!(
             "BUY TO CLOSE {} x{} @ {}",
@@ -674,9 +689,15 @@ impl QcAlgorithm {
         quantity: Decimal,
         premium_per_contract: Decimal,
     ) -> i64 {
-        let total_premium = premium_per_contract * quantity * Decimal::from(100i64);
-        *self.portfolio.cash.write() += total_premium;
-        self.option_positions.remove(&symbol.id.sid);
+        self.ensure_option_security(&symbol, Resolution::Minute);
+        let multiplier = self.option_contract_multiplier(&symbol);
+        self.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            premium_per_contract,
+            -quantity,
+            dec!(0),
+            multiplier,
+        );
         let order_id = self.next_order_id();
         tracing::info!(
             "SELL TO CLOSE {} x{} @ {}",
@@ -688,8 +709,30 @@ impl QcAlgorithm {
     }
 
     /// Returns all currently open option positions.
-    pub fn get_option_positions(&self) -> Vec<&OpenOptionPosition> {
-        self.option_positions.values().collect()
+    pub fn get_option_positions(&self) -> Vec<OpenOptionPosition> {
+        self.portfolio
+            .all_holdings()
+            .into_iter()
+            .filter(|holding| holding.is_invested() && holding.symbol.option_symbol_id().is_some())
+            .filter_map(|holding| {
+                let option_id = holding.symbol.option_symbol_id()?;
+                Some(OpenOptionPosition {
+                    symbol: holding.symbol,
+                    strike: option_id.strike,
+                    expiry: option_id.expiry,
+                    right: option_id.right,
+                    style: option_id.style,
+                    settlement: SettlementType::PhysicalDelivery,
+                    quantity: holding.quantity,
+                    entry_price: holding.average_price,
+                    contract_unit_of_trade: holding
+                        .contract_multiplier
+                        .trunc()
+                        .to_i64()
+                        .unwrap_or(100),
+                })
+            })
+            .collect()
     }
 
     /// Returns the most recently generated option chain for a canonical ticker.
