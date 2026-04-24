@@ -74,8 +74,14 @@ fn warm_up_model(
 /// With insufficient price history the model should return empty targets.
 #[test]
 fn returns_empty_when_not_enough_history() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 63, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        63,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     let spy = make_equity("SPY");
     let insights = vec![make_insight(spy.clone(), InsightDirection::Up, 0.05)];
@@ -92,8 +98,14 @@ fn returns_empty_when_not_enough_history() {
 /// With a single bullish view, the model should return a positive (long) weight.
 #[test]
 fn bullish_view_produces_positive_weight() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     let spy = make_equity("SPY");
     let agg = make_equity("AGG");
@@ -110,7 +122,10 @@ fn bullish_view_produces_positive_weight() {
     ];
 
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
-    assert!(!targets.is_empty(), "Should produce targets with sufficient history");
+    assert!(
+        !targets.is_empty(),
+        "Should produce targets with sufficient history"
+    );
 
     let spy_target = targets.iter().find(|t| t.symbol.value == "SPY");
     assert!(spy_target.is_some(), "SPY should have a target");
@@ -127,8 +142,14 @@ fn bullish_view_produces_positive_weight() {
 /// Long-only bias: all weights should be non-negative.
 #[test]
 fn long_only_bias_produces_non_negative_weights() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::Long);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::Long,
+    );
 
     warm_up_model(&mut model, &["SPY", "IEF", "GLD"], 50);
 
@@ -170,8 +191,14 @@ fn model_name_matches_lean() {
 /// incorporated and targets are produced for both assets.
 #[test]
 fn multiple_source_models_produce_targets_for_each() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     warm_up_model(&mut model, &["SPY", "TLT"], 50);
 
@@ -199,11 +226,7 @@ fn multiple_source_models_produce_targets_for_each() {
     ];
 
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
-    assert_eq!(
-        targets.len(),
-        2,
-        "Should produce a target for each insight"
-    );
+    assert_eq!(targets.len(), 2, "Should produce a target for each insight");
 }
 
 /// Empty insights always produce empty targets (no panic).
@@ -251,13 +274,13 @@ mod matrix_tests {
         ];
         let inv = mat_inv(&a).unwrap();
         let prod = mat_mul(&a, &inv);
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, row) in prod.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
-                    (prod[i][j] - expected).abs() < 1e-8,
+                    (val - expected).abs() < 1e-8,
                     "A*A⁻¹[{i}][{j}] = {} ≠ {expected}",
-                    prod[i][j]
+                    val
                 );
             }
         }
@@ -285,14 +308,14 @@ mod matrix_tests {
         ];
         let cov = covariance_matrix(&returns);
         // Must be symmetric
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!((cov[i][j] - cov[j][i]).abs() < 1e-14);
+        for (i, row) in cov.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!((val - cov[j][i]).abs() < 1e-14);
             }
         }
         // Diagonal must be non-negative
-        for i in 0..3 {
-            assert!(cov[i][i] >= 0.0);
+        for (i, row) in cov.iter().enumerate() {
+            assert!(row[i] >= 0.0);
         }
     }
 
@@ -309,7 +332,7 @@ mod matrix_tests {
         let pi = vec![0.05, 0.03];
         let sigma = vec![vec![0.04, 0.01], vec![0.01, 0.02]];
         let p = vec![vec![1.0, 0.0]];
-        let q = vec![0.08];
+        let q = [0.08];
         let tau = 0.05;
 
         // τΣ
@@ -331,7 +354,7 @@ mod matrix_tests {
         let p_pi = mat_vec_mul(&p, &pi);
         let diff = vec![q[0] - p_pi[0]];
         let correction = mat_vec_mul(&a, &diff);
-        let pi_post = vec![pi[0] + correction[0], pi[1] + correction[1]];
+        let pi_post = [pi[0] + correction[0], pi[1] + correction[1]];
 
         // The view says asset 1 should return 8% vs prior 5%
         // Posterior should be between 5% and 8%.

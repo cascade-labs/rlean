@@ -16,21 +16,21 @@ pub mod runner;
 use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
+use py_data::{
+    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyQuoteBar, PyQuoteBars,
+    PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
+};
 use py_framework::{
-    PyAccumulativeInsightPcm, PyAlphaModelBase, PyBlackLittermanPcm, PyConfidenceWeightingPcm, PyPortfolioBias,
+    PyAccumulativeInsightPcm, PyAlphaModelBase, PyBlackLittermanPcm, PyConfidenceWeightingPcm,
     PyConstantAlphaModel, PyEmaCrossAlphaModel, PyEqualWeightingPcm, PyExecutionModelBase,
     PyHistoricalReturnsAlphaModel, PyImmediateExecutionModel, PyInsight, PyInsightDirection,
     PyInsightWeightingPcm, PyMacdAlphaModel, PyMaxDrawdownPercentPerSecurity,
     PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel, PyMaxSharpeRatioPcm,
-    PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm,
-    PyNullExecutionModel, PyNullRiskManagementModel,
-    PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioConstructionModelBase, PyPortfolioTarget,
-    PyRiskManagementModelBase, PyRiskParityPcm, PyRsiAlphaModel, PySpreadExecutionModel,
-    PyStandardDeviationExecutionModel, PyTrailingStopRiskModel, PyVwapExecutionModel,
-};
-use py_data::{
-    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyQuoteBar, PyQuoteBars,
-    PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
+    PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm, PyNullExecutionModel,
+    PyNullRiskManagementModel, PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias,
+    PyPortfolioConstructionModelBase, PyPortfolioTarget, PyRiskManagementModelBase,
+    PyRiskParityPcm, PyRsiAlphaModel, PySpreadExecutionModel, PyStandardDeviationExecutionModel,
+    PyTrailingStopRiskModel, PyVwapExecutionModel,
 };
 use py_indicators::{
     PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyMomp, PyRsi, PySma, PyStd,
@@ -41,8 +41,7 @@ use py_qc_algorithm::PyQcAlgorithm;
 use py_quant_book::PyQuantBook;
 use py_types::{
     PyAlgorithmSettings, PyDataNormalizationMode, PyIndicatorResult, PyMovingAverageType,
-    PyOptionSecurity,
-    PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol,
+    PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol,
 };
 
 // ─── Additional enums matching LEAN's Python API ──────────────────────────────
@@ -104,7 +103,7 @@ pub enum PyOrderDirection {
 /// The `AlgorithmImports` Python module — importable as `from AlgorithmImports import *`.
 ///
 /// Register before starting the interpreter:
-/// ```rust
+/// ```rust,ignore
 /// pyo3::append_to_inittab!(AlgorithmImports);
 /// pyo3::prepare_freethreaded_python();
 /// ```

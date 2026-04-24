@@ -39,7 +39,10 @@ impl PyAlgorithmAdapter {
     pub fn on_data_proxy(&mut self, py: Python<'_>, proxy: &SliceProxy, slice: &Slice) {
         proxy.update(py, slice);
         self.update_indicators(py, slice);
-        if let Err(e) = self.py_obj.call_method1(py, "OnData", (proxy.py_slice.bind(py),)) {
+        if let Err(e) = self
+            .py_obj
+            .call_method1(py, "OnData", (proxy.py_slice.bind(py),))
+        {
             e.print(py);
         }
     }
@@ -215,7 +218,10 @@ impl PyAlgorithmAdapter {
         py: Python<'_>,
         events: pyo3::Py<crate::py_data::PySymbolChangedEvents>,
     ) {
-        if let Err(e) = self.py_obj.call_method1(py, "OnSymbolChangedEvents", (events,)) {
+        if let Err(e) = self
+            .py_obj
+            .call_method1(py, "OnSymbolChangedEvents", (events,))
+        {
             if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
                 tracing::warn!("OnSymbolChangedEvents error: {e}");
             }
@@ -236,7 +242,10 @@ impl PyAlgorithmAdapter {
             is_assignment,
         );
         Python::with_gil(|py| {
-            if let Err(e) = self.py_obj.call_method1(py, "OnAssignmentOrderEvent", (event,)) {
+            if let Err(e) = self
+                .py_obj
+                .call_method1(py, "OnAssignmentOrderEvent", (event,))
+            {
                 if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
                     tracing::warn!("OnAssignmentOrderEvent error: {e}");
                 }

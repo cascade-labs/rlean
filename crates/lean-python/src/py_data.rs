@@ -2,8 +2,10 @@ use crate::py_options::{PyOptionChain, PyOptionChains};
 use crate::py_types::{PySecurity, PySymbol};
 use lean_core::TickType;
 use lean_data::QuoteBar;
-use lean_data::{CustomDataPoint, Delisting, DelistingType, Slice, SubscriptionDataConfig,
-    SymbolChangedEvent, Tick, TradeBar};
+use lean_data::{
+    CustomDataPoint, Delisting, DelistingType, Slice, SubscriptionDataConfig, SymbolChangedEvent,
+    Tick, TradeBar,
+};
 use lean_options::OptionChain;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
@@ -620,11 +622,7 @@ impl PyDelistings {
 
 #[pymethods]
 impl PyDelistings {
-    fn get(
-        &self,
-        py: Python<'_>,
-        symbol: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<Py<PyDelisting>>> {
+    fn get(&self, py: Python<'_>, symbol: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyDelisting>>> {
         Ok(self
             .resolve_sid(symbol)?
             .and_then(|sid| self.events.get(&sid).map(|e| e.clone_ref(py))))
@@ -1462,7 +1460,10 @@ mod tests {
     #[test]
     fn tradebar_value_equals_close() {
         let bar = make_trade_bar();
-        assert!((bar.value() - bar.close).abs() < 1e-9, "bar.value must equal bar.close");
+        assert!(
+            (bar.value() - bar.close).abs() < 1e-9,
+            "bar.value must equal bar.close"
+        );
     }
 
     /// All TradeBar PascalCase names must convert to valid snake_case properties
@@ -1481,8 +1482,11 @@ mod tests {
             ("Value", "value"),
         ] {
             assert_eq!(
-                pascal_to_snake(pascal), *snake,
-                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+                pascal_to_snake(pascal),
+                *snake,
+                "PascalCase '{}' should map to snake_case '{}'",
+                pascal,
+                snake
             );
         }
     }
@@ -1506,8 +1510,11 @@ mod tests {
             ("FillPriceCurrency", "fill_price_currency"),
         ] {
             assert_eq!(
-                pascal_to_snake(pascal), *snake,
-                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+                pascal_to_snake(pascal),
+                *snake,
+                "PascalCase '{}' should map to snake_case '{}'",
+                pascal,
+                snake
             );
         }
     }
@@ -1531,8 +1538,11 @@ mod tests {
             ("TheoreticalPrice", "theoretical_price"),
         ] {
             assert_eq!(
-                pascal_to_snake(pascal), *snake,
-                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+                pascal_to_snake(pascal),
+                *snake,
+                "PascalCase '{}' should map to snake_case '{}'",
+                pascal,
+                snake
             );
         }
     }

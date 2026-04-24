@@ -74,7 +74,11 @@ pub fn risk_parity_optimize(
 
     // Hessian: H(x) = Σ + diag(b/x²)
     let hessian = |x: &[f64]| -> Vec<Vec<f64>> {
-        let diag_vec: Vec<f64> = b.iter().zip(x.iter()).map(|(bi, xi)| bi / (xi * xi)).collect();
+        let diag_vec: Vec<f64> = b
+            .iter()
+            .zip(x.iter())
+            .map(|(bi, xi)| bi / (xi * xi))
+            .collect();
         let d = diag(&diag_vec);
         mat_add(cov, &d)
     };
@@ -310,7 +314,10 @@ impl IPortfolioConstructionModel for RiskParityPortfolioConstructionModel {
                 let idx = tickers.iter().position(|t| *t == insight.symbol.value)?;
                 let w = weights.get(idx).copied().unwrap_or(0.0);
                 let pct = Decimal::try_from(w).ok()?;
-                let price = prices.get(&insight.symbol.value).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.value)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 Some(PortfolioTarget::percent(
                     insight.symbol.clone(),
                     pct,

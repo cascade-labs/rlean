@@ -1,12 +1,12 @@
-/// Minimal dense matrix math using Vec<Vec<f64>> (row-major).
-/// All matrices are represented as Vec<Vec<f64>> where mat[i] is row i.
-/// Used internally by Black-Litterman and Risk-Parity implementations.
+//! Minimal dense matrix math using Vec<Vec<f64>> (row-major).
+//! All matrices are represented as Vec<Vec<f64>> where mat[i] is row i.
+//! Used internally by Black-Litterman and Risk-Parity implementations.
 
 /// Create an n×n identity matrix.
 pub fn identity(n: usize) -> Vec<Vec<f64>> {
     let mut m = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        m[i][i] = 1.0;
+    for (i, row) in m.iter_mut().enumerate().take(n) {
+        row[i] = 1.0;
     }
     m
 }
@@ -102,8 +102,8 @@ pub fn mat_inv(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
 
     for col in 0..n {
         // Find pivot (max absolute value in column)
-        let pivot_row = (col..n)
-            .max_by(|&i, &j| aug[i][col].abs().partial_cmp(&aug[j][col].abs()).unwrap())?;
+        let pivot_row =
+            (col..n).max_by(|&i, &j| aug[i][col].abs().partial_cmp(&aug[j][col].abs()).unwrap())?;
 
         if aug[pivot_row][col].abs() < 1e-14 {
             return None; // singular
@@ -112,27 +112,23 @@ pub fn mat_inv(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
         aug.swap(col, pivot_row);
 
         let pivot = aug[col][col];
-        for j in 0..2 * n {
-            aug[col][j] /= pivot;
+        for val in aug[col].iter_mut().take(2 * n) {
+            *val /= pivot;
         }
 
         for row in 0..n {
             if row != col {
                 let factor = aug[row][col];
-                for j in 0..2 * n {
-                    let v = aug[col][j];
-                    aug[row][j] -= factor * v;
+                let col_vals: Vec<f64> = aug[col][..2 * n].to_vec();
+                for (dst, v) in aug[row][..2 * n].iter_mut().zip(col_vals.iter()) {
+                    *dst -= factor * v;
                 }
             }
         }
     }
 
     // Extract right half → inverse
-    Some(
-        aug.into_iter()
-            .map(|row| row[n..].to_vec())
-            .collect(),
-    )
+    Some(aug.into_iter().map(|row| row[n..].to_vec()).collect())
 }
 
 /// Compute the sample covariance matrix from a returns matrix.
@@ -216,10 +212,10 @@ mod tests {
         let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
         let inv = mat_inv(&a).unwrap();
         let prod = mat_mul(&a, &inv);
-        for i in 0..2 {
-            for j in 0..2 {
+        for (i, row) in prod.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((prod[i][j] - expected).abs() < 1e-10);
+                assert!((val - expected).abs() < 1e-10);
             }
         }
     }
@@ -227,11 +223,7 @@ mod tests {
     #[test]
     fn test_covariance_matrix() {
         // Simple: two perfectly correlated assets
-        let returns = vec![
-            vec![0.01, 0.02],
-            vec![0.02, 0.04],
-            vec![0.03, 0.06],
-        ];
+        let returns = vec![vec![0.01, 0.02], vec![0.02, 0.04], vec![0.03, 0.06]];
         let cov = covariance_matrix(&returns);
         assert!(cov[0][0] > 0.0);
         // cov[0][1] should equal cov[1][0]

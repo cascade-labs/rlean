@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
 
 async fn run_backtest(mut args: RunArgs) -> Result<()> {
     // Apply global config data-folder when --data was not explicitly provided.
-    if args.data == PathBuf::from("data") {
+    if args.data == std::path::Path::new("data") {
         if let Ok(cfg) = config::GlobalConfig::load() {
             if let Some(folder) = cfg.data_folder {
                 args.data = PathBuf::from(folder);

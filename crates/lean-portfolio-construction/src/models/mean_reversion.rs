@@ -127,7 +127,10 @@ impl MeanReversionPortfolioConstructionModel {
     ///
     /// Algorithm from Duchi et al. (2008), ICML.
     pub fn simplex_projection(vector: &[f64], total: f64) -> Vec<f64> {
-        assert!(total > 0.0, "Total must be > 0 for Euclidean Projection onto the Simplex.");
+        assert!(
+            total > 0.0,
+            "Total must be > 0 for Euclidean Projection onto the Simplex."
+        );
 
         let mut mu: Vec<f64> = vector.to_vec();
         mu.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -146,7 +149,7 @@ impl MeanReversionPortfolioConstructionModel {
             .enumerate()
             .filter(|(i, &u)| u > (sv[*i] - total) / (*i as f64 + 1.0))
             .map(|(i, _)| i)
-            .last()
+            .next_back()
             .unwrap_or(0);
 
         let theta = (sv[rho] - total) / (rho as f64 + 1.0);
@@ -258,7 +261,10 @@ impl IPortfolioConstructionModel for MeanReversionPortfolioConstructionModel {
             .zip(normalized.iter())
             .map(|(insight, &w)| {
                 let pct = Decimal::try_from(w).unwrap_or(Decimal::ZERO);
-                let price = prices.get(&insight.symbol.value).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.value)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
             })
             .collect()
@@ -288,10 +294,7 @@ mod tests {
     }
 
     fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     #[test]
@@ -444,14 +447,27 @@ mod tests {
         ];
 
         let targets = pcm.create_targets(&insights, portfolio_value, &prices);
-        let aapl_qty = targets.iter().find(|t| t.symbol.value == "AAPL").unwrap().quantity;
-        let spy_qty = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
+        let aapl_qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "AAPL")
+            .unwrap()
+            .quantity;
+        let spy_qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
 
         // C# uses Math.Floor; Rust PortfolioTarget uses .round().  The weight split is
         // approximately 1/3 : 2/3.  950*1/3/10=31.67→round=32, 950*2/3/10=63.33→round=63.
         // C# produces 31 and 63 (floor).  Both are within 1 share of each other — the OLMAR
         // algorithm is identical; only the quantity rounding differs.
-        assert_eq!(aapl_qty, dec!(32), "AAPL: expected 32 (Rust round vs C# floor=31), got {}", aapl_qty);
+        assert_eq!(
+            aapl_qty,
+            dec!(32),
+            "AAPL: expected 32 (Rust round vs C# floor=31), got {}",
+            aapl_qty
+        );
         assert_eq!(spy_qty, dec!(63), "SPY: expected 63, got {}", spy_qty);
     }
 }

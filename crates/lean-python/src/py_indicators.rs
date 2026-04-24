@@ -24,7 +24,7 @@ fn make_result(r: lean_indicators::indicator::IndicatorResult) -> PyIndicatorRes
 }
 
 /// PascalCase → snake_case forwarding helper shared by all indicator classes.
-fn indicator_getattr(py: Python<'_>, obj: &Bound<'_, PyAny>, name: &str) -> PyResult<PyObject> {
+fn indicator_getattr(_py: Python<'_>, obj: &Bound<'_, PyAny>, name: &str) -> PyResult<PyObject> {
     let snake = crate::py_qc_algorithm::pascal_to_snake(name);
     if snake != name {
         if let Ok(attr) = obj.getattr(snake.as_str()) {
@@ -106,7 +106,9 @@ pub struct PySma {
 
 impl PySma {
     pub fn create(period: usize) -> Self {
-        PySma { inner: Sma::new(period) }
+        PySma {
+            inner: Sma::new(period),
+        }
     }
 }
 
@@ -187,7 +189,9 @@ pub struct PyEma {
 
 impl PyEma {
     pub fn create(period: usize) -> Self {
-        PyEma { inner: Ema::new(period) }
+        PyEma {
+            inner: Ema::new(period),
+        }
     }
 }
 
@@ -268,7 +272,9 @@ pub struct PyRsi {
 
 impl PyRsi {
     pub fn create(period: usize) -> Self {
-        PyRsi { inner: Rsi::new(period) }
+        PyRsi {
+            inner: Rsi::new(period),
+        }
     }
 }
 
@@ -560,7 +566,9 @@ pub struct PyMomp {
 
 impl PyMomp {
     pub fn create(period: usize) -> Self {
-        PyMomp { inner: MomentumPct::new(period) }
+        PyMomp {
+            inner: MomentumPct::new(period),
+        }
     }
 }
 
@@ -638,7 +646,9 @@ pub struct PyStd {
 
 impl PyStd {
     pub fn create(period: usize) -> Self {
-        PyStd { inner: StandardDeviation::new(period) }
+        PyStd {
+            inner: StandardDeviation::new(period),
+        }
     }
 }
 

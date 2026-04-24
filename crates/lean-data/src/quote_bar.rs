@@ -1,6 +1,5 @@
 use crate::base_data::{BaseData, BaseDataType};
 use lean_core::{DateTime, Price, Quantity, Symbol, TimeSpan};
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
@@ -137,7 +136,6 @@ impl QuoteBar {
         self.end_time = other.end_time;
         self.period = TimeSpan::from_nanos(self.end_time.0 - self.time.0);
     }
-
 }
 
 impl BaseData for QuoteBar {

@@ -48,7 +48,6 @@ fn trade_tick_has_zero_spread() {
     assert_eq!(t.spread(), dec!(0));
 }
 
-
 #[test]
 fn open_interest_tick() {
     let t = Tick::open_interest(spy(), now(), dec!(1_234_567));

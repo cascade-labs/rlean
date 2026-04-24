@@ -1,5 +1,5 @@
-use crate::{Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
 use crate::symbol_changed::SymbolChangedEvent;
+use crate::{Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
 use lean_core::{DateTime, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

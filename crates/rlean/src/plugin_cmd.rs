@@ -109,7 +109,9 @@ struct InstalledEntry {
 /// - `https://` / `http://` — fetched via curl
 /// - `file:///path/to/registry.json` — read directly from disk
 /// - `/absolute/path/to/registry.json` — read directly from disk
+///
 /// Try to get a GitHub token for authenticating requests to private repos.
+///
 /// Checks (in order): GH_TOKEN env var, GITHUB_TOKEN env var, `gh auth token`.
 fn github_token() -> Option<String> {
     if let Ok(t) = std::env::var("GH_TOKEN") {

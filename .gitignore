@@ -3,3 +3,9 @@
 Cargo.lock
 examples/backtests/
 examples/data/
+
+# Runtime data — never commit
+data/
+
+# Claude memory files — may contain secrets
+.claude/projects/

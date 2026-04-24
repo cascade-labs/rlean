@@ -707,8 +707,8 @@ mod scheduled_universe_tests {
 // ---------------------------------------------------------------------------
 
 mod ema_cross_universe_tests {
-    use lean_universe::{CoarseFundamental, EmaCrossUniverseSelectionModel};
     use lean_core::{Market, Symbol};
+    use lean_universe::{CoarseFundamental, EmaCrossUniverseSelectionModel};
     use rust_decimal::Decimal;
 
     fn make_symbol(ticker: &str) -> Symbol {
@@ -783,13 +783,16 @@ mod ema_cross_universe_tests {
             last = model.select(&[make_coarse("FLAT", 50.0, 1_000_000.0)]);
         }
         // Fast == Slow, so fast > slow*(1+0.01) is false → not selected.
-        assert!(last.is_empty(), "flat price should not trigger a bullish cross");
+        assert!(
+            last.is_empty(),
+            "flat price should not trigger a bullish cross"
+        );
     }
 
     #[test]
     fn universe_count_limits_results() {
         let mut model = EmaCrossUniverseSelectionModel::new(3, 5, 2); // max 2 results
-        // 5 symbols — all rising strongly.
+                                                                      // 5 symbols — all rising strongly.
         let tickers = ["A", "B", "C", "D", "E"];
         for _ in 0..30 {
             let coarse: Vec<_> = tickers
@@ -818,13 +821,13 @@ mod ema_cross_universe_tests {
         for _ in 0..30 {
             model.select(&[
                 make_coarse("HIGH_DV", 100.0, 1_000_000.0),
-                make_coarse("LOW_DV",  100.0,   100_000.0),
+                make_coarse("LOW_DV", 100.0, 100_000.0),
             ]);
         }
         // Push both prices up strongly.
         let result = model.select(&[
             make_coarse("HIGH_DV", 300.0, 1_000_000.0),
-            make_coarse("LOW_DV",  300.0,   100_000.0),
+            make_coarse("LOW_DV", 300.0, 100_000.0),
         ]);
 
         // After enough bars HIGH_DV may or may not be selected; LOW_DV must never be.
@@ -878,9 +881,9 @@ mod inception_date_universe_tests {
     #[test]
     fn symbols_accumulate_over_time() {
         let mut model = InceptionDateUniverseSelectionModel::new("test");
-        model.add("AMZN", d(1997,  5, 15));
-        model.add("GOOG", d(2004,  8, 19));
-        model.add("META", d(2012,  5, 18));
+        model.add("AMZN", d(1997, 5, 15));
+        model.add("GOOG", d(2004, 8, 19));
+        model.add("META", d(2012, 5, 18));
 
         // After AMZN inception only.
         let r1 = model.select(d(2000, 1, 1));
@@ -909,7 +912,7 @@ mod inception_date_universe_tests {
         let mut model = InceptionDateUniverseSelectionModel::new("test");
         model.add("SPY", d(1993, 1, 22));
         model.select(d(1993, 1, 22)); // adds SPY
-        // Next day — no new tickers → universe unchanged.
+                                      // Next day — no new tickers → universe unchanged.
         let result = model.select(d(1993, 1, 23));
         assert!(result.is_none(), "universe unchanged should return None");
     }
@@ -917,8 +920,14 @@ mod inception_date_universe_tests {
     #[test]
     fn from_pairs_builds_correctly() {
         let pairs = vec![
-            ("SPY".to_string(), NaiveDate::from_ymd_opt(1993, 1, 22).unwrap()),
-            ("QQQ".to_string(), NaiveDate::from_ymd_opt(1999, 3, 10).unwrap()),
+            (
+                "SPY".to_string(),
+                NaiveDate::from_ymd_opt(1993, 1, 22).unwrap(),
+            ),
+            (
+                "QQQ".to_string(),
+                NaiveDate::from_ymd_opt(1999, 3, 10).unwrap(),
+            ),
         ];
         let mut model = InceptionDateUniverseSelectionModel::from_pairs("test", pairs);
         let result = model.select(d(2000, 1, 1)).unwrap();
@@ -983,7 +992,9 @@ mod inception_date_universe_tests {
     fn sp500_sectors_etf_universe_has_all_nine_spdr() {
         let mut m = LiquidEtfUniverse::sp500_sectors();
         let result = m.select(d(2020, 1, 1)).unwrap();
-        for ticker in &["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"] {
+        for ticker in &[
+            "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY",
+        ] {
             assert!(result.contains(&ticker.to_string()), "missing {ticker}");
         }
     }
@@ -1028,7 +1039,12 @@ mod option_universe_tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    fn make_call(underlying: &str, strike: f64, dte: i64, delta: Option<f64>) -> OptionContractView {
+    fn make_call(
+        underlying: &str,
+        strike: f64,
+        dte: i64,
+        delta: Option<f64>,
+    ) -> OptionContractView {
         OptionContractView {
             underlying: underlying.to_string(),
             symbol: format!("{underlying}_C_{strike}"),
@@ -1062,7 +1078,7 @@ mod option_universe_tests {
     fn dte_filter_excludes_out_of_range() {
         let model = OptionUniverseSelectionModel::new(7, 30);
         let contracts = vec![
-            make_call("SPY", 400.0,  5, None), // DTE too low
+            make_call("SPY", 400.0, 5, None),  // DTE too low
             make_call("SPY", 410.0, 15, None), // in range
             make_call("SPY", 420.0, 45, None), // DTE too high
         ];
@@ -1073,8 +1089,7 @@ mod option_universe_tests {
 
     #[test]
     fn delta_filter_excludes_out_of_range() {
-        let model = OptionUniverseSelectionModel::new(0, 45)
-            .with_delta(dec!(0.20), dec!(0.50));
+        let model = OptionUniverseSelectionModel::new(0, 45).with_delta(dec!(0.20), dec!(0.50));
         let contracts = vec![
             make_call("SPY", 400.0, 20, Some(0.10)), // too low delta
             make_call("SPY", 410.0, 20, Some(0.35)), // in range
@@ -1087,12 +1102,11 @@ mod option_universe_tests {
 
     #[test]
     fn right_filter_only_puts() {
-        let model = OptionUniverseSelectionModel::new(0, 45)
-            .with_right(OptionRight::Put);
+        let model = OptionUniverseSelectionModel::new(0, 45).with_right(OptionRight::Put);
         let contracts = vec![
             make_call("SPY", 400.0, 20, None),
-            make_put("SPY",  390.0, 20, None),
-            make_put("SPY",  380.0, 20, None),
+            make_put("SPY", 390.0, 20, None),
+            make_put("SPY", 380.0, 20, None),
         ];
         let result = model.filter(&contracts);
         assert_eq!(result.len(), 2);
@@ -1101,8 +1115,7 @@ mod option_universe_tests {
 
     #[test]
     fn strike_filter_excludes_out_of_range() {
-        let model = OptionUniverseSelectionModel::new(0, 45)
-            .with_strike(dec!(390.0), dec!(420.0));
+        let model = OptionUniverseSelectionModel::new(0, 45).with_strike(dec!(390.0), dec!(420.0));
         let contracts = vec![
             make_call("SPY", 370.0, 20, None), // too low
             make_call("SPY", 400.0, 20, None), // in range
@@ -1122,8 +1135,8 @@ mod option_universe_tests {
         let contracts = vec![
             make_call("SPY", 400.0, 15, Some(0.40)), // passes all
             make_call("SPY", 410.0, 15, Some(0.10)), // delta too low
-            make_put("SPY",  390.0, 15, Some(0.40)), // wrong right
-            make_call("SPY", 420.0,  5, Some(0.40)), // DTE too low
+            make_put("SPY", 390.0, 15, Some(0.40)),  // wrong right
+            make_call("SPY", 420.0, 5, Some(0.40)),  // DTE too low
         ];
         let result = model.filter(&contracts);
         assert_eq!(result.len(), 1);
@@ -1156,11 +1169,14 @@ mod option_universe_tests {
         // If delta is None and the model requires a delta range, the contract should
         // pass through (we can't filter what we don't know) — document current behaviour.
         // Current impl: no delta on contract → delta filter block skipped → contract passes.
-        let model = OptionUniverseSelectionModel::new(0, 45)
-            .with_delta(dec!(0.20), dec!(0.50));
+        let model = OptionUniverseSelectionModel::new(0, 45).with_delta(dec!(0.20), dec!(0.50));
         let contracts = vec![make_call("SPY", 400.0, 20, None)];
         // Contracts with no delta are not excluded (we have no info to exclude them).
         let result = model.filter(&contracts);
-        assert_eq!(result.len(), 1, "no-delta contracts pass through delta filter");
+        assert_eq!(
+            result.len(),
+            1,
+            "no-delta contracts pass through delta filter"
+        );
     }
 }
