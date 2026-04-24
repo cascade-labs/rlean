@@ -163,7 +163,7 @@ impl PyAlgorithmSettings {
     fn __setattr__(&mut self, _name: &str, _value: &Bound<'_, PyAny>) {}
 
     /// Accept any attribute get; return 0 as default.
-    fn __getattr__(&self, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(&self, _name: &str) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             Ok(0i64.into_pyobject(py).unwrap().into_any().unbind())
         })

@@ -88,12 +88,12 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(3, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // Feed only 3 bars (need 4 = lookback+1 prices before ROC is defined)
         for i in 0..3 {
             let s = slice_with_bar(&sym, i * DAY_NS, dec!(100));
-            let insights = model.update(&s, &[sym.clone()]);
+            let insights = model.update(&s, std::slice::from_ref(&sym));
             assert!(
                 insights.is_empty(),
                 "should not emit during warm-up (bar {})",
@@ -111,12 +111,12 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // Bar 0: $100
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), &[sym.clone()]);
+        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
         // Bar 1: $110 → ROC = 10% > 0 → Up
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), &[sym.clone()]);
+        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
 
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].direction, InsightDirection::Up);
@@ -132,10 +132,10 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), &[sym.clone()]);
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(90)), &[sym.clone()]);
+        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
+        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(90)), std::slice::from_ref(&sym));
 
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].direction, InsightDirection::Down);
@@ -150,10 +150,10 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), &[sym.clone()]);
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(100)), &[sym.clone()]);
+        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
+        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(100)), std::slice::from_ref(&sym));
 
         assert!(
             insights.is_empty(),
@@ -170,11 +170,11 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // 100 → 110: ROC = 10% = 0.10
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), &[sym.clone()]);
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), &[sym.clone()]);
+        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
+        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
 
         assert_eq!(insights.len(), 1);
         let mag = insights[0].magnitude.expect("magnitude should be set");
@@ -195,14 +195,14 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(3);
         let mut model = HistoricalReturnsAlphaModel::new(3, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // bars: 100, 105, 95, 120
         // At bar 3, ROC = (120 - 100) / 100 = 0.20 → Up
         let prices = [dec!(100), dec!(105), dec!(95), dec!(120)];
         let mut insights_final = vec![];
         for (i, &p) in prices.iter().enumerate() {
-            let ins = model.update(&slice_with_bar(&sym, i as i64 * DAY_NS, p), &[sym.clone()]);
+            let ins = model.update(&slice_with_bar(&sym, i as i64 * DAY_NS, p), std::slice::from_ref(&sym));
             if i == 3 {
                 insights_final = ins;
             } else {
@@ -223,16 +223,16 @@ mod historical_returns_tests {
         let sym = spy();
         let period = TimeSpan::from_days(1);
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
-        model.on_securities_changed(&[sym.clone()], &[]);
+        model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // Warm up
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), &[sym.clone()]);
+        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
 
         // Remove the security
-        model.on_securities_changed(&[], &[sym.clone()]);
+        model.on_securities_changed(&[], std::slice::from_ref(&sym));
 
         // A further bar should produce no insights
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), &[sym.clone()]);
+        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
         assert!(insights.is_empty(), "removed security must not emit insights");
     }
 
@@ -485,7 +485,7 @@ mod pearson_pairs_tests {
         }
 
         // Remove sym_a — any pair containing sym_a should be cleared.
-        model.on_securities_changed(&[], &[sym_a.clone()]);
+        model.on_securities_changed(&[], std::slice::from_ref(&sym_a));
 
         // Model must not panic and no insight should reference sym_a.
         for i in (lookback + 1)..(lookback + 5) {

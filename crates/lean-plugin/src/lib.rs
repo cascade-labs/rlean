@@ -2,7 +2,7 @@
 ///
 /// Every rlean plugin is a `cdylib` crate that exports one symbol:
 ///
-/// ```rust
+/// ```rust,ignore
 /// #[no_mangle]
 /// pub extern "C" fn rlean_plugin_descriptor() -> PluginDescriptor {
 ///     PluginDescriptor {
@@ -105,7 +105,7 @@ pub type DestroyHistoryProviderFn = unsafe extern "C" fn(ptr: *mut ());
 ///
 /// Plugins with `kind = PluginKind::CustomData` must export this symbol:
 ///
-/// ```rust
+/// ```rust,ignore
 /// #[no_mangle]
 /// pub extern "C" fn rlean_custom_data_factory() -> *mut () {
 ///     let source: Arc<dyn ICustomDataSource> = Arc::new(MyCustomSource::new());
@@ -118,7 +118,7 @@ pub type DestroyHistoryProviderFn = unsafe extern "C" fn(ptr: *mut ());
 /// `Box<Arc<dyn lean_data_providers::ICustomDataSource>>` and takes ownership.
 ///
 /// A corresponding destroy function must also be exported:
-/// ```rust
+/// ```rust,ignore
 /// #[no_mangle]
 /// pub unsafe extern "C" fn rlean_destroy_custom_data_source(ptr: *mut ()) {
 ///     drop(Box::from_raw(ptr as *mut Arc<dyn lean_data_providers::ICustomDataSource>));
@@ -135,7 +135,7 @@ pub type DestroyCustomDataSourceFn = unsafe extern "C" fn(ptr: *mut ());
 
 /// Convenience macro for plugin crates to implement the required export.
 ///
-/// ```rust
+/// ```rust,ignore
 /// use lean_plugin::{PluginKind, PluginDescriptor, rlean_plugin};
 ///
 /// rlean_plugin! {

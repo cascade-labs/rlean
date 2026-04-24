@@ -104,7 +104,7 @@ pub enum PyOrderDirection {
 /// The `AlgorithmImports` Python module — importable as `from AlgorithmImports import *`.
 ///
 /// Register before starting the interpreter:
-/// ```rust
+/// ```rust,ignore
 /// pyo3::append_to_inittab!(AlgorithmImports);
 /// pyo3::prepare_freethreaded_python();
 /// ```

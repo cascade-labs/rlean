@@ -1,5 +1,5 @@
 use crate::base_data::{BaseData, BaseDataType};
-use lean_core::{DateTime, Price, Quantity, Resolution, Symbol, TimeSpan};
+use lean_core::{DateTime, Price, Quantity, Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};

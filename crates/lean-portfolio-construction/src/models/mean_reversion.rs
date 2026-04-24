@@ -146,7 +146,7 @@ impl MeanReversionPortfolioConstructionModel {
             .enumerate()
             .filter(|(i, &u)| u > (sv[*i] - total) / (*i as f64 + 1.0))
             .map(|(i, _)| i)
-            .last()
+            .next_back()
             .unwrap_or(0);
 
         let theta = (sv[rho] - total) / (rho as f64 + 1.0);

@@ -1170,9 +1170,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     .update_price(&qbar.symbol, mid);
                                 portfolio.update_prices(&qbar.symbol, mid);
                             }
-                            if !bars_for_orders.contains_key(&sid) {
+                            if let std::collections::hash_map::Entry::Vacant(e) = bars_for_orders.entry(sid) {
                                 if let Some(synth) = synthesize_trade_bar_from_quote_bar(&qbar) {
-                                    bars_for_orders.insert(sid, synth);
+                                    e.insert(synth);
                                 }
                             }
                             minute_quote_bars.insert(sid, qbar.clone());
@@ -1181,7 +1181,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                         if let Some(ticks) = ticks_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
                             if !ticks.is_empty() {
-                                if !bars_for_orders.contains_key(&sid) {
+                                if let std::collections::hash_map::Entry::Vacant(e) = bars_for_orders.entry(sid) {
                                     if let Some(synth) = synthesize_trade_bar_from_ticks(
                                         &sub.symbol,
                                         utc_time,
@@ -1194,7 +1194,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                             .securities
                                             .update_price(&synth.symbol, synth.close);
                                         portfolio.update_prices(&synth.symbol, synth.close);
-                                        bars_for_orders.insert(sid, synth);
+                                        e.insert(synth);
                                     }
                                 }
                                 for tick in ticks {
@@ -1402,7 +1402,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 if let Err(e) = pre_fetch_all(
                                     provider.as_ref(),
                                     config.history_provider.clone(),
-                                    &[sub.clone()],
+                                    std::slice::from_ref(sub),
                                     start_date,
                                     end_date,
                                     &resolver,
@@ -2990,7 +2990,7 @@ fn load_custom_data_points(
 ///
 /// Rows are sorted newest-first; the first row whose date <= query_date is the
 /// active mapping for that date.
-fn ticker_at_date<'a>(rows: &'a [MapFileEntry], date: NaiveDate) -> Option<&'a str> {
+fn ticker_at_date(rows: &[MapFileEntry], date: NaiveDate) -> Option<&str> {
     rows.iter().find(|r| r.date <= date).map(|r| r.ticker.as_str())
 }
 
@@ -3332,7 +3332,6 @@ mod factor_tests {
     /// and doubles the volume.
     #[test]
     fn test_apply_factor_row_scales_volume_for_split() {
-        use lean_core::Market;
         use lean_data::trade_bar::TradeBarData;
         use rust_decimal_macros::dec;
 

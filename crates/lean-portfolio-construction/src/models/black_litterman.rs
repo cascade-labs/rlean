@@ -355,7 +355,7 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
         let mut p_rows: Vec<Vec<f64>> = Vec::new();
         let mut q_vec: Vec<f64> = Vec::new();
 
-        for (_source, group) in &groups {
+        for group in groups.values() {
             // Compute Q for this group: max of up-magnitude-sum vs down-magnitude-sum
             let up_sum: f64 = group
                 .iter()
@@ -465,8 +465,7 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         // Build portfolio targets
         insights
             .iter()
-            .enumerate()
-            .filter_map(|(_, insight)| {
+            .filter_map(|insight| {
                 let idx = tickers.iter().position(|t| *t == insight.symbol.value)?;
                 let w = weights[idx];
                 let pct = Decimal::try_from(w).ok()?;

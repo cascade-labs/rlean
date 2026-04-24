@@ -383,6 +383,10 @@ impl PyEqualWeightingPcm {
     }
 }
 
+impl Default for PyEqualWeightingPcm {
+    fn default() -> Self { Self::new() }
+}
+
 #[pyclass(name = "InsightWeightingPortfolioConstructionModel")]
 pub struct PyInsightWeightingPcm {
     pub model: Option<Box<dyn IPortfolioConstructionModel>>,
@@ -397,6 +401,10 @@ impl PyInsightWeightingPcm {
             model: Some(Box::new(InsightWeightingPortfolioConstructionModel::new())),
         }
     }
+}
+
+impl Default for PyInsightWeightingPcm {
+    fn default() -> Self { Self::new() }
 }
 
 #[pyclass(name = "MeanVarianceOptimizationPortfolioConstructionModel")]
@@ -415,6 +423,10 @@ impl PyMeanVariancePcm {
     }
 }
 
+impl Default for PyMeanVariancePcm {
+    fn default() -> Self { Self::new() }
+}
+
 #[pyclass(name = "MaximumSharpeRatioPortfolioConstructionModel")]
 pub struct PyMaxSharpeRatioPcm {
     pub model: Option<Box<dyn IPortfolioConstructionModel>>,
@@ -431,6 +443,10 @@ impl PyMaxSharpeRatioPcm {
             )),
         }
     }
+}
+
+impl Default for PyMaxSharpeRatioPcm {
+    fn default() -> Self { Self::new() }
 }
 
 #[pyclass(name = "BlackLittermanOptimizationPortfolioConstructionModel")]
@@ -455,6 +471,7 @@ impl PyBlackLittermanPcm {
     /// )
     /// ```
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         rebalance=None,
         portfolio_bias=PyPortfolioBias::LongShort,
@@ -528,6 +545,10 @@ impl PyConfidenceWeightingPcm {
             model: Some(Box::new(ConfidenceWeightingPortfolioConstructionModel::new())),
         }
     }
+}
+
+impl Default for PyConfidenceWeightingPcm {
+    fn default() -> Self { Self::new() }
 }
 
 #[pyclass(name = "AccumulativeInsightPortfolioConstructionModel")]
@@ -610,6 +631,14 @@ impl PyNullExecutionModel {
     }
 }
 
+impl Default for PyImmediateExecutionModel {
+    fn default() -> Self { Self::new() }
+}
+
+impl Default for PyNullExecutionModel {
+    fn default() -> Self { Self::new() }
+}
+
 #[pyclass(name = "VolumeWeightedAveragePriceExecutionModel")]
 pub struct PyVwapExecutionModel {
     pub model: Option<Box<dyn IExecutionModel>>,
@@ -686,6 +715,10 @@ impl PyNullRiskManagementModel {
             model: Some(Box::new(NullRiskManagement)),
         }
     }
+}
+
+impl Default for PyNullRiskManagementModel {
+    fn default() -> Self { Self::new() }
 }
 
 #[pyclass(name = "MaximumDrawdownPercentPerSecurity")]
@@ -860,6 +893,7 @@ impl PyInsight {
     /// ``Insight.Price(symbol, timedelta(days=1), InsightDirection.Up)``  (LEAN PascalCase)
     #[staticmethod]
     #[pyo3(name = "Price", signature = (symbol, period, direction, magnitude=None, confidence=None, source_model=None, weight=None))]
+    #[allow(non_snake_case)]
     pub fn Price(
         symbol: &Bound<'_, PyAny>,
         period: &Bound<'_, PyAny>,
@@ -1010,6 +1044,7 @@ impl PyAlphaModelBase {
     /// Override in subclass — return a list of `Insight` objects.
     /// Matches LEAN's PascalCase API: ``def Update(self, algorithm, data): ...``
     #[pyo3(name = "Update")]
+    #[allow(non_snake_case)]
     fn Update(
         &self,
         _algorithm: &Bound<'_, PyAny>,
@@ -1019,6 +1054,7 @@ impl PyAlphaModelBase {
     }
 
     #[pyo3(name = "OnSecuritiesChanged")]
+    #[allow(non_snake_case)]
     fn OnSecuritiesChanged(
         &self,
         _algorithm: &Bound<'_, PyAny>,
@@ -1240,7 +1276,7 @@ fn extract_pcm_targets(
 }
 
 /// Convert a Python iterable of `Insight` objects into Rust `Insight`s.
-fn extract_py_insights(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alpha::Insight> {
+fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alpha::Insight> {
     let Ok(iter) = obj.try_iter() else {
         return vec![];
     };

@@ -24,7 +24,7 @@ fn make_result(r: lean_indicators::indicator::IndicatorResult) -> PyIndicatorRes
 }
 
 /// PascalCase → snake_case forwarding helper shared by all indicator classes.
-fn indicator_getattr(py: Python<'_>, obj: &Bound<'_, PyAny>, name: &str) -> PyResult<PyObject> {
+fn indicator_getattr(_py: Python<'_>, obj: &Bound<'_, PyAny>, name: &str) -> PyResult<PyObject> {
     let snake = crate::py_qc_algorithm::pascal_to_snake(name);
     if snake != name {
         if let Ok(attr) = obj.getattr(snake.as_str()) {

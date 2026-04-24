@@ -30,6 +30,12 @@ impl IndicatorRegistry {
     }
 }
 
+impl Default for IndicatorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
 }

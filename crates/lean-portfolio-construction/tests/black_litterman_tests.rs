@@ -251,13 +251,13 @@ mod matrix_tests {
         ];
         let inv = mat_inv(&a).unwrap();
         let prod = mat_mul(&a, &inv);
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, row) in prod.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
-                    (prod[i][j] - expected).abs() < 1e-8,
+                    (val - expected).abs() < 1e-8,
                     "A*A⁻¹[{i}][{j}] = {} ≠ {expected}",
-                    prod[i][j]
+                    val
                 );
             }
         }
@@ -285,14 +285,14 @@ mod matrix_tests {
         ];
         let cov = covariance_matrix(&returns);
         // Must be symmetric
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!((cov[i][j] - cov[j][i]).abs() < 1e-14);
+        for (i, row) in cov.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!((val - cov[j][i]).abs() < 1e-14);
             }
         }
         // Diagonal must be non-negative
-        for i in 0..3 {
-            assert!(cov[i][i] >= 0.0);
+        for (i, row) in cov.iter().enumerate() {
+            assert!(row[i] >= 0.0);
         }
     }
 
@@ -309,7 +309,7 @@ mod matrix_tests {
         let pi = vec![0.05, 0.03];
         let sigma = vec![vec![0.04, 0.01], vec![0.01, 0.02]];
         let p = vec![vec![1.0, 0.0]];
-        let q = vec![0.08];
+        let q = [0.08];
         let tau = 0.05;
 
         // τΣ
@@ -331,7 +331,7 @@ mod matrix_tests {
         let p_pi = mat_vec_mul(&p, &pi);
         let diff = vec![q[0] - p_pi[0]];
         let correction = mat_vec_mul(&a, &diff);
-        let pi_post = vec![pi[0] + correction[0], pi[1] + correction[1]];
+        let pi_post = [pi[0] + correction[0], pi[1] + correction[1]];
 
         // The view says asset 1 should return 8% vs prior 5%
         // Posterior should be between 5% and 8%.

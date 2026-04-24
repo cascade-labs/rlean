@@ -8,7 +8,6 @@ use lean_portfolio_construction::{
     RiskParityPortfolioConstructionModel,
 };
 use lean_portfolio_construction::models::risk_parity::risk_parity_optimize;
-use lean_portfolio_construction::models::matrix::covariance_matrix;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -356,7 +355,7 @@ fn on_securities_changed_removes_symbol_data() {
     }
 
     // Remove SPY — should clear its data without panic
-    model.on_securities_changed(&[], &[spy.clone()]);
+    model.on_securities_changed(&[], std::slice::from_ref(&spy));
 
     // After removal, the next call should start fresh with no data
     let prices = HashMap::from([("SPY".to_string(), dec!(115))]);

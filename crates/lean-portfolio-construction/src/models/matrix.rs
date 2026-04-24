@@ -1,12 +1,12 @@
-/// Minimal dense matrix math using Vec<Vec<f64>> (row-major).
-/// All matrices are represented as Vec<Vec<f64>> where mat[i] is row i.
-/// Used internally by Black-Litterman and Risk-Parity implementations.
+//! Minimal dense matrix math using Vec<Vec<f64>> (row-major).
+//! All matrices are represented as Vec<Vec<f64>> where mat[i] is row i.
+//! Used internally by Black-Litterman and Risk-Parity implementations.
 
 /// Create an n×n identity matrix.
 pub fn identity(n: usize) -> Vec<Vec<f64>> {
     let mut m = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        m[i][i] = 1.0;
+    for (i, row) in m.iter_mut().enumerate().take(n) {
+        row[i] = 1.0;
     }
     m
 }
@@ -112,16 +112,16 @@ pub fn mat_inv(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
         aug.swap(col, pivot_row);
 
         let pivot = aug[col][col];
-        for j in 0..2 * n {
-            aug[col][j] /= pivot;
+        for val in aug[col].iter_mut().take(2 * n) {
+            *val /= pivot;
         }
 
         for row in 0..n {
             if row != col {
                 let factor = aug[row][col];
-                for j in 0..2 * n {
-                    let v = aug[col][j];
-                    aug[row][j] -= factor * v;
+                let col_vals: Vec<f64> = aug[col][..2 * n].to_vec();
+                for (dst, v) in aug[row][..2 * n].iter_mut().zip(col_vals.iter()) {
+                    *dst -= factor * v;
                 }
             }
         }
@@ -216,10 +216,10 @@ mod tests {
         let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
         let inv = mat_inv(&a).unwrap();
         let prod = mat_mul(&a, &inv);
-        for i in 0..2 {
-            for j in 0..2 {
+        for (i, row) in prod.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((prod[i][j] - expected).abs() < 1e-10);
+                assert!((val - expected).abs() < 1e-10);
             }
         }
     }
