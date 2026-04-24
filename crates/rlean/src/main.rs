@@ -36,6 +36,7 @@ mod registry_cmd;
 mod research;
 mod research_daemon;
 mod stubs_cmd;
+mod vcs_cmd;
 
 use config_cmd::{run_config, ConfigArgs};
 use init::{run_init, InitArgs};
@@ -45,6 +46,7 @@ use registry_cmd::{run_registry, RegistryArgs};
 use research::{run_research, ResearchArgs};
 use research_daemon::{run_daemon, ResearchDaemonArgs};
 use stubs_cmd::{run_stubs, StubsArgs};
+use vcs_cmd::{run_vcs, VcsArgs};
 
 type ProviderPair = (
     Option<Arc<dyn IHistoricalDataProvider>>,
@@ -93,6 +95,9 @@ enum Command {
 
     /// Generate and install AlgorithmImports.pyi stub files for IDE autocomplete
     Stubs(StubsArgs),
+
+    /// Version control: push, pull, sync, and configure your strategy remote
+    Vcs(VcsArgs),
 
     /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
     #[command(name = "__research-daemon", hide = true)]
@@ -179,6 +184,7 @@ async fn main() -> Result<()> {
         Command::Live(args) => run_live(args).await,
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),
+        Command::Vcs(args) => run_vcs(args),
         Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
