@@ -282,11 +282,7 @@ fn run_git(args: &[&str], workspace: &Path) -> Result<()> {
         .current_dir(workspace)
         .status()?;
     if !status.success() {
-        bail!(
-            "git {} failed (exit {:?})",
-            args.join(" "),
-            status.code()
-        );
+        bail!("git {} failed (exit {:?})", args.join(" "), status.code());
     }
     Ok(())
 }

@@ -134,18 +134,12 @@ pub(crate) fn ensure_gitignore(workspace: &Path) -> Result<()> {
     };
 
     let sections: &[(&str, &[&str])] = &[
-        (
-            "# rlean workspace — host-specific config",
-            &["rlean.json"],
-        ),
+        ("# rlean workspace — host-specific config", &["rlean.json"]),
         (
             "# Data files — fetched from provider, not strategy code",
             &["data/"],
         ),
-        (
-            "# Generated output",
-            &["**/backtests/", "**/live/"],
-        ),
+        ("# Generated output", &["**/backtests/", "**/live/"]),
         ("# Python artifacts", &["__pycache__/", "*.pyc", "*.pyo"]),
         ("# macOS", &[".DS_Store"]),
         ("# Secrets", &[".env", "*.env"]),
