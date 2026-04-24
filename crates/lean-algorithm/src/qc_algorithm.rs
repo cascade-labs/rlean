@@ -573,7 +573,10 @@ impl QcAlgorithm {
             return;
         }
         let hours = ExchangeHours::us_equity();
-        let props = SymbolProperties { contract_multiplier: 100.0, ..SymbolProperties::default() };
+        let props = SymbolProperties {
+            contract_multiplier: 100.0,
+            ..SymbolProperties::default()
+        };
         self.securities.add(crate::securities::Security::new(
             symbol.clone(),
             resolution,

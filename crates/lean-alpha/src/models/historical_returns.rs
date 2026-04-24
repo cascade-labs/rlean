@@ -114,10 +114,12 @@ impl IAlphaModel for HistoricalReturnsAlphaModel {
 
     fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
         for s in added {
-            self.state.entry(s.id.sid).or_insert_with(|| HistoricalReturnsState {
-                prices: Vec::with_capacity(self.lookback + 1),
-                symbol: s.clone(),
-            });
+            self.state
+                .entry(s.id.sid)
+                .or_insert_with(|| HistoricalReturnsState {
+                    prices: Vec::with_capacity(self.lookback + 1),
+                    symbol: s.clone(),
+                });
         }
         for s in removed {
             self.state.remove(&s.id.sid);

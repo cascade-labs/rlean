@@ -192,7 +192,10 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
         let mean_daily: Vec<f64> = (0..n)
             .map(|j| returns.iter().map(|row| row[j]).sum::<f64>() / t)
             .collect();
-        let ann_return: Vec<f64> = mean_daily.iter().map(|r| (1.0 + r).powf(252.0) - 1.0).collect();
+        let ann_return: Vec<f64> = mean_daily
+            .iter()
+            .map(|r| (1.0 + r).powf(252.0) - 1.0)
+            .collect();
 
         // Annual portfolio return and variance
         let port_return: f64 = dot(&w, &ann_return);
@@ -226,8 +229,8 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
         &self,
         pi: &[f64],
         sigma: &[Vec<f64>],
-        p: &[Vec<f64>],  // K×N view matrix
-        q: &[f64],       // K view returns
+        p: &[Vec<f64>], // K×N view matrix
+        q: &[f64],      // K view returns
     ) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
         let _n = sigma.len();
         let k = p.len();
@@ -469,7 +472,10 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
                 let idx = tickers.iter().position(|t| *t == insight.symbol.value)?;
                 let w = weights[idx];
                 let pct = Decimal::try_from(w).ok()?;
-                let price = prices.get(&insight.symbol.value).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.value)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 Some(PortfolioTarget::percent(
                     insight.symbol.clone(),
                     pct,
@@ -486,7 +492,10 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         }
     }
 
-    fn update_security_prices(&mut self, prices: &std::collections::HashMap<String, rust_decimal::Decimal>) {
+    fn update_security_prices(
+        &mut self,
+        prices: &std::collections::HashMap<String, rust_decimal::Decimal>,
+    ) {
         self.update_prices(prices);
     }
 

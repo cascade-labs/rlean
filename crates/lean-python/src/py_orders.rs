@@ -411,8 +411,11 @@ mod tests {
         ];
         for (pascal, snake) in &cases {
             assert_eq!(
-                pascal_to_snake(pascal), *snake,
-                "PascalCase '{}' should map to snake_case '{}'", pascal, snake
+                pascal_to_snake(pascal),
+                *snake,
+                "PascalCase '{}' should map to snake_case '{}'",
+                pascal,
+                snake
             );
         }
     }

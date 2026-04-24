@@ -102,8 +102,8 @@ pub fn mat_inv(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
 
     for col in 0..n {
         // Find pivot (max absolute value in column)
-        let pivot_row = (col..n)
-            .max_by(|&i, &j| aug[i][col].abs().partial_cmp(&aug[j][col].abs()).unwrap())?;
+        let pivot_row =
+            (col..n).max_by(|&i, &j| aug[i][col].abs().partial_cmp(&aug[j][col].abs()).unwrap())?;
 
         if aug[pivot_row][col].abs() < 1e-14 {
             return None; // singular
@@ -128,11 +128,7 @@ pub fn mat_inv(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     }
 
     // Extract right half → inverse
-    Some(
-        aug.into_iter()
-            .map(|row| row[n..].to_vec())
-            .collect(),
-    )
+    Some(aug.into_iter().map(|row| row[n..].to_vec()).collect())
 }
 
 /// Compute the sample covariance matrix from a returns matrix.
@@ -227,11 +223,7 @@ mod tests {
     #[test]
     fn test_covariance_matrix() {
         // Simple: two perfectly correlated assets
-        let returns = vec![
-            vec![0.01, 0.02],
-            vec![0.02, 0.04],
-            vec![0.03, 0.06],
-        ];
+        let returns = vec![vec![0.01, 0.02], vec![0.02, 0.04], vec![0.03, 0.06]];
         let cov = covariance_matrix(&returns);
         assert!(cov[0][0] > 0.0);
         // cov[0][1] should equal cov[1][0]

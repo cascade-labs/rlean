@@ -10,12 +10,15 @@ use lean_execution::{
     ExecutionTarget, IExecutionModel, ImmediateExecutionModel, OrderRequest, SecurityData,
 };
 use lean_portfolio_construction::{
-    AccumulativeInsightPortfolioConstructionModel, BlackLittermanOptimizationPortfolioConstructionModel,
+    AccumulativeInsightPortfolioConstructionModel,
+    BlackLittermanOptimizationPortfolioConstructionModel,
     ConfidenceWeightingPortfolioConstructionModel, EqualWeightingPortfolioConstructionModel,
     IPortfolioConstructionModel, InsightDirection as PcmDir, InsightForPcm,
     MeanReversionPortfolioConstructionModel, PortfolioBias, RiskParityPortfolioConstructionModel,
 };
-use lean_risk::risk_management::{NullRiskManagement, PortfolioTarget as RiskTarget, RiskManagementModel};
+use lean_risk::risk_management::{
+    NullRiskManagement, PortfolioTarget as RiskTarget, RiskManagementModel,
+};
 use lean_risk::{
     MaximumDrawdownPercentPortfolio, MaximumSectorExposureRiskManagementModel,
     MaximumUnrealizedProfitPercentPerSecurity,
@@ -167,11 +170,7 @@ pub fn run_framework_pipeline(
 
     let (securities, prices, holdings, portfolio_value) = {
         let alg = alg_inner.lock().unwrap();
-        let securities: Vec<Symbol> = alg
-            .securities
-            .all()
-            .map(|s| s.symbol.clone())
-            .collect();
+        let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
         let prices: HashMap<String, Decimal> = alg
             .securities
             .all()
@@ -261,7 +260,10 @@ impl PyHistoricalReturnsAlphaModel {
         let days = insight_period_days.unwrap_or(period as i64);
         let insight_period = TimeSpan::from_nanos(days * 86_400 * 1_000_000_000);
         Self {
-            model: Some(Box::new(HistoricalReturnsAlphaModel::new(period, insight_period))),
+            model: Some(Box::new(HistoricalReturnsAlphaModel::new(
+                period,
+                insight_period,
+            ))),
         }
     }
 }
@@ -384,7 +386,9 @@ impl PyEqualWeightingPcm {
 }
 
 impl Default for PyEqualWeightingPcm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "InsightWeightingPortfolioConstructionModel")]
@@ -404,7 +408,9 @@ impl PyInsightWeightingPcm {
 }
 
 impl Default for PyInsightWeightingPcm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "MeanVarianceOptimizationPortfolioConstructionModel")]
@@ -424,7 +430,9 @@ impl PyMeanVariancePcm {
 }
 
 impl Default for PyMeanVariancePcm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "MaximumSharpeRatioPortfolioConstructionModel")]
@@ -438,15 +446,15 @@ impl PyMaxSharpeRatioPcm {
     pub fn new() -> Self {
         use lean_portfolio_construction::MaximumSharpeRatioPortfolioConstructionModel;
         Self {
-            model: Some(Box::new(
-                MaximumSharpeRatioPortfolioConstructionModel::new(),
-            )),
+            model: Some(Box::new(MaximumSharpeRatioPortfolioConstructionModel::new())),
         }
     }
 }
 
 impl Default for PyMaxSharpeRatioPcm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "BlackLittermanOptimizationPortfolioConstructionModel")]
@@ -492,8 +500,8 @@ impl PyBlackLittermanPcm {
         delta: f64,
         tau: f64,
     ) -> Self {
-        let _ = rebalance;   // rebalancing frequency not yet implemented in rlean
-        let _ = resolution;  // resolution hint accepted but unused
+        let _ = rebalance; // rebalancing frequency not yet implemented in rlean
+        let _ = resolution; // resolution hint accepted but unused
         Self {
             model: Some(Box::new(
                 BlackLittermanOptimizationPortfolioConstructionModel::with_params(
@@ -542,13 +550,17 @@ impl PyConfidenceWeightingPcm {
     #[new]
     pub fn new() -> Self {
         Self {
-            model: Some(Box::new(ConfidenceWeightingPortfolioConstructionModel::new())),
+            model: Some(Box::new(
+                ConfidenceWeightingPortfolioConstructionModel::new(),
+            )),
         }
     }
 }
 
 impl Default for PyConfidenceWeightingPcm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "AccumulativeInsightPortfolioConstructionModel")]
@@ -590,10 +602,12 @@ impl PyMeanReversionPcm {
     #[pyo3(signature = (reversion_threshold=1.0, window_size=20))]
     pub fn new(reversion_threshold: f64, window_size: usize) -> Self {
         Self {
-            model: Some(Box::new(MeanReversionPortfolioConstructionModel::with_params(
-                reversion_threshold,
-                window_size,
-            ))),
+            model: Some(Box::new(
+                MeanReversionPortfolioConstructionModel::with_params(
+                    reversion_threshold,
+                    window_size,
+                ),
+            )),
         }
     }
 }
@@ -632,11 +646,15 @@ impl PyNullExecutionModel {
 }
 
 impl Default for PyImmediateExecutionModel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Default for PyNullExecutionModel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "VolumeWeightedAveragePriceExecutionModel")]
@@ -718,7 +736,9 @@ impl PyNullRiskManagementModel {
 }
 
 impl Default for PyNullRiskManagementModel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pyclass(name = "MaximumDrawdownPercentPerSecurity")]
@@ -806,7 +826,9 @@ impl PyMaxUnrealizedProfitPerSecurity {
     pub fn new(maximum_unrealized_profit_percent: f64) -> Self {
         let pct = Decimal::from_f64(maximum_unrealized_profit_percent).unwrap_or(Decimal::ZERO);
         Self {
-            model: Some(Box::new(MaximumUnrealizedProfitPercentPerSecurity::new(pct))),
+            model: Some(Box::new(MaximumUnrealizedProfitPercentPerSecurity::new(
+                pct,
+            ))),
         }
     }
 }
@@ -887,7 +909,14 @@ impl PyInsight {
         weight: Option<f64>,
     ) -> PyResult<Self> {
         let _ = weight;
-        Self::new(symbol, direction, period, magnitude, confidence, source_model)
+        Self::new(
+            symbol,
+            direction,
+            period,
+            magnitude,
+            confidence,
+            source_model,
+        )
     }
 
     /// ``Insight.Price(symbol, timedelta(days=1), InsightDirection.Up)``  (LEAN PascalCase)
@@ -904,12 +933,21 @@ impl PyInsight {
         weight: Option<f64>,
     ) -> PyResult<Self> {
         let _ = weight; // LEAN API compat — not used in rlean
-        Self::new(symbol, direction, period, magnitude, confidence, source_model)
+        Self::new(
+            symbol,
+            direction,
+            period,
+            magnitude,
+            confidence,
+            source_model,
+        )
     }
 
     #[getter]
     pub fn symbol(&self) -> crate::py_types::PySymbol {
-        crate::py_types::PySymbol { inner: self.symbol.clone() }
+        crate::py_types::PySymbol {
+            inner: self.symbol.clone(),
+        }
     }
 
     #[getter]
@@ -964,7 +1002,11 @@ impl PyPortfolioTarget {
     #[new]
     pub fn new(symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<Self> {
         let lean_symbol = extract_lean_symbol_from_py(symbol)?;
-        Ok(Self { symbol: lean_symbol, quantity: Some(quantity), percent: None })
+        Ok(Self {
+            symbol: lean_symbol,
+            quantity: Some(quantity),
+            percent: None,
+        })
     }
 
     /// ``PortfolioTarget.Percent(algorithm, symbol, percent)`` — deferred percent target.
@@ -977,7 +1019,11 @@ impl PyPortfolioTarget {
         percent: f64,
     ) -> PyResult<Self> {
         let lean_symbol = extract_lean_symbol_from_py(symbol)?;
-        Ok(Self { symbol: lean_symbol, quantity: None, percent: Some(percent) })
+        Ok(Self {
+            symbol: lean_symbol,
+            quantity: None,
+            percent: Some(percent),
+        })
     }
 
     /// snake_case alias.
@@ -992,12 +1038,18 @@ impl PyPortfolioTarget {
 
     #[getter]
     fn symbol(&self) -> crate::py_types::PySymbol {
-        crate::py_types::PySymbol { inner: self.symbol.clone() }
+        crate::py_types::PySymbol {
+            inner: self.symbol.clone(),
+        }
     }
 
     fn __repr__(&self) -> String {
         if let Some(pct) = self.percent {
-            format!("PortfolioTarget('{}', {:.1}%)", self.symbol.value, pct * 100.0)
+            format!(
+                "PortfolioTarget('{}', {:.1}%)",
+                self.symbol.value,
+                pct * 100.0
+            )
         } else {
             format!(
                 "PortfolioTarget('{}', qty={:.0})",
@@ -1013,7 +1065,10 @@ fn extract_lean_symbol_from_py(symbol: &Bound<'_, PyAny>) -> PyResult<lean_core:
         return Ok(s.borrow().inner.clone());
     }
     let ticker: String = symbol.extract()?;
-    Ok(lean_core::Symbol::create_equity(&ticker, &lean_core::Market::usa()))
+    Ok(lean_core::Symbol::create_equity(
+        &ticker,
+        &lean_core::Market::usa(),
+    ))
 }
 
 // ─── Framework Base Classes (subclassable by Python strategies) ───────────────
@@ -1045,22 +1100,13 @@ impl PyAlphaModelBase {
     /// Matches LEAN's PascalCase API: ``def Update(self, algorithm, data): ...``
     #[pyo3(name = "Update")]
     #[allow(non_snake_case)]
-    fn Update(
-        &self,
-        _algorithm: &Bound<'_, PyAny>,
-        _data: &Bound<'_, PyAny>,
-    ) -> Vec<PyObject> {
+    fn Update(&self, _algorithm: &Bound<'_, PyAny>, _data: &Bound<'_, PyAny>) -> Vec<PyObject> {
         vec![]
     }
 
     #[pyo3(name = "OnSecuritiesChanged")]
     #[allow(non_snake_case)]
-    fn OnSecuritiesChanged(
-        &self,
-        _algorithm: &Bound<'_, PyAny>,
-        _changes: &Bound<'_, PyAny>,
-    ) {
-    }
+    fn OnSecuritiesChanged(&self, _algorithm: &Bound<'_, PyAny>, _changes: &Bound<'_, PyAny>) {}
 }
 
 /// Base class for Python-defined portfolio construction models.
@@ -1148,7 +1194,12 @@ impl IAlphaModel for PyAlphaAdapter {
         })
     }
 
-    fn on_securities_changed(&mut self, _added: &[lean_core::Symbol], _removed: &[lean_core::Symbol]) {}
+    fn on_securities_changed(
+        &mut self,
+        _added: &[lean_core::Symbol],
+        _removed: &[lean_core::Symbol],
+    ) {
+    }
 }
 
 // ─── Python-defined PCM adapter ──────────────────────────────────────────────
@@ -1196,9 +1247,7 @@ impl IPortfolioConstructionModel for PyPcmAdapter {
             let list = pyo3::types::PyList::new(py, py_insights).unwrap();
 
             match self.obj.call_method1(py, "CreateTargets", (alg, list)) {
-                Ok(result) => {
-                    extract_pcm_targets(py, result.bind(py), portfolio_value, prices)
-                }
+                Ok(result) => extract_pcm_targets(py, result.bind(py), portfolio_value, prices),
                 Err(e) => {
                     tracing::warn!("PyPcmAdapter::CreateTargets error: {e}");
                     vec![]
@@ -1217,7 +1266,9 @@ fn extract_pcm_targets(
     portfolio_value: Decimal,
     prices: &HashMap<String, Decimal>,
 ) -> Vec<lean_portfolio_construction::PortfolioTarget> {
-    let Ok(iter) = obj.try_iter() else { return vec![] };
+    let Ok(iter) = obj.try_iter() else {
+        return vec![];
+    };
     iter.filter_map(|item| {
         let item = item.ok()?;
 
@@ -1229,7 +1280,10 @@ fn extract_pcm_targets(
                 let pct_dec = Decimal::from_f64(pct)?;
                 let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ONE);
                 return Some(lean_portfolio_construction::PortfolioTarget::percent(
-                    sym, pct_dec, portfolio_value, price,
+                    sym,
+                    pct_dec,
+                    portfolio_value,
+                    price,
                 ));
             }
             if let Some(qty) = pt.quantity {
@@ -1258,11 +1312,17 @@ fn extract_pcm_targets(
                 let pct_dec = Decimal::from_f64(pct)?;
                 let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ONE);
                 return Some(lean_portfolio_construction::PortfolioTarget::percent(
-                    sym, pct_dec, portfolio_value, price,
+                    sym,
+                    pct_dec,
+                    portfolio_value,
+                    price,
                 ));
             }
         }
-        if let Ok(qty_attr) = item.getattr("quantity").or_else(|_| item.getattr("Quantity")) {
+        if let Ok(qty_attr) = item
+            .getattr("quantity")
+            .or_else(|_| item.getattr("Quantity"))
+        {
             if let Ok(qty) = qty_attr.extract::<f64>() {
                 return Some(lean_portfolio_construction::PortfolioTarget::new(
                     sym,
@@ -1314,7 +1374,8 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
                 if symbol_str.is_empty() {
                     continue;
                 }
-                let symbol = lean_core::Symbol::create_equity(&symbol_str, &lean_core::Market::usa());
+                let symbol =
+                    lean_core::Symbol::create_equity(&symbol_str, &lean_core::Market::usa());
                 let dir_val: i32 = dir_o.extract().unwrap_or(1);
                 let dir = if dir_val > 0 {
                     lean_alpha::InsightDirection::Up
@@ -1323,10 +1384,7 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
                 } else {
                     lean_alpha::InsightDirection::Flat
                 };
-                let days: f64 = per
-                    .getattr("days")
-                    .and_then(|d| d.extract())
-                    .unwrap_or(1.0);
+                let days: f64 = per.getattr("days").and_then(|d| d.extract()).unwrap_or(1.0);
                 let period =
                     lean_core::TimeSpan::from_nanos((days * 86_400.0 * 1_000_000_000.0) as i64);
                 out.push(lean_alpha::Insight::new(

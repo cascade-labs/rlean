@@ -164,10 +164,8 @@ impl PyAlgorithmSettings {
 
     /// Accept any attribute get; return 0 as default.
     fn __getattr__(&self, _name: &str) -> PyResult<PyObject> {
-        Python::with_gil(|py| {
-            Ok(0i64.into_pyobject(py).unwrap().into_any().unbind())
-        })
-        .map_err(|e: PyErr| e)
+        Python::with_gil(|py| Ok(0i64.into_pyobject(py).unwrap().into_any().unbind()))
+            .map_err(|e: PyErr| e)
     }
 }
 
@@ -329,8 +327,12 @@ impl From<PyDataNormalizationMode> for DataNormalizationMode {
             PyDataNormalizationMode::Adjusted => DataNormalizationMode::Adjusted,
             PyDataNormalizationMode::SplitAdjusted => DataNormalizationMode::SplitAdjusted,
             PyDataNormalizationMode::TotalReturn => DataNormalizationMode::TotalReturn,
-            PyDataNormalizationMode::ForwardPanamaCanal => DataNormalizationMode::ForwardPanamaCanal,
-            PyDataNormalizationMode::BackwardPanamaCanal => DataNormalizationMode::BackwardPanamaCanal,
+            PyDataNormalizationMode::ForwardPanamaCanal => {
+                DataNormalizationMode::ForwardPanamaCanal
+            }
+            PyDataNormalizationMode::BackwardPanamaCanal => {
+                DataNormalizationMode::BackwardPanamaCanal
+            }
         }
     }
 }
@@ -390,7 +392,11 @@ mod tests {
     #[test]
     fn symbol_pascal_names_convert_correctly() {
         assert_eq!(pascal_to_snake("Value"), "value", "Symbol.Value → value");
-        assert_eq!(pascal_to_snake("Ticker"), "ticker", "Symbol.Ticker → ticker");
+        assert_eq!(
+            pascal_to_snake("Ticker"),
+            "ticker",
+            "Symbol.Ticker → ticker"
+        );
         assert_eq!(pascal_to_snake("HasUnderlying"), "has_underlying");
         assert_eq!(pascal_to_snake("SecurityType"), "security_type");
     }

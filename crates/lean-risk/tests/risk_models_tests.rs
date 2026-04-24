@@ -105,7 +105,11 @@ fn test_drawdown_portfolio_triggers_at_threshold() {
     };
     let result = model.manage_risk_with_context(&targets, &ctx_drop);
     assert_eq!(result.len(), 1, "Should emit one liquidation target");
-    assert_eq!(result[0].quantity, Decimal::ZERO, "Liquidation qty must be 0");
+    assert_eq!(
+        result[0].quantity,
+        Decimal::ZERO,
+        "Liquidation qty must be 0"
+    );
     assert_eq!(result[0].symbol.value, "SPY");
 }
 
@@ -166,7 +170,11 @@ fn test_drawdown_portfolio_trailing_updates_high() {
         holdings: vec![],
     };
     let result = model.manage_risk_with_context(&targets, &ctx3);
-    assert_eq!(result.len(), 1, "Should liquidate when trailing drawdown exceeded");
+    assert_eq!(
+        result.len(),
+        1,
+        "Should liquidate when trailing drawdown exceeded"
+    );
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
@@ -244,7 +252,11 @@ fn test_unrealized_profit_short_position() {
         holdings: vec![holding(spy(), dec!(-10), dec!(400), dec!(370))],
     };
     let result = model.manage_risk_with_context(&[], &ctx);
-    assert_eq!(result.len(), 1, "Short position with 7.5% profit should trigger");
+    assert_eq!(
+        result.len(),
+        1,
+        "Short position with 7.5% profit should trigger"
+    );
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
@@ -255,10 +267,7 @@ fn test_sector_exposure_pass_through_when_no_violation() {
     let mut model = MaximumSectorExposureRiskManagementModel::new(dec!(0.20));
 
     // The stub passes targets through — verify it doesn't panic and returns targets.
-    let targets = vec![
-        make_target(spy(), dec!(100)),
-        make_target(aapl(), dec!(50)),
-    ];
+    let targets = vec![make_target(spy(), dec!(100)), make_target(aapl(), dec!(50))];
     let result = model.manage_risk(&targets);
     // Current stub impl passes targets through unchanged.
     assert_eq!(result.len(), 2);
@@ -277,5 +286,8 @@ fn test_sector_exposure_model_construction() {
 fn test_sector_exposure_zero_targets() {
     let mut model = MaximumSectorExposureRiskManagementModel::new(dec!(0.20));
     let result = model.manage_risk(&[]);
-    assert!(result.is_empty(), "Empty targets should produce empty result");
+    assert!(
+        result.is_empty(),
+        "Empty targets should produce empty result"
+    );
 }

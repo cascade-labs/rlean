@@ -181,7 +181,10 @@ impl PyQcAlgorithm {
         // Check for timedelta first.
         if let Ok(td) = bars_or_days_or_timespan.extract::<chrono::Duration>() {
             let nanos = td.num_nanoseconds().unwrap_or(0);
-            self.inner.lock().unwrap().set_warm_up(TimeSpan::from_nanos(nanos));
+            self.inner
+                .lock()
+                .unwrap()
+                .set_warm_up(TimeSpan::from_nanos(nanos));
             return Ok(());
         }
 
@@ -195,7 +198,10 @@ impl PyQcAlgorithm {
         } else {
             // Calendar days (TimeSpan overload without resolution).
             let nanos = n * 86_400 * 1_000_000_000i64;
-            self.inner.lock().unwrap().set_warm_up(TimeSpan::from_nanos(nanos));
+            self.inner
+                .lock()
+                .unwrap()
+                .set_warm_up(TimeSpan::from_nanos(nanos));
         }
         Ok(())
     }

@@ -110,7 +110,6 @@ impl Tick {
     pub fn is_quote(&self) -> bool {
         self.tick_type == TickType::Quote
     }
-
 }
 
 impl BaseData for Tick {

@@ -3,11 +3,11 @@
 ///
 /// Tests mirror the spirit of LEAN's C# RiskParityPortfolioConstructionModelTests.
 use lean_core::{Market, Symbol};
+use lean_portfolio_construction::models::risk_parity::risk_parity_optimize;
 use lean_portfolio_construction::{
     risk_contributions, IPortfolioConstructionModel, InsightDirection, InsightForPcm,
     RiskParityPortfolioConstructionModel,
 };
-use lean_portfolio_construction::models::risk_parity::risk_parity_optimize;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -164,10 +164,7 @@ fn risk_contributions_are_equal_after_optimization() {
 /// Weights must sum to 1.0 after optimization.
 #[test]
 fn weights_sum_to_one() {
-    let cov = vec![
-        vec![0.04, 0.01],
-        vec![0.01, 0.09],
-    ];
+    let cov = vec![vec![0.04, 0.01], vec![0.01, 0.09]];
     let weights = risk_parity_optimize(&cov, None, 1e-5, f64::MAX, 1e-11, 15_000);
     let sum: f64 = weights.iter().sum();
     assert!(
@@ -259,8 +256,14 @@ fn lower_vol_asset_gets_higher_allocation_in_pcm() {
         .unwrap_or(Decimal::ZERO);
 
     // Both should be positive (long-only by nature of risk parity)
-    assert!(spy_qty >= Decimal::ZERO, "SPY quantity should be non-negative");
-    assert!(tlt_qty >= Decimal::ZERO, "TLT quantity should be non-negative");
+    assert!(
+        spy_qty >= Decimal::ZERO,
+        "SPY quantity should be non-negative"
+    );
+    assert!(
+        tlt_qty >= Decimal::ZERO,
+        "TLT quantity should be non-negative"
+    );
 
     // The lower-vol asset (TLT) should have a higher portfolio weight
     // We compare portfolio value per asset (qty × price)
@@ -349,7 +352,10 @@ fn on_securities_changed_removes_symbol_data() {
 
     // Warm up with some data
     for i in 0..15 {
-        let prices = HashMap::from([("SPY".to_string(), Decimal::try_from(100.0 + i as f64).unwrap())]);
+        let prices = HashMap::from([(
+            "SPY".to_string(),
+            Decimal::try_from(100.0 + i as f64).unwrap(),
+        )]);
         let insights = vec![make_insight(spy.clone(), InsightDirection::Up)];
         model.create_targets(&insights, dec!(100_000), &prices);
     }

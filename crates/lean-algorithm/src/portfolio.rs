@@ -152,14 +152,10 @@ impl SecurityPortfolioManager {
     }
 
     pub fn get_holding_by_sid(&self, sid: u64) -> SecurityHolding {
-        self.holdings
-            .read()
-            .get(&sid)
-            .cloned()
-            .unwrap_or_else(|| {
-                let dummy = lean_core::Symbol::create_equity("UNKNOWN", &lean_core::Market::usa());
-                SecurityHolding::new(dummy)
-            })
+        self.holdings.read().get(&sid).cloned().unwrap_or_else(|| {
+            let dummy = lean_core::Symbol::create_equity("UNKNOWN", &lean_core::Market::usa());
+            SecurityHolding::new(dummy)
+        })
     }
 
     pub fn is_invested(&self, symbol: &Symbol) -> bool {

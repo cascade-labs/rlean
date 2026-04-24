@@ -136,7 +136,6 @@ impl QuoteBar {
         self.end_time = other.end_time;
         self.period = TimeSpan::from_nanos(self.end_time.0 - self.time.0);
     }
-
 }
 
 impl BaseData for QuoteBar {

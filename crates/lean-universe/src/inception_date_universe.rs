@@ -50,7 +50,10 @@ impl InceptionDateUniverseSelectionModel {
     }
 
     /// Build from a collection of (ticker, inception_date) pairs.
-    pub fn from_pairs(name: impl Into<String>, pairs: impl IntoIterator<Item = (String, NaiveDate)>) -> Self {
+    pub fn from_pairs(
+        name: impl Into<String>,
+        pairs: impl IntoIterator<Item = (String, NaiveDate)>,
+    ) -> Self {
         let mut model = Self::new(name);
         for (ticker, date) in pairs {
             model.add(ticker, date);
@@ -68,11 +71,7 @@ impl InceptionDateUniverseSelectionModel {
     /// change or on the very first call.
     pub fn select(&mut self, date: NaiveDate) -> Option<Vec<String>> {
         // Drain all pending tickers whose inception date has passed.
-        let ready_dates: Vec<NaiveDate> = self
-            .pending
-            .range(..=date)
-            .map(|(d, _)| *d)
-            .collect();
+        let ready_dates: Vec<NaiveDate> = self.pending.range(..=date).map(|(d, _)| *d).collect();
 
         if ready_dates.is_empty() && !self.active.is_empty() {
             return None; // Universe unchanged
@@ -119,25 +118,25 @@ impl LiquidEtfUniverse {
     pub fn energy() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-energy-etf-basket");
         let d = NaiveDate::from_ymd_opt;
-        m.add("XLE",  d(1998, 12, 22).unwrap());
-        m.add("IYE",  d(2000,  6, 16).unwrap());
-        m.add("VDE",  d(2004,  9, 29).unwrap());
-        m.add("USO",  d(2006,  4, 10).unwrap());
-        m.add("XES",  d(2006,  6, 22).unwrap());
-        m.add("XOP",  d(2006,  6, 22).unwrap());
-        m.add("UNG",  d(2007,  4, 18).unwrap());
-        m.add("ICLN", d(2008,  6, 25).unwrap());
-        m.add("ERX",  d(2008, 11,  6).unwrap());
-        m.add("ERY",  d(2008, 11,  6).unwrap());
-        m.add("SCO",  d(2008, 11, 25).unwrap());
-        m.add("UCO",  d(2008, 11, 25).unwrap());
-        m.add("AMJ",  d(2009,  6,  2).unwrap());
-        m.add("BNO",  d(2010,  6,  2).unwrap());
-        m.add("AMLP", d(2010,  8, 25).unwrap());
-        m.add("OIH",  d(2011, 12, 21).unwrap());
-        m.add("DGAZ", d(2012,  2,  8).unwrap());
-        m.add("UGAZ", d(2012,  2,  8).unwrap());
-        m.add("TAN",  d(2012,  2, 15).unwrap());
+        m.add("XLE", d(1998, 12, 22).unwrap());
+        m.add("IYE", d(2000, 6, 16).unwrap());
+        m.add("VDE", d(2004, 9, 29).unwrap());
+        m.add("USO", d(2006, 4, 10).unwrap());
+        m.add("XES", d(2006, 6, 22).unwrap());
+        m.add("XOP", d(2006, 6, 22).unwrap());
+        m.add("UNG", d(2007, 4, 18).unwrap());
+        m.add("ICLN", d(2008, 6, 25).unwrap());
+        m.add("ERX", d(2008, 11, 6).unwrap());
+        m.add("ERY", d(2008, 11, 6).unwrap());
+        m.add("SCO", d(2008, 11, 25).unwrap());
+        m.add("UCO", d(2008, 11, 25).unwrap());
+        m.add("AMJ", d(2009, 6, 2).unwrap());
+        m.add("BNO", d(2010, 6, 2).unwrap());
+        m.add("AMLP", d(2010, 8, 25).unwrap());
+        m.add("OIH", d(2011, 12, 21).unwrap());
+        m.add("DGAZ", d(2012, 2, 8).unwrap());
+        m.add("UGAZ", d(2012, 2, 8).unwrap());
+        m.add("TAN", d(2012, 2, 15).unwrap());
         m
     }
 
@@ -146,19 +145,19 @@ impl LiquidEtfUniverse {
     pub fn metals() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-metals-etf-basket");
         let d = NaiveDate::from_ymd_opt;
-        m.add("GLD",  d(2004, 11, 18).unwrap());
-        m.add("IAU",  d(2005,  1, 28).unwrap());
-        m.add("SLV",  d(2006,  4, 28).unwrap());
-        m.add("GDX",  d(2006,  5, 22).unwrap());
-        m.add("AGQ",  d(2008, 12,  4).unwrap());
+        m.add("GLD", d(2004, 11, 18).unwrap());
+        m.add("IAU", d(2005, 1, 28).unwrap());
+        m.add("SLV", d(2006, 4, 28).unwrap());
+        m.add("GDX", d(2006, 5, 22).unwrap());
+        m.add("AGQ", d(2008, 12, 4).unwrap());
         m.add("GDXJ", d(2009, 11, 11).unwrap());
-        m.add("PPLT", d(2010,  1,  8).unwrap());
-        m.add("NUGT", d(2010, 12,  8).unwrap());
-        m.add("DUST", d(2010, 12,  8).unwrap());
+        m.add("PPLT", d(2010, 1, 8).unwrap());
+        m.add("NUGT", d(2010, 12, 8).unwrap());
+        m.add("DUST", d(2010, 12, 8).unwrap());
         m.add("USLV", d(2011, 10, 17).unwrap());
         m.add("UGLD", d(2011, 10, 17).unwrap());
-        m.add("JNUG", d(2013, 10,  3).unwrap());
-        m.add("JDST", d(2013, 10,  3).unwrap());
+        m.add("JNUG", d(2013, 10, 3).unwrap());
+        m.add("JDST", d(2013, 10, 3).unwrap());
         m
     }
 
@@ -167,21 +166,21 @@ impl LiquidEtfUniverse {
     pub fn technology() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-technology-etf-basket");
         let d = NaiveDate::from_ymd_opt;
-        m.add("XLK",  d(1998, 12, 22).unwrap());
-        m.add("QQQ",  d(1999,  3, 10).unwrap());
-        m.add("SOXX", d(2001,  7, 13).unwrap());
-        m.add("IGV",  d(2001,  7, 13).unwrap());
-        m.add("VGT",  d(2004,  1, 30).unwrap());
-        m.add("QTEC", d(2006,  4, 25).unwrap());
-        m.add("FDN",  d(2006,  6, 23).unwrap());
-        m.add("FXL",  d(2007,  5, 10).unwrap());
+        m.add("XLK", d(1998, 12, 22).unwrap());
+        m.add("QQQ", d(1999, 3, 10).unwrap());
+        m.add("SOXX", d(2001, 7, 13).unwrap());
+        m.add("IGV", d(2001, 7, 13).unwrap());
+        m.add("VGT", d(2004, 1, 30).unwrap());
+        m.add("QTEC", d(2006, 4, 25).unwrap());
+        m.add("FDN", d(2006, 6, 23).unwrap());
+        m.add("FXL", d(2007, 5, 10).unwrap());
         m.add("TECL", d(2008, 12, 17).unwrap());
         m.add("TECS", d(2008, 12, 17).unwrap());
-        m.add("SOXL", d(2010,  3, 11).unwrap());
-        m.add("SOXS", d(2010,  3, 11).unwrap());
-        m.add("SKYY", d(2011,  7,  6).unwrap());
-        m.add("SMH",  d(2011, 12, 21).unwrap());
-        m.add("KWEB", d(2013,  8,  1).unwrap());
+        m.add("SOXL", d(2010, 3, 11).unwrap());
+        m.add("SOXS", d(2010, 3, 11).unwrap());
+        m.add("SKYY", d(2011, 7, 6).unwrap());
+        m.add("SMH", d(2011, 12, 21).unwrap());
+        m.add("KWEB", d(2013, 8, 1).unwrap());
         m.add("FTEC", d(2013, 10, 24).unwrap());
         m
     }
@@ -191,26 +190,26 @@ impl LiquidEtfUniverse {
     pub fn us_treasuries() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-us-treasuries-etf-basket");
         let d = NaiveDate::from_ymd_opt;
-        m.add("IEF",  d(2002,  7, 26).unwrap());
-        m.add("SHY",  d(2002,  7, 26).unwrap());
-        m.add("TLT",  d(2002,  7, 26).unwrap());
-        m.add("IEI",  d(2007,  1, 11).unwrap());
-        m.add("SHV",  d(2007,  1, 11).unwrap());
-        m.add("TLH",  d(2007,  1, 11).unwrap());
-        m.add("EDV",  d(2007, 12, 10).unwrap());
-        m.add("BIL",  d(2007,  5, 30).unwrap());
-        m.add("SPTL", d(2007,  5, 30).unwrap());
-        m.add("TBT",  d(2008,  5,  1).unwrap());
-        m.add("TMF",  d(2009,  4, 16).unwrap());
-        m.add("TMV",  d(2009,  4, 16).unwrap());
-        m.add("TBF",  d(2009,  8, 20).unwrap());
+        m.add("IEF", d(2002, 7, 26).unwrap());
+        m.add("SHY", d(2002, 7, 26).unwrap());
+        m.add("TLT", d(2002, 7, 26).unwrap());
+        m.add("IEI", d(2007, 1, 11).unwrap());
+        m.add("SHV", d(2007, 1, 11).unwrap());
+        m.add("TLH", d(2007, 1, 11).unwrap());
+        m.add("EDV", d(2007, 12, 10).unwrap());
+        m.add("BIL", d(2007, 5, 30).unwrap());
+        m.add("SPTL", d(2007, 5, 30).unwrap());
+        m.add("TBT", d(2008, 5, 1).unwrap());
+        m.add("TMF", d(2009, 4, 16).unwrap());
+        m.add("TMV", d(2009, 4, 16).unwrap());
+        m.add("TBF", d(2009, 8, 20).unwrap());
         m.add("VGSH", d(2009, 11, 23).unwrap());
         m.add("VGIT", d(2009, 11, 23).unwrap());
         m.add("VGLT", d(2009, 11, 24).unwrap());
-        m.add("SCHO", d(2010,  8,  6).unwrap());
-        m.add("SCHR", d(2010,  8,  6).unwrap());
-        m.add("SPTS", d(2011, 12,  1).unwrap());
-        m.add("GOVT", d(2012,  2, 24).unwrap());
+        m.add("SCHO", d(2010, 8, 6).unwrap());
+        m.add("SCHR", d(2010, 8, 6).unwrap());
+        m.add("SPTS", d(2011, 12, 1).unwrap());
+        m.add("GOVT", d(2012, 2, 24).unwrap());
         m
     }
 
@@ -219,13 +218,13 @@ impl LiquidEtfUniverse {
     pub fn volatility() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-volatility-etf-basket");
         let d = NaiveDate::from_ymd_opt;
-        m.add("SQQQ", d(2010,  2, 11).unwrap());
-        m.add("TQQQ", d(2010,  2, 11).unwrap());
+        m.add("SQQQ", d(2010, 2, 11).unwrap());
+        m.add("TQQQ", d(2010, 2, 11).unwrap());
         m.add("TVIX", d(2010, 11, 30).unwrap());
-        m.add("VIXY", d(2011,  1,  4).unwrap());
-        m.add("SPLV", d(2011,  5,  5).unwrap());
-        m.add("SVXY", d(2011, 10,  4).unwrap());
-        m.add("UVXY", d(2011, 10,  4).unwrap());
+        m.add("VIXY", d(2011, 1, 4).unwrap());
+        m.add("SPLV", d(2011, 5, 5).unwrap());
+        m.add("SVXY", d(2011, 10, 4).unwrap());
+        m.add("UVXY", d(2011, 10, 4).unwrap());
         m.add("EEMV", d(2011, 10, 20).unwrap());
         m.add("EFAV", d(2011, 10, 20).unwrap());
         m.add("USMV", d(2011, 10, 20).unwrap());
@@ -237,7 +236,9 @@ impl LiquidEtfUniverse {
     pub fn sp500_sectors() -> InceptionDateUniverseSelectionModel {
         let mut m = InceptionDateUniverseSelectionModel::new("qc-sp500-sectors-etf-basket");
         let inception = NaiveDate::from_ymd_opt(1998, 12, 22).unwrap();
-        for ticker in &["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"] {
+        for ticker in &[
+            "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY",
+        ] {
             m.add(*ticker, inception);
         }
         m

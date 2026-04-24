@@ -25,14 +25,14 @@ fn pearson_correlation(x: &[f64], y: &[f64]) -> Option<f64> {
     let mean_x = x.iter().sum::<f64>() / n_f;
     let mean_y = y.iter().sum::<f64>() / n_f;
 
-    let (cov, var_x, var_y) = x.iter().zip(y.iter()).fold(
-        (0.0_f64, 0.0_f64, 0.0_f64),
-        |(cov, vx, vy), (&xi, &yi)| {
-            let dx = xi - mean_x;
-            let dy = yi - mean_y;
-            (cov + dx * dy, vx + dx * dx, vy + dy * dy)
-        },
-    );
+    let (cov, var_x, var_y) =
+        x.iter()
+            .zip(y.iter())
+            .fold((0.0_f64, 0.0_f64, 0.0_f64), |(cov, vx, vy), (&xi, &yi)| {
+                let dx = xi - mean_x;
+                let dy = yi - mean_y;
+                (cov + dx * dy, vx + dx * dx, vy + dy * dy)
+            });
 
     if var_x == 0.0 || var_y == 0.0 {
         return None;
@@ -129,20 +129,10 @@ impl SymbolWindow {
 
     /// Return log-returns for the price series (length = prices.len() - 1).
     fn log_returns(&self) -> Vec<f64> {
-        let p: Vec<f64> = self
-            .prices
-            .iter()
-            .map(|d| d.to_f64_lossy())
-            .collect();
+        let p: Vec<f64> = self.prices.iter().map(|d| d.to_f64_lossy()).collect();
 
         p.windows(2)
-            .map(|w| {
-                if w[0] > 0.0 {
-                    (w[1] / w[0]).ln()
-                } else {
-                    0.0
-                }
-            })
+            .map(|w| if w[0] > 0.0 { (w[1] / w[0]).ln() } else { 0.0 })
             .collect()
     }
 }
@@ -281,11 +271,19 @@ impl IAlphaModel for PearsonCorrelationPairsTradingAlphaModel {
         };
 
         // Need prices for both symbols.
-        let price_a = match self.windows.get(&sid_a).and_then(|w| w.prices.back().copied()) {
+        let price_a = match self
+            .windows
+            .get(&sid_a)
+            .and_then(|w| w.prices.back().copied())
+        {
             Some(p) => p,
             None => return vec![],
         };
-        let price_b = match self.windows.get(&sid_b).and_then(|w| w.prices.back().copied()) {
+        let price_b = match self
+            .windows
+            .get(&sid_b)
+            .and_then(|w| w.prices.back().copied())
+        {
             Some(p) => p,
             None => return vec![],
         };
@@ -295,7 +293,10 @@ impl IAlphaModel for PearsonCorrelationPairsTradingAlphaModel {
         }
 
         let ratio = (price_a / price_b).to_f64_lossy();
-        let pair_data = self.pairs.entry((sid_a, sid_b)).or_insert_with(PairData::new);
+        let pair_data = self
+            .pairs
+            .entry((sid_a, sid_b))
+            .or_insert_with(PairData::new);
 
         let prev_state = pair_data.state;
         let new_state = pair_data.update(ratio, self.threshold_pct);

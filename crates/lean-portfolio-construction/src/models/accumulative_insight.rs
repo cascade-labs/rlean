@@ -172,7 +172,12 @@ impl AccumulativeInsightPortfolioConstructionModel {
 
             let pct = pct_per_symbol.unwrap_or(Decimal::ZERO);
             let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
-            targets.push(PortfolioTarget::percent(sym.clone(), pct, portfolio_value, price));
+            targets.push(PortfolioTarget::percent(
+                sym.clone(),
+                pct,
+                portfolio_value,
+                price,
+            ));
         }
 
         targets
@@ -233,10 +238,7 @@ mod tests {
     }
 
     fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     /// 3 % of 100_000 at price 100 = 3000 → qty = 30
@@ -261,7 +263,11 @@ mod tests {
             PORTFOLIO,
             &prices,
         );
-        let qty1 = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
+        let qty1 = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
         assert_eq!(qty1, dec!(30), "first Up: expected qty=30, got {}", qty1);
 
         // Second Up insight → pct = 0.06, qty = 60
@@ -276,7 +282,11 @@ mod tests {
             PORTFOLIO,
             &prices,
         );
-        let qty2 = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
+        let qty2 = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
         assert_eq!(qty2, dec!(60), "second Up: expected qty=60, got {}", qty2);
     }
 
@@ -294,14 +304,27 @@ mod tests {
         pcm.push_insight(spy.clone(), InsightDirection::Flat, None);
 
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
-        let qty = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
+        let qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
         assert_eq!(qty, dec!(30), "after Flat: expected qty=30, got {}", qty);
 
         // Second Flat: reduce to 0
         pcm.push_insight(spy.clone(), InsightDirection::Flat, None);
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
-        let qty = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
-        assert_eq!(qty, dec!(0), "after second Flat: expected qty=0, got {}", qty);
+        let qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
+        assert_eq!(
+            qty,
+            dec!(0),
+            "after second Flat: expected qty=0, got {}",
+            qty
+        );
     }
 
     #[test]
@@ -317,9 +340,18 @@ mod tests {
         pcm.push_insight(spy.clone(), InsightDirection::Up, Some(2_000));
 
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
-        let qty = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
+        let qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
         // Only the second insight is active → pct=0.03, qty=30
-        assert_eq!(qty, dec!(30), "expired insight excluded: expected qty=30, got {}", qty);
+        assert_eq!(
+            qty,
+            dec!(30),
+            "expired insight excluded: expected qty=30, got {}",
+            qty
+        );
     }
 
     #[test]
@@ -335,8 +367,16 @@ mod tests {
         pcm.push_insight(ibm.clone(), InsightDirection::Down, None);
 
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
-        let spy_qty = targets.iter().find(|t| t.symbol.value == "SPY").unwrap().quantity;
-        let ibm_qty = targets.iter().find(|t| t.symbol.value == "IBM").unwrap().quantity;
+        let spy_qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "SPY")
+            .unwrap()
+            .quantity;
+        let ibm_qty = targets
+            .iter()
+            .find(|t| t.symbol.value == "IBM")
+            .unwrap()
+            .quantity;
 
         assert_eq!(spy_qty, dec!(60), "SPY: expected 60, got {}", spy_qty);
         assert_eq!(ibm_qty, dec!(-30), "IBM: expected -30, got {}", ibm_qty);

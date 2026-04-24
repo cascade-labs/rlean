@@ -1170,7 +1170,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     .update_price(&qbar.symbol, mid);
                                 portfolio.update_prices(&qbar.symbol, mid);
                             }
-                            if let std::collections::hash_map::Entry::Vacant(e) = bars_for_orders.entry(sid) {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                bars_for_orders.entry(sid)
+                            {
                                 if let Some(synth) = synthesize_trade_bar_from_quote_bar(&qbar) {
                                     e.insert(synth);
                                 }
@@ -1181,7 +1183,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                         if let Some(ticks) = ticks_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
                             if !ticks.is_empty() {
-                                if let std::collections::hash_map::Entry::Vacant(e) = bars_for_orders.entry(sid) {
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    bars_for_orders.entry(sid)
+                                {
                                     if let Some(synth) = synthesize_trade_bar_from_ticks(
                                         &sub.symbol,
                                         utc_time,
@@ -1461,8 +1465,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         split_ratios_today.insert(*sid, ratio);
                         let holding = portfolio.get_holding_by_sid(*sid);
                         if holding.is_invested() {
-                            let new_qty = holding.quantity
-                                * Decimal::from_f64(ratio).unwrap_or(Decimal::ONE);
+                            let new_qty =
+                                holding.quantity * Decimal::from_f64(ratio).unwrap_or(Decimal::ONE);
                             let new_avg = if ratio != 0.0 {
                                 holding.average_price
                                     / Decimal::from_f64(ratio).unwrap_or(Decimal::ONE)
@@ -1711,10 +1715,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                 // Check for rename (ticker change between yesterday and today)
                 let today_ticker = ticker_at_date(rows, current_date);
-                let yesterday_ticker = ticker_at_date(
-                    rows,
-                    current_date - chrono::Duration::days(1),
-                );
+                let yesterday_ticker =
+                    ticker_at_date(rows, current_date - chrono::Duration::days(1));
                 if let (Some(old), Some(new)) = (yesterday_ticker, today_ticker) {
                     if old != new {
                         let ev = SymbolChangedEvent::new(
@@ -1724,10 +1726,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             new.to_string(),
                         );
                         slice.add_symbol_changed(ev);
-                        info!(
-                            "Symbol rename: {} → {} on {}",
-                            old, new, current_date
-                        );
+                        info!("Symbol rename: {} → {} on {}", old, new, current_date);
                     }
                 }
 
@@ -1748,9 +1747,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             let qty = -holding.quantity;
                             adapter.inner.lock().unwrap().market_order(&sub.symbol, qty);
                         }
-                    } else if current_date
-                        == delist_date + chrono::Duration::days(1)
-                    {
+                    } else if current_date == delist_date + chrono::Duration::days(1) {
                         slice.add_delisting(Delisting::new(
                             sub.symbol.clone(),
                             utc_time,
@@ -2991,7 +2988,9 @@ fn load_custom_data_points(
 /// Rows are sorted newest-first; the first row whose date <= query_date is the
 /// active mapping for that date.
 fn ticker_at_date(rows: &[MapFileEntry], date: NaiveDate) -> Option<&str> {
-    rows.iter().find(|r| r.date <= date).map(|r| r.ticker.as_str())
+    rows.iter()
+        .find(|r| r.date <= date)
+        .map(|r| r.ticker.as_str())
 }
 
 /// Return the delisting date from a map file (first / newest row), if the
@@ -3000,9 +2999,7 @@ fn ticker_at_date(rows: &[MapFileEntry], date: NaiveDate) -> Option<&str> {
 /// LEAN convention: if the newest row's date is before 2049, it is a real
 /// delisting date.  Far-future sentinels (year >= 2049) indicate active.
 fn delisting_date(rows: &[MapFileEntry]) -> Option<NaiveDate> {
-    rows.first()
-        .map(|r| r.date)
-        .filter(|d| d.year() < 2049)
+    rows.first().map(|r| r.date).filter(|d| d.year() < 2049)
 }
 
 /// factor-file row whose date is strictly earlier than `bar_date`.
@@ -3012,7 +3009,11 @@ fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64)
         return (1.0, 1.0);
     }
     // Most-recent row strictly before bar_date.
-    if let Some(row) = rows.iter().filter(|r| r.date < bar_date).max_by_key(|r| r.date) {
+    if let Some(row) = rows
+        .iter()
+        .filter(|r| r.date < bar_date)
+        .max_by_key(|r| r.date)
+    {
         return (row.price_factor, row.split_factor);
     }
     // bar_date predates every row in the factor file.  Extend the oldest
@@ -3243,40 +3244,88 @@ mod factor_tests {
         //   bar <= 2023-01-14          : 0.0875 (oldest row, backward extension)
 
         // After last real action (before sentinel) → still that action's factor
-        assert!((psf(2024, 1, 9) - 0.9).abs() < 1e-9, "bar after last action row → 0.9");
-        assert!((psf(2024, 1, 8) - 0.9).abs() < 1e-9, "day after last action row → 0.9");
+        assert!(
+            (psf(2024, 1, 9) - 0.9).abs() < 1e-9,
+            "bar after last action row → 0.9"
+        );
+        assert!(
+            (psf(2024, 1, 8) - 0.9).abs() < 1e-9,
+            "day after last action row → 0.9"
+        );
 
         // ON the last action row date → falls back to prev row
-        assert!((psf(2024, 1, 7) - 0.8).abs() < 1e-9, "ON 2024-01-07 row → prev row 0.8");
+        assert!(
+            (psf(2024, 1, 7) - 0.8).abs() < 1e-9,
+            "ON 2024-01-07 row → prev row 0.8"
+        );
 
         // Between 2023-12-31 and 2024-01-07 rows → 2023-12-31 row (div, sf=1.0)
-        assert!((psf(2024, 1, 6) - 0.8).abs() < 1e-9, "2024-01-06 → 2023-12-31 row 0.8");
-        assert!((psf(2024, 1, 1) - 0.8).abs() < 1e-9, "2024-01-01 → 2023-12-31 row 0.8");
+        assert!(
+            (psf(2024, 1, 6) - 0.8).abs() < 1e-9,
+            "2024-01-06 → 2023-12-31 row 0.8"
+        );
+        assert!(
+            (psf(2024, 1, 1) - 0.8).abs() < 1e-9,
+            "2024-01-01 → 2023-12-31 row 0.8"
+        );
 
         // ON 2023-12-31 row → falls back to 2023-12-24 row (split 2:1, combined=0.4)
-        assert!((psf(2023, 12, 31) - 0.4).abs() < 1e-9, "ON 2023-12-31 row → 0.4");
+        assert!(
+            (psf(2023, 12, 31) - 0.4).abs() < 1e-9,
+            "ON 2023-12-31 row → 0.4"
+        );
 
         // Between 2023-12-24 and 2023-12-31 rows → 2023-12-24 (split 2:1, combined=0.4)
-        assert!((psf(2023, 12, 30) - 0.4).abs() < 1e-9, "2023-12-30 → 2023-12-24 row 0.4");
-        assert!((psf(2023, 12, 25) - 0.4).abs() < 1e-9, "2023-12-25 → 2023-12-24 row 0.4");
+        assert!(
+            (psf(2023, 12, 30) - 0.4).abs() < 1e-9,
+            "2023-12-30 → 2023-12-24 row 0.4"
+        );
+        assert!(
+            (psf(2023, 12, 25) - 0.4).abs() < 1e-9,
+            "2023-12-25 → 2023-12-24 row 0.4"
+        );
 
         // ON 2023-12-24 row → falls to 2023-10-16 (split 4:1, combined=0.2)
-        assert!((psf(2023, 12, 24) - 0.2).abs() < 1e-9, "ON 2023-12-24 row → 0.2");
+        assert!(
+            (psf(2023, 12, 24) - 0.2).abs() < 1e-9,
+            "ON 2023-12-24 row → 0.2"
+        );
 
         // Between 2023-10-16 and 2023-12-24 rows → 2023-10-16 row (split 4:1, combined=0.2)
-        assert!((psf(2023, 12, 1) - 0.2).abs() < 1e-9, "2023-12-01 → 2023-10-16 row 0.2");
-        assert!((psf(2023, 10, 17) - 0.2).abs() < 1e-9, "2023-10-17 → 2023-10-16 row 0.2");
+        assert!(
+            (psf(2023, 12, 1) - 0.2).abs() < 1e-9,
+            "2023-12-01 → 2023-10-16 row 0.2"
+        );
+        assert!(
+            (psf(2023, 10, 17) - 0.2).abs() < 1e-9,
+            "2023-10-17 → 2023-10-16 row 0.2"
+        );
 
         // ON 2023-10-16 row → falls to 2023-01-14 (oldest row, combined=0.0875)
-        assert!((psf(2023, 10, 16) - 0.0875).abs() < 1e-9, "ON 2023-10-16 row → 0.0875");
+        assert!(
+            (psf(2023, 10, 16) - 0.0875).abs() < 1e-9,
+            "ON 2023-10-16 row → 0.0875"
+        );
 
         // Between first row and 2023-10-16 row → 2023-01-14 row (combined=0.0875)
-        assert!((psf(2023, 5, 1) - 0.0875).abs() < 1e-9, "2023-05-01 → first row 0.0875");
-        assert!((psf(2023, 1, 15) - 0.0875).abs() < 1e-9, "day after first row → 0.0875");
+        assert!(
+            (psf(2023, 5, 1) - 0.0875).abs() < 1e-9,
+            "2023-05-01 → first row 0.0875"
+        );
+        assert!(
+            (psf(2023, 1, 15) - 0.0875).abs() < 1e-9,
+            "day after first row → 0.0875"
+        );
 
         // ON first row date and before → backward extension of oldest factor
-        assert!((psf(2023, 1, 14) - 0.0875).abs() < 1e-9, "ON first row → backward ext 0.0875");
-        assert!((psf(2020, 1, 1) - 0.0875).abs() < 1e-9, "before first row → backward ext 0.0875");
+        assert!(
+            (psf(2023, 1, 14) - 0.0875).abs() < 1e-9,
+            "ON first row → backward ext 0.0875"
+        );
+        assert!(
+            (psf(2020, 1, 1) - 0.0875).abs() < 1e-9,
+            "before first row → backward ext 0.0875"
+        );
     }
 
     /// Mirrors C# HasSplitEventOnNextTradingDay.
@@ -3291,13 +3340,22 @@ mod factor_tests {
         // 2023-12-24 row: sf=0.5 (2:1 split).  Appears for the first time on bar 2023-12-25.
         let (_, sf_before) = factor_for_entry(&rows, d(2023, 12, 24)); // ON row date → prev row
         let (_, sf_on_plus_one) = factor_for_entry(&rows, d(2023, 12, 25)); // 1 day after → this row
-        assert!((sf_before - 0.25).abs() < 1e-9, "day before split takes effect: sf=0.25");
-        assert!((sf_on_plus_one - 0.5).abs() < 1e-9, "day split takes effect: sf=0.5");
+        assert!(
+            (sf_before - 0.25).abs() < 1e-9,
+            "day before split takes effect: sf=0.25"
+        );
+        assert!(
+            (sf_on_plus_one - 0.5).abs() < 1e-9,
+            "day split takes effect: sf=0.5"
+        );
 
         // 2023-10-16 row: sf=0.25 (4:1 split).  First appears on bar 2023-10-17.
         let (_, sf_before2) = factor_for_entry(&rows, d(2023, 10, 16));
         let (_, sf_after2) = factor_for_entry(&rows, d(2023, 10, 17));
-        assert!((sf_before2 - 0.125).abs() < 1e-9, "before 4:1 split: sf=0.125");
+        assert!(
+            (sf_before2 - 0.125).abs() < 1e-9,
+            "before 4:1 split: sf=0.125"
+        );
         assert!((sf_after2 - 0.25).abs() < 1e-9, "after 4:1 split: sf=0.25");
     }
 
@@ -3311,8 +3369,14 @@ mod factor_tests {
         // Bar on 2024-01-07 → uses prev row (pf=0.8), bar on 2024-01-08 → uses this row (pf=0.9).
         let (pf_on_row, _) = factor_for_entry(&rows, d(2024, 1, 7));
         let (pf_next_day, _) = factor_for_entry(&rows, d(2024, 1, 8));
-        assert!((pf_on_row - 0.8).abs() < 1e-9, "on div row date: still old pf=0.8");
-        assert!((pf_next_day - 0.9).abs() < 1e-9, "day after div row: new pf=0.9");
+        assert!(
+            (pf_on_row - 0.8).abs() < 1e-9,
+            "on div row date: still old pf=0.8"
+        );
+        assert!(
+            (pf_next_day - 0.9).abs() < 1e-9,
+            "day after div row: new pf=0.9"
+        );
     }
 
     /// Split factor backward extension:  if the backtest starts before any split occurred,
@@ -3336,7 +3400,10 @@ mod factor_tests {
         use rust_decimal_macros::dec;
 
         // A 2:1 split (sf=0.5) should DOUBLE the volume on pre-split bars.
-        let rows = vec![entry_split(2023, 12, 24, 1.0, 0.5), entry_split(2050, 12, 31, 1.0, 1.0)];
+        let rows = vec![
+            entry_split(2023, 12, 24, 1.0, 0.5),
+            entry_split(2050, 12, 31, 1.0, 1.0),
+        ];
 
         let sym = lean_core::Symbol::create_equity("SPY", &lean_core::Market::usa());
         let bar = TradeBar::new(

@@ -74,8 +74,14 @@ fn warm_up_model(
 /// With insufficient price history the model should return empty targets.
 #[test]
 fn returns_empty_when_not_enough_history() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 63, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        63,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     let spy = make_equity("SPY");
     let insights = vec![make_insight(spy.clone(), InsightDirection::Up, 0.05)];
@@ -92,8 +98,14 @@ fn returns_empty_when_not_enough_history() {
 /// With a single bullish view, the model should return a positive (long) weight.
 #[test]
 fn bullish_view_produces_positive_weight() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     let spy = make_equity("SPY");
     let agg = make_equity("AGG");
@@ -110,7 +122,10 @@ fn bullish_view_produces_positive_weight() {
     ];
 
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
-    assert!(!targets.is_empty(), "Should produce targets with sufficient history");
+    assert!(
+        !targets.is_empty(),
+        "Should produce targets with sufficient history"
+    );
 
     let spy_target = targets.iter().find(|t| t.symbol.value == "SPY");
     assert!(spy_target.is_some(), "SPY should have a target");
@@ -127,8 +142,14 @@ fn bullish_view_produces_positive_weight() {
 /// Long-only bias: all weights should be non-negative.
 #[test]
 fn long_only_bias_produces_non_negative_weights() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::Long);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::Long,
+    );
 
     warm_up_model(&mut model, &["SPY", "IEF", "GLD"], 50);
 
@@ -170,8 +191,14 @@ fn model_name_matches_lean() {
 /// incorporated and targets are produced for both assets.
 #[test]
 fn multiple_source_models_produce_targets_for_each() {
-    let mut model =
-        BlackLittermanOptimizationPortfolioConstructionModel::with_params(1, 30, 0.0, 2.5, 0.05, PortfolioBias::LongShort);
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::LongShort,
+    );
 
     warm_up_model(&mut model, &["SPY", "TLT"], 50);
 
@@ -199,11 +226,7 @@ fn multiple_source_models_produce_targets_for_each() {
     ];
 
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
-    assert_eq!(
-        targets.len(),
-        2,
-        "Should produce a target for each insight"
-    );
+    assert_eq!(targets.len(), 2, "Should produce a target for each insight");
 }
 
 /// Empty insights always produce empty targets (no panic).

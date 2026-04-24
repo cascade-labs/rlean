@@ -114,9 +114,15 @@ mod historical_returns_tests {
         model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // Bar 0: $100
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
+        model.update(
+            &slice_with_bar(&sym, 0, dec!(100)),
+            std::slice::from_ref(&sym),
+        );
         // Bar 1: $110 → ROC = 10% > 0 → Up
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
+        let insights = model.update(
+            &slice_with_bar(&sym, DAY_NS, dec!(110)),
+            std::slice::from_ref(&sym),
+        );
 
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].direction, InsightDirection::Up);
@@ -134,8 +140,14 @@ mod historical_returns_tests {
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
         model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(90)), std::slice::from_ref(&sym));
+        model.update(
+            &slice_with_bar(&sym, 0, dec!(100)),
+            std::slice::from_ref(&sym),
+        );
+        let insights = model.update(
+            &slice_with_bar(&sym, DAY_NS, dec!(90)),
+            std::slice::from_ref(&sym),
+        );
 
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].direction, InsightDirection::Down);
@@ -152,13 +164,16 @@ mod historical_returns_tests {
         let mut model = HistoricalReturnsAlphaModel::new(1, period);
         model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(100)), std::slice::from_ref(&sym));
-
-        assert!(
-            insights.is_empty(),
-            "flat ROC should not emit an insight"
+        model.update(
+            &slice_with_bar(&sym, 0, dec!(100)),
+            std::slice::from_ref(&sym),
         );
+        let insights = model.update(
+            &slice_with_bar(&sym, DAY_NS, dec!(100)),
+            std::slice::from_ref(&sym),
+        );
+
+        assert!(insights.is_empty(), "flat ROC should not emit an insight");
     }
 
     // -----------------------------------------------------------------------
@@ -173,8 +188,14 @@ mod historical_returns_tests {
         model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // 100 → 110: ROC = 10% = 0.10
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
+        model.update(
+            &slice_with_bar(&sym, 0, dec!(100)),
+            std::slice::from_ref(&sym),
+        );
+        let insights = model.update(
+            &slice_with_bar(&sym, DAY_NS, dec!(110)),
+            std::slice::from_ref(&sym),
+        );
 
         assert_eq!(insights.len(), 1);
         let mag = insights[0].magnitude.expect("magnitude should be set");
@@ -202,7 +223,10 @@ mod historical_returns_tests {
         let prices = [dec!(100), dec!(105), dec!(95), dec!(120)];
         let mut insights_final = vec![];
         for (i, &p) in prices.iter().enumerate() {
-            let ins = model.update(&slice_with_bar(&sym, i as i64 * DAY_NS, p), std::slice::from_ref(&sym));
+            let ins = model.update(
+                &slice_with_bar(&sym, i as i64 * DAY_NS, p),
+                std::slice::from_ref(&sym),
+            );
             if i == 3 {
                 insights_final = ins;
             } else {
@@ -226,14 +250,23 @@ mod historical_returns_tests {
         model.on_securities_changed(std::slice::from_ref(&sym), &[]);
 
         // Warm up
-        model.update(&slice_with_bar(&sym, 0, dec!(100)), std::slice::from_ref(&sym));
+        model.update(
+            &slice_with_bar(&sym, 0, dec!(100)),
+            std::slice::from_ref(&sym),
+        );
 
         // Remove the security
         model.on_securities_changed(&[], std::slice::from_ref(&sym));
 
         // A further bar should produce no insights
-        let insights = model.update(&slice_with_bar(&sym, DAY_NS, dec!(110)), std::slice::from_ref(&sym));
-        assert!(insights.is_empty(), "removed security must not emit insights");
+        let insights = model.update(
+            &slice_with_bar(&sym, DAY_NS, dec!(110)),
+            std::slice::from_ref(&sym),
+        );
+        assert!(
+            insights.is_empty(),
+            "removed security must not emit insights"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -359,7 +392,11 @@ mod pearson_pairs_tests {
             let pb = rust_decimal::Decimal::from(200u32);
             let s = slice_with_two_bars(&sym_a, &sym_b, i as i64 * DAY_NS, pa, pb);
             let ins = model.update(&s, &[sym_a.clone(), sym_b.clone()]);
-            assert!(ins.is_empty(), "should not emit before EMA warm-up (bar {})", i);
+            assert!(
+                ins.is_empty(),
+                "should not emit before EMA warm-up (bar {})",
+                i
+            );
         }
     }
 
@@ -493,8 +530,7 @@ mod pearson_pairs_tests {
             let ins = model.update(&s, &[sym_b.clone(), sym_c.clone()]);
             for insight in &ins {
                 assert_ne!(
-                    insight.symbol,
-                    sym_a,
+                    insight.symbol, sym_a,
                     "removed symbol should not appear in insights"
                 );
             }

@@ -111,10 +111,7 @@ fn cmd_get(key: &str) -> Result<()> {
         }
         "data-folder" => {
             let cfg = GlobalConfig::load()?;
-            println!(
-                "{}",
-                cfg.data_folder.as_deref().unwrap_or("data")
-            );
+            println!("{}", cfg.data_folder.as_deref().unwrap_or("data"));
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \

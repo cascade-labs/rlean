@@ -41,10 +41,8 @@ impl IPortfolioConstructionModel for ConfidenceWeightingPortfolioConstructionMod
         prices: &HashMap<String, Decimal>,
     ) -> Vec<PortfolioTarget> {
         // Key difference vs InsightWeighting: skip insights with no confidence value.
-        let eligible: Vec<&InsightForPcm> = insights
-            .iter()
-            .filter(|i| i.confidence.is_some())
-            .collect();
+        let eligible: Vec<&InsightForPcm> =
+            insights.iter().filter(|i| i.confidence.is_some()).collect();
 
         if eligible.is_empty() {
             return Vec::new();
@@ -104,10 +102,7 @@ mod tests {
     }
 
     fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     #[test]
