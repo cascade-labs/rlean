@@ -63,7 +63,7 @@ fn main() {
 
     // ── CRITICAL: register AlgorithmImports module BEFORE starting Python ────
     pyo3::append_to_inittab!(AlgorithmImports);
-    pyo3::prepare_freethreaded_python();
+    pyo3::Python::initialize();
 
     // ── run backtest ─────────────────────────────────────────────────────────
     let config = RunConfig {

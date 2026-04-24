@@ -242,9 +242,9 @@ async fn run_python_backtest(
     use lean_python::AlgorithmImports;
 
     // Register the AlgorithmImports PyO3 module before starting Python.
-    // Must be called before prepare_freethreaded_python.
+    // Must be called before Python::initialize.
     pyo3::append_to_inittab!(AlgorithmImports);
-    pyo3::prepare_freethreaded_python();
+    pyo3::Python::initialize();
 
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")

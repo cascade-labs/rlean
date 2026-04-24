@@ -215,10 +215,10 @@ pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
 
     // Register AlgorithmImports before Python initialises.
     pyo3::append_to_inittab!(AlgorithmImports);
-    pyo3::prepare_freethreaded_python();
+    pyo3::Python::initialize();
 
     // Create persistent globals dict and run startup.
-    let globals: Py<PyDict> = Python::with_gil(|py| {
+    let globals: Py<PyDict> = Python::attach(|py| {
         let d = PyDict::new(py);
         let code = startup_code(args.data_folder.as_deref());
         let builtins = PyModule::import(py, "builtins")?;
@@ -297,7 +297,7 @@ pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
 // ── Execute code in the persistent globals dict ───────────────────────────────
 
 fn exec_in_globals(globals: &Py<PyDict>, code: &str) -> Resp {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let g = globals.bind(py);
 
         let capture_fn = match g.get_item("_rlean_exec_capture") {

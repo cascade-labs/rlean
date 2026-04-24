@@ -35,7 +35,7 @@ impl PyAlgorithmAdapter {
     ///
     /// Updates the proxy's bar objects in-place (zero allocation), then calls
     /// Python's `OnData` with the same stable Python object as every other day.
-    /// Must be called with the GIL already held via `Python::with_gil`.
+    /// Must be called with the GIL already held via `Python::attach`.
     pub fn on_data_proxy(&mut self, py: Python<'_>, proxy: &SliceProxy, slice: &Slice) {
         proxy.update(py, slice);
         self.update_indicators(py, slice);
@@ -64,7 +64,7 @@ impl PyAlgorithmAdapter {
     /// The instance must be a subclass of `lean_rust.QcAlgorithm`.
     pub fn from_instance(py: Python<'_>, instance: Py<PyAny>) -> PyResult<Self> {
         let bound = instance.bind(py);
-        let qc_ref = bound.downcast::<PyQcAlgorithm>()?;
+        let qc_ref = bound.cast::<PyQcAlgorithm>()?;
         let inner = qc_ref.borrow().inner_arc();
         let charts = qc_ref.borrow().charts_arc();
         let framework = qc_ref.borrow().framework_arc();
@@ -99,7 +99,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn initialize(&mut self) -> LeanResult<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.py_obj.call_method0(py, "Initialize").map_err(|e| {
                 e.print(py);
                 anyhow::anyhow!("Python Initialize() failed")
@@ -110,7 +110,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn on_data(&mut self, slice: &Slice) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.update_indicators(py, slice);
             match PySlice::from_slice(py, slice) {
                 Ok(py_slice) => {
@@ -124,7 +124,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn on_order_event(&mut self, event: &OrderEvent) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let py_event = PyOrderEvent::from(event);
             if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (py_event,)) {
                 if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
@@ -135,31 +135,31 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn on_end_of_day(&mut self, _symbol: Option<Symbol>) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             lean_call0(py, &self.py_obj, "OnEndOfDay");
         });
     }
 
     fn on_end_of_algorithm(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             lean_call0(py, &self.py_obj, "OnEndOfAlgorithm");
         });
     }
 
     fn on_warmup_finished(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             lean_call0(py, &self.py_obj, "OnWarmupFinished");
         });
     }
 
     fn on_margin_call(&mut self, _requests: &[Order]) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             lean_call0(py, &self.py_obj, "OnMarginCall");
         });
     }
 
     fn on_securities_changed(&mut self, _changes: &SecurityChanges) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             lean_call0(py, &self.py_obj, "OnSecuritiesChanged");
         });
     }
@@ -192,7 +192,7 @@ impl PyAlgorithmAdapter {
                 .to_f64()
                 .unwrap_or(0.0),
         );
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (event,)) {
                 if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
                     tracing::warn!("OnOrderEvent (OTM expiry) error: {e}");
@@ -241,7 +241,7 @@ impl PyAlgorithmAdapter {
             quantity,
             is_assignment,
         );
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if let Err(e) = self
                 .py_obj
                 .call_method1(py, "OnAssignmentOrderEvent", (event,))

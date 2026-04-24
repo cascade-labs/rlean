@@ -89,7 +89,7 @@ impl PyQuantBook {
     /// Resolve the symbol from a Python object that is either a `PySymbol`
     /// or a plain ticker string.
     fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<Symbol> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(sym.get().inner.clone());
         }
         if let Ok(s) = arg.extract::<String>() {
@@ -309,7 +309,7 @@ impl PyQuantBook {
         symbol: &Bound<'_, PyAny>,
         bar_count: usize,
         resolution: PyResolution,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let sym = self.resolve_symbol(symbol)?;
         let res: Resolution = resolution.into();
 
@@ -334,7 +334,7 @@ impl PyQuantBook {
         start: (i32, u32, u32),
         end: (i32, u32, u32),
         resolution: PyResolution,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let sym = self.resolve_symbol(symbol)?;
         let res: Resolution = resolution.into();
 
@@ -369,7 +369,7 @@ impl PyQuantBook {
         period: usize,
         bar_count: usize,
         resolution: PyResolution,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let sym = self.resolve_symbol(symbol)?;
         let res: Resolution = resolution.into();
         let bars = self.load_bars_count(&sym, bar_count, res);
@@ -394,7 +394,7 @@ impl PyQuantBook {
     ///
     /// Returns an empty list when no options data is available locally.
     #[pyo3(signature = (ticker))]
-    fn option_chain(&self, py: Python<'_>, ticker: &str) -> PyResult<PyObject> {
+    fn option_chain(&self, py: Python<'_>, ticker: &str) -> PyResult<Py<PyAny>> {
         // Local option chain data is not implemented yet.
         // Return an empty list with the correct schema so callers can rely on it.
         warn!(
@@ -442,7 +442,7 @@ impl Default for PyQuantBook {
 
 // ─── Helper: build history dict ───────────────────────────────────────────────
 
-fn bars_to_pydict(py: Python<'_>, bars: &[TradeBar]) -> PyResult<PyObject> {
+fn bars_to_pydict(py: Python<'_>, bars: &[TradeBar]) -> PyResult<Py<PyAny>> {
     let mut times: Vec<String> = Vec::with_capacity(bars.len());
     let mut opens: Vec<f64> = Vec::with_capacity(bars.len());
     let mut highs: Vec<f64> = Vec::with_capacity(bars.len());
@@ -476,7 +476,7 @@ fn run_indicator(
     name: &str,
     period: usize,
     bars: &[TradeBar],
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     match name.to_uppercase().as_str() {
         "SMA" => run_single(py, bars, &mut Sma::new(period)),
         "EMA" => run_single(py, bars, &mut Ema::new(period)),
@@ -501,7 +501,7 @@ fn run_indicator(
 }
 
 /// Run any single-value indicator and collect ready results into a dict.
-fn run_single(py: Python<'_>, bars: &[TradeBar], ind: &mut dyn Indicator) -> PyResult<PyObject> {
+fn run_single(py: Python<'_>, bars: &[TradeBar], ind: &mut dyn Indicator) -> PyResult<Py<PyAny>> {
     let mut times: Vec<String> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
 
@@ -525,7 +525,7 @@ fn run_macd(
     fast: usize,
     slow: usize,
     signal: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let mut ind = Macd::new(fast, slow, signal);
     let mut times: Vec<String> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
@@ -550,7 +550,7 @@ fn run_macd(
     Ok(dict.into())
 }
 
-fn run_bb(py: Python<'_>, bars: &[TradeBar], period: usize, k: Decimal) -> PyResult<PyObject> {
+fn run_bb(py: Python<'_>, bars: &[TradeBar], period: usize, k: Decimal) -> PyResult<Py<PyAny>> {
     let mut ind = BollingerBands::new(period, k);
     let mut times: Vec<String> = Vec::new();
     let mut middles: Vec<f64> = Vec::new();
