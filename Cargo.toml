@@ -96,7 +96,7 @@ num_cpus = "1"
 glob = "0.3"
 reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "http2"], default-features = false }
 tempfile = "3"
-pyo3 = { version = "0.23", features = ["auto-initialize", "chrono"] }
+pyo3 = { version = "0.27", features = ["auto-initialize", "chrono"] }
 zip    = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

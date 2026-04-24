@@ -61,7 +61,7 @@ impl PySecurityHolding {
         self.unrealized_pnl + self.realized_pnl
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -147,7 +147,7 @@ impl PyPortfolio {
             .collect()
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -171,10 +171,10 @@ impl PyPortfolio {
 
 impl PyPortfolio {
     fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<PySymbol> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(sym.get().clone());
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(sec.get().inner.clone());
         }
         if let Ok(ticker) = arg.extract::<String>() {

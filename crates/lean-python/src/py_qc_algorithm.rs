@@ -481,14 +481,14 @@ impl PyQcAlgorithm {
 
     /// Current algorithm time as a Python datetime object (matches LEAN's `self.time`).
     #[getter]
-    fn time(&self) -> PyResult<PyObject> {
+    fn time(&self) -> PyResult<Py<PyAny>> {
         let ns = self.inner.lock().unwrap().time.0;
         ns_to_py_datetime(ns)
     }
 
     /// Current UTC time as a Python datetime object.
     #[getter]
-    fn utc_time(&self) -> PyResult<PyObject> {
+    fn utc_time(&self) -> PyResult<Py<PyAny>> {
         let ns = self.inner.lock().unwrap().utc_time.0;
         ns_to_py_datetime(ns)
     }
@@ -715,7 +715,7 @@ impl PyQcAlgorithm {
     /// QCAlgorithm methods by their LEAN names (e.g. `self.SetStartDate(...)`).
     /// Called only when normal attribute lookup fails, so snake_case always wins
     /// for directly defined methods/properties.
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -740,10 +740,10 @@ impl PyQcAlgorithm {
 /// Resolve a symbol/security/string argument to its SID (for indicator registry).
 fn resolve_symbol_sid(sym: &Bound<'_, PyAny>) -> PyResult<u64> {
     use crate::py_types::{PySecurity, PySymbol};
-    if let Ok(s) = sym.downcast::<PySymbol>() {
+    if let Ok(s) = sym.cast::<PySymbol>() {
         return Ok(s.get().inner.id.sid);
     }
-    if let Ok(s) = sym.downcast::<PySecurity>() {
+    if let Ok(s) = sym.cast::<PySecurity>() {
         return Ok(s.get().inner.inner.id.sid);
     }
     if let Ok(ticker) = sym.extract::<String>() {
@@ -779,8 +779,8 @@ pub(crate) fn pascal_to_snake(name: &str) -> String {
     out
 }
 
-fn ns_to_py_datetime(ns: i64) -> PyResult<PyObject> {
-    Python::with_gil(|py| {
+fn ns_to_py_datetime(ns: i64) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| {
         let secs = ns / 1_000_000_000;
         let micros = (ns % 1_000_000_000) / 1_000;
         let timestamp = secs as f64 + micros as f64 / 1_000_000.0;
@@ -811,15 +811,15 @@ fn lean_datetime_to_date(ns: i64) -> String {
 
 impl PyQcAlgorithm {
     fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<lean_core::Symbol> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(sym.get().inner.clone());
         }
         // Accept Security objects directly (mirrors LEAN's set_holdings(security, ...) API)
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(sec.get().inner.inner.clone());
         }
         // Accept OptionContract objects — uses contract.symbol
-        if let Ok(contract) = arg.downcast::<crate::py_options::PyOptionContract>() {
+        if let Ok(contract) = arg.cast::<crate::py_options::PyOptionContract>() {
             return Ok(contract.borrow().inner.symbol.clone());
         }
         if let Ok(ticker) = arg.extract::<String>() {

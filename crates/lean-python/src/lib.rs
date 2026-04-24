@@ -105,7 +105,7 @@ pub enum PyOrderDirection {
 /// Register before starting the interpreter:
 /// ```rust,ignore
 /// pyo3::append_to_inittab!(AlgorithmImports);
-/// pyo3::prepare_freethreaded_python();
+/// pyo3::Python::initialize();
 /// ```
 ///
 /// Then in Python strategies:
@@ -253,9 +253,9 @@ mod tests {
     #[test]
     fn test_algorithm_imports_api() {
         pyo3::append_to_inittab!(AlgorithmImports);
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Test 1: Resolution.Daily is accessible (PascalCase, not SCREAMING_SNAKE_CASE)
             let result = py.run(
                 c"

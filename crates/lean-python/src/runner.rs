@@ -213,7 +213,7 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
     // Try AlgorithmImports first (new name), fall back to lean_rust (old name).
     let lean_mod = py.import("AlgorithmImports")
         .or_else(|_| py.import("lean_rust"))
-        .context("AlgorithmImports not importable — was append_to_inittab!(lean_python::AlgorithmImports) called before prepare_freethreaded_python()?")?;
+        .context("AlgorithmImports not importable — was append_to_inittab!(lean_python::AlgorithmImports) called before Python::initialize()?")?;
     let base_class = lean_mod
         .getattr("QCAlgorithm")
         .or_else(|_| lean_mod.getattr("QcAlgorithm"))
@@ -271,7 +271,7 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
 /// is reused so that tokio primitives (Mutex, Semaphore, reqwest) in the
 /// historical provider work correctly across the same runtime context.
 pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<BacktestResult> {
-    let mut adapter = Python::with_gil(|py| load_strategy(py, strategy_path))?;
+    let mut adapter = Python::attach(|py| load_strategy(py, strategy_path))?;
 
     // ── initialize ──────────────────────────────────────────────────────────
     adapter
@@ -608,7 +608,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── pre-allocate proxy objects for the hot path ──────────────────────────
     // One PyTradeBar per subscription is allocated here and reused every day.
     // `on_data_proxy` updates fields in-place instead of constructing new objects.
-    let slice_proxy = Python::with_gil(|py| SliceProxy::new(py, &subscriptions))
+    let slice_proxy = Python::attach(|py| SliceProxy::new(py, &subscriptions))
         .context("Failed to create SliceProxy")?;
 
     // ── pre-load benchmark data ──────────────────────────────────────────────
@@ -1238,7 +1238,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                     sync_option_holdings_to_chain_prices(&adapter, &portfolio, &chains_snapshot);
 
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         slice_proxy.update_option_chains(py, &chains_snapshot);
                         slice_proxy.update_quote_bars(py, &minute_quote_bars);
                         slice_proxy.update_ticks(py, &minute_ticks);
@@ -1758,7 +1758,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 slice_proxy.update_option_chains(py, &chains_snapshot);
                 slice_proxy.update_quote_bars(py, &HashMap::new());
                 slice_proxy.update_ticks(py, &HashMap::new());

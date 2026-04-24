@@ -60,7 +60,7 @@ impl PySymbol {
         self.inner.id.sid == other.inner.id.sid
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -127,7 +127,7 @@ impl PySecurity {
     /// LEAN API: ``security.SetLeverage(2.0)`` — no-op; rlean does not support leverage multipliers.
     fn set_leverage(&self, _leverage: f64) {}
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -163,8 +163,8 @@ impl PyAlgorithmSettings {
     fn __setattr__(&mut self, _name: &str, _value: &Bound<'_, PyAny>) {}
 
     /// Accept any attribute get; return 0 as default.
-    fn __getattr__(&self, _name: &str) -> PyResult<PyObject> {
-        Python::with_gil(|py| Ok(0i64.into_pyobject(py).unwrap().into_any().unbind()))
+    fn __getattr__(&self, _name: &str) -> PyResult<Py<PyAny>> {
+        Python::attach(|py| Ok(0i64.into_pyobject(py).unwrap().into_any().unbind()))
             .map_err(|e: PyErr| e)
     }
 }
@@ -225,7 +225,7 @@ impl PySecurityEntry {
         self.symbol_inner.clone()
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -293,7 +293,7 @@ impl PySecurityManager {
 }
 
 fn resolve_sid(arg: &Bound<'_, PyAny>) -> PyResult<u64> {
-    if let Ok(sym) = arg.downcast::<PySymbol>() {
+    if let Ok(sym) = arg.cast::<PySymbol>() {
         return Ok(sym.get().inner.id.sid);
     }
     if let Ok(ticker) = arg.extract::<String>() {

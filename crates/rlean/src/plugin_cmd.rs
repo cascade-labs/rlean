@@ -9,15 +9,19 @@
 /// Usage:
 ///   rlean plugin list                               # list plugins from all registries
 ///   rlean plugin list --installed                   # show installed plugins
-///   rlean plugin install <name>                     # install from any registry
+///   rlean plugin install <name>[,<name>...]         # install from any registry
 ///   rlean plugin install <git-url>                  # install ad-hoc plugin from git URL
 ///   rlean plugin upgrade <name>                     # rebuild from updated source
 ///   rlean plugin remove <name>                      # remove installed plugin
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+type PackagePathMap = BTreeMap<String, PathBuf>;
+type PatchEntries = Vec<(String, PathBuf)>;
 
 /// Raw GitHub URL for the official plugin registry.
 pub(crate) const OFFICIAL_REGISTRY_URL: &str =
@@ -39,9 +43,9 @@ pub enum PluginCommand {
         #[arg(long)]
         installed: bool,
     },
-    /// Clone, build, and install a plugin
+    /// Clone, build, and install one or more plugins
     Install {
-        /// Plugin name (from any registry) or a full git URL for an ad-hoc plugin
+        /// Plugin name(s), comma-separated, or a full git URL for an ad-hoc plugin
         name: String,
     },
     /// Rebuild an installed plugin from its latest source
@@ -99,6 +103,12 @@ struct InstalledEntry {
     pub lib_path: String,
     /// Checkout path (for upgrade)
     pub src_path: String,
+}
+
+struct InstallGroup {
+    git_url: String,
+    src_dir: PathBuf,
+    entries: Vec<RegistryEntry>,
 }
 
 // ── Registry fetch ────────────────────────────────────────────────────────────
@@ -321,50 +331,71 @@ fn cmd_list_installed() -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(name: &str) -> Result<()> {
-    let entry = resolve_entry(name)?;
-
+fn cmd_install(names: &str) -> Result<()> {
+    let entries = resolve_install_entries(names)?;
     let mut manifest = load_manifest()?;
-    if manifest.plugins.iter().any(|e| e.info.name == entry.name) {
-        bail!(
-            "Plugin '{}' is already installed. Use `rlean plugin upgrade {}` to update.",
-            name,
-            name
-        );
+
+    for entry in &entries {
+        if manifest.plugins.iter().any(|e| e.info.name == entry.name) {
+            bail!(
+                "Plugin '{}' is already installed. Use `rlean plugin upgrade {}` to update.",
+                entry.name,
+                entry.name
+            );
+        }
     }
 
-    let src_dir = plugin_src_dir(&entry.name)?;
-    let lib_path = plugin_lib_path(&entry.name)?;
+    let groups = install_groups(&entries, &manifest)?;
+    for group in groups {
+        if group.src_dir.exists() {
+            println!("Using existing source at {} ...", group.src_dir.display());
+        } else {
+            println!("Cloning {} ...", group.git_url);
+            git_clone(&group.git_url, &group.src_dir)?;
+        }
+        write_plugin_cargo_config(&group.src_dir)?;
 
-    println!("Cloning {} ...", entry.git_url);
-    git_clone(&entry.git_url, &src_dir)?;
+        let names = group
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Resolving dependencies for {names} ...");
+        cargo_update(&group.src_dir)?;
 
-    println!("Resolving dependencies for '{}' ...", entry.name);
-    cargo_update(&src_dir)?;
+        let package_names = group
+            .entries
+            .iter()
+            .map(|entry| package_name_for(&entry.name))
+            .collect::<Vec<_>>();
+        println!("Building {names} ...");
+        cargo_build_many(&group.src_dir, &package_names)?;
 
-    println!("Building {} ...", entry.name);
-    let package_name = package_name_for(&entry.name);
-    cargo_build(&src_dir, &package_name)?;
+        for entry in group.entries {
+            let lib_path = plugin_lib_path(&entry.name)?;
+            let built = find_built_lib(&group.src_dir, &entry.name)?;
+            std::fs::copy(&built, &lib_path).with_context(|| {
+                format!(
+                    "Failed to copy {} → {}",
+                    built.display(),
+                    lib_path.display()
+                )
+            })?;
+            adhoc_codesign(&lib_path);
 
-    let built = find_built_lib(&src_dir, &entry.name)?;
-    std::fs::copy(&built, &lib_path).with_context(|| {
-        format!(
-            "Failed to copy {} → {}",
-            built.display(),
-            lib_path.display()
-        )
-    })?;
-    adhoc_codesign(&lib_path);
+            manifest.plugins.push(InstalledEntry {
+                info: entry.clone(),
+                installed_at: now_utc(),
+                lib_path: lib_path.display().to_string(),
+                src_path: group.src_dir.display().to_string(),
+            });
 
-    manifest.plugins.push(InstalledEntry {
-        info: entry.clone(),
-        installed_at: now_utc(),
-        lib_path: lib_path.display().to_string(),
-        src_path: src_dir.display().to_string(),
-    });
+            println!("Installed '{}'  →  {}", entry.name, lib_path.display());
+        }
+    }
     save_manifest(&manifest)?;
 
-    println!("Installed '{}'  →  {}", entry.name, lib_path.display());
     Ok(())
 }
 
@@ -381,6 +412,7 @@ fn cmd_upgrade(name: &str) -> Result<()> {
 
     println!("Pulling latest source for '{}' ...", name);
     git_pull(&src_dir)?;
+    write_plugin_cargo_config(&src_dir)?;
 
     println!("Updating dependencies for '{}' ...", name);
     cargo_update(&src_dir)?;
@@ -477,6 +509,77 @@ fn resolve_entry(name_or_url: &str) -> Result<RegistryEntry> {
         })
 }
 
+fn resolve_install_entries(names_or_url: &str) -> Result<Vec<RegistryEntry>> {
+    if is_git_url_or_path(names_or_url) {
+        return Ok(vec![resolve_entry(names_or_url)?]);
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
+    for raw_name in names_or_url.split(',') {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            bail!("Plugin '{}' was requested more than once.", name);
+        }
+        entries.push(resolve_entry(name)?);
+    }
+
+    if entries.is_empty() {
+        bail!("No plugin names provided.");
+    }
+    Ok(entries)
+}
+
+fn install_groups(
+    entries: &[RegistryEntry],
+    manifest: &InstalledManifest,
+) -> Result<Vec<InstallGroup>> {
+    let mut by_git_url: BTreeMap<String, Vec<RegistryEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_git_url
+            .entry(entry.git_url.clone())
+            .or_default()
+            .push(entry.clone());
+    }
+
+    let mut groups = Vec::new();
+    for (git_url, entries) in by_git_url {
+        let src_dir = source_dir_for_install_group(&git_url, &entries, manifest)?;
+        groups.push(InstallGroup {
+            git_url,
+            src_dir,
+            entries,
+        });
+    }
+    Ok(groups)
+}
+
+fn source_dir_for_install_group(
+    git_url: &str,
+    entries: &[RegistryEntry],
+    manifest: &InstalledManifest,
+) -> Result<PathBuf> {
+    if let Some(installed) = manifest
+        .plugins
+        .iter()
+        .find(|installed| installed.info.git_url == git_url)
+    {
+        return Ok(PathBuf::from(&installed.src_path));
+    }
+
+    for entry in entries {
+        let dir = plugin_src_dir(&entry.name)?;
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+
+    plugin_src_dir(&entries[0].name)
+}
+
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 fn plugins_dir() -> Result<PathBuf> {
@@ -524,12 +627,6 @@ fn package_name_for(plugin_name: &str) -> String {
 // ── Git + Cargo helpers ───────────────────────────────────────────────────────
 
 fn git_clone(url: &str, dest: &Path) -> Result<()> {
-    if dest.exists() {
-        bail!(
-            "Source directory '{}' already exists. Remove it first or use `rlean plugin upgrade`.",
-            dest.display()
-        );
-    }
     let status = Command::new("git")
         .args(["clone", "--depth=1", url, &dest.display().to_string()])
         .status()
@@ -538,6 +635,225 @@ fn git_clone(url: &str, dest: &Path) -> Result<()> {
         bail!("git clone failed for {}", url);
     }
     Ok(())
+}
+
+fn write_plugin_cargo_config(plugin_src: &Path) -> Result<()> {
+    let rlean_root = rlean_workspace_root()?;
+    let packages = rlean_workspace_packages(&rlean_root)?;
+    let (sources, patch_entries) = plugin_rlean_dependency_patches(plugin_src, &packages)?;
+    let cargo_dir = plugin_src.join(".cargo");
+    std::fs::create_dir_all(&cargo_dir)
+        .with_context(|| format!("Failed to create {}", cargo_dir.display()))?;
+
+    let mut config = String::from(
+        "# Generated by rlean. Keeps plugin builds ABI-compatible with this CLI.\n\
+         [net]\n\
+         git-fetch-with-cli = true\n\n",
+    );
+    for source in sources {
+        config.push_str(&format!("[patch.\"{source}\"]\n"));
+        for (package_name, path) in &patch_entries {
+            config.push_str(&format!(
+                "{package_name} = {{ path = \"{}\" }}\n",
+                path.display()
+            ));
+        }
+        config.push('\n');
+    }
+
+    let config_path = cargo_dir.join("config.toml");
+    std::fs::write(&config_path, config)
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn rlean_workspace_packages(root: &Path) -> Result<PackagePathMap> {
+    let root_manifest = root.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&root_manifest)
+        .with_context(|| format!("Failed to read {}", root_manifest.display()))?;
+    let members = parse_workspace_members(&manifest).with_context(|| {
+        format!(
+            "Failed to parse workspace members from {}",
+            root_manifest.display()
+        )
+    })?;
+
+    let mut packages = BTreeMap::new();
+    for member in members {
+        let member_path = root.join(&member);
+        let member_manifest = member_path.join("Cargo.toml");
+        if !member_manifest.exists() {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(&member_manifest)
+            .with_context(|| format!("Failed to read {}", member_manifest.display()))?;
+        let Some(package_name) = parse_package_name(&manifest) else {
+            continue;
+        };
+        packages.insert(package_name, member_path);
+    }
+
+    Ok(packages)
+}
+
+fn plugin_rlean_dependency_patches(
+    plugin_src: &Path,
+    packages: &PackagePathMap,
+) -> Result<(BTreeSet<String>, PatchEntries)> {
+    let mut manifests = Vec::new();
+    collect_cargo_manifests(plugin_src, &mut manifests)?;
+
+    let mut sources = BTreeSet::new();
+    let mut package_names = BTreeSet::new();
+    for manifest_path in manifests {
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+        for raw_line in manifest.lines() {
+            let line = raw_line.split('#').next().unwrap_or("").trim();
+            if !line.contains("git") || !line.contains("cascade-labs/rlean") {
+                continue;
+            }
+
+            let Some((dependency_name, _)) = line.split_once('=') else {
+                continue;
+            };
+            let Some(source) = extract_toml_string_value(line, "git") else {
+                continue;
+            };
+
+            sources.insert(source);
+            let package_name = extract_toml_string_value(line, "package")
+                .unwrap_or_else(|| dependency_name.trim().to_string());
+            if packages.contains_key(&package_name) {
+                package_names.insert(package_name);
+            }
+        }
+    }
+
+    let patch_entries = package_names
+        .into_iter()
+        .filter_map(|package_name| {
+            packages
+                .get(&package_name)
+                .map(|path| (package_name, path.clone()))
+        })
+        .collect();
+
+    Ok((sources, patch_entries))
+}
+
+fn collect_cargo_manifests(dir: &Path, manifests: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("Failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if matches!(name, ".git" | "target") {
+                continue;
+            }
+            collect_cargo_manifests(&path, manifests)?;
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml") {
+            manifests.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn extract_toml_string_value(line: &str, key: &str) -> Option<String> {
+    let key_start = line.find(key)?;
+    let after_key = line[key_start + key.len()..].trim_start();
+    let after_equals = after_key.strip_prefix('=')?.trim_start();
+    let value = after_equals.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(value[..end].to_string())
+}
+
+fn parse_workspace_members(manifest: &str) -> Result<Vec<String>> {
+    let mut in_workspace = false;
+    let mut in_members = false;
+    let mut members = Vec::new();
+
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') {
+            in_workspace = line == "[workspace]";
+            if !in_workspace && in_members {
+                break;
+            }
+        }
+        if !in_workspace {
+            continue;
+        }
+
+        if line.starts_with("members") && line.contains('[') {
+            in_members = true;
+        }
+        if in_members {
+            for part in line.split('"').skip(1).step_by(2) {
+                members.push(part.to_string());
+            }
+            if line.contains(']') {
+                break;
+            }
+        }
+    }
+
+    if members.is_empty() {
+        bail!("workspace.members is empty or missing")
+    }
+    Ok(members)
+}
+
+fn parse_package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package || !line.starts_with("name") {
+            continue;
+        }
+
+        let (_, value) = line.split_once('=')?;
+        return Some(value.trim().trim_matches('"').to_string());
+    }
+    None
+}
+
+fn rlean_workspace_root() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("RLEAN_SOURCE_DIR") {
+        let root = PathBuf::from(path);
+        if root.join("Cargo.toml").exists() {
+            return root
+                .canonicalize()
+                .with_context(|| format!("Failed to canonicalize {}", root.display()));
+        }
+        bail!(
+            "RLEAN_SOURCE_DIR points to {}, but Cargo.toml was not found",
+            root.display()
+        );
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("Could not derive rlean workspace root from CARGO_MANIFEST_DIR")?;
+
+    if root.join("Cargo.toml").exists() && root.join("crates").join("lean-plugin").exists() {
+        return root
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize {}", root.display()));
+    }
+
+    bail!("Could not find rlean workspace root. Set RLEAN_SOURCE_DIR to a local rlean checkout.")
 }
 
 fn git_pull(dir: &Path) -> Result<()> {
@@ -565,17 +881,30 @@ fn git_pull(dir: &Path) -> Result<()> {
 
 fn cargo_update(workspace_root: &Path) -> Result<()> {
     // Force cargo to re-fetch git dependencies (e.g. rlean crates) to their latest HEAD.
-    Command::new("cargo")
+    let status = Command::new("cargo")
         .args(["update"])
         .current_dir(workspace_root)
         .status()
         .context("Failed to run cargo update")?;
+    if !status.success() {
+        bail!("cargo update failed in {}", workspace_root.display());
+    }
     Ok(())
 }
 
 fn cargo_build(workspace_root: &Path, package_name: &str) -> Result<()> {
+    cargo_build_many(workspace_root, &[package_name.to_string()])
+}
+
+fn cargo_build_many(workspace_root: &Path, package_names: &[String]) -> Result<()> {
+    let mut args = vec!["build".to_string(), "--release".to_string()];
+    for package_name in package_names {
+        args.push("-p".to_string());
+        args.push(package_name.clone());
+    }
+
     let status = Command::new("cargo")
-        .args(["build", "--release", "-p", package_name])
+        .args(&args)
         .current_dir(workspace_root)
         .status()
         .context("Failed to run cargo build — is Rust installed?")?;

@@ -76,7 +76,7 @@ impl PyTradeBar {
         self.close
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -109,10 +109,10 @@ pub struct PyTradeBars {
 
 impl PyTradeBars {
     fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(Some(sym.get().inner.id.sid));
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(Some(sec.get().inner.inner.id.sid));
         }
         if let Ok(ticker) = arg.extract::<String>() {
@@ -164,7 +164,7 @@ impl PyTradeBars {
         self.__contains__(symbol)
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -333,10 +333,10 @@ impl PyQuoteBars {
     }
 
     fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(Some(sym.get().inner.id.sid));
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(Some(sec.get().inner.inner.id.sid));
         }
         if let Ok(ticker) = arg.extract::<String>() {
@@ -439,7 +439,7 @@ impl PyTick {
         self.tick_type == TickType::Quote
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -477,10 +477,10 @@ impl PyTicks {
     }
 
     fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(Some(sym.get().inner.id.sid));
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(Some(sec.get().inner.inner.id.sid));
         }
         if let Ok(ticker) = arg.extract::<String>() {
@@ -572,7 +572,7 @@ impl PyDelisting {
         self.delisting_type == DelistingType::Warning
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -608,10 +608,10 @@ impl PyDelistings {
     }
 
     fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(Some(sym.get().inner.id.sid));
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(Some(sec.get().inner.inner.id.sid));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(
@@ -687,7 +687,7 @@ impl From<&SymbolChangedEvent> for PySymbolChangedEvent {
 
 #[pymethods]
 impl PySymbolChangedEvent {
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -721,10 +721,10 @@ impl PySymbolChangedEvents {
     }
 
     fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        if let Ok(sym) = arg.downcast::<PySymbol>() {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(Some(sym.get().inner.id.sid));
         }
-        if let Ok(sec) = arg.downcast::<PySecurity>() {
+        if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(Some(sec.get().inner.inner.id.sid));
         }
         Err(pyo3::exceptions::PyTypeError::new_err(
@@ -963,7 +963,7 @@ impl PySlice {
             .collect()
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -1004,7 +1004,7 @@ pub struct PyCustomDataPoint {
 impl PyCustomDataPoint {
     /// Extra fields dict — `data.custom["VIX"].fields["open"]`.
     #[getter]
-    fn fields(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn fields(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         use pyo3::types::PyDict;
         let dict = PyDict::new(py);
         for (k, v) in &self.fields_inner {
@@ -1014,7 +1014,7 @@ impl PyCustomDataPoint {
         Ok(dict.into())
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -1032,7 +1032,7 @@ impl PyCustomDataPoint {
 }
 
 /// Convert a `serde_json::Value` to a Python object.
-fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
+fn json_value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match v {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => (*b).into_py_any(py),

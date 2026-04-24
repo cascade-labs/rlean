@@ -869,7 +869,7 @@ impl PyInsight {
         source_model: Option<String>,
     ) -> PyResult<Self> {
         use crate::py_types::PySymbol;
-        let lean_symbol = if let Ok(s) = symbol.downcast::<PySymbol>() {
+        let lean_symbol = if let Ok(s) = symbol.cast::<PySymbol>() {
             s.borrow().inner.clone()
         } else {
             let s: String = symbol.extract()?;
@@ -971,7 +971,7 @@ impl PyInsight {
     }
 
     /// Forward LEAN PascalCase attribute access to snake_case equivalents.
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -1061,7 +1061,7 @@ impl PyPortfolioTarget {
 }
 
 fn extract_lean_symbol_from_py(symbol: &Bound<'_, PyAny>) -> PyResult<lean_core::Symbol> {
-    if let Ok(s) = symbol.downcast::<crate::py_types::PySymbol>() {
+    if let Ok(s) = symbol.cast::<crate::py_types::PySymbol>() {
         return Ok(s.borrow().inner.clone());
     }
     let ticker: String = symbol.extract()?;
@@ -1100,7 +1100,7 @@ impl PyAlphaModelBase {
     /// Matches LEAN's PascalCase API: ``def Update(self, algorithm, data): ...``
     #[pyo3(name = "Update")]
     #[allow(non_snake_case)]
-    fn Update(&self, _algorithm: &Bound<'_, PyAny>, _data: &Bound<'_, PyAny>) -> Vec<PyObject> {
+    fn Update(&self, _algorithm: &Bound<'_, PyAny>, _data: &Bound<'_, PyAny>) -> Vec<Py<PyAny>> {
         vec![]
     }
 
@@ -1166,9 +1166,9 @@ impl IAlphaModel for PyAlphaAdapter {
         slice: &lean_data::Slice,
         _securities: &[lean_core::Symbol],
     ) -> Vec<lean_alpha::Insight> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Build a PySlice proxy to pass as `data`.
-            let slice_py: PyObject = match crate::py_data::PySlice::from_slice(py, slice) {
+            let slice_py: Py<PyAny> = match crate::py_data::PySlice::from_slice(py, slice) {
                 Ok(s) => match Py::new(py, s) {
                     Ok(p) => p.into_any(),
                     Err(e) => {
@@ -1219,9 +1219,9 @@ impl IPortfolioConstructionModel for PyPcmAdapter {
         portfolio_value: Decimal,
         prices: &HashMap<String, Decimal>,
     ) -> Vec<lean_portfolio_construction::PortfolioTarget> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Build PyInsight list to pass as the `insights` argument.
-            let py_insights: Vec<PyObject> = insights
+            let py_insights: Vec<Py<PyAny>> = insights
                 .iter()
                 .map(|i| {
                     let direction = match i.direction {
@@ -1273,7 +1273,7 @@ fn extract_pcm_targets(
         let item = item.ok()?;
 
         // Fast path: typed PyPortfolioTarget.
-        if let Ok(pt) = item.downcast::<PyPortfolioTarget>() {
+        if let Ok(pt) = item.cast::<PyPortfolioTarget>() {
             let pt = pt.borrow();
             let sym = pt.symbol.clone();
             if let Some(pct) = pt.percent {
@@ -1297,7 +1297,7 @@ fn extract_pcm_targets(
 
         // Duck-type fallback: any object with .symbol and .percent / .quantity attrs.
         let sym_attr = item.getattr("symbol").ok()?;
-        let sym = if let Ok(s) = sym_attr.downcast::<crate::py_types::PySymbol>() {
+        let sym = if let Ok(s) = sym_attr.cast::<crate::py_types::PySymbol>() {
             s.borrow().inner.clone()
         } else {
             let ticker: String = sym_attr
@@ -1343,7 +1343,7 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
     let mut out = Vec::new();
     for item in iter {
         let Ok(item) = item else { continue };
-        if let Ok(pi) = item.downcast::<PyInsight>() {
+        if let Ok(pi) = item.cast::<PyInsight>() {
             let pi = pi.borrow();
             let period = lean_core::TimeSpan::from_nanos(pi.period_nanos);
             let dir = match pi.direction {
@@ -1401,22 +1401,22 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
 /// Try to extract an IAlphaModel Box from a Python object.
 /// `alg_py` is the Python QCAlgorithm instance — passed as `algorithm` to `Update()`.
 pub fn try_take_alpha(model: &Bound<'_, PyAny>, alg_py: Py<PyAny>) -> Option<Box<dyn IAlphaModel>> {
-    if let Ok(m) = model.downcast::<PyEmaCrossAlphaModel>() {
+    if let Ok(m) = model.cast::<PyEmaCrossAlphaModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMacdAlphaModel>() {
+    if let Ok(m) = model.cast::<PyMacdAlphaModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyRsiAlphaModel>() {
+    if let Ok(m) = model.cast::<PyRsiAlphaModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyConstantAlphaModel>() {
+    if let Ok(m) = model.cast::<PyConstantAlphaModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyHistoricalReturnsAlphaModel>() {
+    if let Ok(m) = model.cast::<PyHistoricalReturnsAlphaModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyPearsonCorrelationPairsTradingAlphaModel>() {
+    if let Ok(m) = model.cast::<PyPearsonCorrelationPairsTradingAlphaModel>() {
         return m.borrow_mut().model.take();
     }
     // Accept any Python object that subclasses AlphaModel.
@@ -1435,31 +1435,31 @@ pub fn try_take_pcm(
     model: &Bound<'_, PyAny>,
     alg_py: Py<PyAny>,
 ) -> Option<Box<dyn IPortfolioConstructionModel>> {
-    if let Ok(m) = model.downcast::<PyEqualWeightingPcm>() {
+    if let Ok(m) = model.cast::<PyEqualWeightingPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyInsightWeightingPcm>() {
+    if let Ok(m) = model.cast::<PyInsightWeightingPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMeanVariancePcm>() {
+    if let Ok(m) = model.cast::<PyMeanVariancePcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMaxSharpeRatioPcm>() {
+    if let Ok(m) = model.cast::<PyMaxSharpeRatioPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyBlackLittermanPcm>() {
+    if let Ok(m) = model.cast::<PyBlackLittermanPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyRiskParityPcm>() {
+    if let Ok(m) = model.cast::<PyRiskParityPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyConfidenceWeightingPcm>() {
+    if let Ok(m) = model.cast::<PyConfidenceWeightingPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyAccumulativeInsightPcm>() {
+    if let Ok(m) = model.cast::<PyAccumulativeInsightPcm>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMeanReversionPcm>() {
+    if let Ok(m) = model.cast::<PyMeanReversionPcm>() {
         return m.borrow_mut().model.take();
     }
     // Accept any Python object that subclasses PortfolioConstructionModel.
@@ -1477,19 +1477,19 @@ pub fn try_take_pcm(
 
 /// Try to extract an IExecutionModel Box from a Python object.
 pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel>> {
-    if let Ok(m) = model.downcast::<PyImmediateExecutionModel>() {
+    if let Ok(m) = model.cast::<PyImmediateExecutionModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyNullExecutionModel>() {
+    if let Ok(m) = model.cast::<PyNullExecutionModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyVwapExecutionModel>() {
+    if let Ok(m) = model.cast::<PyVwapExecutionModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PySpreadExecutionModel>() {
+    if let Ok(m) = model.cast::<PySpreadExecutionModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyStandardDeviationExecutionModel>() {
+    if let Ok(m) = model.cast::<PyStandardDeviationExecutionModel>() {
         return m.borrow_mut().model.take();
     }
     tracing::warn!("set_execution: unrecognized model type — use a built-in ExecutionModel class");
@@ -1498,22 +1498,22 @@ pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel
 
 /// Try to extract a RiskManagementModel Box from a Python object.
 pub fn try_take_risk(model: &Bound<'_, PyAny>) -> Option<Box<dyn RiskManagementModel>> {
-    if let Ok(m) = model.downcast::<PyNullRiskManagementModel>() {
+    if let Ok(m) = model.cast::<PyNullRiskManagementModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMaxDrawdownPercentPerSecurity>() {
+    if let Ok(m) = model.cast::<PyMaxDrawdownPercentPerSecurity>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyTrailingStopRiskModel>() {
+    if let Ok(m) = model.cast::<PyTrailingStopRiskModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMaxSectorExposureRiskModel>() {
+    if let Ok(m) = model.cast::<PyMaxSectorExposureRiskModel>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMaxDrawdownPercentPortfolio>() {
+    if let Ok(m) = model.cast::<PyMaxDrawdownPercentPortfolio>() {
         return m.borrow_mut().model.take();
     }
-    if let Ok(m) = model.downcast::<PyMaxUnrealizedProfitPerSecurity>() {
+    if let Ok(m) = model.cast::<PyMaxUnrealizedProfitPerSecurity>() {
         return m.borrow_mut().model.take();
     }
     tracing::warn!(

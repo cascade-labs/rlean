@@ -88,7 +88,7 @@ impl PyGreeks {
         self.theta / 365.0
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -219,7 +219,7 @@ impl PyOptionContract {
     fn time_value(&self) -> f64 {
         self.inner.time_value().to_f64().unwrap_or(0.0)
     }
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -318,7 +318,7 @@ impl PyOptionChain {
             .collect()
     }
 
-    fn filter(&self, py: Python, filter_fn: PyObject) -> PyResult<Vec<PyOptionContract>> {
+    fn filter(&self, py: Python, filter_fn: Py<PyAny>) -> PyResult<Vec<PyOptionContract>> {
         let all: Vec<Py<PyOptionContract>> = self
             .inner
             .contracts
@@ -362,7 +362,7 @@ impl PyOptionChain {
             .collect()
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -509,11 +509,11 @@ fn extract_chain_key(key: &Bound<'_, PyAny>) -> PyResult<String> {
         return Ok(s);
     }
     // PySymbol → use permtick (e.g. "?SPY")
-    if let Ok(sym) = key.downcast::<PySymbol>() {
+    if let Ok(sym) = key.cast::<PySymbol>() {
         return Ok(sym.get().inner.permtick.clone());
     }
     // PyOptionSecurity → extract its canonical symbol's permtick
-    if let Ok(opt) = key.downcast::<crate::py_types::PyOptionSecurity>() {
+    if let Ok(opt) = key.cast::<crate::py_types::PyOptionSecurity>() {
         return Ok(opt.borrow().canonical.inner.permtick.clone());
     }
     Err(pyo3::exceptions::PyTypeError::new_err(

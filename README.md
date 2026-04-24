@@ -33,7 +33,7 @@ To enforce merge gates on GitHub, configure branch protection or a ruleset for `
 ### Install the CLI
 
 ```sh
-cargo install --git https://github.com/cascade-labs/rlean --bin rlean
+cargo install --git https://github.com/cascade-labs/rlean rlean --bin rlean
 ```
 
 Or build from source:

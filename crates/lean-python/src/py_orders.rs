@@ -156,7 +156,7 @@ impl PyOrderEvent {
 
     /// Event time in UTC as a `datetime.datetime`.
     #[getter]
-    fn utc_time(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn utc_time(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         ns_to_py_datetime(py, self.inner_utc_ns)
     }
 
@@ -265,7 +265,7 @@ impl PyOrderEvent {
         self.trailing_as_percentage
     }
 
-    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
             if let Ok(attr) = slf.getattr(snake.as_str()) {
@@ -294,7 +294,7 @@ impl PyOrderEvent {
     }
 }
 
-fn ns_to_py_datetime(py: Python<'_>, ns: i64) -> PyResult<PyObject> {
+fn ns_to_py_datetime(py: Python<'_>, ns: i64) -> PyResult<Py<PyAny>> {
     let secs = ns / 1_000_000_000;
     let micros = (ns % 1_000_000_000) / 1_000;
     let timestamp = secs as f64 + micros as f64 / 1_000_000.0;
