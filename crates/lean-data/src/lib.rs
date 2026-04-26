@@ -17,8 +17,8 @@ pub mod trade_bar;
 
 pub use base_data::{BaseData, BaseDataType, DataTimeZoneInfo};
 pub use custom::{
-    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataSubscription,
-    CustomDataTransport,
+    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSource,
+    CustomDataSubscription, CustomDataTransport, CustomParquetSource,
 };
 pub use data_queue::DataQueueHandler;
 pub use delisting::{Delisting, DelistingType};

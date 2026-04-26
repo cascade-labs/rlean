@@ -325,7 +325,14 @@ impl ParquetWriter {
 
         let schema = schema::custom_data_schema();
 
-        let dates: Vec<i64> = points.iter().map(|p| schema::date_to_ns(p.time)).collect();
+        let dates: Vec<i64> = points
+            .iter()
+            .map(|p| {
+                p.end_time
+                    .map(|t| t.0)
+                    .unwrap_or_else(|| schema::date_to_ns(p.time))
+            })
+            .collect();
         let values: Vec<f64> = points
             .iter()
             .map(|p| {

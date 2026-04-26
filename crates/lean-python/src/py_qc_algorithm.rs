@@ -5,9 +5,12 @@ use crate::py_framework::{
 use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
 use crate::py_portfolio::PyPortfolio;
 use crate::py_types::{PyAlgorithmSettings, PyResolution, PySecurity, PySecurityManager, PySymbol};
+use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
+use chrono::{Datelike, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{Market, Resolution, SymbolOptionsExt};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyTuple};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -50,7 +53,7 @@ fn f2d(f: f64) -> Decimal {
 ///         self.set_start_date(2020, 1, 1)
 ///         self.set_end_date(2023, 12, 31)
 ///         self.set_cash(100_000)
-///         self.spy = self.add_equity("SPY", Resolution.Daily).symbol
+///         self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
 ///         self.fast = SimpleMovingAverage(50)
 ///         self.slow = SimpleMovingAverage(200)
 ///
@@ -78,6 +81,10 @@ pub struct PyQcAlgorithm {
     /// Registry of indicators to auto-update each bar.
     /// Shared with PyAlgorithmAdapter for pre-OnData updates.
     pub indicators: Arc<Mutex<IndicatorRegistry>>,
+    /// LEAN universe settings shared between Python and the runner.
+    pub universe_settings: PyUniverseSettings,
+    /// Registered scheduled/user-defined universes.
+    pub universes: Arc<Mutex<Vec<Py<PyScheduledUniverse>>>>,
 }
 
 impl PyQcAlgorithm {
@@ -93,6 +100,120 @@ impl PyQcAlgorithm {
     pub fn indicators_arc(&self) -> Arc<Mutex<IndicatorRegistry>> {
         self.indicators.clone()
     }
+    pub fn universes_arc(&self) -> Arc<Mutex<Vec<Py<PyScheduledUniverse>>>> {
+        self.universes.clone()
+    }
+}
+
+fn py_properties_to_map(
+    properties: Option<&Bound<'_, PyAny>>,
+) -> PyResult<HashMap<String, String>> {
+    let Some(properties) = properties else {
+        return Ok(HashMap::new());
+    };
+    if properties.is_none() {
+        return Ok(HashMap::new());
+    }
+    if let Ok(map) = properties.extract::<HashMap<String, String>>() {
+        return Ok(map);
+    }
+    let dict = properties.cast::<PyDict>()?;
+    let mut out = HashMap::new();
+    for (key, value) in dict.iter() {
+        let key = key.extract::<String>()?;
+        let value = if let Ok(s) = value.extract::<String>() {
+            s
+        } else {
+            value.str()?.to_str()?.to_string()
+        };
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+fn py_string_list(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(Some(split_csv(&s)));
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        return collect_py_string_iter(list.iter()).map(Some);
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        return collect_py_string_iter(tuple.iter()).map(Some);
+    }
+    Ok(Some(vec![py_value_to_string(value)?]))
+}
+
+fn collect_py_string_iter<'py>(
+    iter: impl Iterator<Item = Bound<'py, PyAny>>,
+) -> PyResult<Vec<String>> {
+    let mut out = Vec::new();
+    for item in iter {
+        let s = py_value_to_string(&item)?;
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+fn py_value_to_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(s);
+    }
+    for attr in ["Value", "value", "Ticker", "ticker"] {
+        if let Ok(v) = value.getattr(attr) {
+            if let Ok(s) = v.extract::<String>() {
+                return Ok(s);
+            }
+        }
+    }
+    Ok(value.str()?.to_str()?.to_string())
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn custom_query_from_properties(
+    properties: &HashMap<String, String>,
+) -> lean_data::CustomDataQuery {
+    let mut query = lean_data::CustomDataQuery::default();
+    if let Some(symbols) = properties.get("symbols") {
+        query.symbols = Some(split_csv(symbols));
+    }
+    if let Some(columns) = properties.get("columns") {
+        query.columns = Some(split_csv(columns));
+    }
+    for (key, value) in properties {
+        if let Some(column) = key.strip_prefix("eq_") {
+            query
+                .string_equals
+                .insert(column.to_string(), value.to_string());
+        } else if let Some(column) = key.strip_prefix("in_") {
+            query.string_in.insert(column.to_string(), split_csv(value));
+        } else if let Some(column) = key.strip_prefix("min_") {
+            if let Ok(v) = value.parse::<f64>() {
+                query.numeric_min.insert(column.to_string(), v);
+            }
+        } else if let Some(column) = key.strip_prefix("max_") {
+            if let Ok(v) = value.parse::<f64>() {
+                query.numeric_max.insert(column.to_string(), v);
+            }
+        }
+    }
+    query.properties = properties.clone();
+    query
 }
 
 impl Default for PyQcAlgorithm {
@@ -114,6 +235,8 @@ impl PyQcAlgorithm {
             charts: Arc::new(Mutex::new(ChartCollection::new())),
             framework: Arc::new(Mutex::new(FrameworkState::new())),
             indicators: Arc::new(Mutex::new(IndicatorRegistry::new())),
+            universe_settings: PyUniverseSettings::new_shared(),
+            universes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -230,6 +353,46 @@ impl PyQcAlgorithm {
         PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
+    #[getter]
+    fn universe_settings(&self) -> PyUniverseSettings {
+        self.universe_settings.clone()
+    }
+
+    #[getter]
+    fn date_rules(&self) -> PyDateRules {
+        PyDateRules::default()
+    }
+
+    #[getter]
+    fn time_rules(&self) -> PyTimeRules {
+        PyTimeRules::default()
+    }
+
+    #[pyo3(signature = (*args))]
+    fn add_universe(&mut self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+        if args.len() == 1 {
+            let universe = args.get_item(0)?.extract::<Py<PyScheduledUniverse>>()?;
+            self.universes.lock().unwrap().push(universe);
+            return Ok(());
+        }
+
+        if args.len() >= 3 {
+            let resolution = args.get_item(1)?.extract::<PyResolution>()?;
+            let selector = args.get_item(2)?.unbind();
+            let universe = PyScheduledUniverse::user_defined(
+                selector,
+                resolution.into(),
+                self.universe_settings.snapshot(),
+            );
+            self.universes.lock().unwrap().push(Py::new(py, universe)?);
+            return Ok(());
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "add_universe expects ScheduledUniverse or (name, resolution, selector)",
+        ))
+    }
+
     // ─── Ordering ─────────────────────────────────────────────────────────────
 
     /// LEAN API: place a market order. Routes option symbols through the option
@@ -322,25 +485,25 @@ impl PyQcAlgorithm {
 
     // ─── Custom Data ──────────────────────────────────────────────────────────
 
-    /// LEAN API: `self.add_data(source_type, ticker, resolution=Resolution.Daily)`.
+    /// LEAN API: `self.add_data(source_type, ticker, resolution=Resolution.DAILY, properties={...})`.
     ///
     /// Registers a custom data subscription so the runner fetches and delivers
     /// data points to `on_data` via `data.custom[ticker]`.
     ///
     /// ```python
     /// self.unrate = self.add_data("fred", "UNRATE").symbol
-    /// self.vix    = self.add_data("cboe_vix", "VIX", Resolution.Daily)
+    /// self.vix    = self.add_data("cboe_vix", "VIX", Resolution.DAILY)
     /// ```
-    #[pyo3(signature = (source_type, ticker, resolution=None))]
+    #[pyo3(signature = (source_type, ticker, resolution=None, properties=None))]
     fn add_data(
         &mut self,
         source_type: &str,
         ticker: &str,
         resolution: Option<&Bound<'_, PyAny>>,
+        properties: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySecurity> {
         use lean_core::Resolution;
-        use lean_data::{CustomDataConfig, CustomDataSubscription};
-        use std::collections::HashMap;
+        use lean_data::{CustomDataConfig, CustomDataQuery, CustomDataSubscription};
 
         let res = match resolution {
             Some(r) => {
@@ -362,16 +525,21 @@ impl PyQcAlgorithm {
             None => Resolution::Daily,
         };
 
+        let properties = py_properties_to_map(properties)?;
+        let query = custom_query_from_properties(&properties);
+
         let config = CustomDataConfig {
             ticker: ticker.to_string(),
             source_type: source_type.to_string(),
             resolution: res,
-            properties: HashMap::new(),
+            properties,
+            query,
         };
         let sub = CustomDataSubscription {
             source_type: source_type.to_string(),
             ticker: ticker.to_string(),
             config,
+            dynamic_query: CustomDataQuery::default(),
         };
 
         self.inner
@@ -388,11 +556,57 @@ impl PyQcAlgorithm {
         Ok(PySecurity::from_symbol(PySymbol { inner: sym }))
     }
 
+    /// Update dynamic custom-data query hints for an existing subscription.
+    ///
+    /// This is intended for evolving universes: broad custom data can be used
+    /// to select a universe, then downstream custom subscriptions can be
+    /// narrowed to the current active symbols.
+    #[pyo3(signature = (source_type, ticker, symbols=None, columns=None, properties=None))]
+    fn set_custom_data_query(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        symbols: Option<&Bound<'_, PyAny>>,
+        columns: Option<&Bound<'_, PyAny>>,
+        properties: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let mut query = lean_data::CustomDataQuery {
+            symbols: py_string_list(symbols)?,
+            columns: py_string_list(columns)?,
+            ..Default::default()
+        };
+        let properties = py_properties_to_map(properties)?;
+        query = query.merge(&custom_query_from_properties(&properties));
+        query.properties.extend(properties);
+        let mut inner = self.inner.lock().unwrap();
+        for sub in &mut inner.custom_data_subscriptions {
+            if sub.source_type.eq_ignore_ascii_case(source_type)
+                && sub.ticker.eq_ignore_ascii_case(ticker)
+            {
+                sub.dynamic_query = query;
+                return Ok(());
+            }
+        }
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "custom data subscription not found: {source_type}/{ticker}"
+        )))
+    }
+
+    #[pyo3(signature = (source_type, ticker, symbols))]
+    fn set_custom_data_symbols(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        symbols: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.set_custom_data_query(source_type, ticker, Some(symbols), None, None)
+    }
+
     // ─── Options ──────────────────────────────────────────────────────────────
 
     /// Subscribe to an option chain for an underlying equity.
     /// Returns a LEAN-compatible `Option` security object with `.symbol` and `.set_filter()`.
-    /// Accepts `Resolution.Daily`, `Resolution.Minute`, etc. or a string, defaulting to Daily.
+    /// Accepts `Resolution.DAILY`, `Resolution.Daily`, etc. or a string, defaulting to Daily.
     #[pyo3(signature = (ticker, resolution=None))]
     fn add_option(
         &mut self,
@@ -483,7 +697,7 @@ impl PyQcAlgorithm {
     #[getter]
     fn time(&self) -> PyResult<Py<PyAny>> {
         let ns = self.inner.lock().unwrap().time.0;
-        ns_to_py_datetime(ns)
+        ns_to_py_datetime_in_tz(ns, chrono_tz::America::New_York)
     }
 
     /// Current UTC time as a Python datetime object.
@@ -788,6 +1002,27 @@ fn ns_to_py_datetime(ns: i64) -> PyResult<Py<PyAny>> {
             .import("datetime")?
             .getattr("datetime")?
             .call_method1("utcfromtimestamp", (timestamp,))?;
+        Ok(datetime.into())
+    })
+}
+
+fn ns_to_py_datetime_in_tz(ns: i64, tz: chrono_tz::Tz) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| {
+        use chrono::{DateTime as ChronoDateTime, Utc};
+        let secs = ns / 1_000_000_000;
+        let nsub = (ns % 1_000_000_000) as u32;
+        let dt: ChronoDateTime<Utc> =
+            chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
+        let local = dt.with_timezone(&tz).naive_local();
+        let datetime = py.import("datetime")?.getattr("datetime")?.call1((
+            local.year(),
+            local.month(),
+            local.day(),
+            local.hour(),
+            local.minute(),
+            local.second(),
+            local.and_utc().timestamp_subsec_micros(),
+        ))?;
         Ok(datetime.into())
     })
 }

@@ -1,7 +1,9 @@
 /// Standalone Python strategy runner.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate};
@@ -15,11 +17,11 @@ use tracing::{info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt, TickType,
-    TimeSpan,
+    exchange_hours::ExchangeHours, DateTime, Market, OptionRight, OptionStyle, Resolution,
+    SecurityType, Symbol, SymbolOptionsExt, TickType, TimeSpan,
 };
 use lean_data::{
-    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
+    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSubscription,
     CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice,
     SubscriptionDataConfig, SymbolChangedEvent, Tick, TradeBar, TradeBarData,
 };
@@ -48,6 +50,10 @@ use crate::py_data::SliceProxy;
 use crate::py_framework::run_framework_pipeline;
 use lean_data_providers::IHistoryProvider as SyncHistoryProvider;
 
+const HIGH_RESOLUTION_PREFETCH_CONCURRENCY: usize = 8;
+const SUBSCRIPTION_PREFETCH_CONCURRENCY: usize = 8;
+const CUSTOM_DATA_SOURCE_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub struct RunConfig {
     pub data_root: PathBuf,
     pub _compression_level: i32,
@@ -64,6 +70,9 @@ pub struct RunConfig {
     /// Custom data source plugins loaded from `~/.rlean/plugins/` or set explicitly.
     /// Keyed by `source_type` name (e.g. `"fred"`, `"cboe_vix"`).
     pub custom_data_sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>>,
+    /// Optional backtest output directory. When set, progress/order/trade sidecar
+    /// files are written while the backtest is still running.
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -76,6 +85,7 @@ impl Default for RunConfig {
             start_date_override: None,
             end_date_override: None,
             custom_data_sources: vec![],
+            output_dir: None,
         }
     }
 }
@@ -105,6 +115,171 @@ pub struct BacktestResult {
     pub backtest_id: i64,
     /// The ticker used as the benchmark (e.g. "SPY").
     pub benchmark_symbol: String,
+}
+
+struct LiveBacktestWriter {
+    dir: PathBuf,
+    progress_path: PathBuf,
+    order_events_path: PathBuf,
+    trades_path: PathBuf,
+    heartbeat_path: PathBuf,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    started_at: chrono::DateTime<chrono::Utc>,
+    last_log_date: Option<NaiveDate>,
+    last_heartbeat: Instant,
+}
+
+impl LiveBacktestWriter {
+    fn new(dir: PathBuf, start_date: NaiveDate, end_date: NaiveDate) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        let writer = LiveBacktestWriter {
+            progress_path: dir.join("progress.json"),
+            order_events_path: dir.join("order-events.jsonl"),
+            trades_path: dir.join("trades.jsonl"),
+            heartbeat_path: dir.join("heartbeat.log"),
+            dir,
+            start_date,
+            end_date,
+            started_at: chrono::Utc::now(),
+            last_log_date: None,
+            last_heartbeat: Instant::now() - Duration::from_secs(60),
+        };
+        let _ = std::fs::File::create(&writer.order_events_path);
+        let _ = std::fs::File::create(&writer.trades_path);
+        let _ = std::fs::File::create(&writer.heartbeat_path);
+        writer
+    }
+
+    fn progress_fraction(&self, current_date: NaiveDate) -> f64 {
+        let total = (self.end_date - self.start_date).num_days().max(1) as f64;
+        let done = (current_date - self.start_date).num_days().max(0) as f64;
+        (done / total).clamp(0.0, 1.0)
+    }
+
+    fn record_progress(
+        &mut self,
+        current_date: NaiveDate,
+        trading_days: i64,
+        portfolio_value: Decimal,
+        order_events: usize,
+        trades: usize,
+    ) {
+        let progress = self.progress_fraction(current_date);
+        let payload = serde_json::json!({
+            "status": "running",
+            "current_date": current_date.to_string(),
+            "start_date": self.start_date.to_string(),
+            "end_date": self.end_date.to_string(),
+            "progress": progress,
+            "progress_percent": (progress * 100.0),
+            "trading_days": trading_days,
+            "portfolio_value": portfolio_value.to_string(),
+            "order_events": order_events,
+            "trades": trades,
+            "started_at": self.started_at.to_rfc3339(),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let tmp = self.progress_path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(&tmp, json);
+            let _ = std::fs::rename(&tmp, &self.progress_path);
+        }
+
+        if self.last_log_date != Some(current_date) {
+            info!(
+                "Backtest progress: {} ({:.1}%) trading_days={} portfolio={} orders={} trades={} output={}",
+                current_date,
+                progress * 100.0,
+                trading_days,
+                portfolio_value,
+                order_events,
+                trades,
+                self.dir.display()
+            );
+            self.last_log_date = Some(current_date);
+        }
+
+        if self.last_heartbeat.elapsed() >= Duration::from_secs(30) {
+            self.append_heartbeat(current_date, progress, trading_days, portfolio_value);
+            self.last_heartbeat = Instant::now();
+        }
+    }
+
+    fn append_order_events(&self, events: &[OrderEvent]) {
+        append_json_lines(&self.order_events_path, events);
+    }
+
+    fn append_trades(&self, trades: &[Trade]) {
+        append_json_lines(&self.trades_path, trades);
+    }
+
+    fn append_heartbeat(
+        &self,
+        current_date: NaiveDate,
+        progress: f64,
+        trading_days: i64,
+        portfolio_value: Decimal,
+    ) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.heartbeat_path)
+        {
+            let _ = writeln!(
+                file,
+                "{} current_date={} progress={:.3} trading_days={} portfolio={}",
+                chrono::Utc::now().to_rfc3339(),
+                current_date,
+                progress,
+                trading_days,
+                portfolio_value
+            );
+        }
+    }
+
+    fn mark_completed(
+        &self,
+        trading_days: i64,
+        portfolio_value: Decimal,
+        order_events: usize,
+        trades: usize,
+    ) {
+        let payload = serde_json::json!({
+            "status": "completed",
+            "current_date": self.end_date.to_string(),
+            "start_date": self.start_date.to_string(),
+            "end_date": self.end_date.to_string(),
+            "progress": 1.0,
+            "progress_percent": 100.0,
+            "trading_days": trading_days,
+            "portfolio_value": portfolio_value.to_string(),
+            "order_events": order_events,
+            "trades": trades,
+            "started_at": self.started_at.to_rfc3339(),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(&self.progress_path, json);
+        }
+    }
+}
+
+fn append_json_lines<T: serde::Serialize>(path: &Path, values: &[T]) {
+    if values.is_empty() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        for value in values {
+            if let Ok(line) = serde_json::to_string(value) {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
 }
 
 impl BacktestResult {
@@ -191,6 +366,11 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
     let parent = strategy_path.parent().unwrap_or(Path::new("."));
     let sys = py.import("sys").context("failed to import sys")?;
     let path_list = sys.getattr("path").context("no sys.path")?;
+    if let Some(site_packages) = rlean_python_site_packages(py)? {
+        path_list
+            .call_method1("insert", (0, site_packages.to_string_lossy().as_ref()))
+            .context("failed to insert rlean Python site-packages to sys.path")?;
+    }
     path_list
         .call_method1("insert", (0, parent.to_string_lossy().as_ref()))
         .context("failed to insert to sys.path")?;
@@ -262,6 +442,25 @@ pub fn load_strategy(py: Python<'_>, strategy_path: &Path) -> Result<PyAlgorithm
 
     PyAlgorithmAdapter::from_instance(py, instance_py)
         .context("strategy class must inherit from AlgorithmImports.QCAlgorithm")
+}
+
+fn rlean_python_site_packages(py: Python<'_>) -> Result<Option<PathBuf>> {
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => return Ok(None),
+    };
+    let sys = py.import("sys").context("failed to import sys")?;
+    let version_info = sys
+        .getattr("version_info")
+        .context("failed to read sys.version_info")?;
+    let major: u8 = version_info.getattr("major")?.extract()?;
+    let minor: u8 = version_info.getattr("minor")?.extract()?;
+    let site_packages = PathBuf::from(home)
+        .join(".rlean")
+        .join("python")
+        .join(format!("cp{major}{minor}"))
+        .join("site-packages");
+    Ok(site_packages.exists().then_some(site_packages))
 }
 
 /// Run the full backtest loop for a Python strategy.
@@ -352,13 +551,37 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         transactions,
     );
 
+    // ── determine warm-up window ────────────────────────────────────────────
+    // Compute this before prefetching so data is requested once for the full
+    // range the algorithm can consume. This mirrors LEAN's source-driven data
+    // provider path and avoids overwriting daily/hourly single-file data with a
+    // narrower main-period-only download.
+    let warmup_start: Option<NaiveDate> = {
+        let alg = adapter.inner.lock().unwrap();
+        if let Some(bar_count) = alg.warmup_bar_count {
+            // C# LEAN counts back N trading days using exchange calendar.
+            // For daily data: 5 trading days per 7 calendar days -> multiply by 7/5.
+            // Add a small buffer (+10) to ensure we never undershoot.
+            let calendar_days = (bar_count as i64 * 7 + 4) / 5 + 10;
+            Some(start_date - chrono::Duration::days(calendar_days))
+        } else if let Some(dur) = alg.warmup_duration {
+            let days = (dur.nanos / TimeSpan::ONE_DAY.nanos).max(1);
+            Some(start_date - chrono::Duration::days(days))
+        } else if let Some(period) = alg.warmup_period {
+            let days = (period.nanos / TimeSpan::ONE_DAY.nanos).max(1);
+            Some(start_date - chrono::Duration::days(days))
+        } else {
+            None
+        }
+    };
+
     // ── pre-fetch missing data ───────────────────────────────────────────────
     if let Some(ref provider) = config.historical_provider {
         pre_fetch_all(
-            provider.as_ref(),
+            provider.clone(),
             config.history_provider.clone(),
             &subscriptions,
-            start_date,
+            warmup_start.unwrap_or(start_date),
             end_date,
             &resolver,
         )
@@ -457,44 +680,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     };
 
     // ── warm-up loop ────────────────────────────────────────────────────────
-    // Determine the warm-up window from the strategy's configuration.
-    // The strategy may call set_warm_up(days) or set_warm_up_bars(n) in
-    // initialize().  Both are stored as `warmup_bar_count` / `warmup_duration`
-    // on QcAlgorithm.  We also honour the legacy `warmup_period` field.
-    let warmup_start: Option<NaiveDate> = {
-        let alg = adapter.inner.lock().unwrap();
-        if let Some(bar_count) = alg.warmup_bar_count {
-            // C# LEAN counts back N trading days using exchange calendar.
-            // For daily data: 5 trading days per 7 calendar days → multiply by 7/5.
-            // Add a small buffer (+10) to ensure we never undershoot.
-            let calendar_days = (bar_count as i64 * 7 + 4) / 5 + 10;
-            Some(start_date - chrono::Duration::days(calendar_days))
-        } else if let Some(dur) = alg.warmup_duration {
-            let days = (dur.nanos / TimeSpan::ONE_DAY.nanos).max(1);
-            Some(start_date - chrono::Duration::days(days))
-        } else if let Some(period) = alg.warmup_period {
-            let days = (period.nanos / TimeSpan::ONE_DAY.nanos).max(1);
-            Some(start_date - chrono::Duration::days(days))
-        } else {
-            None
-        }
-    };
-
     if let Some(wu_start) = warmup_start {
         info!("Warm-up: {} → {} (exclusive)", wu_start, start_date);
-
-        // Pre-fetch warm-up data if a historical provider is configured.
-        if let Some(ref provider) = config.historical_provider {
-            pre_fetch_all(
-                provider.as_ref(),
-                config.history_provider.clone(),
-                &subscriptions,
-                wu_start,
-                start_date - chrono::Duration::days(1),
-                &resolver,
-            )
-            .await?;
-        }
 
         let mut wu_date = wu_start;
         while wu_date < start_date {
@@ -608,7 +795,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── pre-allocate proxy objects for the hot path ──────────────────────────
     // One PyTradeBar per subscription is allocated here and reused every day.
     // `on_data_proxy` updates fields in-place instead of constructing new objects.
-    let slice_proxy = Python::attach(|py| SliceProxy::new(py, &subscriptions))
+    let mut slice_proxy = Python::attach(|py| SliceProxy::new(py, &subscriptions))
         .context("Failed to create SliceProxy")?;
 
     // ── pre-load benchmark data ──────────────────────────────────────────────
@@ -675,6 +862,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
     // Record the backtest start time as Unix epoch seconds (used as the LEAN backtest ID).
     let backtest_id = chrono::Utc::now().timestamp();
+    let mut live_writer = config
+        .output_dir
+        .clone()
+        .map(|dir| LiveBacktestWriter::new(dir, start_date, end_date));
 
     // ── prefetch full-history custom data sources ────────────────────────────
     // For sources where is_full_history_source() is true (FRED, CBOE VIX, …),
@@ -886,12 +1077,34 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 if !sub.resolution.is_high_resolution() {
                     continue;
                 }
+                if !is_expected_market_date(&sub.symbol, current_date) {
+                    continue;
+                }
 
                 let sid = sub.symbol.id.sid;
                 let mut had_data = false;
 
                 if sub.resolution == Resolution::Tick {
                     let tick_path = resolver.tick(&sub.symbol, current_date).to_path();
+                    if !tick_path.exists() {
+                        if let Some(ref provider) = config.historical_provider {
+                            if let Err(e) = pre_fetch_subscription(
+                                provider.clone(),
+                                config.history_provider.clone(),
+                                sub.clone(),
+                                current_date,
+                                current_date,
+                                resolver.clone(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "Failed to fetch data for {} on {}: {}",
+                                    sub.symbol.value, current_date, e
+                                );
+                            }
+                        }
+                    }
                     if tick_path.exists() {
                         match reader.read_ticks(&[tick_path], sub.symbol.clone(), &day_params) {
                             Ok(mut ticks) if !ticks.is_empty() => {
@@ -922,6 +1135,25 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let trade_path = resolver
                         .trade_bar(&sub.symbol, sub.resolution, current_date)
                         .to_path();
+                    if !trade_path.exists() {
+                        if let Some(ref provider) = config.historical_provider {
+                            if let Err(e) = pre_fetch_subscription(
+                                provider.clone(),
+                                config.history_provider.clone(),
+                                sub.clone(),
+                                current_date,
+                                current_date,
+                                resolver.clone(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "Failed to fetch data for {} on {}: {}",
+                                    sub.symbol.value, current_date, e
+                                );
+                            }
+                        }
+                    }
                     if trade_path.exists() {
                         match reader
                             .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
@@ -1091,6 +1323,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 };
                 let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
                 for sub in &custom_subs {
+                    if sub.config.resolution.is_high_resolution() {
+                        continue;
+                    }
                     let key = sub.ticker.to_uppercase();
                     if let Some(by_date) = custom_history.get(&key) {
                         // Full-history source: look up from preloaded in-memory map.
@@ -1108,18 +1343,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let source_type = sub.source_type.clone();
                         let ticker = sub.ticker.clone();
                         let cfg = sub.config.clone();
-                        let points = tokio::task::spawn_blocking(move || {
-                            load_custom_data_points(
-                                &data_root,
-                                &source_type,
-                                &ticker,
-                                current_date,
-                                source.as_ref(),
-                                &cfg,
-                            )
-                        })
+                        let dynamic_query = sub.dynamic_query.clone();
+                        let points = load_custom_data_points_for_subscription(
+                            data_root,
+                            source_type,
+                            ticker,
+                            current_date,
+                            source,
+                            cfg,
+                            dynamic_query,
+                        )
                         .await
-                        .unwrap_or_default();
+                        .with_context(|| {
+                            format!(
+                                "failed to load custom data for {}/{} {}",
+                                sub.source_type, sub.ticker, current_date
+                            )
+                        })?;
                         if !points.is_empty() {
                             custom_data_for_day.insert(sub.ticker.clone(), points);
                         }
@@ -1239,12 +1479,218 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     sync_option_holdings_to_chain_prices(&adapter, &portfolio, &chains_snapshot);
 
                     Python::attach(|py| {
+                        adapter.apply_universe_selection(py, utc_time.0, Resolution::Minute);
+                    });
+
+                    let mut custom_data_for_slice = custom_data_for_day.clone();
+                    for sub in custom_subs
+                        .iter()
+                        .filter(|sub| sub.config.resolution.is_high_resolution())
+                    {
+                        let source = config
+                            .custom_data_sources
+                            .iter()
+                            .find(|s| s.name() == sub.source_type)
+                            .cloned();
+                        let timestamp_query = sub.dynamic_query.merge(&CustomDataQuery {
+                            start_time: Some(utc_time),
+                            end_time: Some(utc_time),
+                            ..Default::default()
+                        });
+                        let points = load_custom_data_points_for_subscription(
+                            config.data_root.clone(),
+                            sub.source_type.clone(),
+                            sub.ticker.clone(),
+                            current_date,
+                            source,
+                            sub.config.clone(),
+                            timestamp_query,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to load custom data for {}/{} {} at {}",
+                                sub.source_type, sub.ticker, current_date, utc_time.0
+                            )
+                        })?;
+                        if !points.is_empty() {
+                            custom_data_for_slice.insert(sub.ticker.clone(), points);
+                        }
+                    }
+
+                    Python::attach(|py| {
                         slice_proxy.update_option_chains(py, &chains_snapshot);
                         slice_proxy.update_quote_bars(py, &minute_quote_bars);
                         slice_proxy.update_ticks(py, &minute_ticks);
-                        slice_proxy.update_custom_data(py, &custom_data_for_day);
+                        slice_proxy.update_custom_data(py, &custom_data_for_slice);
                         adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
                     });
+
+                    // Mirror C# LEAN's DataManager.AddSubscription behavior for
+                    // intraday universes: symbols added during this slice are
+                    // attached to the active data stream so later slices can
+                    // receive bars without requiring a static universe.
+                    let current_subs =
+                        { adapter.inner.lock().unwrap().subscription_manager.get_all() };
+                    for sub in &current_subs {
+                        let sid = sub.symbol.id.sid;
+                        if loaded_sids.contains(&sid) {
+                            continue;
+                        }
+                        loaded_sids.insert(sid);
+                        subscriptions.push(sub.clone());
+                        let _ = Python::attach(|py| slice_proxy.add_subscription(py, sub));
+
+                        if !sub.resolution.is_high_resolution() {
+                            continue;
+                        }
+
+                        if let Some(ref provider) = config.historical_provider {
+                            if let Err(e) = pre_fetch_subscription(
+                                provider.clone(),
+                                config.history_provider.clone(),
+                                sub.clone(),
+                                current_date,
+                                current_date,
+                                resolver.clone(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "Failed to fetch data for dynamic subscription {}: {}",
+                                    sub.symbol.value, e
+                                );
+                            }
+                        }
+
+                        let ticker = sub.symbol.permtick.to_lowercase();
+                        let market = sub.symbol.market().as_str().to_lowercase();
+                        let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
+                        let factor_path = config
+                            .data_root
+                            .join(&sec)
+                            .join(&market)
+                            .join("factor_files")
+                            .join(format!("{ticker}.parquet"));
+                        if let Ok(rows) = factor_reader.read_factor_file(&factor_path) {
+                            if !rows.is_empty() {
+                                factor_map.insert(sid, rows);
+                            }
+                        }
+
+                        let exchange_hours = {
+                            adapter
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .securities
+                                .get(&sub.symbol)
+                                .map(|s| s.exchange_hours.clone())
+                        };
+
+                        if sub.resolution == Resolution::Tick {
+                            let tick_path = resolver.tick(&sub.symbol, current_date).to_path();
+                            if tick_path.exists() {
+                                match reader.read_ticks(
+                                    &[tick_path],
+                                    sub.symbol.clone(),
+                                    &day_params,
+                                ) {
+                                    Ok(mut ticks) if !ticks.is_empty() => {
+                                        if let Some(hours) = &exchange_hours {
+                                            ticks.retain(|tick| hours.is_open_at(tick.time));
+                                        }
+                                        ticks.retain(|tick| match tick.tick_type {
+                                            TickType::Trade => tick.value > Decimal::ZERO,
+                                            TickType::Quote => {
+                                                tick.bid_price > Decimal::ZERO
+                                                    || tick.ask_price > Decimal::ZERO
+                                            }
+                                            TickType::OpenInterest => true,
+                                        });
+                                        if !ticks.is_empty() {
+                                            let mut ts_map: HashMap<i64, Vec<Tick>> =
+                                                HashMap::new();
+                                            for tick in &ticks {
+                                                ts_map
+                                                    .entry(tick.time.0)
+                                                    .or_default()
+                                                    .push(tick.clone());
+                                            }
+                                            ticks_by_ts.insert(sid, ts_map);
+                                            day_ticks.insert(sid, ticks);
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        "Failed to read dynamic ticks for {} on {}: {}",
+                                        sub.symbol.value, current_date, e
+                                    ),
+                                }
+                            }
+                        } else {
+                            let trade_path = resolver
+                                .trade_bar(&sub.symbol, sub.resolution, current_date)
+                                .to_path();
+                            if trade_path.exists() {
+                                match reader
+                                    .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
+                                    .await
+                                {
+                                    Ok(mut bars) if !bars.is_empty() => {
+                                        if let Some(hours) = &exchange_hours {
+                                            bars.retain(|bar| hours.is_open_at(bar.time));
+                                        }
+                                        bars.retain(|bar| bar.close > Decimal::ZERO);
+                                        if !bars.is_empty() {
+                                            let mut ts_map: HashMap<i64, TradeBar> = HashMap::new();
+                                            for bar in &bars {
+                                                ts_map.insert(bar.time.0, bar.clone());
+                                            }
+                                            trade_by_ts.insert(sid, ts_map);
+                                            day_trade_bars.insert(sid, bars);
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        "Failed to read dynamic intraday bars for {} on {}: {}",
+                                        sub.symbol.value, current_date, e
+                                    ),
+                                }
+                            }
+
+                            let quote_path = resolver
+                                .quote_bar(&sub.symbol, sub.resolution, current_date)
+                                .to_path();
+                            if quote_path.exists() {
+                                match reader.read_quote_bars(
+                                    &[quote_path],
+                                    sub.symbol.clone(),
+                                    &day_params,
+                                ) {
+                                    Ok(mut bars) if !bars.is_empty() => {
+                                        if let Some(hours) = &exchange_hours {
+                                            bars.retain(|bar| hours.is_open_at(bar.time));
+                                        }
+                                        bars.retain(|bar| bar.mid_close() > Decimal::ZERO);
+                                        if !bars.is_empty() {
+                                            let mut ts_map: HashMap<i64, QuoteBar> = HashMap::new();
+                                            for qbar in &bars {
+                                                ts_map.insert(qbar.time.0, qbar.clone());
+                                            }
+                                            quote_by_ts.insert(sid, ts_map);
+                                            day_quote_bars.insert(sid, bars);
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        "Failed to read dynamic quote bars for {} on {}: {}",
+                                        sub.symbol.value, current_date, e
+                                    ),
+                                }
+                            }
+                        }
+                    }
 
                     // ── Algorithm Framework pipeline (intraday) ───────────
                     {
@@ -1279,6 +1725,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                     let fill_events = order_processor.process_orders(&bars_for_orders, utc_time);
                     all_order_events.extend(fill_events.iter().cloned());
+                    if let Some(writer) = &live_writer {
+                        writer.append_order_events(&fill_events);
+                    }
                     let ib_fee_model = InteractiveBrokersFeeModel::default();
                     for event in &fill_events {
                         if event.is_fill() {
@@ -1324,7 +1773,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 open_positions.remove(&sid)
                             {
                                 let close_qty = open_qty.abs().min(fill_qty.abs());
-                                completed_trades.push(Trade::new(
+                                let trade = Trade::new(
                                     event.symbol.clone(),
                                     entry_time,
                                     event.utc_time,
@@ -1332,7 +1781,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     event.fill_price,
                                     close_qty,
                                     rust_decimal_macros::dec!(0),
-                                ));
+                                );
+                                if let Some(writer) = &live_writer {
+                                    writer.append_trades(std::slice::from_ref(&trade));
+                                }
+                                completed_trades.push(trade);
                             } else {
                                 open_positions
                                     .insert(sid, (event.utc_time, event.fill_price, fill_qty));
@@ -1380,6 +1833,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let day_equity = portfolio.total_portfolio_value();
                 equity_curve.push(day_equity);
                 daily_dates.push(current_date.to_string());
+                if let Some(writer) = &mut live_writer {
+                    writer.record_progress(
+                        current_date,
+                        trading_days,
+                        day_equity,
+                        all_order_events.len(),
+                        completed_trades.len(),
+                    );
+                }
             }
 
             current_date += chrono::Duration::days(1);
@@ -1404,7 +1866,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         if !path.exists() {
                             if let Some(ref provider) = config.historical_provider {
                                 if let Err(e) = pre_fetch_all(
-                                    provider.as_ref(),
+                                    provider.clone(),
                                     config.history_provider.clone(),
                                     std::slice::from_ref(sub),
                                     start_date,
@@ -1438,6 +1900,58 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             let utc_time = date_to_datetime(current_date, 16, 0, 0);
             set_algorithm_time(&adapter, utc_time);
+
+            Python::attach(|py| {
+                adapter.apply_universe_selection(py, utc_time.0, Resolution::Daily);
+            });
+
+            // Universe selection can add subscriptions at the frontier before
+            // OnData. Load those subscriptions now so the current slice can
+            // contain their data, matching C# LEAN's time-pulse selection flow.
+            if !is_intraday {
+                let current_subs = { adapter.inner.lock().unwrap().subscription_manager.get_all() };
+                for sub in &current_subs {
+                    let sid = sub.symbol.id.sid;
+                    if !loaded_sids.contains(&sid) {
+                        loaded_sids.insert(sid);
+                        let path = resolver
+                            .trade_bar(&sub.symbol, sub.resolution, start_date)
+                            .to_path();
+                        if !path.exists() {
+                            if let Some(ref provider) = config.historical_provider {
+                                if let Err(e) = pre_fetch_all(
+                                    provider.clone(),
+                                    config.history_provider.clone(),
+                                    std::slice::from_ref(sub),
+                                    start_date,
+                                    end_date,
+                                    &resolver,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "Failed to fetch data for universe subscription {}: {}",
+                                        sub.symbol.value, e
+                                    );
+                                }
+                            }
+                        }
+                        if path.exists() {
+                            let bars = reader
+                                .read_trade_bars(&[path], sub.symbol.clone(), &daily_full_params)
+                                .await
+                                .unwrap_or_default();
+                            let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
+                                bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+                            if !date_map.is_empty() {
+                                bar_map.insert(sid, date_map);
+                            }
+                        }
+                        subscriptions.push(sub.clone());
+                        let _ = Python::attach(|py| slice_proxy.add_subscription(py, sub));
+                    }
+                }
+            }
 
             // ── split adjustment for option-underlying equities ───────────────
             // Option-underlying equities skip factor adjustment (raw prices used
@@ -1545,6 +2059,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             let fill_events = order_processor.process_orders(&bars_map, utc_time);
             all_order_events.extend(fill_events.iter().cloned());
+            if let Some(writer) = &live_writer {
+                writer.append_order_events(&fill_events);
+            }
             let ib_fee_model = InteractiveBrokersFeeModel::default();
             for event in &fill_events {
                 if event.is_fill() {
@@ -1584,7 +2101,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let fill_qty = event.fill_quantity;
                     if let Some((entry_time, entry_price, open_qty)) = open_positions.remove(&sid) {
                         let close_qty = open_qty.abs().min(fill_qty.abs());
-                        completed_trades.push(Trade::new(
+                        let trade = Trade::new(
                             event.symbol.clone(),
                             entry_time,
                             event.utc_time,
@@ -1592,7 +2109,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             event.fill_price,
                             close_qty,
                             rust_decimal_macros::dec!(0),
-                        ));
+                        );
+                        if let Some(writer) = &live_writer {
+                            writer.append_trades(std::slice::from_ref(&trade));
+                        }
+                        completed_trades.push(trade);
                     } else {
                         open_positions.insert(sid, (event.utc_time, event.fill_price, fill_qty));
                     }
@@ -1688,18 +2209,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let source_type = sub.source_type.clone();
                     let ticker = sub.ticker.clone();
                     let cfg = sub.config.clone();
-                    let points = tokio::task::spawn_blocking(move || {
-                        load_custom_data_points(
-                            &data_root,
-                            &source_type,
-                            &ticker,
-                            current_date,
-                            source.as_ref(),
-                            &cfg,
-                        )
-                    })
+                    let dynamic_query = sub.dynamic_query.clone();
+                    let points = load_custom_data_points_for_subscription(
+                        data_root,
+                        source_type,
+                        ticker,
+                        current_date,
+                        source,
+                        cfg,
+                        dynamic_query,
+                    )
                     .await
-                    .unwrap_or_default();
+                    .with_context(|| {
+                        format!(
+                            "failed to load custom data for {}/{} {}",
+                            sub.source_type, sub.ticker, current_date
+                        )
+                    })?;
                     if !points.is_empty() {
                         custom_data_for_day.insert(sub.ticker.clone(), points);
                     }
@@ -1815,6 +2341,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             let day_equity = portfolio.total_portfolio_value();
             equity_curve.push(day_equity);
             daily_dates.push(current_date.to_string());
+            if let Some(writer) = &mut live_writer {
+                writer.record_progress(
+                    current_date,
+                    trading_days,
+                    day_equity,
+                    all_order_events.len(),
+                    completed_trades.len(),
+                );
+            }
 
             current_date += chrono::Duration::days(1);
         }
@@ -1869,6 +2404,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             v.to_f64().unwrap_or(0.0)
         })
         .collect();
+    if let Some(writer) = &live_writer {
+        writer.mark_completed(
+            trading_days,
+            portfolio.total_portfolio_value(),
+            all_order_events.len(),
+            completed_trades.len(),
+        );
+    }
 
     // Collect charts from the strategy after the backtest completes.
     let charts = adapter.charts.lock().map(|c| c.clone()).unwrap_or_default();
@@ -1900,194 +2443,425 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 /// For minute/second (date-partitioned): checks for the first date; if
 /// missing, fetches the full range and the provider splits by date on write.
 async fn pre_fetch_all(
-    provider: &dyn IHistoricalDataProvider,
+    provider: Arc<dyn IHistoricalDataProvider>,
     factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
     subscriptions: &[Arc<SubscriptionDataConfig>],
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
 ) -> Result<()> {
-    for sub in subscriptions {
-        let data_path = if sub.resolution == Resolution::Tick {
-            resolver.tick(&sub.symbol, start).to_path()
-        } else if sub.tick_type == TickType::Quote {
-            resolver
-                .quote_bar(&sub.symbol, sub.resolution, start)
-                .to_path()
-        } else {
-            resolver
-                .trade_bar(&sub.symbol, sub.resolution, start)
-                .to_path()
-        };
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
 
-        let ticker = sub.symbol.permtick.to_lowercase();
-        let market = sub.symbol.market().as_str().to_lowercase();
-        let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
-        let factor_path = resolver
-            .data_root
-            .join(&sec)
-            .join(&market)
-            .join("factor_files")
-            .join(format!("{ticker}.parquet"));
+    info!(
+        "Prefetching {} subscriptions with parallelism {} ({} → {})",
+        subscriptions.len(),
+        SUBSCRIPTION_PREFETCH_CONCURRENCY.min(subscriptions.len()),
+        start,
+        end
+    );
 
-        // A factor file is valid if it exists, is non-empty, AND the sentinel row
-        // (row 0, dated when the file was last generated) covers the backtest end.
-        // If the sentinel is older than `end`, a new corporate action may have
-        // occurred since then and we need to re-fetch.
-        let factor_valid = factor_path.exists() && {
-            let r = ParquetReader::new();
-            r.read_factor_file(&factor_path).is_ok_and(|rows| {
-                if rows.is_empty() {
-                    return false;
-                }
-                // rows are newest-first; row 0 is the sentinel (date = generation date).
-                rows[0].date >= end
-            })
-        };
-
-        if data_path.exists() && factor_valid {
-            continue;
+    for chunk in subscriptions.chunks(SUBSCRIPTION_PREFETCH_CONCURRENCY) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for sub in chunk {
+            let provider = provider.clone();
+            let factor_provider = factor_provider.clone();
+            let sub = sub.clone();
+            let resolver = resolver.clone();
+            tasks.spawn(async move {
+                pre_fetch_subscription(provider, factor_provider, sub, start, end, resolver).await
+            });
         }
 
-        // Clip start to the provider's earliest supported date (e.g. ThetaData
-        // STANDARD only has data from 2018-01-01; requesting earlier causes 403).
-        let effective_start = match provider.earliest_date() {
-            Some(earliest) if start < earliest => {
-                warn!(
-                    "Provider earliest date is {}; clipping backtest start from {} for {}",
-                    earliest, start, sub.symbol.value
-                );
-                earliest
+        while let Some(result) = tasks.join_next().await {
+            result.map_err(|e| anyhow::anyhow!("prefetch task failed: {}", e))??;
+        }
+    }
+
+    Ok(())
+}
+
+async fn pre_fetch_subscription(
+    provider: Arc<dyn IHistoricalDataProvider>,
+    factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
+    sub: Arc<SubscriptionDataConfig>,
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: PathResolver,
+) -> Result<()> {
+    let data_path = if sub.resolution == Resolution::Tick {
+        resolver.tick(&sub.symbol, start).to_path()
+    } else if sub.tick_type == TickType::Quote {
+        resolver
+            .quote_bar(&sub.symbol, sub.resolution, start)
+            .to_path()
+    } else {
+        resolver
+            .trade_bar(&sub.symbol, sub.resolution, start)
+            .to_path()
+    };
+
+    let ticker = sub.symbol.permtick.to_lowercase();
+    let market = sub.symbol.market().as_str().to_lowercase();
+    let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
+    let factor_path = resolver
+        .data_root
+        .join(&sec)
+        .join(&market)
+        .join("factor_files")
+        .join(format!("{ticker}.parquet"));
+
+    // A factor file is valid if it exists, is non-empty, AND the sentinel row
+    // (row 0, dated when the file was last generated) covers the backtest end.
+    let factor_valid = factor_path.exists() && {
+        let r = ParquetReader::new();
+        r.read_factor_file(&factor_path).is_ok_and(|rows| {
+            if rows.is_empty() {
+                return false;
             }
-            _ => start,
-        };
+            rows[0].date >= end
+        })
+    };
 
-        let start_dt = date_to_datetime(effective_start, 0, 0, 0);
-        let end_dt = date_to_datetime(end, 23, 59, 59);
+    let data_covers_range = local_data_covers_range(&sub, start, end, &resolver, &data_path).await;
 
-        if !data_path.exists() {
+    if data_covers_range && factor_valid {
+        return Ok(());
+    }
+
+    // Clip start to the provider's earliest supported date (e.g. ThetaData
+    // STANDARD only has data from 2018-01-01; requesting earlier causes 403).
+    let effective_start = match provider.earliest_date() {
+        Some(earliest) if start < earliest => {
+            warn!(
+                "Provider earliest date is {}; clipping backtest start from {} for {}",
+                earliest, start, sub.symbol.value
+            );
+            earliest
+        }
+        _ => start,
+    };
+
+    let start_dt = date_to_datetime(effective_start, 0, 0, 0);
+    let end_dt = date_to_datetime(end, 23, 59, 59);
+
+    if !data_covers_range
+        && (sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote)
+    {
+        let rows_downloaded = pre_fetch_missing_high_resolution_days(
+            provider.clone(),
+            factor_provider.clone(),
+            &sub,
+            effective_start,
+            end,
+            &resolver,
+        )
+        .await?;
+        if rows_downloaded > 0 {
             info!(
-                "No local data for {} — fetching from provider ({} → {})",
+                "Downloaded {} high-resolution rows for {} and cached to disk",
+                rows_downloaded, sub.symbol.value
+            );
+        } else {
+            warn!(
+                "Historical provider returned 0 high-resolution rows for {} ({} → {}); no cache file was written",
                 sub.symbol.value, effective_start, end
             );
-            if sub.resolution == Resolution::Tick || sub.tick_type == TickType::Quote {
-                let Some(fp) = factor_provider.clone() else {
-                    warn!(
-                        "No sync history provider configured for {} {} download",
-                        sub.symbol.value, sub.resolution
-                    );
-                    continue;
-                };
-                let request = lean_data_providers::HistoryRequest {
-                    symbol: sub.symbol.clone(),
-                    resolution: sub.resolution,
-                    start: start_dt,
-                    end: end_dt,
-                    data_type: if sub.resolution == Resolution::Tick {
-                        lean_data_providers::DataType::Tick
-                    } else {
-                        lean_data_providers::DataType::QuoteBar
-                    },
-                };
-                let rows_downloaded = if sub.resolution == Resolution::Tick {
-                    match tokio::task::spawn_blocking(move || fp.get_ticks(&request)).await {
-                        Ok(Ok(rows)) => rows.len(),
-                        Ok(Err(e)) => {
-                            return Err(anyhow::anyhow!(
-                                "historical provider failed for {}: {}",
-                                sub.symbol.value,
-                                e
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "historical provider task failed for {}: {}",
-                                sub.symbol.value,
-                                e
-                            ));
-                        }
-                    }
-                } else {
-                    match tokio::task::spawn_blocking(move || fp.get_quote_bars(&request)).await {
-                        Ok(Ok(rows)) => rows.len(),
-                        Ok(Err(e)) => {
-                            return Err(anyhow::anyhow!(
-                                "historical provider failed for {}: {}",
-                                sub.symbol.value,
-                                e
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "historical provider task failed for {}: {}",
-                                sub.symbol.value,
-                                e
-                            ));
-                        }
-                    }
-                };
-                info!(
-                    "Downloaded {} {} rows for {} and cached to disk",
-                    rows_downloaded,
-                    if sub.resolution == Resolution::Tick {
-                        "tick"
-                    } else {
-                        "quote"
-                    },
-                    sub.symbol.value
-                );
-            } else {
-                let bars = provider
-                    .get_trade_bars(sub.symbol.clone(), sub.resolution, start_dt, end_dt)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "historical provider failed for {}: {}",
-                            sub.symbol.value,
-                            e
-                        )
-                    })?;
-                info!(
-                    "Downloaded {} bars for {} and cached to disk",
-                    bars.len(),
-                    sub.symbol.value
-                );
-            }
         }
+    } else if !data_covers_range {
+        // LEAN's DownloaderDataProvider downloads daily/hourly as a whole
+        // single-file data source. Do the same by using the provider's earliest
+        // supported date when known, so a later narrower request cannot replace
+        // a wider cached file with only the requested slice.
+        let single_file_start = provider.earliest_date().unwrap_or(effective_start);
+        let single_file_start_dt = date_to_datetime(single_file_start, 0, 0, 0);
+        info!(
+            "Local data missing or incomplete for {} — fetching single-file range from provider ({} → {})",
+            sub.symbol.value, single_file_start, end
+        );
+        let bars = provider
+            .get_trade_bars(
+                sub.symbol.clone(),
+                sub.resolution,
+                single_file_start_dt,
+                end_dt,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("historical provider failed for {}: {}", sub.symbol.value, e)
+            })?;
+        info!(
+            "Downloaded {} bars for {} and cached to disk",
+            bars.len(),
+            sub.symbol.value
+        );
+    }
 
-        // Re-check after bar fetch — some providers write the factor file as a side-effect.
-        // Also re-fetch if the file exists but the sentinel date is before `end` (stale).
-        let factor_needs_update = !factor_path.exists() || {
-            let r = ParquetReader::new();
-            r.read_factor_file(&factor_path)
-                .is_ok_and(|rows| rows.is_empty() || rows[0].date < end)
-        };
-        if factor_needs_update {
-            if let Some(ref fp) = factor_provider {
-                info!(
-                    "Factor file missing or stale for {} — requesting from provider",
+    let factor_needs_update = !factor_path.exists() || {
+        let r = ParquetReader::new();
+        r.read_factor_file(&factor_path)
+            .is_ok_and(|rows| rows.is_empty() || rows[0].date < end)
+    };
+    if factor_needs_update {
+        if let Some(ref fp) = factor_provider {
+            info!(
+                "Factor file missing or stale for {} — requesting from provider",
+                sub.symbol.value
+            );
+            let fp = Arc::clone(fp);
+            let request = lean_data_providers::HistoryRequest {
+                symbol: sub.symbol.clone(),
+                resolution: lean_core::Resolution::Daily,
+                start: start_dt,
+                end: end_dt,
+                data_type: lean_data_providers::DataType::FactorFile,
+            };
+            match tokio::task::spawn_blocking(move || fp.get_history(&request)).await {
+                Ok(Ok(_)) => info!("Factor file generated for {}", sub.symbol.value),
+                Ok(Err(e)) => warn!(
+                    "Factor file generation failed for {}: {e}",
                     sub.symbol.value
-                );
-                let fp = Arc::clone(fp);
-                let request = lean_data_providers::HistoryRequest {
-                    symbol: sub.symbol.clone(),
-                    resolution: lean_core::Resolution::Daily,
-                    start: start_dt,
-                    end: end_dt,
-                    data_type: lean_data_providers::DataType::FactorFile,
-                };
-                match tokio::task::spawn_blocking(move || fp.get_history(&request)).await {
-                    Ok(Ok(_)) => info!("Factor file generated for {}", sub.symbol.value),
-                    Ok(Err(e)) => warn!(
-                        "Factor file generation failed for {}: {e}",
-                        sub.symbol.value
-                    ),
-                    Err(e) => warn!("Factor file task panicked for {}: {e}", sub.symbol.value),
-                }
+                ),
+                Err(e) => warn!("Factor file task panicked for {}: {e}", sub.symbol.value),
             }
         }
     }
+
     Ok(())
+}
+
+async fn pre_fetch_missing_high_resolution_days(
+    provider: Arc<dyn IHistoricalDataProvider>,
+    factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: &PathResolver,
+) -> Result<usize> {
+    let dates = expected_market_dates(&sub.symbol, start, end);
+    let mut missing = Vec::new();
+    for date in dates {
+        let path = if sub.resolution == Resolution::Tick {
+            resolver.tick(&sub.symbol, date).to_path()
+        } else if sub.tick_type == TickType::Quote {
+            resolver
+                .quote_bar(&sub.symbol, sub.resolution, date)
+                .to_path()
+        } else {
+            resolver
+                .trade_bar(&sub.symbol, sub.resolution, date)
+                .to_path()
+        };
+        if !path.exists() {
+            missing.push(date);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    info!(
+        "Local data missing or incomplete for {} — fetching {} missing {} files date-by-date with parallelism {} ({} → {})",
+        sub.symbol.value,
+        missing.len(),
+        sub.resolution,
+        HIGH_RESOLUTION_PREFETCH_CONCURRENCY.min(missing.len()),
+        missing.first().unwrap(),
+        missing.last().unwrap()
+    );
+
+    let mut rows_downloaded = 0usize;
+    let mut completed = 0usize;
+    for chunk in missing.chunks(HIGH_RESOLUTION_PREFETCH_CONCURRENCY) {
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for date in chunk.iter().copied() {
+            let provider = provider.clone();
+            let factor_provider = factor_provider.clone();
+            let symbol = sub.symbol.clone();
+            let resolution = sub.resolution;
+            let tick_type = sub.tick_type;
+            let symbol_value = sub.symbol.value.clone();
+
+            tasks.spawn(async move {
+                let start_dt = date_to_datetime(date, 0, 0, 0);
+                let end_dt = date_to_datetime(date, 23, 59, 59);
+
+                if resolution == Resolution::Tick || tick_type == TickType::Quote {
+                    let Some(fp) = factor_provider else {
+                        warn!(
+                            "No sync history provider configured for {} {} download",
+                            symbol_value, resolution
+                        );
+                        return Ok((date, 0usize));
+                    };
+                    let request = lean_data_providers::HistoryRequest {
+                        symbol,
+                        resolution,
+                        start: start_dt,
+                        end: end_dt,
+                        data_type: if resolution == Resolution::Tick {
+                            lean_data_providers::DataType::Tick
+                        } else {
+                            lean_data_providers::DataType::QuoteBar
+                        },
+                    };
+                    let rows = if resolution == Resolution::Tick {
+                        match tokio::task::spawn_blocking(move || fp.get_ticks(&request)).await {
+                            Ok(Ok(rows)) => rows.len(),
+                            Ok(Err(e)) => {
+                                return Err(anyhow::anyhow!(
+                                    "historical provider failed for {} {}: {}",
+                                    symbol_value,
+                                    date,
+                                    e
+                                ));
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "historical provider task failed for {} {}: {}",
+                                    symbol_value,
+                                    date,
+                                    e
+                                ));
+                            }
+                        }
+                    } else {
+                        match tokio::task::spawn_blocking(move || fp.get_quote_bars(&request)).await
+                        {
+                            Ok(Ok(rows)) => rows.len(),
+                            Ok(Err(e)) => {
+                                return Err(anyhow::anyhow!(
+                                    "historical provider failed for {} {}: {}",
+                                    symbol_value,
+                                    date,
+                                    e
+                                ));
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "historical provider task failed for {} {}: {}",
+                                    symbol_value,
+                                    date,
+                                    e
+                                ));
+                            }
+                        }
+                    };
+                    Ok((date, rows))
+                } else {
+                    let bars = provider
+                        .get_trade_bars(symbol, resolution, start_dt, end_dt)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "historical provider failed for {} {}: {}",
+                                symbol_value,
+                                date,
+                                e
+                            )
+                        })?;
+                    Ok((date, bars.len()))
+                }
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            let (date, rows) =
+                result.map_err(|e| anyhow::anyhow!("historical provider task failed: {}", e))??;
+            completed += 1;
+            rows_downloaded += rows;
+
+            if completed == 1 || completed.is_multiple_of(50) || completed == missing.len() {
+                info!(
+                    "Fetched {} {} missing day {}/{} ({})",
+                    sub.symbol.value,
+                    sub.resolution,
+                    completed,
+                    missing.len(),
+                    date
+                );
+            }
+        }
+    }
+
+    Ok(rows_downloaded)
+}
+
+async fn local_data_covers_range(
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: &PathResolver,
+    start_path: &std::path::Path,
+) -> bool {
+    let expected_dates = expected_market_dates(&sub.symbol, start, end);
+    if expected_dates.is_empty() {
+        return true;
+    }
+
+    if sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote {
+        for current in &expected_dates {
+            let path = if sub.resolution == Resolution::Tick {
+                resolver.tick(&sub.symbol, *current).to_path()
+            } else if sub.tick_type == TickType::Quote {
+                resolver
+                    .quote_bar(&sub.symbol, sub.resolution, *current)
+                    .to_path()
+            } else {
+                resolver
+                    .trade_bar(&sub.symbol, sub.resolution, *current)
+                    .to_path()
+            };
+            if !path.exists() {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if !start_path.exists() {
+        return false;
+    }
+
+    let reader = ParquetReader::new();
+    let params = QueryParams::new().with_time_range(
+        date_to_datetime(start, 0, 0, 0),
+        date_to_datetime(end, 23, 59, 59),
+    );
+    let bars = reader
+        .read_trade_bars(&[start_path.to_path_buf()], sub.symbol.clone(), &params)
+        .await
+        .unwrap_or_default();
+
+    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
+    expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn expected_market_dates(symbol: &Symbol, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+    let mut dates = Vec::new();
+    let mut current = start;
+    while current <= end {
+        if is_expected_market_date(symbol, current) {
+            dates.push(current);
+        }
+        current += chrono::Duration::days(1);
+    }
+    dates
+}
+
+fn is_expected_market_date(symbol: &Symbol, date: NaiveDate) -> bool {
+    match symbol.security_type() {
+        SecurityType::Equity | SecurityType::Option | SecurityType::IndexOption => {
+            let hours = ExchangeHours::us_equity();
+            let dow = date.weekday().num_days_from_sunday() as usize;
+            hours.schedule[dow].is_open() && !hours.holidays.contains(&date)
+        }
+        SecurityType::Crypto => true,
+        _ => !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun),
+    }
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -2834,16 +3608,80 @@ fn load_option_eod_bars(
     bars
 }
 
-/// Cache-first fetch for custom data points.
+/// Load custom data points for one subscription/date.
 ///
-/// Cache layout: `{data_root}/custom/{source_type}/{ticker_lower}/{YYYYMMDD}.parquet`
-/// One file per (source_type, ticker, date).  A cache hit is a single `path.exists()` check.
-///
-/// On cache miss, calls `source.get_source()` to get the URI, fetches via HTTP or reads a
-/// local file, then calls `source.reader()` line-by-line to parse points.  Parsed points
-/// are written to the Parquet cache before returning.
-///
-/// Called from inside `tokio::task::spawn_blocking` — all I/O is synchronous.
+/// Parquet-native providers are read directly from provider parquet paths.
+/// Text providers use `get_source()`/`reader()` and persist parsed points as
+/// framework parquet under `{data_root}/custom/...`.
+async fn load_custom_data_points_for_subscription(
+    data_root: PathBuf,
+    source_type: String,
+    ticker: String,
+    date: NaiveDate,
+    source: Option<Arc<dyn lean_data_providers::ICustomDataSource>>,
+    mut config: CustomDataConfig,
+    dynamic_query: lean_data::CustomDataQuery,
+) -> Result<Vec<CustomDataPoint>> {
+    let effective_query = config.query.merge(&dynamic_query);
+    config.query = effective_query.clone();
+    config.properties.extend(
+        effective_query
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+
+    if let Some(source_ref) = source.as_ref() {
+        let source_for_task = Arc::clone(source_ref);
+        let ticker_for_task = ticker.clone();
+        let config_for_task = config.clone();
+        let query_for_task = effective_query.clone();
+        let parquet_source = tokio::time::timeout(
+            CUSTOM_DATA_SOURCE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                source_for_task.get_parquet_source(
+                    &ticker_for_task,
+                    date,
+                    &config_for_task,
+                    &query_for_task,
+                )
+            }),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "custom parquet source timed out after {:?} for {}/{} {}",
+                CUSTOM_DATA_SOURCE_TIMEOUT, source_type, ticker, date
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("custom parquet source task failed: {e}"))?;
+
+        if let Some(parquet_source) = parquet_source {
+            return ParquetReader::new()
+                .read_custom_parquet_points(&parquet_source, &effective_query, date)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()));
+        }
+        if source_ref.is_parquet_native() {
+            return Ok(Vec::new());
+        }
+    }
+
+    let points = tokio::task::spawn_blocking(move || {
+        load_custom_data_points(
+            &data_root,
+            &source_type,
+            &ticker,
+            date,
+            source.as_ref(),
+            &config,
+        )
+    })
+    .await
+    .unwrap_or_default();
+    Ok(points)
+}
+
 fn load_custom_data_points(
     data_root: &Path,
     source_type: &str,
@@ -2916,7 +3754,7 @@ fn load_custom_data_points(
     // Parse content using the plugin's reader() method.
     let mut points: Vec<CustomDataPoint> = Vec::new();
     match data_source.format {
-        CustomDataFormat::Csv | CustomDataFormat::JsonLines => {
+        CustomDataFormat::Csv => {
             // Line-by-line: call reader() on each non-empty line.
             for line in raw_content.lines() {
                 if line.trim().is_empty() {

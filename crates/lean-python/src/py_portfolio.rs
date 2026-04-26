@@ -116,10 +116,22 @@ impl PyPortfolio {
         self.inner.total_holdings_value().to_f64().unwrap_or(0.0)
     }
 
-    /// True if ANY symbol is currently invested.
+    /// Compatibility spelling for whole-portfolio investment state.
     #[getter]
     fn is_invested(&self) -> bool {
         !self.inner.invested_symbols().is_empty()
+    }
+
+    /// LEAN API: `portfolio.invested`.
+    #[getter]
+    fn invested(&self) -> bool {
+        self.is_invested()
+    }
+
+    /// LEAN API alias: `portfolio.hold_stock`.
+    #[getter]
+    fn hold_stock(&self) -> bool {
+        self.is_invested()
     }
 
     /// Check if a specific symbol is invested.

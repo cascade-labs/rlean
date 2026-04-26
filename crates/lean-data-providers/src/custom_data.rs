@@ -1,10 +1,14 @@
 use chrono::NaiveDate;
-use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataSource};
+use lean_data::custom::{
+    CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource, CustomParquetSource,
+};
 use std::sync::Arc;
 
 /// Trait implemented by custom data source plugins.
 ///
-/// Mirrors LEAN C#'s `BaseData.GetSource()` + `Reader()` pattern.
+/// Supports two custom data modes:
+/// - Native parquet via `get_parquet_source()` and `is_parquet_native()`.
+/// - Text sources via `get_source()` + `reader()`.
 ///
 /// # Plugin ABI
 ///
@@ -28,26 +32,50 @@ pub trait ICustomDataSource: Send + Sync {
     /// Unique name matching the plugin registry entry (e.g. `"fred"`, `"cboe_vix"`).
     fn name(&self) -> &str;
 
-    /// Return the data source location for the given ticker and date.
+    /// Return the text data source location for the given ticker and date.
     ///
     /// Return `None` if this date has no data (e.g. weekends for daily sources,
-    /// or dates before the series started).
+    /// dates before the series started, or providers that expose native parquet).
     fn get_source(
         &self,
-        ticker: &str,
-        date: NaiveDate,
-        config: &CustomDataConfig,
-    ) -> Option<CustomDataSource>;
+        _ticker: &str,
+        _date: NaiveDate,
+        _config: &CustomDataConfig,
+    ) -> Option<CustomDataSource> {
+        None
+    }
+
+    /// Return parquet files for the given ticker/date/query when this provider
+    /// can expose native parquet. The runner applies generic projection and
+    /// predicates, then materializes `CustomDataPoint`s.
+    fn get_parquet_source(
+        &self,
+        _ticker: &str,
+        _date: NaiveDate,
+        _config: &CustomDataConfig,
+        _query: &CustomDataQuery,
+    ) -> Option<CustomParquetSource> {
+        None
+    }
+
+    /// Returns `true` for providers whose canonical storage is native parquet.
+    /// The runner will not call `get_source()`/`reader()` for these providers;
+    /// a missing parquet source means no data for that request.
+    fn is_parquet_native(&self) -> bool {
+        false
+    }
 
     /// Parse one line/record from the fetched data.
     ///
     /// Return `None` to skip the line (headers, empty lines, comment rows, etc.).
     fn reader(
         &self,
-        line: &str,
-        date: NaiveDate,
-        config: &CustomDataConfig,
-    ) -> Option<CustomDataPoint>;
+        _line: &str,
+        _date: NaiveDate,
+        _config: &CustomDataConfig,
+    ) -> Option<CustomDataPoint> {
+        None
+    }
 
     /// Default resolution for this source.  Overridden when the user calls
     /// `add_data(source_type, ticker, resolution=Resolution.Daily)`.

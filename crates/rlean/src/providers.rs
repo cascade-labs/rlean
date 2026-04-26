@@ -170,17 +170,15 @@ impl ProviderArgs {
 /// - `"thetadata"` — ThetaData historical data (installed plugin)
 /// - `"local"` / `""` — local Parquet store only, no network calls
 ///
-/// A `LocalHistoryProvider` is always prepended as the highest-priority
-/// provider (unless `local` is already listed first).  This ensures that any
-/// data already cached as Parquet on disk is served immediately without
-/// hitting the network on reruns.
+/// A `LocalHistoryProvider` is prepended as the highest-priority provider
+/// unless `local` is already listed first. Local is expected to return data
+/// only when it can satisfy the request; otherwise remote providers are tried.
 pub fn build_history_provider(
     names: &str,
     args: ProviderArgs,
 ) -> Result<Arc<dyn IHistoryProvider>> {
     let provider_names: Vec<&str> = names.split(',').map(str::trim).collect();
 
-    // Prepend local cache provider unless the user already put "local" first.
     let has_local_first = matches!(provider_names.first(), Some(&"local") | Some(&""));
     let mut providers: Vec<Arc<dyn IHistoryProvider>> = if !has_local_first {
         vec![Arc::new(LocalHistoryProvider::new(&args.data_root))]

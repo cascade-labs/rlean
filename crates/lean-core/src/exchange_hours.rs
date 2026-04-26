@@ -170,6 +170,37 @@ impl ExchangeHours {
     fn us_equity_holidays() -> HashSet<NaiveDate> {
         use chrono::NaiveDate;
         let mut h = HashSet::new();
+        // 2018 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 1, 15).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 2, 19).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 3, 30).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 5, 28).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 7, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 9, 3).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 11, 22).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2018, 12, 5).unwrap()); // Bush funeral
+        h.insert(NaiveDate::from_ymd_opt(2018, 12, 25).unwrap());
+        // 2019 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2019, 1, 1).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 1, 21).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 2, 18).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 4, 19).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 5, 27).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 7, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 9, 2).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 11, 28).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2019, 12, 25).unwrap());
+        // 2020 NYSE holidays
+        h.insert(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 1, 20).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 2, 17).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 4, 10).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 5, 25).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 7, 3).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 9, 7).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 11, 26).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2020, 12, 25).unwrap());
         // 2021 NYSE holidays
         h.insert(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2021, 1, 18).unwrap());

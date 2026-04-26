@@ -155,7 +155,7 @@ fn cmd_pull(workspace: &Path) -> Result<()> {
     }
 
     let branch = current_branch(workspace)?;
-    run_git(&["pull", "--rebase", "origin", &branch], workspace)?;
+    run_git_remote(&["pull", "--rebase", "origin", &branch], workspace)?;
     ensure_rlean_json(workspace)?;
     Ok(())
 }
@@ -174,7 +174,7 @@ fn cmd_sync(message: Option<&str>, workspace: &Path) -> Result<()> {
 
     // Pull with rebase so local commits land on top of remote changes.
     let branch = current_branch(workspace)?;
-    run_git(&["pull", "--rebase", "origin", &branch], workspace)?;
+    run_git_remote(&["pull", "--rebase", "origin", &branch], workspace)?;
 
     // Push everything to remote.
     push_to_origin(workspace)?;
@@ -195,10 +195,10 @@ fn push_to_origin(workspace: &Path) -> Result<()> {
         .unwrap_or(false);
 
     if has_upstream {
-        run_git(&["push"], workspace)
+        run_git_remote(&["push"], workspace)
     } else {
         let branch = current_branch(workspace)?;
-        run_git(&["push", "--set-upstream", "origin", &branch], workspace)
+        run_git_remote(&["push", "--set-upstream", "origin", &branch], workspace)
     }
 }
 
@@ -285,6 +285,54 @@ fn run_git(args: &[&str], workspace: &Path) -> Result<()> {
         bail!("git {} failed (exit {:?})", args.join(" "), status.code());
     }
     Ok(())
+}
+
+/// Run a remote git command. If a GitHub HTTPS remote fails, retry the command
+/// with Git's URL rewrite so machines with SSH auth can still use HTTPS remotes.
+fn run_git_remote(args: &[&str], workspace: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    if should_retry_github_https_as_ssh(workspace)? {
+        eprintln!(
+            "GitHub HTTPS remote failed; retrying via SSH for this command. \
+             To make this permanent, run: rlean vcs remote set git@github.com:<owner>/<repo>.git"
+        );
+        let retry_status = Command::new("git")
+            .arg("-c")
+            .arg("url.git@github.com:.insteadOf=https://github.com/")
+            .args(args)
+            .current_dir(workspace)
+            .status()?;
+        if retry_status.success() {
+            return Ok(());
+        }
+        bail!(
+            "git {} failed via HTTPS (exit {:?}) and SSH fallback (exit {:?})",
+            args.join(" "),
+            status.code(),
+            retry_status.code()
+        );
+    }
+
+    bail!("git {} failed (exit {:?})", args.join(" "), status.code());
+}
+
+fn should_retry_github_https_as_ssh(workspace: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(workspace)
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let remote = String::from_utf8_lossy(&output.stdout);
+    Ok(remote.trim().starts_with("https://github.com/"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

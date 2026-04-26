@@ -67,6 +67,7 @@ mod custom_data_tests {
             fields.insert("low".to_string(), serde_json::json!(low.to_string()));
             Some(CustomDataPoint {
                 time: date,
+                end_time: None,
                 value: close,
                 fields,
             })
@@ -83,6 +84,7 @@ mod custom_data_tests {
             source_type: "mock_vix".to_string(),
             resolution: Resolution::Daily,
             properties: HashMap::new(),
+            query: Default::default(),
         }
     }
 
@@ -222,10 +224,14 @@ mod provider_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use chrono::NaiveDate;
-    use lean_core::{Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol};
-    use lean_storage::OptionEodBar;
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use lean_core::{
+        Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TimeSpan,
+    };
+    use lean_data::{TradeBar, TradeBarData};
+    use lean_storage::{OptionEodBar, ParquetWriter, PathResolver, WriterConfig};
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use crate::config::ProviderConfig;
     use crate::local::LocalHistoryProvider;
@@ -253,6 +259,43 @@ mod provider_tests {
             end,
             data_type: DataType::TradeBar,
         }
+    }
+
+    fn make_history_request_for_range(start: NaiveDate, end: NaiveDate) -> HistoryRequest {
+        HistoryRequest {
+            symbol: make_symbol(),
+            resolution: Resolution::Daily,
+            start: date_time(start, 0, 0, 0),
+            end: date_time(end, 23, 59, 59),
+            data_type: DataType::TradeBar,
+        }
+    }
+
+    fn date_time(date: NaiveDate, h: u32, m: u32, s: u32) -> NanosecondTimestamp {
+        NanosecondTimestamp::from(Utc.from_utc_datetime(&date.and_hms_opt(h, m, s).unwrap()))
+    }
+
+    fn make_bar(date: NaiveDate) -> TradeBar {
+        TradeBar::new(
+            make_symbol(),
+            date_time(date, 16, 0, 0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
+        )
+    }
+
+    fn write_daily_bars(root: &std::path::Path, bars: &[TradeBar]) {
+        let resolver = PathResolver::new(root);
+        let path = resolver
+            .trade_bar(
+                &make_symbol(),
+                Resolution::Daily,
+                NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            )
+            .to_path();
+        ParquetWriter::new(WriterConfig::default())
+            .write_trade_bars(bars, &path)
+            .unwrap();
     }
 
     // ── ProviderConfig ────────────────────────────────────────────────────────
@@ -374,6 +417,53 @@ mod provider_tests {
             "Expected empty result when no Parquet file exists, got {} bars",
             bars.len()
         );
+    }
+
+    #[test]
+    fn local_provider_returns_empty_for_partial_daily_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = LocalHistoryProvider::new(dir.path());
+        write_daily_bars(
+            dir.path(),
+            &[
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
+            ],
+        );
+
+        let request = make_history_request_for_range(
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+        );
+        let bars = provider.get_history(&request).unwrap();
+
+        assert!(
+            bars.is_empty(),
+            "partial local cache should fall through to the next stacked provider"
+        );
+    }
+
+    #[test]
+    fn local_provider_returns_data_for_complete_daily_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = LocalHistoryProvider::new(dir.path());
+        write_daily_bars(
+            dir.path(),
+            &[
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()),
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 4).unwrap()),
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
+            ],
+        );
+
+        let request = make_history_request_for_range(
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+        );
+        let bars = provider.get_history(&request).unwrap();
+
+        assert_eq!(bars.len(), 4);
     }
 
     // ── HistoryRequest construction ───────────────────────────────────────────

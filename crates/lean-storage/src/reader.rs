@@ -1,9 +1,14 @@
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
 use crate::{convert, predicate::Predicate, schema};
-use arrow_array::{Float64Array, Int64Array, StringArray};
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    UInt32Array, UInt64Array,
+};
+use arrow_cast::display::array_value_to_string;
+use chrono::{NaiveDate, TimeZone, Utc};
 use datafusion::prelude::*;
-use lean_core::{DateTime, Result as LeanResult, Symbol};
-use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
+use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, Symbol};
+use lean_data::{CustomDataPoint, CustomDataQuery, CustomParquetSource, QuoteBar, Tick, TradeBar};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +60,217 @@ impl ParquetReader {
         ParquetReader {
             ctx: SessionContext::new_with_config(config),
         }
+    }
+
+    /// Read custom data directly from provider-native parquet with generic
+    /// projection and predicate pushdown through DataFusion.
+    pub async fn read_custom_parquet_points(
+        &self,
+        source: &CustomParquetSource,
+        query: &CustomDataQuery,
+        date: chrono::NaiveDate,
+    ) -> LeanResult<Vec<CustomDataPoint>> {
+        if source.paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let table_name = format!(
+            "custom_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+
+        if source.paths.len() == 1 {
+            self.ctx
+                .register_parquet(&table_name, &source.paths[0], ParquetReadOptions::default())
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        } else {
+            let first = Path::new(&source.paths[0]);
+            let parent = first.parent().ok_or_else(|| {
+                lean_core::LeanError::DataError(format!(
+                    "parquet path has no parent: {}",
+                    source.paths[0]
+                ))
+            })?;
+            let listing_opts = datafusion::datasource::listing::ListingOptions::new(Arc::new(
+                datafusion::datasource::file_format::parquet::ParquetFormat::new(),
+            ))
+            .with_file_extension(".parquet");
+            let listing_table_url =
+                datafusion::datasource::listing::ListingTableUrl::parse(parent.to_str().unwrap())
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            let listing_config =
+                datafusion::datasource::listing::ListingTableConfig::new(listing_table_url)
+                    .with_listing_options(listing_opts)
+                    .infer_schema(&self.ctx.state())
+                    .await
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            let listing_table =
+                datafusion::datasource::listing::ListingTable::try_new(listing_config)
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            self.ctx
+                .register_table(&table_name, Arc::new(listing_table))
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let mut df = self
+            .ctx
+            .table(&table_name)
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let mut filters: Vec<Expr> = Vec::new();
+        if let (Some(symbol_col), Some(symbols)) = (&source.symbol_column, &query.symbols) {
+            if symbols.len() == 1 {
+                filters.push(col(symbol_col).eq(lit(symbols[0].clone())));
+            } else if !symbols.is_empty() {
+                let expr = symbols
+                    .iter()
+                    .map(|s| col(symbol_col).eq(lit(s.clone())))
+                    .reduce(|a, b| a.or(b))
+                    .unwrap();
+                filters.push(expr);
+            }
+        }
+        for (column, value) in &query.string_equals {
+            filters.push(col(column).eq(lit(value.clone())));
+        }
+        for (column, values) in &query.string_in {
+            if values.len() == 1 {
+                filters.push(col(column).eq(lit(values[0].clone())));
+            } else if !values.is_empty() {
+                let expr = values
+                    .iter()
+                    .map(|s| col(column).eq(lit(s.clone())))
+                    .reduce(|a, b| a.or(b))
+                    .unwrap();
+                filters.push(expr);
+            }
+        }
+        for (column, value) in &query.numeric_min {
+            filters.push(col(column).gt_eq(lit(*value)));
+        }
+        for (column, value) in &query.numeric_max {
+            filters.push(col(column).lt_eq(lit(*value)));
+        }
+        if let (Some(time_column), Some(format)) = (&source.time_column, &source.time_format) {
+            match format.as_str() {
+                "unix_ns" => {
+                    if let Some(start) = query.start_time {
+                        filters.push(col(time_column).gt_eq(lit(start.0)));
+                    }
+                    if let Some(end) = query.end_time {
+                        filters.push(col(time_column).lt_eq(lit(end.0)));
+                    }
+                }
+                "unix_ms" => {
+                    if let Some(start) = query.start_time {
+                        filters.push(col(time_column).gt_eq(lit(start.0 / 1_000_000)));
+                    }
+                    if let Some(end) = query.end_time {
+                        filters.push(col(time_column).lt_eq(lit(end.0 / 1_000_000)));
+                    }
+                }
+                "unix_s" => {
+                    if let Some(start) = query.start_time {
+                        filters.push(col(time_column).gt_eq(lit(start.0 / 1_000_000_000)));
+                    }
+                    if let Some(end) = query.end_time {
+                        filters.push(col(time_column).lt_eq(lit(end.0 / 1_000_000_000)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(filter) = filters.into_iter().reduce(|a, b| a.and(b)) {
+            df = df
+                .filter(filter)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        if let Some(columns) = &query.columns {
+            let mut projection = columns.clone();
+            for required in [
+                source.time_column.as_ref(),
+                source.symbol_column.as_ref(),
+                source.value_column.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !projection.iter().any(|c| c == required) {
+                    projection.push(required.clone());
+                }
+            }
+            let refs: Vec<&str> = projection.iter().map(String::as_str).collect();
+            df = df
+                .select_columns(&refs)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let _ = self.ctx.deregister_table(&table_name);
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            let schema = batch.schema();
+            let time_idx = source
+                .time_column
+                .as_ref()
+                .and_then(|c| schema.index_of(c).ok());
+            let value_idx = source
+                .value_column
+                .as_ref()
+                .and_then(|c| schema.index_of(c).ok());
+            for row in 0..batch.num_rows() {
+                let point_end_time = time_idx.and_then(|idx| {
+                    parquet_custom_time_to_datetime(
+                        batch.column(idx).as_ref(),
+                        row,
+                        source.time_format.as_deref(),
+                        source.time_zone.as_deref(),
+                        date,
+                    )
+                });
+                let point_date = point_end_time
+                    .map(|time| {
+                        time.to_tz(custom_time_zone(source.time_zone.as_deref()))
+                            .date_naive()
+                    })
+                    .unwrap_or(date);
+                let value = value_idx
+                    .and_then(|idx| numeric_cell_as_f64(batch.column(idx).as_ref(), row))
+                    .and_then(rust_decimal::Decimal::from_f64_retain)
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                let mut fields = HashMap::new();
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    fields.insert(
+                        field.name().clone(),
+                        arrow_cell_to_json(batch.column(col_idx).as_ref(), row),
+                    );
+                }
+                out.push(CustomDataPoint {
+                    time: point_date,
+                    end_time: point_end_time,
+                    value,
+                    fields,
+                });
+            }
+        }
+
+        debug!(
+            "Read {} custom parquet points from {} file(s)",
+            out.len(),
+            source.paths.len()
+        );
+        Ok(out)
     }
 
     /// Read trade bars from one or more parquet files with predicate pushdown.
@@ -555,6 +771,7 @@ impl ParquetReader {
                     serde_json::from_str(fields_col.value(i)).unwrap_or_default();
                 result.push(CustomDataPoint {
                     time: date,
+                    end_time: Some(NanosecondTimestamp(dates.value(i))),
                     value,
                     fields,
                 });
@@ -630,6 +847,121 @@ fn matches_time_filter(time: DateTime, params: &QueryParams) -> bool {
         }
     }
     true
+}
+
+fn parquet_custom_time_to_datetime(
+    array: &dyn Array,
+    row: usize,
+    format: Option<&str>,
+    time_zone: Option<&str>,
+    date: NaiveDate,
+) -> Option<DateTime> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    let numeric = numeric_cell_as_f64(array, row).map(|value| value.round() as i64);
+    match format.unwrap_or("unix_ns") {
+        "hhmm" => {
+            let hhmm = numeric.or_else(|| {
+                array_value_to_string(array, row)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+            })?;
+            let hour = (hhmm / 100) as u32;
+            let minute = (hhmm % 100) as u32;
+            local_datetime_to_utc(date, hour, minute, 0, time_zone)
+        }
+        "unix_ms" => numeric.map(|value| NanosecondTimestamp(value * 1_000_000)),
+        "unix_s" => numeric.map(|value| NanosecondTimestamp(value * 1_000_000_000)),
+        "date" => Some(DateTime::from(
+            Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?),
+        )),
+        _ => numeric.map(NanosecondTimestamp),
+    }
+}
+
+fn local_datetime_to_utc(
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    time_zone: Option<&str>,
+) -> Option<DateTime> {
+    let local = date.and_hms_opt(hour, minute, second)?;
+    let tz = custom_time_zone(time_zone);
+    let zoned = tz
+        .from_local_datetime(&local)
+        .single()
+        .or_else(|| tz.from_local_datetime(&local).earliest())
+        .or_else(|| tz.from_local_datetime(&local).latest())?;
+    Some(DateTime::from(zoned.with_timezone(&Utc)))
+}
+
+fn custom_time_zone(time_zone: Option<&str>) -> chrono_tz::Tz {
+    time_zone
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::UTC)
+}
+
+fn numeric_cell_as_f64(array: &dyn Array, row: usize) -> Option<f64> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        Some(arr.value(row))
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        Some(arr.value(row) as f64)
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        Some(arr.value(row) as f64)
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        Some(arr.value(row) as f64)
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        Some(arr.value(row) as f64)
+    } else {
+        array.as_any().downcast_ref::<UInt32Array>().map_or_else(
+            || {
+                array_value_to_string(array, row)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+            },
+            |arr| Some(arr.value(row) as f64),
+        )
+    }
+}
+
+fn arrow_cell_to_json(array: &dyn Array, row: usize) -> serde_json::Value {
+    if array.is_null(row) {
+        return serde_json::Value::Null;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        serde_json::Value::String(arr.value(row).to_string())
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        serde_json::Number::from_f64(arr.value(row))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        serde_json::Number::from_f64(arr.value(row) as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        serde_json::Value::Number(arr.value(row).into())
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        serde_json::Value::Number(arr.value(row).into())
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        serde_json::Value::Number(arr.value(row).into())
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() {
+        serde_json::Value::Number(arr.value(row).into())
+    } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        serde_json::Value::Bool(arr.value(row))
+    } else {
+        match array_value_to_string(array, row) {
+            Ok(s) => serde_json::Number::from_f64(s.parse::<f64>().unwrap_or(f64::NAN))
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::String(s)),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
 }
 
 impl Default for ParquetReader {

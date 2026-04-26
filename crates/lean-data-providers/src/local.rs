@@ -2,9 +2,14 @@
 ///
 /// Useful as a fallback when data has already been downloaded to the local
 /// Parquet store, or in tests.
-use lean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt};
+use chrono::{Datelike, NaiveDate};
+use lean_core::{
+    exchange_hours::ExchangeHours, Market, OptionRight, OptionStyle, Resolution, SecurityType,
+    Symbol, SymbolOptionsExt,
+};
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{ParquetReader, PathResolver, QueryParams};
+use std::collections::HashSet;
 
 use crate::request::HistoryRequest;
 use crate::traits::IHistoryProvider;
@@ -37,16 +42,18 @@ impl IHistoryProvider for LocalHistoryProvider {
         let start_date = request.start.date_utc();
         let end_date = request.end.date_utc();
 
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+
         let paths: Vec<std::path::PathBuf> = if request.resolution.is_high_resolution() {
-            let mut current = start_date;
             let mut v = Vec::new();
-            while current <= end_date {
-                let dp = resolver.trade_bar(&request.symbol, request.resolution, current);
+            for current in &expected_dates {
+                let dp = resolver.trade_bar(&request.symbol, request.resolution, *current);
                 let p = dp.to_path();
                 if p.exists() {
                     v.push(p);
+                } else {
+                    return Ok(vec![]);
                 }
-                current = current.succ_opt().unwrap_or(current);
             }
             v
         } else {
@@ -79,6 +86,10 @@ impl IHistoryProvider for LocalHistoryProvider {
             .block_on(reader.read_trade_bars(&paths, symbol, &params))
             .unwrap_or_default();
 
+        if !local_bars_cover_expected_dates(&bars, &expected_dates) {
+            return Ok(vec![]);
+        }
+
         Ok(bars)
     }
 
@@ -86,18 +97,19 @@ impl IHistoryProvider for LocalHistoryProvider {
         let resolver = PathResolver::new(&self.data_root);
         let start_date = request.start.date_utc();
         let end_date = request.end.date_utc();
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
 
         let paths: Vec<std::path::PathBuf> = if request.resolution.is_high_resolution() {
-            let mut current = start_date;
             let mut v = Vec::new();
-            while current <= end_date {
+            for current in &expected_dates {
                 let p = resolver
-                    .quote_bar(&request.symbol, request.resolution, current)
+                    .quote_bar(&request.symbol, request.resolution, *current)
                     .to_path();
                 if p.exists() {
                     v.push(p);
+                } else {
+                    return Ok(vec![]);
                 }
-                current = current.succ_opt().unwrap_or(current);
             }
             v
         } else {
@@ -117,22 +129,27 @@ impl IHistoryProvider for LocalHistoryProvider {
 
         let reader = ParquetReader::new();
         let params = QueryParams::new().with_time_range(request.start, request.end);
-        Ok(reader.read_quote_bars(&paths, request.symbol.clone(), &params)?)
+        let bars = reader.read_quote_bars(&paths, request.symbol.clone(), &params)?;
+        if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
+            return Ok(vec![]);
+        }
+        Ok(bars)
     }
 
     fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
         let resolver = PathResolver::new(&self.data_root);
         let start_date = request.start.date_utc();
         let end_date = request.end.date_utc();
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
 
-        let mut current = start_date;
         let mut paths = Vec::new();
-        while current <= end_date {
-            let p = resolver.tick(&request.symbol, current).to_path();
+        for current in &expected_dates {
+            let p = resolver.tick(&request.symbol, *current).to_path();
             if p.exists() {
                 paths.push(p);
+            } else {
+                return Ok(vec![]);
             }
-            current = current.succ_opt().unwrap_or(current);
         }
 
         if paths.is_empty() {
@@ -141,7 +158,11 @@ impl IHistoryProvider for LocalHistoryProvider {
 
         let reader = ParquetReader::new();
         let params = QueryParams::new().with_time_range(request.start, request.end);
-        Ok(reader.read_ticks(&paths, request.symbol.clone(), &params)?)
+        let ticks = reader.read_ticks(&paths, request.symbol.clone(), &params)?;
+        if !local_ticks_cover_expected_dates(&ticks, &expected_dates) {
+            return Ok(vec![]);
+        }
+        Ok(ticks)
     }
 
     fn get_option_universe(
@@ -229,6 +250,54 @@ impl IHistoryProvider for LocalHistoryProvider {
 
         let params = day_params(date, Resolution::Tick);
         Ok(ParquetReader::new().read_ticks_with_symbols(&[path], &symbols_by_value, &params)?)
+    }
+}
+
+fn local_bars_cover_expected_dates(bars: &[TradeBar], expected_dates: &[NaiveDate]) -> bool {
+    if expected_dates.is_empty() {
+        return true;
+    }
+    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
+    expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn local_quote_bars_cover_expected_dates(bars: &[QuoteBar], expected_dates: &[NaiveDate]) -> bool {
+    if expected_dates.is_empty() {
+        return true;
+    }
+    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
+    expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn local_ticks_cover_expected_dates(ticks: &[Tick], expected_dates: &[NaiveDate]) -> bool {
+    if expected_dates.is_empty() {
+        return true;
+    }
+    let available: HashSet<NaiveDate> = ticks.iter().map(|tick| tick.time.date_utc()).collect();
+    expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn expected_market_dates(symbol: &Symbol, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+    let mut dates = Vec::new();
+    let mut current = start;
+    while current <= end {
+        if is_expected_market_date(symbol, current) {
+            dates.push(current);
+        }
+        current += chrono::Duration::days(1);
+    }
+    dates
+}
+
+fn is_expected_market_date(symbol: &Symbol, date: NaiveDate) -> bool {
+    match symbol.security_type() {
+        SecurityType::Equity | SecurityType::Option | SecurityType::IndexOption => {
+            let hours = ExchangeHours::us_equity();
+            let dow = date.weekday().num_days_from_sunday() as usize;
+            hours.schedule[dow].is_open() && !hours.holidays.contains(&date)
+        }
+        SecurityType::Crypto => true,
+        _ => !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun),
     }
 }
 

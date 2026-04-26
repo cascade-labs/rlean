@@ -996,6 +996,9 @@ pub struct PyCustomDataPoint {
     /// Date this point applies to.
     #[pyo3(get)]
     pub time: chrono::NaiveDate,
+    /// Emission/end time in algorithm/exchange local time when available.
+    #[pyo3(get)]
+    pub end_time: chrono::NaiveDateTime,
     /// JSON-decoded extra fields dict.
     fields_inner: HashMap<String, serde_json::Value>,
 }
@@ -1266,6 +1269,79 @@ impl SliceProxy {
         })
     }
 
+    /// Add cells for a subscription created after the backtest loop started.
+    ///
+    /// C# LEAN's data feed can add universe subscriptions mid-stream. rlean
+    /// keeps stable Python containers, so new symbols need cells registered
+    /// before their later slices can expose `data.bars[symbol]`.
+    pub fn add_subscription(
+        &mut self,
+        py: Python<'_>,
+        sub: &Arc<SubscriptionDataConfig>,
+    ) -> PyResult<()> {
+        let sid = sub.symbol.id.sid;
+        if self.bar_cells.contains_key(&sid) {
+            return Ok(());
+        }
+
+        let py_bar = Py::new(
+            py,
+            PyTradeBar {
+                open: 0.0,
+                high: 0.0,
+                low: 0.0,
+                close: 0.0,
+                volume: 0.0,
+                symbol: PySymbol {
+                    inner: sub.symbol.clone(),
+                },
+                time: chrono::NaiveDateTime::default(),
+                end_time: chrono::NaiveDateTime::default(),
+            },
+        )?;
+        self.bar_cells.insert(sid, py_bar);
+        {
+            let mut bars_obj = self.bars_cell.borrow_mut(py);
+            bars_obj.ticker_to_sid.insert(sub.symbol.value.clone(), sid);
+            bars_obj
+                .ticker_to_sid
+                .insert(sub.symbol.permtick.clone(), sid);
+        }
+
+        let py_qbar = Py::new(
+            py,
+            PyQuoteBar {
+                bid_open: 0.0,
+                bid_high: 0.0,
+                bid_low: 0.0,
+                bid_close: 0.0,
+                ask_open: 0.0,
+                ask_high: 0.0,
+                ask_low: 0.0,
+                ask_close: 0.0,
+                bid_size: 0.0,
+                ask_size: 0.0,
+                symbol: PySymbol {
+                    inner: sub.symbol.clone(),
+                },
+                time: chrono::NaiveDateTime::default(),
+                end_time: chrono::NaiveDateTime::default(),
+            },
+        )?;
+        self.quote_bar_cells.insert(sid, py_qbar);
+        {
+            let mut qbars_obj = self.quote_bars_cell.borrow_mut(py);
+            qbars_obj
+                .ticker_to_sid
+                .insert(sub.symbol.value.clone(), sid);
+            qbars_obj
+                .ticker_to_sid
+                .insert(sub.symbol.permtick.clone(), sid);
+        }
+
+        Ok(())
+    }
+
     /// Write new bar values in-place.  Zero allocation; ~5 f64 writes + 2 string
     /// formats per symbol.  Must be called with the GIL held and no active Python
     /// borrows on the bar objects (guaranteed safe between `on_data` calls).
@@ -1421,6 +1497,10 @@ impl SliceProxy {
                     PyCustomDataPoint {
                         value: pt.value.to_f64().unwrap_or(0.0),
                         time: pt.time,
+                        end_time: pt
+                            .end_time
+                            .map(|time| ns_to_naive(time.0))
+                            .unwrap_or_else(|| pt.time.and_hms_opt(0, 0, 0).unwrap_or_default()),
                         fields_inner: pt.fields.clone(),
                     },
                 ) {

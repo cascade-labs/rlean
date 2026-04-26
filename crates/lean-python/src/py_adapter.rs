@@ -3,6 +3,7 @@ use crate::py_data::{PySlice, PyTradeBar, SliceProxy};
 use crate::py_framework::FrameworkState;
 use crate::py_orders::PyOrderEvent;
 use crate::py_qc_algorithm::{IndicatorRegistry, PyQcAlgorithm};
+use crate::py_universe::{PyScheduledUniverse, PySecurityChanges};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
@@ -26,6 +27,8 @@ pub struct PyAlgorithmAdapter {
     pub framework: Arc<Mutex<FrameworkState>>,
     /// Indicator registry — auto-updated before every OnData call.
     pub indicators: Arc<Mutex<IndicatorRegistry>>,
+    /// Scheduled/user-defined universes registered from Python.
+    pub universes: Arc<Mutex<Vec<Py<PyScheduledUniverse>>>>,
     /// Cached after Initialize().
     pub name: String,
 }
@@ -69,6 +72,7 @@ impl PyAlgorithmAdapter {
         let charts = qc_ref.borrow().charts_arc();
         let framework = qc_ref.borrow().framework_arc();
         let indicators = qc_ref.borrow().indicators_arc();
+        let universes = qc_ref.borrow().universes_arc();
         let name = inner.lock().unwrap().name.clone();
         Ok(PyAlgorithmAdapter {
             py_obj: instance,
@@ -76,8 +80,48 @@ impl PyAlgorithmAdapter {
             charts,
             framework,
             indicators,
+            universes,
             name,
         })
+    }
+
+    /// Apply all due universes at the current frontier and add subscriptions
+    /// for selected symbols, mirroring C# LEAN's UniverseSelection/DataManager flow.
+    pub fn apply_universe_selection(
+        &mut self,
+        py: Python<'_>,
+        utc_ns: i64,
+        resolution: lean_core::Resolution,
+    ) -> SecurityChanges {
+        let universes = self.universes.lock().unwrap();
+        let mut merged = SecurityChanges::empty();
+        for universe in universes.iter() {
+            let mut bound = universe.bind(py).borrow_mut();
+            if !bound.should_trigger(utc_ns, resolution) {
+                continue;
+            }
+            match bound.select(py, utc_ns) {
+                Ok(changes) => {
+                    if changes.has_changes() {
+                        let settings = bound.settings();
+                        {
+                            let mut alg = self.inner.lock().unwrap();
+                            for symbol in &changes.added {
+                                alg.add_equity(&symbol.value, settings.resolution);
+                            }
+                        }
+                        merged.added.extend(changes.added);
+                        merged.removed.extend(changes.removed);
+                    }
+                }
+                Err(e) => e.print(py),
+            }
+        }
+        drop(universes);
+        if merged.has_changes() {
+            self.on_securities_changed(&merged);
+        }
+        merged
     }
 }
 
@@ -158,9 +202,24 @@ impl IAlgorithm for PyAlgorithmAdapter {
         });
     }
 
-    fn on_securities_changed(&mut self, _changes: &SecurityChanges) {
+    fn on_securities_changed(&mut self, changes: &SecurityChanges) {
         Python::attach(|py| {
-            lean_call0(py, &self.py_obj, "OnSecuritiesChanged");
+            let py_changes = PySecurityChanges::from_changes(changes);
+            if let Ok(changes_obj) = Py::new(py, py_changes) {
+                let changes_for_pascal = changes_obj.clone_ref(py);
+                if let Err(e) =
+                    self.py_obj
+                        .call_method1(py, "OnSecuritiesChanged", (changes_for_pascal,))
+                {
+                    if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                        let _ =
+                            self.py_obj
+                                .call_method1(py, "on_securities_changed", (changes_obj,));
+                    } else {
+                        e.print(py);
+                    }
+                }
+            }
         });
     }
 

@@ -17,9 +17,10 @@
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -247,6 +248,8 @@ async fn run_python_backtest(
     use lean_python::runner::{run_strategy, RunConfig};
     use lean_python::AlgorithmImports;
 
+    ensure_python_baseline_packages()?;
+
     // Register the AlgorithmImports PyO3 module before starting Python.
     // Must be called before Python::initialize.
     pyo3::append_to_inittab!(AlgorithmImports);
@@ -305,6 +308,7 @@ async fn run_python_backtest(
         start_date_override,
         end_date_override,
         custom_data_sources,
+        output_dir: Some(backtest_dir.clone()),
     };
 
     let results = run_strategy(&args.strategy, config).await?;
@@ -397,6 +401,134 @@ async fn run_live(_args: RunArgs) -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn ensure_python_baseline_packages() -> Result<()> {
+    let python = std::env::var("RLEAN_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let packages = ["numpy", "pandas", "scipy"];
+    let site_packages = rlean_python_site_packages(&python)?;
+    let import_check = packages
+        .iter()
+        .map(|pkg| format!("import {pkg}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let check = python_import_check(&python, &site_packages, &import_check);
+    if matches!(check, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    eprintln!(
+        "Python baseline packages missing for {python}; installing LEAN-compatible defaults into {}: {}",
+        site_packages.display(),
+        packages.join(", ")
+    );
+
+    std::fs::create_dir_all(&site_packages)?;
+    if install_python_baseline_with_uv(&site_packages, packages).is_err() {
+        install_python_baseline_with_pip(&python, packages)?;
+    }
+
+    let recheck = python_import_check(&python, &site_packages, &import_check)
+        .map_err(|e| anyhow::anyhow!("failed to verify Python baseline packages: {e}"))?;
+    if !recheck.success() {
+        bail!(
+            "Python baseline packages still cannot be imported by {python}. \
+             Set RLEAN_PYTHON to the interpreter used by the embedded Python runtime."
+        );
+    }
+
+    Ok(())
+}
+
+fn python_import_check(
+    python: &str,
+    site_packages: &Path,
+    import_check: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    ProcessCommand::new(python)
+        .env("PYTHONPATH", site_packages)
+        .arg("-c")
+        .arg(import_check)
+        .status()
+}
+
+fn install_python_baseline_with_uv(site_packages: &Path, packages: [&str; 3]) -> Result<()> {
+    let python_platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-manylinux_2_28",
+        ("linux", "x86_64") => "x86_64-manylinux_2_28",
+        _ => "aarch64-apple-darwin",
+    };
+
+    let status = ProcessCommand::new("uv")
+        .args([
+            "pip",
+            "install",
+            "--target",
+            site_packages.to_string_lossy().as_ref(),
+            "--python-version",
+            "3.14",
+            "--python-platform",
+            python_platform,
+        ])
+        .args(packages)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run `uv pip install`: {e}"))?;
+    if !status.success() {
+        bail!("`uv pip install` failed");
+    }
+    Ok(())
+}
+
+fn install_python_baseline_with_pip(python: &str, packages: [&str; 3]) -> Result<()> {
+    let ensurepip_status = ProcessCommand::new(python)
+        .args(["-m", "ensurepip", "--upgrade"])
+        .status();
+    if !matches!(ensurepip_status, Ok(status) if status.success()) {
+        eprintln!("Warning: `{python} -m ensurepip --upgrade` did not complete successfully");
+    }
+
+    let status = ProcessCommand::new(python)
+        .args(["-m", "pip", "install", "--upgrade"])
+        .args(packages)
+        .status()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to run `{python} -m pip install --upgrade numpy pandas scipy`: {e}"
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "failed to install Python baseline packages for {python}. \
+             Install them manually with `{python} -m pip install --upgrade numpy pandas scipy`, \
+             or set RLEAN_PYTHON to the Python interpreter rlean should use."
+        );
+    }
+    Ok(())
+}
+
+fn rlean_python_site_packages(python: &str) -> Result<PathBuf> {
+    let tag = ProcessCommand::new(python)
+        .arg("-c")
+        .arg("import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to query Python version from {python}: {e}"))?;
+    if !tag.status.success() {
+        bail!("failed to query Python version from {python}");
+    }
+    let tag = String::from_utf8(tag.stdout)
+        .context("Python version output was not UTF-8")?
+        .trim()
+        .to_string();
+
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".rlean")
+        .join("python")
+        .join(tag)
+        .join("site-packages"))
+}
 
 /// Derive a human-readable strategy name from a strategy file path.
 ///

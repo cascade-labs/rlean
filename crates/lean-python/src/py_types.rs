@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 /// Python-visible Resolution enum.
-/// LEAN uses PascalCase: Resolution.Daily, Resolution.Minute, Resolution.Hour, etc.
+/// QuantConnect Python uses SCREAMING_SNAKE_CASE; PascalCase remains accepted.
 #[pyclass(name = "Resolution", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyResolution {
@@ -12,6 +12,24 @@ pub enum PyResolution {
     Minute = 2,
     Hour = 3,
     Daily = 4,
+}
+
+#[pymethods]
+impl PyResolution {
+    #[classattr]
+    const TICK: Self = Self::Tick;
+
+    #[classattr]
+    const SECOND: Self = Self::Second;
+
+    #[classattr]
+    const MINUTE: Self = Self::Minute;
+
+    #[classattr]
+    const HOUR: Self = Self::Hour;
+
+    #[classattr]
+    const DAILY: Self = Self::Daily;
 }
 
 impl From<PyResolution> for Resolution {

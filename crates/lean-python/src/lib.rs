@@ -10,6 +10,7 @@ pub mod py_portfolio;
 pub mod py_qc_algorithm;
 pub mod py_quant_book;
 pub mod py_types;
+pub mod py_universe;
 pub mod report;
 pub mod runner;
 
@@ -42,6 +43,10 @@ use py_quant_book::PyQuantBook;
 use py_types::{
     PyAlgorithmSettings, PyDataNormalizationMode, PyIndicatorResult, PyMovingAverageType,
     PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol,
+};
+use py_universe::{
+    PyDateRule, PyDateRules, PyScheduledUniverse, PySecurityChanges, PyTimeRule, PyTimeRules,
+    PyUniverseSettings,
 };
 
 // ─── Additional enums matching LEAN's Python API ──────────────────────────────
@@ -114,7 +119,7 @@ pub enum PyOrderDirection {
 ///
 /// class MyAlgo(QCAlgorithm):
 ///     def initialize(self):
-///         self.spy = self.add_equity("SPY", Resolution.Daily).symbol
+///         self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
 ///         self.fast = SimpleMovingAverage(50)
 /// ```
 #[pymodule]
@@ -123,6 +128,13 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core types
     m.add_class::<PyResolution>()?;
     m.add_class::<PyAlgorithmSettings>()?;
+    m.add_class::<PyUniverseSettings>()?;
+    m.add_class::<PyDateRule>()?;
+    m.add_class::<PyDateRules>()?;
+    m.add_class::<PyTimeRule>()?;
+    m.add_class::<PyTimeRules>()?;
+    m.add_class::<PyScheduledUniverse>()?;
+    m.add_class::<PySecurityChanges>()?;
     m.add_class::<PyDataNormalizationMode>()?;
     m.add_class::<PyMovingAverageType>()?;
     m.add_class::<PySymbol>()?;
@@ -245,6 +257,21 @@ pub use algorithm_imports as AlgorithmImports;
 pub use algorithm_imports as lean_rust;
 
 #[cfg(test)]
+pub(crate) mod test_python {
+    use super::AlgorithmImports;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    pub(crate) fn init() {
+        INIT.call_once(|| {
+            pyo3::append_to_inittab!(AlgorithmImports);
+            pyo3::Python::initialize();
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -252,21 +279,20 @@ mod tests {
     /// correct LEAN-compatible API surface from Python.
     #[test]
     fn test_algorithm_imports_api() {
-        pyo3::append_to_inittab!(AlgorithmImports);
-        pyo3::Python::initialize();
+        crate::test_python::init();
 
         Python::attach(|py| {
-            // Test 1: Resolution.Daily is accessible (PascalCase, not SCREAMING_SNAKE_CASE)
+            // Test 1: documented Python Resolution aliases are accessible.
             let result = py.run(
                 c"
 from AlgorithmImports import Resolution
-assert Resolution.Daily is not None, 'Resolution.Daily must be accessible'
-assert not hasattr(Resolution, 'DAILY'), 'Resolution.DAILY must NOT exist (use Daily)'
+assert Resolution.DAILY is not None, 'Resolution.DAILY must be accessible'
+assert Resolution.Daily == Resolution.DAILY, 'Resolution.Daily remains a compatibility alias'
 ",
                 None,
                 None,
             );
-            assert!(result.is_ok(), "Resolution.Daily test failed: {:?}", result);
+            assert!(result.is_ok(), "Resolution API test failed: {:?}", result);
 
             // Test 2: SimpleMovingAverage(50) creates an indicator
             let result = py.run(
@@ -333,7 +359,25 @@ assert QCAlgorithm is not None, 'QCAlgorithm must be accessible'
             );
             assert!(result.is_ok(), "QCAlgorithm name test failed: {:?}", result);
 
-            // Test 6: All expected LEAN indicator names are present
+            // Test 6: documented LEAN portfolio aliases are present.
+            let result = py.run(
+                c"
+from AlgorithmImports import QCAlgorithm
+algorithm = QCAlgorithm()
+assert algorithm.portfolio.invested is False
+assert algorithm.portfolio.hold_stock is False
+assert algorithm.portfolio.is_invested is False
+",
+                None,
+                None,
+            );
+            assert!(
+                result.is_ok(),
+                "Portfolio API alias test failed: {:?}",
+                result
+            );
+
+            // Test 7: All expected LEAN indicator names are present
             let result = py.run(
                 c"
 from AlgorithmImports import (
@@ -356,7 +400,7 @@ assert AverageTrueRange is not None
             );
             assert!(result.is_ok(), "Indicator names test failed: {:?}", result);
 
-            // Test 7: All expected LEAN OrderEvent properties are present
+            // Test 8: All expected LEAN OrderEvent properties are present
             let result = py.run(
                 c"
 from AlgorithmImports import OrderEvent, OrderStatus, OrderDirection
@@ -385,6 +429,25 @@ assert hasattr(OrderDirection, 'Hold')
                 None,
             );
             assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
+
+            // Test 9: universe selection API surface mirrors LEAN names.
+            let result = py.run(
+                c"
+from AlgorithmImports import *
+algorithm = QCAlgorithm()
+algorithm.universe_settings.resolution = Resolution.HOUR
+assert algorithm.UniverseSettings.Resolution == Resolution.HOUR
+u = ScheduledUniverse(algorithm.DateRules.EveryDay(), algorithm.TimeRules.At(12, 0), lambda time: ['SPY'])
+algorithm.AddUniverse(u)
+algorithm.AddUniverse('hourly', Resolution.HOUR, lambda time: ['AAPL'])
+changes = SecurityChanges()
+assert changes.added_securities == []
+assert changes.AddedSecurities == []
+",
+                None,
+                None,
+            );
+            assert!(result.is_ok(), "Universe API test failed: {:?}", result);
         });
     }
 }

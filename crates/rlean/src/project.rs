@@ -111,7 +111,7 @@ class {class_name}(QCAlgorithm):
         self.set_end_date(2023, 1, 1)
         self.set_cash(100_000)
 
-        self.spy = self.add_equity("SPY", Resolution.Daily).symbol
+        self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
 
     def on_data(self, data: Slice):
         if not self.portfolio.invested:

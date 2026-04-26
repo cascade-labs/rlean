@@ -15,7 +15,7 @@
 ///   rlean plugin remove <name>                      # remove installed plugin
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,31 @@ struct InstallGroup {
     git_url: String,
     src_dir: PathBuf,
     entries: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginUpgradeStatus {
+    Current,
+    UpgradeAvailable,
+    Unknown,
+}
+
+impl PluginUpgradeStatus {
+    fn list_status(self) -> &'static str {
+        match self {
+            PluginUpgradeStatus::Current => "installed",
+            PluginUpgradeStatus::UpgradeAvailable => "installed (upgrade available)",
+            PluginUpgradeStatus::Unknown => "installed (upgrade unknown)",
+        }
+    }
+
+    fn installed_status(self) -> &'static str {
+        match self {
+            PluginUpgradeStatus::Current => "current",
+            PluginUpgradeStatus::UpgradeAvailable => "upgrade available",
+            PluginUpgradeStatus::Unknown => "upgrade unknown",
+        }
+    }
 }
 
 // ── Registry fetch ────────────────────────────────────────────────────────────
@@ -271,8 +296,7 @@ fn cmd_list_registry() -> Result<()> {
     let plugins = fetch_all_registries();
 
     let installed = load_manifest()?.plugins;
-    let installed_names: std::collections::HashSet<&str> =
-        installed.iter().map(|e| e.info.name.as_str()).collect();
+    let upgrade_statuses = plugin_upgrade_statuses(&installed);
 
     if plugins.is_empty() && installed.is_empty() {
         println!("No plugins available. Check your network or run `rlean plugin registry list`.");
@@ -293,8 +317,8 @@ fn cmd_list_registry() -> Result<()> {
         "-".repeat(NAME_W + 1 + KIND_W + 1 + DESC_W + 1 + REG_W + 1 + 9)
     );
     for (registry, entry) in &plugins {
-        let status = if installed_names.contains(entry.name.as_str()) {
-            "installed"
+        let status = if let Some(upgrade) = upgrade_statuses.get(entry.name.as_str()) {
+            upgrade.list_status()
         } else {
             ""
         };
@@ -311,6 +335,7 @@ fn cmd_list_registry() -> Result<()> {
     }
     println!();
     println!("Install:  rlean plugin install <name>");
+    println!("Upgrade:  rlean plugin upgrade <name>");
     Ok(())
 }
 
@@ -320,15 +345,63 @@ fn cmd_list_installed() -> Result<()> {
         println!("No plugins installed. Run `rlean plugin list` to see available plugins.");
         return Ok(());
     }
-    println!("{:<22} {:<10} {:<28} INSTALLED", "NAME", "VERSION", "KIND");
-    println!("{}", "-".repeat(78));
+    let upgrade_statuses = plugin_upgrade_statuses(&manifest.plugins);
+
+    println!(
+        "{:<22} {:<10} {:<28} {:<22} STATUS",
+        "NAME", "VERSION", "KIND", "INSTALLED"
+    );
+    println!("{}", "-".repeat(100));
     for entry in &manifest.plugins {
+        let status = upgrade_statuses
+            .get(entry.info.name.as_str())
+            .map(|status| status.installed_status())
+            .unwrap_or("");
         println!(
-            "{:<22} {:<10} {:<28} {}",
-            entry.info.name, entry.info.version, entry.info.kind, entry.installed_at
+            "{:<22} {:<10} {:<28} {:<22} {}",
+            entry.info.name, entry.info.version, entry.info.kind, entry.installed_at, status
         );
     }
+    println!();
+    println!("Upgrade:  rlean plugin upgrade <name>");
     Ok(())
+}
+
+fn plugin_upgrade_statuses(installed: &[InstalledEntry]) -> BTreeMap<String, PluginUpgradeStatus> {
+    installed
+        .iter()
+        .map(|entry| {
+            (
+                entry.info.name.clone(),
+                plugin_upgrade_status(Path::new(&entry.src_path)),
+            )
+        })
+        .collect()
+}
+
+fn plugin_upgrade_status(src_dir: &Path) -> PluginUpgradeStatus {
+    if !src_dir.join(".git").exists() {
+        return PluginUpgradeStatus::Unknown;
+    }
+
+    if !git_fetch_quiet(src_dir) {
+        return PluginUpgradeStatus::Unknown;
+    }
+
+    let Some(local) = git_rev_parse(src_dir, "HEAD") else {
+        return PluginUpgradeStatus::Unknown;
+    };
+    let Some(upstream) = git_rev_parse(src_dir, "@{upstream}") else {
+        return PluginUpgradeStatus::Unknown;
+    };
+
+    if local == upstream {
+        PluginUpgradeStatus::Current
+    } else if git_is_ancestor(src_dir, &local, &upstream) {
+        PluginUpgradeStatus::UpgradeAvailable
+    } else {
+        PluginUpgradeStatus::Unknown
+    }
 }
 
 fn cmd_install(names: &str) -> Result<()> {
@@ -877,6 +950,46 @@ fn git_pull(dir: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&lock);
     }
     Ok(())
+}
+
+fn git_fetch_quiet(dir: &Path) -> bool {
+    let d = dir.display().to_string();
+    Command::new("git")
+        .args(["-C", &d, "fetch", "--quiet"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn git_rev_parse(dir: &Path, rev: &str) -> Option<String> {
+    let d = dir.display().to_string();
+    let output = Command::new("git")
+        .args(["-C", &d, "rev-parse", rev])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    let d = dir.display().to_string();
+    Command::new("git")
+        .args([
+            "-C",
+            &d,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn cargo_update(workspace_root: &Path) -> Result<()> {
