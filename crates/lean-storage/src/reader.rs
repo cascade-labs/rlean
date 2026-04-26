@@ -1,5 +1,9 @@
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
 use crate::{convert, predicate::Predicate, schema};
+use arrow_array::types::{
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType,
+};
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     UInt32Array, UInt64Array,
@@ -70,6 +74,7 @@ impl ParquetReader {
         query: &CustomDataQuery,
         date: chrono::NaiveDate,
     ) -> LeanResult<Vec<CustomDataPoint>> {
+        validate_custom_parquet_source(source)?;
         if source.paths.is_empty() {
             return Ok(vec![]);
         }
@@ -157,35 +162,6 @@ impl ParquetReader {
         for (column, value) in &query.numeric_max {
             filters.push(col(column).lt_eq(lit(*value)));
         }
-        if let (Some(time_column), Some(format)) = (&source.time_column, &source.time_format) {
-            match format.as_str() {
-                "unix_ns" => {
-                    if let Some(start) = query.start_time {
-                        filters.push(col(time_column).gt_eq(lit(start.0)));
-                    }
-                    if let Some(end) = query.end_time {
-                        filters.push(col(time_column).lt_eq(lit(end.0)));
-                    }
-                }
-                "unix_ms" => {
-                    if let Some(start) = query.start_time {
-                        filters.push(col(time_column).gt_eq(lit(start.0 / 1_000_000)));
-                    }
-                    if let Some(end) = query.end_time {
-                        filters.push(col(time_column).lt_eq(lit(end.0 / 1_000_000)));
-                    }
-                }
-                "unix_s" => {
-                    if let Some(start) = query.start_time {
-                        filters.push(col(time_column).gt_eq(lit(start.0 / 1_000_000_000)));
-                    }
-                    if let Some(end) = query.end_time {
-                        filters.push(col(time_column).lt_eq(lit(end.0 / 1_000_000_000)));
-                    }
-                }
-                _ => {}
-            }
-        }
         if let Some(filter) = filters.into_iter().reduce(|a, b| a.and(b)) {
             df = df
                 .filter(filter)
@@ -230,15 +206,16 @@ impl ParquetReader {
                 .as_ref()
                 .and_then(|c| schema.index_of(c).ok());
             for row in 0..batch.num_rows() {
-                let point_end_time = time_idx.and_then(|idx| {
-                    parquet_custom_time_to_datetime(
+                let point_end_time = match time_idx {
+                    Some(idx) => Some(parquet_custom_time_to_datetime(
                         batch.column(idx).as_ref(),
                         row,
                         source.time_format.as_deref(),
                         source.time_zone.as_deref(),
                         date,
-                    )
-                });
+                    )?),
+                    None => None,
+                };
                 let point_date = point_end_time
                     .map(|time| {
                         time.to_tz(custom_time_zone(source.time_zone.as_deref()))
@@ -835,6 +812,21 @@ impl ParquetReader {
     }
 }
 
+fn validate_custom_parquet_source(source: &CustomParquetSource) -> LeanResult<()> {
+    match (&source.time_column, source.time_format.as_deref()) {
+        (Some(_), Some("timestamp")) | (None, None) => Ok(()),
+        (Some(_), None) => Err(lean_core::LeanError::DataError(
+            "custom parquet source with time_column must set time_format='timestamp'".to_string(),
+        )),
+        (Some(_), Some(other)) => Err(lean_core::LeanError::DataError(format!(
+            "unsupported custom parquet time_format '{other}'; native custom parquet requires Arrow timestamp columns"
+        ))),
+        (None, Some(_)) => Err(lean_core::LeanError::DataError(
+            "custom parquet source cannot set time_format without time_column".to_string(),
+        )),
+    }
+}
+
 fn matches_time_filter(time: DateTime, params: &QueryParams) -> bool {
     if let Some(start) = params.predicate.start_time {
         if time.0 < start.0 {
@@ -854,48 +846,78 @@ fn parquet_custom_time_to_datetime(
     row: usize,
     format: Option<&str>,
     time_zone: Option<&str>,
-    date: NaiveDate,
-) -> Option<DateTime> {
+    _date: NaiveDate,
+) -> LeanResult<DateTime> {
     if array.is_null(row) {
-        return None;
+        return Err(lean_core::LeanError::DataError(
+            "custom parquet timestamp column contains null".to_string(),
+        ));
     }
 
-    let numeric = numeric_cell_as_f64(array, row).map(|value| value.round() as i64);
-    match format.unwrap_or("unix_ns") {
-        "hhmm" => {
-            let hhmm = numeric.or_else(|| {
-                array_value_to_string(array, row)
-                    .ok()
-                    .and_then(|value| value.trim().parse::<i64>().ok())
-            })?;
-            let hour = (hhmm / 100) as u32;
-            let minute = (hhmm % 100) as u32;
-            local_datetime_to_utc(date, hour, minute, 0, time_zone)
+    let time = match format {
+        Some("timestamp") => arrow_timestamp_cell_as_datetime(array, row, time_zone),
+        Some(other) => {
+            return Err(lean_core::LeanError::DataError(format!(
+                "unsupported custom parquet time_format '{other}'; native custom parquet requires Arrow timestamp columns"
+            )))
         }
-        "unix_ms" => numeric.map(|value| NanosecondTimestamp(value * 1_000_000)),
-        "unix_s" => numeric.map(|value| NanosecondTimestamp(value * 1_000_000_000)),
-        "date" => Some(DateTime::from(
-            Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?),
-        )),
-        _ => numeric.map(NanosecondTimestamp),
-    }
+        None => {
+            return Err(lean_core::LeanError::DataError(
+                "custom parquet source with time_column must set time_format='timestamp'"
+                    .to_string(),
+            ))
+        }
+    };
+    time.ok_or_else(|| {
+        lean_core::LeanError::DataError(
+            "custom parquet timestamp column must be Arrow Timestamp".to_string(),
+        )
+    })
 }
 
-fn local_datetime_to_utc(
-    date: NaiveDate,
-    hour: u32,
-    minute: u32,
-    second: u32,
+fn arrow_timestamp_cell_as_datetime(
+    array: &dyn Array,
+    row: usize,
     time_zone: Option<&str>,
 ) -> Option<DateTime> {
-    let local = date.and_hms_opt(hour, minute, second)?;
-    let tz = custom_time_zone(time_zone);
-    let zoned = tz
-        .from_local_datetime(&local)
-        .single()
-        .or_else(|| tz.from_local_datetime(&local).earliest())
-        .or_else(|| tz.from_local_datetime(&local).latest())?;
-    Some(DateTime::from(zoned.with_timezone(&Utc)))
+    let raw_ns = if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::PrimitiveArray<TimestampNanosecondType>>()
+    {
+        values.value(row)
+    } else if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::PrimitiveArray<TimestampMicrosecondType>>()
+    {
+        values.value(row) * 1_000
+    } else if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::PrimitiveArray<TimestampMillisecondType>>()
+    {
+        values.value(row) * 1_000_000
+    } else if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::PrimitiveArray<TimestampSecondType>>()
+    {
+        values.value(row) * 1_000_000_000
+    } else {
+        return None;
+    };
+
+    let timestamp = NanosecondTimestamp(raw_ns);
+    match time_zone {
+        Some(tz) => {
+            let local = timestamp.to_utc().naive_utc();
+            let tz = custom_time_zone(Some(tz));
+            let zoned = tz
+                .from_local_datetime(&local)
+                .single()
+                .or_else(|| tz.from_local_datetime(&local).earliest())
+                .or_else(|| tz.from_local_datetime(&local).latest())?;
+            Some(DateTime::from(zoned.with_timezone(&Utc)))
+        }
+        None => Some(timestamp),
+    }
 }
 
 fn custom_time_zone(time_zone: Option<&str>) -> chrono_tz::Tz {

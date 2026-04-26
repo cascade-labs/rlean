@@ -86,10 +86,14 @@ pub struct CustomParquetSource {
     /// Column used as the data timestamp/date. If absent, the runner uses the
     /// requested date for every row.
     pub time_column: Option<String>,
-    /// Timestamp encoding for `time_column`: `unix_ns`, `unix_ms`,
-    /// `unix_s`, `hhmm`, or `date`.
+    /// Timestamp encoding for `time_column`.
+    ///
+    /// Native custom parquet supports one LEAN-compatible value:
+    /// `timestamp`, an Arrow timestamp column. If `time_zone` is set, the
+    /// timestamp is interpreted as local wall-clock time in that zone and
+    /// converted to UTC.
     pub time_format: Option<String>,
-    /// Time zone used for local timestamp encodings like `hhmm`.
+    /// Time zone for provider-local Arrow timestamp columns. Omit for UTC.
     pub time_zone: Option<String>,
     /// Primary symbol column for generic `symbols` filtering.
     pub symbol_column: Option<String>,
