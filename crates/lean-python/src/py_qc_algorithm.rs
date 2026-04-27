@@ -376,6 +376,20 @@ impl PyQcAlgorithm {
             return Ok(());
         }
 
+        if args.len() >= 4 {
+            let ticker = args.get_item(1)?.extract::<String>()?;
+            let resolution = args.get_item(2)?.extract::<PyResolution>()?;
+            let selector = args.get_item(3)?.unbind();
+            let universe = PyScheduledUniverse::custom_data(
+                ticker,
+                selector,
+                resolution.into(),
+                self.universe_settings.snapshot(),
+            );
+            self.universes.lock().unwrap().push(Py::new(py, universe)?);
+            return Ok(());
+        }
+
         if args.len() >= 3 {
             let resolution = args.get_item(1)?.extract::<PyResolution>()?;
             let selector = args.get_item(2)?.unbind();
@@ -389,7 +403,7 @@ impl PyQcAlgorithm {
         }
 
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "add_universe expects ScheduledUniverse or (name, resolution, selector)",
+            "add_universe expects ScheduledUniverse, (name, resolution, selector), or (source, name, resolution, selector)",
         ))
     }
 

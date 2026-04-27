@@ -98,6 +98,12 @@ impl SubscriptionManager {
         self.subscriptions.write().remove(&config.unique_id());
     }
 
+    pub fn remove_symbol(&self, symbol: &Symbol) {
+        self.subscriptions
+            .write()
+            .retain(|_, config| config.symbol.id.sid != symbol.id.sid);
+    }
+
     pub fn get_all(&self) -> Vec<Arc<SubscriptionDataConfig>> {
         self.subscriptions.read().values().cloned().collect()
     }

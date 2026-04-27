@@ -7,7 +7,7 @@ use crate::py_universe::{PyScheduledUniverse, PySecurityChanges};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Result as LeanResult, Symbol};
-use lean_data::Slice;
+use lean_data::{CustomDataPoint, Slice};
 use lean_orders::{Order, OrderEvent};
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,55 @@ impl PyAlgorithmAdapter {
                             let mut alg = self.inner.lock().unwrap();
                             for symbol in &changes.added {
                                 alg.add_equity(&symbol.value, settings.resolution);
+                            }
+                            for symbol in &changes.removed {
+                                if !alg.is_invested(symbol) {
+                                    alg.subscription_manager.remove_symbol(symbol);
+                                    alg.securities.remove(symbol);
+                                }
+                            }
+                        }
+                        merged.added.extend(changes.added);
+                        merged.removed.extend(changes.removed);
+                    }
+                }
+                Err(e) => e.print(py),
+            }
+        }
+        drop(universes);
+        if merged.has_changes() {
+            self.on_securities_changed(&merged);
+        }
+        merged
+    }
+
+    /// Apply data-driven custom universes using the custom data already loaded
+    /// for the current frontier. This mirrors LEAN's FuncUniverse<T> path.
+    pub fn apply_custom_universe_selection(
+        &mut self,
+        py: Python<'_>,
+        utc_ns: i64,
+        resolution: lean_core::Resolution,
+        custom_data: &std::collections::HashMap<String, Vec<CustomDataPoint>>,
+    ) -> SecurityChanges {
+        let universes = self.universes.lock().unwrap();
+        let mut merged = SecurityChanges::empty();
+        for universe in universes.iter() {
+            let mut bound = universe.bind(py).borrow_mut();
+            match bound.select_custom_data(py, utc_ns, resolution, custom_data) {
+                Ok(changes) => {
+                    if changes.has_changes() {
+                        let settings = bound.settings();
+                        {
+                            let mut alg = self.inner.lock().unwrap();
+                            for symbol in &changes.added {
+                                alg.add_equity(&symbol.value, settings.resolution);
+                            }
+                            for symbol in &changes.removed {
+                                if !alg.is_invested(symbol) {
+                                    alg.subscription_manager.remove_symbol(symbol);
+                                    alg.securities.remove(symbol);
+                                }
                             }
                         }
                         merged.added.extend(changes.added);

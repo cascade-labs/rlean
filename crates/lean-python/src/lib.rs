@@ -41,8 +41,9 @@ use py_portfolio::{PyPortfolio, PySecurityHolding};
 use py_qc_algorithm::PyQcAlgorithm;
 use py_quant_book::PyQuantBook;
 use py_types::{
-    PyAlgorithmSettings, PyDataNormalizationMode, PyIndicatorResult, PyMovingAverageType,
-    PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry, PySecurityManager, PySymbol,
+    PyAlgorithmSettings, PyDataNormalizationMode, PyExchangeHours, PyIndicatorResult,
+    PyMovingAverageType, PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry,
+    PySecurityExchange, PySecurityManager, PySymbol,
 };
 use py_universe::{
     PyDateRule, PyDateRules, PyScheduledUniverse, PySecurityChanges, PyTimeRule, PyTimeRules,
@@ -63,6 +64,35 @@ pub enum PySecurityType {
     Cfd = 5,
     Crypto = 7,
     Index = 8,
+}
+
+#[pymethods]
+impl PySecurityType {
+    #[classattr]
+    const BASE: Self = Self::Base;
+    #[classattr]
+    const EQUITY: Self = Self::Equity;
+    #[classattr]
+    const OPTION: Self = Self::Option;
+    #[classattr]
+    const FOREX: Self = Self::Forex;
+    #[classattr]
+    const FUTURE: Self = Self::Future;
+    #[classattr]
+    const CFD: Self = Self::Cfd;
+    #[classattr]
+    const CRYPTO: Self = Self::Crypto;
+    #[classattr]
+    const INDEX: Self = Self::Index;
+}
+
+#[pyclass(name = "Market")]
+pub struct PyMarket;
+
+#[pymethods]
+impl PyMarket {
+    #[classattr]
+    const USA: &'static str = "usa";
 }
 
 /// LEAN OrderType enum values.
@@ -140,6 +170,8 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySymbol>()?;
     m.add_class::<PySecurity>()?;
     m.add_class::<PySecurityEntry>()?;
+    m.add_class::<PySecurityExchange>()?;
+    m.add_class::<PyExchangeHours>()?;
     m.add_class::<PySecurityManager>()?;
     m.add_class::<PyIndicatorResult>()?;
     m.add_class::<PyIndicatorDataPoint>()?;
@@ -197,6 +229,7 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Additional enums
     m.add_class::<PySecurityType>()?;
+    m.add_class::<PyMarket>()?;
     m.add_class::<PyOrderType>()?;
     m.add_class::<PyOrderStatus>()?;
     m.add_class::<PyOrderDirection>()?;
@@ -430,7 +463,30 @@ assert hasattr(OrderDirection, 'Hold')
             );
             assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
 
-            // Test 9: universe selection API surface mirrors LEAN names.
+            // Test 9: security identity and market-hours API surface mirrors LEAN names.
+            let result = py.run(
+                c"
+import datetime
+from AlgorithmImports import *
+algorithm = QCAlgorithm()
+spy = Symbol.Create('SPY', SecurityType.EQUITY, Market.USA)
+assert spy.Value == 'SPY'
+assert SecurityType.EQUITY == SecurityType.Equity
+assert Market.USA == 'usa'
+security = algorithm.AddEquity('SPY', Resolution.Minute)
+assert algorithm.Securities.ContainsKey(spy)
+assert security.Exchange.Hours.IsOpen(
+    datetime.datetime(2022, 1, 3, 10, 0),
+    datetime.datetime(2022, 1, 3, 10, 1),
+    False,
+)
+",
+                None,
+                None,
+            );
+            assert!(result.is_ok(), "Security API test failed: {:?}", result);
+
+            // Test 10: universe selection API surface mirrors LEAN names.
             let result = py.run(
                 c"
 from AlgorithmImports import *
@@ -440,6 +496,7 @@ assert algorithm.UniverseSettings.Resolution == Resolution.HOUR
 u = ScheduledUniverse(algorithm.DateRules.EveryDay(), algorithm.TimeRules.At(12, 0), lambda time: ['SPY'])
 algorithm.AddUniverse(u)
 algorithm.AddUniverse('hourly', Resolution.HOUR, lambda time: ['AAPL'])
+algorithm.AddUniverse('tradealert', 'snapshot', Resolution.Daily, lambda points: ['SPY'])
 changes = SecurityChanges()
 assert changes.added_securities == []
 assert changes.AddedSecurities == []

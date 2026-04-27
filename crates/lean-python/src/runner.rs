@@ -13,7 +13,7 @@ use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{
@@ -1069,11 +1069,40 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 date_to_datetime(current_date, 23, 59, 59),
             );
 
+            if let Some(ref provider) = config.historical_provider {
+                let missing_subs: Vec<_> = subscriptions
+                    .iter()
+                    .filter(|sub| sub.resolution.is_high_resolution())
+                    .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                    .filter(|sub| !subscription_data_path(&resolver, sub, current_date).exists())
+                    .cloned()
+                    .collect();
+                if !missing_subs.is_empty() {
+                    if let Err(e) = pre_fetch_all(
+                        provider.clone(),
+                        config.history_provider.clone(),
+                        &missing_subs,
+                        current_date,
+                        current_date,
+                        &resolver,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to fetch {} intraday subscriptions for {}: {}",
+                            missing_subs.len(),
+                            current_date,
+                            e
+                        );
+                    }
+                }
+            }
+
             for sub in &subscriptions {
                 // In intraday mode skip low-resolution subscriptions (e.g. the daily
                 // underlying equity subscription that add_option() creates internally).
                 // They share the same SID as the high-resolution subscription and
-                // would overwrite the correct minute bars with daily bars.
+                // would overwrite the correct intraday bars with daily bars.
                 if !sub.resolution.is_high_resolution() {
                     continue;
                 }
@@ -1086,25 +1115,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                 if sub.resolution == Resolution::Tick {
                     let tick_path = resolver.tick(&sub.symbol, current_date).to_path();
-                    if !tick_path.exists() {
-                        if let Some(ref provider) = config.historical_provider {
-                            if let Err(e) = pre_fetch_subscription(
-                                provider.clone(),
-                                config.history_provider.clone(),
-                                sub.clone(),
-                                current_date,
-                                current_date,
-                                resolver.clone(),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to fetch data for {} on {}: {}",
-                                    sub.symbol.value, current_date, e
-                                );
-                            }
-                        }
-                    }
                     if tick_path.exists() {
                         match reader.read_ticks(&[tick_path], sub.symbol.clone(), &day_params) {
                             Ok(mut ticks) if !ticks.is_empty() => {
@@ -1135,25 +1145,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let trade_path = resolver
                         .trade_bar(&sub.symbol, sub.resolution, current_date)
                         .to_path();
-                    if !trade_path.exists() {
-                        if let Some(ref provider) = config.historical_provider {
-                            if let Err(e) = pre_fetch_subscription(
-                                provider.clone(),
-                                config.history_provider.clone(),
-                                sub.clone(),
-                                current_date,
-                                current_date,
-                                resolver.clone(),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to fetch data for {} on {}: {}",
-                                    sub.symbol.value, current_date, e
-                                );
-                            }
-                        }
-                    }
                     if trade_path.exists() {
                         match reader
                             .read_trade_bars(&[trade_path], sub.symbol.clone(), &day_params)
@@ -1519,19 +1510,29 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
 
                     Python::attach(|py| {
-                        slice_proxy.update_option_chains(py, &chains_snapshot);
-                        slice_proxy.update_quote_bars(py, &minute_quote_bars);
-                        slice_proxy.update_ticks(py, &minute_ticks);
-                        slice_proxy.update_custom_data(py, &custom_data_for_slice);
-                        adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
+                        adapter.apply_custom_universe_selection(
+                            py,
+                            utc_time.0,
+                            Resolution::Daily,
+                            &custom_data_for_slice,
+                        );
+                        adapter.apply_custom_universe_selection(
+                            py,
+                            utc_time.0,
+                            Resolution::Minute,
+                            &custom_data_for_slice,
+                        );
                     });
 
                     // Mirror C# LEAN's DataManager.AddSubscription behavior for
                     // intraday universes: symbols added during this slice are
                     // attached to the active data stream so later slices can
-                    // receive bars without requiring a static universe.
+                    // receive bars without requiring a static universe. This
+                    // runs before OnData so universe-added securities have a
+                    // current price when user trading logic executes.
                     let current_subs =
                         { adapter.inner.lock().unwrap().subscription_manager.get_all() };
+                    let mut new_subs = Vec::new();
                     for sub in &current_subs {
                         let sid = sub.symbol.id.sid;
                         if loaded_sids.contains(&sid) {
@@ -1540,27 +1541,35 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         loaded_sids.insert(sid);
                         subscriptions.push(sub.clone());
                         let _ = Python::attach(|py| slice_proxy.add_subscription(py, sub));
+                        new_subs.push(sub.clone());
+                    }
 
-                        if !sub.resolution.is_high_resolution() {
-                            continue;
-                        }
-
+                    let new_high_res_subs: Vec<_> = new_subs
+                        .iter()
+                        .filter(|sub| sub.resolution.is_high_resolution())
+                        .cloned()
+                        .collect();
+                    if !new_high_res_subs.is_empty() {
                         if let Some(ref provider) = config.historical_provider {
-                            if let Err(e) = pre_fetch_subscription(
+                            if let Err(e) = pre_fetch_all(
                                 provider.clone(),
                                 config.history_provider.clone(),
-                                sub.clone(),
+                                &new_high_res_subs,
                                 current_date,
                                 current_date,
-                                resolver.clone(),
+                                &resolver,
                             )
                             .await
                             {
-                                warn!(
-                                    "Failed to fetch data for dynamic subscription {}: {}",
-                                    sub.symbol.value, e
-                                );
+                                warn!("Failed to fetch universe subscriptions: {e}");
                             }
+                        }
+                    }
+
+                    for sub in &new_subs {
+                        let sid = sub.symbol.id.sid;
+                        if !sub.resolution.is_high_resolution() {
+                            continue;
                         }
 
                         let ticker = sub.symbol.permtick.to_lowercase();
@@ -1647,6 +1656,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                             for bar in &bars {
                                                 ts_map.insert(bar.time.0, bar.clone());
                                             }
+                                            if let Some(bar) = ts_map.get(&utc_time.0).cloned() {
+                                                adapter
+                                                    .inner
+                                                    .lock()
+                                                    .unwrap()
+                                                    .securities
+                                                    .update_price(&bar.symbol, bar.close);
+                                                portfolio.update_prices(&bar.symbol, bar.close);
+                                                bars_for_orders.insert(sid, bar.clone());
+                                                minute_slice.add_bar(bar);
+                                            }
                                             trade_by_ts.insert(sid, ts_map);
                                             day_trade_bars.insert(sid, bars);
                                         }
@@ -1691,6 +1711,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             }
                         }
                     }
+
+                    Python::attach(|py| {
+                        slice_proxy.update_option_chains(py, &chains_snapshot);
+                        slice_proxy.update_quote_bars(py, &minute_quote_bars);
+                        slice_proxy.update_ticks(py, &minute_ticks);
+                        slice_proxy.update_custom_data(py, &custom_data_for_slice);
+                        adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
+                    });
 
                     // ── Algorithm Framework pipeline (intraday) ───────────
                     {
@@ -2559,14 +2587,14 @@ async fn pre_fetch_subscription(
         )
         .await?;
         if rows_downloaded > 0 {
-            info!(
-                "Downloaded {} high-resolution rows for {} and cached to disk",
-                rows_downloaded, sub.symbol.value
+            debug!(
+                "Downloaded {} {} rows for {} and cached to disk",
+                rows_downloaded, sub.resolution, sub.symbol.value
             );
         } else {
             warn!(
-                "Historical provider returned 0 high-resolution rows for {} ({} → {}); no cache file was written",
-                sub.symbol.value, effective_start, end
+                "Historical provider returned 0 {} rows for {} ({} → {}); no cache file was written",
+                sub.resolution, sub.symbol.value, effective_start, end
             );
         }
     } else if !data_covers_range {
@@ -2576,7 +2604,7 @@ async fn pre_fetch_subscription(
         // a wider cached file with only the requested slice.
         let single_file_start = provider.earliest_date().unwrap_or(effective_start);
         let single_file_start_dt = date_to_datetime(single_file_start, 0, 0, 0);
-        info!(
+        debug!(
             "Local data missing or incomplete for {} — fetching single-file range from provider ({} → {})",
             sub.symbol.value, single_file_start, end
         );
@@ -2591,7 +2619,7 @@ async fn pre_fetch_subscription(
             .map_err(|e| {
                 anyhow::anyhow!("historical provider failed for {}: {}", sub.symbol.value, e)
             })?;
-        info!(
+        debug!(
             "Downloaded {} bars for {} and cached to disk",
             bars.len(),
             sub.symbol.value
@@ -2605,7 +2633,7 @@ async fn pre_fetch_subscription(
     };
     if factor_needs_update {
         if let Some(ref fp) = factor_provider {
-            info!(
+            debug!(
                 "Factor file missing or stale for {} — requesting from provider",
                 sub.symbol.value
             );
@@ -2618,7 +2646,7 @@ async fn pre_fetch_subscription(
                 data_type: lean_data_providers::DataType::FactorFile,
             };
             match tokio::task::spawn_blocking(move || fp.get_history(&request)).await {
-                Ok(Ok(_)) => info!("Factor file generated for {}", sub.symbol.value),
+                Ok(Ok(_)) => debug!("Factor file generated for {}", sub.symbol.value),
                 Ok(Err(e)) => warn!(
                     "Factor file generation failed for {}: {e}",
                     sub.symbol.value
@@ -2662,7 +2690,7 @@ async fn pre_fetch_missing_high_resolution_days(
         return Ok(0);
     }
 
-    info!(
+    debug!(
         "Local data missing or incomplete for {} — fetching {} missing {} files date-by-date with parallelism {} ({} → {})",
         sub.symbol.value,
         missing.len(),
@@ -2775,7 +2803,7 @@ async fn pre_fetch_missing_high_resolution_days(
             rows_downloaded += rows;
 
             if completed == 1 || completed.is_multiple_of(50) || completed == missing.len() {
-                info!(
+                debug!(
                     "Fetched {} {} missing day {}/{} ({})",
                     sub.symbol.value,
                     sub.resolution,
@@ -2838,6 +2866,24 @@ async fn local_data_covers_range(
 
     let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
     expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn subscription_data_path(
+    resolver: &PathResolver,
+    sub: &SubscriptionDataConfig,
+    date: NaiveDate,
+) -> PathBuf {
+    if sub.resolution == Resolution::Tick {
+        resolver.tick(&sub.symbol, date).to_path()
+    } else if sub.tick_type == TickType::Quote {
+        resolver
+            .quote_bar(&sub.symbol, sub.resolution, date)
+            .to_path()
+    } else {
+        resolver
+            .trade_bar(&sub.symbol, sub.resolution, date)
+            .to_path()
+    }
 }
 
 fn expected_market_dates(symbol: &Symbol, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {

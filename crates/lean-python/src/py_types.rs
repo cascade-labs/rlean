@@ -1,3 +1,4 @@
+use chrono::{Datelike, Timelike};
 use lean_core::{DataNormalizationMode, Market, Resolution, Symbol};
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -53,6 +54,28 @@ pub struct PySymbol {
 
 #[pymethods]
 impl PySymbol {
+    #[staticmethod]
+    #[pyo3(signature = (ticker, _security_type=None, _market=None))]
+    fn create(
+        ticker: &str,
+        _security_type: Option<&Bound<'_, PyAny>>,
+        _market: Option<&Bound<'_, PyAny>>,
+    ) -> Self {
+        PySymbol {
+            inner: Symbol::create_equity(ticker, &Market::usa()),
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "Create", signature = (ticker, security_type=None, market=None))]
+    fn create_pascal(
+        ticker: &str,
+        security_type: Option<&Bound<'_, PyAny>>,
+        market: Option<&Bound<'_, PyAny>>,
+    ) -> Self {
+        Self::create(ticker, security_type, market)
+    }
+
     #[getter]
     fn value(&self) -> &str {
         &self.inner.value
@@ -136,6 +159,18 @@ impl PySecurity {
     #[getter]
     fn symbol(&self) -> PySymbol {
         self.inner.clone()
+    }
+
+    #[getter]
+    fn exchange(&self) -> PySecurityExchange {
+        PySecurityExchange {
+            hours: PyExchangeHours,
+        }
+    }
+
+    #[getter(Exchange)]
+    fn exchange_pascal(&self) -> PySecurityExchange {
+        self.exchange()
     }
 
     /// LEAN API: ``security.SetDataNormalizationMode(DataNormalizationMode.Adjusted)``
@@ -243,6 +278,18 @@ impl PySecurityEntry {
         self.symbol_inner.clone()
     }
 
+    #[getter]
+    fn exchange(&self) -> PySecurityExchange {
+        PySecurityExchange {
+            hours: PyExchangeHours,
+        }
+    }
+
+    #[getter(Exchange)]
+    fn exchange_pascal(&self) -> PySecurityExchange {
+        self.exchange()
+    }
+
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
@@ -260,6 +307,54 @@ impl PySecurityEntry {
             "Security('{}', price={:.2})",
             self.symbol_inner.inner.value, self.price
         )
+    }
+}
+
+#[pyclass(name = "SecurityExchange", frozen)]
+#[derive(Debug, Clone)]
+pub struct PySecurityExchange {
+    #[pyo3(get)]
+    hours: PyExchangeHours,
+}
+
+#[pymethods]
+impl PySecurityExchange {
+    #[getter(Hours)]
+    fn hours_pascal(&self) -> PyExchangeHours {
+        self.hours.clone()
+    }
+}
+
+#[pyclass(name = "SecurityExchangeHours", frozen)]
+#[derive(Debug, Clone)]
+pub struct PyExchangeHours;
+
+#[pymethods]
+impl PyExchangeHours {
+    #[pyo3(signature = (start, _end=None, _extended_market_hours=false))]
+    fn is_open(
+        &self,
+        start: &Bound<'_, PyAny>,
+        _end: Option<&Bound<'_, PyAny>>,
+        _extended_market_hours: bool,
+    ) -> PyResult<bool> {
+        let dt = start.extract::<chrono::NaiveDateTime>()?;
+        let weekday = dt.weekday().number_from_monday();
+        if weekday > 5 {
+            return Ok(false);
+        }
+        let minutes = dt.hour() * 60 + dt.minute();
+        Ok((9 * 60 + 30..16 * 60).contains(&minutes))
+    }
+
+    #[pyo3(name = "IsOpen", signature = (start, end=None, extended_market_hours=false))]
+    fn is_open_pascal(
+        &self,
+        start: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        extended_market_hours: bool,
+    ) -> PyResult<bool> {
+        self.is_open(start, end, extended_market_hours)
     }
 }
 
@@ -299,6 +394,15 @@ impl PySecurityManager {
         resolve_sid(symbol)
             .map(|sid| self.entries.contains_key(&sid))
             .unwrap_or(false)
+    }
+
+    fn contains_key(&self, symbol: &Bound<'_, PyAny>) -> bool {
+        self.__contains__(symbol)
+    }
+
+    #[pyo3(name = "ContainsKey")]
+    fn contains_key_pascal(&self, symbol: &Bound<'_, PyAny>) -> bool {
+        self.__contains__(symbol)
     }
 
     fn __len__(&self) -> usize {

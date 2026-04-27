@@ -1003,6 +1003,20 @@ pub struct PyCustomDataPoint {
     fields_inner: HashMap<String, serde_json::Value>,
 }
 
+impl PyCustomDataPoint {
+    pub fn from_point(point: &CustomDataPoint) -> Self {
+        PyCustomDataPoint {
+            value: point.value.to_f64().unwrap_or(0.0),
+            time: point.time,
+            end_time: point
+                .end_time
+                .map(|time| ns_to_naive(time.0))
+                .unwrap_or_else(|| point.time.and_hms_opt(0, 0, 0).unwrap_or_default()),
+            fields_inner: point.fields.clone(),
+        }
+    }
+}
+
 #[pymethods]
 impl PyCustomDataPoint {
     /// Extra fields dict — `data.custom["VIX"].fields["open"]`.
@@ -1492,18 +1506,7 @@ impl SliceProxy {
             }
             let mut py_points = Vec::with_capacity(points.len());
             for pt in points {
-                match Py::new(
-                    py,
-                    PyCustomDataPoint {
-                        value: pt.value.to_f64().unwrap_or(0.0),
-                        time: pt.time,
-                        end_time: pt
-                            .end_time
-                            .map(|time| ns_to_naive(time.0))
-                            .unwrap_or_else(|| pt.time.and_hms_opt(0, 0, 0).unwrap_or_default()),
-                        fields_inner: pt.fields.clone(),
-                    },
-                ) {
+                match Py::new(py, PyCustomDataPoint::from_point(pt)) {
                     Ok(p) => py_points.push(p),
                     Err(_) => continue,
                 }

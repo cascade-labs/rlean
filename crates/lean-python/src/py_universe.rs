@@ -1,6 +1,8 @@
+use crate::py_data::PyCustomDataPoint;
 use crate::py_types::{PyResolution, PySecurity, PySymbol};
 use lean_algorithm::algorithm::SecurityChanges;
 use lean_core::{Market, Resolution, Symbol};
+use lean_data::CustomDataPoint;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 use std::collections::HashMap;
@@ -239,6 +241,9 @@ pub struct PyScheduledUniverse {
     time_rule: PyTimeRule,
     selector: Py<PyAny>,
     settings: UniverseSettingsState,
+    trigger_resolution: Resolution,
+    custom_ticker: Option<String>,
+    last_custom_trigger: Option<i64>,
     selected: HashMap<u64, UniverseMember>,
 }
 
@@ -259,6 +264,31 @@ impl PyScheduledUniverse {
             },
             selector,
             settings,
+            trigger_resolution: resolution,
+            custom_ticker: None,
+            last_custom_trigger: None,
+            selected: HashMap::new(),
+        }
+    }
+
+    pub fn custom_data(
+        ticker: String,
+        selector: Py<PyAny>,
+        resolution: Resolution,
+        settings: UniverseSettingsState,
+    ) -> Self {
+        Self {
+            date_rule: PyDateRule {
+                kind: DateRuleKind::EveryDay,
+            },
+            time_rule: PyTimeRule {
+                kind: TimeRuleKind::EveryResolution,
+            },
+            selector,
+            settings,
+            trigger_resolution: resolution,
+            custom_ticker: Some(ticker.to_uppercase()),
+            last_custom_trigger: None,
             selected: HashMap::new(),
         }
     }
@@ -268,12 +298,15 @@ impl PyScheduledUniverse {
     }
 
     pub fn should_trigger(&self, utc_ns: i64, resolution: Resolution) -> bool {
+        if self.custom_ticker.is_some() {
+            return false;
+        }
         let dt = ns_to_utc_datetime(utc_ns);
         match self.date_rule.kind {
             DateRuleKind::EveryDay => {}
         }
         match self.time_rule.kind {
-            TimeRuleKind::EveryResolution => resolution == self.settings.resolution,
+            TimeRuleKind::EveryResolution => resolution == self.trigger_resolution,
             TimeRuleKind::At { hour, minute } => dt.hour() == hour && dt.minute() == minute,
             TimeRuleKind::AfterMarketOpen { minutes_after_open } => {
                 let open = chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap()
@@ -286,10 +319,56 @@ impl PyScheduledUniverse {
     pub fn select(&mut self, py: Python<'_>, utc_ns: i64) -> PyResult<SecurityChanges> {
         let dt = py_datetime_from_ns(py, utc_ns)?;
         let result = self.selector.call1(py, (dt,))?;
-        if result.bind(py).is_none() {
+        self.apply_selection_result(result.bind(py), utc_ns)
+    }
+
+    pub fn select_custom_data(
+        &mut self,
+        py: Python<'_>,
+        utc_ns: i64,
+        resolution: Resolution,
+        custom_data: &HashMap<String, Vec<CustomDataPoint>>,
+    ) -> PyResult<SecurityChanges> {
+        if self.custom_ticker.is_none() || self.trigger_resolution != resolution {
             return Ok(SecurityChanges::empty());
         }
-        let symbols = extract_symbols(result.bind(py))?;
+
+        let trigger = custom_trigger_key(utc_ns, resolution);
+        if self.last_custom_trigger == Some(trigger) {
+            return Ok(SecurityChanges::empty());
+        }
+
+        let ticker = self.custom_ticker.as_ref().unwrap();
+        let Some(points) = custom_data
+            .get(ticker)
+            .or_else(|| custom_data.get(&ticker.to_lowercase()))
+        else {
+            return Ok(SecurityChanges::empty());
+        };
+        if points.is_empty() {
+            return Ok(SecurityChanges::empty());
+        }
+
+        let py_points = PyList::empty(py);
+        for point in points {
+            py_points.append(Py::new(py, PyCustomDataPoint::from_point(point))?)?;
+        }
+
+        let result = self.selector.call1(py, (py_points,))?;
+        let changes = self.apply_selection_result(result.bind(py), utc_ns)?;
+        self.last_custom_trigger = Some(trigger);
+        Ok(changes)
+    }
+
+    fn apply_selection_result(
+        &mut self,
+        result: &Bound<'_, PyAny>,
+        utc_ns: i64,
+    ) -> PyResult<SecurityChanges> {
+        if result.is_none() {
+            return Ok(SecurityChanges::empty());
+        }
+        let symbols = extract_symbols(result)?;
         let mut next = HashMap::new();
         for symbol in symbols {
             next.insert(symbol.id.sid, symbol);
@@ -344,6 +423,9 @@ impl PyScheduledUniverse {
             time_rule,
             selector,
             settings: settings.map(|s| s.snapshot()).unwrap_or_default(),
+            trigger_resolution: Resolution::Daily,
+            custom_ticker: None,
+            last_custom_trigger: None,
             selected: HashMap::new(),
         }
     }
@@ -514,6 +596,19 @@ fn ns_to_utc_datetime(ns: i64) -> chrono::DateTime<chrono::Utc> {
     let secs = ns / 1_000_000_000;
     let nanos = (ns % 1_000_000_000) as u32;
     chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default()
+}
+
+fn custom_trigger_key(ns: i64, resolution: Resolution) -> i64 {
+    match resolution {
+        Resolution::Daily => ns_to_utc_datetime(ns)
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_nanos_opt()
+            .unwrap_or(ns),
+        _ => ns,
+    }
 }
 
 fn py_datetime_from_ns(py: Python<'_>, ns: i64) -> PyResult<Py<PyAny>> {
