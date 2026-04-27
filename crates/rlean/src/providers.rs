@@ -13,6 +13,7 @@
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 
 use lean_data_providers::{
     config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider,
@@ -44,76 +45,81 @@ impl LazyPluginProvider {
     }
 }
 
+#[async_trait]
 impl IHistoryProvider for LazyPluginProvider {
-    fn get_history(
+    async fn get_history(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_history(request)
+        provider.get_history(request).await
     }
 
-    fn get_quote_bars(
+    async fn get_quote_bars(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_quote_bars(request)
+        provider.get_quote_bars(request).await
     }
 
-    fn get_ticks(
+    async fn get_ticks(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<lean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_ticks(request)
+        provider.get_ticks(request).await
     }
 
-    fn get_option_eod_bars(
+    async fn get_option_eod_bars(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_storage::OptionEodBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_option_eod_bars(ticker, date)
+        provider.get_option_eod_bars(ticker, date).await
     }
 
-    fn get_option_universe(
+    async fn get_option_universe(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_storage::OptionUniverseRow>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_option_universe(ticker, date)
+        provider.get_option_universe(ticker, date).await
     }
 
-    fn get_option_trade_bars(
+    async fn get_option_trade_bars(
         &self,
         ticker: &str,
         resolution: lean_core::Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_option_trade_bars(ticker, resolution, date)
+        provider
+            .get_option_trade_bars(ticker, resolution, date)
+            .await
     }
 
-    fn get_option_quote_bars(
+    async fn get_option_quote_bars(
         &self,
         ticker: &str,
         resolution: lean_core::Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_option_quote_bars(ticker, resolution, date)
+        provider
+            .get_option_quote_bars(ticker, resolution, date)
+            .await
     }
 
-    fn get_option_ticks(
+    async fn get_option_ticks(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
-        provider.get_option_ticks(ticker, date)
+        provider.get_option_ticks(ticker, date).await
     }
 
     fn earliest_date(&self) -> Option<chrono::NaiveDate> {

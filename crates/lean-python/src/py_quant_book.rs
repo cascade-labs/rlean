@@ -29,10 +29,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use tracing::warn;
 
-use lean_core::{DateTime, Market, Resolution, Symbol};
+use lean_core::{DateTime, Market, Resolution, Symbol, TickType};
 use lean_data::TradeBar;
 use lean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi, Sma};
-use lean_storage::{DataPath, ParquetReader, QueryParams};
+use lean_storage::{ParquetReader, PathResolver, QueryParams};
 
 use crate::py_types::{PyResolution, PySecurity, PySymbol};
 
@@ -112,13 +112,12 @@ impl PyQuantBook {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Vec<TradeBar> {
-        // Collect candidate paths.
+        let resolver = PathResolver::new(&self.data_folder);
         let paths: Vec<PathBuf> = if resolution.is_high_resolution() {
-            // Date-partitioned: one file per date.
             let mut ps = Vec::new();
             let mut d = start;
             while d <= end {
-                let p = DataPath::trade_bar(&self.data_folder, symbol, resolution, d).to_path();
+                let p = resolver.market_data_partition(symbol, resolution, TickType::Trade, d);
                 if p.exists() {
                     ps.push(p);
                 }
@@ -126,8 +125,7 @@ impl PyQuantBook {
             }
             ps
         } else {
-            // Single file for the whole range.
-            let p = DataPath::trade_bar(&self.data_folder, symbol, resolution, start).to_path();
+            let p = resolver.market_data_partition(symbol, resolution, TickType::Trade, start);
             if p.exists() {
                 vec![p]
             } else {
@@ -158,10 +156,17 @@ impl PyQuantBook {
             .build()
             .map(|rt| {
                 rt.block_on(async move {
-                    reader
-                        .read_trade_bars(&paths, symbol_clone, &params)
-                        .await
-                        .unwrap_or_default()
+                    let mut bars = Vec::new();
+                    for path in paths {
+                        bars.extend(
+                            reader
+                                .read_trade_bar_partition(&path, &symbol_clone, &params)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|bar| bar.symbol.id.sid == symbol_clone.id.sid),
+                        );
+                    }
+                    bars
                 })
             })
             .unwrap_or_default()

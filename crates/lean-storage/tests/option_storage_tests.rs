@@ -4,21 +4,16 @@
 /// unit tests (found in Lean/Tests/Common/Data/LeanDataTests.cs) translated
 /// to Rust, plus round-trip Parquet write/read tests.
 use chrono::NaiveDate;
-use lean_core::{Market, Resolution, Symbol};
+use lean_core::{Resolution, TickType};
 use lean_storage::{
-    path_resolver::{DataPath, PathResolver},
     schema::{OptionEodBar, OptionUniverseRow},
-    ParquetReader, ParquetWriter, WriterConfig,
+    ParquetReader, ParquetWriter, PathResolver, WriterConfig,
 };
 use rust_decimal_macros::dec;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
-
-fn spy_equity() -> Symbol {
-    Symbol::create_equity("SPY", &Market::usa())
-}
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -58,119 +53,46 @@ fn sample_universe_row(underlying: &str, osi: &str, expiry: NaiveDate) -> Option
 
 // ─── Path generation tests ───────────────────────────────────────────────────
 
-/// Date-partitioned daily option path — one file per date per underlying:
-///   option/usa/daily/spy/20210430_trade.parquet
+/// Date-partitioned daily option path — one file per date for all underlyings:
+///   option/usa/daily/trade/date=2021-04-30/data.parquet
 #[test]
-fn test_option_daily_path() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
-    let path = dp.to_path();
+fn test_option_daily_trade_partition_path() {
+    let pr = PathResolver::new("/data");
+    let path = pr.option_partition(Resolution::Daily, TickType::Trade, date(2021, 4, 30));
 
     assert_eq!(
         path,
-        PathBuf::from("/data/option/usa/daily/spy/20210430_trade.parquet"),
-        "daily option EOD path mismatch"
+        PathBuf::from("/data/option/usa/daily/trade/date=2021-04-30/data.parquet"),
+        "daily option trade partition path mismatch"
     );
 }
 
 /// Minute resolution option path:
-///   option/usa/minute/spy/20210430_trade.parquet
+///   option/usa/minute/trade/date=2021-04-30/data.parquet
 #[test]
-fn test_option_minute_path() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Minute, date(2021, 4, 30));
-    let path = dp.to_path();
+fn test_option_minute_trade_partition_path() {
+    let pr = PathResolver::new("/data");
+    let path = pr.option_partition(Resolution::Minute, TickType::Trade, date(2021, 4, 30));
 
     assert_eq!(
         path,
-        PathBuf::from("/data/option/usa/minute/spy/20210430_trade.parquet"),
-        "minute option EOD path mismatch"
+        PathBuf::from("/data/option/usa/minute/trade/date=2021-04-30/data.parquet"),
+        "minute option trade partition path mismatch"
     );
 }
 
 /// Universe path:
-///   option/usa/universes/spy/20210101_universe.parquet
+///   option/usa/daily/universe/date=2021-01-01/data.parquet
 #[test]
-fn test_option_universe_path() {
-    let spy = spy_equity();
-    let dp = DataPath::option_universe("/data", &spy, date(2021, 1, 1));
-    let path = dp.to_path();
+fn test_option_universe_partition_path() {
+    let pr = PathResolver::new("/data");
+    let path = pr.option_universe_partition(date(2021, 1, 1));
 
     assert_eq!(
         path,
-        PathBuf::from("/data/option/usa/universes/spy/20210101_universe.parquet"),
-        "option universe path mismatch"
+        PathBuf::from("/data/option/usa/daily/universe/date=2021-01-01/data.parquet"),
+        "option universe partition path mismatch"
     );
-}
-
-/// The underlying ticker drives the subdirectory; the date drives the filename.
-#[test]
-fn test_option_path_uses_underlying_not_osi() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
-    let path_str = dp.to_path().to_string_lossy().to_lowercase();
-    assert!(
-        path_str.contains("/spy/"),
-        "path should contain spy subdirectory: {path_str}"
-    );
-    assert!(
-        path_str.contains("20210430_trade.parquet"),
-        "daily path should contain date-prefixed filename: {path_str}"
-    );
-}
-
-/// dir() should give the ticker subdirectory (date-partitioned layout).
-#[test]
-fn test_option_dir() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
-    assert_eq!(dp.dir(), PathBuf::from("/data/option/usa/daily/spy"));
-}
-
-/// glob_all_dates for daily option bars — all dates under ticker subdirectory.
-#[test]
-fn test_option_glob_all_dates_daily() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30));
-    let glob = dp.glob_all_dates();
-    assert_eq!(glob, "/data/option/usa/daily/spy/*_trade.parquet");
-}
-
-/// glob_all_dates for minute option bars.
-#[test]
-fn test_option_glob_all_dates_minute() {
-    let spy = spy_equity();
-    let dp = DataPath::option_eod_bar("/data", &spy, Resolution::Minute, date(2021, 4, 30));
-    let glob = dp.glob_all_dates();
-    assert_eq!(glob, "/data/option/usa/minute/spy/*_trade.parquet");
-}
-
-/// glob_all_dates for universe files.
-#[test]
-fn test_option_universe_glob() {
-    let spy = spy_equity();
-    let dp = DataPath::option_universe("/data", &spy, date(2021, 1, 1));
-    let glob = dp.glob_all_dates();
-    assert_eq!(glob, "/data/option/usa/universes/spy/*_universe.parquet");
-}
-
-/// PathResolver convenience methods produce the same results as DataPath static methods.
-#[test]
-fn test_path_resolver_option_methods() {
-    let spy = spy_equity();
-    let pr = PathResolver::new("/data");
-
-    let via_resolver = pr
-        .option_eod_bar(&spy, Resolution::Daily, date(2021, 4, 30))
-        .to_path();
-    let via_static =
-        DataPath::option_eod_bar("/data", &spy, Resolution::Daily, date(2021, 4, 30)).to_path();
-
-    assert_eq!(via_resolver, via_static);
-
-    let univ_resolver = pr.option_universe(&spy, date(2021, 1, 1)).to_path();
-    let univ_static = DataPath::option_universe("/data", &spy, date(2021, 1, 1)).to_path();
-    assert_eq!(univ_resolver, univ_static);
 }
 
 // ─── Parquet round-trip tests ─────────────────────────────────────────────────
@@ -180,7 +102,7 @@ fn test_path_resolver_option_methods() {
 #[test]
 fn test_option_eod_bar_round_trip() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("spy_trade.parquet");
+    let path = tmp.path().join("option_eod_roundtrip.parquet");
 
     let expiry = date(2021, 4, 30);
     let bars = vec![
@@ -238,7 +160,7 @@ fn test_option_eod_bar_round_trip() {
 #[test]
 fn test_option_universe_round_trip() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("20210101_universe.parquet");
+    let path = tmp.path().join("option_universe_roundtrip.parquet");
 
     let expiry = date(2021, 4, 16);
     let rows = vec![
@@ -271,33 +193,6 @@ fn test_option_universe_round_trip() {
 
     let call = roundtrip.iter().find(|r| r.right == "C").unwrap();
     assert_eq!(call.strike, dec!(400.00));
-}
-
-/// Verify that writing via DataPath helper produces a file at the expected location.
-#[test]
-fn test_write_option_eod_bars_at_data_path() {
-    let tmp = TempDir::new().unwrap();
-    let spy = spy_equity();
-
-    let dp = DataPath::option_eod_bar(tmp.path(), &spy, Resolution::Daily, date(2021, 4, 30));
-    let expected_path = tmp
-        .path()
-        .join("option/usa/daily/spy/20210430_trade.parquet");
-
-    let bars = vec![sample_eod_bar(
-        "SPY",
-        "SPY210430P00480000",
-        date(2021, 4, 30),
-        "P",
-    )];
-    let writer = ParquetWriter::new(WriterConfig::default());
-    writer.write_option_eod_bars_at(&bars, &dp).unwrap();
-
-    assert!(
-        expected_path.exists(),
-        "file should be at {}",
-        expected_path.display()
-    );
 }
 
 /// Writing an empty slice should be a no-op (no file created).

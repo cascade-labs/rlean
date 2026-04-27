@@ -1356,6 +1356,37 @@ impl SliceProxy {
         Ok(())
     }
 
+    /// Drop proxy cells and ticker aliases for symbols no longer present in
+    /// the algorithm's active SubscriptionManager snapshot.
+    pub fn retain_subscriptions(
+        &mut self,
+        py: Python<'_>,
+        subscriptions: &[Arc<SubscriptionDataConfig>],
+    ) {
+        let active_sids: std::collections::HashSet<u64> =
+            subscriptions.iter().map(|sub| sub.symbol.id.sid).collect();
+
+        self.bar_cells.retain(|sid, _| active_sids.contains(sid));
+        self.quote_bar_cells
+            .retain(|sid, _| active_sids.contains(sid));
+
+        {
+            let mut bars_obj = self.bars_cell.borrow_mut(py);
+            bars_obj.bars.retain(|sid, _| active_sids.contains(sid));
+            bars_obj
+                .ticker_to_sid
+                .retain(|_, sid| active_sids.contains(sid));
+        }
+
+        {
+            let mut qbars_obj = self.quote_bars_cell.borrow_mut(py);
+            qbars_obj.bars.retain(|sid, _| active_sids.contains(sid));
+            qbars_obj
+                .ticker_to_sid
+                .retain(|_, sid| active_sids.contains(sid));
+        }
+    }
+
     /// Write new bar values in-place.  Zero allocation; ~5 f64 writes + 2 string
     /// formats per symbol.  Must be called with the GIL held and no active Python
     /// borrows on the bar objects (guaranteed safe between `on_data` calls).
@@ -1522,7 +1553,7 @@ impl SliceProxy {
 mod tests {
     use super::*;
     use crate::py_qc_algorithm::pascal_to_snake;
-    use lean_core::{Market, Symbol};
+    use lean_core::{Market, Resolution, Symbol};
 
     fn make_trade_bar() -> PyTradeBar {
         PyTradeBar {
@@ -1547,6 +1578,38 @@ mod tests {
             (bar.value() - bar.close).abs() < 1e-9,
             "bar.value must equal bar.close"
         );
+    }
+
+    #[test]
+    fn slice_proxy_retain_subscriptions_removes_stale_cells_and_aliases() {
+        Python::attach(|py| {
+            let market = Market::usa();
+            let spy = Symbol::create_equity("SPY", &market);
+            let qqq = Symbol::create_equity("QQQ", &market);
+            let spy_sub = Arc::new(SubscriptionDataConfig::new_equity(spy, Resolution::Minute));
+            let qqq_sub = Arc::new(SubscriptionDataConfig::new_equity(qqq, Resolution::Minute));
+            let mut proxy =
+                SliceProxy::new(py, &[spy_sub.clone(), qqq_sub.clone()]).expect("proxy");
+
+            proxy.retain_subscriptions(py, std::slice::from_ref(&spy_sub));
+
+            assert!(proxy.bar_cells.contains_key(&spy_sub.symbol.id.sid));
+            assert!(!proxy.bar_cells.contains_key(&qqq_sub.symbol.id.sid));
+            assert!(proxy.quote_bar_cells.contains_key(&spy_sub.symbol.id.sid));
+            assert!(!proxy.quote_bar_cells.contains_key(&qqq_sub.symbol.id.sid));
+
+            let bars = proxy.bars_cell.borrow(py);
+            assert_eq!(bars.ticker_to_sid.get("SPY"), Some(&spy_sub.symbol.id.sid));
+            assert!(!bars.ticker_to_sid.contains_key("QQQ"));
+            drop(bars);
+
+            let quote_bars = proxy.quote_bars_cell.borrow(py);
+            assert_eq!(
+                quote_bars.ticker_to_sid.get("SPY"),
+                Some(&spy_sub.symbol.id.sid)
+            );
+            assert!(!quote_bars.ticker_to_sid.contains_key("QQQ"));
+        });
     }
 
     /// All TradeBar PascalCase names must convert to valid snake_case properties

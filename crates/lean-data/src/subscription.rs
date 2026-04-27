@@ -1,7 +1,7 @@
 use lean_core::{DataNormalizationMode, Resolution, Symbol, TickType};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// All configuration needed to subscribe to a data stream.
@@ -79,7 +79,13 @@ impl SubscriptionDataConfig {
 /// Manages the set of active subscriptions.
 #[derive(Debug, Default)]
 pub struct SubscriptionManager {
-    subscriptions: RwLock<HashMap<u64, Arc<SubscriptionDataConfig>>>,
+    state: RwLock<SubscriptionState>,
+}
+
+#[derive(Debug, Default)]
+struct SubscriptionState {
+    subscriptions: HashMap<u64, Arc<SubscriptionDataConfig>>,
+    order: Vec<u64>,
 }
 
 impl SubscriptionManager {
@@ -90,25 +96,102 @@ impl SubscriptionManager {
     pub fn add(&self, config: SubscriptionDataConfig) -> Arc<SubscriptionDataConfig> {
         let id = config.unique_id();
         let config = Arc::new(config);
-        self.subscriptions.write().insert(id, config.clone());
+        let mut state = self.state.write();
+        if !state.subscriptions.contains_key(&id) {
+            state.order.push(id);
+        }
+        state.subscriptions.insert(id, config.clone());
         config
     }
 
     pub fn remove(&self, config: &SubscriptionDataConfig) {
-        self.subscriptions.write().remove(&config.unique_id());
+        let id = config.unique_id();
+        let mut state = self.state.write();
+        state.subscriptions.remove(&id);
+        state.order.retain(|existing_id| *existing_id != id);
     }
 
     pub fn remove_symbol(&self, symbol: &Symbol) {
-        self.subscriptions
-            .write()
+        let mut state = self.state.write();
+        state
+            .subscriptions
             .retain(|_, config| config.symbol.id.sid != symbol.id.sid);
+        let active_ids: HashSet<_> = state.subscriptions.keys().copied().collect();
+        state.order.retain(|id| active_ids.contains(id));
     }
 
     pub fn get_all(&self) -> Vec<Arc<SubscriptionDataConfig>> {
-        self.subscriptions.read().values().cloned().collect()
+        let state = self.state.read();
+        state
+            .order
+            .iter()
+            .filter_map(|id| state.subscriptions.get(id).cloned())
+            .collect()
     }
 
     pub fn count(&self) -> usize {
-        self.subscriptions.read().len()
+        self.state.read().subscriptions.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SubscriptionDataConfig, SubscriptionManager};
+    use lean_core::{Market, Resolution, Symbol};
+
+    fn equity_config(ticker: &str) -> SubscriptionDataConfig {
+        SubscriptionDataConfig::new_equity(
+            Symbol::create_equity(ticker, &Market::new(Market::USA)),
+            Resolution::Minute,
+        )
+    }
+
+    #[test]
+    fn get_all_preserves_subscription_insertion_order() {
+        let manager = SubscriptionManager::new();
+
+        manager.add(equity_config("SPY"));
+        manager.add(equity_config("XLK"));
+        manager.add(equity_config("XLF"));
+
+        let symbols: Vec<_> = manager
+            .get_all()
+            .iter()
+            .map(|config| config.symbol.value.clone())
+            .collect();
+        assert_eq!(symbols, vec!["SPY", "XLK", "XLF"]);
+    }
+
+    #[test]
+    fn removed_subscription_is_removed_from_order() {
+        let manager = SubscriptionManager::new();
+        let spy = manager.add(equity_config("SPY"));
+        manager.add(equity_config("XLK"));
+        manager.add(equity_config("XLF"));
+
+        manager.remove(&spy);
+
+        let symbols: Vec<_> = manager
+            .get_all()
+            .iter()
+            .map(|config| config.symbol.value.clone())
+            .collect();
+        assert_eq!(symbols, vec!["XLK", "XLF"]);
+    }
+
+    #[test]
+    fn readded_subscription_moves_to_end_after_removal() {
+        let manager = SubscriptionManager::new();
+        let spy = manager.add(equity_config("SPY"));
+        manager.add(equity_config("XLK"));
+        manager.remove(&spy);
+        manager.add(equity_config("SPY"));
+
+        let symbols: Vec<_> = manager
+            .get_all()
+            .iter()
+            .map(|config| config.symbol.value.clone())
+            .collect();
+        assert_eq!(symbols, vec!["XLK", "SPY"]);
     }
 }

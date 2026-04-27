@@ -182,14 +182,15 @@ impl QcAlgorithm {
     pub fn add_equity(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
         let market = Market::usa();
         let symbol = Symbol::create_equity(ticker, &market);
+        self.add_equity_subscriptions(symbol.clone(), resolution);
+
         // Idempotent: if the security already exists (e.g. called again during
         // universe rebalancing), keep it as-is so the runner-updated price is
         // not reset to zero.
         if self.securities.contains(&symbol) {
             return symbol;
         }
-        let config = SubscriptionDataConfig::new_equity(symbol.clone(), resolution);
-        self.subscription_manager.add(config);
+
         let hours = ExchangeHours::us_equity();
         let props = SymbolProperties::default();
         self.securities.add(crate::securities::Security::new(
@@ -199,6 +200,19 @@ impl QcAlgorithm {
             hours,
         ));
         symbol
+    }
+
+    fn add_equity_subscriptions(&self, symbol: Symbol, resolution: Resolution) {
+        self.subscription_manager
+            .add(SubscriptionDataConfig::new_equity(
+                symbol.clone(),
+                resolution,
+            ));
+        if resolution != Resolution::Hour && resolution != Resolution::Daily {
+            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            quote_config.tick_type = lean_core::TickType::Quote;
+            self.subscription_manager.add(quote_config);
+        }
     }
 
     pub fn add_forex(&mut self, ticker: &str, resolution: Resolution) -> Symbol {

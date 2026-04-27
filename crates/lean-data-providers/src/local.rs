@@ -5,7 +5,7 @@
 use chrono::{Datelike, NaiveDate};
 use lean_core::{
     exchange_hours::ExchangeHours, Market, OptionRight, OptionStyle, Resolution, SecurityType,
-    Symbol, SymbolOptionsExt,
+    Symbol, SymbolOptionsExt, TickType,
 };
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{ParquetReader, PathResolver, QueryParams};
@@ -13,6 +13,7 @@ use std::collections::HashSet;
 
 use crate::request::HistoryRequest;
 use crate::traits::IHistoryProvider;
+use async_trait::async_trait;
 
 pub struct LocalHistoryProvider {
     pub(crate) data_root: std::path::PathBuf,
@@ -26,8 +27,9 @@ impl LocalHistoryProvider {
     }
 }
 
+#[async_trait]
 impl IHistoryProvider for LocalHistoryProvider {
-    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+    async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
         use crate::request::DataType;
         // LocalHistoryProvider only serves trade bars from disk.
         // Any other DataType (FactorFile, etc.) must go to a remote provider.
@@ -44,107 +46,14 @@ impl IHistoryProvider for LocalHistoryProvider {
 
         let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
 
-        let paths: Vec<std::path::PathBuf> = if request.resolution.is_high_resolution() {
-            let mut v = Vec::new();
-            for current in &expected_dates {
-                let dp = resolver.trade_bar(&request.symbol, request.resolution, *current);
-                let p = dp.to_path();
-                if p.exists() {
-                    v.push(p);
-                } else {
-                    return Ok(vec![]);
-                }
-            }
-            v
-        } else {
-            let dp = resolver.trade_bar(&request.symbol, request.resolution, start_date);
-            let p = dp.to_path();
-            if p.exists() {
-                vec![p]
-            } else {
-                vec![]
-            }
-        };
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // ParquetReader::read_trade_bars is async; run it on a current-thread
-        // runtime since get_history is called from spawn_blocking (no outer
-        // runtime context is active on this thread).
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build local runtime: {e}"))?;
-
-        let reader = ParquetReader::new();
-        let params = QueryParams::new().with_time_range(request.start, request.end);
-        let symbol = request.symbol.clone();
-
-        let bars = rt
-            .block_on(reader.read_trade_bars(&paths, symbol, &params))
-            .unwrap_or_default();
-
-        if !local_bars_cover_expected_dates(&bars, &expected_dates) {
-            return Ok(vec![]);
-        }
-
-        Ok(bars)
-    }
-
-    fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-
-        let paths: Vec<std::path::PathBuf> = if request.resolution.is_high_resolution() {
-            let mut v = Vec::new();
-            for current in &expected_dates {
-                let p = resolver
-                    .quote_bar(&request.symbol, request.resolution, *current)
-                    .to_path();
-                if p.exists() {
-                    v.push(p);
-                } else {
-                    return Ok(vec![]);
-                }
-            }
-            v
-        } else {
-            let p = resolver
-                .quote_bar(&request.symbol, request.resolution, start_date)
-                .to_path();
-            if p.exists() {
-                vec![p]
-            } else {
-                vec![]
-            }
-        };
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let reader = ParquetReader::new();
-        let params = QueryParams::new().with_time_range(request.start, request.end);
-        let bars = reader.read_quote_bars(&paths, request.symbol.clone(), &params)?;
-        if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
-            return Ok(vec![]);
-        }
-        Ok(bars)
-    }
-
-    fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-
         let mut paths = Vec::new();
         for current in &expected_dates {
-            let p = resolver.tick(&request.symbol, *current).to_path();
+            let p = resolver.market_data_partition(
+                &request.symbol,
+                request.resolution,
+                TickType::Trade,
+                *current,
+            );
             if p.exists() {
                 paths.push(p);
             } else {
@@ -157,39 +66,126 @@ impl IHistoryProvider for LocalHistoryProvider {
         }
 
         let reader = ParquetReader::new();
-        let params = QueryParams::new().with_time_range(request.start, request.end);
-        let ticks = reader.read_ticks(&paths, request.symbol.clone(), &params)?;
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        let symbol = request.symbol.clone();
+
+        let mut bars = Vec::new();
+        for path in &paths {
+            bars.extend(
+                reader
+                    .read_trade_bar_partition(path, &symbol, &params)
+                    .unwrap_or_default(),
+            );
+        }
+
+        if !local_bars_cover_expected_dates(&bars, &expected_dates) {
+            return Ok(vec![]);
+        }
+
+        Ok(bars)
+    }
+
+    async fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
+        let resolver = PathResolver::new(&self.data_root);
+        let start_date = request.start.date_utc();
+        let end_date = request.end.date_utc();
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+
+        let mut paths = Vec::new();
+        for current in &expected_dates {
+            let p = resolver.market_data_partition(
+                &request.symbol,
+                request.resolution,
+                TickType::Quote,
+                *current,
+            );
+            if p.exists() {
+                paths.push(p);
+            } else {
+                return Ok(vec![]);
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let reader = ParquetReader::new();
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        let mut bars = Vec::new();
+        for path in &paths {
+            bars.extend(reader.read_quote_bar_partition(path, &request.symbol, &params)?);
+        }
+        if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
+            return Ok(vec![]);
+        }
+        Ok(bars)
+    }
+
+    async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+        let resolver = PathResolver::new(&self.data_root);
+        let start_date = request.start.date_utc();
+        let end_date = request.end.date_utc();
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+
+        let mut paths = Vec::new();
+        for current in &expected_dates {
+            let p = resolver.market_data_partition(
+                &request.symbol,
+                Resolution::Tick,
+                TickType::Trade,
+                *current,
+            );
+            if p.exists() {
+                paths.push(p);
+            } else {
+                return Ok(vec![]);
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let reader = ParquetReader::new();
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        let mut ticks = Vec::new();
+        for path in &paths {
+            ticks.extend(reader.read_tick_partition(path, &request.symbol, &params)?);
+        }
         if !local_ticks_cover_expected_dates(&ticks, &expected_dates) {
             return Ok(vec![]);
         }
         Ok(ticks)
     }
 
-    fn get_option_universe(
+    async fn get_option_universe(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_storage::OptionUniverseRow>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = resolver.option_universe(&underlying, date).to_path();
+        let path = option_partition_path(&self.data_root, Resolution::Daily, "universe", date);
         if !path.exists() {
             return Ok(vec![]);
         }
-        Ok(ParquetReader::new().read_option_universe(&[path])?)
+        Ok(ParquetReader::new()
+            .read_option_universe(&[path])?
+            .into_iter()
+            .filter(|row| row.underlying.eq_ignore_ascii_case(ticker))
+            .collect())
     }
 
-    fn get_option_trade_bars(
+    async fn get_option_trade_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<TradeBar>> {
         let resolver = PathResolver::new(&self.data_root);
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = resolver
-            .option_trade_bar(&underlying, resolution, date)
-            .to_path();
+        let path = option_partition_path(&self.data_root, resolution, "trade", date);
         if !path.exists() {
             return Ok(vec![]);
         }
@@ -207,17 +203,14 @@ impl IHistoryProvider for LocalHistoryProvider {
         )?)
     }
 
-    fn get_option_quote_bars(
+    async fn get_option_quote_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
         let resolver = PathResolver::new(&self.data_root);
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = resolver
-            .option_quote_bar(&underlying, resolution, date)
-            .to_path();
+        let path = option_partition_path(&self.data_root, resolution, "quote", date);
         if !path.exists() {
             return Ok(vec![]);
         }
@@ -235,10 +228,13 @@ impl IHistoryProvider for LocalHistoryProvider {
         )?)
     }
 
-    fn get_option_ticks(&self, ticker: &str, date: chrono::NaiveDate) -> anyhow::Result<Vec<Tick>> {
+    async fn get_option_ticks(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<Tick>> {
         let resolver = PathResolver::new(&self.data_root);
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = resolver.option_tick(&underlying, date).to_path();
+        let path = option_partition_path(&self.data_root, Resolution::Tick, "tick", date);
         if !path.exists() {
             return Ok(vec![]);
         }
@@ -307,12 +303,16 @@ fn load_option_symbols(
     date: chrono::NaiveDate,
 ) -> anyhow::Result<std::collections::HashMap<String, Symbol>> {
     let underlying = Symbol::create_equity(ticker, &Market::usa());
-    let universe_path = resolver.option_universe(&underlying, date).to_path();
+    let universe_path =
+        option_partition_path(&resolver.data_root, Resolution::Daily, "universe", date);
     if !universe_path.exists() {
         return Ok(std::collections::HashMap::new());
     }
 
-    let universe_rows = ParquetReader::new().read_option_universe(&[universe_path])?;
+    let universe_rows = ParquetReader::new()
+        .read_option_universe(&[universe_path])?
+        .into_iter()
+        .filter(|row| row.underlying.eq_ignore_ascii_case(ticker));
     let mut out = std::collections::HashMap::new();
     for row in universe_rows {
         let right = match row.right.to_ascii_uppercase().as_str() {
@@ -331,6 +331,21 @@ fn load_option_symbols(
         out.insert(row.symbol_value, sym);
     }
     Ok(out)
+}
+
+fn option_partition_path(
+    data_root: &std::path::Path,
+    resolution: Resolution,
+    tick_type: &str,
+    date: chrono::NaiveDate,
+) -> std::path::PathBuf {
+    data_root
+        .join("option")
+        .join("usa")
+        .join(resolution.folder_name())
+        .join(tick_type)
+        .join(format!("date={date}"))
+        .join("data.parquet")
 }
 
 fn day_params(date: chrono::NaiveDate, resolution: Resolution) -> QueryParams {

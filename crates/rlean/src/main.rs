@@ -619,16 +619,10 @@ impl IHistoricalDataProvider for HistoryProviderAdapter {
             end,
             data_type: lean_data_providers::DataType::TradeBar,
         };
-        // IHistoryProvider::get_history is synchronous so that plugins (cdylibs
-        // with their own tokio copy) can block internally without conflicting
-        // with the host runtime's thread-locals.  We bridge to async here using
-        // spawn_blocking so the tokio scheduler is not blocked.
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || provider.get_history(&request))
+            provider
+                .get_history(&request)
                 .await
-                .map_err(|e| {
-                    lean_core::LeanError::DataError(format!("provider task panicked: {e}"))
-                })?
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
         })
     }

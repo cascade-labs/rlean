@@ -7,6 +7,7 @@
 /// and is returned immediately.
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lean_core::Resolution;
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{OptionEodBar, OptionUniverseRow};
@@ -37,10 +38,11 @@ impl StackedHistoryProvider {
     }
 }
 
+#[async_trait]
 impl IHistoryProvider for StackedHistoryProvider {
-    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+    async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
         for provider in &self.providers {
-            match provider.get_history(request) {
+            match provider.get_history(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -50,9 +52,9 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
+    async fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
         for provider in &self.providers {
-            match provider.get_quote_bars(request) {
+            match provider.get_quote_bars(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -62,9 +64,9 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+    async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
         for provider in &self.providers {
-            match provider.get_ticks(request) {
+            match provider.get_ticks(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -74,13 +76,13 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_option_eod_bars(
+    async fn get_option_eod_bars(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionEodBar>> {
         for provider in &self.providers {
-            match provider.get_option_eod_bars(ticker, date) {
+            match provider.get_option_eod_bars(ticker, date).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -90,13 +92,13 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_option_universe(
+    async fn get_option_universe(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
         for provider in &self.providers {
-            match provider.get_option_universe(ticker, date) {
+            match provider.get_option_universe(ticker, date).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -106,14 +108,17 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_option_trade_bars(
+    async fn get_option_trade_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<TradeBar>> {
         for provider in &self.providers {
-            match provider.get_option_trade_bars(ticker, resolution, date) {
+            match provider
+                .get_option_trade_bars(ticker, resolution, date)
+                .await
+            {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -123,14 +128,17 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_option_quote_bars(
+    async fn get_option_quote_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
         for provider in &self.providers {
-            match provider.get_option_quote_bars(ticker, resolution, date) {
+            match provider
+                .get_option_quote_bars(ticker, resolution, date)
+                .await
+            {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -140,9 +148,13 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    fn get_option_ticks(&self, ticker: &str, date: chrono::NaiveDate) -> anyhow::Result<Vec<Tick>> {
+    async fn get_option_ticks(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<Tick>> {
         for provider in &self.providers {
-            match provider.get_option_ticks(ticker, date) {
+            match provider.get_option_ticks(ticker, date).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,

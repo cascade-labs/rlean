@@ -226,7 +226,7 @@ mod provider_tests {
 
     use chrono::{NaiveDate, TimeZone, Utc};
     use lean_core::{
-        Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TimeSpan,
+        Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TickType, TimeSpan,
     };
     use lean_data::{TradeBar, TradeBarData};
     use lean_storage::{OptionEodBar, ParquetWriter, PathResolver, WriterConfig};
@@ -286,16 +286,18 @@ mod provider_tests {
 
     fn write_daily_bars(root: &std::path::Path, bars: &[TradeBar]) {
         let resolver = PathResolver::new(root);
-        let path = resolver
-            .trade_bar(
-                &make_symbol(),
+        let writer = ParquetWriter::new(WriterConfig::default());
+        for bar in bars {
+            let path = resolver.market_data_partition(
+                &bar.symbol,
                 Resolution::Daily,
-                NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-            )
-            .to_path();
-        ParquetWriter::new(WriterConfig::default())
-            .write_trade_bars(bars, &path)
-            .unwrap();
+                TickType::Trade,
+                bar.time.date_utc(),
+            );
+            writer
+                .merge_trade_bar_partition(std::slice::from_ref(bar), &path)
+                .unwrap();
+        }
     }
 
     // ── ProviderConfig ────────────────────────────────────────────────────────
@@ -315,15 +317,16 @@ mod provider_tests {
         earliest: Option<NaiveDate>,
     }
 
+    #[async_trait::async_trait]
     impl IHistoryProvider for MockOptionProvider {
-        fn get_history(
+        async fn get_history(
             &self,
             _request: &HistoryRequest,
         ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
             Ok(vec![])
         }
 
-        fn get_option_eod_bars(
+        async fn get_option_eod_bars(
             &self,
             _ticker: &str,
             _date: NaiveDate,
@@ -356,8 +359,8 @@ mod provider_tests {
         }
     }
 
-    #[test]
-    fn stacked_provider_forwards_option_eod_requests() {
+    #[tokio::test]
+    async fn stacked_provider_forwards_option_eod_requests() {
         let provider = StackedHistoryProvider::new(vec![Arc::new(MockOptionProvider {
             option_rows: vec![sample_option_row()],
             earliest: Some(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap()),
@@ -365,6 +368,7 @@ mod provider_tests {
 
         let rows = provider
             .get_option_eod_bars("TLT", NaiveDate::from_ymd_opt(2026, 4, 17).unwrap())
+            .await
             .unwrap();
 
         assert_eq!(rows.len(), 1);
@@ -404,13 +408,13 @@ mod provider_tests {
 
     // ── LocalHistoryProvider — no data file ───────────────────────────────────
 
-    #[test]
-    fn local_provider_returns_empty_when_no_file() {
+    #[tokio::test]
+    async fn local_provider_returns_empty_when_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let provider = LocalHistoryProvider::new(dir.path());
 
         let request = make_history_request();
-        let bars = provider.get_history(&request).unwrap();
+        let bars = provider.get_history(&request).await.unwrap();
 
         assert!(
             bars.is_empty(),
@@ -419,8 +423,8 @@ mod provider_tests {
         );
     }
 
-    #[test]
-    fn local_provider_returns_empty_for_partial_daily_coverage() {
+    #[tokio::test]
+    async fn local_provider_returns_empty_for_partial_daily_coverage() {
         let dir = tempfile::tempdir().unwrap();
         let provider = LocalHistoryProvider::new(dir.path());
         write_daily_bars(
@@ -435,7 +439,7 @@ mod provider_tests {
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
         );
-        let bars = provider.get_history(&request).unwrap();
+        let bars = provider.get_history(&request).await.unwrap();
 
         assert!(
             bars.is_empty(),
@@ -443,8 +447,8 @@ mod provider_tests {
         );
     }
 
-    #[test]
-    fn local_provider_returns_data_for_complete_daily_coverage() {
+    #[tokio::test]
+    async fn local_provider_returns_data_for_complete_daily_coverage() {
         let dir = tempfile::tempdir().unwrap();
         let provider = LocalHistoryProvider::new(dir.path());
         write_daily_bars(
@@ -461,7 +465,7 @@ mod provider_tests {
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
         );
-        let bars = provider.get_history(&request).unwrap();
+        let bars = provider.get_history(&request).await.unwrap();
 
         assert_eq!(bars.len(), 4);
     }
@@ -479,12 +483,12 @@ mod provider_tests {
     // ── Unknown provider name (via providers module in rlean) — tested here
     //    by calling LocalHistoryProvider directly ───────────────────────────────
 
-    #[test]
-    fn local_provider_handles_non_existent_dir_gracefully() {
+    #[tokio::test]
+    async fn local_provider_handles_non_existent_dir_gracefully() {
         // A data root that doesn't exist should return empty rather than error.
         let provider = LocalHistoryProvider::new("/nonexistent/path/to/data");
         let request = make_history_request();
-        let result = provider.get_history(&request);
+        let result = provider.get_history(&request).await;
         // Either Ok(empty) or we accept errors — the key property is no panic.
         let _ = result; // result can be Ok([]) or Err — both are acceptable
     }

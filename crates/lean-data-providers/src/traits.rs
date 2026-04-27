@@ -3,40 +3,66 @@ use lean_core::Symbol;
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
 
-use crate::request::{DownloadRequest, HistoryRequest};
+use crate::request::{
+    DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,
+};
 
 /// Provides historical market data — Rust equivalent of C# `IHistoryProvider`.
 ///
 /// Implementors are expected to fetch data from a remote source (or local
 /// disk), write it to the Parquet store, and return the raw bars.
-///
-/// This trait is **synchronous** by design.  Plugins are loaded as cdylib
-/// dynamic libraries; each plugin links its own copy of tokio and cannot share
-/// runtime state (thread-locals) with the host binary.  Making the trait sync
-/// lets plugins block internally (e.g. via a `current_thread` runtime or
-/// `reqwest::blocking`) while the host adapts the call to async via
-/// `tokio::task::spawn_blocking`.
+#[async_trait]
 pub trait IHistoryProvider: Send + Sync {
     /// Fetch historical trade bars for the symbol described in `request`.
-    fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>>;
+    async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>>;
 
     /// Fetch historical quote bars for the symbol described in `request`.
-    fn get_quote_bars(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
+    async fn get_quote_bars(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
         Ok(vec![])
     }
 
     /// Fetch historical ticks for the symbol described in `request`.
-    fn get_ticks(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+    async fn get_ticks(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
         Ok(vec![])
+    }
+
+    /// Fetch/cache a multi-symbol batch. Providers with true batch APIs should
+    /// override this; the default keeps existing providers correct by fanning
+    /// out over the single-symbol async methods.
+    async fn get_history_batch(
+        &self,
+        request: &HistoryBatchRequest,
+    ) -> anyhow::Result<MarketDataBatch> {
+        let mut batch = MarketDataBatch::default();
+        for symbol in &request.symbols {
+            let single = HistoryRequest {
+                symbol: symbol.clone(),
+                resolution: request.resolution,
+                start: request.start,
+                end: request.end,
+                data_type: request.data_type,
+            };
+            match request.data_type {
+                DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
+                    batch.trade_bars.extend(self.get_history(&single).await?);
+                }
+                DataType::QuoteBar => {
+                    batch.quote_bars.extend(self.get_quote_bars(&single).await?);
+                }
+                DataType::Tick | DataType::OpenInterest => {
+                    batch.ticks.extend(self.get_ticks(&single).await?);
+                }
+            }
+        }
+        Ok(batch)
     }
 
     /// Fetch all option EOD bars for `ticker` on `date`.
     ///
     /// Returns an empty vec if this provider does not support option data.
     /// Providers that do (e.g. ThetaData) override this to fetch from their
-    /// source and cache locally.  The host runner calls this through
-    /// `tokio::task::spawn_blocking` since the trait is sync.
-    fn get_option_eod_bars(
+    /// source and cache locally.
+    async fn get_option_eod_bars(
         &self,
         _ticker: &str,
         _date: chrono::NaiveDate,
@@ -49,7 +75,7 @@ pub trait IHistoryProvider: Send + Sync {
     /// Returned rows identify which contracts existed for the underlying on the
     /// requested date. Intraday option minute/tick paths use this to reconstruct
     /// symbols and build chains without falling back to daily EOD snapshots.
-    fn get_option_universe(
+    async fn get_option_universe(
         &self,
         _ticker: &str,
         _date: chrono::NaiveDate,
@@ -58,7 +84,7 @@ pub trait IHistoryProvider: Send + Sync {
     }
 
     /// Fetch intraday option trade bars for all contracts of `ticker` on `date`.
-    fn get_option_trade_bars(
+    async fn get_option_trade_bars(
         &self,
         _ticker: &str,
         _resolution: lean_core::Resolution,
@@ -68,7 +94,7 @@ pub trait IHistoryProvider: Send + Sync {
     }
 
     /// Fetch intraday option quote bars for all contracts of `ticker` on `date`.
-    fn get_option_quote_bars(
+    async fn get_option_quote_bars(
         &self,
         _ticker: &str,
         _resolution: lean_core::Resolution,
@@ -78,7 +104,7 @@ pub trait IHistoryProvider: Send + Sync {
     }
 
     /// Fetch option ticks for all contracts of `ticker` on `date`.
-    fn get_option_ticks(
+    async fn get_option_ticks(
         &self,
         _ticker: &str,
         _date: chrono::NaiveDate,

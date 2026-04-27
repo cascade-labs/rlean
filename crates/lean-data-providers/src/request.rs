@@ -27,6 +27,25 @@ pub struct HistoryRequest {
     pub data_type: DataType,
 }
 
+/// A multi-symbol history request for providers that can fetch/cache symbols in
+/// batches. The framework groups subscriptions by date/resolution/tick type and
+/// can call this without changing provider-specific request semantics.
+#[derive(Debug, Clone)]
+pub struct HistoryBatchRequest {
+    pub symbols: Vec<Symbol>,
+    pub resolution: Resolution,
+    pub start: DateTime,
+    pub end: DateTime,
+    pub data_type: DataType,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MarketDataBatch {
+    pub trade_bars: Vec<lean_data::TradeBar>,
+    pub quote_bars: Vec<lean_data::QuoteBar>,
+    pub ticks: Vec<lean_data::Tick>,
+}
+
 /// A request to download data to the local store — mirrors C# `DataDownloaderGetParameters`.
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {

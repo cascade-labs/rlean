@@ -1,6 +1,7 @@
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
-use crate::{convert, path_resolver::DataPath, schema};
+use crate::{convert, schema};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use fs2::FileExt;
 use lean_core::Result as LeanResult;
 use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use parquet::{
@@ -8,7 +9,7 @@ use parquet::{
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
-use std::{fs, path::Path, sync::Arc};
+use std::{collections::HashSet, fs, path::Path, sync::Arc};
 use tracing::debug;
 
 /// Configuration for Parquet output.
@@ -140,6 +141,93 @@ impl ParquetWriter {
         Ok(())
     }
 
+    /// Merge trade bars into a daily all-symbol partition. Existing rows for
+    /// symbols present in `bars` are replaced; all other symbols are preserved.
+    pub fn merge_trade_bar_partition(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_symbols: HashSet<String> =
+            bars.iter().map(|bar| bar.symbol.value.clone()).collect();
+        if partition_has_all_trade_rows(path, bars)? {
+            return Ok(());
+        }
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_trade_bar_partition(path, &bars[0].symbol, &Default::default())?
+                .into_iter()
+                .filter(|bar| !replacement_symbols.contains(&bar.symbol.value))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(bars);
+        dedupe_trade_bars(&mut merged);
+        merged.sort_by_key(|bar| (bar.time.0, bar.symbol.value.clone()));
+        self.write_trade_bars_atomic(&merged, path)
+    }
+
+    /// Merge quote bars into a daily all-symbol partition. Existing rows for
+    /// symbols present in `bars` are replaced; all other symbols are preserved.
+    pub fn merge_quote_bar_partition(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_symbols: HashSet<String> =
+            bars.iter().map(|bar| bar.symbol.value.clone()).collect();
+        if partition_has_all_quote_rows(path, bars)? {
+            return Ok(());
+        }
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_quote_bar_partition(path, &bars[0].symbol, &Default::default())?
+                .into_iter()
+                .filter(|bar| !replacement_symbols.contains(&bar.symbol.value))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(bars);
+        dedupe_quote_bars(&mut merged);
+        merged.sort_by_key(|bar| (bar.time.0, bar.symbol.value.clone()));
+        self.write_quote_bars_atomic(&merged, path)
+    }
+
+    /// Merge ticks into a daily all-symbol partition. Existing rows for symbols
+    /// present in `ticks` are replaced; all other symbols are preserved.
+    pub fn merge_tick_partition(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
+        if ticks.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_symbols: HashSet<String> =
+            ticks.iter().map(|tick| tick.symbol.value.clone()).collect();
+        if partition_has_all_tick_rows(path, ticks)? {
+            return Ok(());
+        }
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_tick_partition(path, &ticks[0].symbol, &Default::default())?
+                .into_iter()
+                .filter(|tick| !replacement_symbols.contains(&tick.symbol.value))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(ticks);
+        dedupe_ticks(&mut merged);
+        merged.sort_by_key(|tick| (tick.time.0, tick.symbol.value.clone()));
+        self.write_ticks_atomic(&merged, path)
+    }
+
     /// Write option EOD bars to a parquet file at the given path.
     pub fn write_option_eod_bars(&self, rows: &[OptionEodBar], path: &Path) -> LeanResult<()> {
         if rows.is_empty() {
@@ -192,35 +280,6 @@ impl ParquetWriter {
             path.display()
         );
         Ok(())
-    }
-
-    /// Write using a `DataPath` (preferred — derives path from symbol/date/resolution).
-    pub fn write_trade_bars_at(&self, bars: &[TradeBar], data_path: &DataPath) -> LeanResult<()> {
-        self.write_trade_bars(bars, &data_path.to_path())
-    }
-
-    pub fn write_quote_bars_at(&self, bars: &[QuoteBar], data_path: &DataPath) -> LeanResult<()> {
-        self.write_quote_bars(bars, &data_path.to_path())
-    }
-
-    pub fn write_ticks_at(&self, ticks: &[Tick], data_path: &DataPath) -> LeanResult<()> {
-        self.write_ticks(ticks, &data_path.to_path())
-    }
-
-    pub fn write_option_eod_bars_at(
-        &self,
-        rows: &[OptionEodBar],
-        data_path: &DataPath,
-    ) -> LeanResult<()> {
-        self.write_option_eod_bars(rows, &data_path.to_path())
-    }
-
-    pub fn write_option_universe_at(
-        &self,
-        rows: &[OptionUniverseRow],
-        data_path: &DataPath,
-    ) -> LeanResult<()> {
-        self.write_option_universe(rows, &data_path.to_path())
     }
 
     /// Write factor file entries to a parquet file.
@@ -380,4 +439,136 @@ impl ParquetWriter {
         }
         Ok(())
     }
+
+    fn lock_partition(&self, path: &Path) -> LeanResult<PartitionLock> {
+        self.ensure_dir(path)?;
+        let lock_path = path.with_file_name(".data.parquet.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&lock_path)?;
+        file.lock_exclusive()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        Ok(PartitionLock { file })
+    }
+
+    fn write_trade_bars_atomic(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_trade_bars(bars, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn write_quote_bars_atomic(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_quote_bars(bars, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn write_ticks_atomic(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_ticks(ticks, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+struct PartitionLock {
+    file: fs::File,
+}
+
+impl Drop for PartitionLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    path.with_file_name(format!("data.parquet.tmp.{}", uuid::Uuid::new_v4()))
+}
+
+fn partition_has_all_trade_rows(path: &Path, bars: &[TradeBar]) -> LeanResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = crate::reader::ParquetReader::new().read_trade_bar_partition(
+        path,
+        &bars[0].symbol,
+        &Default::default(),
+    )?;
+    Ok(bars.iter().all(|bar| {
+        existing.iter().any(|existing| {
+            existing.symbol.id.sid == bar.symbol.id.sid
+                && existing.time.0 == bar.time.0
+                && existing.open == bar.open
+                && existing.high == bar.high
+                && existing.low == bar.low
+                && existing.close == bar.close
+                && existing.volume == bar.volume
+                && existing.period == bar.period
+        })
+    }))
+}
+
+fn partition_has_all_quote_rows(path: &Path, bars: &[QuoteBar]) -> LeanResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = crate::reader::ParquetReader::new().read_quote_bar_partition(
+        path,
+        &bars[0].symbol,
+        &Default::default(),
+    )?;
+    Ok(bars.iter().all(|bar| {
+        existing.iter().any(|existing| {
+            existing.symbol.id.sid == bar.symbol.id.sid
+                && existing.time.0 == bar.time.0
+                && existing.bid == bar.bid
+                && existing.ask == bar.ask
+                && existing.last_bid_size == bar.last_bid_size
+                && existing.last_ask_size == bar.last_ask_size
+                && existing.period == bar.period
+        })
+    }))
+}
+
+fn partition_has_all_tick_rows(path: &Path, ticks: &[Tick]) -> LeanResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = crate::reader::ParquetReader::new().read_tick_partition(
+        path,
+        &ticks[0].symbol,
+        &Default::default(),
+    )?;
+    Ok(ticks.iter().all(|tick| {
+        existing.iter().any(|existing| {
+            existing.symbol.id.sid == tick.symbol.id.sid
+                && existing.time.0 == tick.time.0
+                && existing.tick_type == tick.tick_type
+                && existing.value == tick.value
+                && existing.quantity == tick.quantity
+                && existing.bid_price == tick.bid_price
+                && existing.ask_price == tick.ask_price
+                && existing.bid_size == tick.bid_size
+                && existing.ask_size == tick.ask_size
+        })
+    }))
+}
+
+fn dedupe_trade_bars(bars: &mut Vec<TradeBar>) {
+    let mut seen = HashSet::new();
+    bars.retain(|bar| seen.insert((bar.symbol.id.sid, bar.time.0)));
+}
+
+fn dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
+    let mut seen = HashSet::new();
+    bars.retain(|bar| seen.insert((bar.symbol.id.sid, bar.time.0)));
+}
+
+fn dedupe_ticks(ticks: &mut Vec<Tick>) {
+    let mut seen = HashSet::new();
+    ticks.retain(|tick| seen.insert((tick.symbol.id.sid, tick.time.0, tick.tick_type)));
 }

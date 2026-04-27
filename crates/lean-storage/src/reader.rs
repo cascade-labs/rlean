@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_cast::display::array_value_to_string;
 use chrono::{NaiveDate, TimeZone, Utc};
 use datafusion::prelude::*;
-use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, Symbol};
+use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, CustomDataQuery, CustomParquetSource, QuoteBar, Tick, TradeBar};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
@@ -446,6 +446,42 @@ impl ParquetReader {
         Ok(result)
     }
 
+    /// Read every trade bar in an all-symbol partition, reconstructing symbols
+    /// from each row's `symbol_value` using `template` for market/security type.
+    pub fn read_trade_bar_partition(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<TradeBar>> {
+        let mut result = Vec::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_values = string_column(&batch, 3, "symbol_value")?;
+            let time_ns = int64_column(&batch, 0, "time_ns")?;
+
+            for row_idx in 0..batch.num_rows() {
+                let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                if !matches_time_filter(time, params) {
+                    continue;
+                }
+                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                    continue;
+                }
+                let symbol = symbol_like(template, symbol_values.value(row_idx));
+                result.extend(convert::record_batch_to_trade_bars(
+                    &batch.slice(row_idx, 1),
+                    symbol,
+                ));
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Read quote bars from files that may contain multiple symbols.
     pub fn read_quote_bars_with_symbols(
         &self,
@@ -505,6 +541,41 @@ impl ParquetReader {
         Ok(result)
     }
 
+    /// Read every quote bar in an all-symbol partition.
+    pub fn read_quote_bar_partition(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<QuoteBar>> {
+        let mut result = Vec::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_values = string_column(&batch, 3, "symbol_value")?;
+            let time_ns = int64_column(&batch, 0, "time_ns")?;
+
+            for row_idx in 0..batch.num_rows() {
+                let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                if !matches_time_filter(time, params) {
+                    continue;
+                }
+                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                    continue;
+                }
+                let symbol = symbol_like(template, symbol_values.value(row_idx));
+                result.extend(convert::record_batch_to_quote_bars(
+                    &batch.slice(row_idx, 1),
+                    symbol,
+                ));
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Read ticks from files that may contain multiple symbols.
     pub fn read_ticks_with_symbols(
         &self,
@@ -558,6 +629,41 @@ impl ParquetReader {
                     let single = batch.slice(row_idx, 1);
                     result.extend(convert::record_batch_to_ticks(&single, symbol.clone()));
                 }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read every tick in an all-symbol partition.
+    pub fn read_tick_partition(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<Tick>> {
+        let mut result = Vec::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_values = string_column(&batch, 2, "symbol_value")?;
+            let time_ns = int64_column(&batch, 0, "time_ns")?;
+
+            for row_idx in 0..batch.num_rows() {
+                let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                if !matches_time_filter(time, params) {
+                    continue;
+                }
+                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                    continue;
+                }
+                let symbol = symbol_like(template, symbol_values.value(row_idx));
+                result.extend(convert::record_batch_to_ticks(
+                    &batch.slice(row_idx, 1),
+                    symbol,
+                ));
             }
         }
 
@@ -839,6 +945,67 @@ fn matches_time_filter(time: DateTime, params: &QueryParams) -> bool {
         }
     }
     true
+}
+
+fn matches_symbol_filter(symbol_value: &str, template: &Symbol, params: &QueryParams) -> bool {
+    let Some(ref sids) = params.predicate.symbol_sids else {
+        return true;
+    };
+    let symbol = symbol_like(template, symbol_value);
+    sids.contains(&symbol.id.sid)
+}
+
+fn record_batches(path: &Path) -> LeanResult<Vec<arrow_array::RecordBatch>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| lean_core::LeanError::DataError(format!("{}: {}", path.display(), e)))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+        .build()
+        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+    reader
+        .map(|batch| batch.map_err(|e| lean_core::LeanError::DataError(e.to_string())))
+        .collect()
+}
+
+fn string_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    name: &str,
+) -> LeanResult<&'a StringArray> {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
+}
+
+fn int64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    name: &str,
+) -> LeanResult<&'a Int64Array> {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
+}
+
+fn symbol_like(template: &Symbol, symbol_value: &str) -> Symbol {
+    match template.security_type() {
+        SecurityType::Equity | SecurityType::Index => {
+            Symbol::create_equity(symbol_value, template.market())
+        }
+        SecurityType::Forex => Symbol::create_forex(symbol_value),
+        SecurityType::Crypto => Symbol::create_crypto(symbol_value, template.market()),
+        _ => {
+            let mut symbol = template.clone();
+            symbol.value = symbol_value.to_string();
+            symbol.permtick = symbol_value.to_string();
+            symbol
+        }
+    }
 }
 
 fn parquet_custom_time_to_datetime(

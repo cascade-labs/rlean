@@ -1,4 +1,4 @@
-use lean_core::{DateTime, Resolution, Result as LeanResult, Symbol};
+use lean_core::{DateTime, Resolution, Result as LeanResult, Symbol, TickType};
 use lean_data::{Slice, SubscriptionDataConfig};
 use lean_storage::{DataCache, ParquetReader, PathResolver, QueryParams};
 use std::path::PathBuf;
@@ -49,16 +49,21 @@ impl DataManager {
                 continue;
             }
 
-            // Load from parquet
-            let data_path = self.resolver.trade_bar(&sub.symbol, sub.resolution, date);
-            let path = data_path.to_path();
+            let path = self.resolver.market_data_partition(
+                &sub.symbol,
+                sub.resolution,
+                TickType::Trade,
+                date,
+            );
 
             if path.exists() {
                 let params = QueryParams::new().with_time_range(start, end);
                 let bars = self
                     .reader
-                    .read_trade_bars(&[path], sub.symbol.clone(), &params)
-                    .await?;
+                    .read_trade_bar_partition(&path, &sub.symbol, &params)?
+                    .into_iter()
+                    .filter(|bar| bar.symbol.id.sid == sub.symbol.id.sid)
+                    .collect::<Vec<_>>();
 
                 self.cache.insert_bars(sid, day_key, bars.clone());
                 for bar in bars {
@@ -83,8 +88,9 @@ impl DataManager {
         let mut date = start;
 
         while date <= end {
-            let data_path = self.resolver.trade_bar(symbol, resolution, date);
-            let path = data_path.to_path();
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, resolution, TickType::Trade, date);
             let sid = symbol.id.sid;
             let day_key = date
                 .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap())
@@ -100,8 +106,10 @@ impl DataManager {
                 let params = QueryParams::new().with_time_range(day_start, day_end);
                 let bars = self
                     .reader
-                    .read_trade_bars(&[path], symbol.clone(), &params)
-                    .await?;
+                    .read_trade_bar_partition(&path, symbol, &params)?
+                    .into_iter()
+                    .filter(|bar| bar.symbol.id.sid == sid)
+                    .collect::<Vec<_>>();
                 loaded += bars.len();
                 self.cache.insert_bars(sid, day_key, bars);
             }

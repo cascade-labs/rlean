@@ -8,8 +8,7 @@ pub mod writer;
 
 pub use cache::DataCache;
 pub use path_resolver::{
-    custom_data_history_path, custom_data_path, factor_file_path, map_file_path, option_eod_glob,
-    option_eod_path, DataPath, PathResolver,
+    custom_data_history_path, custom_data_path, factor_file_path, map_file_path, PathResolver,
 };
 pub use predicate::Predicate;
 pub use reader::{ParquetReader, QueryParams};
