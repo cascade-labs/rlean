@@ -1,20 +1,23 @@
-use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
+use crate::schema::{i64_to_price, FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
 use crate::{convert, predicate::Predicate, schema};
 use arrow_array::types::{
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType,
 };
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    UInt32Array, UInt64Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt32Array, UInt64Array,
 };
 use arrow_cast::display::array_value_to_string;
 use chrono::{NaiveDate, TimeZone, Utc};
+use datafusion::common::config::ConfigOptions;
 use datafusion::prelude::*;
 use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol};
-use lean_data::{CustomDataPoint, CustomDataQuery, CustomParquetSource, QuoteBar, Tick, TradeBar};
+use lean_data::{
+    Bar, CustomDataPoint, CustomDataQuery, CustomParquetSource, QuoteBar, Tick, TradeBar,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
@@ -61,7 +64,11 @@ pub struct ParquetReader {
 
 impl ParquetReader {
     pub fn new() -> Self {
-        let config = SessionConfig::new()
+        let mut config_options = ConfigOptions::new();
+        config_options.execution.parquet.pushdown_filters = true;
+        config_options.execution.parquet.reorder_filters = true;
+
+        let config = SessionConfig::from(config_options)
             .with_batch_size(65_536)
             .with_repartition_joins(true)
             .with_target_partitions(num_cpus::get());
@@ -459,32 +466,100 @@ impl ParquetReader {
         template: &Symbol,
         params: &QueryParams,
     ) -> LeanResult<Vec<TradeBar>> {
-        let mut result = Vec::new();
+        Ok(self
+            .read_trade_bar_partition_grouped(path, template, params)?
+            .into_values()
+            .flatten()
+            .collect())
+    }
+
+    /// Read every trade bar in an all-symbol partition using DataFusion
+    /// projection/filter pushdown, grouped by stored SID.
+    pub async fn read_trade_bar_partition_grouped_async(
+        &self,
+        path: &Path,
+        symbols_by_sid: &HashMap<u64, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<TradeBar>>> {
         if !path.exists() {
-            return Ok(result);
+            return Ok(HashMap::new());
+        }
+
+        let batches = self
+            .collect_market_partition_batches(
+                path,
+                params,
+                &[
+                    "time_ns",
+                    "end_time_ns",
+                    "symbol_sid",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "period_ns",
+                ],
+            )
+            .await?;
+        trade_batches_to_grouped(&batches, symbols_by_sid, params)
+    }
+
+    /// Read every trade bar in an all-symbol partition, grouped by stored SID.
+    pub fn read_trade_bar_partition_grouped(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<TradeBar>>> {
+        let mut grouped: HashMap<u64, Vec<TradeBar>> = HashMap::new();
+        let mut symbols: HashMap<u64, Symbol> = HashMap::new();
+        if !path.exists() {
+            return Ok(grouped);
         }
 
         for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, 2, "symbol_sid")?;
             let symbol_values = string_column(&batch, 3, "symbol_value")?;
             let time_ns = int64_column(&batch, 0, "time_ns")?;
+            let end_ns = int64_column(&batch, 1, "end_time_ns")?;
+            let open_col = int64_column(&batch, 4, "open")?;
+            let high_col = int64_column(&batch, 5, "high")?;
+            let low_col = int64_column(&batch, 6, "low")?;
+            let close_col = int64_column(&batch, 7, "close")?;
+            let volume_col = int64_column(&batch, 8, "volume")?;
+            let period_col = int64_column(&batch, 9, "period_ns")?;
 
             for row_idx in 0..batch.num_rows() {
                 let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
                 if !matches_time_filter(time, params) {
                     continue;
                 }
-                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                let symbol_sid = symbol_sids.value(row_idx);
+                if !matches_symbol_filter(symbol_sid, params) {
                     continue;
                 }
-                let symbol = symbol_like(template, symbol_values.value(row_idx));
-                result.extend(convert::record_batch_to_trade_bars(
-                    &batch.slice(row_idx, 1),
+                let symbol = symbols
+                    .entry(symbol_sid)
+                    .or_insert_with(|| {
+                        symbol_for_partition_row(template, symbol_values.value(row_idx), symbol_sid)
+                    })
+                    .clone();
+                grouped.entry(symbol_sid).or_default().push(TradeBar {
                     symbol,
-                ));
+                    time,
+                    end_time: lean_core::NanosecondTimestamp(end_ns.value(row_idx)),
+                    open: i64_to_price(open_col.value(row_idx)),
+                    high: i64_to_price(high_col.value(row_idx)),
+                    low: i64_to_price(low_col.value(row_idx)),
+                    close: i64_to_price(close_col.value(row_idx)),
+                    volume: i64_to_price(volume_col.value(row_idx)),
+                    period: lean_core::TimeSpan::from_nanos(period_col.value(row_idx)),
+                });
             }
         }
 
-        Ok(result)
+        Ok(grouped)
     }
 
     /// Read quote bars from files that may contain multiple symbols.
@@ -553,32 +628,184 @@ impl ParquetReader {
         template: &Symbol,
         params: &QueryParams,
     ) -> LeanResult<Vec<QuoteBar>> {
-        let mut result = Vec::new();
+        Ok(self
+            .read_quote_bar_partition_grouped(path, template, params)?
+            .into_values()
+            .flatten()
+            .collect())
+    }
+
+    /// Read every quote bar in an all-symbol partition using DataFusion
+    /// projection/filter pushdown, grouped by stored SID.
+    pub async fn read_quote_bar_partition_grouped_async(
+        &self,
+        path: &Path,
+        symbols_by_sid: &HashMap<u64, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<QuoteBar>>> {
         if !path.exists() {
-            return Ok(result);
+            return Ok(HashMap::new());
+        }
+
+        let batches = self
+            .collect_market_partition_batches(
+                path,
+                params,
+                &[
+                    "time_ns",
+                    "end_time_ns",
+                    "symbol_sid",
+                    "bid_open",
+                    "bid_high",
+                    "bid_low",
+                    "bid_close",
+                    "ask_open",
+                    "ask_high",
+                    "ask_low",
+                    "ask_close",
+                    "last_bid_size",
+                    "last_ask_size",
+                    "period_ns",
+                ],
+            )
+            .await?;
+        quote_batches_to_grouped(&batches, symbols_by_sid, params)
+    }
+
+    /// Read every quote bar in an all-symbol partition, grouped by stored SID.
+    pub fn read_quote_bar_partition_grouped(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<QuoteBar>>> {
+        let mut grouped: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+        let mut symbols: HashMap<u64, Symbol> = HashMap::new();
+        if !path.exists() {
+            return Ok(grouped);
         }
 
         for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, 2, "symbol_sid")?;
             let symbol_values = string_column(&batch, 3, "symbol_value")?;
             let time_ns = int64_column(&batch, 0, "time_ns")?;
+            let end_ns = int64_column(&batch, 1, "end_time_ns")?;
+            let bid_open_col = int64_column(&batch, 4, "bid_open")?;
+            let bid_high_col = int64_column(&batch, 5, "bid_high")?;
+            let bid_low_col = int64_column(&batch, 6, "bid_low")?;
+            let bid_close_col = int64_column(&batch, 7, "bid_close")?;
+            let ask_open_col = int64_column(&batch, 8, "ask_open")?;
+            let ask_high_col = int64_column(&batch, 9, "ask_high")?;
+            let ask_low_col = int64_column(&batch, 10, "ask_low")?;
+            let ask_close_col = int64_column(&batch, 11, "ask_close")?;
+            let last_bid_size_col = int64_column(&batch, 12, "last_bid_size")?;
+            let last_ask_size_col = int64_column(&batch, 13, "last_ask_size")?;
+            let period_col = int64_column(&batch, 14, "period_ns")?;
 
             for row_idx in 0..batch.num_rows() {
                 let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
                 if !matches_time_filter(time, params) {
                     continue;
                 }
-                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                let symbol_sid = symbol_sids.value(row_idx);
+                if !matches_symbol_filter(symbol_sid, params) {
                     continue;
                 }
-                let symbol = symbol_like(template, symbol_values.value(row_idx));
-                result.extend(convert::record_batch_to_quote_bars(
-                    &batch.slice(row_idx, 1),
+                let symbol = symbols
+                    .entry(symbol_sid)
+                    .or_insert_with(|| {
+                        symbol_for_partition_row(template, symbol_values.value(row_idx), symbol_sid)
+                    })
+                    .clone();
+                let bid = if bid_open_col.is_null(row_idx) {
+                    None
+                } else {
+                    Some(Bar {
+                        open: i64_to_price(bid_open_col.value(row_idx)),
+                        high: i64_to_price(bid_high_col.value(row_idx)),
+                        low: i64_to_price(bid_low_col.value(row_idx)),
+                        close: i64_to_price(bid_close_col.value(row_idx)),
+                    })
+                };
+                let ask = if ask_open_col.is_null(row_idx) {
+                    None
+                } else {
+                    Some(Bar {
+                        open: i64_to_price(ask_open_col.value(row_idx)),
+                        high: i64_to_price(ask_high_col.value(row_idx)),
+                        low: i64_to_price(ask_low_col.value(row_idx)),
+                        close: i64_to_price(ask_close_col.value(row_idx)),
+                    })
+                };
+                grouped.entry(symbol_sid).or_default().push(QuoteBar {
                     symbol,
-                ));
+                    time,
+                    end_time: lean_core::NanosecondTimestamp(end_ns.value(row_idx)),
+                    bid,
+                    ask,
+                    last_bid_size: i64_to_price(last_bid_size_col.value(row_idx)),
+                    last_ask_size: i64_to_price(last_ask_size_col.value(row_idx)),
+                    period: lean_core::TimeSpan::from_nanos(period_col.value(row_idx)),
+                });
             }
         }
 
-        Ok(result)
+        Ok(grouped)
+    }
+
+    async fn collect_market_partition_batches(
+        &self,
+        path: &Path,
+        params: &QueryParams,
+        columns: &[&str],
+    ) -> LeanResult<Vec<RecordBatch>> {
+        let table_name = format!(
+            "market_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+
+        self.ctx
+            .register_parquet(
+                &table_name,
+                path.to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let result = async {
+            let mut df = self
+                .ctx
+                .table(&table_name)
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                .select_columns(columns)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            if let Some(filter) = params.predicate.to_datafusion_expr() {
+                df = df
+                    .filter(filter)
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            }
+
+            if let Some(limit) = params.limit {
+                df = df
+                    .limit(0, Some(limit))
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            }
+
+            df.collect()
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
+        }
+        .await;
+
+        let _ = self.ctx.deregister_table(&table_name);
+        result
     }
 
     /// Read ticks from files that may contain multiple symbols.
@@ -653,6 +880,7 @@ impl ParquetReader {
         }
 
         for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, 1, "symbol_sid")?;
             let symbol_values = string_column(&batch, 2, "symbol_value")?;
             let time_ns = int64_column(&batch, 0, "time_ns")?;
 
@@ -661,14 +889,37 @@ impl ParquetReader {
                 if !matches_time_filter(time, params) {
                     continue;
                 }
-                if !matches_symbol_filter(symbol_values.value(row_idx), template, params) {
+                let symbol_sid = symbol_sids.value(row_idx);
+                if !matches_symbol_filter(symbol_sid, params) {
                     continue;
                 }
-                let symbol = symbol_like(template, symbol_values.value(row_idx));
+                let symbol =
+                    symbol_like_with_sid(template, symbol_values.value(row_idx), symbol_sid);
                 result.extend(convert::record_batch_to_ticks(
                     &batch.slice(row_idx, 1),
                     symbol,
                 ));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Return all symbol SIDs present in a market-data partition.
+    pub fn read_partition_symbol_sids(
+        &self,
+        path: &Path,
+        symbol_sid_column: usize,
+    ) -> LeanResult<HashSet<u64>> {
+        let mut result = HashSet::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, symbol_sid_column, "symbol_sid")?;
+            for row_idx in 0..batch.num_rows() {
+                result.insert(symbol_sids.value(row_idx));
             }
         }
 
@@ -952,12 +1203,129 @@ fn matches_time_filter(time: DateTime, params: &QueryParams) -> bool {
     true
 }
 
-fn matches_symbol_filter(symbol_value: &str, template: &Symbol, params: &QueryParams) -> bool {
+fn matches_symbol_filter(symbol_sid: u64, params: &QueryParams) -> bool {
     let Some(ref sids) = params.predicate.symbol_sids else {
         return true;
     };
-    let symbol = symbol_like(template, symbol_value);
-    sids.contains(&symbol.id.sid)
+    sids.contains(&symbol_sid)
+}
+
+fn trade_batches_to_grouped(
+    batches: &[RecordBatch],
+    symbols_by_sid: &HashMap<u64, Symbol>,
+    params: &QueryParams,
+) -> LeanResult<HashMap<u64, Vec<TradeBar>>> {
+    let mut grouped: HashMap<u64, Vec<TradeBar>> = HashMap::new();
+
+    for batch in batches {
+        let symbol_sids = uint64_column_named(batch, "symbol_sid")?;
+        let time_ns = int64_column_named(batch, "time_ns")?;
+        let end_ns = int64_column_named(batch, "end_time_ns")?;
+        let open_col = int64_column_named(batch, "open")?;
+        let high_col = int64_column_named(batch, "high")?;
+        let low_col = int64_column_named(batch, "low")?;
+        let close_col = int64_column_named(batch, "close")?;
+        let volume_col = int64_column_named(batch, "volume")?;
+        let period_col = int64_column_named(batch, "period_ns")?;
+
+        for row_idx in 0..batch.num_rows() {
+            let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+            if !matches_time_filter(time, params) {
+                continue;
+            }
+            let symbol_sid = symbol_sids.value(row_idx);
+            if !matches_symbol_filter(symbol_sid, params) {
+                continue;
+            }
+            let Some(symbol) = symbols_by_sid.get(&symbol_sid).cloned() else {
+                continue;
+            };
+            grouped.entry(symbol_sid).or_default().push(TradeBar {
+                symbol,
+                time,
+                end_time: lean_core::NanosecondTimestamp(end_ns.value(row_idx)),
+                open: i64_to_price(open_col.value(row_idx)),
+                high: i64_to_price(high_col.value(row_idx)),
+                low: i64_to_price(low_col.value(row_idx)),
+                close: i64_to_price(close_col.value(row_idx)),
+                volume: i64_to_price(volume_col.value(row_idx)),
+                period: lean_core::TimeSpan::from_nanos(period_col.value(row_idx)),
+            });
+        }
+    }
+
+    Ok(grouped)
+}
+
+fn quote_batches_to_grouped(
+    batches: &[RecordBatch],
+    symbols_by_sid: &HashMap<u64, Symbol>,
+    params: &QueryParams,
+) -> LeanResult<HashMap<u64, Vec<QuoteBar>>> {
+    let mut grouped: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+
+    for batch in batches {
+        let symbol_sids = uint64_column_named(batch, "symbol_sid")?;
+        let time_ns = int64_column_named(batch, "time_ns")?;
+        let end_ns = int64_column_named(batch, "end_time_ns")?;
+        let bid_open_col = int64_column_named(batch, "bid_open")?;
+        let bid_high_col = int64_column_named(batch, "bid_high")?;
+        let bid_low_col = int64_column_named(batch, "bid_low")?;
+        let bid_close_col = int64_column_named(batch, "bid_close")?;
+        let ask_open_col = int64_column_named(batch, "ask_open")?;
+        let ask_high_col = int64_column_named(batch, "ask_high")?;
+        let ask_low_col = int64_column_named(batch, "ask_low")?;
+        let ask_close_col = int64_column_named(batch, "ask_close")?;
+        let last_bid_size_col = int64_column_named(batch, "last_bid_size")?;
+        let last_ask_size_col = int64_column_named(batch, "last_ask_size")?;
+        let period_col = int64_column_named(batch, "period_ns")?;
+
+        for row_idx in 0..batch.num_rows() {
+            let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+            if !matches_time_filter(time, params) {
+                continue;
+            }
+            let symbol_sid = symbol_sids.value(row_idx);
+            if !matches_symbol_filter(symbol_sid, params) {
+                continue;
+            }
+            let Some(symbol) = symbols_by_sid.get(&symbol_sid).cloned() else {
+                continue;
+            };
+            let bid = if bid_open_col.is_null(row_idx) {
+                None
+            } else {
+                Some(Bar {
+                    open: i64_to_price(bid_open_col.value(row_idx)),
+                    high: i64_to_price(bid_high_col.value(row_idx)),
+                    low: i64_to_price(bid_low_col.value(row_idx)),
+                    close: i64_to_price(bid_close_col.value(row_idx)),
+                })
+            };
+            let ask = if ask_open_col.is_null(row_idx) {
+                None
+            } else {
+                Some(Bar {
+                    open: i64_to_price(ask_open_col.value(row_idx)),
+                    high: i64_to_price(ask_high_col.value(row_idx)),
+                    low: i64_to_price(ask_low_col.value(row_idx)),
+                    close: i64_to_price(ask_close_col.value(row_idx)),
+                })
+            };
+            grouped.entry(symbol_sid).or_default().push(QuoteBar {
+                symbol,
+                time,
+                end_time: lean_core::NanosecondTimestamp(end_ns.value(row_idx)),
+                bid,
+                ask,
+                last_bid_size: i64_to_price(last_bid_size_col.value(row_idx)),
+                last_ask_size: i64_to_price(last_ask_size_col.value(row_idx)),
+                period: lean_core::TimeSpan::from_nanos(period_col.value(row_idx)),
+            });
+        }
+    }
+
+    Ok(grouped)
 }
 
 fn record_batches(path: &Path) -> LeanResult<Vec<arrow_array::RecordBatch>> {
@@ -997,6 +1365,47 @@ fn int64_column<'a>(
         .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
 }
 
+fn uint64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    name: &str,
+) -> LeanResult<&'a UInt64Array> {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
+}
+
+fn column_index(batch: &arrow_array::RecordBatch, name: &str) -> LeanResult<usize> {
+    let schema = batch.schema();
+    schema.index_of(name).map_err(|_| {
+        let available = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        lean_core::LeanError::DataError(format!(
+            "{name} column missing; available columns: {available}"
+        ))
+    })
+}
+
+fn int64_column_named<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+) -> LeanResult<&'a Int64Array> {
+    int64_column(batch, column_index(batch, name)?, name)
+}
+
+fn uint64_column_named<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+) -> LeanResult<&'a UInt64Array> {
+    uint64_column(batch, column_index(batch, name)?, name)
+}
+
 fn symbol_like(template: &Symbol, symbol_value: &str) -> Symbol {
     match template.security_type() {
         SecurityType::Equity | SecurityType::Index => {
@@ -1011,6 +1420,19 @@ fn symbol_like(template: &Symbol, symbol_value: &str) -> Symbol {
             symbol
         }
     }
+}
+
+fn symbol_like_with_sid(template: &Symbol, symbol_value: &str, symbol_sid: u64) -> Symbol {
+    let mut symbol = symbol_like(template, symbol_value);
+    symbol.id.sid = symbol_sid;
+    symbol
+}
+
+fn symbol_for_partition_row(template: &Symbol, symbol_value: &str, symbol_sid: u64) -> Symbol {
+    if template.id.sid == symbol_sid {
+        return template.clone();
+    }
+    symbol_like_with_sid(template, symbol_value, symbol_sid)
 }
 
 fn parquet_custom_time_to_datetime(

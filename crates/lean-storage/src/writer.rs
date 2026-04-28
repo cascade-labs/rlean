@@ -12,12 +12,26 @@ use parquet::{
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 use tracing::debug;
 
+/// Compression codec for locally cached Parquet.
+///
+/// Local cache files optimize repeated backtest read speed, not cold-storage
+/// density. Snappy is the default because it is substantially cheaper to decode
+/// than ZSTD for repeatedly scanned market data partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterCompression {
+    Snappy,
+    Zstd,
+    Uncompressed,
+}
+
 /// Configuration for Parquet output.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
-    /// Zstandard compression level (1–22). Default 3.
+    /// Compression codec. Default Snappy for local-cache scan speed.
+    pub compression: WriterCompression,
+    /// Zstandard compression level (1–22). Only used with ZSTD. Default 1.
     pub compression_level: i32,
-    /// Row group size in number of rows. Default 128k.
+    /// Row group size in rows. Default 8k to make SID predicates skip chunks.
     pub row_group_size: usize,
     /// Write statistics (min/max per column) for predicate pushdown.
     pub write_statistics: bool,
@@ -28,8 +42,9 @@ pub struct WriterConfig {
 impl Default for WriterConfig {
     fn default() -> Self {
         WriterConfig {
-            compression_level: 3,
-            row_group_size: 131_072,
+            compression: WriterCompression::Snappy,
+            compression_level: 1,
+            row_group_size: 8_192,
             write_statistics: true,
             bloom_filter: true,
         }
@@ -47,11 +62,18 @@ impl ParquetWriter {
     }
 
     fn writer_props(&self) -> WriterProperties {
-        let zstd = ZstdLevel::try_new(self.config.compression_level)
-            .unwrap_or(ZstdLevel::try_new(3).unwrap());
+        let compression = match self.config.compression {
+            WriterCompression::Snappy => Compression::SNAPPY,
+            WriterCompression::Zstd => {
+                let zstd = ZstdLevel::try_new(self.config.compression_level)
+                    .unwrap_or(ZstdLevel::try_new(1).unwrap());
+                Compression::ZSTD(zstd)
+            }
+            WriterCompression::Uncompressed => Compression::UNCOMPRESSED,
+        };
 
         let mut builder = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(zstd))
+            .set_compression(compression)
             .set_max_row_group_size(self.config.row_group_size)
             .set_statistics_enabled(if self.config.write_statistics {
                 parquet::file::properties::EnabledStatistics::Page
@@ -166,7 +188,7 @@ impl ParquetWriter {
 
         merged.extend_from_slice(bars);
         dedupe_trade_bars(&mut merged);
-        merged.sort_by_key(|bar| (bar.time.0, bar.symbol.value.clone()));
+        sort_trade_bars_for_predicate_pruning(&mut merged);
         self.write_trade_bars_atomic(&merged, path)
     }
 
@@ -195,7 +217,7 @@ impl ParquetWriter {
 
         merged.extend_from_slice(bars);
         dedupe_quote_bars(&mut merged);
-        merged.sort_by_key(|bar| (bar.time.0, bar.symbol.value.clone()));
+        sort_quote_bars_for_predicate_pruning(&mut merged);
         self.write_quote_bars_atomic(&merged, path)
     }
 
@@ -224,7 +246,7 @@ impl ParquetWriter {
 
         merged.extend_from_slice(ticks);
         dedupe_ticks(&mut merged);
-        merged.sort_by_key(|tick| (tick.time.0, tick.symbol.value.clone()));
+        sort_ticks_for_predicate_pruning(&mut merged);
         self.write_ticks_atomic(&merged, path)
     }
 
@@ -572,4 +594,16 @@ fn dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
 fn dedupe_ticks(ticks: &mut Vec<Tick>) {
     let mut seen = HashSet::new();
     ticks.retain(|tick| seen.insert((tick.symbol.id.sid, tick.time.0, tick.tick_type)));
+}
+
+fn sort_trade_bars_for_predicate_pruning(bars: &mut [TradeBar]) {
+    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+}
+
+fn sort_quote_bars_for_predicate_pruning(bars: &mut [QuoteBar]) {
+    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+}
+
+fn sort_ticks_for_predicate_pruning(ticks: &mut [Tick]) {
+    ticks.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0, tick.tick_type as u8));
 }

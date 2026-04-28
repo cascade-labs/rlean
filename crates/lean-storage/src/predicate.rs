@@ -65,12 +65,10 @@ impl Predicate {
         }
         if let Some(ref sids) = self.symbol_sids {
             if sids.len() == 1 {
-                exprs.push(col("symbol_sid").eq(lit(sids[0] as i64)));
+                exprs.push(col("symbol_sid").eq(lit(sids[0])));
             } else {
-                let sid_exprs: Vec<Expr> = sids
-                    .iter()
-                    .map(|&s| col("symbol_sid").eq(lit(s as i64)))
-                    .collect();
+                let sid_exprs: Vec<Expr> =
+                    sids.iter().map(|&s| col("symbol_sid").eq(lit(s))).collect();
                 exprs.push(sid_exprs.into_iter().reduce(|a, b| a.or(b)).unwrap());
             }
         }

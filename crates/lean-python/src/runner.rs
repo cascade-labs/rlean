@@ -21,7 +21,7 @@ use lean_core::{
     SecurityType, Symbol, SymbolOptionsExt, TickType, TimeSpan,
 };
 use lean_data::{
-    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSubscription,
+    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
     CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice,
     SubscriptionDataConfig, SymbolChangedEvent, Tick, TradeBar, TradeBarData,
 };
@@ -611,12 +611,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         }
     };
 
-    // ── pre-fetch missing data ───────────────────────────────────────────────
+    // ── pre-fetch missing low-resolution data ───────────────────────────────
+    // C# LEAN resolves date-partitioned high-resolution sources lazily: the
+    // subscription reader asks for the current tradable date's source and the
+    // data provider reports whether that file exists. Mirror that behavior by
+    // leaving minute/second/tick data to the intraday loop below.
     if let Some(ref provider) = config.historical_provider {
+        let startup_prefetch_subscriptions: Vec<_> = subscriptions
+            .iter()
+            .filter(|sub| !sub.resolution.is_high_resolution() && sub.tick_type != TickType::Quote)
+            .cloned()
+            .collect();
+
         pre_fetch_all(
             provider.clone(),
             config.history_provider.clone(),
-            &subscriptions,
+            &startup_prefetch_subscriptions,
             warmup_start.unwrap_or(start_date),
             end_date,
             &resolver,
@@ -1108,27 +1118,89 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             let mut day_quote_bars: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
             let mut day_ticks: HashMap<u64, Vec<Tick>> = HashMap::new();
 
-            let day_params = QueryParams::new().with_time_range(
+            let day_time_params = QueryParams::new().with_time_range(
                 date_to_datetime(current_date, 0, 0, 0),
                 date_to_datetime(current_date, 23, 59, 59),
             );
 
+            let custom_subs: Vec<CustomDataSubscription> = {
+                adapter
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .custom_data_subscriptions
+                    .clone()
+            };
+            let custom_data_for_day = load_low_resolution_custom_data_for_day(
+                &custom_subs,
+                &custom_history,
+                &config,
+                current_date,
+            )
+            .await?;
+
+            let daily_custom_changes = Python::attach(|py| {
+                adapter.apply_custom_universe_selection(
+                    py,
+                    date_to_datetime(current_date, 0, 0, 0).0,
+                    Resolution::Daily,
+                    &custom_data_for_day,
+                )
+            });
+            if daily_custom_changes.has_changes() {
+                let current_subs = { adapter.inner.lock().unwrap().subscription_manager.get_all() };
+                let reconciliation = reconcile_runner_subscriptions(
+                    &mut subscriptions,
+                    &mut loaded_subscription_ids,
+                    &current_subs,
+                );
+                Python::attach(|py| {
+                    slice_proxy.retain_subscriptions(py, &current_subs);
+                    for sub in &reconciliation.new_subs {
+                        let _ = slice_proxy.add_subscription(py, sub);
+                    }
+                });
+            }
+
+            let day_symbol_sids: Vec<u64> = subscriptions
+                .iter()
+                .filter(|sub| sub.resolution.is_high_resolution())
+                .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                .map(|sub| sub.symbol.id.sid)
+                .collect();
+            let day_symbols_by_sid: HashMap<u64, Symbol> = subscriptions
+                .iter()
+                .filter(|sub| sub.resolution.is_high_resolution())
+                .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                .map(|sub| (sub.symbol.id.sid, sub.symbol.clone()))
+                .collect();
+            let day_read_params = if day_symbol_sids.is_empty() {
+                day_time_params.clone()
+            } else {
+                day_time_params.clone().with_symbols(day_symbol_sids)
+            };
+
             if let Some(ref provider) = config.historical_provider {
                 let cache_reader = ParquetReader::new();
-                let missing_subs: Vec<_> = subscriptions
-                    .iter()
-                    .filter(|sub| sub.resolution.is_high_resolution())
-                    .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
-                    .filter(|sub| {
-                        !cached_partition_has_symbol_data(
-                            &cache_reader,
-                            &resolver,
-                            sub,
-                            current_date,
-                        )
-                    })
-                    .cloned()
-                    .collect();
+                let mut partition_sid_cache: HashMap<PathBuf, HashSet<u64>> = HashMap::new();
+                let mut missing_subs = Vec::new();
+                for sub in subscriptions.iter() {
+                    if !sub.resolution.is_high_resolution()
+                        || !is_expected_market_date(&sub.symbol, current_date)
+                    {
+                        continue;
+                    }
+
+                    if !cached_partition_has_symbol_sid(
+                        &cache_reader,
+                        &resolver,
+                        sub,
+                        current_date,
+                        &mut partition_sid_cache,
+                    ) {
+                        missing_subs.push(sub.clone());
+                    }
+                }
                 if !missing_subs.is_empty() {
                     if let Err(e) = pre_fetch_all(
                         provider.clone(),
@@ -1181,7 +1253,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             tick_path,
                             &sub.symbol,
                             sid,
-                            &day_params,
+                            &day_read_params,
                         );
                         if !ticks.is_empty() {
                             ticks.retain(|tick| tick.symbol.id.sid == sid);
@@ -1213,10 +1285,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &mut trade_partition_cache,
                             &reader,
                             trade_path,
-                            &sub.symbol,
+                            &day_symbols_by_sid,
                             sid,
-                            &day_params,
-                        );
+                            &day_read_params,
+                        )
+                        .await;
                         if !bars.is_empty() {
                             bars.retain(|bar| bar.symbol.id.sid == sid);
                             if let Some(hours) = market_hours_filter.get(&sid) {
@@ -1241,10 +1314,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &mut quote_partition_cache,
                             &reader,
                             quote_path,
-                            &sub.symbol,
+                            &day_symbols_by_sid,
                             sid,
-                            &day_params,
-                        );
+                            &day_read_params,
+                        )
+                        .await;
                         if !bars.is_empty() {
                             bars.retain(|bar| bar.symbol.id.sid == sid);
                             if let Some(hours) = market_hours_filter.get(&sid) {
@@ -1304,6 +1378,61 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 option_runtimes.push(runtime);
             }
 
+            let mut high_resolution_custom_by_ts: HashMap<
+                i64,
+                HashMap<String, Vec<CustomDataPoint>>,
+            > = HashMap::new();
+            for sub in custom_subs
+                .iter()
+                .filter(|sub| sub.config.resolution.is_high_resolution())
+            {
+                let source = config
+                    .custom_data_sources
+                    .iter()
+                    .find(|s| s.name() == sub.source_type)
+                    .cloned();
+                let points = load_custom_data_points_for_subscription(
+                    config.data_root.clone(),
+                    sub.source_type.clone(),
+                    sub.ticker.clone(),
+                    current_date,
+                    source,
+                    sub.config.clone(),
+                    sub.dynamic_query.clone(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load custom data for {}/{} {}",
+                        sub.source_type, sub.ticker, current_date
+                    )
+                })?;
+                for point in points {
+                    let Some(timestamp) = point.end_time else {
+                        continue;
+                    };
+                    high_resolution_custom_by_ts
+                        .entry(timestamp.0)
+                        .or_default()
+                        .entry(sub.ticker.clone())
+                        .or_default()
+                        .push(point);
+                }
+            }
+            if !high_resolution_custom_by_ts.is_empty() {
+                let row_count: usize = high_resolution_custom_by_ts
+                    .values()
+                    .flat_map(|points_by_ticker| points_by_ticker.values())
+                    .map(Vec::len)
+                    .sum();
+                debug!(
+                    "Loaded {} high-resolution custom rows across {} timestamps for {}",
+                    row_count,
+                    high_resolution_custom_by_ts.len(),
+                    current_date
+                );
+            }
+
             let mut all_timestamps: std::collections::BTreeSet<i64> =
                 std::collections::BTreeSet::new();
             for bars in day_trade_bars.values() {
@@ -1324,6 +1453,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             for runtime in &option_runtimes {
                 all_timestamps.extend(runtime.timestamps());
             }
+            all_timestamps.extend(high_resolution_custom_by_ts.keys().copied());
 
             let has_data = !all_timestamps.is_empty();
 
@@ -1354,59 +1484,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         ts_map.entry(tick.time.0).or_default().push(tick.clone());
                     }
                     ticks_by_ts.insert(sid, ts_map);
-                }
-
-                let custom_subs: Vec<CustomDataSubscription> = {
-                    adapter
-                        .inner
-                        .lock()
-                        .unwrap()
-                        .custom_data_subscriptions
-                        .clone()
-                };
-                let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
-                for sub in &custom_subs {
-                    if sub.config.resolution.is_high_resolution() {
-                        continue;
-                    }
-                    let key = sub.ticker.to_uppercase();
-                    if let Some(by_date) = custom_history.get(&key) {
-                        // Full-history source: look up from preloaded in-memory map.
-                        if let Some(pts) = by_date.get(&current_date) {
-                            custom_data_for_day.insert(sub.ticker.clone(), pts.clone());
-                        }
-                    } else {
-                        // Date-keyed source: per-day HTTP fetch with per-day Parquet cache.
-                        let source = config
-                            .custom_data_sources
-                            .iter()
-                            .find(|s| s.name() == sub.source_type)
-                            .cloned();
-                        let data_root = config.data_root.clone();
-                        let source_type = sub.source_type.clone();
-                        let ticker = sub.ticker.clone();
-                        let cfg = sub.config.clone();
-                        let dynamic_query = sub.dynamic_query.clone();
-                        let points = load_custom_data_points_for_subscription(
-                            data_root,
-                            source_type,
-                            ticker,
-                            current_date,
-                            source,
-                            cfg,
-                            dynamic_query,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to load custom data for {}/{} {}",
-                                sub.source_type, sub.ticker, current_date
-                            )
-                        })?;
-                        if !points.is_empty() {
-                            custom_data_for_day.insert(sub.ticker.clone(), points);
-                        }
-                    }
                 }
 
                 for &ts_ns in &all_timestamps {
@@ -1526,48 +1603,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     });
 
                     let mut custom_data_for_slice = custom_data_for_day.clone();
-                    for sub in custom_subs
-                        .iter()
-                        .filter(|sub| sub.config.resolution.is_high_resolution())
-                    {
-                        let source = config
-                            .custom_data_sources
-                            .iter()
-                            .find(|s| s.name() == sub.source_type)
-                            .cloned();
-                        let timestamp_query = sub.dynamic_query.merge(&CustomDataQuery {
-                            start_time: Some(utc_time),
-                            end_time: Some(utc_time),
-                            ..Default::default()
-                        });
-                        let points = load_custom_data_points_for_subscription(
-                            config.data_root.clone(),
-                            sub.source_type.clone(),
-                            sub.ticker.clone(),
-                            current_date,
-                            source,
-                            sub.config.clone(),
-                            timestamp_query,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to load custom data for {}/{} {} at {}",
-                                sub.source_type, sub.ticker, current_date, utc_time.0
-                            )
-                        })?;
-                        if !points.is_empty() {
-                            custom_data_for_slice.insert(sub.ticker.clone(), points);
+                    if let Some(points_by_ticker) = high_resolution_custom_by_ts.get(&utc_time.0) {
+                        for (ticker, points) in points_by_ticker {
+                            custom_data_for_slice.insert(ticker.clone(), points.clone());
                         }
                     }
 
                     Python::attach(|py| {
-                        adapter.apply_custom_universe_selection(
-                            py,
-                            utc_time.0,
-                            Resolution::Daily,
-                            &custom_data_for_slice,
-                        );
                         adapter.apply_custom_universe_selection(
                             py,
                             utc_time.0,
@@ -1680,7 +1722,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 match reader.read_tick_partition(
                                     &tick_path,
                                     &sub.symbol,
-                                    &day_params,
+                                    &day_time_params.clone().with_symbols(vec![sid]),
                                 ) {
                                     Ok(mut ticks) if !ticks.is_empty() => {
                                         ticks.retain(|tick| tick.symbol.id.sid == sid);
@@ -1716,6 +1758,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 }
                             }
                         } else {
+                            let dynamic_symbols_by_sid = HashMap::from([(sid, sub.symbol.clone())]);
                             let trade_path = resolver.market_data_partition(
                                 &sub.symbol,
                                 sub.resolution,
@@ -1723,11 +1766,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 current_date,
                             );
                             if trade_path.exists() {
-                                match reader.read_trade_bar_partition(
-                                    &trade_path,
-                                    &sub.symbol,
-                                    &day_params,
-                                ) {
+                                match reader
+                                    .read_trade_bar_partition_grouped_async(
+                                        &trade_path,
+                                        &dynamic_symbols_by_sid,
+                                        &day_time_params.clone().with_symbols(vec![sid]),
+                                    )
+                                    .await
+                                    .map(|mut grouped| grouped.remove(&sid).unwrap_or_default())
+                                {
                                     Ok(mut bars) if !bars.is_empty() => {
                                         bars.retain(|bar| bar.symbol.id.sid == sid);
                                         if let Some(hours) = &exchange_hours {
@@ -1769,11 +1816,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 current_date,
                             );
                             if quote_path.exists() {
-                                match reader.read_quote_bar_partition(
-                                    &quote_path,
-                                    &sub.symbol,
-                                    &day_params,
-                                ) {
+                                match reader
+                                    .read_quote_bar_partition_grouped_async(
+                                        &quote_path,
+                                        &dynamic_symbols_by_sid,
+                                        &day_time_params.clone().with_symbols(vec![sid]),
+                                    )
+                                    .await
+                                    .map(|mut grouped| grouped.remove(&sid).unwrap_or_default())
+                                {
                                     Ok(mut bars) if !bars.is_empty() => {
                                         bars.retain(|bar| bar.symbol.id.sid == sid);
                                         if let Some(hours) = &exchange_hours {
@@ -2547,13 +2598,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     })
 }
 
-/// Before the backtest loop, fetch any symbols that don't have local data.
+/// Before the backtest loop, fetch missing low-resolution/single-file data.
 ///
 /// For daily/hourly (single-file per ticker): checks once and fetches the
 /// entire date range in one API call.
 ///
-/// For minute/second (date-partitioned): checks for the first date; if
-/// missing, fetches the full range and the provider splits by date on write.
+/// High-resolution date-partitioned data is resolved lazily in the intraday
+/// loop, matching LEAN's source-per-date subscription reader behavior.
 async fn pre_fetch_all(
     provider: Arc<dyn IHistoricalDataProvider>,
     factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
@@ -2960,6 +3011,31 @@ fn cached_partition_has_symbol_data(
     }
 }
 
+fn cached_partition_has_symbol_sid(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    sub: &SubscriptionDataConfig,
+    date: NaiveDate,
+    partition_sid_cache: &mut HashMap<PathBuf, HashSet<u64>>,
+) -> bool {
+    let path = subscription_data_path(resolver, sub, date);
+    if !path.exists() {
+        return false;
+    }
+
+    let symbol_sid_column = if sub.resolution == Resolution::Tick {
+        1
+    } else {
+        2
+    };
+    let sids = partition_sid_cache.entry(path.clone()).or_insert_with(|| {
+        reader
+            .read_partition_symbol_sids(&path, symbol_sid_column)
+            .unwrap_or_default()
+    });
+    sids.contains(&sub.symbol.id.sid)
+}
+
 fn load_trade_bar_partitions(
     reader: &ParquetReader,
     resolver: &PathResolver,
@@ -2985,52 +3061,58 @@ fn load_trade_bar_partitions(
     bars
 }
 
-fn cached_trade_partition(
+async fn cached_trade_partition(
     cache: &mut HashMap<PathBuf, HashMap<u64, Vec<TradeBar>>>,
     reader: &ParquetReader,
     path: PathBuf,
-    template: &Symbol,
+    symbols_by_sid: &HashMap<u64, Symbol>,
     sid: u64,
     params: &QueryParams,
 ) -> Vec<TradeBar> {
-    cache
-        .entry(path.clone())
-        .or_insert_with(|| {
-            let rows = reader
-                .read_trade_bar_partition(&path, template, params)
-                .unwrap_or_default();
-            let mut grouped: HashMap<u64, Vec<TradeBar>> = HashMap::new();
-            for row in rows {
-                grouped.entry(row.symbol.id.sid).or_default().push(row);
+    if !cache.contains_key(&path) {
+        let grouped = match reader
+            .read_trade_bar_partition_grouped_async(&path, symbols_by_sid, params)
+            .await
+        {
+            Ok(grouped) => grouped,
+            Err(err) => {
+                warn!("Failed to read trade partition {}: {}", path.display(), err);
+                HashMap::new()
             }
-            grouped
-        })
-        .get(&sid)
+        };
+        cache.insert(path.clone(), grouped);
+    }
+    cache
+        .get(&path)
+        .and_then(|grouped| grouped.get(&sid))
         .cloned()
         .unwrap_or_default()
 }
 
-fn cached_quote_partition(
+async fn cached_quote_partition(
     cache: &mut HashMap<PathBuf, HashMap<u64, Vec<QuoteBar>>>,
     reader: &ParquetReader,
     path: PathBuf,
-    template: &Symbol,
+    symbols_by_sid: &HashMap<u64, Symbol>,
     sid: u64,
     params: &QueryParams,
 ) -> Vec<QuoteBar> {
-    cache
-        .entry(path.clone())
-        .or_insert_with(|| {
-            let rows = reader
-                .read_quote_bar_partition(&path, template, params)
-                .unwrap_or_default();
-            let mut grouped: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
-            for row in rows {
-                grouped.entry(row.symbol.id.sid).or_default().push(row);
+    if !cache.contains_key(&path) {
+        let grouped = match reader
+            .read_quote_bar_partition_grouped_async(&path, symbols_by_sid, params)
+            .await
+        {
+            Ok(grouped) => grouped,
+            Err(err) => {
+                warn!("Failed to read quote partition {}: {}", path.display(), err);
+                HashMap::new()
             }
-            grouped
-        })
-        .get(&sid)
+        };
+        cache.insert(path.clone(), grouped);
+    }
+    cache
+        .get(&path)
+        .and_then(|grouped| grouped.get(&sid))
         .cloned()
         .unwrap_or_default()
 }
@@ -3850,6 +3932,53 @@ async fn load_option_eod_bars(
 /// Parquet-native providers are read directly from provider parquet paths.
 /// Text providers use `get_source()`/`reader()` and persist parsed points as
 /// framework parquet under `{data_root}/custom/...`.
+async fn load_low_resolution_custom_data_for_day(
+    custom_subs: &[CustomDataSubscription],
+    custom_history: &HashMap<String, HashMap<NaiveDate, Vec<CustomDataPoint>>>,
+    config: &RunConfig,
+    current_date: NaiveDate,
+) -> Result<HashMap<String, Vec<CustomDataPoint>>> {
+    let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
+    for sub in custom_subs {
+        if sub.config.resolution.is_high_resolution() {
+            continue;
+        }
+        let key = sub.ticker.to_uppercase();
+        if let Some(by_date) = custom_history.get(&key) {
+            if let Some(pts) = by_date.get(&current_date) {
+                custom_data_for_day.insert(sub.ticker.clone(), pts.clone());
+            }
+            continue;
+        }
+
+        let source = config
+            .custom_data_sources
+            .iter()
+            .find(|s| s.name() == sub.source_type)
+            .cloned();
+        let points = load_custom_data_points_for_subscription(
+            config.data_root.clone(),
+            sub.source_type.clone(),
+            sub.ticker.clone(),
+            current_date,
+            source,
+            sub.config.clone(),
+            sub.dynamic_query.clone(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load custom data for {}/{} {}",
+                sub.source_type, sub.ticker, current_date
+            )
+        })?;
+        if !points.is_empty() {
+            custom_data_for_day.insert(sub.ticker.clone(), points);
+        }
+    }
+    Ok(custom_data_for_day)
+}
+
 async fn load_custom_data_points_for_subscription(
     data_root: PathBuf,
     source_type: String,

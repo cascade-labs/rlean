@@ -15,4 +15,4 @@ pub use reader::{ParquetReader, QueryParams};
 pub use schema::{
     custom_data_schema, FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow,
 };
-pub use writer::{ParquetWriter, WriterConfig};
+pub use writer::{ParquetWriter, WriterCompression, WriterConfig};

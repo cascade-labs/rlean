@@ -151,7 +151,7 @@ struct RunArgs {
     report: Option<PathBuf>,
 
     // ── Logging ───────────────────────────────────────────────────────────────
-    /// Enable debug logging (equivalent to RUST_LOG=debug)
+    /// Enable debug logging for rlean crates
     #[arg(long, short = 'v')]
     verbose: bool,
 }
@@ -167,11 +167,17 @@ async fn main() -> Result<()> {
         _ => false,
     };
 
-    let filter = if verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::from_default_env().add_directive("info".parse().unwrap())
-    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if verbose {
+            EnvFilter::new(
+                "info,rlean=debug,lean_algorithm=debug,lean_core=debug,lean_data=debug,\
+                 lean_data_providers=debug,lean_engine=debug,lean_python=debug,\
+                 lean_storage=debug",
+            )
+        } else {
+            EnvFilter::new("info")
+        }
+    });
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
