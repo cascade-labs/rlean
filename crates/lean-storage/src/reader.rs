@@ -43,6 +43,11 @@ impl QueryParams {
         self
     }
 
+    pub fn with_symbols(mut self, sids: Vec<u64>) -> Self {
+        self.predicate = self.predicate.with_symbols(sids);
+        self
+    }
+
     pub fn with_limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self

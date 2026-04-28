@@ -1582,6 +1582,7 @@ mod tests {
 
     #[test]
     fn slice_proxy_retain_subscriptions_removes_stale_cells_and_aliases() {
+        crate::test_python::init();
         Python::attach(|py| {
             let market = Market::usa();
             let spy = Symbol::create_equity("SPY", &market);

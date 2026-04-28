@@ -631,7 +631,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // request; those that don't (e.g. thetadata) return NotImplemented.
     let factor_reader = ParquetReader::new();
     let mut factor_map: HashMap<u64, Vec<FactorFileEntry>> = HashMap::new();
+    let mut loaded_factor_sids: HashSet<u64> = HashSet::new();
     for sub in &subscriptions {
+        if !loaded_factor_sids.insert(sub.symbol.id.sid) {
+            continue;
+        }
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
         let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
@@ -644,7 +648,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
         match factor_reader.read_factor_file(&factor_path) {
             Ok(rows) if !rows.is_empty() => {
-                info!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
+                debug!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
                 factor_map.insert(sub.symbol.id.sid, rows);
             }
             _ => {
@@ -1110,11 +1114,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             );
 
             if let Some(ref provider) = config.historical_provider {
+                let cache_reader = ParquetReader::new();
                 let missing_subs: Vec<_> = subscriptions
                     .iter()
                     .filter(|sub| sub.resolution.is_high_resolution())
                     .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
-                    .filter(|sub| !subscription_data_path(&resolver, sub, current_date).exists())
+                    .filter(|sub| {
+                        !cached_partition_has_symbol_data(
+                            &cache_reader,
+                            &resolver,
+                            sub,
+                            current_date,
+                        )
+                    })
                     .cloned()
                     .collect();
                 if !missing_subs.is_empty() {
@@ -1138,9 +1150,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
-            let mut trade_partition_cache: HashMap<PathBuf, Vec<TradeBar>> = HashMap::new();
-            let mut quote_partition_cache: HashMap<PathBuf, Vec<QuoteBar>> = HashMap::new();
-            let mut tick_partition_cache: HashMap<PathBuf, Vec<Tick>> = HashMap::new();
+            let mut trade_partition_cache: HashMap<PathBuf, HashMap<u64, Vec<TradeBar>>> =
+                HashMap::new();
+            let mut quote_partition_cache: HashMap<PathBuf, HashMap<u64, Vec<QuoteBar>>> =
+                HashMap::new();
+            let mut tick_partition_cache: HashMap<PathBuf, HashMap<u64, Vec<Tick>>> =
+                HashMap::new();
 
             for sub in &subscriptions {
                 // In intraday mode skip low-resolution subscriptions (e.g. the daily
@@ -1165,6 +1180,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &reader,
                             tick_path,
                             &sub.symbol,
+                            sid,
                             &day_params,
                         );
                         if !ticks.is_empty() {
@@ -1198,6 +1214,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &reader,
                             trade_path,
                             &sub.symbol,
+                            sid,
                             &day_params,
                         );
                         if !bars.is_empty() {
@@ -1225,6 +1242,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &reader,
                             quote_path,
                             &sub.symbol,
+                            sid,
                             &day_params,
                         );
                         if !bars.is_empty() {
@@ -1276,7 +1294,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let runtime = load_option_chain_runtime(
                     &config.data_root,
                     &ticker,
-                    &canonical,
+                    canonical,
                     option_resolution,
                     current_date,
                     spot,
@@ -2548,8 +2566,8 @@ async fn pre_fetch_all(
         return Ok(());
     }
 
-    info!(
-        "Prefetching {} subscriptions with parallelism {} ({} → {})",
+    debug!(
+        "Checking local data coverage for {} subscriptions with parallelism {} ({} → {})",
         subscriptions.len(),
         SUBSCRIPTION_PREFETCH_CONCURRENCY.min(subscriptions.len()),
         start,
@@ -2723,10 +2741,10 @@ async fn pre_fetch_missing_high_resolution_days(
     resolver: &PathResolver,
 ) -> Result<usize> {
     let dates = expected_market_dates(&sub.symbol, start, end);
+    let reader = ParquetReader::new();
     let mut missing = Vec::new();
     for date in dates {
-        let path = subscription_data_path(resolver, sub, date);
-        if !path.exists() {
+        if !cached_partition_has_symbol_data(&reader, resolver, sub, date) {
             missing.push(date);
         }
     }
@@ -2859,9 +2877,9 @@ async fn local_data_covers_range(
     }
 
     if sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote {
+        let reader = ParquetReader::new();
         for current in &expected_dates {
-            let path = subscription_data_path(resolver, sub, *current);
-            if !path.exists() {
+            if !cached_partition_has_symbol_data(&reader, resolver, sub, *current) {
                 return false;
             }
         }
@@ -2869,10 +2887,12 @@ async fn local_data_covers_range(
     }
 
     let reader = ParquetReader::new();
-    let params = QueryParams::new().with_time_range(
-        date_to_datetime(start, 0, 0, 0),
-        date_to_datetime(end, 23, 59, 59),
-    );
+    let params = QueryParams::new()
+        .with_time_range(
+            date_to_datetime(start, 0, 0, 0),
+            date_to_datetime(end, 23, 59, 59),
+        )
+        .with_symbols(vec![sub.symbol.id.sid]);
     let mut bars = Vec::new();
     for current in &expected_dates {
         let path = subscription_data_path(resolver, sub, *current);
@@ -2907,6 +2927,39 @@ fn subscription_data_path(
     resolver.market_data_partition(&sub.symbol, sub.resolution, tick_type, date)
 }
 
+fn cached_partition_has_symbol_data(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    sub: &SubscriptionDataConfig,
+    date: NaiveDate,
+) -> bool {
+    let path = subscription_data_path(resolver, sub, date);
+    if !path.exists() {
+        return false;
+    }
+
+    let params = QueryParams::new()
+        .with_time_range(
+            date_to_datetime(date, 0, 0, 0),
+            date_to_datetime(date, 23, 59, 59),
+        )
+        .with_symbols(vec![sub.symbol.id.sid]);
+
+    if sub.resolution == Resolution::Tick {
+        reader
+            .read_tick_partition(&path, &sub.symbol, &params)
+            .is_ok_and(|rows| !rows.is_empty())
+    } else if sub.tick_type == TickType::Quote {
+        reader
+            .read_quote_bar_partition(&path, &sub.symbol, &params)
+            .is_ok_and(|rows| !rows.is_empty())
+    } else {
+        reader
+            .read_trade_bar_partition(&path, &sub.symbol, &params)
+            .is_ok_and(|rows| !rows.is_empty())
+    }
+}
+
 fn load_trade_bar_partitions(
     reader: &ParquetReader,
     resolver: &PathResolver,
@@ -2933,54 +2986,78 @@ fn load_trade_bar_partitions(
 }
 
 fn cached_trade_partition(
-    cache: &mut HashMap<PathBuf, Vec<TradeBar>>,
+    cache: &mut HashMap<PathBuf, HashMap<u64, Vec<TradeBar>>>,
     reader: &ParquetReader,
     path: PathBuf,
     template: &Symbol,
+    sid: u64,
     params: &QueryParams,
 ) -> Vec<TradeBar> {
     cache
         .entry(path.clone())
         .or_insert_with(|| {
-            reader
+            let rows = reader
                 .read_trade_bar_partition(&path, template, params)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let mut grouped: HashMap<u64, Vec<TradeBar>> = HashMap::new();
+            for row in rows {
+                grouped.entry(row.symbol.id.sid).or_default().push(row);
+            }
+            grouped
         })
-        .clone()
+        .get(&sid)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn cached_quote_partition(
-    cache: &mut HashMap<PathBuf, Vec<QuoteBar>>,
+    cache: &mut HashMap<PathBuf, HashMap<u64, Vec<QuoteBar>>>,
     reader: &ParquetReader,
     path: PathBuf,
     template: &Symbol,
+    sid: u64,
     params: &QueryParams,
 ) -> Vec<QuoteBar> {
     cache
         .entry(path.clone())
         .or_insert_with(|| {
-            reader
+            let rows = reader
                 .read_quote_bar_partition(&path, template, params)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let mut grouped: HashMap<u64, Vec<QuoteBar>> = HashMap::new();
+            for row in rows {
+                grouped.entry(row.symbol.id.sid).or_default().push(row);
+            }
+            grouped
         })
-        .clone()
+        .get(&sid)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn cached_tick_partition(
-    cache: &mut HashMap<PathBuf, Vec<Tick>>,
+    cache: &mut HashMap<PathBuf, HashMap<u64, Vec<Tick>>>,
     reader: &ParquetReader,
     path: PathBuf,
     template: &Symbol,
+    sid: u64,
     params: &QueryParams,
 ) -> Vec<Tick> {
     cache
         .entry(path.clone())
         .or_insert_with(|| {
-            reader
+            let rows = reader
                 .read_tick_partition(&path, template, params)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let mut grouped: HashMap<u64, Vec<Tick>> = HashMap::new();
+            for row in rows {
+                grouped.entry(row.symbol.id.sid).or_default().push(row);
+            }
+            grouped
         })
-        .clone()
+        .get(&sid)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn expected_market_dates(symbol: &Symbol, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
@@ -3724,7 +3801,7 @@ async fn load_option_eod_bars(
     if cache_path.exists() {
         let reader = ParquetReader::new();
         let cached = reader
-            .read_option_eod_bars(&[cache_path.clone()])
+            .read_option_eod_bars(std::slice::from_ref(&cache_path))
             .unwrap_or_default()
             .into_iter()
             .filter(|bar| bar.underlying.eq_ignore_ascii_case(ticker))
@@ -3752,7 +3829,7 @@ async fn load_option_eod_bars(
 
     let mut merged = if cache_path.exists() {
         ParquetReader::new()
-            .read_option_eod_bars(&[cache_path.clone()])
+            .read_option_eod_bars(std::slice::from_ref(&cache_path))
             .unwrap_or_default()
     } else {
         Vec::new()

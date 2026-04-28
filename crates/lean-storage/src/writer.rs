@@ -445,6 +445,7 @@ impl ParquetWriter {
         let lock_path = path.with_file_name(".data.parquet.lock");
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .read(true)
             .open(&lock_path)?;
