@@ -5,11 +5,11 @@ use arrow_array::types::{
     TimestampSecondType,
 };
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_cast::display::array_value_to_string;
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use datafusion::common::config::ConfigOptions;
 use datafusion::prelude::*;
 use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol};
@@ -1176,12 +1176,12 @@ impl ParquetReader {
 
 fn validate_custom_parquet_source(source: &CustomParquetSource) -> LeanResult<()> {
     match (&source.time_column, source.time_format.as_deref()) {
-        (Some(_), Some("timestamp")) | (None, None) => Ok(()),
+        (Some(_), Some("timestamp" | "tradealert")) | (None, None) => Ok(()),
         (Some(_), None) => Err(lean_core::LeanError::DataError(
             "custom parquet source with time_column must set time_format='timestamp'".to_string(),
         )),
         (Some(_), Some(other)) => Err(lean_core::LeanError::DataError(format!(
-            "unsupported custom parquet time_format '{other}'; native custom parquet requires Arrow timestamp columns"
+            "unsupported custom parquet time_format '{other}'; native custom parquet supports 'timestamp' and 'tradealert'"
         ))),
         (None, Some(_)) => Err(lean_core::LeanError::DataError(
             "custom parquet source cannot set time_format without time_column".to_string(),
@@ -1450,9 +1450,10 @@ fn parquet_custom_time_to_datetime(
 
     let time = match format {
         Some("timestamp") => arrow_timestamp_cell_as_datetime(array, row, time_zone),
+        Some("tradealert") => tradealert_time_cell_as_datetime(array, row, time_zone, _date),
         Some(other) => {
             return Err(lean_core::LeanError::DataError(format!(
-                "unsupported custom parquet time_format '{other}'; native custom parquet requires Arrow timestamp columns"
+                "unsupported custom parquet time_format '{other}'; native custom parquet supports 'timestamp' and 'tradealert'"
             )))
         }
         None => {
@@ -1467,6 +1468,52 @@ fn parquet_custom_time_to_datetime(
             "custom parquet timestamp column must be Arrow Timestamp".to_string(),
         )
     })
+}
+
+fn tradealert_time_cell_as_datetime(
+    array: &dyn Array,
+    row: usize,
+    time_zone: Option<&str>,
+    date: NaiveDate,
+) -> Option<DateTime> {
+    let raw = if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        values.value(row).trim().to_string()
+    } else if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        values.value(row).trim().to_string()
+    } else {
+        array_value_to_string(array, row).ok()?.trim().to_string()
+    };
+    let raw = raw.trim_matches('"').trim();
+
+    let local = parse_tradealert_time(raw, date)?;
+    let tz = custom_time_zone(time_zone);
+    let zoned = tz
+        .from_local_datetime(&local)
+        .single()
+        .or_else(|| tz.from_local_datetime(&local).earliest())
+        .or_else(|| tz.from_local_datetime(&local).latest())?;
+    Some(DateTime::from(zoned.with_timezone(&Utc)))
+}
+
+fn parse_tradealert_time(raw: &str, date: NaiveDate) -> Option<NaiveDateTime> {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S:%3f",
+        "%Y-%m-%d %H:%M:%S%.3f",
+        "%Y-%m-%dT%H:%M:%S:%3f",
+        "%Y-%m-%dT%H:%M:%S%.3f",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(raw, fmt) {
+            return Some(dt);
+        }
+    }
+
+    for fmt in ["%H:%M:%S:%3f", "%H:%M:%S%.3f"] {
+        if let Ok(time) = NaiveTime::parse_from_str(raw, fmt) {
+            return Some(date.and_time(time));
+        }
+    }
+
+    None
 }
 
 fn arrow_timestamp_cell_as_datetime(

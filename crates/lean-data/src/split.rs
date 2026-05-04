@@ -14,7 +14,8 @@ pub enum SplitType {
 pub struct Split {
     pub symbol: Symbol,
     pub time: DateTime,
-    /// New shares per old share (e.g., 2.0 for 2:1 split, 0.5 for 1:2 reverse).
+    /// LEAN split factor, expressed as the price scale applied on the split.
+    /// A 2:1 forward split is 0.5; a 1:10 reverse split is 10.
     pub split_factor: Price,
     pub reference_price: Price,
     pub split_type: SplitType,

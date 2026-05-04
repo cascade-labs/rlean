@@ -17,12 +17,13 @@ use tracing::{debug, info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
 use lean_core::{
-    exchange_hours::ExchangeHours, DateTime, Market, OptionRight, OptionStyle, Resolution,
-    SecurityType, Symbol, SymbolOptionsExt, TickType, TimeSpan,
+    exchange_hours::ExchangeHours, DataNormalizationMode, DateTime, Market, OptionRight,
+    OptionStyle, Resolution, SecurityType, Symbol, SymbolOptionsExt, TickType, TimeSpan,
 };
+use lean_data::split::SplitType;
 use lean_data::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
-    CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice,
+    CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice, Split,
     SubscriptionDataConfig, SymbolChangedEvent, Tick, TradeBar, TradeBarData,
 };
 use lean_options::payoff::{get_exercise_quantity, intrinsic_value};
@@ -48,7 +49,7 @@ use crate::charting::ChartCollection;
 use crate::py_adapter::{set_algorithm_time, PyAlgorithmAdapter};
 use crate::py_data::SliceProxy;
 use crate::py_framework::run_framework_pipeline;
-use lean_data_providers::IHistoryProvider as SyncHistoryProvider;
+use lean_data_providers::{DataType, HistoryBatchRequest, IHistoryProvider as SyncHistoryProvider};
 
 const HIGH_RESOLUTION_PREFETCH_CONCURRENCY: usize = 8;
 const SUBSCRIPTION_PREFETCH_CONCURRENCY: usize = 8;
@@ -634,6 +635,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         .await?;
     }
 
+    if let Some(ref provider) = config.history_provider {
+        ensure_auxiliary_files_for_subscriptions(
+            provider.clone(),
+            &subscriptions,
+            start_date,
+            end_date,
+            &resolver,
+        )
+        .await;
+    }
+
     // ── factor files: load from disk ─────────────────────────────────────────
     // Factor files are Parquet; key = symbol SID → rows sorted newest first.
     // Generated during pre_fetch_all via DataType::FactorFile requests —
@@ -1180,7 +1192,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 day_time_params.clone().with_symbols(day_symbol_sids)
             };
 
-            if let Some(ref provider) = config.historical_provider {
+            if let Some(ref provider) = config.history_provider {
                 let cache_reader = ParquetReader::new();
                 let mut partition_sid_cache: HashMap<PathBuf, HashSet<u64>> = HashMap::new();
                 let mut missing_subs = Vec::new();
@@ -1202,11 +1214,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 }
                 if !missing_subs.is_empty() {
-                    if let Err(e) = pre_fetch_all(
+                    if let Err(e) = pre_fetch_high_resolution_day_batched(
                         provider.clone(),
                         config.history_provider.clone(),
                         &missing_subs,
-                        current_date,
                         current_date,
                         &resolver,
                     )
@@ -1459,6 +1470,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             if has_data {
                 trading_days += 1;
+                let first_timestamp = all_timestamps.iter().next().copied();
+                let split_time = lean_core::NanosecondTimestamp(
+                    first_timestamp.unwrap_or_else(|| date_to_datetime(current_date, 0, 0, 0).0),
+                );
+                let day_split_events =
+                    split_events_for_date(&subscriptions, &factor_map, current_date, split_time);
 
                 let mut trade_by_ts: HashMap<u64, HashMap<i64, TradeBar>> = HashMap::new();
                 for (&sid, bars) in &day_trade_bars {
@@ -1494,6 +1511,20 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let mut minute_quote_bars: HashMap<u64, QuoteBar> = HashMap::new();
                     let mut minute_ticks: HashMap<u64, Vec<Tick>> = HashMap::new();
                     let mut bars_for_orders: HashMap<u64, TradeBar> = HashMap::new();
+
+                    if Some(ts_ns) == first_timestamp {
+                        apply_split_events_to_state(
+                            &day_split_events,
+                            &subscriptions,
+                            &option_underlying_sids,
+                            &portfolio,
+                            &order_processor,
+                            &mut open_positions,
+                        );
+                        for split in &day_split_events {
+                            minute_slice.add_split(split.clone());
+                        }
+                    }
 
                     for sub in &subscriptions {
                         let sid = sub.symbol.id.sid;
@@ -1669,12 +1700,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         .cloned()
                         .collect();
                     if !new_high_res_subs.is_empty() {
-                        if let Some(ref provider) = config.historical_provider {
-                            if let Err(e) = pre_fetch_all(
+                        if let Some(ref provider) = config.history_provider {
+                            if let Err(e) = pre_fetch_high_resolution_day_batched(
                                 provider.clone(),
                                 config.history_provider.clone(),
                                 &new_high_res_subs,
-                                current_date,
                                 current_date,
                                 &resolver,
                             )
@@ -2123,64 +2153,33 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
-            // ── split adjustment for option-underlying equities ───────────────
-            // Option-underlying equities skip factor adjustment (raw prices used
-            // so that the strategy sees prices on the same scale as ThetaData
-            // option strikes).  When a split occurs, the raw price halves but
-            // holding quantities don't change — causing a 50% portfolio cliff.
-            //
-            // Fix: detect when the split_factor boundary crosses into a new era
-            // and adjust holding quantity / average_price exactly as C# LEAN's
-            // SecurityPortfolioManager.ApplySplit does in live/raw mode.
-            //
-            // Also record split ratios for use by process_option_expirations so
-            // that option contracts written in the pre-split era are correctly
-            // evaluated OTM/ITM against the post-split spot price.
-            let mut split_ratios_today: HashMap<u64, f64> = HashMap::new();
-            for sid in &option_underlying_sids {
-                if let Some(rows) = factor_map.get(sid) {
-                    let (_, sf_today) = factor_for_entry(rows, current_date);
-                    let prev_date = current_date - chrono::Duration::days(1);
-                    let (_, sf_prev) = factor_for_entry(rows, prev_date);
-                    if (sf_today - sf_prev).abs() > 1e-9 && sf_prev > 0.0 {
-                        // Split factor changed — adjust equity holding quantities.
-                        // ratio > 1 = forward split (more shares at lower price).
-                        let ratio = sf_today / sf_prev;
-                        split_ratios_today.insert(*sid, ratio);
-                        let holding = portfolio.get_holding_by_sid(*sid);
-                        if holding.is_invested() {
-                            let new_qty =
-                                holding.quantity * Decimal::from_f64(ratio).unwrap_or(Decimal::ONE);
-                            let new_avg = if ratio != 0.0 {
-                                holding.average_price
-                                    / Decimal::from_f64(ratio).unwrap_or(Decimal::ONE)
-                            } else {
-                                holding.average_price
-                            };
-                            portfolio.set_holdings(
-                                &holding.symbol,
-                                new_avg,
-                                new_qty,
-                                holding.contract_multiplier,
-                            );
-                            info!(
-                                "Split adjustment: {} sf {:.4}→{:.4} (×{:.4}): \
-                                 qty {:.0}→{:.0} avg_px {:.4}→{:.4}",
-                                holding.symbol.value,
-                                sf_prev,
-                                sf_today,
-                                ratio,
-                                holding.quantity.to_f64().unwrap_or(0.0),
-                                new_qty.to_f64().unwrap_or(0.0),
-                                holding.average_price.to_f64().unwrap_or(0.0),
-                                new_avg.to_f64().unwrap_or(0.0),
-                            );
-                        }
-                    }
-                }
-            }
+            // Split events are generated from factor-file boundaries for every
+            // equity subscription.  C# LEAN applies holdings/open-order/trade
+            // adjustments only in live/raw mode; option underlyings are treated
+            // as raw here because their bars intentionally bypass factor scaling.
+            let day_split_events =
+                split_events_for_date(&subscriptions, &factor_map, current_date, utc_time);
+            apply_split_events_to_state(
+                &day_split_events,
+                &subscriptions,
+                &option_underlying_sids,
+                &portfolio,
+                &order_processor,
+                &mut open_positions,
+            );
+            let split_ratios_today: HashMap<u64, f64> = day_split_events
+                .iter()
+                .filter(|split| option_underlying_sids.contains(&split.symbol.id.sid))
+                .filter_map(|split| {
+                    let sf = split.split_factor.to_f64()?;
+                    (sf != 0.0).then_some((split.symbol.id.sid, 1.0 / sf))
+                })
+                .collect();
 
             let mut slice = Slice::new(utc_time);
+            for split in &day_split_events {
+                slice.add_split(split.clone());
+            }
             for sub in &subscriptions {
                 let sid = sub.symbol.id.sid;
                 if let Some(day_bar) = bar_map.get(&sid).and_then(|m| m.get(&current_date)) {
@@ -2645,6 +2644,234 @@ async fn pre_fetch_all(
     Ok(())
 }
 
+async fn ensure_auxiliary_files_for_subscriptions(
+    provider: Arc<dyn lean_data_providers::IHistoryProvider>,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: &PathResolver,
+) {
+    let reader = ParquetReader::new();
+    let mut seen = HashSet::new();
+    for sub in subscriptions {
+        if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
+            continue;
+        }
+        if !seen.insert(sub.symbol.id.sid) {
+            continue;
+        }
+
+        let ticker = sub.symbol.permtick.to_lowercase();
+        let market = sub.symbol.market().as_str().to_lowercase();
+        let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
+        let map_path = resolver
+            .data_root
+            .join("equity")
+            .join(&market)
+            .join("map_files")
+            .join(format!("{ticker}.parquet"));
+        if !map_path.exists() {
+            let request = lean_data_providers::HistoryRequest {
+                symbol: sub.symbol.clone(),
+                resolution: Resolution::Daily,
+                start: date_to_datetime(start, 0, 0, 0),
+                end: date_to_datetime(end, 23, 59, 59),
+                data_type: DataType::MapFile,
+            };
+            if let Err(e) = provider.get_history(&request).await {
+                warn!("Map file generation failed for {}: {e}", sub.symbol.value);
+            }
+        }
+
+        let map_rows = reader.read_map_file(&map_path).unwrap_or_default();
+        let Some((mapped_start, mapped_end)) = mapped_data_date_range(&map_rows, start, end) else {
+            continue;
+        };
+
+        let factor_path = resolver
+            .data_root
+            .join(&sec)
+            .join(&market)
+            .join("factor_files")
+            .join(format!("{ticker}.parquet"));
+        let factor_valid = factor_path.exists()
+            && reader
+                .read_factor_file(&factor_path)
+                .is_ok_and(|rows| factor_file_covers_range(&rows, mapped_start, mapped_end));
+        if factor_valid {
+            continue;
+        }
+
+        let request = lean_data_providers::HistoryRequest {
+            symbol: sub.symbol.clone(),
+            resolution: Resolution::Daily,
+            start: date_to_datetime(mapped_start, 0, 0, 0),
+            end: date_to_datetime(mapped_end, 23, 59, 59),
+            data_type: DataType::FactorFile,
+        };
+        match provider.get_history(&request).await {
+            Ok(_) => debug!("Factor file generated for {}", sub.symbol.value),
+            Err(e) => warn!(
+                "Factor file generation failed for {}: {e}",
+                sub.symbol.value
+            ),
+        }
+    }
+}
+
+async fn pre_fetch_high_resolution_day_batched(
+    provider: Arc<dyn SyncHistoryProvider>,
+    factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    date: NaiveDate,
+    resolver: &PathResolver,
+) -> Result<usize> {
+    #[derive(Clone)]
+    struct BatchItem {
+        requested_symbol: Symbol,
+        provider_symbol: Symbol,
+        resolution: Resolution,
+        data_type: DataType,
+        is_mapped_request: bool,
+    }
+
+    let mut items = Vec::new();
+    for sub in subscriptions {
+        if !sub.resolution.is_high_resolution() || !is_expected_market_date(&sub.symbol, date) {
+            continue;
+        }
+
+        let ticker = sub.symbol.permtick.to_lowercase();
+        let market = sub.symbol.market().as_str().to_lowercase();
+        let map_path = resolver
+            .data_root
+            .join("equity")
+            .join(&market)
+            .join("map_files")
+            .join(format!("{ticker}.parquet"));
+
+        if !map_path.exists() {
+            if let Some(ref fp) = factor_provider {
+                let request = lean_data_providers::HistoryRequest {
+                    symbol: sub.symbol.clone(),
+                    resolution: Resolution::Daily,
+                    start: date_to_datetime(date, 0, 0, 0),
+                    end: date_to_datetime(date, 23, 59, 59),
+                    data_type: DataType::MapFile,
+                };
+                if let Err(e) = fp.get_history(&request).await {
+                    warn!("Map file generation failed for {}: {e}", sub.symbol.value);
+                }
+            }
+        }
+
+        let map_rows = ParquetReader::new()
+            .read_map_file(&map_path)
+            .unwrap_or_default();
+        if mapped_data_date_range(&map_rows, date, date).is_none() {
+            continue;
+        }
+
+        let requested_symbol = sub.symbol.clone();
+        let provider_symbol = mapped_symbol_for_provider(sub.symbol.clone(), &map_rows, date);
+        let data_type = if sub.resolution == Resolution::Tick {
+            DataType::Tick
+        } else if sub.tick_type == TickType::Quote {
+            DataType::QuoteBar
+        } else {
+            DataType::TradeBar
+        };
+        items.push(BatchItem {
+            is_mapped_request: provider_symbol.permtick != requested_symbol.permtick,
+            requested_symbol,
+            provider_symbol,
+            resolution: sub.resolution,
+            data_type,
+        });
+    }
+
+    let mut rows_downloaded = 0usize;
+    let mut groups: HashMap<(Resolution, DataType), Vec<BatchItem>> = HashMap::new();
+    for item in items {
+        groups
+            .entry((item.resolution, item.data_type))
+            .or_default()
+            .push(item);
+    }
+
+    for ((resolution, data_type), group) in groups {
+        let request = HistoryBatchRequest {
+            symbols: group
+                .iter()
+                .map(|item| item.provider_symbol.clone())
+                .collect(),
+            resolution,
+            start: date_to_datetime(date, 0, 0, 0),
+            end: date_to_datetime(date, 23, 59, 59),
+            data_type,
+        };
+        let batch = provider.get_history_batch(&request).await?;
+        let returned_sids: HashSet<u64> = match data_type {
+            DataType::TradeBar => {
+                rows_downloaded += batch.trade_bars.len();
+                batch
+                    .trade_bars
+                    .iter()
+                    .map(|bar| bar.symbol.id.sid)
+                    .collect()
+            }
+            DataType::QuoteBar => {
+                rows_downloaded += batch.quote_bars.len();
+                batch
+                    .quote_bars
+                    .iter()
+                    .map(|bar| bar.symbol.id.sid)
+                    .collect()
+            }
+            DataType::Tick => {
+                rows_downloaded += batch.ticks.len();
+                batch.ticks.iter().map(|tick| tick.symbol.id.sid).collect()
+            }
+            DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => HashSet::new(),
+        };
+
+        let fallback_symbols: Vec<Symbol> = group
+            .iter()
+            .filter(|item| {
+                item.is_mapped_request && !returned_sids.contains(&item.requested_symbol.id.sid)
+            })
+            .map(|item| item.requested_symbol.clone())
+            .collect();
+        if fallback_symbols.is_empty() {
+            continue;
+        }
+
+        debug!(
+            "Retrying {} mapped {} {:?} requests for {} with requested tickers",
+            fallback_symbols.len(),
+            resolution,
+            data_type,
+            date
+        );
+        let retry_request = HistoryBatchRequest {
+            symbols: fallback_symbols,
+            resolution,
+            start: date_to_datetime(date, 0, 0, 0),
+            end: date_to_datetime(date, 23, 59, 59),
+            data_type,
+        };
+        let retry_batch = provider.get_history_batch(&retry_request).await?;
+        rows_downloaded += match data_type {
+            DataType::TradeBar => retry_batch.trade_bars.len(),
+            DataType::QuoteBar => retry_batch.quote_bars.len(),
+            DataType::Tick => retry_batch.ticks.len(),
+            DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => 0,
+        };
+    }
+
+    Ok(rows_downloaded)
+}
+
 async fn pre_fetch_subscription(
     provider: Arc<dyn IHistoricalDataProvider>,
     factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
@@ -2664,20 +2891,58 @@ async fn pre_fetch_subscription(
         .join(&market)
         .join("factor_files")
         .join(format!("{ticker}.parquet"));
+    let map_path = resolver
+        .data_root
+        .join("equity")
+        .join(&market)
+        .join("map_files")
+        .join(format!("{ticker}.parquet"));
 
-    // A factor file is valid if it exists, is non-empty, AND the sentinel row
-    // (row 0, dated when the file was last generated) covers the backtest end.
-    let factor_valid = factor_path.exists() && {
-        let r = ParquetReader::new();
-        r.read_factor_file(&factor_path).is_ok_and(|rows| {
-            if rows.is_empty() {
-                return false;
+    if !map_path.exists() {
+        if let Some(ref fp) = factor_provider {
+            debug!(
+                "Map file missing for {} — requesting from provider",
+                sub.symbol.value
+            );
+            let request = lean_data_providers::HistoryRequest {
+                symbol: sub.symbol.clone(),
+                resolution: lean_core::Resolution::Daily,
+                start: date_to_datetime(start, 0, 0, 0),
+                end: date_to_datetime(end, 23, 59, 59),
+                data_type: lean_data_providers::DataType::MapFile,
+            };
+            match fp.get_history(&request).await {
+                Ok(_) => debug!("Map file generated for {}", sub.symbol.value),
+                Err(e) => warn!("Map file generation failed for {}: {e}", sub.symbol.value),
             }
-            rows[0].date >= end
-        })
+        }
+    }
+
+    let map_rows = ParquetReader::new()
+        .read_map_file(&map_path)
+        .unwrap_or_default();
+    let effective_range = mapped_data_date_range(&map_rows, start, end);
+    let Some((mapped_start, mapped_end)) = effective_range else {
+        debug!(
+            "Skipping data prefetch for {}: requested range {} → {} is outside map-file data range",
+            sub.symbol.value, start, end
+        );
+        return Ok(());
     };
 
-    let data_covers_range = local_data_covers_range(&sub, start, end, &resolver, &data_path).await;
+    // A factor file is valid if it exists, is non-empty, the sentinel row
+    // covers the backtest end, and the oldest row covers the requested start.
+    // Older rlean/Massive builds could write sentinel-only files for a narrow
+    // later request; accepting those for a longer backtest skips historical
+    // splits such as DPST's 2023-06-05 reverse split.
+    let factor_valid = factor_path.exists() && {
+        let r = ParquetReader::new();
+        r.read_factor_file(&factor_path)
+            .is_ok_and(|rows| factor_file_covers_range(&rows, mapped_start, mapped_end))
+    };
+
+    let data_covers_range =
+        local_data_covers_range(&sub, mapped_start, mapped_end, &resolver, &data_path).await;
 
     if data_covers_range && factor_valid {
         return Ok(());
@@ -2686,18 +2951,18 @@ async fn pre_fetch_subscription(
     // Clip start to the provider's earliest supported date (e.g. ThetaData
     // STANDARD only has data from 2018-01-01; requesting earlier causes 403).
     let effective_start = match provider.earliest_date() {
-        Some(earliest) if start < earliest => {
+        Some(earliest) if mapped_start < earliest => {
             warn!(
                 "Provider earliest date is {}; clipping backtest start from {} for {}",
-                earliest, start, sub.symbol.value
+                earliest, mapped_start, sub.symbol.value
             );
             earliest
         }
-        _ => start,
+        _ => mapped_start,
     };
 
     let start_dt = date_to_datetime(effective_start, 0, 0, 0);
-    let end_dt = date_to_datetime(end, 23, 59, 59);
+    let end_dt = date_to_datetime(mapped_end, 23, 59, 59);
 
     if !data_covers_range
         && (sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote)
@@ -2707,8 +2972,9 @@ async fn pre_fetch_subscription(
             factor_provider.clone(),
             &sub,
             effective_start,
-            end,
+            mapped_end,
             &resolver,
+            &map_rows,
         )
         .await?;
         if rows_downloaded > 0 {
@@ -2719,7 +2985,7 @@ async fn pre_fetch_subscription(
         } else {
             warn!(
                 "Historical provider returned 0 {} rows for {} ({} → {}); no cache file was written",
-                sub.resolution, sub.symbol.value, effective_start, end
+                sub.resolution, sub.symbol.value, effective_start, mapped_end
             );
         }
     } else if !data_covers_range {
@@ -2728,22 +2994,36 @@ async fn pre_fetch_subscription(
         // supported date when known, so a later narrower request cannot replace
         // a wider cached file with only the requested slice.
         let single_file_start = provider.earliest_date().unwrap_or(effective_start);
-        let single_file_start_dt = date_to_datetime(single_file_start, 0, 0, 0);
         debug!(
             "Local data missing or incomplete for {} — fetching single-file range from provider ({} → {})",
-            sub.symbol.value, single_file_start, end
+            sub.symbol.value, single_file_start, mapped_end
         );
-        let bars = provider
-            .get_trade_bars(
-                sub.symbol.clone(),
-                sub.resolution,
-                single_file_start_dt,
-                end_dt,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("historical provider failed for {}: {}", sub.symbol.value, e)
-            })?;
+        let mut bars = Vec::new();
+        for (range_start, range_end, mapped_ticker) in mapped_ticker_ranges(
+            &map_rows,
+            single_file_start,
+            mapped_end,
+            &sub.symbol.permtick,
+        ) {
+            let provider_symbol = symbol_with_mapped_ticker(&sub.symbol, &mapped_ticker);
+            bars.extend(
+                provider
+                    .get_trade_bars(
+                        provider_symbol,
+                        sub.resolution,
+                        date_to_datetime(range_start, 0, 0, 0),
+                        date_to_datetime(range_end, 23, 59, 59),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "historical provider failed for {}: {}",
+                            sub.symbol.value,
+                            e
+                        )
+                    })?,
+            );
+        }
         debug!(
             "Downloaded {} bars for {} and cached to disk",
             bars.len(),
@@ -2754,7 +3034,8 @@ async fn pre_fetch_subscription(
     let factor_needs_update = !factor_path.exists() || {
         let r = ParquetReader::new();
         r.read_factor_file(&factor_path)
-            .is_ok_and(|rows| rows.is_empty() || rows[0].date < end)
+            .map(|rows| !factor_file_covers_range(&rows, mapped_start, mapped_end))
+            .unwrap_or(true)
     };
     if factor_needs_update {
         if let Some(ref fp) = factor_provider {
@@ -2790,6 +3071,7 @@ async fn pre_fetch_missing_high_resolution_days(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
+    map_rows: &[MapFileEntry],
 ) -> Result<usize> {
     let dates = expected_market_dates(&sub.symbol, start, end);
     let reader = ParquetReader::new();
@@ -2826,10 +3108,16 @@ async fn pre_fetch_missing_high_resolution_days(
             let resolution = sub.resolution;
             let tick_type = sub.tick_type;
             let symbol_value = sub.symbol.value.clone();
+            let map_rows = map_rows.to_vec();
 
             tasks.spawn(async move {
                 let start_dt = date_to_datetime(date, 0, 0, 0);
                 let end_dt = date_to_datetime(date, 23, 59, 59);
+                let requested_symbol = symbol.clone();
+                let provider_symbol = mapped_symbol_for_provider(symbol, &map_rows, date);
+                let is_mapped_request =
+                    provider_symbol.permtick != requested_symbol.permtick;
+                let mapped_ticker = provider_symbol.permtick.clone();
 
                 if resolution == Resolution::Tick || tick_type == TickType::Quote {
                     let Some(fp) = factor_provider else {
@@ -2840,7 +3128,7 @@ async fn pre_fetch_missing_high_resolution_days(
                         return Ok((date, 0usize));
                     };
                     let request = lean_data_providers::HistoryRequest {
-                        symbol,
+                        symbol: provider_symbol,
                         resolution,
                         start: start_dt,
                         end: end_dt,
@@ -2850,7 +3138,7 @@ async fn pre_fetch_missing_high_resolution_days(
                             lean_data_providers::DataType::QuoteBar
                         },
                     };
-                    let rows = if resolution == Resolution::Tick {
+                    let mut rows = if resolution == Resolution::Tick {
                         match fp.get_ticks(&request).await {
                             Ok(rows) => rows.len(),
                             Err(e) => {
@@ -2875,10 +3163,51 @@ async fn pre_fetch_missing_high_resolution_days(
                             }
                         }
                     };
+                    if rows == 0 && is_mapped_request {
+                        debug!(
+                            "Mapped {} request for {} returned 0 rows on {}; retrying requested ticker {}",
+                            mapped_ticker,
+                            requested_symbol.permtick,
+                            date,
+                            requested_symbol.permtick
+                        );
+                        let retry_request = lean_data_providers::HistoryRequest {
+                            symbol: requested_symbol,
+                            resolution,
+                            start: start_dt,
+                            end: end_dt,
+                            data_type: request.data_type,
+                        };
+                        rows = if resolution == Resolution::Tick {
+                            match fp.get_ticks(&retry_request).await {
+                                Ok(rows) => rows.len(),
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "historical provider retry failed for {} {}: {}",
+                                        symbol_value,
+                                        date,
+                                        e
+                                    ));
+                                }
+                            }
+                        } else {
+                            match fp.get_quote_bars(&retry_request).await {
+                                Ok(rows) => rows.len(),
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "historical provider retry failed for {} {}: {}",
+                                        symbol_value,
+                                        date,
+                                        e
+                                    ));
+                                }
+                            }
+                        };
+                    }
                     Ok((date, rows))
                 } else {
-                    let bars = provider
-                        .get_trade_bars(symbol, resolution, start_dt, end_dt)
+                    let mut bars = provider
+                        .get_trade_bars(provider_symbol, resolution, start_dt, end_dt)
                         .await
                         .map_err(|e| {
                             anyhow::anyhow!(
@@ -2888,6 +3217,26 @@ async fn pre_fetch_missing_high_resolution_days(
                                 e
                             )
                         })?;
+                    if bars.is_empty() && is_mapped_request {
+                        debug!(
+                            "Mapped {} request for {} returned 0 rows on {}; retrying requested ticker {}",
+                            mapped_ticker,
+                            requested_symbol.permtick,
+                            date,
+                            requested_symbol.permtick
+                        );
+                        bars = provider
+                            .get_trade_bars(requested_symbol, resolution, start_dt, end_dt)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "historical provider retry failed for {} {}: {}",
+                                    symbol_value,
+                                    date,
+                                    e
+                                )
+                            })?;
+                    }
                     Ok((date, bars.len()))
                 }
             });
@@ -4189,21 +4538,220 @@ fn load_custom_data_points(
 /// Mirrors the LEAN behavior exercised by the tests here: use the most recent
 /// Return the mapped ticker at `date` using LEAN's convention.
 ///
-/// Rows are sorted newest-first; the first row whose date <= query_date is the
-/// active mapping for that date.
+/// LEAN map files are interpreted as rows sorted by ascending date where each
+/// row date is the last date the row's ticker is valid. The active mapping is
+/// the first row whose date is on/after the query date.
 fn ticker_at_date(rows: &[MapFileEntry], date: NaiveDate) -> Option<&str> {
     rows.iter()
-        .find(|r| r.date <= date)
+        .filter(|r| r.date >= date)
+        .min_by_key(|r| r.date)
         .map(|r| r.ticker.as_str())
 }
 
-/// Return the delisting date from a map file (first / newest row), if the
+/// Return the delisting date from a map file (last / newest row), if the
 /// security is delisted.
 ///
-/// LEAN convention: if the newest row's date is before 2049, it is a real
+/// LEAN convention: if the latest row's date is before 2049, it is a real
 /// delisting date.  Far-future sentinels (year >= 2049) indicate active.
 fn delisting_date(rows: &[MapFileEntry]) -> Option<NaiveDate> {
-    rows.first().map(|r| r.date).filter(|d| d.year() < 2049)
+    rows.iter()
+        .map(|r| r.date)
+        .max()
+        .filter(|d| d.year() < 2049)
+}
+
+fn first_map_file_date(rows: &[MapFileEntry]) -> Option<NaiveDate> {
+    rows.iter().map(|r| r.date).min()
+}
+
+fn mapped_data_date_range(
+    rows: &[MapFileEntry],
+    requested_start: NaiveDate,
+    requested_end: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    let start = first_map_file_date(rows)
+        .map(|first| requested_start.max(first))
+        .unwrap_or(requested_start);
+    let end = delisting_date(rows)
+        .map(|delisted| requested_end.min(delisted))
+        .unwrap_or(requested_end);
+
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn symbol_with_mapped_ticker(symbol: &Symbol, mapped_ticker: &str) -> Symbol {
+    let mut mapped = symbol.clone();
+    let ticker = mapped_ticker.to_uppercase();
+    mapped.value = ticker.clone();
+    mapped.permtick = ticker;
+    mapped
+}
+
+fn mapped_symbol_for_provider(symbol: Symbol, rows: &[MapFileEntry], date: NaiveDate) -> Symbol {
+    match ticker_at_date(rows, date) {
+        Some(ticker) => symbol_with_mapped_ticker(&symbol, ticker),
+        None => symbol,
+    }
+}
+
+fn mapped_ticker_ranges(
+    rows: &[MapFileEntry],
+    start: NaiveDate,
+    end: NaiveDate,
+    default_ticker: &str,
+) -> Vec<(NaiveDate, NaiveDate, String)> {
+    if start > end {
+        return Vec::new();
+    }
+    if rows.is_empty() {
+        return vec![(start, end, default_ticker.to_uppercase())];
+    }
+
+    let mut ranges = Vec::new();
+    let mut current_start = start;
+    let mut current_ticker = ticker_at_date(rows, start)
+        .unwrap_or(default_ticker)
+        .to_uppercase();
+    let mut date = start + chrono::Duration::days(1);
+    while date <= end {
+        let ticker = ticker_at_date(rows, date)
+            .unwrap_or(default_ticker)
+            .to_uppercase();
+        if ticker != current_ticker {
+            ranges.push((
+                current_start,
+                date - chrono::Duration::days(1),
+                current_ticker,
+            ));
+            current_start = date;
+            current_ticker = ticker;
+        }
+        date += chrono::Duration::days(1);
+    }
+    ranges.push((current_start, end, current_ticker));
+    ranges
+}
+
+fn factor_file_covers_range(rows: &[FactorFileEntry], start: NaiveDate, end: NaiveDate) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    let newest = rows.iter().map(|r| r.date).max();
+    let oldest = rows.iter().map(|r| r.date).min();
+    matches!((newest, oldest), (Some(n), Some(o)) if n >= end && o <= start)
+}
+
+fn split_event_for_date(
+    symbol: &Symbol,
+    rows: &[FactorFileEntry],
+    date: NaiveDate,
+    time: DateTime,
+) -> Option<Split> {
+    let (_, sf_today) = factor_for_entry(rows, date);
+    let (_, sf_prev) = factor_for_entry(rows, date - chrono::Duration::days(1));
+    if sf_today <= 0.0 || sf_prev <= 0.0 || (sf_today - sf_prev).abs() <= 1e-9 {
+        return None;
+    }
+
+    // C# LEAN's SplitFactor is the price scale. Since rlean factor rows store
+    // cumulative price split factors, the event factor is previous / current.
+    let split_factor = sf_prev / sf_today;
+    if (split_factor - 1.0).abs() <= 1e-9 {
+        return None;
+    }
+
+    let reference_price = rows
+        .iter()
+        .filter(|row| row.date < date)
+        .max_by_key(|row| row.date)
+        .map(|row| row.reference_price)
+        .unwrap_or(0.0);
+
+    Some(Split::new(
+        symbol.clone(),
+        time,
+        Decimal::from_f64(split_factor).unwrap_or(Decimal::ONE),
+        Decimal::from_f64(reference_price).unwrap_or(Decimal::ZERO),
+        SplitType::SplitOccurred,
+    ))
+}
+
+fn split_events_for_date(
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    factor_map: &HashMap<u64, Vec<FactorFileEntry>>,
+    date: NaiveDate,
+    time: DateTime,
+) -> Vec<Split> {
+    let mut seen = HashSet::new();
+    let mut splits = Vec::new();
+    for sub in subscriptions {
+        let sid = sub.symbol.id.sid;
+        if !seen.insert(sid) {
+            continue;
+        }
+        if let Some(rows) = factor_map.get(&sid) {
+            if let Some(split) = split_event_for_date(&sub.symbol, rows, date, time) {
+                splits.push(split);
+            }
+        }
+    }
+    splits
+}
+
+fn apply_split_events_to_state(
+    splits: &[Split],
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    raw_equity_sids: &HashSet<u64>,
+    portfolio: &lean_algorithm::portfolio::SecurityPortfolioManager,
+    order_processor: &OrderProcessor,
+    open_positions: &mut HashMap<u64, (DateTime, Decimal, Decimal)>,
+) {
+    for split in splits {
+        let sid = split.symbol.id.sid;
+        let should_apply = subscriptions.iter().any(|sub| {
+            sub.symbol.id.sid == sid
+                && (sub.normalization_mode == DataNormalizationMode::Raw
+                    || raw_equity_sids.contains(&sid))
+        });
+        if !should_apply {
+            continue;
+        }
+
+        let before = portfolio.get_holding(&split.symbol);
+        portfolio.apply_split(
+            &split.symbol,
+            split.split_factor,
+            split.reference_price,
+            Some(before.last_price * split.split_factor),
+        );
+        order_processor
+            .transaction_manager
+            .apply_split_to_open_orders(sid, split.split_factor);
+
+        if let Some((_entry_time, entry_price, quantity)) = open_positions.get_mut(&sid) {
+            *entry_price *= split.split_factor;
+            if !split.split_factor.is_zero() {
+                *quantity /= split.split_factor;
+            }
+        }
+
+        let after = portfolio.get_holding(&split.symbol);
+        if before.is_invested() {
+            info!(
+                "Split adjustment: {} factor {:.6}: qty {}→{} avg_px {}→{}",
+                split.symbol.value,
+                split.split_factor,
+                before.quantity,
+                after.quantity,
+                before.average_price,
+                after.average_price,
+            );
+        }
+    }
 }
 
 /// factor-file row whose date is strictly earlier than `bar_date`.
@@ -4259,6 +4807,7 @@ mod factor_tests {
     use super::*;
     use chrono::NaiveDate;
     use lean_storage::schema::FactorFileEntry;
+    use rust_decimal_macros::dec;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -4594,6 +5143,52 @@ mod factor_tests {
         let (pf, sf) = factor_for_entry(&rows, d(1990, 1, 1));
         assert!((pf - 0.7).abs() < 1e-9);
         assert!((sf - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_factor_file_coverage_rejects_sentinel_only_for_earlier_start() {
+        let rows = vec![entry_split(2026, 4, 27, 1.0, 1.0)];
+
+        assert!(!factor_file_covers_range(
+            &rows,
+            d(2022, 1, 1),
+            d(2026, 3, 31)
+        ));
+    }
+
+    #[test]
+    fn test_factor_file_coverage_accepts_base_row_through_end() {
+        let rows = vec![
+            entry_split(2026, 4, 27, 1.0, 1.0),
+            entry_split(1900, 1, 1, 1.0, 1.0),
+        ];
+
+        assert!(factor_file_covers_range(
+            &rows,
+            d(2022, 1, 1),
+            d(2026, 3, 31)
+        ));
+    }
+
+    #[test]
+    fn test_split_event_factor_matches_lean_price_scale() {
+        let rows = vec![
+            entry_split(2026, 1, 1, 1.0, 1.0),
+            entry_split(2023, 6, 4, 1.0, 1.0),
+            entry_split(1900, 1, 1, 1.0, 10.0),
+        ];
+        let symbol = lean_core::Symbol::create_equity("DPST", &lean_core::Market::usa());
+
+        let split = split_event_for_date(
+            &symbol,
+            &rows,
+            d(2023, 6, 5),
+            lean_core::NanosecondTimestamp(0),
+        )
+        .expect("reverse split should be detected");
+
+        assert_eq!(split.split_factor, dec!(10));
+        assert_eq!(split.split_type, SplitType::SplitOccurred);
     }
 
     /// apply_factor_row: a 2:1 split (sf=0.5) on bar after row date halves the price

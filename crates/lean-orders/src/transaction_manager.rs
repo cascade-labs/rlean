@@ -1,6 +1,6 @@
 use crate::{order::Order, order_event::OrderEvent, order_ticket::OrderTicket};
 use dashmap::DashMap;
-use lean_core::DateTime;
+use lean_core::{DateTime, Price};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -58,6 +58,37 @@ impl TransactionManager {
             .filter(|entry| entry.read().is_open())
             .map(|entry| entry.read().clone())
             .collect()
+    }
+
+    /// Apply C# LEAN's default split order adjustment to open orders.
+    ///
+    /// Quantity is divided by the LEAN split factor; price fields are multiplied
+    /// by it so the order retains approximately the same notional value.
+    pub fn apply_split_to_open_orders(&self, symbol_sid: u64, split_factor: Price) {
+        if split_factor.is_zero() {
+            return;
+        }
+        for entry in self.orders.iter() {
+            let mut order = entry.write();
+            if order.symbol.id.sid != symbol_sid || !order.is_open() {
+                continue;
+            }
+
+            order.quantity = (order.quantity / split_factor).trunc();
+            order.price *= split_factor;
+            if let Some(limit_price) = order.limit_price.as_mut() {
+                *limit_price *= split_factor;
+            }
+            if let Some(stop_price) = order.stop_price.as_mut() {
+                *stop_price *= split_factor;
+            }
+            let trailing_as_percent = order.trailing_as_percent;
+            if let Some(trailing_amount) = order.trailing_amount.as_mut() {
+                if !trailing_as_percent {
+                    *trailing_amount *= split_factor;
+                }
+            }
+        }
     }
 
     pub fn get_orders_by_symbol(&self, symbol_sid: u64) -> Vec<Order> {

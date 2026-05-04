@@ -5,6 +5,7 @@ use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
 
 use crate::request::{
     DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,
+    OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch,
 };
 
 /// Provides historical market data — Rust equivalent of C# `IHistoryProvider`.
@@ -110,6 +111,49 @@ pub trait IHistoryProvider: Send + Sync {
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<Tick>> {
         Ok(vec![])
+    }
+
+    /// Fetch/cache option data for several underlyings on one trading day.
+    /// Providers with true bulk APIs should override this; the default keeps
+    /// existing providers correct by fanning out over the single-underlying
+    /// methods sequentially.
+    async fn get_option_history_batch(
+        &self,
+        request: &OptionHistoryBatchRequest,
+    ) -> anyhow::Result<OptionMarketDataBatch> {
+        let mut batch = OptionMarketDataBatch::default();
+        for ticker in &request.tickers {
+            match request.data_type {
+                OptionDataType::EodBar => {
+                    batch
+                        .eod_bars
+                        .extend(self.get_option_eod_bars(ticker, request.date).await?);
+                }
+                OptionDataType::Universe => {
+                    batch
+                        .universe
+                        .extend(self.get_option_universe(ticker, request.date).await?);
+                }
+                OptionDataType::TradeBar => {
+                    batch.trade_bars.extend(
+                        self.get_option_trade_bars(ticker, request.resolution, request.date)
+                            .await?,
+                    );
+                }
+                OptionDataType::QuoteBar => {
+                    batch.quote_bars.extend(
+                        self.get_option_quote_bars(ticker, request.resolution, request.date)
+                            .await?,
+                    );
+                }
+                OptionDataType::Tick => {
+                    batch
+                        .ticks
+                        .extend(self.get_option_ticks(ticker, request.date).await?);
+                }
+            }
+        }
+        Ok(batch)
     }
 
     /// The earliest date this provider can supply data for, if limited.

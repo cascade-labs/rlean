@@ -39,7 +39,7 @@ impl LazyPluginProvider {
 
     fn get(&self) -> anyhow::Result<Arc<dyn IHistoryProvider>> {
         let result = self.inner.get_or_init(|| {
-            load_plugin_provider(&self.name, &self.args).map_err(|e| e.to_string())
+            load_plugin_provider(&self.name, &self.args).map_err(|e| format!("{e:#}"))
         });
         result.clone().map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -69,6 +69,22 @@ impl IHistoryProvider for LazyPluginProvider {
     ) -> anyhow::Result<Vec<lean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_ticks(request).await
+    }
+
+    async fn get_history_batch(
+        &self,
+        request: &lean_data_providers::HistoryBatchRequest,
+    ) -> anyhow::Result<lean_data_providers::MarketDataBatch> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_history_batch(request).await
+    }
+
+    async fn get_option_history_batch(
+        &self,
+        request: &lean_data_providers::OptionHistoryBatchRequest,
+    ) -> anyhow::Result<lean_data_providers::OptionMarketDataBatch> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_option_history_batch(request).await
     }
 
     async fn get_option_eod_bars(

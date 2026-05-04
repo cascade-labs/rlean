@@ -26,6 +26,7 @@ pub use custom_data::{ArcCustomDataSource, ICustomDataSource};
 pub use local::LocalHistoryProvider;
 pub use request::{
     DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,
+    OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch,
 };
 pub use stacked::{is_not_implemented, StackedHistoryProvider};
 pub use traits::{

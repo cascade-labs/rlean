@@ -298,6 +298,48 @@ impl SecurityPortfolioManager {
         h.update_price(average_price);
     }
 
+    /// Apply C# LEAN split semantics to an equity holding in raw/live mode.
+    ///
+    /// `split_factor` is the LEAN price factor: 0.5 for a 2:1 forward split,
+    /// 10 for a 1:10 reverse split. Holdings are rounded toward zero and the
+    /// fractional remainder is paid as cash-in-lieu at the split-adjusted price.
+    pub fn apply_split(
+        &self,
+        symbol: &Symbol,
+        split_factor: Price,
+        reference_price: Price,
+        current_price: Option<Price>,
+    ) {
+        if split_factor.is_zero() {
+            return;
+        }
+
+        let mut holdings = self.holdings.write();
+        let Some(h) = holdings.get_mut(&symbol.id.sid) else {
+            return;
+        };
+        if !h.is_invested() {
+            return;
+        }
+
+        let new_quantity = h.quantity / split_factor;
+        let whole_quantity = new_quantity.trunc();
+        let left_over = new_quantity - whole_quantity;
+        let new_average_price = h.average_price * split_factor;
+        let split_adjusted_price = current_price
+            .filter(|price| !price.is_zero())
+            .unwrap_or(reference_price * split_factor);
+
+        h.quantity = whole_quantity;
+        h.average_price = new_average_price;
+        h.update_price(split_adjusted_price);
+
+        drop(holdings);
+        if !left_over.is_zero() {
+            *self.cash.write() += left_over * split_adjusted_price;
+        }
+    }
+
     pub fn update_prices(&self, symbol: &Symbol, price: Price) {
         if let Some(h) = self.holdings.write().get_mut(&symbol.id.sid) {
             h.update_price(price);

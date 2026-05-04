@@ -88,10 +88,11 @@ pub struct CustomParquetSource {
     pub time_column: Option<String>,
     /// Timestamp encoding for `time_column`.
     ///
-    /// Native custom parquet supports one LEAN-compatible value:
-    /// `timestamp`, an Arrow timestamp column. If `time_zone` is set, the
-    /// timestamp is interpreted as local wall-clock time in that zone and
-    /// converted to UTC.
+    /// Native custom parquet supports LEAN-compatible values:
+    /// `timestamp`, an Arrow timestamp column, and `tradealert`, TradeAlert's
+    /// string timestamp format (`YYYY-MM-DD HH:MM:SS:mmm` or `HH:MM:SS:mmm`).
+    /// If `time_zone` is set, the timestamp is interpreted as local wall-clock
+    /// time in that zone and converted to UTC.
     pub time_format: Option<String>,
     /// Time zone for provider-local Arrow timestamp columns. Omit for UTC.
     pub time_zone: Option<String>,

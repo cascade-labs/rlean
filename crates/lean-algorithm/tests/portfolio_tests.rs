@@ -355,3 +355,34 @@ fn no_phantom_drawdown_on_assignment_day() {
     );
     assert_eq!(total, dec!(61_000));
 }
+
+#[test]
+fn apply_split_matches_lean_reverse_split_cash_in_lieu() {
+    let pm = SecurityPortfolioManager::new(dec!(100_000));
+    let symbol = spy();
+    pm.apply_fill_with_multiplier(&symbol, dec!(5.13), dec!(1697), dec!(0), dec!(1));
+    pm.update_prices(&symbol, dec!(5.13));
+
+    pm.apply_split(&symbol, dec!(10), dec!(5.13), Some(dec!(51.30)));
+
+    let holding = pm.get_holding(&symbol);
+    assert_eq!(holding.quantity, dec!(169));
+    assert_eq!(holding.average_price, dec!(51.30));
+    assert_eq!(*pm.cash.read(), dec!(91330.30));
+    assert_eq!(pm.total_portfolio_value(), dec!(100000.00));
+}
+
+#[test]
+fn apply_split_matches_lean_forward_split() {
+    let pm = SecurityPortfolioManager::new(dec!(100_000));
+    let symbol = spy();
+    pm.apply_fill_with_multiplier(&symbol, dec!(100), dec!(100), dec!(0), dec!(1));
+    pm.update_prices(&symbol, dec!(100));
+
+    pm.apply_split(&symbol, dec!(0.5), dec!(100), Some(dec!(50)));
+
+    let holding = pm.get_holding(&symbol);
+    assert_eq!(holding.quantity, dec!(200));
+    assert_eq!(holding.average_price, dec!(50.0));
+    assert_eq!(pm.total_portfolio_value(), dec!(100_000));
+}

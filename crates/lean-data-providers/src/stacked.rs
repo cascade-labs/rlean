@@ -11,13 +11,40 @@ use async_trait::async_trait;
 use lean_core::Resolution;
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{OptionEodBar, OptionUniverseRow};
+use tracing::debug;
 
-use crate::{HistoryRequest, IHistoryProvider};
+use crate::{
+    DataType, HistoryBatchRequest, HistoryRequest, IHistoryProvider, MarketDataBatch,
+    OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch,
+};
 
 /// Returns `true` when `err` indicates that the provider does not implement
 /// the requested data type (as opposed to a transient network or parse error).
 pub fn is_not_implemented(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("NotImplemented:")
+}
+
+fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> bool {
+    match data_type {
+        DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
+            batch.trade_bars.is_empty()
+        }
+        DataType::QuoteBar => batch.quote_bars.is_empty(),
+        DataType::Tick | DataType::OpenInterest => batch.ticks.is_empty(),
+    }
+}
+
+fn option_market_data_batch_is_empty(
+    batch: &OptionMarketDataBatch,
+    data_type: OptionDataType,
+) -> bool {
+    match data_type {
+        OptionDataType::EodBar => batch.eod_bars.is_empty(),
+        OptionDataType::Universe => batch.universe.is_empty(),
+        OptionDataType::TradeBar => batch.trade_bars.is_empty(),
+        OptionDataType::QuoteBar => batch.quote_bars.is_empty(),
+        OptionDataType::Tick => batch.ticks.is_empty(),
+    }
 }
 
 /// Wraps multiple `IHistoryProvider` implementations and tries them in
@@ -41,11 +68,38 @@ impl StackedHistoryProvider {
 #[async_trait]
 impl IHistoryProvider for StackedHistoryProvider {
     async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider.get_history(request).await {
-                Ok(data) if !data.is_empty() => return Ok(data),
-                Ok(_) => continue,
-                Err(ref e) if is_not_implemented(e) => continue,
+                Ok(data) if !data.is_empty() => {
+                    debug!(
+                        "History provider #{} returned {} {:?} rows for {} ({} → {})",
+                        idx,
+                        data.len(),
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    return Ok(data);
+                }
+                Ok(_) => {
+                    debug!(
+                        "History provider #{} returned 0 {:?} rows for {} ({} → {})",
+                        idx,
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    continue;
+                }
+                Err(ref e) if is_not_implemented(e) => {
+                    debug!(
+                        "History provider #{} does not implement {:?} for {}",
+                        idx, request.data_type, request.symbol.value
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -74,6 +128,47 @@ impl IHistoryProvider for StackedHistoryProvider {
             }
         }
         Ok(vec![])
+    }
+
+    async fn get_history_batch(
+        &self,
+        request: &HistoryBatchRequest,
+    ) -> anyhow::Result<MarketDataBatch> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            match provider.get_history_batch(request).await {
+                Ok(data) if !market_data_batch_is_empty(&data, request.data_type) => {
+                    debug!(
+                        "History provider #{} returned batched {:?} rows for {} symbols ({} → {})",
+                        idx,
+                        request.data_type,
+                        request.symbols.len(),
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    return Ok(data);
+                }
+                Ok(_) => {
+                    debug!(
+                        "History provider #{} returned 0 batched {:?} rows for {} symbols ({} → {})",
+                        idx,
+                        request.data_type,
+                        request.symbols.len(),
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    continue;
+                }
+                Err(ref e) if is_not_implemented(e) => {
+                    debug!(
+                        "History provider #{} does not implement batched {:?}",
+                        idx, request.data_type
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(MarketDataBatch::default())
     }
 
     async fn get_option_eod_bars(
@@ -162,6 +257,45 @@ impl IHistoryProvider for StackedHistoryProvider {
             }
         }
         Ok(vec![])
+    }
+
+    async fn get_option_history_batch(
+        &self,
+        request: &OptionHistoryBatchRequest,
+    ) -> anyhow::Result<OptionMarketDataBatch> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            match provider.get_option_history_batch(request).await {
+                Ok(data) if !option_market_data_batch_is_empty(&data, request.data_type) => {
+                    debug!(
+                        "History provider #{} returned batched option {:?} rows for {} tickers ({})",
+                        idx,
+                        request.data_type,
+                        request.tickers.len(),
+                        request.date
+                    );
+                    return Ok(data);
+                }
+                Ok(_) => {
+                    debug!(
+                        "History provider #{} returned 0 batched option {:?} rows for {} tickers ({})",
+                        idx,
+                        request.data_type,
+                        request.tickers.len(),
+                        request.date
+                    );
+                    continue;
+                }
+                Err(ref e) if is_not_implemented(e) => {
+                    debug!(
+                        "History provider #{} does not implement batched option {:?}",
+                        idx, request.data_type
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(OptionMarketDataBatch::default())
     }
 
     fn earliest_date(&self) -> Option<chrono::NaiveDate> {

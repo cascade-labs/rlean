@@ -1,5 +1,8 @@
 use lean_core::{Market, NanosecondTimestamp, Symbol};
-use lean_orders::{Order, OrderDirection, OrderStatus, OrderType, TimeInForce};
+use lean_orders::{
+    transaction_manager::TransactionManager, Order, OrderDirection, OrderStatus, OrderType,
+    TimeInForce,
+};
 use rust_decimal_macros::dec;
 
 fn ts(i: i64) -> NanosecondTimestamp {
@@ -124,4 +127,19 @@ fn direction_opposite() {
     assert_eq!(OrderDirection::Buy.opposite(), OrderDirection::Sell);
     assert_eq!(OrderDirection::Sell.opposite(), OrderDirection::Buy);
     assert_eq!(OrderDirection::Hold.opposite(), OrderDirection::Hold);
+}
+
+#[test]
+fn transaction_manager_apply_split_updates_open_orders() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    let order = Order::stop_limit(1, symbol.clone(), dec!(100), dec!(90), dec!(95), ts(0), "");
+    tm.add_order(order);
+
+    tm.apply_split_to_open_orders(symbol.id.sid, dec!(0.5));
+
+    let adjusted = tm.get_order(1).expect("order should exist");
+    assert_eq!(adjusted.quantity, dec!(200));
+    assert_eq!(adjusted.stop_price, Some(dec!(45.0)));
+    assert_eq!(adjusted.limit_price, Some(dec!(47.5)));
 }

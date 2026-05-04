@@ -1,7 +1,7 @@
 use lean_core::{DateTime, Resolution, Symbol};
 
 /// Type of market data to request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     TradeBar,
     QuoteBar,
@@ -41,6 +41,36 @@ pub struct HistoryBatchRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct MarketDataBatch {
+    pub trade_bars: Vec<lean_data::TradeBar>,
+    pub quote_bars: Vec<lean_data::QuoteBar>,
+    pub ticks: Vec<lean_data::Tick>,
+}
+
+/// Type of option data to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionDataType {
+    EodBar,
+    Universe,
+    TradeBar,
+    QuoteBar,
+    Tick,
+}
+
+/// A multi-underlying option history request. The request is intentionally
+/// date-scoped because the option APIs and local cache layout are partitioned
+/// by trading day.
+#[derive(Debug, Clone)]
+pub struct OptionHistoryBatchRequest {
+    pub tickers: Vec<String>,
+    pub resolution: Resolution,
+    pub date: chrono::NaiveDate,
+    pub data_type: OptionDataType,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OptionMarketDataBatch {
+    pub eod_bars: Vec<lean_storage::OptionEodBar>,
+    pub universe: Vec<lean_storage::OptionUniverseRow>,
     pub trade_bars: Vec<lean_data::TradeBar>,
     pub quote_bars: Vec<lean_data::QuoteBar>,
     pub ticks: Vec<lean_data::Tick>,
