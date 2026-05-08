@@ -229,7 +229,9 @@ mod provider_tests {
         Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TickType, TimeSpan,
     };
     use lean_data::{TradeBar, TradeBarData};
-    use lean_storage::{OptionEodBar, ParquetWriter, PathResolver, WriterConfig};
+    use lean_storage::{
+        OptionEodBar, OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig,
+    };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -339,6 +341,71 @@ mod provider_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockSideEffectProvider {
+        implemented: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl IHistoryProvider for MockSideEffectProvider {
+        async fn get_history(
+            &self,
+            request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            if !self.implemented {
+                anyhow::bail!("NotImplemented: no {:?}", request.data_type);
+            }
+            Ok(vec![])
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingSideEffectProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl IHistoryProvider for RecordingSideEffectProvider {
+        async fn get_history(
+            &self,
+            _request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingOptionUniverseProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl IHistoryProvider for RecordingOptionUniverseProvider {
+        async fn get_history(
+            &self,
+            _request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            Ok(vec![])
+        }
+
+        async fn get_option_universe(
+            &self,
+            ticker: &str,
+            date: NaiveDate,
+        ) -> anyhow::Result<Vec<OptionUniverseRow>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![OptionUniverseRow {
+                date,
+                symbol_value: format!("{ticker}260417C00050000"),
+                underlying: ticker.to_string(),
+                expiration: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
+                strike: dec!(50),
+                right: "C".to_string(),
+            }])
+        }
+    }
+
     fn sample_option_row() -> OptionEodBar {
         OptionEodBar {
             date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
@@ -373,6 +440,58 @@ mod provider_tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].underlying, "TLT");
+    }
+
+    #[tokio::test]
+    async fn stacked_provider_falls_back_for_side_effect_not_implemented() {
+        let provider = StackedHistoryProvider::new(vec![
+            Arc::new(MockSideEffectProvider { implemented: false }),
+            Arc::new(MockSideEffectProvider { implemented: true }),
+        ]);
+        let mut request = make_history_request();
+        request.data_type = DataType::FactorFile;
+
+        let rows = provider.get_history(&request).await.unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stacked_provider_tries_all_side_effect_providers_after_empty_ok() {
+        let first_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = StackedHistoryProvider::new(vec![
+            Arc::new(RecordingSideEffectProvider {
+                calls: Arc::clone(&first_calls),
+            }),
+            Arc::new(RecordingSideEffectProvider {
+                calls: Arc::clone(&second_calls),
+            }),
+        ]);
+        let mut request = make_history_request();
+        request.data_type = DataType::FactorFile;
+
+        let rows = provider.get_history(&request).await.unwrap();
+
+        assert!(rows.is_empty());
+        assert_eq!(first_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stacked_provider_caches_option_universe_by_underlying_and_date() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider =
+            StackedHistoryProvider::new(vec![Arc::new(RecordingOptionUniverseProvider {
+                calls: Arc::clone(&calls),
+            })]);
+        let date = NaiveDate::from_ymd_opt(2026, 4, 17).unwrap();
+
+        let first = provider.get_option_universe("BE", date).await.unwrap();
+        let second = provider.get_option_universe("be", date).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

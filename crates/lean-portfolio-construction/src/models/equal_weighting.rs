@@ -6,6 +6,7 @@ use crate::portfolio_construction_model::{
     IPortfolioConstructionModel, InsightDirection, InsightForPcm,
 };
 use crate::portfolio_target::PortfolioTarget;
+use crate::PortfolioBias;
 
 /// Gives equal weighting to all active non-Flat insights.
 /// Mirrors C# EqualWeightingPortfolioConstructionModel.
@@ -16,11 +17,42 @@ use crate::portfolio_target::PortfolioTarget;
 ///   - Flat  -> zero target (liquidate)
 ///
 /// where N is the number of Up/Down insights.
-pub struct EqualWeightingPortfolioConstructionModel;
+pub struct EqualWeightingPortfolioConstructionModel {
+    portfolio_bias: PortfolioBias,
+    max_weight: Option<Decimal>,
+}
 
 impl EqualWeightingPortfolioConstructionModel {
     pub fn new() -> Self {
-        Self
+        Self {
+            portfolio_bias: PortfolioBias::LongShort,
+            max_weight: None,
+        }
+    }
+
+    pub fn with_bias(portfolio_bias: PortfolioBias) -> Self {
+        Self {
+            portfolio_bias,
+            max_weight: None,
+        }
+    }
+
+    pub fn with_bias_and_max_weight(
+        portfolio_bias: PortfolioBias,
+        max_weight: Option<Decimal>,
+    ) -> Self {
+        Self {
+            portfolio_bias,
+            max_weight,
+        }
+    }
+
+    fn respects_bias(&self, insight: &InsightForPcm) -> bool {
+        match self.portfolio_bias {
+            PortfolioBias::LongShort => true,
+            PortfolioBias::Long => insight.direction == InsightDirection::Up,
+            PortfolioBias::Short => insight.direction == InsightDirection::Down,
+        }
     }
 }
 
@@ -40,19 +72,26 @@ impl IPortfolioConstructionModel for EqualWeightingPortfolioConstructionModel {
         // Count non-Flat insights (mirrors C# count logic)
         let active_count = insights
             .iter()
-            .filter(|i| i.direction != InsightDirection::Flat)
+            .filter(|i| i.direction != InsightDirection::Flat && self.respects_bias(i))
             .count();
 
         let weight = if active_count == 0 {
             Decimal::ZERO
         } else {
-            Decimal::ONE / Decimal::from(active_count)
+            let equal_weight = Decimal::ONE / Decimal::from(active_count);
+            self.max_weight
+                .map(|max_weight| equal_weight.min(max_weight))
+                .unwrap_or(equal_weight)
         };
 
         insights
             .iter()
             .map(|insight| {
-                let direction_sign = Decimal::from(insight.direction.as_i32());
+                let direction_sign = if self.respects_bias(insight) {
+                    Decimal::from(insight.direction.as_i32())
+                } else {
+                    Decimal::ZERO
+                };
                 // Flat insights get 0 weight per C# logic
                 let pct = if insight.direction == InsightDirection::Flat {
                     Decimal::ZERO

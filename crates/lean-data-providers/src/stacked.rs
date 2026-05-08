@@ -1,11 +1,17 @@
 /// Stacked (priority-ordered) history provider.
 ///
 /// Tries each provider in order.  The first provider that returns a non-empty
-/// `Ok` result wins.  A provider that returns `Ok(vec![])` or an
+/// `Ok` result wins.  For side-effect requests (factor/map files), every
+/// provider that does not return `NotImplemented:` is given a chance to write
+/// its file because success is represented by a filesystem side effect, not
+/// returned rows.  A provider that returns `Ok(vec![])` for market data or an
 /// `anyhow::Error` whose message starts with "NotImplemented:" is treated as
 /// "I don't have this data — try the next one".  Any other error short-circuits
 /// and is returned immediately.
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use lean_core::Resolution;
@@ -15,7 +21,7 @@ use tracing::debug;
 
 use crate::{
     DataType, HistoryBatchRequest, HistoryRequest, IHistoryProvider, MarketDataBatch,
-    OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch,
+    OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch, TickStream,
 };
 
 /// Returns `true` when `err` indicates that the provider does not implement
@@ -32,6 +38,10 @@ fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> b
         DataType::QuoteBar => batch.quote_bars.is_empty(),
         DataType::Tick | DataType::OpenInterest => batch.ticks.is_empty(),
     }
+}
+
+fn is_side_effect_data_type(data_type: DataType) -> bool {
+    matches!(data_type, DataType::FactorFile | DataType::MapFile)
 }
 
 fn option_market_data_batch_is_empty(
@@ -51,6 +61,12 @@ fn option_market_data_batch_is_empty(
 /// priority order.
 pub struct StackedHistoryProvider {
     providers: Vec<Arc<dyn IHistoryProvider>>,
+    option_universe_cache: Mutex<HashMap<String, OptionUniverseCacheEntry>>,
+}
+
+struct OptionUniverseCacheEntry {
+    date: chrono::NaiveDate,
+    rows: Arc<Vec<OptionUniverseRow>>,
 }
 
 impl StackedHistoryProvider {
@@ -61,7 +77,10 @@ impl StackedHistoryProvider {
             !providers.is_empty(),
             "StackedHistoryProvider requires at least one provider"
         );
-        StackedHistoryProvider { providers }
+        StackedHistoryProvider {
+            providers,
+            option_universe_cache: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -81,6 +100,17 @@ impl IHistoryProvider for StackedHistoryProvider {
                         request.end.date_utc()
                     );
                     return Ok(data);
+                }
+                Ok(_data) if is_side_effect_data_type(request.data_type) => {
+                    debug!(
+                        "History provider #{} accepted {:?} for {} as a side-effect ({} → {}); trying remaining providers too",
+                        idx,
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    continue;
                 }
                 Ok(_) => {
                     debug!(
@@ -147,6 +177,17 @@ impl IHistoryProvider for StackedHistoryProvider {
                     );
                     return Ok(data);
                 }
+                Ok(_data) if is_side_effect_data_type(request.data_type) => {
+                    debug!(
+                        "History provider #{} accepted batched {:?} for {} symbols as a side-effect ({} → {}); trying remaining providers too",
+                        idx,
+                        request.data_type,
+                        request.symbols.len(),
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    continue;
+                }
                 Ok(_) => {
                     debug!(
                         "History provider #{} returned 0 batched {:?} rows for {} symbols ({} → {})",
@@ -192,15 +233,43 @@ impl IHistoryProvider for StackedHistoryProvider {
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
+        let key = ticker.to_ascii_uppercase();
+        if let Some(rows) = self
+            .option_universe_cache
+            .lock()
+            .expect("option universe cache poisoned")
+            .get(&key)
+            .filter(|entry| entry.date == date)
+            .map(|entry| Arc::clone(&entry.rows))
+        {
+            return Ok(rows.as_ref().clone());
+        }
+
+        let mut rows = Vec::new();
         for provider in &self.providers {
             match provider.get_option_universe(ticker, date).await {
-                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(data) if !data.is_empty() => {
+                    rows = data;
+                    break;
+                }
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
                 Err(e) => return Err(e),
             }
         }
-        Ok(vec![])
+
+        self.option_universe_cache
+            .lock()
+            .expect("option universe cache poisoned")
+            .insert(
+                key,
+                OptionUniverseCacheEntry {
+                    date,
+                    rows: Arc::new(rows.clone()),
+                },
+            );
+
+        Ok(rows)
     }
 
     async fn get_option_trade_bars(
@@ -257,6 +326,52 @@ impl IHistoryProvider for StackedHistoryProvider {
             }
         }
         Ok(vec![])
+    }
+
+    async fn get_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<Tick>> {
+        for provider in &self.providers {
+            match provider
+                .get_option_ticks_filtered(ticker, date, contracts)
+                .await
+            {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn stream_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<TickStream> {
+        for provider in &self.providers {
+            match provider
+                .stream_option_ticks_filtered(ticker, date, contracts)
+                .await
+            {
+                Ok(mut stream) => match stream.next() {
+                    Some(Ok(first_tick)) => {
+                        return Ok(Box::new(std::iter::once(Ok(first_tick)).chain(stream)));
+                    }
+                    Some(Err(e)) if is_not_implemented(&e) => continue,
+                    Some(Err(e)) => return Err(e),
+                    None => continue,
+                },
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Box::new(std::iter::empty()))
     }
 
     async fn get_option_history_batch(

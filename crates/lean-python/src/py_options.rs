@@ -445,13 +445,49 @@ impl PyOptionChains {
         }
     }
 
-    pub fn set(&mut self, py: Python<'_>, key: &str, chain: PyOptionChain) -> PyResult<()> {
+    pub fn set_or_update(
+        &mut self,
+        py: Python<'_>,
+        key: &str,
+        chain: PyOptionChain,
+    ) -> PyResult<()> {
+        if let Some(existing) = self.chains.get(key) {
+            existing.borrow_mut(py).inner.update_from(&chain.inner);
+            return Ok(());
+        }
         self.chains.insert(key.to_string(), Py::new(py, chain)?);
         Ok(())
     }
 
-    pub fn clear(&mut self) {
-        self.chains.clear();
+    pub fn set_or_update_ref(
+        &mut self,
+        py: Python<'_>,
+        key: &str,
+        chain: &OptionChain,
+    ) -> PyResult<()> {
+        if let Some(existing) = self.chains.get(key) {
+            existing.borrow_mut(py).inner.update_from(chain);
+            return Ok(());
+        }
+        self.chains.insert(
+            key.to_string(),
+            Py::new(
+                py,
+                PyOptionChain {
+                    inner: chain.clone(),
+                },
+            )?,
+        );
+        Ok(())
+    }
+
+    pub fn retain_keys(&mut self, active_keys: &std::collections::HashSet<String>) {
+        self.chains.retain(|key, _| active_keys.contains(key));
+    }
+
+    pub fn retain_key_refs(&mut self, active_keys: &std::collections::HashSet<&str>) {
+        self.chains
+            .retain(|key, _| active_keys.contains(key.as_str()));
     }
 }
 

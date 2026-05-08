@@ -227,6 +227,41 @@ mod insight_collection_tests {
     }
 
     #[test]
+    fn collection_returns_latest_active_per_symbol() {
+        let mut col = InsightCollection::new();
+        let sym = spy();
+        let first_time = NanosecondTimestamp::from_secs(1_700_000_000);
+        let second_time = first_time + TimeSpan::from_mins(5);
+
+        col.add(
+            Insight::up(sym.clone(), TimeSpan::from_days(1)).with_generated_time_utc(first_time),
+        );
+        col.add(
+            Insight::down(sym.clone(), TimeSpan::from_days(1)).with_generated_time_utc(second_time),
+        );
+
+        let active = col.latest_active_per_symbol(second_time);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].direction, InsightDirection::Down);
+    }
+
+    #[test]
+    fn collection_expire_symbols_removes_active_insights() {
+        let mut col = InsightCollection::new();
+        let spy = spy();
+        let ibm = Symbol::create_equity("IBM", &Market::usa());
+        let now = NanosecondTimestamp::from_secs(1_700_000_000);
+
+        col.add(Insight::up(spy.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now));
+        col.add(Insight::up(ibm.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now));
+
+        let removed = col.clear_symbols(std::slice::from_ref(&spy));
+        assert_eq!(removed.len(), 1);
+        assert!(!col.has_active(&spy, now));
+        assert!(col.has_active(&ibm, now));
+    }
+
+    #[test]
     fn collection_active_excludes_expired() {
         let mut col = InsightCollection::new();
         let sym = spy();

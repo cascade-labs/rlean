@@ -39,6 +39,7 @@ pub struct SecurityData {
     pub average_volume: Option<Decimal>,
     pub daily_std_dev: Option<Decimal>,
     pub current_quantity: Decimal, // currently held
+    pub open_order_quantity: Decimal,
 }
 
 /// Converts portfolio targets into orders. Mirrors C# IExecutionModel.

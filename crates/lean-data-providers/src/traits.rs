@@ -8,6 +8,8 @@ use crate::request::{
     OptionDataType, OptionHistoryBatchRequest, OptionMarketDataBatch,
 };
 
+pub type TickStream = Box<dyn Iterator<Item = anyhow::Result<Tick>> + Send>;
+
 /// Provides historical market data — Rust equivalent of C# `IHistoryProvider`.
 ///
 /// Implementors are expected to fetch data from a remote source (or local
@@ -111,6 +113,34 @@ pub trait IHistoryProvider: Send + Sync {
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<Tick>> {
         Ok(vec![])
+    }
+
+    /// Fetch option ticks constrained to an already-selected option universe.
+    /// Providers with chain endpoints should override this so LEAN-style option
+    /// filters reduce the remote request surface, not only the delivered data.
+    async fn get_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        _contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<Tick>> {
+        self.get_option_ticks(ticker, date).await
+    }
+
+    /// Open a memory-bounded stream of option ticks constrained to an
+    /// already-selected option universe. Implementors should yield ticks in
+    /// timestamp order. The default preserves provider compatibility by
+    /// delegating to the batch method.
+    async fn stream_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<TickStream> {
+        let ticks = self
+            .get_option_ticks_filtered(ticker, date, contracts)
+            .await?;
+        Ok(Box::new(ticks.into_iter().map(Ok)))
     }
 
     /// Fetch/cache option data for several underlyings on one trading day.

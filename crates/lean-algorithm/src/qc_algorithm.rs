@@ -4,8 +4,8 @@ use crate::{
 };
 use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SettlementType,
-    Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
+    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SecurityType,
+    SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
 };
 use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionManager};
 use lean_options::OptionChain;
@@ -22,6 +22,40 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// LEAN-style option universe filter configured through `Option.set_filter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionFilter {
+    pub min_strike_rank: i32,
+    pub max_strike_rank: i32,
+    pub min_expiry_days: i32,
+    pub max_expiry_days: i32,
+}
+
+impl Default for OptionFilter {
+    fn default() -> Self {
+        Self {
+            min_strike_rank: -1,
+            max_strike_rank: 1,
+            min_expiry_days: 0,
+            max_expiry_days: 35,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountType {
+    Margin,
+    Cash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerageName {
+    Default,
+    QuantConnectBrokerage,
+    InteractiveBrokersBrokerage,
+    TradierBrokerage,
+}
 
 /// Represents an open option position held by the algorithm.
 #[derive(Debug, Clone)]
@@ -76,6 +110,10 @@ pub struct QcAlgorithm {
     // Option tracking
     /// Canonical option symbols (e.g. `?SPY`) for chain subscriptions.
     pub option_subscriptions: Vec<Symbol>,
+    /// Resolution requested for each canonical option subscription.
+    pub option_subscription_resolutions: HashMap<String, Resolution>,
+    /// LEAN-style option filters keyed by canonical option permtick.
+    pub option_filters: HashMap<String, OptionFilter>,
     /// Specific option contracts that have been subscribed to.
     pub open_option_contracts: Vec<Symbol>,
     /// Generated option chains keyed by canonical ticker (e.g. "?SPY").
@@ -87,6 +125,9 @@ pub struct QcAlgorithm {
 
     /// Custom data subscriptions registered via `add_data()`.
     pub custom_data_subscriptions: Vec<CustomDataSubscription>,
+
+    pub brokerage_name: BrokerageName,
+    pub account_type: AccountType,
 }
 
 impl QcAlgorithm {
@@ -110,10 +151,34 @@ impl QcAlgorithm {
             is_warming_up: false,
             order_id_counter: 0,
             option_subscriptions: Vec::new(),
+            option_subscription_resolutions: HashMap::new(),
+            option_filters: HashMap::new(),
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
             benchmark_symbol: None,
             custom_data_subscriptions: Vec::new(),
+            brokerage_name: BrokerageName::Default,
+            account_type: AccountType::Margin,
+        }
+    }
+
+    pub fn set_brokerage_model(&mut self, brokerage: BrokerageName, account_type: AccountType) {
+        self.brokerage_name = brokerage;
+        self.account_type = account_type;
+        for security in self.securities.all() {
+            security.set_leverage(self.default_leverage_for_security(&security.symbol));
+        }
+    }
+
+    pub fn default_leverage_for_security(&self, symbol: &Symbol) -> f64 {
+        if self.account_type == AccountType::Cash {
+            return 1.0;
+        }
+        match symbol.security_type() {
+            SecurityType::Equity => 2.0,
+            SecurityType::Forex | SecurityType::Cfd => 50.0,
+            SecurityType::CryptoFuture => 25.0,
+            _ => 1.0,
         }
     }
 
@@ -193,12 +258,9 @@ impl QcAlgorithm {
 
         let hours = ExchangeHours::us_equity();
         let props = SymbolProperties::default();
-        self.securities.add(crate::securities::Security::new(
-            symbol.clone(),
-            resolution,
-            props,
-            hours,
-        ));
+        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.securities.add(security);
         symbol
     }
 
@@ -221,12 +283,9 @@ impl QcAlgorithm {
         self.subscription_manager.add(config);
         let hours = ExchangeHours::forex_24h();
         let props = SymbolProperties::default();
-        self.securities.add(crate::securities::Security::new(
-            symbol.clone(),
-            resolution,
-            props,
-            hours,
-        ));
+        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.securities.add(security);
         symbol
     }
 
@@ -236,12 +295,9 @@ impl QcAlgorithm {
         self.subscription_manager.add(config);
         let hours = ExchangeHours::crypto_24_7();
         let props = SymbolProperties::default();
-        self.securities.add(crate::securities::Security::new(
-            symbol.clone(),
-            resolution,
-            props,
-            hours,
-        ));
+        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.securities.add(security);
         symbol
     }
 
@@ -566,7 +622,16 @@ impl QcAlgorithm {
         let underlying = self.add_equity(underlying_ticker, resolution);
         let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
         self.option_subscriptions.push(canonical.clone());
+        self.option_subscription_resolutions
+            .insert(canonical.permtick.clone(), resolution);
+        self.option_filters
+            .insert(canonical.permtick.clone(), OptionFilter::default());
         canonical
+    }
+
+    pub fn set_option_filter(&mut self, canonical: &Symbol, filter: OptionFilter) {
+        self.option_filters
+            .insert(canonical.permtick.clone(), filter);
     }
 
     /// Subscribe to a specific option contract.

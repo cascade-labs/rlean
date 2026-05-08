@@ -52,6 +52,60 @@ use py_universe::{
 
 // ─── Additional enums matching LEAN's Python API ──────────────────────────────
 
+#[pyclass(name = "AccountType", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyAccountType {
+    Margin = 0,
+    Cash = 1,
+}
+
+#[pymethods]
+impl PyAccountType {
+    #[classattr]
+    const MARGIN: Self = Self::Margin;
+    #[classattr]
+    const CASH: Self = Self::Cash;
+}
+
+impl From<PyAccountType> for lean_algorithm::qc_algorithm::AccountType {
+    fn from(value: PyAccountType) -> Self {
+        match value {
+            PyAccountType::Margin => Self::Margin,
+            PyAccountType::Cash => Self::Cash,
+        }
+    }
+}
+
+#[pyclass(name = "BrokerageName", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyBrokerageName {
+    Default = 0,
+    InteractiveBrokersBrokerage = 1,
+    TradierBrokerage = 2,
+}
+
+#[pymethods]
+impl PyBrokerageName {
+    #[classattr]
+    const DEFAULT: Self = Self::Default;
+    #[classattr]
+    const QUANT_CONNECT_BROKERAGE: Self = Self::Default;
+    #[classattr]
+    const INTERACTIVE_BROKERS_BROKERAGE: Self = Self::InteractiveBrokersBrokerage;
+    #[classattr]
+    const TRADIER_BROKERAGE: Self = Self::TradierBrokerage;
+}
+
+impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
+    fn from(value: PyBrokerageName) -> Self {
+        match value {
+            PyBrokerageName::Default => Self::Default,
+            PyBrokerageName::InteractiveBrokersBrokerage => Self::InteractiveBrokersBrokerage,
+            PyBrokerageName::TradierBrokerage => Self::TradierBrokerage,
+        }
+    }
+}
+
 /// LEAN SecurityType enum values.
 #[pyclass(name = "SecurityType", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +282,8 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStd>()?;
 
     // Additional enums
+    m.add_class::<PyAccountType>()?;
+    m.add_class::<PyBrokerageName>()?;
     m.add_class::<PySecurityType>()?;
     m.add_class::<PyMarket>()?;
     m.add_class::<PyOrderType>()?;

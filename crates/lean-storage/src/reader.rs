@@ -90,6 +90,9 @@ impl ParquetReader {
         if source.paths.is_empty() {
             return Ok(vec![]);
         }
+        if source.paths.len() > 1 {
+            return read_custom_parquet_points_from_files(source, query, date);
+        }
 
         let table_name = format!(
             "custom_{}_{}",
@@ -100,39 +103,10 @@ impl ParquetReader {
                 .unwrap_or_default()
         );
 
-        if source.paths.len() == 1 {
-            self.ctx
-                .register_parquet(&table_name, &source.paths[0], ParquetReadOptions::default())
-                .await
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        } else {
-            let first = Path::new(&source.paths[0]);
-            let parent = first.parent().ok_or_else(|| {
-                lean_core::LeanError::DataError(format!(
-                    "parquet path has no parent: {}",
-                    source.paths[0]
-                ))
-            })?;
-            let listing_opts = datafusion::datasource::listing::ListingOptions::new(Arc::new(
-                datafusion::datasource::file_format::parquet::ParquetFormat::new(),
-            ))
-            .with_file_extension(".parquet");
-            let listing_table_url =
-                datafusion::datasource::listing::ListingTableUrl::parse(parent.to_str().unwrap())
-                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-            let listing_config =
-                datafusion::datasource::listing::ListingTableConfig::new(listing_table_url)
-                    .with_listing_options(listing_opts)
-                    .infer_schema(&self.ctx.state())
-                    .await
-                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-            let listing_table =
-                datafusion::datasource::listing::ListingTable::try_new(listing_config)
-                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-            self.ctx
-                .register_table(&table_name, Arc::new(listing_table))
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        }
+        self.ctx
+            .register_parquet(&table_name, &source.paths[0], ParquetReadOptions::default())
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         let mut df = self
             .ctx
@@ -208,50 +182,7 @@ impl ParquetReader {
 
         let mut out = Vec::new();
         for batch in &batches {
-            let schema = batch.schema();
-            let time_idx = source
-                .time_column
-                .as_ref()
-                .and_then(|c| schema.index_of(c).ok());
-            let value_idx = source
-                .value_column
-                .as_ref()
-                .and_then(|c| schema.index_of(c).ok());
-            for row in 0..batch.num_rows() {
-                let point_end_time = match time_idx {
-                    Some(idx) => Some(parquet_custom_time_to_datetime(
-                        batch.column(idx).as_ref(),
-                        row,
-                        source.time_format.as_deref(),
-                        source.time_zone.as_deref(),
-                        date,
-                    )?),
-                    None => None,
-                };
-                let point_date = point_end_time
-                    .map(|time| {
-                        time.to_tz(custom_time_zone(source.time_zone.as_deref()))
-                            .date_naive()
-                    })
-                    .unwrap_or(date);
-                let value = value_idx
-                    .and_then(|idx| numeric_cell_as_f64(batch.column(idx).as_ref(), row))
-                    .and_then(rust_decimal::Decimal::from_f64_retain)
-                    .unwrap_or(rust_decimal::Decimal::ZERO);
-                let mut fields = HashMap::new();
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    fields.insert(
-                        field.name().clone(),
-                        arrow_cell_to_json(batch.column(col_idx).as_ref(), row),
-                    );
-                }
-                out.push(CustomDataPoint {
-                    time: point_date,
-                    end_time: point_end_time,
-                    value,
-                    fields,
-                });
-            }
+            append_custom_batch_points(&mut out, batch, source, query, date)?;
         }
 
         debug!(
@@ -1171,6 +1102,168 @@ impl ParquetReader {
             path.display()
         );
         Ok(result)
+    }
+}
+
+fn read_custom_parquet_points_from_files(
+    source: &CustomParquetSource,
+    query: &CustomDataQuery,
+    date: chrono::NaiveDate,
+) -> LeanResult<Vec<CustomDataPoint>> {
+    let mut out = Vec::new();
+    for path in &source.paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| lean_core::LeanError::DataError(format!("{path}: {e}")))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let reader = builder
+            .build()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            append_custom_batch_points(&mut out, &batch, source, query, date)?;
+        }
+    }
+    debug!(
+        "Read {} custom parquet points from {} file(s)",
+        out.len(),
+        source.paths.len()
+    );
+    Ok(out)
+}
+
+fn append_custom_batch_points(
+    out: &mut Vec<CustomDataPoint>,
+    batch: &RecordBatch,
+    source: &CustomParquetSource,
+    query: &CustomDataQuery,
+    date: chrono::NaiveDate,
+) -> LeanResult<()> {
+    let schema = batch.schema();
+    let time_idx = source
+        .time_column
+        .as_ref()
+        .and_then(|c| schema.index_of(c).ok());
+    let value_idx = source
+        .value_column
+        .as_ref()
+        .and_then(|c| schema.index_of(c).ok());
+    for row in 0..batch.num_rows() {
+        if !custom_row_matches_query(batch, row, source, query) {
+            continue;
+        }
+        let point_end_time = match time_idx {
+            Some(idx) => Some(parquet_custom_time_to_datetime(
+                batch.column(idx).as_ref(),
+                row,
+                source.time_format.as_deref(),
+                source.time_zone.as_deref(),
+                date,
+            )?),
+            None => None,
+        };
+        let point_date = point_end_time
+            .map(|time| {
+                time.to_tz(custom_time_zone(source.time_zone.as_deref()))
+                    .date_naive()
+            })
+            .unwrap_or(date);
+        let value = value_idx
+            .and_then(|idx| numeric_cell_as_f64(batch.column(idx).as_ref(), row))
+            .and_then(rust_decimal::Decimal::from_f64_retain)
+            .unwrap_or(rust_decimal::Decimal::ZERO);
+        let mut fields = HashMap::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            fields.insert(
+                field.name().clone(),
+                arrow_cell_to_json(batch.column(col_idx).as_ref(), row),
+            );
+        }
+        out.push(CustomDataPoint {
+            time: point_date,
+            end_time: point_end_time,
+            value,
+            fields,
+        });
+    }
+    Ok(())
+}
+
+fn custom_row_matches_query(
+    batch: &RecordBatch,
+    row: usize,
+    source: &CustomParquetSource,
+    query: &CustomDataQuery,
+) -> bool {
+    let schema = batch.schema();
+    if let (Some(symbol_col), Some(symbols)) = (&source.symbol_column, &query.symbols) {
+        if !symbols.is_empty() {
+            let Ok(idx) = schema.index_of(symbol_col) else {
+                return false;
+            };
+            let Some(value) = string_cell_as_string(batch.column(idx).as_ref(), row) else {
+                return false;
+            };
+            if !symbols.iter().any(|symbol| symbol == &value) {
+                return false;
+            }
+        }
+    }
+    for (column, expected) in &query.string_equals {
+        let Ok(idx) = schema.index_of(column) else {
+            return false;
+        };
+        if string_cell_as_string(batch.column(idx).as_ref(), row).as_deref() != Some(expected) {
+            return false;
+        }
+    }
+    for (column, expected_values) in &query.string_in {
+        if expected_values.is_empty() {
+            continue;
+        }
+        let Ok(idx) = schema.index_of(column) else {
+            return false;
+        };
+        let Some(value) = string_cell_as_string(batch.column(idx).as_ref(), row) else {
+            return false;
+        };
+        if !expected_values.iter().any(|expected| expected == &value) {
+            return false;
+        }
+    }
+    for (column, min_value) in &query.numeric_min {
+        let Ok(idx) = schema.index_of(column) else {
+            return false;
+        };
+        if numeric_cell_as_f64(batch.column(idx).as_ref(), row)
+            .is_none_or(|value| value < *min_value)
+        {
+            return false;
+        }
+    }
+    for (column, max_value) in &query.numeric_max {
+        let Ok(idx) = schema.index_of(column) else {
+            return false;
+        };
+        if numeric_cell_as_f64(batch.column(idx).as_ref(), row)
+            .is_none_or(|value| value > *max_value)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn string_cell_as_string(array: &dyn Array, row: usize) -> Option<String> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        Some(values.value(row).to_string())
+    } else if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        Some(values.value(row).to_string())
+    } else {
+        array_value_to_string(array, row).ok()
     }
 }
 

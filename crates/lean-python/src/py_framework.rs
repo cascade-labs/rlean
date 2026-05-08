@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use lean_alpha::{IAlphaModel, InsightDirection as AlphaDir};
+use lean_alpha::{IAlphaModel, InsightCollection, InsightDirection as AlphaDir};
 use lean_core::{Symbol, TimeSpan};
 use lean_execution::{
     ExecutionTarget, IExecutionModel, ImmediateExecutionModel, OrderRequest, SecurityData,
@@ -40,6 +40,9 @@ pub struct FrameworkState {
     pub exec_model: Box<dyn IExecutionModel>,
     /// Risk management model — defaults to Null (pass-through).
     pub risk_model: Box<dyn RiskManagementModel>,
+    /// LEAN-style active insight collection owned by the framework pipeline.
+    pub insights: InsightCollection,
+    pending_flat_targets: Vec<lean_alpha::Insight>,
 }
 
 impl FrameworkState {
@@ -49,6 +52,8 @@ impl FrameworkState {
             pcm: Box::new(EqualWeightingPortfolioConstructionModel::new()),
             exec_model: Box::new(ImmediateExecutionModel::new()),
             risk_model: Box::new(NullRiskManagement),
+            insights: InsightCollection::new(),
+            pending_flat_targets: Vec::new(),
         }
     }
 
@@ -67,24 +72,57 @@ impl FrameworkState {
         portfolio_value: Decimal,
         prices: &HashMap<String, Decimal>,
         holdings: &HashMap<String, Decimal>,
+        open_orders: &HashMap<String, Decimal>,
     ) -> Vec<OrderRequest> {
         // 1. Alpha: gather insights from all registered models.
         let alpha_insights: Vec<lean_alpha::Insight> = self
             .alpha_models
             .iter_mut()
             .flat_map(|m| m.update(slice, securities))
+            .map(|i| i.with_generated_time_utc(slice.time))
             .collect();
 
         // Always update PCM price history so warm-up-requiring models (e.g.
         // Black-Litterman) accumulate data even when alpha is silent.
         self.pcm.update_security_prices(prices);
 
-        if alpha_insights.is_empty() {
+        let expired_insights = self.insights.remove_expired(slice.time);
+        let has_insight_changes = !alpha_insights.is_empty() || !expired_insights.is_empty();
+
+        for insight in &alpha_insights {
+            if insight.direction == AlphaDir::Flat {
+                self.insights
+                    .clear_symbols(std::slice::from_ref(&insight.symbol));
+                self.pending_flat_targets.push(insight.clone());
+            } else {
+                self.insights.add(insight.clone());
+            }
+        }
+
+        if !has_insight_changes && self.pending_flat_targets.is_empty() {
             return Vec::new();
         }
 
-        // 2. Convert alpha Insights → InsightForPcm.
-        let pcm_insights: Vec<InsightForPcm> = alpha_insights
+        let mut target_insights = self.insights.latest_active_per_symbol(slice.time);
+
+        for insight in expired_insights {
+            if !self.insights.has_active(&insight.symbol, slice.time) {
+                let mut flat = insight.clone();
+                flat.direction = AlphaDir::Flat;
+                flat.generated_time_utc = slice.time;
+                flat.close_time_utc = slice.time;
+                target_insights.push(flat);
+            }
+        }
+
+        target_insights.append(&mut self.pending_flat_targets);
+
+        if target_insights.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Convert active alpha Insights → InsightForPcm.
+        let pcm_insights: Vec<InsightForPcm> = target_insights
             .iter()
             .map(|i| InsightForPcm {
                 symbol: i.symbol.clone(),
@@ -110,6 +148,13 @@ impl FrameworkState {
             .map(|t| RiskTarget::new(t.symbol.clone(), t.quantity))
             .collect();
         let adjusted = self.risk_model.manage_risk(&risk_targets);
+        let adjusted_by_symbol: HashMap<String, RiskTarget> =
+            adjusted
+                .into_iter()
+                .fold(HashMap::new(), |mut targets, target| {
+                    targets.insert(target.symbol.value.clone(), target);
+                    targets
+                });
 
         // 5. Build SecurityData map for execution model.
         let security_data: HashMap<String, SecurityData> = securities
@@ -117,6 +162,10 @@ impl FrameworkState {
             .map(|sym| {
                 let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
                 let current_qty = holdings.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
+                let open_order_qty = open_orders
+                    .get(&sym.value)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 (
                     sym.value.clone(),
                     SecurityData {
@@ -128,21 +177,36 @@ impl FrameworkState {
                         average_volume: None,
                         daily_std_dev: None,
                         current_quantity: current_qty,
+                        open_order_quantity: open_order_qty,
                     },
                 )
             })
             .collect();
 
         // 6. Execution: convert targets to concrete order requests.
-        let exec_targets: Vec<ExecutionTarget> = adjusted
+        let exec_targets: Vec<ExecutionTarget> = adjusted_by_symbol
             .iter()
             .map(|t| ExecutionTarget {
-                symbol: t.symbol.clone(),
-                quantity: t.quantity,
+                symbol: t.1.symbol.clone(),
+                quantity: t.1.quantity,
             })
             .collect();
 
         self.exec_model.execute(&exec_targets, &security_data)
+    }
+
+    pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
+        for model in &mut self.alpha_models {
+            model.on_securities_changed(added, removed);
+        }
+        self.pcm.on_securities_changed(added, removed);
+        self.exec_model.on_securities_changed(added, removed);
+        self.insights.expire(removed, lean_core::DateTime::MAX);
+        let removed_insights = self.insights.clear_symbols(removed);
+        for mut insight in removed_insights {
+            insight.direction = AlphaDir::Flat;
+            self.pending_flat_targets.push(insight);
+        }
     }
 }
 
@@ -168,7 +232,7 @@ pub fn run_framework_pipeline(
         }
     }
 
-    let (securities, prices, holdings, portfolio_value) = {
+    let (securities, prices, holdings, open_orders, portfolio_value) = {
         let alg = alg_inner.lock().unwrap();
         let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
         let prices: HashMap<String, Decimal> = alg
@@ -182,12 +246,34 @@ pub fn run_framework_pipeline(
             .into_iter()
             .map(|h| (h.symbol.value.clone(), h.quantity))
             .collect();
+        let mut open_orders: HashMap<String, Decimal> = HashMap::new();
+        for order in alg.transactions.get_open_orders() {
+            *open_orders
+                .entry(order.symbol.value.clone())
+                .or_insert(Decimal::ZERO) += order.quantity;
+        }
         let pv = alg.portfolio.total_portfolio_value();
-        (securities, prices, holdings, pv)
+        (securities, prices, holdings, open_orders, pv)
     };
 
     let mut fw = framework.lock().unwrap();
-    fw.run_pipeline(slice, &securities, portfolio_value, &prices, &holdings)
+    fw.run_pipeline(
+        slice,
+        &securities,
+        portfolio_value,
+        &prices,
+        &holdings,
+        &open_orders,
+    )
+}
+
+pub fn notify_framework_securities_changed(
+    framework: &Arc<Mutex<FrameworkState>>,
+    added: &[Symbol],
+    removed: &[Symbol],
+) {
+    let mut fw = framework.lock().unwrap();
+    fw.on_securities_changed(added, removed);
 }
 
 // ─── Python Alpha Model Wrappers ──────────────────────────────────────────────
@@ -378,16 +464,31 @@ pub struct PyEqualWeightingPcm {
 #[pymethods]
 impl PyEqualWeightingPcm {
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (_rebalance=None, portfolio_bias=PyPortfolioBias::LongShort, max_weight=None))]
+    pub fn new(
+        _rebalance: Option<&Bound<'_, PyAny>>,
+        portfolio_bias: PyPortfolioBias,
+        max_weight: Option<f64>,
+    ) -> Self {
+        let max_weight = max_weight
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .and_then(Decimal::from_f64_retain);
         Self {
-            model: Some(Box::new(EqualWeightingPortfolioConstructionModel::new())),
+            model: Some(Box::new(
+                EqualWeightingPortfolioConstructionModel::with_bias_and_max_weight(
+                    portfolio_bias.into(),
+                    max_weight,
+                ),
+            )),
         }
     }
 }
 
 impl Default for PyEqualWeightingPcm {
     fn default() -> Self {
-        Self::new()
+        Self {
+            model: Some(Box::new(EqualWeightingPortfolioConstructionModel::new())),
+        }
     }
 }
 
@@ -1196,9 +1297,30 @@ impl IAlphaModel for PyAlphaAdapter {
 
     fn on_securities_changed(
         &mut self,
-        _added: &[lean_core::Symbol],
-        _removed: &[lean_core::Symbol],
+        added: &[lean_core::Symbol],
+        removed: &[lean_core::Symbol],
     ) {
+        Python::attach(|py| {
+            let changes = lean_algorithm::algorithm::SecurityChanges {
+                added: added.to_vec(),
+                removed: removed.to_vec(),
+            };
+            let py_changes = crate::py_universe::PySecurityChanges::from_changes(&changes);
+            let changes_obj = match Py::new(py, py_changes) {
+                Ok(obj) => obj.into_any(),
+                Err(e) => {
+                    tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged alloc error: {e}");
+                    return;
+                }
+            };
+            let alg = self.alg_py.bind(py);
+            if let Err(e) = self
+                .obj
+                .call_method1(py, "OnSecuritiesChanged", (alg, changes_obj))
+            {
+                tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged error: {e}");
+            }
+        });
     }
 }
 

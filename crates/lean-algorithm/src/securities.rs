@@ -11,7 +11,7 @@ pub struct Security {
     pub resolution: Resolution,
     pub symbol_properties: SymbolProperties,
     pub exchange_hours: ExchangeHours,
-    pub leverage: f64,
+    pub leverage: RwLock<f64>,
     pub is_tradable: bool,
     pub is_delisted: bool,
     pub price: RwLock<Price>,
@@ -29,7 +29,7 @@ impl Security {
             resolution,
             symbol_properties,
             exchange_hours,
-            leverage: 1.0,
+            leverage: RwLock::new(1.0),
             is_tradable: true,
             is_delisted: false,
             price: RwLock::new(rust_decimal_macros::dec!(0)),
@@ -42,6 +42,14 @@ impl Security {
 
     pub fn set_price(&self, price: Price) {
         *self.price.write() = price;
+    }
+
+    pub fn leverage(&self) -> f64 {
+        *self.leverage.read()
+    }
+
+    pub fn set_leverage(&self, leverage: f64) {
+        *self.leverage.write() = leverage;
     }
 }
 

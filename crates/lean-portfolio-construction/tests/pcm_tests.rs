@@ -6,7 +6,7 @@ use lean_core::{Market, Symbol};
 use lean_portfolio_construction::{
     EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel, InsightDirection,
     InsightForPcm, InsightWeightingPortfolioConstructionModel, NullPortfolioConstructionModel,
-    PortfolioTarget,
+    PortfolioBias, PortfolioTarget,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -140,6 +140,48 @@ mod equal_weighting_tests {
             ibm_qty < Decimal::ZERO,
             "IBM should be short (Down insight)"
         );
+    }
+
+    #[test]
+    fn equal_weight_long_bias_flattens_down_insights() {
+        let spy = make_equity("SPY");
+        let ibm = make_equity("IBM");
+
+        let insights = vec![
+            make_insight(spy.clone(), InsightDirection::Up),
+            make_insight(ibm.clone(), InsightDirection::Down),
+        ];
+        let prices = make_prices(&[("SPY", dec!(100)), ("IBM", dec!(100))]);
+
+        let mut model = EqualWeightingPortfolioConstructionModel::with_bias(PortfolioBias::Long);
+        let targets = model.create_targets(&insights, dec!(100_000), &prices);
+
+        let get_qty = |ticker: &str| {
+            targets
+                .iter()
+                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .unwrap()
+                .quantity
+        };
+
+        assert_eq!(get_qty("SPY"), dec!(1000));
+        assert_eq!(get_qty("IBM"), Decimal::ZERO);
+    }
+
+    #[test]
+    fn equal_weight_respects_max_weight_cap() {
+        let spy = make_equity("SPY");
+        let insights = vec![make_insight(spy.clone(), InsightDirection::Up)];
+        let prices = make_prices(&[("SPY", dec!(100))]);
+
+        let mut model = EqualWeightingPortfolioConstructionModel::with_bias_and_max_weight(
+            PortfolioBias::LongShort,
+            Some(dec!(0.10)),
+        );
+        let targets = model.create_targets(&insights, dec!(100_000), &prices);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].quantity, dec!(100));
     }
 
     /// A Flat insight should result in a zero-quantity target (liquidate).

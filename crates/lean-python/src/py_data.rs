@@ -1,4 +1,4 @@
-use crate::py_options::{PyOptionChain, PyOptionChains};
+use crate::py_options::PyOptionChains;
 use crate::py_types::{PySecurity, PySymbol};
 use lean_core::TickType;
 use lean_data::QuoteBar;
@@ -399,6 +399,12 @@ pub struct PyTick {
     pub bid_size: f64,
     #[pyo3(get)]
     pub ask_size: f64,
+    #[pyo3(get)]
+    pub exchange: Option<String>,
+    #[pyo3(get)]
+    pub sale_condition: Option<String>,
+    #[pyo3(get)]
+    pub suspicious: bool,
     tick_type: TickType,
 }
 
@@ -415,6 +421,9 @@ impl From<&Tick> for PyTick {
             ask_price: tick.ask_price.to_f64().unwrap_or(0.0),
             bid_size: tick.bid_size.to_f64().unwrap_or(0.0),
             ask_size: tick.ask_size.to_f64().unwrap_or(0.0),
+            exchange: tick.exchange.clone(),
+            sale_condition: tick.sale_condition.clone(),
+            suspicious: tick.suspicious,
             tick_type: tick.tick_type,
         }
     }
@@ -794,6 +803,14 @@ impl PySlice {
     /// Build a self-contained Slice from a Rust Slice.
     /// Used for warmup and tests where no SliceProxy is available.
     pub fn from_slice(py: Python<'_>, slice: &Slice) -> PyResult<Self> {
+        Self::from_slice_with_custom(py, slice, &HashMap::new())
+    }
+
+    pub fn from_slice_with_custom(
+        py: Python<'_>,
+        slice: &Slice,
+        custom_data: &HashMap<String, Vec<CustomDataPoint>>,
+    ) -> PyResult<Self> {
         let mut bars: HashMap<u64, Py<PyTradeBar>> = HashMap::new();
         let mut ticker_to_sid: HashMap<String, u64> = HashMap::new();
         for (&sid, bar) in &slice.bars {
@@ -847,7 +864,7 @@ impl PySlice {
                 ticker_to_sid: tick_ticker_to_sid,
             },
         )?;
-        let py_custom = Py::new(py, PyCustomData::empty())?;
+        let py_custom = Py::new(py, PyCustomData::from_points(py, custom_data)?)?;
         let py_delistings = {
             let mut events: HashMap<u64, Py<PyDelisting>> = HashMap::new();
             for (&sid, d) in &slice.delistings {
@@ -1099,6 +1116,21 @@ impl PyCustomData {
         PyCustomData {
             points: HashMap::new(),
         }
+    }
+
+    pub fn from_points(
+        py: Python<'_>,
+        data: &HashMap<String, Vec<CustomDataPoint>>,
+    ) -> PyResult<Self> {
+        let mut points = HashMap::new();
+        for (ticker, rows) in data {
+            let mut py_points = Vec::with_capacity(rows.len());
+            for row in rows {
+                py_points.push(Py::new(py, PyCustomDataPoint::from_point(row))?);
+            }
+            points.insert(ticker.to_uppercase(), py_points);
+        }
+        Ok(PyCustomData { points })
     }
 }
 
@@ -1509,14 +1541,13 @@ impl SliceProxy {
 
     /// Write the option chains for this bar in-place.
     /// Called once per trading day before `on_data` when option subscriptions exist.
-    pub fn update_option_chains(&self, py: Python<'_>, chains: &[(String, OptionChain)]) {
+    pub fn update_option_chains(&self, py: Python<'_>, chains: &[(&str, &OptionChain)]) {
         let mut chains_obj = self.option_chains_cell.borrow_mut(py);
-        chains_obj.clear();
+        let active_keys: std::collections::HashSet<&str> =
+            chains.iter().map(|(permtick, _)| *permtick).collect();
+        chains_obj.retain_key_refs(&active_keys);
         for (permtick, chain) in chains {
-            let py_chain = PyOptionChain {
-                inner: chain.clone(),
-            };
-            chains_obj.set(py, permtick, py_chain).ok();
+            chains_obj.set_or_update_ref(py, permtick, chain).ok();
         }
     }
 

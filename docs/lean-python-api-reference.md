@@ -37,6 +37,18 @@ Source: [Initialization](https://www.quantconnect.com/docs/v2/writing-algorithms
 
 Source: [US Equity Requesting Data](https://www.quantconnect.com/docs/v2/writing-algorithms/securities/asset-classes/us-equity/requesting-data)
 
+## History
+
+| C# LEAN | Python LEAN |
+| --- | --- |
+| `History(symbol, 20, Resolution.Daily)` | `self.history(symbol, 20, Resolution.DAILY)` |
+| `History(symbol, start, end, Resolution.Daily)` | `self.history(symbol, start, end, Resolution.DAILY)` |
+| `History(customSymbol, 20, resolution)` | `self.history(custom_symbol, 20, resolution)` |
+
+rlean currently supports the algorithm-scoped subset above for a single subscribed equity/security symbol or a single `add_data` custom symbol. The request is anchored to `self.time`, matching C# LEAN's period-based history semantics. The return value follows rlean's existing QuantBook contract: a column-oriented `dict` suitable for `pd.DataFrame(...)`, not LEAN's full pandas MultiIndex dataframe surface.
+
+Implemented custom history uses the registered custom data subscription/source and the same cache/source helpers used by the runner, so strategies should not read provider files directly. Warm-up daily slices also load low-resolution custom subscriptions through the same custom data path used by the main daily loop. Full C# LEAN overloads that are still out of scope include multi-symbol dataframe shaping, typed `History[T]` subscription selection, tick period requests, fill-forward/extended-hours flags, mapping/normalization override parameters, and option/future universe history.
+
 ## Portfolio
 
 | C# LEAN | Python LEAN |

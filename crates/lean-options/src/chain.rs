@@ -28,6 +28,32 @@ impl OptionChain {
         self.contracts.insert(contract.symbol.clone(), contract);
     }
 
+    /// Update an existing chain without replacing the whole contract map.
+    ///
+    /// This keeps Python/engine chain views stable on high-frequency data where
+    /// the universe shape is mostly unchanged and only quote/trade fields move.
+    pub fn update_from(&mut self, next: &OptionChain) {
+        self.canonical_symbol = next.canonical_symbol.clone();
+        self.underlying_price = next.underlying_price;
+
+        self.contracts
+            .retain(|symbol, _| next.contracts.contains_key(symbol));
+
+        for (symbol, next_contract) in &next.contracts {
+            if let Some(current_contract) = self.contracts.get_mut(symbol) {
+                current_contract.strike = next_contract.strike;
+                current_contract.expiry = next_contract.expiry;
+                current_contract.right = next_contract.right;
+                current_contract.style = next_contract.style;
+                current_contract.data = next_contract.data.clone();
+                current_contract.contract_unit_of_trade = next_contract.contract_unit_of_trade;
+                current_contract.contract_multiplier = next_contract.contract_multiplier;
+            } else {
+                self.contracts.insert(symbol.clone(), next_contract.clone());
+            }
+        }
+    }
+
     /// Returns contracts filtered by the given function.
     pub fn filter<F: Fn(&OptionContract) -> bool>(&self, f: F) -> Vec<&OptionContract> {
         self.contracts.values().filter(|c| f(c)).collect()

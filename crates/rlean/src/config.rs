@@ -107,6 +107,56 @@ impl WorkspaceConfig {
     }
 }
 
+/// Walk up from `start` looking for the nearest `rlean.json`.
+///
+/// Returns the workspace directory containing the file plus the parsed config.
+/// Relative start paths are interpreted relative to the current process
+/// directory, which matches how CLI strategy paths are resolved.
+pub fn find_workspace_config(start: &Path) -> Result<Option<(PathBuf, WorkspaceConfig)>> {
+    let current_dir = std::env::current_dir()?;
+    let mut dir = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        current_dir.join(start)
+    };
+
+    if dir.is_file() {
+        dir.pop();
+    }
+
+    loop {
+        let path = dir.join("rlean.json");
+        if path.exists() {
+            return Ok(Some((dir.clone(), WorkspaceConfig::load(&dir)?)));
+        }
+
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Resolve the effective data folder for a command whose default local folder
+/// has not been overridden by `--data`.
+///
+/// Precedence:
+/// 1. nearest workspace `rlean.json`, relative to that workspace directory
+/// 2. global `~/.rlean/config`
+/// 3. caller keeps its existing default (`data`)
+pub fn configured_data_folder(start: &Path) -> Result<Option<PathBuf>> {
+    if let Some((workspace, cfg)) = find_workspace_config(start)? {
+        let path = PathBuf::from(cfg.data_folder);
+        return Ok(Some(if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        }));
+    }
+
+    Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))
+}
+
 // ── Project config (config.json) ──────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]

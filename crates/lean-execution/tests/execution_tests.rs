@@ -25,6 +25,7 @@ fn make_security(ticker: &str, price: f64, current_qty: f64) -> SecurityData {
         average_volume: None,
         daily_std_dev: None,
         current_quantity: Decimal::try_from(current_qty).unwrap(),
+        open_order_quantity: Decimal::ZERO,
     }
 }
 
@@ -90,6 +91,39 @@ mod immediate_execution_tests {
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(40));
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    /// Target=100, current=10, open buy=60 → market buy 30.
+    /// Mirrors C# OrderSizing.GetUnorderedQuantity / ProjectedHoldings.
+    #[test]
+    fn open_orders_reduce_unordered_quantity() {
+        let mut model = ImmediateExecutionModel::new();
+        let mut security = make_security("AAPL", 250.0, 10.0);
+        security.open_order_quantity = dec!(60);
+        let securities = securities_map(vec![security]);
+        let targets = vec![make_target("AAPL", 100.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(30));
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    /// Target=-100, current=-10, open sell=-60 → market sell 30.
+    #[test]
+    fn open_short_orders_reduce_unordered_quantity() {
+        let mut model = ImmediateExecutionModel::new();
+        let mut security = make_security("AAPL", 250.0, -10.0);
+        security.open_order_quantity = dec!(-60);
+        let securities = securities_map(vec![security]);
+        let targets = vec![make_target("AAPL", -100.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(-30));
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
     }
 
@@ -407,12 +441,14 @@ mod struct_tests {
             average_volume: Some(dec!(900000)),
             daily_std_dev: Some(dec!(5)),
             current_quantity: dec!(50),
+            open_order_quantity: dec!(7),
         };
         assert_eq!(s.symbol.value, "MSFT");
         assert_eq!(s.price, dec!(300));
         assert_eq!(s.bid, Some(dec!(299.5)));
         assert_eq!(s.ask, Some(dec!(300.5)));
         assert_eq!(s.current_quantity, dec!(50));
+        assert_eq!(s.open_order_quantity, dec!(7));
     }
 
     /// OrderRequest limit_price is None for market orders from ImmediateExecutionModel.
@@ -457,6 +493,7 @@ mod spread_execution_tests {
             average_volume: None,
             daily_std_dev: None,
             current_quantity: Decimal::try_from(current_qty).unwrap(),
+            open_order_quantity: Decimal::ZERO,
         }
     }
 
@@ -687,6 +724,7 @@ mod standard_deviation_execution_tests {
             average_volume: None,
             daily_std_dev: Some(Decimal::try_from(daily_std_dev).unwrap()),
             current_quantity: Decimal::try_from(current_qty).unwrap(),
+            open_order_quantity: Decimal::ZERO,
         }
     }
 

@@ -8,6 +8,7 @@
 ///   data-folder                 Parquet data root (relative to rlean.json)
 ///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
+use std::path::{Path, PathBuf};
 
 use crate::config::{GlobalConfig, PluginConfigs, WorkspaceConfig};
 
@@ -77,10 +78,20 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set default-language = {value}");
         }
         "data-folder" => {
-            let mut cfg = GlobalConfig::load()?;
-            cfg.data_folder = Some(value.to_string());
-            cfg.save()?;
-            println!("Set data-folder = {value} in ~/.rlean/config");
+            let cwd = std::env::current_dir()?;
+            if let Some((workspace, mut cfg)) = crate::config::find_workspace_config(&cwd)? {
+                cfg.data_folder = value.to_string();
+                cfg.save(&workspace)?;
+                println!(
+                    "Set data-folder = {value} in {}",
+                    workspace.join("rlean.json").display()
+                );
+            } else {
+                let mut cfg = GlobalConfig::load()?;
+                cfg.data_folder = Some(value.to_string());
+                cfg.save()?;
+                println!("Set data-folder = {value} in ~/.rlean/config");
+            }
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \
@@ -110,8 +121,9 @@ fn cmd_get(key: &str) -> Result<()> {
             println!("{}", cfg.default_language);
         }
         "data-folder" => {
-            let cfg = GlobalConfig::load()?;
-            println!("{}", cfg.data_folder.as_deref().unwrap_or("data"));
+            let cwd = std::env::current_dir()?;
+            let value = effective_data_folder_display(&cwd)?;
+            println!("{value}");
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, data-folder. \
@@ -125,16 +137,14 @@ fn cmd_get(key: &str) -> Result<()> {
 fn cmd_list() -> Result<()> {
     let global = GlobalConfig::load()?;
     let plugin_cfgs = PluginConfigs::load()?;
+    let cwd = std::env::current_dir()?;
+    let data_folder = effective_data_folder_display(&cwd)?;
 
     println!("{:<30} VALUE", "KEY");
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
-    println!(
-        "{:<30} {}",
-        "data-folder",
-        global.data_folder.as_deref().unwrap_or("data")
-    );
+    println!("{:<30} {}", "data-folder", data_folder);
 
     // Plugin configs
     let mut plugin_names: Vec<&str> = plugin_cfgs.0.keys().map(String::as_str).collect();
@@ -171,4 +181,11 @@ fn mask(s: &str) -> String {
         return "*".repeat(s.len());
     }
     format!("{}{}", &s[..4], "*".repeat(s.len() - 4))
+}
+
+fn effective_data_folder_display(start: &Path) -> Result<String> {
+    Ok(crate::config::configured_data_folder(start)?
+        .unwrap_or_else(|| PathBuf::from("data"))
+        .display()
+        .to_string())
 }

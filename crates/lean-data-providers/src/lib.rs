@@ -31,7 +31,7 @@ pub use request::{
 pub use stacked::{is_not_implemented, StackedHistoryProvider};
 pub use traits::{
     IDataDownloader, IFactorFileProvider, IHistoryProvider, ILiveDataProvider, IMapFileProvider,
-    IOptionChainProvider,
+    IOptionChainProvider, TickStream,
 };
 
 #[cfg(test)]

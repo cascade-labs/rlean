@@ -6,15 +6,24 @@ use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
 use crate::py_portfolio::PyPortfolio;
 use crate::py_types::{PyAlgorithmSettings, PyResolution, PySecurity, PySecurityManager, PySymbol};
 use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
-use chrono::{Datelike, Timelike};
+use crate::{PyAccountType, PyBrokerageName};
+use chrono::{Datelike, NaiveDate, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{Market, Resolution, SymbolOptionsExt};
+use lean_core::{DateTime, Market, Resolution, SymbolOptionsExt, TickType};
+use lean_data::{
+    CustomDataFormat, CustomDataPoint, CustomDataSubscription, CustomDataTransport, TradeBar,
+};
+use lean_options::{implied_volatility, time_to_expiry_years};
+use lean_storage::{
+    custom_data_history_path, custom_data_path, ParquetReader, PathResolver, QueryParams,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Registry of auto-updating indicators keyed by symbol SID.
@@ -41,6 +50,12 @@ impl Default for IndicatorRegistry {
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
+}
+
+#[derive(Clone)]
+pub struct AlgorithmHistoryContext {
+    pub data_root: PathBuf,
+    pub custom_data_sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>>,
 }
 
 /// The base algorithm class that Python strategies inherit from.
@@ -85,6 +100,10 @@ pub struct PyQcAlgorithm {
     pub universe_settings: PyUniverseSettings,
     /// Registered scheduled/user-defined universes.
     pub universes: Arc<Mutex<Vec<Py<PyScheduledUniverse>>>>,
+    /// Runtime data context installed by the runner before Initialize().
+    pub history_context: Arc<Mutex<Option<AlgorithmHistoryContext>>>,
+    /// Runtime algorithm parameters supplied by the CLI/config before Initialize().
+    pub parameters: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl PyQcAlgorithm {
@@ -102,6 +121,12 @@ impl PyQcAlgorithm {
     }
     pub fn universes_arc(&self) -> Arc<Mutex<Vec<Py<PyScheduledUniverse>>>> {
         self.universes.clone()
+    }
+    pub fn set_parameters(&self, parameters: HashMap<String, String>) {
+        *self.parameters.lock().unwrap() = parameters;
+    }
+    pub fn set_history_context(&self, context: AlgorithmHistoryContext) {
+        *self.history_context.lock().unwrap() = Some(context);
     }
 }
 
@@ -237,6 +262,8 @@ impl PyQcAlgorithm {
             indicators: Arc::new(Mutex::new(IndicatorRegistry::new())),
             universe_settings: PyUniverseSettings::new_shared(),
             universes: Arc::new(Mutex::new(Vec::new())),
+            history_context: Arc::new(Mutex::new(None)),
+            parameters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -254,6 +281,14 @@ impl PyQcAlgorithm {
         self.inner.lock().unwrap().set_cash(f2d(amount));
     }
 
+    #[pyo3(signature = (brokerage, account_type=PyAccountType::Margin))]
+    fn set_brokerage_model(&mut self, brokerage: PyBrokerageName, account_type: PyAccountType) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_brokerage_model(brokerage.into(), account_type.into());
+    }
+
     /// Add (or subtract) cash directly — used to credit option premium
     /// or simulate assignment P&L adjustments.
     fn add_cash(&mut self, amount: f64) {
@@ -264,6 +299,18 @@ impl PyQcAlgorithm {
 
     fn set_name(&mut self, name: &str) {
         self.inner.lock().unwrap().name = name.to_string();
+    }
+
+    #[pyo3(signature = (name, default=None))]
+    fn get_parameter(&self, name: &str, default: Option<&Bound<'_, PyAny>>) -> Option<String> {
+        self.parameters
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                default.and_then(|value| value.str().ok().map(|s| s.to_string_lossy().into_owned()))
+            })
     }
 
     /// Set the benchmark symbol.  When not called, SPY is used as the default.
@@ -616,6 +663,98 @@ impl PyQcAlgorithm {
         self.set_custom_data_query(source_type, ticker, Some(symbols), None, None)
     }
 
+    // ─── History ─────────────────────────────────────────────────────────────
+
+    /// LEAN-style algorithm history.
+    ///
+    /// Supported overloads:
+    ///   self.history(symbol, bar_count, resolution)
+    ///   self.history(symbol, start, end, resolution)
+    ///
+    /// Returns a column-oriented dict suitable for pandas.DataFrame(...).
+    #[pyo3(signature = (*args))]
+    fn history(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+        if args.len() != 3 && args.len() != 4 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "history expects (symbol, bar_count, resolution) or (symbol, start, end, resolution)",
+            ));
+        }
+
+        let symbol_arg = args.get_item(0)?;
+        let resolution_arg = args.get_item(args.len() - 1)?;
+        let resolution: Resolution = resolution_arg.extract::<PyResolution>()?.into();
+
+        let (start, end, bar_count) = if args.len() == 3 {
+            let bar_count = args.get_item(1)?.extract::<usize>()?;
+            let end = self.history_end_date();
+            let calendar_days = (bar_count as i64 * 7 + 4) / 5 + 10;
+            (
+                end - chrono::Duration::days(calendar_days),
+                end,
+                Some(bar_count),
+            )
+        } else {
+            (
+                parse_history_date(&args.get_item(1)?)?,
+                parse_history_date(&args.get_item(2)?)?,
+                None,
+            )
+        };
+
+        let ticker = history_ticker(&symbol_arg)?;
+        if let Some(custom_sub) = self.find_custom_subscription(&ticker) {
+            let mut points = self.load_custom_history(&custom_sub, start, end)?;
+            points.sort_by_key(|p| {
+                p.end_time
+                    .map(|t| t.0)
+                    .unwrap_or_else(|| date_to_datetime(p.time, 0, 0, 0).0)
+            });
+            if let Some(bar_count) = bar_count {
+                points = filter_custom_points_by_last_dates(points, bar_count);
+            }
+            return custom_points_to_pydict(py, &points);
+        }
+
+        let symbol = self.resolve_symbol(&symbol_arg)?;
+        let mut bars = self.load_history_bars(&symbol, resolution, start, end)?;
+        bars.sort_by_key(|b| b.time.0);
+        if let Some(bar_count) = bar_count {
+            if bars.len() > bar_count {
+                bars = bars[bars.len() - bar_count..].to_vec();
+            }
+        }
+        trade_bars_to_pydict(py, &bars)
+    }
+
+    /// Explicit date-range alias for the smaller rlean API.
+    #[pyo3(signature = (symbol, start, end, resolution))]
+    fn history_range(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+        start: &Bound<'_, PyAny>,
+        end: &Bound<'_, PyAny>,
+        resolution: PyResolution,
+    ) -> PyResult<Py<PyAny>> {
+        let start = parse_history_date(start)?;
+        let end = parse_history_date(end)?;
+        let ticker = history_ticker(symbol)?;
+        if let Some(custom_sub) = self.find_custom_subscription(&ticker) {
+            let mut points = self.load_custom_history(&custom_sub, start, end)?;
+            points.sort_by_key(|p| {
+                p.end_time
+                    .map(|t| t.0)
+                    .unwrap_or_else(|| date_to_datetime(p.time, 0, 0, 0).0)
+            });
+            return custom_points_to_pydict(py, &points);
+        }
+
+        let symbol = self.resolve_symbol(symbol)?;
+        let mut bars = self.load_history_bars(&symbol, resolution.into(), start, end)?;
+        bars.sort_by_key(|b| b.time.0);
+        trade_bars_to_pydict(py, &bars)
+    }
+
     // ─── Options ──────────────────────────────────────────────────────────────
 
     /// Subscribe to an option chain for an underlying equity.
@@ -650,6 +789,7 @@ impl PyQcAlgorithm {
         let canonical = self.inner.lock().unwrap().add_option(ticker, res);
         Ok(crate::py_types::PyOptionSecurity {
             canonical: crate::py_types::PySymbol { inner: canonical },
+            algorithm: self.inner.clone(),
         })
     }
 
@@ -750,6 +890,48 @@ impl PyQcAlgorithm {
             .lock()
             .unwrap()
             .log_message(format!("ERROR: {message}"));
+    }
+
+    /// rlean framework helper: Black-Scholes implied-volatility inversion for
+    /// selected option prices. This keeps pricing math in Rust while allowing
+    /// strategies to decide which suspicious events deserve an IV calculation.
+    #[pyo3(signature = (contract, option_price, underlying_price=None, risk_free_rate=0.0, dividend_yield=0.0))]
+    fn calculate_implied_volatility(
+        &self,
+        contract: &crate::py_options::PyOptionContract,
+        option_price: f64,
+        underlying_price: Option<f64>,
+        risk_free_rate: f64,
+        dividend_yield: f64,
+    ) -> Option<f64> {
+        let spot = underlying_price.unwrap_or_else(|| {
+            contract
+                .inner
+                .data
+                .underlying_last_price
+                .to_f64()
+                .unwrap_or(0.0)
+        });
+        let strike = contract.inner.strike.to_f64().unwrap_or(0.0);
+        let valuation_time = self.inner.lock().unwrap().time;
+        let t = time_to_expiry_years(contract.inner.expiry, valuation_time);
+        if option_price <= 0.0 || spot <= 0.0 || strike <= 0.0 || t <= 0.0 {
+            return None;
+        }
+        let iv = implied_volatility(
+            option_price,
+            spot,
+            strike,
+            t,
+            risk_free_rate,
+            dividend_yield,
+            contract.inner.right,
+        );
+        if iv.is_finite() && iv > 0.0 {
+            Some(iv)
+        } else {
+            None
+        }
     }
 
     // ─── Market Hours ─────────────────────────────────────────────────────────
@@ -1058,7 +1240,379 @@ fn lean_datetime_to_date(ns: i64) -> String {
     dt.format("%Y-%m-%d").to_string()
 }
 
+fn date_to_datetime(date: NaiveDate, h: u32, m: u32, s: u32) -> DateTime {
+    use chrono::{TimeZone, Utc};
+    DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(h, m, s).unwrap_or_default()))
+}
+
+fn parse_history_date(value: &Bound<'_, PyAny>) -> PyResult<NaiveDate> {
+    if let Ok((y, m, d)) = value.extract::<(i32, u32, u32)>() {
+        return NaiveDate::from_ymd_opt(y, m, d).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid history date: {y}-{m}-{d}"))
+        });
+    }
+    if let Ok(date) = value.extract::<NaiveDate>() {
+        return Ok(date);
+    }
+    if let Ok(dt) = value.extract::<chrono::NaiveDateTime>() {
+        return Ok(dt.date());
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid history date string '{s}', expected YYYY-MM-DD"
+            ))
+        });
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "history dates must be datetime/date, (year, month, day), or YYYY-MM-DD",
+    ))
+}
+
+fn history_ticker(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(sym) = value.cast::<PySymbol>() {
+        return Ok(sym.get().inner.permtick.to_uppercase());
+    }
+    if let Ok(sec) = value.cast::<PySecurity>() {
+        return Ok(sec.get().inner.inner.permtick.to_uppercase());
+    }
+    if let Ok(ticker) = value.extract::<String>() {
+        return Ok(ticker.to_uppercase());
+    }
+    Ok(value.str()?.to_str()?.to_uppercase())
+}
+
+fn trade_bars_to_pydict(py: Python<'_>, bars: &[TradeBar]) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "time",
+        bars.iter()
+            .map(|b| lean_datetime_to_date(b.time.0))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "open",
+        bars.iter()
+            .map(|b| b.open.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "high",
+        bars.iter()
+            .map(|b| b.high.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "low",
+        bars.iter()
+            .map(|b| b.low.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "close",
+        bars.iter()
+            .map(|b| b.close.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "volume",
+        bars.iter()
+            .map(|b| b.volume.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(dict.into())
+}
+
+fn custom_points_to_pydict(py: Python<'_>, points: &[CustomDataPoint]) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "time",
+        points
+            .iter()
+            .map(|p| p.time.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "end_time",
+        points
+            .iter()
+            .map(|p| {
+                p.end_time
+                    .map(|t| lean_datetime_to_iso(t.0))
+                    .unwrap_or_else(|| p.time.to_string())
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item(
+        "value",
+        points
+            .iter()
+            .map(|p| p.value.to_f64().unwrap_or(0.0))
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut field_names: Vec<String> = points
+        .iter()
+        .flat_map(|p| p.fields.keys().cloned())
+        .collect();
+    field_names.sort();
+    field_names.dedup();
+    for field in field_names {
+        let values = PyList::empty(py);
+        for point in points {
+            match point.fields.get(&field) {
+                Some(value) => values.append(json_value_to_py_history(py, value)?)?,
+                None => values.append(py.None())?,
+            }
+        }
+        dict.set_item(field, values)?;
+    }
+    Ok(dict.into())
+}
+
+fn filter_custom_points_by_last_dates(
+    points: Vec<CustomDataPoint>,
+    bar_count: usize,
+) -> Vec<CustomDataPoint> {
+    if bar_count == 0 || points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut dates: Vec<NaiveDate> = points
+        .iter()
+        .map(|p| p.end_time.map(|t| t.date_utc()).unwrap_or(p.time))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if dates.len() <= bar_count {
+        return points;
+    }
+
+    dates = dates.split_off(dates.len() - bar_count);
+    let keep: BTreeSet<NaiveDate> = dates.into_iter().collect();
+    points
+        .into_iter()
+        .filter(|p| keep.contains(&p.end_time.map(|t| t.date_utc()).unwrap_or(p.time)))
+        .collect()
+}
+
+fn json_value_to_py_history(py: Python<'_>, v: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    use pyo3::IntoPyObjectExt;
+    match v {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(b) => (*b).into_py_any(py),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py_any(py)
+            } else if let Some(f) = n.as_f64() {
+                f.into_py_any(py)
+            } else {
+                n.to_string().into_py_any(py)
+            }
+        }
+        serde_json::Value::String(s) => s.as_str().into_py_any(py),
+        other => other.to_string().into_py_any(py),
+    }
+}
+
+fn read_custom_parquet_points_blocking(
+    source: lean_data::CustomParquetSource,
+    query: lean_data::CustomDataQuery,
+    date: NaiveDate,
+) -> PyResult<Vec<CustomDataPoint>> {
+    let handle = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(async move {
+                ParquetReader::new()
+                    .read_custom_parquet_points(&source, &query, date)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+    });
+    handle
+        .join()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("custom history worker panicked"))?
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
 impl PyQcAlgorithm {
+    fn history_context(&self) -> PyResult<AlgorithmHistoryContext> {
+        self.history_context.lock().unwrap().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "history is only available while running under the rlean backtest runner",
+            )
+        })
+    }
+
+    fn history_end_date(&self) -> NaiveDate {
+        let inner = self.inner.lock().unwrap();
+        let current = inner.time.date_utc();
+        if current == DateTime::EPOCH.date_utc() {
+            inner.start_date.date_utc()
+        } else {
+            current
+        }
+    }
+
+    fn find_custom_subscription(&self, ticker: &str) -> Option<CustomDataSubscription> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .custom_data_subscriptions
+            .iter()
+            .find(|sub| sub.ticker.eq_ignore_ascii_case(ticker))
+            .cloned()
+    }
+
+    fn load_history_bars(
+        &self,
+        symbol: &lean_core::Symbol,
+        resolution: Resolution,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> PyResult<Vec<TradeBar>> {
+        let context = self.history_context()?;
+        let resolver = PathResolver::new(&context.data_root);
+        let reader = ParquetReader::new();
+        let params = QueryParams::new().with_time_range(
+            date_to_datetime(start, 0, 0, 0),
+            date_to_datetime(end, 23, 59, 59),
+        );
+
+        let mut out = Vec::new();
+        let mut d = start;
+        while d <= end {
+            let path = resolver.market_data_partition(symbol, resolution, TickType::Trade, d);
+            if path.exists() {
+                out.extend(
+                    reader
+                        .read_trade_bar_partition(&path, symbol, &params)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|bar| bar.symbol.id.sid == symbol.id.sid),
+                );
+            }
+            d += chrono::Duration::days(1);
+        }
+        Ok(out)
+    }
+
+    fn load_custom_history(
+        &self,
+        sub: &CustomDataSubscription,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> PyResult<Vec<CustomDataPoint>> {
+        let context = self.history_context()?;
+        let reader = ParquetReader::new();
+        let full_history_path =
+            custom_data_history_path(&context.data_root, &sub.source_type, &sub.ticker);
+        if full_history_path.exists() {
+            return Ok(reader
+                .read_custom_data_points(&full_history_path)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.time >= start && p.time <= end)
+                .collect());
+        }
+
+        let source = context
+            .custom_data_sources
+            .iter()
+            .find(|source| source.name() == sub.source_type)
+            .cloned();
+        let mut out = Vec::new();
+        let mut d = start;
+        while d <= end {
+            let cache_path = custom_data_path(&context.data_root, &sub.source_type, &sub.ticker, d);
+            if cache_path.exists() {
+                out.extend(
+                    reader
+                        .read_custom_data_points(&cache_path)
+                        .unwrap_or_default(),
+                );
+                d += chrono::Duration::days(1);
+                continue;
+            }
+
+            let Some(source) = source.as_ref() else {
+                d += chrono::Duration::days(1);
+                continue;
+            };
+            let mut config = sub.config.clone();
+            let effective_query =
+                config
+                    .query
+                    .merge(&sub.dynamic_query)
+                    .merge(&lean_data::CustomDataQuery {
+                        start_date: Some(start),
+                        end_date: Some(end),
+                        ..Default::default()
+                    });
+            config.query = effective_query.clone();
+
+            if let Some(parquet_source) =
+                source.get_parquet_source(&sub.ticker, d, &config, &effective_query)
+            {
+                let points =
+                    read_custom_parquet_points_blocking(parquet_source, effective_query, d)?;
+                out.extend(points);
+                d += chrono::Duration::days(1);
+                continue;
+            }
+
+            if let Some(data_source) = source.get_source(&sub.ticker, d, &config) {
+                let raw = match data_source.transport {
+                    CustomDataTransport::LocalFile => {
+                        std::fs::read_to_string(&data_source.uri).unwrap_or_default()
+                    }
+                    CustomDataTransport::Http => reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(120))
+                        .user_agent("Mozilla/5.0 (compatible; rlean/0.1)")
+                        .build()
+                        .and_then(|client| client.get(&data_source.uri).send())
+                        .and_then(|response| response.text())
+                        .unwrap_or_default(),
+                };
+                match data_source.format {
+                    CustomDataFormat::Csv => {
+                        for line in raw.lines() {
+                            if let Some(point) = source.reader(line, d, &config) {
+                                out.push(point);
+                            }
+                        }
+                    }
+                    CustomDataFormat::Json => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            match value {
+                                serde_json::Value::Array(rows) => {
+                                    for row in rows {
+                                        if let Some(point) =
+                                            source.reader(&row.to_string(), d, &config)
+                                        {
+                                            out.push(point);
+                                        }
+                                    }
+                                }
+                                row => {
+                                    if let Some(point) = source.reader(&row.to_string(), d, &config)
+                                    {
+                                        out.push(point);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            d += chrono::Duration::days(1);
+        }
+        out.retain(|p| p.time >= start && p.time <= end);
+        Ok(out)
+    }
+
     fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<lean_core::Symbol> {
         if let Ok(sym) = arg.cast::<PySymbol>() {
             return Ok(sym.get().inner.clone());
@@ -1142,5 +1696,186 @@ impl PyQcAlgorithm {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_data::TradeBarData;
+    use lean_storage::{ParquetWriter, WriterConfig};
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn algorithm_history_range_reads_equity_fixture_rows() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let mut alg = PyQcAlgorithm::new();
+        let security = alg.add_equity("SPY", PyResolution::Daily);
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            custom_data_sources: Vec::new(),
+        });
+
+        let symbol = security.inner.inner.clone();
+        let bars = vec![
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100.5), dec!(1000)),
+            ),
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(101), dec!(102), dec!(100), dec!(101.5), dec!(2000)),
+            ),
+        ];
+        let path = resolver.market_data_partition(
+            &symbol,
+            Resolution::Daily,
+            TickType::Trade,
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+        );
+        ParquetWriter::new(WriterConfig::default())
+            .write_trade_bars(&bars, &path)
+            .unwrap();
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();
+            let start = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 3]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![100.5, 101.5]);
+        });
+    }
+
+    #[test]
+    fn algorithm_history_range_reads_custom_subscription_cache_rows() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut alg = PyQcAlgorithm::new();
+        alg.add_data("fixture", "ALT", None, None).unwrap();
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            custom_data_sources: Vec::new(),
+        });
+
+        let mut fields = HashMap::new();
+        fields.insert("signal".to_string(), serde_json::json!("ready"));
+        let points = vec![CustomDataPoint {
+            time: NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            end_time: Some(date_to_datetime(
+                NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+                16,
+                0,
+                0,
+            )),
+            value: dec!(42),
+            fields,
+        }];
+        let path = custom_data_path(
+            tmp.path(),
+            "fixture",
+            "ALT",
+            NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+        );
+        ParquetWriter::new(WriterConfig {
+            bloom_filter: false,
+            write_statistics: false,
+            ..WriterConfig::default()
+        })
+        .write_custom_data_points(&points, &path)
+        .unwrap();
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(
+                py,
+                PySymbol {
+                    inner: alg.symbols.get("ALT").unwrap().clone(),
+                },
+            )
+            .unwrap();
+            let start = PyTuple::new(py, [2024, 1, 1]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 4]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let values: Vec<f64> = dict.get_item("value").unwrap().unwrap().extract().unwrap();
+            let signals: Vec<String> = dict.get_item("signal").unwrap().unwrap().extract().unwrap();
+            assert_eq!(values, vec![42.0]);
+            assert_eq!(signals, vec!["ready".to_string()]);
+        });
+    }
+
+    #[test]
+    fn algorithm_custom_history_bar_count_keeps_last_dates_not_rows() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut alg = PyQcAlgorithm::new();
+        alg.add_data("fixture", "ALT", None, None).unwrap();
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            custom_data_sources: Vec::new(),
+        });
+
+        for (day, values) in [(2, vec![1, 2]), (3, vec![3, 4]), (4, vec![5, 6])] {
+            let date = NaiveDate::from_ymd_opt(2024, 1, day).unwrap();
+            let points = values
+                .into_iter()
+                .map(|value| CustomDataPoint {
+                    time: date,
+                    end_time: Some(date_to_datetime(date, 16, 0, 0)),
+                    value: Decimal::from(value),
+                    fields: HashMap::new(),
+                })
+                .collect::<Vec<_>>();
+            let path = custom_data_path(tmp.path(), "fixture", "ALT", date);
+            ParquetWriter::new(WriterConfig {
+                bloom_filter: false,
+                write_statistics: false,
+                ..WriterConfig::default()
+            })
+            .write_custom_data_points(&points, &path)
+            .unwrap();
+        }
+
+        let custom_sub = alg.find_custom_subscription("ALT").unwrap();
+        let mut points = alg
+            .load_custom_history(
+                &custom_sub,
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 1, 4).unwrap(),
+            )
+            .unwrap();
+        points.sort_by_key(|p| {
+            p.end_time
+                .map(|t| t.0)
+                .unwrap_or_else(|| date_to_datetime(p.time, 0, 0, 0).0)
+        });
+        let values = filter_custom_points_by_last_dates(points, 2)
+            .into_iter()
+            .map(|p| p.value.to_f64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![3.0, 4.0, 5.0, 6.0]);
     }
 }

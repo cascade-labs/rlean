@@ -1,8 +1,8 @@
 use crate::charting::ChartCollection;
 use crate::py_data::{PySlice, PyTradeBar, SliceProxy};
-use crate::py_framework::FrameworkState;
+use crate::py_framework::{notify_framework_securities_changed, FrameworkState};
 use crate::py_orders::PyOrderEvent;
-use crate::py_qc_algorithm::{IndicatorRegistry, PyQcAlgorithm};
+use crate::py_qc_algorithm::{AlgorithmHistoryContext, IndicatorRegistry, PyQcAlgorithm};
 use crate::py_universe::{PyScheduledUniverse, PySecurityChanges};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
@@ -50,6 +50,26 @@ impl PyAlgorithmAdapter {
         }
     }
 
+    /// Self-contained `OnData` for paths that do not use the hot `SliceProxy`,
+    /// while still carrying custom data through the Python `Slice`.
+    pub fn on_data_with_custom(
+        &mut self,
+        slice: &Slice,
+        custom_data: &std::collections::HashMap<String, Vec<CustomDataPoint>>,
+    ) {
+        Python::attach(|py| {
+            self.update_indicators(py, slice);
+            match PySlice::from_slice_with_custom(py, slice, custom_data) {
+                Ok(py_slice) => {
+                    if let Err(e) = self.py_obj.call_method1(py, "OnData", (py_slice,)) {
+                        e.print(py);
+                    }
+                }
+                Err(e) => e.print(py),
+            }
+        });
+    }
+
     /// Update all registered indicators with bars from the current slice.
     fn update_indicators(&self, py: Python<'_>, slice: &Slice) {
         let registry = self.indicators.lock().unwrap();
@@ -83,6 +103,28 @@ impl PyAlgorithmAdapter {
             universes,
             name,
         })
+    }
+
+    pub fn set_history_context(
+        &self,
+        py: Python<'_>,
+        context: AlgorithmHistoryContext,
+    ) -> PyResult<()> {
+        let bound = self.py_obj.bind(py);
+        let qc_ref = bound.cast::<PyQcAlgorithm>()?;
+        qc_ref.borrow().set_history_context(context);
+        Ok(())
+    }
+
+    pub fn set_parameters(
+        &self,
+        py: Python<'_>,
+        parameters: std::collections::HashMap<String, String>,
+    ) -> PyResult<()> {
+        let bound = self.py_obj.bind(py);
+        let qc_ref = bound.cast::<PyQcAlgorithm>()?;
+        qc_ref.borrow().set_parameters(parameters);
+        Ok(())
     }
 
     /// Apply all due universes at the current frontier and add subscriptions
@@ -252,6 +294,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn on_securities_changed(&mut self, changes: &SecurityChanges) {
+        notify_framework_securities_changed(&self.framework, &changes.added, &changes.removed);
         Python::attach(|py| {
             let py_changes = PySecurityChanges::from_changes(changes);
             if let Ok(changes_obj) = Py::new(py, py_changes) {

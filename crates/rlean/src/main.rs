@@ -16,6 +16,7 @@
 ///   rlean create-project my_strategy
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -132,6 +133,10 @@ struct RunArgs {
     #[arg(long)]
     end_date: Option<String>,
 
+    /// Algorithm parameter as KEY=VALUE for LEAN-style GetParameter access.
+    #[arg(long = "parameter", short = 'p', value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    parameters: Vec<String>,
+
     // ── Rate limits (plugin API keys/URLs live in ~/.rlean/plugin-configs.json) ─
     /// Polygon/Massive requests/second (default: 5)
     #[arg(long, default_value_t = 5.0)]
@@ -196,18 +201,23 @@ async fn main() -> Result<()> {
     }
 }
 
+fn parse_algorithm_parameters(raw: &[String]) -> Result<HashMap<String, String>> {
+    let mut parameters = HashMap::new();
+    for item in raw {
+        let Some((key, value)) = item.split_once('=') else {
+            bail!("invalid algorithm parameter '{item}', expected KEY=VALUE");
+        };
+        if key.is_empty() {
+            bail!("invalid algorithm parameter '{item}', key cannot be empty");
+        }
+        parameters.insert(key.to_string(), value.to_string());
+    }
+    Ok(parameters)
+}
+
 // ── Backtest ──────────────────────────────────────────────────────────────────
 
 async fn run_backtest(mut args: RunArgs) -> Result<()> {
-    // Apply global config data-folder when --data was not explicitly provided.
-    if args.data == std::path::Path::new("data") {
-        if let Ok(cfg) = config::GlobalConfig::load() {
-            if let Some(folder) = cfg.data_folder {
-                args.data = PathBuf::from(folder);
-            }
-        }
-    }
-
     // If the user passed a directory, look for main.py inside it.
     if args.strategy.is_dir() {
         let candidate = args.strategy.join("main.py");
@@ -223,6 +233,15 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
     }
 
     validate_strategy_path(&args.strategy)?;
+
+    // Apply configured data-folder when --data was not explicitly provided.
+    // Workspace rlean.json takes precedence over ~/.rlean/config, and relative
+    // workspace paths are resolved from the directory containing rlean.json.
+    if args.data == std::path::Path::new("data") {
+        if let Some(folder) = config::configured_data_folder(&args.strategy)? {
+            args.data = folder;
+        }
+    }
 
     let (historical_provider, history_provider) = build_providers(&args)?;
 
@@ -267,6 +286,7 @@ async fn run_python_backtest(
     };
     let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
     let end_date_override = args.end_date.as_deref().map(parse_date).transpose()?;
+    let parameters = parse_algorithm_parameters(&args.parameters)?;
 
     // Each backtest creates a LEAN-compatible output directory:
     //   <project>/backtests/YYYY-MM-DD_<strategy-name>/
@@ -274,6 +294,7 @@ async fn run_python_backtest(
     // Matches C# LEAN format (e.g. "backtests/2026-04-01_sma_crossover/").
     // When --report is set it is treated as the folder path directly.
     let backtest_dir: PathBuf = if let Some(p) = args.report.clone() {
+        std::fs::create_dir_all(&p)?;
         p
     } else {
         let backtests_root = args
@@ -283,9 +304,8 @@ async fn run_python_backtest(
             .unwrap_or_else(|| PathBuf::from("backtests"));
         let now = chrono::Utc::now();
         let name = strategy_name_from_path(&args.strategy);
-        backtests_root.join(backtest_dir_name(now, &name))
+        reserve_backtest_dir(&backtests_root, now, &name)?
     };
-    std::fs::create_dir_all(&backtest_dir)?;
 
     // Snapshot the strategy source file into the backtest directory so there is
     // a permanent record of the exact code that produced this backtest.
@@ -313,6 +333,7 @@ async fn run_python_backtest(
         history_provider,
         start_date_override,
         end_date_override,
+        parameters,
         custom_data_sources,
         output_dir: Some(backtest_dir.clone()),
     };
@@ -574,6 +595,33 @@ pub(crate) fn backtest_dir_name(
     format!("{}_{}", datetime.format("%Y-%m-%d_%H%M%S"), strategy_name)
 }
 
+fn reserve_backtest_dir(
+    backtests_root: &Path,
+    datetime: chrono::DateTime<chrono::Utc>,
+    strategy_name: &str,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(backtests_root)?;
+    let base = backtest_dir_name(datetime, strategy_name);
+    for attempt in 0..1000 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{}", attempt + 1)
+        };
+        let candidate = backtests_root.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!(
+        "could not reserve unique backtest directory under {} for {}",
+        backtests_root.display(),
+        base
+    )
+}
+
 fn validate_strategy_path(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("Strategy file not found: {}", path.display());
@@ -706,5 +754,30 @@ mod tests {
         let dt = Utc.with_ymd_and_hms(2026, 4, 10, 9, 5, 3).unwrap();
         let dir = backtest_dir_name(dt, "sma_crossover");
         assert!(dir.starts_with("2026-04-10_090503_"), "dir={dir}");
+    }
+
+    #[test]
+    fn test_reserve_backtest_dir_adds_suffix_on_collision() {
+        use chrono::{TimeZone, Utc};
+        let root =
+            std::env::temp_dir().join(format!("rlean-backtest-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
+
+        let first = reserve_backtest_dir(&root, dt, "strategy").unwrap();
+        let second = reserve_backtest_dir(&root, dt, "strategy").unwrap();
+
+        assert_eq!(
+            first.file_name().and_then(|n| n.to_str()),
+            Some("2026-04-10_143000_strategy")
+        );
+        assert_eq!(
+            second.file_name().and_then(|n| n.to_str()),
+            Some("2026-04-10_143000_strategy_2")
+        );
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

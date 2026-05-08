@@ -1,7 +1,9 @@
 use chrono::{Datelike, Timelike};
+use lean_algorithm::qc_algorithm::{OptionFilter, QcAlgorithm};
 use lean_core::{DataNormalizationMode, Market, Resolution, Symbol};
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Python-visible Resolution enum.
 /// QuantConnect Python uses SCREAMING_SNAKE_CASE; PascalCase remains accepted.
@@ -230,11 +232,12 @@ pub fn symbol_from_str(ticker: &str) -> Symbol {
 // ─── PyOptionSecurity ─────────────────────────────────────────────────────────
 
 /// LEAN API: returned by `self.add_option("SPY")`.
-/// Exposes `.symbol` (the canonical option symbol) and `.set_filter()` (no-op in rlean).
+/// Exposes `.symbol` (the canonical option symbol) and `.set_filter()`.
 #[pyclass(name = "Option")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PyOptionSecurity {
     pub canonical: PySymbol,
+    pub algorithm: Arc<Mutex<QcAlgorithm>>,
 }
 
 #[pymethods]
@@ -244,14 +247,24 @@ impl PyOptionSecurity {
         self.canonical.clone()
     }
 
-    /// No-op filter stub — LEAN uses this to limit the option universe.
-    /// In rlean the universe is already constrained by the data provider.
-    #[pyo3(signature = (*_args, **_kwargs))]
+    /// LEAN API: option.set_filter(min_strike_rank, max_strike_rank, min_expiry, max_expiry)
+    #[pyo3(signature = (min_strike_rank, max_strike_rank, min_expiry_days=0, max_expiry_days=35))]
     fn set_filter(
         &self,
-        _args: &Bound<'_, pyo3::types::PyTuple>,
-        _kwargs: Option<Bound<'_, pyo3::types::PyDict>>,
+        min_strike_rank: i32,
+        max_strike_rank: i32,
+        min_expiry_days: i32,
+        max_expiry_days: i32,
     ) {
+        self.algorithm.lock().unwrap().set_option_filter(
+            &self.canonical.inner,
+            OptionFilter {
+                min_strike_rank,
+                max_strike_rank,
+                min_expiry_days,
+                max_expiry_days,
+            },
+        );
     }
 
     fn __repr__(&self) -> String {

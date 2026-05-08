@@ -63,6 +63,12 @@ impl Insight {
         }
     }
 
+    pub fn with_generated_time_utc(mut self, generated_time_utc: DateTime) -> Self {
+        self.generated_time_utc = generated_time_utc;
+        self.close_time_utc = generated_time_utc + self.period;
+        self
+    }
+
     pub fn up(symbol: Symbol, period: TimeSpan) -> Self {
         Self::new(symbol, InsightDirection::Up, period, None, None, "")
     }

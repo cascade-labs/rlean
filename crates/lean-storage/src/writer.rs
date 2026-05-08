@@ -1,14 +1,15 @@
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
-use crate::{convert, schema};
+use crate::{convert, schema, QueryParams};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use fs2::FileExt;
-use lean_core::Result as LeanResult;
+use lean_core::{Result as LeanResult, TickType};
 use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
+use rust_decimal::Decimal;
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 use tracing::debug;
 
@@ -561,24 +562,16 @@ fn partition_has_all_tick_rows(path: &Path, ticks: &[Tick]) -> LeanResult<bool> 
     if !path.exists() {
         return Ok(false);
     }
-    let existing = crate::reader::ParquetReader::new().read_tick_partition(
-        path,
-        &ticks[0].symbol,
-        &Default::default(),
-    )?;
-    Ok(ticks.iter().all(|tick| {
-        existing.iter().any(|existing| {
-            existing.symbol.id.sid == tick.symbol.id.sid
-                && existing.time.0 == tick.time.0
-                && existing.tick_type == tick.tick_type
-                && existing.value == tick.value
-                && existing.quantity == tick.quantity
-                && existing.bid_price == tick.bid_price
-                && existing.ask_price == tick.ask_price
-                && existing.bid_size == tick.bid_size
-                && existing.ask_size == tick.ask_size
-        })
-    }))
+    let replacement_sids: Vec<u64> = ticks.iter().map(|tick| tick.symbol.id.sid).collect();
+    let params = QueryParams::new().with_symbols(replacement_sids);
+    let existing =
+        crate::reader::ParquetReader::new().read_tick_partition(path, &ticks[0].symbol, &params)?;
+    let existing_keys: HashSet<TickStorageKey> =
+        existing.iter().map(TickStorageKey::from).collect();
+    Ok(ticks
+        .iter()
+        .map(TickStorageKey::from)
+        .all(|key| existing_keys.contains(&key)))
 }
 
 fn dedupe_trade_bars(bars: &mut Vec<TradeBar>) {
@@ -593,7 +586,7 @@ fn dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
 
 fn dedupe_ticks(ticks: &mut Vec<Tick>) {
     let mut seen = HashSet::new();
-    ticks.retain(|tick| seen.insert((tick.symbol.id.sid, tick.time.0, tick.tick_type)));
+    ticks.retain(|tick| seen.insert(TickStorageKey::from(tick)));
 }
 
 fn sort_trade_bars_for_predicate_pruning(bars: &mut [TradeBar]) {
@@ -606,4 +599,39 @@ fn sort_quote_bars_for_predicate_pruning(bars: &mut [QuoteBar]) {
 
 fn sort_ticks_for_predicate_pruning(ticks: &mut [Tick]) {
     ticks.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0, tick.tick_type as u8));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TickStorageKey {
+    sid: u64,
+    time: i64,
+    tick_type: TickType,
+    value: Decimal,
+    quantity: Decimal,
+    bid_price: Decimal,
+    ask_price: Decimal,
+    bid_size: Decimal,
+    ask_size: Decimal,
+    exchange: Option<String>,
+    sale_condition: Option<String>,
+    suspicious: bool,
+}
+
+impl From<&Tick> for TickStorageKey {
+    fn from(tick: &Tick) -> Self {
+        Self {
+            sid: tick.symbol.id.sid,
+            time: tick.time.0,
+            tick_type: tick.tick_type,
+            value: tick.value,
+            quantity: tick.quantity,
+            bid_price: tick.bid_price,
+            ask_price: tick.ask_price,
+            bid_size: tick.bid_size,
+            ask_size: tick.ask_size,
+            exchange: tick.exchange.clone(),
+            sale_condition: tick.sale_condition.clone(),
+            suspicious: tick.suspicious,
+        }
+    }
 }

@@ -30,6 +30,8 @@ impl Trade {
         let pnl = (exit_price - entry_price) * quantity - fees;
         let pnl_pct = if entry_price.is_zero() {
             dec!(0)
+        } else if quantity < dec!(0) {
+            (entry_price - exit_price) / entry_price
         } else {
             (exit_price - entry_price) / entry_price
         };
@@ -45,6 +47,67 @@ impl Trade {
             fees,
             is_win: pnl > dec!(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_core::{Market, Symbol};
+
+    fn spy() -> Symbol {
+        Symbol::create_equity("SPY", &Market::new(Market::USA))
+    }
+
+    #[test]
+    fn long_trade_profit_uses_positive_quantity() {
+        let trade = Trade::new(
+            spy(),
+            DateTime::EPOCH,
+            DateTime::EPOCH,
+            dec!(100),
+            dec!(101),
+            dec!(10),
+            dec!(0),
+        );
+
+        assert_eq!(trade.pnl, dec!(10));
+        assert_eq!(trade.pnl_pct, dec!(0.01));
+        assert!(trade.is_win);
+    }
+
+    #[test]
+    fn short_trade_loss_uses_negative_quantity() {
+        let trade = Trade::new(
+            spy(),
+            DateTime::EPOCH,
+            DateTime::EPOCH,
+            dec!(100),
+            dec!(101),
+            dec!(-10),
+            dec!(0),
+        );
+
+        assert_eq!(trade.pnl, dec!(-10));
+        assert_eq!(trade.pnl_pct, dec!(-0.01));
+        assert!(!trade.is_win);
+    }
+
+    #[test]
+    fn short_trade_profit_uses_negative_quantity() {
+        let trade = Trade::new(
+            spy(),
+            DateTime::EPOCH,
+            DateTime::EPOCH,
+            dec!(100),
+            dec!(99),
+            dec!(-10),
+            dec!(0),
+        );
+
+        assert_eq!(trade.pnl, dec!(10));
+        assert_eq!(trade.pnl_pct, dec!(0.01));
+        assert!(trade.is_win);
     }
 }
 

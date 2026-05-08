@@ -234,8 +234,16 @@ impl IHistoryProvider for LocalHistoryProvider {
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<Tick>> {
         let resolver = PathResolver::new(&self.data_root);
-        let path = option_partition_path(&self.data_root, Resolution::Tick, "tick", date);
-        if !path.exists() {
+        let paths = [
+            resolver.option_partition(Resolution::Tick, TickType::Trade, date),
+            resolver.option_partition(Resolution::Tick, TickType::Quote, date),
+            resolver.option_partition(Resolution::Tick, TickType::OpenInterest, date),
+        ];
+        let existing_paths = paths
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if existing_paths.is_empty() {
             return Ok(vec![]);
         }
 
@@ -245,7 +253,28 @@ impl IHistoryProvider for LocalHistoryProvider {
         }
 
         let params = day_params(date, Resolution::Tick);
-        Ok(ParquetReader::new().read_ticks_with_symbols(&[path], &symbols_by_value, &params)?)
+        let mut ticks = ParquetReader::new().read_ticks_with_symbols(
+            &existing_paths,
+            &symbols_by_value,
+            &params,
+        )?;
+        ticks.sort_by_key(|tick| (tick.time.0, tick.symbol.id.sid, tick.tick_type as u8));
+        Ok(ticks)
+    }
+
+    async fn get_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<Tick>> {
+        let allowed_symbols = contracts
+            .iter()
+            .map(|row| row.symbol_value.as_str())
+            .collect::<HashSet<_>>();
+        let mut ticks = self.get_option_ticks(ticker, date).await?;
+        ticks.retain(|tick| allowed_symbols.contains(tick.symbol.value.as_str()));
+        Ok(ticks)
     }
 }
 

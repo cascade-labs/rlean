@@ -36,7 +36,7 @@ impl IExecutionModel for ImmediateExecutionModel {
             let key = target.symbol.value.clone();
             let current_qty = securities
                 .get(&key)
-                .map(|s| s.current_quantity)
+                .map(|s| s.current_quantity + s.open_order_quantity)
                 .unwrap_or(Decimal::ZERO);
 
             let delta = target.quantity - current_qty;

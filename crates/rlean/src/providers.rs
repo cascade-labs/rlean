@@ -138,6 +138,30 @@ impl IHistoryProvider for LazyPluginProvider {
         provider.get_option_ticks(ticker, date).await
     }
 
+    async fn get_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider
+            .get_option_ticks_filtered(ticker, date, contracts)
+            .await
+    }
+
+    async fn stream_option_ticks_filtered(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<lean_data_providers::TickStream> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider
+            .stream_option_ticks_filtered(ticker, date, contracts)
+            .await
+    }
+
     fn earliest_date(&self) -> Option<chrono::NaiveDate> {
         self.get()
             .ok()

@@ -638,6 +638,22 @@ class ExecutionModel:
 class RiskManagementModel:
     """Base class for Python-defined risk management models."""
 
+# ── Brokerage ─────────────────────────────────────────────────────────────────
+
+class AccountType:
+    Margin: AccountType
+    Cash: AccountType
+    MARGIN: AccountType
+    CASH: AccountType
+
+class BrokerageName:
+    Default: BrokerageName
+    InteractiveBrokersBrokerage: BrokerageName
+    TradierBrokerage: BrokerageName
+    DEFAULT: BrokerageName
+    INTERACTIVE_BROKERS_BROKERAGE: BrokerageName
+    TRADIER_BROKERAGE: BrokerageName
+
 # ── Algorithm Framework — Alpha Models ────────────────────────────────────────
 
 class ConstantAlphaModel(AlphaModel):
@@ -677,7 +693,7 @@ class PortfolioBias:
 
 class EqualWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Equal-weight PCM: splits portfolio evenly across all Up-insight symbols."""
-    def __init__(self) -> None: ...
+    def __init__(self, rebalance: Any = None, portfolio_bias: PortfolioBias = ...) -> None: ...
 
 class InsightWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Weights positions by insight magnitude."""
@@ -890,9 +906,20 @@ class QCAlgorithm:
     def set_start_date(self, year: int, month: int, day: int) -> None: ...
     def set_end_date(self, year: int, month: int, day: int) -> None: ...
     def set_cash(self, amount: float) -> None: ...
+    def set_brokerage_model(self, brokerage: BrokerageName, account_type: AccountType = AccountType.Margin) -> None: ...
     def add_cash(self, amount: float) -> None: ...
     def set_name(self, name: str) -> None: ...
     def set_warm_up(self, bars_or_days: int) -> None: ...
+
+    # ── History ──────────────────────────────────────────────────────────────
+
+    def history(self, symbol: Symbol | Security | str, bar_count: int, resolution: Resolution) -> Any:
+        """Return history ending at algorithm time as a column-oriented dict."""
+        ...
+    def history_range(self, symbol: Symbol | Security | str, start: Any, end: Any, resolution: Resolution) -> Any:
+        """Return history for an explicit date range as a column-oriented dict."""
+        ...
+    def History(self, *args: Any) -> Any: ...
 
     # ── Universe subscription ─────────────────────────────────────────────────
 
