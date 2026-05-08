@@ -58,6 +58,13 @@ use lean_data_providers::{
 const HIGH_RESOLUTION_PREFETCH_CONCURRENCY: usize = 8;
 const SUBSCRIPTION_PREFETCH_CONCURRENCY: usize = 8;
 
+type OptionRuntimeInputs = (
+    Vec<Symbol>,
+    HashMap<String, OptionFilter>,
+    HashMap<String, Resolution>,
+    Vec<Symbol>,
+);
+
 fn default_backtest_end_date(today: NaiveDate) -> NaiveDate {
     today - chrono::Duration::days(1)
 }
@@ -162,6 +169,10 @@ pub struct BacktestResult {
     pub equity_curve: Vec<f64>,
     /// ISO date strings matching equity_curve.
     pub daily_dates: Vec<String>,
+    /// Daily benchmark prices, in order.
+    pub benchmark_curve: Vec<f64>,
+    /// ISO date strings matching benchmark_curve.
+    pub benchmark_dates: Vec<String>,
     /// Full statistics computed at the end of the backtest.
     pub statistics: PortfolioStatistics,
     /// Custom strategy charts plotted via self.plot().
@@ -608,7 +619,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         }
     }
 
-    if subscriptions.is_empty() {
+    let has_universes = { !adapter.universes.lock().unwrap().is_empty() };
+    if subscriptions.is_empty() && !has_universes {
         warn!("No subscriptions — strategy did not call add_equity/add_forex.");
     }
 
@@ -894,9 +906,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     }
 
     // ── detect resolution mode ───────────────────────────────────────────────
+    let highest_universe_resolution = Python::attach(|py| {
+        adapter
+            .universes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|universe| universe.bind(py).borrow().settings().resolution)
+            .min()
+    });
     let is_intraday = subscriptions
         .iter()
-        .any(|s| s.resolution.is_high_resolution());
+        .any(|s| s.resolution.is_high_resolution())
+        || highest_universe_resolution.is_some_and(|resolution| resolution.is_high_resolution());
 
     // ── pre-load all subscription bars (daily mode only) ─────────────────────
     // For daily (and other single-file) resolutions the same parquet file would
@@ -949,9 +971,35 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut slice_proxy = Python::attach(|py| SliceProxy::new(py, &subscriptions))
         .context("Failed to create SliceProxy")?;
 
+    // ── ensure benchmark data exists ─────────────────────────────────────────
+    // C# LEAN adds a SecurityBenchmark as an internal subscription so the data
+    // feed downloads and records benchmark points alongside the backtest. Mirror
+    // that behavior here: when the benchmark is not already a user subscription,
+    // ask the historical provider to materialize the daily benchmark source
+    // before we load it for statistics/results/report output.
+    if !benchmark_in_subs {
+        if let Some(ref provider) = config.historical_provider {
+            let mut benchmark_config =
+                SubscriptionDataConfig::new_equity(benchmark_symbol_obj.clone(), Resolution::Daily);
+            benchmark_config.is_internal_feed = true;
+            benchmark_config.fill_data_forward = false;
+            let benchmark_sub = Arc::new(benchmark_config);
+            pre_fetch_all(
+                provider.clone(),
+                config.history_provider.clone(),
+                &[benchmark_sub],
+                start_date,
+                end_date,
+                &resolver,
+            )
+            .await?;
+        }
+    }
+
     // ── pre-load benchmark data ──────────────────────────────────────────────
     let benchmark_sid: u64 = benchmark_symbol_obj.id.sid;
     let mut benchmark_curve: Vec<Decimal> = Vec::new();
+    let mut benchmark_dates: Vec<String> = Vec::new();
     let benchmark_price_map: HashMap<NaiveDate, Decimal> = {
         let mut map: HashMap<NaiveDate, Decimal> = HashMap::new();
         if !benchmark_in_subs {
@@ -1196,6 +1244,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let resolution_label = if subscriptions
         .iter()
         .any(|s| s.resolution == Resolution::Tick)
+        || highest_universe_resolution == Some(Resolution::Tick)
     {
         "tick"
     } else if is_intraday {
@@ -1463,16 +1512,21 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
-            let (option_subs, option_filters, option_resolutions): (
-                Vec<Symbol>,
-                HashMap<String, OptionFilter>,
-                HashMap<String, Resolution>,
-            ) = {
+            let (
+                option_subs,
+                option_filters,
+                option_resolutions,
+                open_option_symbols,
+            ): OptionRuntimeInputs = {
                 let alg = adapter.inner.lock().unwrap();
                 (
                     alg.option_subscriptions.clone(),
                     alg.option_filters.clone(),
                     alg.option_subscription_resolutions.clone(),
+                    alg.get_option_positions()
+                        .into_iter()
+                        .map(|position| position.symbol)
+                        .collect(),
                 )
             };
             let mut option_runtimes: Vec<OptionChainRuntime> = Vec::new();
@@ -1495,6 +1549,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 };
                 let ticker = underlying_ticker.to_uppercase();
                 let filter = option_filters.get(&canonical.permtick).copied();
+                let held_contracts =
+                    option_contracts_for_canonical(&open_option_symbols, canonical);
                 let runtime = load_option_chain_runtime(OptionChainRuntimeRequest {
                     data_root: &config.data_root,
                     ticker: &ticker,
@@ -1503,6 +1559,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     date: current_date,
                     spot,
                     filter,
+                    held_contracts,
                     provider: config.history_provider.as_ref(),
                 })
                 .await;
@@ -1677,7 +1734,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
 
                         if let Some(qbar) = quote_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
-                            let qbar = qbar.clone();
+                            let qbar = if !option_underlying_sids.contains(&sid) {
+                                if let Some(rows) = factor_map.get(&sid) {
+                                    apply_factor_quote_bar(qbar.clone(), rows, current_date)
+                                } else {
+                                    qbar.clone()
+                                }
+                            } else {
+                                qbar.clone()
+                            };
                             let mid = qbar.mid_close();
                             if mid > Decimal::ZERO && !bars_for_orders.contains_key(&sid) {
                                 adapter
@@ -1701,13 +1766,26 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                         if let Some(ticks) = ticks_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
                             if !ticks.is_empty() {
+                                let ticks = if !option_underlying_sids.contains(&sid) {
+                                    if let Some(rows) = factor_map.get(&sid) {
+                                        ticks
+                                            .iter()
+                                            .cloned()
+                                            .map(|tick| apply_factor_tick(tick, rows, current_date))
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        ticks.to_vec()
+                                    }
+                                } else {
+                                    ticks.to_vec()
+                                };
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     bars_for_orders.entry(sid)
                                 {
                                     if let Some(synth) = synthesize_trade_bar_from_ticks(
                                         &sub.symbol,
                                         utc_time,
-                                        ticks,
+                                        &ticks,
                                     ) {
                                         adapter
                                             .inner
@@ -1719,10 +1797,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                         e.insert(synth);
                                     }
                                 }
-                                for tick in ticks {
+                                for tick in &ticks {
                                     minute_slice.add_tick(tick.clone());
                                 }
-                                minute_ticks.insert(sid, ticks.clone());
+                                minute_ticks.insert(sid, ticks);
                             }
                         }
                     }
@@ -1763,6 +1841,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 .entry(tick.symbol.id.sid)
                                 .or_default()
                                 .push(tick);
+                        }
+                        let option_order_bars: Vec<TradeBar> = runtime
+                            .chain
+                            .contracts
+                            .values()
+                            .filter_map(|contract| {
+                                synthesize_trade_bar_from_option_contract(contract, utc_time)
+                            })
+                            .collect();
+                        if !option_order_bars.is_empty() {
+                            let alg = adapter.inner.lock().unwrap();
+                            for bar in option_order_bars {
+                                let sid = bar.symbol.id.sid;
+                                alg.securities.update_price(&bar.symbol, bar.close);
+                                portfolio.update_prices(&bar.symbol, bar.close);
+                                bars_for_orders.entry(sid).or_insert(bar);
+                            }
                         }
                     }
 
@@ -2296,6 +2391,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 };
                 if let Some(close) = bm_close {
                     benchmark_curve.push(close);
+                    benchmark_dates.push(current_date.to_string());
                 }
 
                 let day_equity = portfolio.total_portfolio_value();
@@ -2491,6 +2587,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             };
             if let Some(close) = bm_close {
                 benchmark_curve.push(close);
+                benchmark_dates.push(current_date.to_string());
             }
 
             trading_days += 1;
@@ -2568,9 +2665,20 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             // Build option chains before calling on_data.
             {
-                let (option_subs, option_filters): (Vec<Symbol>, HashMap<String, OptionFilter>) = {
+                let (option_subs, option_filters, open_option_symbols): (
+                    Vec<Symbol>,
+                    HashMap<String, OptionFilter>,
+                    Vec<Symbol>,
+                ) = {
                     let alg = adapter.inner.lock().unwrap();
-                    (alg.option_subscriptions.clone(), alg.option_filters.clone())
+                    (
+                        alg.option_subscriptions.clone(),
+                        alg.option_filters.clone(),
+                        alg.get_option_positions()
+                            .into_iter()
+                            .map(|position| position.symbol)
+                            .collect(),
+                    )
                 };
 
                 let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
@@ -2598,12 +2706,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         )
                         .await;
                         if !bars.is_empty() {
+                            let held_contracts =
+                                option_contracts_for_canonical(&open_option_symbols, canonical);
                             build_option_chain_from_eod_bars(
                                 canonical,
                                 spot,
                                 utc_time,
                                 &bars,
                                 option_filters.get(&canonical.permtick).copied(),
+                                &held_contracts,
                             )
                         } else {
                             OptionChain::new(canonical.clone(), spot)
@@ -2833,11 +2944,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let starting_cash_dec = Decimal::from_f64(starting_cash).unwrap_or(Decimal::ONE);
     // Use benchmark_curve only when it aligns with the equity curve length;
     // mismatches (e.g. benchmark had no data on some days) fall back to empty.
-    let benchmark_slice: &[Decimal] = if benchmark_curve.len() == equity_curve.len() {
-        &benchmark_curve
-    } else {
-        &[]
-    };
+    let benchmark_slice: &[Decimal] =
+        if benchmark_curve.len() == equity_curve.len() && benchmark_dates == daily_dates {
+            &benchmark_curve
+        } else {
+            &[]
+        };
     let statistics = PortfolioStatistics::compute(
         &equity_curve,
         benchmark_slice,
@@ -2848,6 +2960,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     );
 
     let equity_curve_f64: Vec<f64> = equity_curve
+        .iter()
+        .map(|v| {
+            use rust_decimal::prelude::ToPrimitive;
+            v.to_f64().unwrap_or(0.0)
+        })
+        .collect();
+    let benchmark_curve_f64: Vec<f64> = benchmark_curve
         .iter()
         .map(|v| {
             use rust_decimal::prelude::ToPrimitive;
@@ -2875,6 +2994,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         end_date,
         equity_curve: equity_curve_f64,
         daily_dates,
+        benchmark_curve: benchmark_curve_f64,
+        benchmark_dates,
         statistics,
         charts,
         order_events: all_order_events,
@@ -4070,6 +4191,7 @@ struct OptionChainRuntimeRequest<'a> {
     date: NaiveDate,
     spot: Decimal,
     filter: Option<OptionFilter>,
+    held_contracts: Vec<Symbol>,
     provider: Option<&'a Arc<dyn lean_data_providers::IHistoryProvider>>,
 }
 
@@ -4082,11 +4204,13 @@ async fn load_option_chain_runtime(request: OptionChainRuntimeRequest<'_>) -> Op
         date,
         spot,
         filter,
+        held_contracts,
         provider,
     } = request;
 
     let mut universe_rows = load_option_universe_rows(data_root, ticker, date, provider).await;
     apply_option_universe_filter_to_rows(&mut universe_rows, date, spot, filter);
+    append_option_universe_rows_for_contracts(&mut universe_rows, &held_contracts, date);
     let chain = build_option_chain_from_universe_rows(canonical, spot, &universe_rows);
     let allowed_contract_sids = chain
         .contracts
@@ -4097,18 +4221,32 @@ async fn load_option_chain_runtime(request: OptionChainRuntimeRequest<'_>) -> Op
     let (trade_updates, quote_updates, tick_updates, tick_stream) = match resolution {
         Resolution::Minute => (
             group_trade_bars_by_time(
-                load_option_trade_bars(data_root, ticker, resolution, date, provider)
-                    .await
-                    .into_iter()
-                    .filter(|bar| allowed_contract_sids.contains(&bar.symbol.id.sid))
-                    .collect(),
+                load_option_trade_bars(
+                    data_root,
+                    ticker,
+                    resolution,
+                    date,
+                    &universe_rows,
+                    provider,
+                )
+                .await
+                .into_iter()
+                .filter(|bar| allowed_contract_sids.contains(&bar.symbol.id.sid))
+                .collect(),
             ),
             group_quote_bars_by_time(
-                load_option_quote_bars(data_root, ticker, resolution, date, provider)
-                    .await
-                    .into_iter()
-                    .filter(|bar| allowed_contract_sids.contains(&bar.symbol.id.sid))
-                    .collect(),
+                load_option_quote_bars(
+                    data_root,
+                    ticker,
+                    resolution,
+                    date,
+                    &universe_rows,
+                    provider,
+                )
+                .await
+                .into_iter()
+                .filter(|bar| allowed_contract_sids.contains(&bar.symbol.id.sid))
+                .collect(),
             ),
             HashMap::new(),
             None,
@@ -4168,15 +4306,16 @@ async fn load_option_trade_bars(
     ticker: &str,
     resolution: Resolution,
     date: NaiveDate,
+    contracts: &[OptionUniverseRow],
     provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
 ) -> Vec<TradeBar> {
     let result = if let Some(provider) = provider {
         provider
-            .get_option_trade_bars(ticker, resolution, date)
+            .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
             .await
     } else {
         lean_data_providers::LocalHistoryProvider::new(data_root)
-            .get_option_trade_bars(ticker, resolution, date)
+            .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
             .await
     };
 
@@ -4191,15 +4330,16 @@ async fn load_option_quote_bars(
     ticker: &str,
     resolution: Resolution,
     date: NaiveDate,
+    contracts: &[OptionUniverseRow],
     provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
 ) -> Vec<QuoteBar> {
     let result = if let Some(provider) = provider {
         provider
-            .get_option_quote_bars(ticker, resolution, date)
+            .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
             .await
     } else {
         lean_data_providers::LocalHistoryProvider::new(data_root)
-            .get_option_quote_bars(ticker, resolution, date)
+            .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
             .await
     };
 
@@ -4242,28 +4382,121 @@ async fn load_option_ticks_for_selected_contracts(
     ticks
 }
 
+fn option_contracts_for_canonical(
+    open_option_symbols: &[Symbol],
+    canonical: &Symbol,
+) -> Vec<Symbol> {
+    let canonical_underlying = canonical
+        .underlying
+        .as_ref()
+        .map(|underlying| {
+            underlying
+                .permtick
+                .trim_start_matches('?')
+                .to_ascii_uppercase()
+        })
+        .unwrap_or_else(|| {
+            canonical
+                .permtick
+                .trim_start_matches('?')
+                .to_ascii_uppercase()
+        });
+
+    open_option_symbols
+        .iter()
+        .filter(|symbol| {
+            symbol
+                .underlying
+                .as_ref()
+                .map(|underlying| {
+                    underlying
+                        .permtick
+                        .eq_ignore_ascii_case(&canonical_underlying)
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn option_right_from_str(right: &str) -> Option<OptionRight> {
+    match right.to_ascii_uppercase().as_str() {
+        "C" | "CALL" => Some(OptionRight::Call),
+        "P" | "PUT" => Some(OptionRight::Put),
+        _ => None,
+    }
+}
+
+fn option_universe_row_symbol(row: &OptionUniverseRow) -> Option<Symbol> {
+    let right = option_right_from_str(&row.right)?;
+    let underlying = Symbol::create_equity(&row.underlying, &Market::usa());
+    Some(Symbol::create_option_osi(
+        underlying,
+        row.strike,
+        row.expiration,
+        right,
+        OptionStyle::American,
+        &Market::usa(),
+    ))
+}
+
+fn option_universe_row_from_contract_symbol(
+    symbol: &Symbol,
+    date: NaiveDate,
+) -> Option<OptionUniverseRow> {
+    let option_id = symbol.option_symbol_id()?;
+    let underlying = symbol
+        .underlying
+        .as_ref()
+        .map(|underlying| underlying.permtick.clone())
+        .unwrap_or_else(|| option_id.underlying.permtick.clone());
+    let right = match option_id.right {
+        OptionRight::Call => "C",
+        OptionRight::Put => "P",
+    }
+    .to_string();
+
+    Some(OptionUniverseRow {
+        date,
+        symbol_value: symbol.value.clone(),
+        underlying,
+        expiration: option_id.expiry,
+        strike: option_id.strike,
+        right,
+    })
+}
+
+fn append_option_universe_rows_for_contracts(
+    rows: &mut Vec<OptionUniverseRow>,
+    contracts: &[Symbol],
+    date: NaiveDate,
+) {
+    if contracts.is_empty() {
+        return;
+    }
+
+    let mut existing_sids: HashSet<u64> = rows
+        .iter()
+        .filter_map(option_universe_row_symbol)
+        .map(|symbol| symbol.id.sid)
+        .collect();
+
+    for contract in contracts {
+        if existing_sids.contains(&contract.id.sid) {
+            continue;
+        }
+        if let Some(row) = option_universe_row_from_contract_symbol(contract, date) {
+            existing_sids.insert(contract.id.sid);
+            rows.push(row);
+        }
+    }
+}
+
 fn option_universe_symbol_values(contracts: &[OptionUniverseRow]) -> HashSet<String> {
     contracts
         .iter()
-        .filter_map(|row| {
-            let right = match row.right.to_ascii_uppercase().as_str() {
-                "C" | "CALL" => OptionRight::Call,
-                "P" | "PUT" => OptionRight::Put,
-                _ => return None,
-            };
-            let underlying = Symbol::create_equity(&row.underlying, &Market::usa());
-            Some(
-                Symbol::create_option_osi(
-                    underlying,
-                    row.strike,
-                    row.expiration,
-                    right,
-                    OptionStyle::American,
-                    &Market::usa(),
-                )
-                .value,
-            )
-        })
+        .filter_map(option_universe_row_symbol)
+        .map(|symbol| symbol.value)
         .collect()
 }
 
@@ -4576,6 +4809,22 @@ fn synthesize_trade_bar_from_quote_bar(bar: &QuoteBar) -> Option<TradeBar> {
     ))
 }
 
+fn synthesize_trade_bar_from_option_contract(
+    contract: &OptionContract,
+    time: DateTime,
+) -> Option<TradeBar> {
+    let price = contract.mid_price();
+    if price <= Decimal::ZERO {
+        return None;
+    }
+    Some(TradeBar::new(
+        contract.symbol.clone(),
+        time,
+        TimeSpan::ZERO,
+        TradeBarData::new(price, price, price, price, Decimal::ZERO),
+    ))
+}
+
 fn synthesize_trade_bar_from_ticks(
     symbol: &Symbol,
     time: DateTime,
@@ -4855,6 +5104,18 @@ fn update_option_chain_map_in_place(
     }
 }
 
+fn option_eod_bar_symbol(bar: &OptionEodBar, underlying_sym: &Symbol) -> Option<Symbol> {
+    let right = option_right_from_str(&bar.right)?;
+    Some(Symbol::create_option_osi(
+        underlying_sym.clone(),
+        bar.strike,
+        bar.expiration,
+        right,
+        OptionStyle::American,
+        &Market::usa(),
+    ))
+}
+
 /// Build a real option chain from ThetaData EOD rows for a single trading day.
 ///
 /// Build an option chain directly from typed `OptionEodBar` rows.
@@ -4867,30 +5128,52 @@ fn build_option_chain_from_eod_bars(
     valuation_time: DateTime,
     bars: &[OptionEodBar],
     filter: Option<OptionFilter>,
+    held_contracts: &[Symbol],
 ) -> OptionChain {
     let today = valuation_time.date_utc();
-    let mut bars = bars.to_vec();
-    apply_option_filter_to_eod_bars(&mut bars, today, spot, filter);
-    let mut chain = OptionChain::new(canonical_sym.clone(), spot);
     let underlying_sym: Symbol = canonical_sym
         .underlying
         .as_ref()
         .map(|u| *u.clone())
         .unwrap_or_else(|| canonical_sym.clone());
     let market = Market::usa();
+    let unfiltered_bars = bars;
+    let mut bars = bars.to_vec();
+    apply_option_filter_to_eod_bars(&mut bars, today, spot, filter);
+
+    if !held_contracts.is_empty() {
+        let held_sids: HashSet<u64> = held_contracts
+            .iter()
+            .map(|contract| contract.id.sid)
+            .collect();
+        let mut retained_sids: HashSet<u64> = bars
+            .iter()
+            .filter_map(|bar| option_eod_bar_symbol(bar, &underlying_sym))
+            .map(|symbol| symbol.id.sid)
+            .collect();
+        for bar in unfiltered_bars {
+            let Some(symbol) = option_eod_bar_symbol(bar, &underlying_sym) else {
+                continue;
+            };
+            let sid = symbol.id.sid;
+            if held_sids.contains(&sid) && retained_sids.insert(sid) {
+                bars.push(bar.clone());
+            }
+        }
+    }
+
+    let mut chain = OptionChain::new(canonical_sym.clone(), spot);
 
     for bar in &bars {
         if bar.expiration < today {
             continue;
-        } // include 0DTE (expiration == today)
+        }
         if bar.strike < Decimal::ONE {
             continue;
         }
 
-        let right = match bar.right.to_ascii_lowercase().as_str() {
-            "c" | "call" => OptionRight::Call,
-            "p" | "put" => OptionRight::Put,
-            _ => continue,
+        let Some(right) = option_right_from_str(&bar.right) else {
+            continue;
         };
 
         let sym = Symbol::create_option_osi(
@@ -5451,17 +5734,15 @@ fn factor_file_covers_range(rows: &[FactorFileEntry], start: NaiveDate, end: Nai
     }
     let newest = rows.iter().map(|r| r.date).max();
     let oldest = rows.iter().map(|r| r.date).min();
+    let lean_end_of_time = NaiveDate::from_ymd_opt(2050, 12, 31).unwrap();
     let identity_only = rows.iter().all(|r| {
         (r.price_factor - 1.0).abs() <= 1e-12
             && (r.split_factor - 1.0).abs() <= 1e-12
             && r.reference_price.abs() <= 1e-12
     });
-    let fake_base_row = identity_only
-        && rows.len() <= 2
-        && rows
-            .iter()
-            .any(|r| r.date == NaiveDate::from_ymd_opt(1900, 1, 1).unwrap());
-    matches!((newest, oldest), (Some(n), Some(o)) if n >= end && o <= start && !fake_base_row)
+    let current_date_placeholder =
+        identity_only && rows.len() <= 2 && rows.iter().all(|r| r.date < lean_end_of_time);
+    matches!((newest, oldest), (Some(n), Some(o)) if n >= end && o <= start && !current_date_placeholder)
 }
 
 fn split_event_for_date(
@@ -5599,6 +5880,25 @@ fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64)
     (1.0, 1.0)
 }
 
+fn factor_price_and_volume_scale(
+    rows: &[FactorFileEntry],
+    bar_date: NaiveDate,
+) -> Option<(Decimal, Decimal)> {
+    let (pf, sf) = factor_for_entry(rows, bar_date);
+    let combined = pf * sf;
+    if (combined - 1.0).abs() < 1e-9 {
+        return None;
+    }
+
+    let price_scale = Decimal::from_f64(combined).unwrap_or(Decimal::ONE);
+    let volume_scale = if combined.abs() > 1e-12 {
+        Decimal::from_f64(1.0 / combined).unwrap_or(Decimal::ONE)
+    } else {
+        Decimal::ONE
+    };
+    Some((price_scale, volume_scale))
+}
+
 fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: NaiveDate) -> TradeBar {
     let (pf, sf) = factor_for_entry(rows, bar_date);
     let combined = pf * sf;
@@ -5617,6 +5917,64 @@ fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: Naive
         bar.volume *= vol_scale;
     }
     bar
+}
+
+fn apply_factor_quote_bar(
+    mut bar: QuoteBar,
+    rows: &[FactorFileEntry],
+    bar_date: NaiveDate,
+) -> QuoteBar {
+    let Some((price_scale, volume_scale)) = factor_price_and_volume_scale(rows, bar_date) else {
+        return bar;
+    };
+
+    if let Some(bid) = &mut bar.bid {
+        bid.open *= price_scale;
+        bid.high *= price_scale;
+        bid.low *= price_scale;
+        bid.close *= price_scale;
+    }
+    if let Some(ask) = &mut bar.ask {
+        ask.open *= price_scale;
+        ask.high *= price_scale;
+        ask.low *= price_scale;
+        ask.close *= price_scale;
+    }
+    bar.last_bid_size *= volume_scale;
+    bar.last_ask_size *= volume_scale;
+    bar
+}
+
+fn apply_factor_tick(mut tick: Tick, rows: &[FactorFileEntry], bar_date: NaiveDate) -> Tick {
+    let Some((price_scale, volume_scale)) = factor_price_and_volume_scale(rows, bar_date) else {
+        return tick;
+    };
+
+    match tick.tick_type {
+        TickType::Trade => {
+            tick.value *= price_scale;
+            tick.quantity *= volume_scale;
+        }
+        TickType::Quote => {
+            if tick.bid_price > Decimal::ZERO {
+                tick.bid_price *= price_scale;
+            }
+            if tick.ask_price > Decimal::ZERO {
+                tick.ask_price *= price_scale;
+            }
+            tick.bid_size *= volume_scale;
+            tick.ask_size *= volume_scale;
+            tick.value = if tick.bid_price > Decimal::ZERO && tick.ask_price > Decimal::ZERO {
+                (tick.bid_price + tick.ask_price) / Decimal::from(2)
+            } else if tick.bid_price > Decimal::ZERO {
+                tick.bid_price
+            } else {
+                tick.ask_price
+            };
+        }
+        TickType::OpenInterest => {}
+    }
+    tick
 }
 
 fn read_factor_rows_for_subscription(
@@ -5992,7 +6350,21 @@ mod factor_tests {
     }
 
     #[test]
-    fn test_factor_file_coverage_rejects_identity_base_placeholder() {
+    fn test_factor_file_coverage_accepts_lean_identity_file() {
+        let rows = vec![
+            entry_split(2050, 12, 31, 1.0, 1.0),
+            entry_split(1900, 1, 1, 1.0, 1.0),
+        ];
+
+        assert!(factor_file_covers_range(
+            &rows,
+            d(2022, 1, 1),
+            d(2026, 3, 31)
+        ));
+    }
+
+    #[test]
+    fn test_factor_file_coverage_rejects_current_date_identity_placeholder() {
         let rows = vec![
             entry_split(2026, 4, 27, 1.0, 1.0),
             entry_split(1900, 1, 1, 1.0, 1.0),
@@ -6051,6 +6423,68 @@ mod factor_tests {
         let adjusted = apply_factor_row(bar.clone(), &rows, d(2023, 12, 25));
         assert_eq!(adjusted.close, dec!(52.5)); // 105 * 0.5
         assert_eq!(adjusted.volume, dec!(2000)); // 1000 / 0.5
+    }
+
+    #[test]
+    fn test_apply_factor_quote_bar_prevents_raw_quote_adjusted_trade_mismatch() {
+        use lean_data::quote_bar::Bar;
+        use rust_decimal_macros::dec;
+
+        let rows = vec![
+            entry_split(2050, 12, 31, 1.0, 1.0),
+            entry_split(1900, 1, 1, 1.0, 10.0),
+        ];
+
+        let sym = lean_core::Symbol::create_equity("SIRI", &lean_core::Market::usa());
+        let qbar = QuoteBar::new(
+            sym,
+            lean_core::NanosecondTimestamp(0),
+            lean_core::TimeSpan::from_mins(1),
+            Some(Bar::new(dec!(6.60), dec!(6.60), dec!(6.60), dec!(6.60))),
+            Some(Bar::new(dec!(6.61), dec!(6.61), dec!(6.61), dec!(6.61))),
+            dec!(1000),
+            dec!(1200),
+        );
+
+        let adjusted = apply_factor_quote_bar(qbar, &rows, d(2022, 3, 29));
+        let synth = synthesize_trade_bar_from_quote_bar(&adjusted).unwrap();
+
+        assert_eq!(adjusted.bid.as_ref().unwrap().close, dec!(66.00));
+        assert_eq!(adjusted.ask.as_ref().unwrap().close, dec!(66.10));
+        assert_eq!(synth.close, dec!(66.05));
+    }
+
+    #[test]
+    fn test_apply_factor_tick_quote_prevents_raw_quote_fill() {
+        use rust_decimal_macros::dec;
+
+        let rows = vec![
+            entry_split(2050, 12, 31, 1.0, 1.0),
+            entry_split(1900, 1, 1, 1.0, 10.0),
+        ];
+
+        let sym = lean_core::Symbol::create_equity("SIRI", &lean_core::Market::usa());
+        let tick = Tick::quote(
+            sym.clone(),
+            lean_core::NanosecondTimestamp(0),
+            dec!(6.60),
+            dec!(6.61),
+            dec!(1000),
+            dec!(1200),
+        );
+
+        let adjusted = apply_factor_tick(tick, &rows, d(2022, 3, 29));
+        let synth = synthesize_trade_bar_from_ticks(
+            &sym,
+            lean_core::NanosecondTimestamp(0),
+            std::slice::from_ref(&adjusted),
+        )
+        .unwrap();
+
+        assert_eq!(adjusted.bid_price, dec!(66.00));
+        assert_eq!(adjusted.ask_price, dec!(66.10));
+        assert_eq!(adjusted.value, dec!(66.05));
+        assert_eq!(synth.close, dec!(66.05));
     }
 }
 
@@ -6161,6 +6595,8 @@ mod tests {
             end_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
             equity_curve: vec![100_000.0, 101_000.0],
             daily_dates: vec!["2024-01-02".to_string(), "2024-01-03".to_string()],
+            benchmark_curve: vec![400.0, 402.0],
+            benchmark_dates: vec!["2024-01-02".to_string(), "2024-01-03".to_string()],
             statistics: stats,
             charts: ChartCollection::default(),
             order_events: vec![],
@@ -6294,13 +6730,152 @@ mod tests {
             ask_size: 12,
         }];
 
-        let chain =
-            build_option_chain_from_eod_bars(&canonical, dec!(100), valuation_time, &bars, None);
+        let chain = build_option_chain_from_eod_bars(
+            &canonical,
+            dec!(100),
+            valuation_time,
+            &bars,
+            None,
+            &[],
+        );
         let contract = chain.contracts.values().next().unwrap();
 
         assert!(contract.data.implied_volatility > Decimal::ZERO);
         assert!(contract.data.theoretical_price > Decimal::ZERO);
         assert!(contract.data.greeks.delta > Decimal::ZERO);
+    }
+
+    #[test]
+    fn option_universe_filter_retains_held_contracts() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let canonical = Symbol::create_canonical_option(&underlying, &market);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 18).unwrap();
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let held = Symbol::create_option_osi(
+            underlying.clone(),
+            dec!(110),
+            expiry,
+            OptionRight::Put,
+            OptionStyle::American,
+            &market,
+        );
+        let mut rows = vec![
+            OptionUniverseRow {
+                date,
+                symbol_value: "SPY240119C00100000".to_string(),
+                underlying: "SPY".to_string(),
+                expiration: expiry,
+                strike: dec!(100),
+                right: "C".to_string(),
+            },
+            OptionUniverseRow {
+                date,
+                symbol_value: held.value.clone(),
+                underlying: "SPY".to_string(),
+                expiration: expiry,
+                strike: dec!(110),
+                right: "P".to_string(),
+            },
+        ];
+        let filter = OptionFilter {
+            min_strike_rank: 0,
+            max_strike_rank: 0,
+            min_expiry_days: 0,
+            max_expiry_days: 5,
+        };
+
+        apply_option_universe_filter_to_rows(&mut rows, date, dec!(100), Some(filter));
+        assert!(!rows
+            .iter()
+            .filter_map(option_universe_row_symbol)
+            .any(|symbol| symbol.id.sid == held.id.sid));
+
+        append_option_universe_rows_for_contracts(&mut rows, std::slice::from_ref(&held), date);
+        let chain = build_option_chain_from_universe_rows(&canonical, dec!(100), &rows);
+
+        assert!(chain
+            .contracts
+            .keys()
+            .any(|symbol| symbol.id.sid == held.id.sid));
+    }
+
+    #[test]
+    fn eod_option_chain_filter_retains_held_contracts() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let canonical = Symbol::create_canonical_option(&underlying, &market);
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let valuation_time = DateTime::from(
+            chrono::Utc
+                .with_ymd_and_hms(2024, 1, 18, 20, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let held = Symbol::create_option_osi(
+            underlying.clone(),
+            dec!(110),
+            expiry,
+            OptionRight::Put,
+            OptionStyle::American,
+            &market,
+        );
+        let bars = vec![
+            OptionEodBar {
+                date: valuation_time.date_utc(),
+                symbol_value: "SPY240119C00100000".to_string(),
+                underlying: "SPY".to_string(),
+                expiration: expiry,
+                strike: dec!(100),
+                right: "C".to_string(),
+                open: dec!(2.50),
+                high: dec!(2.60),
+                low: dec!(2.40),
+                close: dec!(2.50),
+                volume: 42,
+                bid: dec!(2.40),
+                ask: dec!(2.60),
+                bid_size: 10,
+                ask_size: 12,
+            },
+            OptionEodBar {
+                date: valuation_time.date_utc(),
+                symbol_value: held.value.clone(),
+                underlying: "SPY".to_string(),
+                expiration: expiry,
+                strike: dec!(110),
+                right: "P".to_string(),
+                open: dec!(11.00),
+                high: dec!(11.20),
+                low: dec!(10.80),
+                close: dec!(11.00),
+                volume: 7,
+                bid: dec!(10.90),
+                ask: dec!(11.10),
+                bid_size: 4,
+                ask_size: 5,
+            },
+        ];
+        let filter = OptionFilter {
+            min_strike_rank: 0,
+            max_strike_rank: 0,
+            min_expiry_days: 0,
+            max_expiry_days: 5,
+        };
+
+        let chain = build_option_chain_from_eod_bars(
+            &canonical,
+            dec!(100),
+            valuation_time,
+            &bars,
+            Some(filter),
+            std::slice::from_ref(&held),
+        );
+
+        assert!(chain
+            .contracts
+            .keys()
+            .any(|symbol| symbol.id.sid == held.id.sid));
     }
 
     #[test]

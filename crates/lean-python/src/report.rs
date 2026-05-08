@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::charting::{ChartCollection, SeriesType};
+use crate::charting::{Chart, ChartCollection, ChartPoint, Series, SeriesType};
 use crate::runner::BacktestResult;
 
 // ── LEAN-compatible output file writers ───────────────────────────────────────
@@ -170,10 +170,12 @@ struct BacktestResultJson<'a> {
     #[serde(rename = "Statistics")]
     statistics: &'a lean_statistics::PortfolioStatistics,
     #[serde(rename = "Charts")]
-    charts: &'a ChartCollection,
+    charts: ChartCollection,
     /// Equity curve as {date → portfolio value} pairs (LEAN "Strategy Equity" series).
     #[serde(rename = "Equity")]
     equity: std::collections::HashMap<&'a str, f64>,
+    #[serde(rename = "Benchmark")]
+    benchmark: std::collections::HashMap<&'a str, f64>,
     #[serde(rename = "TradingDays")]
     trading_days: i64,
     #[serde(rename = "StartingCash")]
@@ -191,11 +193,18 @@ pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Resu
         .zip(result.equity_curve.iter())
         .map(|(d, &v)| (d.as_str(), v))
         .collect();
+    let benchmark: std::collections::HashMap<&str, f64> = result
+        .benchmark_dates
+        .iter()
+        .zip(result.benchmark_curve.iter())
+        .map(|(d, &v)| (d.as_str(), v))
+        .collect();
 
     let json_obj = BacktestResultJson {
         statistics: &result.statistics,
-        charts: &result.charts,
+        charts: charts_with_benchmark(result),
         equity,
+        benchmark,
         trading_days: result.trading_days,
         starting_cash: result.starting_cash,
         final_value: result.final_value,
@@ -223,6 +232,19 @@ fn generate_html(r: &BacktestResult) -> String {
         .map(|v| format!("{:.2}", v))
         .collect::<Vec<_>>()
         .join(",");
+    let benchmark_dates_json = r
+        .benchmark_dates
+        .iter()
+        .map(|d| format!("\"{}\"", d))
+        .collect::<Vec<_>>()
+        .join(",");
+    let benchmark_json = r
+        .benchmark_curve
+        .iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(",");
+    let benchmark_return = cumulative_return(&r.benchmark_curve);
 
     // ── drawdown series ───────────────────────────────────────────────────
     let drawdown_json = {
@@ -390,7 +412,7 @@ fn generate_html(r: &BacktestResult) -> String {
 <!-- Charts -->
 <div class="charts">
   <div class="chart-card">
-    <h3>Equity Curve</h3>
+    <h3>Equity Curve vs {benchmark_symbol}</h3>
     <canvas id="equityChart"></canvas>
   </div>
   <div class="chart-card">
@@ -414,6 +436,7 @@ fn generate_html(r: &BacktestResult) -> String {
     <h3>Risk / Return</h3>
     <table>
       <tr><td>Total Return</td><td>{total_return_pct}</td></tr>
+      <tr><td>{benchmark_symbol} Return</td><td>{benchmark_return_pct}</td></tr>
       <tr><td>CAGR</td><td>{cagr}</td></tr>
       <tr><td>Annual Std Dev</td><td>{ann_std}</td></tr>
       <tr><td>Max Drawdown</td><td>{drawdown}</td></tr>
@@ -452,7 +475,23 @@ fn generate_html(r: &BacktestResult) -> String {
 <script>
 const DATES  = [{dates_json}];
 const EQUITY = [{equity_json}];
+const BENCHMARK_DATES = [{benchmark_dates_json}];
+const BENCHMARK = [{benchmark_json}];
 const DD     = [{drawdown_json}];
+
+const normalizeBenchmark = (dates, equity, benchmarkDates, benchmark) => {{
+  if (!dates.length || !equity.length || !benchmarkDates.length || !benchmark.length) return [];
+  const byDate = new Map(benchmarkDates.map((d, i) => [d, benchmark[i]]));
+  const first = benchmark.find(v => Number.isFinite(v) && v > 0);
+  if (!first) return [];
+  const start = equity[0] || 1;
+  let last = null;
+  return dates.map(d => {{
+    const raw = byDate.get(d);
+    if (Number.isFinite(raw) && raw > 0) last = raw;
+    return last ? start * (last / first) : null;
+  }});
+}};
 
 const chartOpts = (label, color, data, fill) => ({{
   type: 'line',
@@ -472,7 +511,27 @@ const chartOpts = (label, color, data, fill) => ({{
   }}
 }});
 
-new Chart(document.getElementById('equityChart'), chartOpts('Portfolio Value', '#4caf50', EQUITY, true));
+const benchmarkNormalized = normalizeBenchmark(DATES, EQUITY, BENCHMARK_DATES, BENCHMARK);
+new Chart(document.getElementById('equityChart'), {{
+  type: 'line',
+  data: {{ labels: DATES, datasets: [
+    {{ label: 'Portfolio Value', data: EQUITY, borderColor: '#4caf50',
+       backgroundColor: '#4caf5022', borderWidth: 1.5, pointRadius: 0, fill: true }},
+    {{ label: '{benchmark_symbol}', data: benchmarkNormalized, borderColor: '#90caf9',
+       backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, fill: false }}
+  ] }},
+  options: {{
+    animation: false, responsive: true, maintainAspectRatio: true,
+    interaction: {{ mode: 'index', intersect: false }},
+    plugins: {{ legend: {{ display: true, labels: {{ color: '#aaa' }} }}, tooltip: {{
+      callbacks: {{ label: ctx => ' ' + ctx.dataset.label + ': ' + (ctx.parsed.y == null ? 'n/a' : ctx.parsed.y.toFixed(2)) }}
+    }} }},
+    scales: {{
+      x: {{ ticks: {{ maxTicksLimit: 6, color: '#666' }}, grid: {{ color: '#1a1d2e' }} }},
+      y: {{ ticks: {{ color: '#666' }}, grid: {{ color: '#1a1d2e' }} }}
+    }}
+  }}
+}});
 new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '#f44336', DD,     true));
 </script>
 </body>
@@ -486,6 +545,8 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         monthly_html = monthly_html,
         custom_charts_html = custom_charts_html,
         total_return_pct = pct(r.total_return),
+        benchmark_symbol = r.benchmark_symbol,
+        benchmark_return_pct = pct(benchmark_return),
         cagr = pct(cagr),
         ann_std = pct(ann_std),
         drawdown = pct(drawdown),
@@ -512,8 +573,49 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         avg_dur = avg_dur,
         dates_json = dates_json,
         equity_json = equity_json,
+        benchmark_dates_json = benchmark_dates_json,
+        benchmark_json = benchmark_json,
         drawdown_json = drawdown_json,
     )
+}
+
+fn cumulative_return(values: &[f64]) -> f64 {
+    let Some(first) = values.iter().copied().find(|v| v.is_finite() && *v > 0.0) else {
+        return 0.0;
+    };
+    let Some(last) = values
+        .iter()
+        .rev()
+        .copied()
+        .find(|v| v.is_finite() && *v > 0.0)
+    else {
+        return 0.0;
+    };
+    last / first - 1.0
+}
+
+fn charts_with_benchmark(result: &BacktestResult) -> ChartCollection {
+    let mut charts = result.charts.clone();
+    if !result.benchmark_curve.is_empty() {
+        let mut chart = Chart::new("Benchmark");
+        chart.add_series(Series {
+            name: "Benchmark".to_string(),
+            series_type: SeriesType::Line,
+            color: Some("#90caf9".to_string()),
+            unit: "$".to_string(),
+            points: result
+                .benchmark_dates
+                .iter()
+                .zip(result.benchmark_curve.iter())
+                .map(|(time, value)| ChartPoint {
+                    time: time.clone(),
+                    value: *value,
+                })
+                .collect(),
+        });
+        charts.charts.insert("Benchmark".to_string(), chart);
+    }
+    charts
 }
 
 fn kpi_cards(r: &BacktestResult) -> String {
@@ -801,6 +903,12 @@ mod tests {
                 "2026-01-03".to_string(),
                 "2026-01-04".to_string(),
             ],
+            benchmark_curve: vec![400.0, 404.0, 408.0],
+            benchmark_dates: vec![
+                "2026-01-02".to_string(),
+                "2026-01-03".to_string(),
+                "2026-01-04".to_string(),
+            ],
             statistics: stats,
             charts: crate::charting::ChartCollection::default(),
             order_events: vec![],
@@ -827,8 +935,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v.get("Statistics").is_some(), "missing 'Statistics' key");
         assert!(v.get("Equity").is_some(), "missing 'Equity' key");
+        assert!(v.get("Benchmark").is_some(), "missing 'Benchmark' key");
         assert!(v.get("TradingDays").is_some(), "missing 'TradingDays' key");
         assert!(v.get("TotalReturn").is_some(), "missing 'TotalReturn' key");
+        let charts = v.get("Charts").expect("missing 'Charts' key");
+        assert!(
+            charts
+                .get("charts")
+                .and_then(|charts| charts.get("Benchmark"))
+                .is_some(),
+            "results Charts should include LEAN-style Benchmark chart"
+        );
     }
 
     // ── write_order_events_json ────────────────────────────────────────────────

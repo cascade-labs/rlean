@@ -324,7 +324,7 @@ async fn run_python_backtest(
     }
 
     // Auto-load custom data source plugins from ~/.rlean/plugins/.
-    let custom_data_sources = crate::providers::load_custom_data_plugins();
+    let custom_data_sources = crate::providers::load_custom_data_plugins(&args.data);
 
     let config = RunConfig {
         data_root: args.data.clone(),

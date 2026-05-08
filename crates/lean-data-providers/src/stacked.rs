@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lean_core::Resolution;
+use lean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt};
 use lean_data::{QuoteBar, Tick, TradeBar};
 use lean_storage::{OptionEodBar, OptionUniverseRow};
 use tracing::debug;
@@ -55,6 +55,52 @@ fn option_market_data_batch_is_empty(
         OptionDataType::QuoteBar => batch.quote_bars.is_empty(),
         OptionDataType::Tick => batch.ticks.is_empty(),
     }
+}
+
+fn option_quote_bars_cover_contracts(
+    ticker: &str,
+    bars: &[QuoteBar],
+    contracts: &[OptionUniverseRow],
+) -> bool {
+    if contracts.is_empty() {
+        return true;
+    }
+    let required = option_contract_symbol_values(ticker, contracts);
+    if required.is_empty() {
+        return true;
+    }
+    let available = bars
+        .iter()
+        .map(|bar| bar.symbol.value.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    required
+        .iter()
+        .all(|symbol_value| available.contains(symbol_value.as_str()))
+}
+
+fn option_contract_symbol_values(ticker: &str, contracts: &[OptionUniverseRow]) -> Vec<String> {
+    let underlying = Symbol::create_equity(ticker, &Market::usa());
+    contracts
+        .iter()
+        .filter_map(|row| {
+            let right = match row.right.to_ascii_uppercase().as_str() {
+                "C" | "CALL" => OptionRight::Call,
+                "P" | "PUT" => OptionRight::Put,
+                _ => return None,
+            };
+            Some(
+                Symbol::create_option_osi(
+                    underlying.clone(),
+                    row.strike,
+                    row.expiration,
+                    right,
+                    OptionStyle::American,
+                    &Market::usa(),
+                )
+                .value,
+            )
+        })
+        .collect()
 }
 
 /// Wraps multiple `IHistoryProvider` implementations and tries them in
@@ -292,6 +338,27 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
+    async fn get_option_trade_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        for provider in &self.providers {
+            match provider
+                .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
+                .await
+            {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
     async fn get_option_quote_bars(
         &self,
         ticker: &str,
@@ -310,6 +377,39 @@ impl IHistoryProvider for StackedHistoryProvider {
             }
         }
         Ok(vec![])
+    }
+
+    async fn get_option_quote_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let mut best_partial = Vec::new();
+        for provider in &self.providers {
+            match provider
+                .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
+                .await
+            {
+                Ok(data)
+                    if !data.is_empty()
+                        && option_quote_bars_cover_contracts(ticker, &data, contracts) =>
+                {
+                    return Ok(data)
+                }
+                Ok(data) if !data.is_empty() => {
+                    if data.len() > best_partial.len() {
+                        best_partial = data;
+                    }
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(best_partial)
     }
 
     async fn get_option_ticks(

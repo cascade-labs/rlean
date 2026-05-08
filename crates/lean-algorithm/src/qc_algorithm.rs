@@ -647,7 +647,7 @@ impl QcAlgorithm {
         symbol
     }
 
-    fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
+    pub fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
         if self.securities.contains(symbol) {
             return;
         }

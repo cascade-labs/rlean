@@ -96,6 +96,27 @@ pub trait IHistoryProvider: Send + Sync {
         Ok(vec![])
     }
 
+    /// Fetch intraday option trade bars constrained to an already-selected option universe.
+    /// Providers with contract-specific chain endpoints should override this so option
+    /// filters reduce the remote request surface and include held contracts explicitly.
+    async fn get_option_trade_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        let allowed = contracts
+            .iter()
+            .map(|row| row.symbol_value.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut bars = self.get_option_trade_bars(ticker, resolution, date).await?;
+        if !allowed.is_empty() {
+            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
+        }
+        Ok(bars)
+    }
+
     /// Fetch intraday option quote bars for all contracts of `ticker` on `date`.
     async fn get_option_quote_bars(
         &self,
@@ -104,6 +125,27 @@ pub trait IHistoryProvider: Send + Sync {
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
         Ok(vec![])
+    }
+
+    /// Fetch intraday option quote bars constrained to an already-selected option universe.
+    /// Providers with contract-specific chain endpoints should override this so option
+    /// filters reduce the remote request surface and include held contracts explicitly.
+    async fn get_option_quote_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let allowed = contracts
+            .iter()
+            .map(|row| row.symbol_value.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut bars = self.get_option_quote_bars(ticker, resolution, date).await?;
+        if !allowed.is_empty() {
+            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
+        }
+        Ok(bars)
     }
 
     /// Fetch option ticks for all contracts of `ticker` on `date`.

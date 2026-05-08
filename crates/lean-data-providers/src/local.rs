@@ -203,6 +203,21 @@ impl IHistoryProvider for LocalHistoryProvider {
         )?)
     }
 
+    async fn get_option_trade_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        let allowed_symbols = option_symbol_values_from_contracts(ticker, contracts);
+        let mut bars = self.get_option_trade_bars(ticker, resolution, date).await?;
+        if !allowed_symbols.is_empty() {
+            bars.retain(|bar| allowed_symbols.contains(bar.symbol.value.as_str()));
+        }
+        Ok(bars)
+    }
+
     async fn get_option_quote_bars(
         &self,
         ticker: &str,
@@ -226,6 +241,21 @@ impl IHistoryProvider for LocalHistoryProvider {
             &symbols_by_value,
             &params,
         )?)
+    }
+
+    async fn get_option_quote_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let allowed_symbols = option_symbol_values_from_contracts(ticker, contracts);
+        let mut bars = self.get_option_quote_bars(ticker, resolution, date).await?;
+        if !allowed_symbols.is_empty() {
+            bars.retain(|bar| allowed_symbols.contains(bar.symbol.value.as_str()));
+        }
+        Ok(bars)
     }
 
     async fn get_option_ticks(
@@ -357,9 +387,38 @@ fn load_option_symbols(
             OptionStyle::American,
             &Market::usa(),
         );
-        out.insert(row.symbol_value, sym);
+        out.insert(row.symbol_value, sym.clone());
+        out.insert(sym.value.clone(), sym);
     }
     Ok(out)
+}
+
+fn option_symbol_values_from_contracts(
+    ticker: &str,
+    contracts: &[lean_storage::OptionUniverseRow],
+) -> HashSet<String> {
+    let underlying = Symbol::create_equity(ticker, &Market::usa());
+    contracts
+        .iter()
+        .filter_map(|row| {
+            let right = match row.right.to_ascii_uppercase().as_str() {
+                "C" | "CALL" => OptionRight::Call,
+                "P" | "PUT" => OptionRight::Put,
+                _ => return None,
+            };
+            Some(
+                Symbol::create_option_osi(
+                    underlying.clone(),
+                    row.strike,
+                    row.expiration,
+                    right,
+                    OptionStyle::American,
+                    &Market::usa(),
+                )
+                .value,
+            )
+        })
+        .collect()
 }
 
 fn option_partition_path(

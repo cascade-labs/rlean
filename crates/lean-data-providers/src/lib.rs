@@ -22,7 +22,7 @@ pub mod stacked;
 pub mod traits;
 
 pub use config::ProviderConfig;
-pub use custom_data::{ArcCustomDataSource, ICustomDataSource};
+pub use custom_data::{ArcCustomDataSource, CustomDataContext, ICustomDataSource};
 pub use local::LocalHistoryProvider;
 pub use request::{
     DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,

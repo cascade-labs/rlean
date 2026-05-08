@@ -1659,42 +1659,18 @@ impl PyQcAlgorithm {
                 .unwrap_or(Decimal::ZERO)
         };
 
-        // Determine if opening or closing from the portfolio holding, mirroring LEAN.
-        let existing_qty = {
-            self.inner
-                .lock()
-                .unwrap()
-                .portfolio
-                .get_holding(&sym)
-                .quantity
-        };
-
-        let abs_qty = quantity.abs();
-        if quantity < Decimal::ZERO {
-            if existing_qty > Decimal::ZERO {
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .sell_to_close(sym, abs_qty, premium);
-            } else {
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .sell_to_open(sym, abs_qty, premium);
-            }
-        } else if quantity > Decimal::ZERO {
-            if existing_qty < Decimal::ZERO {
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .buy_to_close(sym, abs_qty, premium);
-            } else {
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .buy_to_open(sym, abs_qty, premium);
-            }
+        if quantity == Decimal::ZERO {
+            return Ok(());
         }
+        if premium <= Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "No positive option premium available for market order: {}",
+                sym.value
+            )));
+        }
+        let mut alg = self.inner.lock().unwrap();
+        alg.ensure_option_security(&sym, Resolution::Minute);
+        alg.market_order(&sym, quantity);
         Ok(())
     }
 }

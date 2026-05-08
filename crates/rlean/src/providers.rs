@@ -16,7 +16,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
 use lean_data_providers::{
-    config::ProviderConfig, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider,
+    config::ProviderConfig, CustomDataContext, IHistoryProvider, LocalHistoryProvider,
+    StackedHistoryProvider,
 };
 
 /// A lazy wrapper around a named plugin provider.
@@ -117,6 +118,19 @@ impl IHistoryProvider for LazyPluginProvider {
             .await
     }
 
+    async fn get_option_trade_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider
+            .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
+            .await
+    }
+
     async fn get_option_quote_bars(
         &self,
         ticker: &str,
@@ -126,6 +140,19 @@ impl IHistoryProvider for LazyPluginProvider {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_quote_bars(ticker, resolution, date)
+            .await
+    }
+
+    async fn get_option_quote_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: lean_core::Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[lean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider
+            .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
             .await
     }
 
@@ -357,7 +384,9 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
 /// Plugins that don't export the symbol are silently skipped — not every plugin
 /// is a custom data source.  Any dylib that does export it is loaded eagerly
 /// (custom data sources are lightweight and used throughout the backtest).
-pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDataSource>> {
+pub fn load_custom_data_plugins(
+    data_root: &std::path::Path,
+) -> Vec<Arc<dyn lean_data_providers::ICustomDataSource>> {
     use libloading::{Library, Symbol};
 
     let plugins_dir = match home_dir() {
@@ -373,6 +402,7 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
     let glob_pattern = pattern.to_string_lossy().to_string();
 
     let mut sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>> = Vec::new();
+    let context = CustomDataContext::new(data_root);
 
     let paths: Vec<_> = match glob::glob(&glob_pattern) {
         Ok(paths) => paths.filter_map(|r| r.ok()).collect(),
@@ -406,8 +436,9 @@ pub fn load_custom_data_plugins() -> Vec<Arc<dyn lean_data_providers::ICustomDat
 
         // The factory returns *mut () pointing to a heap-allocated
         // Box<dyn ICustomDataSource> (double-boxed to keep a thin pointer over FFI).
-        let source_box: Box<dyn lean_data_providers::ICustomDataSource> =
+        let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
             unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+        source_box.initialize(&context);
         let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
 
         tracing::info!(

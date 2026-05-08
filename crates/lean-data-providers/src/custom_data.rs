@@ -2,7 +2,30 @@ use chrono::NaiveDate;
 use lean_data::custom::{
     CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource, CustomParquetSource,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Engine-owned context passed to custom-data plugins at load time.
+///
+/// This mirrors LEAN's centralized data-provider model: the engine resolves the
+/// data root once, then gives plugins that resolved path instead of requiring
+/// each plugin to rediscover it from environment variables or user config.
+#[derive(Debug, Clone)]
+pub struct CustomDataContext {
+    data_root: PathBuf,
+}
+
+impl CustomDataContext {
+    pub fn new(data_root: impl AsRef<Path>) -> Self {
+        Self {
+            data_root: data_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+}
 
 /// Trait implemented by custom data source plugins.
 ///
@@ -29,6 +52,12 @@ use std::sync::Arc;
 /// the factory function signature is documented here but **not** type-checked at
 /// the ABI boundary — the runner performs the cast internally.
 pub trait ICustomDataSource: Send + Sync {
+    /// Initialize the plugin with engine-owned services and paths.
+    ///
+    /// The default keeps older custom-data plugins source-compatible, but new
+    /// plugins should use this context for all local file access.
+    fn initialize(&mut self, _context: &CustomDataContext) {}
+
     /// Unique name matching the plugin registry entry (e.g. `"fred"`, `"cboe_vix"`).
     fn name(&self) -> &str;
 
