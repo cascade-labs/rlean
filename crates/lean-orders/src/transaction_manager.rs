@@ -109,6 +109,17 @@ impl TransactionManager {
         }
     }
 
+    pub fn cancel_open_orders_for_symbol(&self, symbol_sid: u64, time: DateTime) {
+        for entry in self.orders.iter() {
+            let order = entry.read();
+            if order.symbol.id.sid == symbol_sid && order.is_open() {
+                if let Some(ticket) = self.tickets.get(&order.id) {
+                    ticket.cancel(time);
+                }
+            }
+        }
+    }
+
     pub fn order_count(&self) -> usize {
         self.orders.len()
     }

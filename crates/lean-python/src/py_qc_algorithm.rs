@@ -4,7 +4,9 @@ use crate::py_framework::{
 };
 use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
 use crate::py_portfolio::PyPortfolio;
-use crate::py_types::{PyAlgorithmSettings, PyResolution, PySecurity, PySecurityManager, PySymbol};
+use crate::py_types::{
+    PyAlgorithmSettings, PyOptionSecurity, PyResolution, PySecurity, PySecurityManager, PySymbol,
+};
 use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
 use crate::{PyAccountType, PyBrokerageName};
 use chrono::{Datelike, NaiveDate, Timelike};
@@ -791,6 +793,27 @@ impl PyQcAlgorithm {
             canonical: crate::py_types::PySymbol { inner: canonical },
             algorithm: self.inner.clone(),
         })
+    }
+
+    /// LEAN API: remove a security subscription.
+    ///
+    /// Mirrors C# LEAN's `RemoveSecurity(symbol, tag=None)` surface. For a
+    /// canonical option symbol, this unsubscribes the option universe/filter.
+    #[pyo3(signature = (symbol, tag=None))]
+    fn remove_security(&mut self, symbol: &Bound<'_, PyAny>, tag: Option<&str>) -> PyResult<bool> {
+        let sym = self.resolve_symbol(symbol)?;
+        Ok(self.inner.lock().unwrap().remove_security(&sym, tag))
+    }
+
+    /// LEAN API sugar for removing a specific option contract.
+    #[pyo3(signature = (symbol, tag=None))]
+    fn remove_option_contract(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        tag: Option<&str>,
+    ) -> PyResult<bool> {
+        let sym = self.resolve_symbol(symbol)?;
+        Ok(self.inner.lock().unwrap().remove_option_contract(&sym, tag))
     }
 
     // ─── Securities ───────────────────────────────────────────────────────────
@@ -1620,6 +1643,10 @@ impl PyQcAlgorithm {
         // Accept Security objects directly (mirrors LEAN's set_holdings(security, ...) API)
         if let Ok(sec) = arg.cast::<PySecurity>() {
             return Ok(sec.get().inner.inner.clone());
+        }
+        // Accept Option security objects returned by add_option().
+        if let Ok(option) = arg.cast::<PyOptionSecurity>() {
+            return Ok(option.borrow().canonical.inner.clone());
         }
         // Accept OptionContract objects — uses contract.symbol
         if let Ok(contract) = arg.cast::<crate::py_options::PyOptionContract>() {

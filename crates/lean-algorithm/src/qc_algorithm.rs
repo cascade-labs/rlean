@@ -613,6 +613,21 @@ impl QcAlgorithm {
         self.portfolio.is_invested(symbol)
     }
 
+    pub fn is_option_underlying(&self, symbol: &Symbol) -> bool {
+        self.option_subscriptions.iter().any(|canonical| {
+            canonical
+                .underlying
+                .as_ref()
+                .map(|underlying| underlying.id.sid == symbol.id.sid)
+                .unwrap_or_else(|| {
+                    canonical
+                        .permtick
+                        .trim_start_matches('?')
+                        .eq_ignore_ascii_case(&symbol.permtick)
+                })
+        })
+    }
+
     // ─── Options ─────────────────────────────────────────────────────────────
 
     /// Subscribe to the option chain for an underlying equity.
@@ -621,7 +636,13 @@ impl QcAlgorithm {
     pub fn add_option(&mut self, underlying_ticker: &str, resolution: Resolution) -> Symbol {
         let underlying = self.add_equity(underlying_ticker, resolution);
         let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
-        self.option_subscriptions.push(canonical.clone());
+        if !self
+            .option_subscriptions
+            .iter()
+            .any(|symbol| symbol.id.sid == canonical.id.sid)
+        {
+            self.option_subscriptions.push(canonical.clone());
+        }
         self.option_subscription_resolutions
             .insert(canonical.permtick.clone(), resolution);
         self.option_filters
@@ -643,8 +664,111 @@ impl QcAlgorithm {
             }
         }
         self.ensure_option_security(&symbol, resolution);
-        self.open_option_contracts.push(symbol.clone());
+        if !self
+            .open_option_contracts
+            .iter()
+            .any(|existing| existing.id.sid == symbol.id.sid)
+        {
+            self.open_option_contracts.push(symbol.clone());
+        }
         symbol
+    }
+
+    /// Remove a security subscription, matching LEAN's `RemoveSecurity` surface.
+    ///
+    /// For canonical options, this removes the option universe/filter/chain and
+    /// any unheld child option contract securities. Underlying equities are not
+    /// removed here because rlean does not yet mark add-option underlyings as
+    /// internal feeds, while user strategies often subscribe to the same equity
+    /// through an explicit universe.
+    pub fn remove_security(&mut self, symbol: &Symbol, _tag: Option<&str>) -> bool {
+        if symbol.is_canonical_option() {
+            return self.remove_option_subscription(symbol);
+        }
+
+        let existed = self.securities.contains(symbol)
+            || self
+                .open_option_contracts
+                .iter()
+                .any(|existing| existing.id.sid == symbol.id.sid);
+        if !existed {
+            return false;
+        }
+
+        self.transactions
+            .cancel_open_orders_for_symbol(symbol.id.sid, self.utc_time);
+        if self.is_invested(symbol) {
+            self.liquidate(Some(symbol));
+        }
+        self.subscription_manager.remove_symbol(symbol);
+        self.securities.remove(symbol);
+        self.open_option_contracts
+            .retain(|existing| existing.id.sid != symbol.id.sid);
+        true
+    }
+
+    /// LEAN sugar for `RemoveSecurity` on a specific option contract.
+    pub fn remove_option_contract(&mut self, symbol: &Symbol, tag: Option<&str>) -> bool {
+        self.remove_security(symbol, tag)
+    }
+
+    fn remove_option_subscription(&mut self, canonical: &Symbol) -> bool {
+        let canonical_key = canonical.permtick.clone();
+        let underlying_key = Self::canonical_underlying_key(canonical);
+        let existed = self
+            .option_subscriptions
+            .iter()
+            .any(|symbol| symbol.id.sid == canonical.id.sid);
+        if !existed {
+            return false;
+        }
+
+        self.option_subscriptions
+            .retain(|symbol| symbol.id.sid != canonical.id.sid);
+        self.option_subscription_resolutions.remove(&canonical_key);
+        self.option_filters.remove(&canonical_key);
+        self.option_chains.remove(&canonical_key);
+
+        let child_symbols: Vec<Symbol> = self
+            .open_option_contracts
+            .iter()
+            .filter(|symbol| Self::option_symbol_matches_underlying(symbol, &underlying_key))
+            .cloned()
+            .collect();
+        for child in child_symbols {
+            self.transactions
+                .cancel_open_orders_for_symbol(child.id.sid, self.utc_time);
+            if self.is_invested(&child) {
+                self.liquidate(Some(&child));
+            }
+            self.subscription_manager.remove_symbol(&child);
+            self.securities.remove(&child);
+            self.open_option_contracts
+                .retain(|existing| existing.id.sid != child.id.sid);
+        }
+
+        true
+    }
+
+    fn canonical_underlying_key(canonical: &Symbol) -> String {
+        canonical
+            .underlying
+            .as_ref()
+            .map(|underlying| underlying.permtick.to_ascii_uppercase())
+            .unwrap_or_else(|| {
+                canonical
+                    .permtick
+                    .trim_start_matches('?')
+                    .to_ascii_uppercase()
+            })
+    }
+
+    fn option_symbol_matches_underlying(symbol: &Symbol, underlying_key: &str) -> bool {
+        symbol
+            .underlying
+            .as_ref()
+            .map(|underlying| underlying.permtick.eq_ignore_ascii_case(underlying_key))
+            .unwrap_or(false)
     }
 
     pub fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
@@ -819,5 +943,95 @@ impl QcAlgorithm {
     /// Returns the most recently generated option chain for a canonical ticker.
     pub fn get_option_chain(&self, canonical: &str) -> Option<OptionChain> {
         self.option_chains.get(canonical).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn remove_security_removes_equity_subscription_and_security() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+
+        assert!(alg.securities.contains(&symbol));
+        assert!(alg
+            .subscription_manager
+            .get_all()
+            .iter()
+            .any(|config| config.symbol.id.sid == symbol.id.sid));
+
+        assert!(alg.remove_security(&symbol, None));
+        assert!(!alg.securities.contains(&symbol));
+        assert!(!alg
+            .subscription_manager
+            .get_all()
+            .iter()
+            .any(|config| config.symbol.id.sid == symbol.id.sid));
+    }
+
+    #[test]
+    fn remove_security_removes_canonical_option_state_but_keeps_underlying() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let canonical = alg.add_option("AAPL", Resolution::Minute);
+        let underlying = canonical.underlying.as_ref().unwrap().as_ref().clone();
+        let contract = Symbol::create_option(
+            underlying.clone(),
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+            dec!(250),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+
+        alg.set_option_filter(
+            &canonical,
+            OptionFilter {
+                min_strike_rank: -5,
+                max_strike_rank: 25,
+                min_expiry_days: 7,
+                max_expiry_days: 45,
+            },
+        );
+        alg.option_chains.insert(
+            canonical.permtick.clone(),
+            OptionChain::new(canonical.clone(), dec!(200)),
+        );
+        alg.add_option_contract(contract.clone(), Resolution::Minute);
+
+        assert!(alg
+            .option_subscriptions
+            .iter()
+            .any(|symbol| symbol.id.sid == canonical.id.sid));
+        assert!(alg.securities.contains(&underlying));
+        assert!(alg.is_option_underlying(&underlying));
+        assert!(alg.securities.contains(&contract));
+
+        assert!(alg.remove_security(&canonical, None));
+
+        assert!(!alg
+            .option_subscriptions
+            .iter()
+            .any(|symbol| symbol.id.sid == canonical.id.sid));
+        assert!(!alg
+            .option_subscription_resolutions
+            .contains_key(&canonical.permtick));
+        assert!(!alg.option_filters.contains_key(&canonical.permtick));
+        assert!(!alg.option_chains.contains_key(&canonical.permtick));
+        assert!(!alg.is_option_underlying(&underlying));
+        assert!(!alg
+            .open_option_contracts
+            .iter()
+            .any(|symbol| symbol.id.sid == contract.id.sid));
+        assert!(!alg.securities.contains(&contract));
+        assert!(alg.securities.contains(&underlying));
+        assert!(alg
+            .subscription_manager
+            .get_all()
+            .iter()
+            .any(|config| config.symbol.id.sid == underlying.id.sid));
     }
 }

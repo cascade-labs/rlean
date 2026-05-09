@@ -727,7 +727,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             end_date,
             &resolver,
         )
-        .await;
+        .await?;
     }
 
     // ── factor files: load from disk ─────────────────────────────────────────
@@ -738,22 +738,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let factor_reader = ParquetReader::new();
     let mut factor_map: HashMap<u64, Vec<FactorFileEntry>> = HashMap::new();
     let mut loaded_factor_sids: HashSet<u64> = HashSet::new();
+    let require_factor_files = config.history_provider.is_some();
     for sub in &subscriptions {
+        if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
+            continue;
+        }
         if !loaded_factor_sids.insert(sub.symbol.id.sid) {
             continue;
         }
-        match read_factor_rows_for_subscription(&factor_reader, &config.data_root, sub) {
-            Ok(rows) if !rows.is_empty() => {
-                debug!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
-                factor_map.insert(sub.symbol.id.sid, rows);
-            }
-            _ => {
-                warn!(
-                    "Factor file missing for {} — bars will not be adjusted.",
-                    sub.symbol.value
-                );
-            }
-        }
+        load_factor_rows_into_map(
+            &factor_reader,
+            &config.data_root,
+            sub,
+            start_date,
+            end_date,
+            &mut factor_map,
+            require_factor_files,
+        )?;
     }
 
     // ── map files: load ticker rename history ───────────────────────────────
@@ -1300,16 +1301,26 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     &mut loaded_subscription_ids,
                     &current_subs,
                 );
+                if let Some(ref provider) = config.history_provider {
+                    ensure_auxiliary_files_for_subscriptions(
+                        provider.clone(),
+                        &reconciliation.new_subs,
+                        current_date,
+                        end_date,
+                        &resolver,
+                    )
+                    .await?;
+                }
                 for sub in &reconciliation.new_subs {
-                    let sid = sub.symbol.id.sid;
-                    if let Ok(rows) =
-                        read_factor_rows_for_subscription(&factor_reader, &config.data_root, sub)
-                    {
-                        if !rows.is_empty() {
-                            debug!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
-                            factor_map.insert(sid, rows);
-                        }
-                    }
+                    load_factor_rows_into_map(
+                        &factor_reader,
+                        &config.data_root,
+                        sub,
+                        current_date,
+                        end_date,
+                        &mut factor_map,
+                        require_factor_files,
+                    )?;
                 }
                 Python::attach(|py| {
                     slice_proxy.retain_subscriptions(py, &current_subs);
@@ -1334,16 +1345,75 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 .await?;
             }
 
+            if let Some(ref provider) = config.history_provider {
+                let missing_factor_subs: Vec<_> = subscriptions
+                    .iter()
+                    .filter(|sub| sub.resolution.is_high_resolution())
+                    .filter(|sub| matches!(sub.symbol.security_type(), SecurityType::Equity))
+                    .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                    .filter(|sub| {
+                        subscription_has_mapped_data_for_range(
+                            &factor_reader,
+                            &config.data_root,
+                            sub,
+                            current_date,
+                            current_date,
+                        )
+                    })
+                    .filter(|sub| !factor_map.contains_key(&sub.symbol.id.sid))
+                    .cloned()
+                    .collect();
+                if !missing_factor_subs.is_empty() {
+                    ensure_auxiliary_files_for_subscriptions(
+                        provider.clone(),
+                        &missing_factor_subs,
+                        current_date,
+                        end_date,
+                        &resolver,
+                    )
+                    .await?;
+                    for sub in &missing_factor_subs {
+                        load_factor_rows_into_map(
+                            &factor_reader,
+                            &config.data_root,
+                            sub,
+                            current_date,
+                            end_date,
+                            &mut factor_map,
+                            require_factor_files,
+                        )?;
+                    }
+                }
+            }
+
             let day_symbol_sids: Vec<u64> = subscriptions
                 .iter()
                 .filter(|sub| sub.resolution.is_high_resolution())
                 .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                .filter(|sub| {
+                    subscription_has_mapped_data_for_range(
+                        &factor_reader,
+                        &config.data_root,
+                        sub,
+                        current_date,
+                        current_date,
+                    )
+                })
                 .map(|sub| sub.symbol.id.sid)
                 .collect();
             let day_symbols_by_sid: HashMap<u64, Symbol> = subscriptions
                 .iter()
                 .filter(|sub| sub.resolution.is_high_resolution())
                 .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
+                .filter(|sub| {
+                    subscription_has_mapped_data_for_range(
+                        &factor_reader,
+                        &config.data_root,
+                        sub,
+                        current_date,
+                        current_date,
+                    )
+                })
                 .map(|sub| (sub.symbol.id.sid, sub.symbol.clone()))
                 .collect();
             let day_read_params = if day_symbol_sids.is_empty() {
@@ -1359,6 +1429,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 for sub in subscriptions.iter() {
                     if !sub.resolution.is_high_resolution()
                         || !is_expected_market_date(&sub.symbol, current_date)
+                        || !subscription_has_mapped_data_for_range(
+                            &cache_reader,
+                            &config.data_root,
+                            sub,
+                            current_date,
+                            current_date,
+                        )
                     {
                         continue;
                     }
@@ -1374,7 +1451,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 }
                 if !missing_subs.is_empty() {
-                    if let Err(e) = pre_fetch_high_resolution_day_batched(
+                    pre_fetch_high_resolution_day_batched(
                         provider.clone(),
                         config.history_provider.clone(),
                         &missing_subs,
@@ -1382,15 +1459,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         end_date,
                         &resolver,
                     )
-                    .await
-                    {
-                        warn!(
-                            "Failed to fetch {} intraday subscriptions for {}: {}",
-                            missing_subs.len(),
-                            current_date,
-                            e
-                        );
-                    }
+                    .await?;
                 }
             }
 
@@ -1968,7 +2037,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         .collect();
                     if !new_high_res_subs.is_empty() {
                         if let Some(ref provider) = config.history_provider {
-                            if let Err(e) = pre_fetch_high_resolution_day_batched(
+                            pre_fetch_high_resolution_day_batched(
                                 provider.clone(),
                                 config.history_provider.clone(),
                                 &new_high_res_subs,
@@ -1976,11 +2045,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 end_date,
                                 &resolver,
                             )
-                            .await
-                            {
-                                warn!("Failed to fetch universe subscriptions: {e}");
-                            }
+                            .await?;
                         }
+                    }
+
+                    if let Some(ref provider) = config.history_provider {
+                        ensure_auxiliary_files_for_subscriptions(
+                            provider.clone(),
+                            &new_subs,
+                            current_date,
+                            end_date,
+                            &resolver,
+                        )
+                        .await?;
                     }
 
                     for sub in &new_subs {
@@ -1989,15 +2066,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             continue;
                         }
 
-                        if let Ok(rows) = read_factor_rows_for_subscription(
+                        load_factor_rows_into_map(
                             &factor_reader,
                             &config.data_root,
                             sub,
-                        ) {
-                            if !rows.is_empty() {
-                                factor_map.insert(sid, rows);
-                            }
-                        }
+                            current_date,
+                            end_date,
+                            &mut factor_map,
+                            require_factor_files,
+                        )?;
 
                         let exchange_hours = {
                             adapter
@@ -2427,7 +2504,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         // the historical provider (same as pre_fetch_all does at startup).
                         if !path.exists() {
                             if let Some(ref provider) = config.historical_provider {
-                                if let Err(e) = pre_fetch_all(
+                                pre_fetch_all(
                                     provider.clone(),
                                     config.history_provider.clone(),
                                     std::slice::from_ref(sub),
@@ -2435,15 +2512,28 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     end_date,
                                     &resolver,
                                 )
-                                .await
-                                {
-                                    warn!(
-                                        "Failed to fetch data for dynamic subscription {}: {}",
-                                        sub.symbol.value, e
-                                    );
-                                }
+                                .await?;
                             }
                         }
+                        if let Some(ref provider) = config.history_provider {
+                            ensure_auxiliary_files_for_subscriptions(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
+                        }
+                        load_factor_rows_into_map(
+                            &factor_reader,
+                            &config.data_root,
+                            sub,
+                            start_date,
+                            end_date,
+                            &mut factor_map,
+                            require_factor_files,
+                        )?;
                         if path.exists() {
                             let bars = load_trade_bar_partitions(
                                 &reader,
@@ -2483,7 +2573,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         let path = subscription_data_path(&resolver, sub, start_date);
                         if !path.exists() {
                             if let Some(ref provider) = config.historical_provider {
-                                if let Err(e) = pre_fetch_all(
+                                pre_fetch_all(
                                     provider.clone(),
                                     config.history_provider.clone(),
                                     std::slice::from_ref(sub),
@@ -2491,15 +2581,28 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     end_date,
                                     &resolver,
                                 )
-                                .await
-                                {
-                                    warn!(
-                                        "Failed to fetch data for universe subscription {}: {}",
-                                        sub.symbol.value, e
-                                    );
-                                }
+                                .await?;
                             }
                         }
+                        if let Some(ref provider) = config.history_provider {
+                            ensure_auxiliary_files_for_subscriptions(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
+                        }
+                        load_factor_rows_into_map(
+                            &factor_reader,
+                            &config.data_root,
+                            sub,
+                            start_date,
+                            end_date,
+                            &mut factor_map,
+                            require_factor_files,
+                        )?;
                         if path.exists() {
                             let bars = load_trade_bar_partitions(
                                 &reader,
@@ -3059,7 +3162,7 @@ async fn ensure_auxiliary_files_for_subscriptions(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
-) {
+) -> Result<()> {
     let reader = ParquetReader::new();
     let mut seen = HashSet::new();
     for sub in subscriptions {
@@ -3087,12 +3190,17 @@ async fn ensure_auxiliary_files_for_subscriptions(
                 end: date_to_datetime(end, 23, 59, 59),
                 data_type: DataType::MapFile,
             };
-            if let Err(e) = provider.get_history(&request).await {
-                warn!("Map file generation failed for {}: {e}", sub.symbol.value);
-            }
+            provider.get_history(&request).await.map_err(|e| {
+                anyhow::anyhow!("Map file generation failed for {}: {e}", sub.symbol.value)
+            })?;
         }
 
-        let map_rows = reader.read_map_file(&map_path).unwrap_or_default();
+        let map_rows = reader.read_map_file(&map_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Map file missing for {} after provider request: {e}",
+                sub.symbol.value
+            )
+        })?;
         let Some((mapped_start, mapped_end)) = mapped_data_date_range(&map_rows, start, end) else {
             continue;
         };
@@ -3120,12 +3228,30 @@ async fn ensure_auxiliary_files_for_subscriptions(
         };
         match provider.get_history(&request).await {
             Ok(_) => debug!("Factor file generated for {}", sub.symbol.value),
-            Err(e) => warn!(
-                "Factor file generation failed for {}: {e}",
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Factor file generation failed for {}: {e}",
+                    sub.symbol.value
+                ));
+            }
+        }
+
+        let rows = reader.read_factor_file(&factor_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Factor file missing for {} after provider request: {e}",
                 sub.symbol.value
-            ),
+            )
+        })?;
+        if !factor_file_covers_range(&rows, mapped_start, mapped_end) {
+            return Err(anyhow::anyhow!(
+                "Factor file for {} does not cover {} -> {} after provider request",
+                sub.symbol.value,
+                mapped_start,
+                mapped_end
+            ));
         }
     }
+    Ok(())
 }
 
 async fn pre_fetch_high_resolution_day_batched(
@@ -3151,6 +3277,19 @@ async fn pre_fetch_high_resolution_day_batched(
             continue;
         }
 
+        if matches!(sub.symbol.security_type(), SecurityType::Equity) {
+            if let Some(ref fp) = factor_provider {
+                ensure_auxiliary_files_for_subscriptions(
+                    fp.clone(),
+                    std::slice::from_ref(sub),
+                    date,
+                    factor_end.max(date),
+                    resolver,
+                )
+                .await?;
+            }
+        }
+
         let ticker = sub.symbol.permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
         let map_path = resolver
@@ -3160,62 +3299,10 @@ async fn pre_fetch_high_resolution_day_batched(
             .join("map_files")
             .join(format!("{ticker}.parquet"));
 
-        if !map_path.exists() {
-            if let Some(ref fp) = factor_provider {
-                let request = lean_data_providers::HistoryRequest {
-                    symbol: sub.symbol.clone(),
-                    resolution: Resolution::Daily,
-                    start: date_to_datetime(date, 0, 0, 0),
-                    end: date_to_datetime(date, 23, 59, 59),
-                    data_type: DataType::MapFile,
-                };
-                if let Err(e) = fp.get_history(&request).await {
-                    warn!("Map file generation failed for {}: {e}", sub.symbol.value);
-                }
-            }
-        }
-
         let reader = ParquetReader::new();
         let map_rows = reader.read_map_file(&map_path).unwrap_or_default();
         if mapped_data_date_range(&map_rows, date, date).is_none() {
             continue;
-        }
-        if matches!(sub.symbol.security_type(), SecurityType::Equity) {
-            let mapped_factor_end = factor_end.max(date);
-            if let Some((mapped_start, mapped_end)) =
-                mapped_data_date_range(&map_rows, date, mapped_factor_end)
-            {
-                let market = sub.symbol.market().as_str().to_lowercase();
-                let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
-                let factor_path = resolver
-                    .data_root
-                    .join(&sec)
-                    .join(&market)
-                    .join("factor_files")
-                    .join(format!("{ticker}.parquet"));
-                let factor_valid = factor_path.exists()
-                    && reader.read_factor_file(&factor_path).is_ok_and(|rows| {
-                        factor_file_covers_range(&rows, mapped_start, mapped_end)
-                    });
-                if !factor_valid {
-                    if let Some(ref fp) = factor_provider {
-                        let request = lean_data_providers::HistoryRequest {
-                            symbol: sub.symbol.clone(),
-                            resolution: Resolution::Daily,
-                            start: date_to_datetime(mapped_start, 0, 0, 0),
-                            end: date_to_datetime(mapped_end, 23, 59, 59),
-                            data_type: DataType::FactorFile,
-                        };
-                        match fp.get_history(&request).await {
-                            Ok(_) => debug!("Factor file generated for {}", sub.symbol.value),
-                            Err(e) => warn!(
-                                "Factor file generation failed for {}: {e}",
-                                sub.symbol.value
-                            ),
-                        }
-                    }
-                }
-            }
         }
 
         let requested_symbol = sub.symbol.clone();
@@ -3387,7 +3474,12 @@ async fn pre_fetch_subscription(
             };
             match fp.get_history(&request).await {
                 Ok(_) => debug!("Map file generated for {}", sub.symbol.value),
-                Err(e) => warn!("Map file generation failed for {}: {e}", sub.symbol.value),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Map file generation failed for {}: {e}",
+                        sub.symbol.value
+                    ));
+                }
             }
         }
     }
@@ -3527,11 +3619,35 @@ async fn pre_fetch_subscription(
             };
             match fp.get_history(&request).await {
                 Ok(_) => debug!("Factor file generated for {}", sub.symbol.value),
-                Err(e) => warn!(
-                    "Factor file generation failed for {}: {e}",
-                    sub.symbol.value
-                ),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Factor file generation failed for {}: {e}",
+                        sub.symbol.value
+                    ));
+                }
             }
+
+            let rows = ParquetReader::new()
+                .read_factor_file(&factor_path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Factor file missing for {} after provider request: {e}",
+                        sub.symbol.value
+                    )
+                })?;
+            if !factor_file_covers_range(&rows, mapped_start, mapped_end) {
+                return Err(anyhow::anyhow!(
+                    "Factor file for {} does not cover {} -> {} after provider request",
+                    sub.symbol.value,
+                    mapped_start,
+                    mapped_end
+                ));
+            }
+        } else if matches!(sub.symbol.security_type(), SecurityType::Equity) {
+            warn!(
+                "Factor file missing or stale for {} but no factor provider is configured.",
+                sub.symbol.value
+            );
         }
     }
 
@@ -5991,6 +6107,76 @@ fn read_factor_rows_for_subscription(
         .join("factor_files")
         .join(format!("{ticker}.parquet"));
     reader.read_factor_file(&factor_path)
+}
+
+fn map_file_path_for_subscription(data_root: &Path, sub: &SubscriptionDataConfig) -> PathBuf {
+    let ticker = sub.symbol.permtick.to_lowercase();
+    let market = sub.symbol.market().as_str().to_lowercase();
+    data_root
+        .join("equity")
+        .join(&market)
+        .join("map_files")
+        .join(format!("{ticker}.parquet"))
+}
+
+fn subscription_has_mapped_data_for_range(
+    reader: &ParquetReader,
+    data_root: &Path,
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> bool {
+    if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
+        return true;
+    }
+    let map_path = map_file_path_for_subscription(data_root, sub);
+    let rows = reader.read_map_file(&map_path).unwrap_or_default();
+    mapped_data_date_range(&rows, start, end).is_some()
+}
+
+fn load_factor_rows_into_map(
+    reader: &ParquetReader,
+    data_root: &Path,
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+    factor_map: &mut HashMap<u64, Vec<FactorFileEntry>>,
+    require_factor_file: bool,
+) -> Result<()> {
+    if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
+        return Ok(());
+    }
+    if !subscription_has_mapped_data_for_range(reader, data_root, sub, start, end) {
+        debug!(
+            "Skipping factor file load for {}: requested range {} -> {} is outside map-file data range",
+            sub.symbol.value, start, end
+        );
+        return Ok(());
+    }
+
+    match read_factor_rows_for_subscription(reader, data_root, sub) {
+        Ok(rows) if !rows.is_empty() => {
+            debug!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
+            factor_map.insert(sub.symbol.id.sid, rows);
+            Ok(())
+        }
+        Ok(_) if require_factor_file => Err(anyhow::anyhow!(
+            "Factor file for equity {} is empty after auxiliary generation",
+            sub.symbol.value
+        )),
+        Err(e) if require_factor_file => Err(anyhow::anyhow!(
+            "Factor file missing for equity {} after auxiliary generation: {}",
+            sub.symbol.value,
+            e
+        )),
+        _ => {
+            warn!(
+                "Factor file missing for {} — bars will not be adjusted.",
+                sub.symbol.value
+            );
+            Ok(())
+        }
+    }
 }
 
 // ─── factor_for_entry unit tests — mirrors LEAN C# FactorFile.GetPriceFactor ─

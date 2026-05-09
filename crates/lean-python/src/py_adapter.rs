@@ -152,7 +152,7 @@ impl PyAlgorithmAdapter {
                                 alg.add_equity(&symbol.value, settings.resolution);
                             }
                             for symbol in &changes.removed {
-                                if !alg.is_invested(symbol) {
+                                if !alg.is_invested(symbol) && !alg.is_option_underlying(symbol) {
                                     alg.subscription_manager.remove_symbol(symbol);
                                     alg.securities.remove(symbol);
                                 }
@@ -195,7 +195,7 @@ impl PyAlgorithmAdapter {
                                 alg.add_equity(&symbol.value, settings.resolution);
                             }
                             for symbol in &changes.removed {
-                                if !alg.is_invested(symbol) {
+                                if !alg.is_invested(symbol) && !alg.is_option_underlying(symbol) {
                                     alg.subscription_manager.remove_symbol(symbol);
                                     alg.securities.remove(symbol);
                                 }
