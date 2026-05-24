@@ -242,6 +242,7 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
             args.data = folder;
         }
     }
+    tracing::info!("Data folder: {}", args.data.display());
 
     let (historical_provider, history_provider) = build_providers(&args)?;
 

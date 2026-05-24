@@ -458,8 +458,7 @@ impl PyQcAlgorithm {
 
     // ─── Ordering ─────────────────────────────────────────────────────────────
 
-    /// LEAN API: place a market order. Routes option symbols through the option
-    /// position manager using the current chain mid price.
+    /// LEAN API: place a market order.
     fn market_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
         if sym.option_symbol_id().is_some() {
@@ -1665,35 +1664,11 @@ impl PyQcAlgorithm {
         ))
     }
 
-    /// Route a market order for an option symbol through the option position manager.
-    /// Looks up the mid price from the current option chain.
+    /// Route a market order for an option symbol through the normal order manager.
+    /// LEAN submits the order first; the fill model handles executable market data.
     fn option_market_order(&mut self, sym: lean_core::Symbol, quantity: Decimal) -> PyResult<()> {
-        // Determine canonical permtick: ?UNDERLYING
-        let canonical = sym
-            .underlying
-            .as_ref()
-            .map(|u| format!("?{}", u.permtick))
-            .unwrap_or_default();
-
-        // Look up mid price from option chains (keyed by Symbol, match by SID)
-        let sid = sym.id.sid;
-        let premium = {
-            let alg = self.inner.lock().unwrap();
-            alg.option_chains
-                .get(&canonical)
-                .and_then(|chain| chain.contracts.iter().find(|(s, _)| s.id.sid == sid))
-                .map(|(_, c)| c.mid_price())
-                .unwrap_or(Decimal::ZERO)
-        };
-
         if quantity == Decimal::ZERO {
             return Ok(());
-        }
-        if premium <= Decimal::ZERO {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "No positive option premium available for market order: {}",
-                sym.value
-            )));
         }
         let mut alg = self.inner.lock().unwrap();
         alg.ensure_option_security(&sym, Resolution::Minute);
@@ -1736,15 +1711,18 @@ mod tests {
                 TradeBarData::new(dec!(101), dec!(102), dec!(100), dec!(101.5), dec!(2000)),
             ),
         ];
-        let path = resolver.market_data_partition(
-            &symbol,
-            Resolution::Daily,
-            TickType::Trade,
-            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-        );
-        ParquetWriter::new(WriterConfig::default())
-            .write_trade_bars(&bars, &path)
-            .unwrap();
+        let writer = ParquetWriter::new(WriterConfig::default());
+        for bar in &bars {
+            let path = resolver.market_data_partition(
+                &symbol,
+                Resolution::Daily,
+                TickType::Trade,
+                bar.time.date_utc(),
+            );
+            writer
+                .write_trade_bars(std::slice::from_ref(bar), &path)
+                .unwrap();
+        }
 
         Python::attach(|py| {
             let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();

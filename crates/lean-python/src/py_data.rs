@@ -803,7 +803,7 @@ impl PySlice {
     /// Build a self-contained Slice from a Rust Slice.
     /// Used for warmup and tests where no SliceProxy is available.
     pub fn from_slice(py: Python<'_>, slice: &Slice) -> PyResult<Self> {
-        Self::from_slice_with_custom(py, slice, &HashMap::new())
+        Self::from_slice_with_custom(py, slice, &slice.custom_data)
     }
 
     pub fn from_slice_with_custom(
@@ -887,7 +887,7 @@ impl PySlice {
             custom_data_obj: py_custom,
             delistings_obj: py_delistings,
             symbol_changed_events_obj: py_sce,
-            has_data: slice.has_data,
+            has_data: slice.has_data || !custom_data.is_empty(),
         })
     }
 }
@@ -1641,6 +1641,35 @@ mod tests {
                 Some(&spy_sub.symbol.id.sid)
             );
             assert!(!quote_bars.ticker_to_sid.contains_key("QQQ"));
+        });
+    }
+
+    #[test]
+    fn slice_from_slice_preserves_custom_data() {
+        crate::test_python::init();
+        Python::attach(|py| {
+            let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 3).unwrap();
+            let mut slice = Slice::new(lean_core::DateTime::from(
+                date.and_hms_opt(13, 46, 0).unwrap(),
+            ));
+            slice.custom_data.insert(
+                "sweeps".to_string(),
+                vec![CustomDataPoint {
+                    time: date,
+                    end_time: None,
+                    value: rust_decimal::Decimal::ONE,
+                    fields: HashMap::from([("usymbol".to_string(), serde_json::json!("ULCC"))]),
+                }],
+            );
+
+            let py_slice = PySlice::from_slice(py, &slice).unwrap();
+            let custom = py_slice.custom_data_obj.borrow(py);
+            let points = custom.points.get("SWEEPS").unwrap();
+            let point = points[0].borrow(py);
+
+            assert!(py_slice.has_data);
+            assert_eq!(points.len(), 1);
+            assert_eq!(point.fields_inner.get("usymbol").unwrap(), "ULCC");
         });
     }
 

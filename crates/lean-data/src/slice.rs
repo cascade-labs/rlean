@@ -1,5 +1,5 @@
 use crate::symbol_changed::SymbolChangedEvent;
-use crate::{Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
+use crate::{CustomDataPoint, Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
 use lean_core::{DateTime, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ pub struct Slice {
     pub splits: HashMap<u64, Split>,
     pub delistings: HashMap<u64, Delisting>,
     pub symbol_changed_events: HashMap<u64, SymbolChangedEvent>,
+    pub custom_data: HashMap<String, Vec<CustomDataPoint>>,
     pub has_data: bool,
 }
 
@@ -30,6 +31,7 @@ impl Slice {
             splits: std::collections::HashMap::new(),
             delistings: std::collections::HashMap::new(),
             symbol_changed_events: std::collections::HashMap::new(),
+            custom_data: std::collections::HashMap::new(),
             has_data: false,
         }
     }

@@ -675,8 +675,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── determine warm-up window ────────────────────────────────────────────
     // Compute this before prefetching so data is requested once for the full
     // range the algorithm can consume. This mirrors LEAN's source-driven data
-    // provider path and avoids overwriting daily/hourly single-file data with a
-    // narrower main-period-only download.
+    // provider path and keeps the date-partitioned cache complete for warm-up
+    // plus the main backtest period.
     let warmup_start: Option<NaiveDate> = {
         let alg = adapter.inner.lock().unwrap();
         if let Some(bar_count) = alg.warmup_bar_count {
@@ -922,9 +922,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         || highest_universe_resolution.is_some_and(|resolution| resolution.is_high_resolution());
 
     // ── pre-load all subscription bars (daily mode only) ─────────────────────
-    // For daily (and other single-file) resolutions the same parquet file would
-    // be opened and scanned once per trading day in the loop.  Pre-loading the
-    // full date range up front reduces 629 file reads to 1 per subscription.
+    // For daily resolutions, pre-loading the date-partitioned cache up front
+    // keeps the main loop to in-memory lookups per subscription/date.
     //
     // bar_map and subscriptions are mut because strategies may call add_equity()
     // mid-backtest (dynamic universe selection).  New subscriptions are detected
@@ -971,31 +970,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // `on_data_proxy` updates fields in-place instead of constructing new objects.
     let mut slice_proxy = Python::attach(|py| SliceProxy::new(py, &subscriptions))
         .context("Failed to create SliceProxy")?;
-
-    // ── ensure benchmark data exists ─────────────────────────────────────────
-    // C# LEAN adds a SecurityBenchmark as an internal subscription so the data
-    // feed downloads and records benchmark points alongside the backtest. Mirror
-    // that behavior here: when the benchmark is not already a user subscription,
-    // ask the historical provider to materialize the daily benchmark source
-    // before we load it for statistics/results/report output.
-    if !benchmark_in_subs {
-        if let Some(ref provider) = config.historical_provider {
-            let mut benchmark_config =
-                SubscriptionDataConfig::new_equity(benchmark_symbol_obj.clone(), Resolution::Daily);
-            benchmark_config.is_internal_feed = true;
-            benchmark_config.fill_data_forward = false;
-            let benchmark_sub = Arc::new(benchmark_config);
-            pre_fetch_all(
-                provider.clone(),
-                config.history_provider.clone(),
-                &[benchmark_sub],
-                start_date,
-                end_date,
-                &resolver,
-            )
-            .await?;
-        }
-    }
 
     // ── pre-load benchmark data ──────────────────────────────────────────────
     let benchmark_sid: u64 = benchmark_symbol_obj.id.sid;
@@ -1975,6 +1949,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     };
 
                     if let Some(custom_data_for_slice) = custom_data_for_slice.as_ref() {
+                        minute_slice.custom_data = custom_data_for_slice.clone();
+                        minute_slice.has_data = true;
                         Python::attach(|py| {
                             adapter.apply_custom_universe_selection(
                                 py,
@@ -2895,6 +2871,10 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 }
             }
+            if !custom_data_for_day.is_empty() {
+                slice.custom_data = custom_data_for_day.clone();
+                slice.has_data = true;
+            }
 
             // ── Map file: check for ticker renames and delistings ────────────
             for sub in &subscriptions {
@@ -3109,13 +3089,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     })
 }
 
-/// Before the backtest loop, fetch missing low-resolution/single-file data.
+/// Before the backtest loop, fetch missing subscription data.
 ///
-/// For daily/hourly (single-file per ticker): checks once and fetches the
-/// entire date range in one API call.
-///
-/// High-resolution date-partitioned data is resolved lazily in the intraday
-/// loop, matching LEAN's source-per-date subscription reader behavior.
+/// Daily/hourly data is stored in date-partitioned cache files. Higher
+/// resolutions are resolved lazily in the intraday loop, matching LEAN's
+/// source-per-date subscription reader behavior.
 async fn pre_fetch_all(
     provider: Arc<dyn IHistoricalDataProvider>,
     factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
@@ -3441,8 +3419,6 @@ async fn pre_fetch_subscription(
     end: NaiveDate,
     resolver: PathResolver,
 ) -> Result<()> {
-    let data_path = subscription_data_path(&resolver, &sub, start);
-
     let ticker = sub.symbol.permtick.to_lowercase();
     let market = sub.symbol.market().as_str().to_lowercase();
     let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
@@ -3508,7 +3484,7 @@ async fn pre_fetch_subscription(
     };
 
     let data_covers_range =
-        local_data_covers_range(&sub, mapped_start, mapped_end, &resolver, &data_path).await;
+        local_data_covers_range(&sub, mapped_start, mapped_end, &resolver).await;
 
     if data_covers_range && factor_valid {
         return Ok(());
@@ -3555,22 +3531,15 @@ async fn pre_fetch_subscription(
             );
         }
     } else if !data_covers_range {
-        // LEAN's DownloaderDataProvider downloads daily/hourly as a whole
-        // single-file data source. Do the same by using the provider's earliest
-        // supported date when known, so a later narrower request cannot replace
-        // a wider cached file with only the requested slice.
-        let single_file_start = provider.earliest_date().unwrap_or(effective_start);
+        let cache_start = provider.earliest_date().unwrap_or(effective_start);
         debug!(
-            "Local data missing or incomplete for {} — fetching single-file range from provider ({} → {})",
-            sub.symbol.value, single_file_start, mapped_end
+            "Local data missing or incomplete for {} — fetching date-partitioned range from provider ({} → {})",
+            sub.symbol.value, cache_start, mapped_end
         );
         let mut bars = Vec::new();
-        for (range_start, range_end, mapped_ticker) in mapped_ticker_ranges(
-            &map_rows,
-            single_file_start,
-            mapped_end,
-            &sub.symbol.permtick,
-        ) {
+        for (range_start, range_end, mapped_ticker) in
+            mapped_ticker_ranges(&map_rows, cache_start, mapped_end, &sub.symbol.permtick)
+        {
             let provider_symbol = symbol_with_mapped_ticker(&sub.symbol, &mapped_ticker);
             bars.extend(
                 provider
@@ -3859,7 +3828,6 @@ async fn local_data_covers_range(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
-    _start_path: &std::path::Path,
 ) -> bool {
     let expected_dates = expected_market_dates(&sub.symbol, start, end);
     if expected_dates.is_empty() {
@@ -3877,36 +3845,16 @@ async fn local_data_covers_range(
     }
 
     let reader = ParquetReader::new();
-    let params = QueryParams::new()
-        .with_time_range(
-            date_to_datetime(start, 0, 0, 0),
-            date_to_datetime(end, 23, 59, 59),
-        )
-        .with_symbols(vec![sub.symbol.id.sid]);
-    let legacy_bars = read_legacy_trade_bars(&reader, resolver, sub, &params);
-    if !legacy_bars.is_empty() {
-        let available: HashSet<NaiveDate> =
-            legacy_bars.iter().map(|bar| bar.time.date_utc()).collect();
-        return expected_dates.iter().all(|date| available.contains(date));
-    }
-
-    let mut bars = Vec::new();
     for current in &expected_dates {
         let path = subscription_data_path(resolver, sub, *current);
         if !path.exists() {
             return false;
         }
-        bars.extend(
-            reader
-                .read_trade_bar_partition(&path, &sub.symbol, &params)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|bar| bar.symbol.id.sid == sub.symbol.id.sid),
-        );
+        if !cached_partition_has_symbol_data(&reader, resolver, sub, *current) {
+            return false;
+        }
     }
-
-    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
-    expected_dates.iter().all(|date| available.contains(date))
+    true
 }
 
 fn subscription_data_path(
@@ -3922,52 +3870,6 @@ fn subscription_data_path(
         TickType::Trade
     };
     resolver.market_data_partition(&sub.symbol, sub.resolution, tick_type, date)
-}
-
-fn legacy_trade_bar_paths(resolver: &PathResolver, sub: &SubscriptionDataConfig) -> Vec<PathBuf> {
-    let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
-    let market = sub.symbol.market().as_str().to_lowercase();
-    let resolution = sub.resolution.folder_name();
-    let ticker = sub.symbol.permtick.to_lowercase();
-    let file_name = format!("{ticker}_trade.parquet");
-    vec![
-        resolver
-            .data_root
-            .join(&sec)
-            .join(&market)
-            .join(resolution)
-            .join(&file_name),
-        resolver
-            .data_root
-            .join(&sec)
-            .join(&market)
-            .join(resolution)
-            .join(&ticker)
-            .join(file_name),
-    ]
-}
-
-fn read_legacy_trade_bars(
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    sub: &SubscriptionDataConfig,
-    params: &QueryParams,
-) -> Vec<lean_data::TradeBar> {
-    for path in legacy_trade_bar_paths(resolver, sub) {
-        if !path.exists() {
-            continue;
-        }
-        let bars: Vec<_> = reader
-            .read_trade_bar_partition(&path, &sub.symbol, params)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|bar| bar.symbol.id.sid == sub.symbol.id.sid)
-            .collect();
-        if !bars.is_empty() {
-            return bars;
-        }
-    }
-    Vec::new()
 }
 
 fn cached_partition_has_symbol_data(
@@ -4036,11 +3938,6 @@ fn load_trade_bar_partitions(
     end: NaiveDate,
     params: &QueryParams,
 ) -> Vec<lean_data::TradeBar> {
-    let legacy_bars = read_legacy_trade_bars(reader, resolver, sub, params);
-    if !legacy_bars.is_empty() {
-        return legacy_bars;
-    }
-
     let mut bars = Vec::new();
     for date in expected_market_dates(&sub.symbol, start, end) {
         let path =
@@ -6834,6 +6731,47 @@ mod tests {
             .iter()
             .any(|s| s.symbol.permtick.eq_ignore_ascii_case(benchmark_ticker2));
         assert!(!in_subs2);
+    }
+
+    #[test]
+    fn load_trade_bar_partitions_reads_date_partition_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let writer = ParquetWriter::new(WriterConfig::default());
+        let market = lean_core::Market::usa();
+        let symbol = Symbol::create_equity("SPY", &market);
+        let sub = SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Daily);
+        let day1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let day2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap();
+
+        let make_bar = |date: chrono::NaiveDate, close| {
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(date, 16, 0, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(close, close, close, close, dec!(1000)),
+            )
+        };
+
+        for (date, close) in [(day1, dec!(100)), (day2, dec!(101))] {
+            let path =
+                resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, date);
+            writer
+                .write_trade_bars(&[make_bar(date, close)], &path)
+                .unwrap();
+        }
+
+        let params = QueryParams::new()
+            .with_time_range(
+                date_to_datetime(day1, 0, 0, 0),
+                date_to_datetime(day2, 23, 59, 59),
+            )
+            .with_symbols(vec![symbol.id.sid]);
+        let rows =
+            load_trade_bar_partitions(&ParquetReader::new(), &resolver, &sub, day1, day2, &params);
+        let closes: Vec<_> = rows.iter().map(|bar| bar.close).collect();
+
+        assert_eq!(closes, vec![dec!(100), dec!(101)]);
     }
 
     #[test]

@@ -102,9 +102,7 @@ impl PyQuantBook {
 
     /// Load trade bars from local Parquet files for [start, end] (inclusive).
     ///
-    /// For daily/hour resolution a single file covers all dates; for
-    /// minute/second resolution files are date-partitioned and we gather them
-    /// with a glob scan.
+    /// All market data resolutions use date-partitioned cache files.
     fn load_bars_local(
         &self,
         symbol: &Symbol,
@@ -113,25 +111,15 @@ impl PyQuantBook {
         end: NaiveDate,
     ) -> Vec<TradeBar> {
         let resolver = PathResolver::new(&self.data_folder);
-        let paths: Vec<PathBuf> = if resolution.is_high_resolution() {
-            let mut ps = Vec::new();
-            let mut d = start;
-            while d <= end {
-                let p = resolver.market_data_partition(symbol, resolution, TickType::Trade, d);
-                if p.exists() {
-                    ps.push(p);
-                }
-                d += chrono::Duration::days(1);
-            }
-            ps
-        } else {
-            let p = resolver.market_data_partition(symbol, resolution, TickType::Trade, start);
+        let mut paths = Vec::new();
+        let mut d = start;
+        while d <= end {
+            let p = resolver.market_data_partition(symbol, resolution, TickType::Trade, d);
             if p.exists() {
-                vec![p]
-            } else {
-                vec![]
+                paths.push(p);
             }
-        };
+            d += chrono::Duration::days(1);
+        }
 
         if paths.is_empty() {
             warn!(
