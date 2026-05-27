@@ -96,6 +96,10 @@ pub struct CustomParquetSource {
     pub time_format: Option<String>,
     /// Time zone for provider-local Arrow timestamp columns. Omit for UTC.
     pub time_zone: Option<String>,
+    /// Optional offset applied to `time_column` to produce the data emission
+    /// time. This mirrors LEAN's `BaseData.EndTime`: providers can preserve
+    /// event time in `time_column` while delaying availability.
+    pub end_time_offset_nanos: Option<i64>,
     /// Primary symbol column for generic `symbols` filtering.
     pub symbol_column: Option<String>,
     /// Primary numeric value column for `CustomDataPoint.value`.

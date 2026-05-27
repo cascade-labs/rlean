@@ -1152,7 +1152,7 @@ fn append_custom_batch_points(
         if !custom_row_matches_query(batch, row, source, query) {
             continue;
         }
-        let point_end_time = match time_idx {
+        let point_time = match time_idx {
             Some(idx) => Some(parquet_custom_time_to_datetime(
                 batch.column(idx).as_ref(),
                 row,
@@ -1162,7 +1162,13 @@ fn append_custom_batch_points(
             )?),
             None => None,
         };
-        let point_date = point_end_time
+        let point_end_time = point_time
+            .map(|time| custom_data_end_time(time, source.end_time_offset_nanos))
+            .transpose()?;
+        if !custom_time_matches_query(point_end_time, query) {
+            continue;
+        }
+        let point_date = point_time
             .map(|time| {
                 time.to_tz(custom_time_zone(source.time_zone.as_deref()))
                     .date_naive()
@@ -1254,6 +1260,37 @@ fn custom_row_matches_query(
     true
 }
 
+fn custom_data_end_time(time: DateTime, offset_nanos: Option<i64>) -> LeanResult<DateTime> {
+    let Some(offset_nanos) = offset_nanos else {
+        return Ok(time);
+    };
+    time.0
+        .checked_add(offset_nanos)
+        .map(NanosecondTimestamp)
+        .ok_or_else(|| {
+            lean_core::LeanError::DataError(format!(
+                "custom parquet end_time_offset_nanos overflowed timestamp {time}"
+            ))
+        })
+}
+
+fn custom_time_matches_query(end_time: Option<DateTime>, query: &CustomDataQuery) -> bool {
+    let Some(end_time) = end_time else {
+        return true;
+    };
+    if let Some(start) = query.start_time {
+        if end_time.0 < start.0 {
+            return false;
+        }
+    }
+    if let Some(end) = query.end_time {
+        if end_time.0 > end.0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn string_cell_as_string(array: &dyn Array, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
@@ -1268,6 +1305,12 @@ fn string_cell_as_string(array: &dyn Array, row: usize) -> Option<String> {
 }
 
 fn validate_custom_parquet_source(source: &CustomParquetSource) -> LeanResult<()> {
+    if source.end_time_offset_nanos.is_some() && source.time_column.is_none() {
+        return Err(lean_core::LeanError::DataError(
+            "custom parquet source cannot set end_time_offset_nanos without time_column"
+                .to_string(),
+        ));
+    }
     match (&source.time_column, source.time_format.as_deref()) {
         (Some(_), Some("timestamp" | "tradealert")) | (None, None) => Ok(()),
         (Some(_), None) => Err(lean_core::LeanError::DataError(
@@ -1723,5 +1766,55 @@ fn arrow_cell_to_json(array: &dyn Array, row: usize) -> serde_json::Value {
 impl Default for ParquetReader {
     fn default() -> Self {
         ParquetReader::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_data_end_time_applies_offset() {
+        let time = NanosecondTimestamp(1_000);
+        let end_time = custom_data_end_time(time, Some(60_000_000_000)).unwrap();
+
+        assert_eq!(end_time, NanosecondTimestamp(60_000_001_000));
+    }
+
+    #[test]
+    fn custom_time_matches_query_uses_inclusive_bounds() {
+        let query = CustomDataQuery {
+            start_time: Some(NanosecondTimestamp(100)),
+            end_time: Some(NanosecondTimestamp(200)),
+            ..Default::default()
+        };
+
+        assert!(custom_time_matches_query(
+            Some(NanosecondTimestamp(100)),
+            &query
+        ));
+        assert!(custom_time_matches_query(
+            Some(NanosecondTimestamp(200)),
+            &query
+        ));
+        assert!(!custom_time_matches_query(
+            Some(NanosecondTimestamp(99)),
+            &query
+        ));
+        assert!(!custom_time_matches_query(
+            Some(NanosecondTimestamp(201)),
+            &query
+        ));
+    }
+
+    #[test]
+    fn custom_time_matches_query_preserves_untimed_rows() {
+        let query = CustomDataQuery {
+            start_time: Some(NanosecondTimestamp(100)),
+            end_time: Some(NanosecondTimestamp(200)),
+            ..Default::default()
+        };
+
+        assert!(custom_time_matches_query(None, &query));
     }
 }
