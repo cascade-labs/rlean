@@ -1638,17 +1638,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         sub.source_type, sub.ticker, current_date
                     )
                 })?;
-                for point in points {
-                    let Some(timestamp) = point.end_time else {
-                        continue;
-                    };
-                    high_resolution_custom_by_ts
-                        .entry(timestamp.0)
-                        .or_default()
-                        .entry(sub.ticker.clone())
-                        .or_default()
-                        .push(point);
-                }
+                bucket_high_resolution_custom_points_by_end_time(
+                    &mut high_resolution_custom_by_ts,
+                    &sub.ticker,
+                    points,
+                );
             }
             if !high_resolution_custom_by_ts.is_empty() {
                 let row_count: usize = high_resolution_custom_by_ts
@@ -5336,6 +5330,24 @@ async fn load_low_resolution_custom_data_for_day(
     Ok(custom_data_for_day)
 }
 
+fn bucket_high_resolution_custom_points_by_end_time(
+    buckets: &mut HashMap<i64, HashMap<String, Vec<CustomDataPoint>>>,
+    ticker: &str,
+    points: impl IntoIterator<Item = CustomDataPoint>,
+) {
+    for point in points {
+        let Some(timestamp) = point.end_time else {
+            continue;
+        };
+        buckets
+            .entry(timestamp.0)
+            .or_default()
+            .entry(ticker.to_string())
+            .or_default()
+            .push(point);
+    }
+}
+
 async fn load_custom_data_points_for_subscription(
     data_root: PathBuf,
     source_type: String,
@@ -6772,6 +6784,44 @@ mod tests {
         let closes: Vec<_> = rows.iter().map(|bar| bar.close).collect();
 
         assert_eq!(closes, vec![dec!(100), dec!(101)]);
+    }
+
+    #[test]
+    fn high_resolution_custom_data_is_bucketed_by_end_time() {
+        let event_time = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 4, 20, 9, 30, 0)
+            .unwrap();
+        let end_time = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 4, 20, 9, 31, 0)
+            .unwrap();
+        let event_time_utc = DateTime::from(event_time.with_timezone(&chrono::Utc));
+        let end_time_utc = DateTime::from(end_time.with_timezone(&chrono::Utc));
+        let mut fields = HashMap::new();
+        fields.insert(
+            "time".to_string(),
+            serde_json::json!("2026-04-20 09:30:00"),
+        );
+        let point = CustomDataPoint {
+            time: event_time.date_naive(),
+            end_time: Some(end_time_utc),
+            value: dec!(1),
+            fields,
+        };
+        let mut buckets = HashMap::new();
+
+        bucket_high_resolution_custom_points_by_end_time(
+            &mut buckets,
+            "flow_alerts",
+            vec![point],
+        );
+
+        assert!(!buckets.contains_key(&event_time_utc.0));
+        let bucket = &buckets[&end_time_utc.0]["flow_alerts"];
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(
+            bucket[0].fields.get("time"),
+            Some(&serde_json::json!("2026-04-20 09:30:00"))
+        );
     }
 
     #[test]
