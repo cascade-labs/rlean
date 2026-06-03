@@ -758,22 +758,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             &resolver,
         )
         .await?;
-        pre_fetch_crypto_future_margin_interest_rates(
-            provider.clone(),
-            &subscriptions,
-            start_date,
-            end_date,
-            &resolver,
-        )
-        .await?;
-        pre_fetch_crypto_future_perpetual_contexts(
-            provider.clone(),
-            &subscriptions,
-            start_date,
-            end_date,
-            &resolver,
-        )
-        .await?;
     }
 
     // ── factor files: load from disk ─────────────────────────────────────────
@@ -1329,19 +1313,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         &resolver,
                     )
                     .await?;
-                    pre_fetch_crypto_future_margin_interest_rates(
+                    ensure_crypto_future_margin_interest_rates_for_date(
                         provider.clone(),
                         &reconciliation.new_subs,
                         current_date,
-                        end_date,
                         &resolver,
                     )
                     .await?;
-                    pre_fetch_crypto_future_perpetual_contexts(
+                    ensure_crypto_future_perpetual_contexts_for_date(
                         provider.clone(),
                         &reconciliation.new_subs,
                         current_date,
-                        end_date,
                         &resolver,
                     )
                     .await?;
@@ -1614,6 +1596,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 } else {
                     failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
                 }
+            }
+
+            if let Some(ref provider) = config.history_provider {
+                ensure_crypto_future_margin_interest_rates_for_date(
+                    provider.clone(),
+                    &subscriptions,
+                    current_date,
+                    &resolver,
+                )
+                .await?;
+                ensure_crypto_future_perpetual_contexts_for_date(
+                    provider.clone(),
+                    &subscriptions,
+                    current_date,
+                    &resolver,
+                )
+                .await?;
             }
 
             let day_margin_interest_rates = load_margin_interest_rates_for_date(
@@ -2159,19 +2158,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &resolver,
                         )
                         .await?;
-                        pre_fetch_crypto_future_margin_interest_rates(
+                        ensure_crypto_future_margin_interest_rates_for_date(
                             provider.clone(),
                             &new_subs,
                             current_date,
-                            end_date,
                             &resolver,
                         )
                         .await?;
-                        pre_fetch_crypto_future_perpetual_contexts(
+                        ensure_crypto_future_perpetual_contexts_for_date(
                             provider.clone(),
                             &new_subs,
                             current_date,
-                            end_date,
                             &resolver,
                         )
                         .await?;
@@ -2542,19 +2539,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 &resolver,
                             )
                             .await?;
-                            pre_fetch_crypto_future_margin_interest_rates(
+                            ensure_crypto_future_margin_interest_rates_for_date(
                                 provider.clone(),
                                 std::slice::from_ref(sub),
-                                start_date,
-                                end_date,
+                                current_date,
                                 &resolver,
                             )
                             .await?;
-                            pre_fetch_crypto_future_perpetual_contexts(
+                            ensure_crypto_future_perpetual_contexts_for_date(
                                 provider.clone(),
                                 std::slice::from_ref(sub),
-                                start_date,
-                                end_date,
+                                current_date,
                                 &resolver,
                             )
                             .await?;
@@ -2627,19 +2622,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 &resolver,
                             )
                             .await?;
-                            pre_fetch_crypto_future_margin_interest_rates(
+                            ensure_crypto_future_margin_interest_rates_for_date(
                                 provider.clone(),
                                 std::slice::from_ref(sub),
-                                start_date,
-                                end_date,
+                                current_date,
                                 &resolver,
                             )
                             .await?;
-                            pre_fetch_crypto_future_perpetual_contexts(
+                            ensure_crypto_future_perpetual_contexts_for_date(
                                 provider.clone(),
                                 std::slice::from_ref(sub),
-                                start_date,
-                                end_date,
+                                current_date,
                                 &resolver,
                             )
                             .await?;
@@ -2725,6 +2718,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 } else {
                     failed_data_requests.push(format!("{}/{}", sub.symbol.value, current_date));
                 }
+            }
+
+            if let Some(ref provider) = config.history_provider {
+                ensure_crypto_future_margin_interest_rates_for_date(
+                    provider.clone(),
+                    &subscriptions,
+                    current_date,
+                    &resolver,
+                )
+                .await?;
             }
 
             let day_margin_interest_rates = load_margin_interest_rates_for_date(
@@ -4169,27 +4172,23 @@ fn crypto_future_symbols(subscriptions: &[Arc<SubscriptionDataConfig>]) -> Vec<S
     symbols
 }
 
-async fn pre_fetch_crypto_future_margin_interest_rates(
+async fn ensure_crypto_future_margin_interest_rates_for_date(
     provider: Arc<dyn lean_data_providers::IHistoryProvider>,
     subscriptions: &[Arc<SubscriptionDataConfig>],
-    start: NaiveDate,
-    end: NaiveDate,
+    date: NaiveDate,
     resolver: &PathResolver,
 ) -> Result<usize> {
     let mut rows = 0usize;
     let reader = ParquetReader::new();
     for symbol in crypto_future_symbols(subscriptions) {
-        let dates = expected_market_dates(&symbol, start, end);
-        if dates.iter().all(|date| {
-            margin_interest_partition_has_symbol_data(&reader, resolver, &symbol, *date)
-        }) {
+        if margin_interest_partition_has_symbol_data(&reader, resolver, &symbol, date) {
             continue;
         }
         let request = lean_data_providers::HistoryRequest {
             symbol: symbol.clone(),
             resolution: Resolution::Hour,
-            start: date_to_datetime(start, 0, 0, 0),
-            end: date_to_datetime(end, 23, 59, 59),
+            start: date_to_datetime(date, 0, 0, 0),
+            end: date_to_datetime(date, 23, 59, 59),
             data_type: DataType::MarginInterestRate,
         };
         let fetched = provider.get_margin_interest_rates(&request).await?;
@@ -4198,21 +4197,17 @@ async fn pre_fetch_crypto_future_margin_interest_rates(
     Ok(rows)
 }
 
-async fn pre_fetch_crypto_future_perpetual_contexts(
+async fn ensure_crypto_future_perpetual_contexts_for_date(
     provider: Arc<dyn lean_data_providers::IHistoryProvider>,
     subscriptions: &[Arc<SubscriptionDataConfig>],
-    start: NaiveDate,
-    end: NaiveDate,
+    date: NaiveDate,
     resolver: &PathResolver,
 ) -> Result<usize> {
     let mut rows = 0usize;
     let reader = ParquetReader::new();
     let mut missing_symbols = Vec::new();
     for symbol in crypto_future_symbols(subscriptions) {
-        let dates = expected_market_dates(&symbol, start, end);
-        if dates.iter().all(|date| {
-            perpetual_context_partition_has_symbol_data(&reader, resolver, &symbol, *date)
-        }) {
+        if perpetual_context_partition_has_symbol_data(&reader, resolver, &symbol, date) {
             continue;
         }
         missing_symbols.push(symbol);
@@ -4221,8 +4216,8 @@ async fn pre_fetch_crypto_future_perpetual_contexts(
         let request = lean_data_providers::HistoryBatchRequest {
             symbols: missing_symbols,
             resolution: Resolution::Minute,
-            start: date_to_datetime(start, 0, 0, 0),
-            end: date_to_datetime(end, 23, 59, 59),
+            start: date_to_datetime(date, 0, 0, 0),
+            end: date_to_datetime(date, 23, 59, 59),
             data_type: DataType::PerpetualContext,
         };
         let fetched = provider.get_history_batch(&request).await?;
