@@ -7,7 +7,7 @@ use lean_core::{
     exchange_hours::ExchangeHours, Market, OptionRight, OptionStyle, Resolution, SecurityType,
     Symbol, SymbolOptionsExt, TickType,
 };
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{MarginInterestRate, QuoteBar, Tick, TradeBar};
 use lean_storage::{ParquetReader, PathResolver, QueryParams};
 use std::collections::HashSet;
 
@@ -160,6 +160,43 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(vec![]);
         }
         Ok(ticks)
+    }
+
+    async fn get_margin_interest_rates(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<MarginInterestRate>> {
+        let resolver = PathResolver::new(&self.data_root);
+        let start_date = request.start.date_utc();
+        let end_date = request.end.date_utc();
+        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+
+        let mut paths = Vec::new();
+        for current in &expected_dates {
+            let p = resolver.margin_interest_partition(&request.symbol, *current);
+            if p.exists() {
+                paths.push(p);
+            } else {
+                return Ok(vec![]);
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let reader = ParquetReader::new();
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        let mut rates = Vec::new();
+        for path in &paths {
+            rates.extend(reader.read_margin_interest_rate_partition(
+                path,
+                &request.symbol,
+                &params,
+            )?);
+        }
+        Ok(rates)
     }
 
     async fn get_option_universe(
@@ -351,7 +388,7 @@ fn is_expected_market_date(symbol: &Symbol, date: NaiveDate) -> bool {
             let dow = date.weekday().num_days_from_sunday() as usize;
             hours.schedule[dow].is_open() && !hours.holidays.contains(&date)
         }
-        SecurityType::Crypto => true,
+        SecurityType::Crypto | SecurityType::CryptoFuture => true,
         _ => !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun),
     }
 }

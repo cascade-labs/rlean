@@ -13,6 +13,8 @@ pub enum BaseDataType {
     Delisting,
     SymbolChangedEvent,
     Fundamental,
+    MarginInterestRate,
+    PerpetualContext,
     Custom,
 }
 

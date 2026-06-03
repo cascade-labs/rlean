@@ -3,9 +3,9 @@ use lean_orders::fee_model::OrderFeeParameters;
 use lean_orders::{
     AlpacaFeeModel, BinanceFeeModel, BybitFeeModel, CharlesSchwabFeeModel, ConstantFeeModel,
     EtradeFeeModel, ExchangeFeeModel, FeeModel, FidelityFeeModel, FlatFeeModel, FxcmFeeModel,
-    GDAXFeeModel, InteractiveBrokersFeeModel, KrakenFeeModel, NullFeeModel, OandaFeeModel, Order,
-    OrderType, PercentFeeModel, RobinhoodFeeModel, TDAmeritradeFeeModel, TradierFeeModel,
-    ZeroFeeModel,
+    GDAXFeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, KrakenFeeModel, NullFeeModel,
+    OandaFeeModel, Order, OrderType, PercentFeeModel, RobinhoodFeeModel, TDAmeritradeFeeModel,
+    TradierFeeModel, ZeroFeeModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -26,6 +26,10 @@ fn forex_sym(ticker: &str) -> Symbol {
 
 fn crypto_sym(ticker: &str) -> Symbol {
     Symbol::create_crypto(ticker, &Market::new("binance"))
+}
+
+fn crypto_future_sym(ticker: &str) -> Symbol {
+    Symbol::create_crypto_future(ticker, &Market::hyperliquid())
 }
 
 /// Build a basic equity OrderFeeParameters — convenience wrapper.
@@ -523,6 +527,42 @@ fn bybit_perpetuals_preset() {
     );
     let fee = model.get_order_fee(&p);
     assert_eq!(fee.amount, dec!(165));
+}
+
+#[test]
+fn hyperliquid_crypto_future_fee_uses_base_perp_tiers() {
+    let model = HyperliquidFeeModel::default();
+    let market_order = Order::market(1, crypto_future_sym("BTC"), dec!(2), ts(0), "");
+    let limit_order = Order::limit(
+        2,
+        crypto_future_sym("BTC"),
+        dec!(2),
+        dec!(100_000),
+        ts(0),
+        "",
+    );
+
+    let taker = model.get_order_fee(&params_full(
+        &market_order,
+        dec!(100_000),
+        SecurityType::CryptoFuture,
+        "USDC",
+        Some("BTC".into()),
+        dec!(1),
+    ));
+    let maker = model.get_order_fee(&params_full(
+        &limit_order,
+        dec!(100_000),
+        SecurityType::CryptoFuture,
+        "USDC",
+        Some("BTC".into()),
+        dec!(1),
+    ));
+
+    assert_eq!(taker.amount, dec!(90.00000));
+    assert_eq!(taker.currency, "USDC");
+    assert_eq!(maker.amount, dec!(30.00000));
+    assert_eq!(maker.currency, "USDC");
 }
 
 // ─── CharlesSchwabFeeModel ────────────────────────────────────────────────────

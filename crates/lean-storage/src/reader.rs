@@ -14,7 +14,8 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::prelude::*;
 use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol};
 use lean_data::{
-    Bar, CustomDataPoint, CustomDataQuery, CustomParquetSource, QuoteBar, Tick, TradeBar,
+    Bar, CustomDataPoint, CustomDataQuery, CustomParquetSource, MarginInterestRate,
+    PerpetualContext, QuoteBar, Tick, TradeBar,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{HashMap, HashSet};
@@ -836,6 +837,82 @@ impl ParquetReader {
         Ok(result)
     }
 
+    /// Read every margin-interest/funding row in an all-symbol partition.
+    pub fn read_margin_interest_rate_partition(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<MarginInterestRate>> {
+        let mut result = Vec::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, 1, "symbol_sid")?;
+            let symbol_values = string_column(&batch, 2, "symbol_value")?;
+            let time_ns = int64_column(&batch, 0, "time_ns")?;
+
+            for row_idx in 0..batch.num_rows() {
+                let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                if !matches_time_filter(time, params) {
+                    continue;
+                }
+                let symbol_sid = symbol_sids.value(row_idx);
+                if !matches_symbol_filter(symbol_sid, params) {
+                    continue;
+                }
+                let symbol =
+                    symbol_like_with_sid(template, symbol_values.value(row_idx), symbol_sid);
+                result.extend(convert::record_batch_to_margin_interest_rates(
+                    &batch.slice(row_idx, 1),
+                    symbol,
+                ));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read every perpetual-context row in an all-symbol partition.
+    pub fn read_perpetual_context_partition(
+        &self,
+        path: &Path,
+        template: &Symbol,
+        params: &QueryParams,
+    ) -> LeanResult<Vec<PerpetualContext>> {
+        let mut result = Vec::new();
+        if !path.exists() {
+            return Ok(result);
+        }
+
+        for batch in record_batches(path)? {
+            let symbol_sids = uint64_column(&batch, 2, "symbol_sid")?;
+            let symbol_values = string_column(&batch, 3, "symbol_value")?;
+            let time_ns = int64_column(&batch, 0, "time_ns")?;
+
+            for row_idx in 0..batch.num_rows() {
+                let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+                if !matches_time_filter(time, params) {
+                    continue;
+                }
+                let symbol_sid = symbol_sids.value(row_idx);
+                if !matches_symbol_filter(symbol_sid, params) {
+                    continue;
+                }
+                let symbol =
+                    symbol_like_with_sid(template, symbol_values.value(row_idx), symbol_sid);
+                result.extend(convert::record_batch_to_perpetual_contexts(
+                    &batch.slice(row_idx, 1),
+                    symbol,
+                ));
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Return all symbol SIDs present in a market-data partition.
     pub fn read_partition_symbol_sids(
         &self,
@@ -1549,6 +1626,7 @@ fn symbol_like(template: &Symbol, symbol_value: &str) -> Symbol {
         }
         SecurityType::Forex => Symbol::create_forex(symbol_value),
         SecurityType::Crypto => Symbol::create_crypto(symbol_value, template.market()),
+        SecurityType::CryptoFuture => Symbol::create_crypto_future(symbol_value, template.market()),
         _ => {
             let mut symbol = template.clone();
             symbol.value = symbol_value.to_string();

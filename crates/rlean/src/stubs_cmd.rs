@@ -106,6 +106,18 @@ class SecurityType:
     Cfd: SecurityType
     Crypto: SecurityType
     Index: SecurityType
+    CryptoFuture: SecurityType
+    CRYPTO_FUTURE: SecurityType
+
+# ── Market ───────────────────────────────────────────────────────────────────
+
+class Market:
+    USA: str
+    BINANCE: str
+    BYBIT: str
+    COINBASE: str
+    KRAKEN: str
+    HYPERLIQUID: str
 
 # ── OrderType ─────────────────────────────────────────────────────────────────
 
@@ -238,6 +250,46 @@ class TradeBars:
     def __len__(self) -> int: ...
     def values(self) -> List[TradeBar]: ...
 
+# ── MarginInterestRate ───────────────────────────────────────────────────────
+
+class MarginInterestRate:
+    symbol: Symbol
+    time: datetime
+    interest_rate: float
+    value: float
+
+class MarginInterestRates:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[MarginInterestRate]: ...
+
+# ── PerpetualContext ─────────────────────────────────────────────────────────
+
+class PerpetualContext:
+    symbol: Symbol
+    time: datetime
+    end_time: datetime
+    funding: float
+    open_interest: float
+    prev_day_px: float
+    day_ntl_vlm: float
+    premium: float
+    oracle_px: float
+    mark_px: float
+    mid_px: float
+    impact_bid_px: float
+    impact_ask_px: float
+    value: float
+
+class PerpetualContexts:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[PerpetualContext]: ...
+
 # ── Slice ─────────────────────────────────────────────────────────────────────
 
 class Slice:
@@ -247,6 +299,10 @@ class Slice:
 
     @property
     def bars(self) -> TradeBars: ...
+    @property
+    def margin_interest_rates(self) -> MarginInterestRates: ...
+    @property
+    def perpetual_contexts(self) -> PerpetualContexts: ...
 
     def get_bar(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
     def get(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
@@ -686,9 +742,11 @@ class BrokerageName:
     Default: BrokerageName
     InteractiveBrokersBrokerage: BrokerageName
     TradierBrokerage: BrokerageName
+    HyperliquidBrokerage: BrokerageName
     DEFAULT: BrokerageName
     INTERACTIVE_BROKERS_BROKERAGE: BrokerageName
     TRADIER_BROKERAGE: BrokerageName
+    HYPERLIQUID_BROKERAGE: BrokerageName
 
 # ── Algorithm Framework — Alpha Models ────────────────────────────────────────
 
@@ -962,7 +1020,8 @@ class QCAlgorithm:
 
     def add_equity(self, ticker: str, resolution: Resolution = ...) -> Security: ...
     def add_forex(self, ticker: str, resolution: Resolution = ...) -> Security: ...
-    def add_crypto(self, ticker: str, resolution: Resolution = ...) -> Security: ...
+    def add_crypto(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
+    def add_crypto_future(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
     @property
     def universe_settings(self) -> UniverseSettings: ...
     @property

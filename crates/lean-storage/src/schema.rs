@@ -71,6 +71,37 @@ pub fn open_interest_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Arrow schema for margin interest / funding rate parquet files.
+pub fn margin_interest_rate_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("time_ns", DataType::Int64, false),
+        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_value", DataType::Utf8, false),
+        Field::new("interest_rate", DataType::Int64, false),
+    ]))
+}
+
+/// Arrow schema for perpetual-future context rows.
+pub fn perpetual_context_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("time_ns", DataType::Int64, false),
+        Field::new("end_time_ns", DataType::Int64, false),
+        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_value", DataType::Utf8, false),
+        Field::new("funding", DataType::Int64, false),
+        Field::new("open_interest", DataType::Int64, false),
+        Field::new("prev_day_px", DataType::Int64, false),
+        Field::new("day_ntl_vlm", DataType::Int64, false),
+        Field::new("premium", DataType::Int64, false),
+        Field::new("oracle_px", DataType::Int64, false),
+        Field::new("mark_px", DataType::Int64, false),
+        Field::new("mid_px", DataType::Int64, false),
+        Field::new("impact_bid_px", DataType::Int64, false),
+        Field::new("impact_ask_px", DataType::Int64, false),
+        Field::new("period_ns", DataType::Int64, false),
+    ]))
+}
+
 /// Arrow schema for OptionEodBar parquet files.
 ///
 /// All contracts for one underlying live in a single file, keyed by underlying

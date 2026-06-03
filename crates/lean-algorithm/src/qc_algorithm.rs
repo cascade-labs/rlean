@@ -11,6 +11,10 @@ use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionMana
 use lean_options::OptionChain;
 use lean_orders::{
     combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
+    fee_model::{
+        BybitFeeModel, FeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, OrderFee,
+        OrderFeeParameters,
+    },
     order::{Order, OrderType},
     order_ticket::OrderTicket,
     trailing_stop_order::TrailingStopOrderParams,
@@ -43,6 +47,31 @@ impl Default for OptionFilter {
     }
 }
 
+fn infer_quote_currency(ticker: &str) -> Option<String> {
+    let upper = ticker.to_ascii_uppercase();
+    for quote in ["USDT", "USDC", "USD", "BTC", "ETH"] {
+        if upper.ends_with(quote) && upper.len() > quote.len() {
+            return Some(quote.to_string());
+        }
+    }
+    None
+}
+
+fn infer_base_currency(symbol: &Symbol, quote_currency: &str) -> Option<String> {
+    match symbol.security_type() {
+        SecurityType::Crypto | SecurityType::CryptoFuture => {
+            let upper = symbol.value.to_ascii_uppercase();
+            let quote = quote_currency.to_ascii_uppercase();
+            if upper.ends_with(&quote) && upper.len() > quote.len() {
+                Some(upper[..upper.len() - quote.len()].to_string())
+            } else {
+                Some(upper)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountType {
     Margin,
@@ -55,6 +84,7 @@ pub enum BrokerageName {
     QuantConnectBrokerage,
     InteractiveBrokersBrokerage,
     TradierBrokerage,
+    HyperliquidBrokerage,
 }
 
 /// Represents an open option position held by the algorithm.
@@ -163,10 +193,27 @@ impl QcAlgorithm {
     }
 
     pub fn set_brokerage_model(&mut self, brokerage: BrokerageName, account_type: AccountType) {
+        if brokerage == BrokerageName::HyperliquidBrokerage && account_type != AccountType::Margin {
+            panic!("HyperliquidBrokerage only supports margin accounts");
+        }
         self.brokerage_name = brokerage;
         self.account_type = account_type;
         for security in self.securities.all() {
             security.set_leverage(self.default_leverage_for_security(&security.symbol));
+        }
+    }
+
+    pub fn default_market_for_security(&self, security_type: SecurityType) -> Market {
+        match (self.brokerage_name, security_type) {
+            (BrokerageName::HyperliquidBrokerage, SecurityType::CryptoFuture) => {
+                Market::hyperliquid()
+            }
+            (_, SecurityType::Equity | SecurityType::Option | SecurityType::IndexOption) => {
+                Market::usa()
+            }
+            (_, SecurityType::Forex) => Market::forex(),
+            (_, SecurityType::Crypto | SecurityType::CryptoFuture) => Market::binance(),
+            _ => Market::usa(),
         }
     }
 
@@ -293,12 +340,119 @@ impl QcAlgorithm {
         let symbol = Symbol::create_crypto(ticker, market);
         let config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
         self.subscription_manager.add(config);
+        let mut quote_config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
+        quote_config.tick_type = lean_core::TickType::Quote;
+        self.subscription_manager.add(quote_config);
         let hours = ExchangeHours::crypto_24_7();
-        let props = SymbolProperties::default();
+        let props = self.symbol_properties_for_symbol(&symbol);
         let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
         security.set_leverage(self.default_leverage_for_security(&symbol));
         self.securities.add(security);
         symbol
+    }
+
+    pub fn add_crypto_future(
+        &mut self,
+        ticker: &str,
+        market: &Market,
+        resolution: Resolution,
+    ) -> Symbol {
+        let symbol = Symbol::create_crypto_future(ticker, market);
+        let trade_config = SubscriptionDataConfig::new_crypto_future(symbol.clone(), resolution);
+        self.subscription_manager.add(trade_config);
+        let mut quote_config =
+            SubscriptionDataConfig::new_crypto_future(symbol.clone(), resolution);
+        quote_config.tick_type = lean_core::TickType::Quote;
+        self.subscription_manager.add(quote_config);
+
+        if self.securities.contains(&symbol) {
+            return symbol;
+        }
+
+        let hours = ExchangeHours::crypto_24_7();
+        let props = self.symbol_properties_for_symbol(&symbol);
+        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.securities.add(security);
+        symbol
+    }
+
+    fn symbol_properties_for_symbol(&self, symbol: &Symbol) -> SymbolProperties {
+        let mut props = SymbolProperties::default();
+        props.market_ticker = symbol.value.clone();
+        props.quote_currency = match symbol.security_type() {
+            SecurityType::CryptoFuture if symbol.market().as_str() == Market::HYPERLIQUID => {
+                "USDC".into()
+            }
+            SecurityType::Crypto | SecurityType::CryptoFuture => {
+                infer_quote_currency(&symbol.value).unwrap_or_else(|| "USD".into())
+            }
+            _ => props.quote_currency,
+        };
+        props
+    }
+
+    pub fn contract_multiplier_for_symbol(&self, symbol: &Symbol) -> Decimal {
+        self.securities
+            .get(symbol)
+            .and_then(|sec| Decimal::from_f64_retain(sec.symbol_properties.contract_multiplier))
+            .unwrap_or_else(|| {
+                if symbol.option_symbol_id().is_some() {
+                    dec!(100)
+                } else {
+                    Decimal::ONE
+                }
+            })
+    }
+
+    pub fn order_fee(&self, order: &Order, fill_price: Price) -> OrderFee {
+        let symbol = &order.symbol;
+        let security_type = symbol.security_type();
+        let (quote_currency, contract_multiplier) = self
+            .securities
+            .get(symbol)
+            .map(|security| {
+                (
+                    security.symbol_properties.quote_currency.clone(),
+                    Decimal::from_f64_retain(security.symbol_properties.contract_multiplier)
+                        .unwrap_or(Decimal::ONE),
+                )
+            })
+            .unwrap_or_else(|| {
+                let props = self.symbol_properties_for_symbol(symbol);
+                (
+                    props.quote_currency,
+                    self.contract_multiplier_for_symbol(symbol),
+                )
+            });
+        let params = OrderFeeParameters {
+            order,
+            security_price: fill_price,
+            security_type,
+            quote_currency: quote_currency.clone(),
+            base_currency: infer_base_currency(symbol, &quote_currency),
+            contract_multiplier,
+        };
+        let model = self.fee_model_for_symbol(symbol);
+        model.get_order_fee(&params)
+    }
+
+    fn fee_model_for_symbol(&self, symbol: &Symbol) -> Box<dyn FeeModel> {
+        match (
+            self.brokerage_name,
+            symbol.security_type(),
+            symbol.market().as_str(),
+        ) {
+            (BrokerageName::HyperliquidBrokerage, SecurityType::CryptoFuture, _)
+            | (_, SecurityType::CryptoFuture, Market::HYPERLIQUID) => {
+                Box::new(HyperliquidFeeModel::default())
+            }
+            (_, SecurityType::CryptoFuture, Market::BYBIT) => Box::new(BybitFeeModel::perpetuals()),
+            (BrokerageName::InteractiveBrokersBrokerage, _, _) => {
+                Box::new(InteractiveBrokersFeeModel::default())
+            }
+            _ => Box::new(InteractiveBrokersFeeModel::default()),
+        }
     }
 
     // ─── Ordering ────────────────────────────────────────────────────────────
@@ -309,6 +463,9 @@ impl QcAlgorithm {
     }
 
     pub fn market_order(&mut self, symbol: &Symbol, quantity: Quantity) -> OrderTicket {
+        if symbol.option_symbol_id().is_some() {
+            self.ensure_option_security(symbol, Resolution::Minute);
+        }
         let id = self.next_order_id();
         let order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
         self.transactions.add_order(order)

@@ -5,7 +5,7 @@ use crate::{
     transaction_manager::TransactionManager,
 };
 use lean_core::DateTime;
-use lean_data::TradeBar;
+use lean_data::{QuoteBar, TradeBar};
 use std::sync::Arc;
 
 /// Processes pending orders against current market data.
@@ -28,13 +28,23 @@ impl OrderProcessor {
         bars: &std::collections::HashMap<u64, TradeBar>,
         time: DateTime,
     ) -> Vec<OrderEvent> {
+        self.process_orders_with_quotes(bars, &std::collections::HashMap::new(), time)
+    }
+
+    /// Scan all open orders and attempt fills against trade and quote bars.
+    pub fn process_orders_with_quotes(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        quote_bars: &std::collections::HashMap<u64, QuoteBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
         let open = self.transaction_manager.get_open_orders();
         let mut events = Vec::new();
 
         for order in open {
             let sid = order.symbol.id.sid;
             if let Some(bar) = bars.get(&sid) {
-                if let Some(event) = self.try_fill(&order, bar, time) {
+                if let Some(event) = self.try_fill(&order, bar, quote_bars.get(&sid), time) {
                     self.transaction_manager.process_order_event(event.clone());
                     events.push(event);
                 }
@@ -44,30 +54,42 @@ impl OrderProcessor {
         events
     }
 
-    fn try_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<OrderEvent> {
+    fn try_fill(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Option<OrderEvent> {
         match order.order_type {
             OrderType::Market => {
-                let fill = self.fill_model.market_fill(order, bar, time);
+                let fill = self
+                    .fill_model
+                    .market_fill_with_quotes(order, bar, quote_bar, time);
                 Some(fill.order_event)
             }
             OrderType::Limit => self
                 .fill_model
-                .limit_fill(order, bar, time)
+                .limit_fill_with_quotes(order, bar, quote_bar, time)
                 .map(|f| f.order_event),
             OrderType::StopMarket => self
                 .fill_model
-                .stop_market_fill(order, bar, time)
+                .stop_market_fill_with_quotes(order, bar, quote_bar, time)
                 .map(|f| f.order_event),
             OrderType::StopLimit => self
                 .fill_model
-                .stop_limit_fill(order, bar, time)
+                .stop_limit_fill_with_quotes(order, bar, quote_bar, time)
                 .map(|f| f.order_event),
             OrderType::MarketOnOpen => {
-                let fill = self.fill_model.market_on_open_fill(order, bar, time);
+                let fill = self
+                    .fill_model
+                    .market_on_open_fill_with_quotes(order, bar, quote_bar, time);
                 Some(fill.order_event)
             }
             OrderType::MarketOnClose => {
-                let fill = self.fill_model.market_on_close_fill(order, bar, time);
+                let fill = self
+                    .fill_model
+                    .market_on_close_fill_with_quotes(order, bar, quote_bar, time);
                 Some(fill.order_event)
             }
             _ => None,

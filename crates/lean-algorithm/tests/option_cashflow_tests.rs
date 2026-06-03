@@ -80,6 +80,25 @@ fn buy_to_open_debits_cash_and_sell_to_close_restores_it() {
 }
 
 #[test]
+fn option_market_order_registers_contract_security_and_submits_order() {
+    let mut alg = QcAlgorithm::new("test", dec!(100_000));
+    let option = spy_put();
+
+    alg.market_order(&option, dec!(1));
+
+    assert!(alg.securities.contains(&option));
+    assert_eq!(alg.transactions.get_open_orders().len(), 1);
+    assert_eq!(
+        alg.securities
+            .get(&option)
+            .unwrap()
+            .symbol_properties
+            .contract_multiplier,
+        100.0
+    );
+}
+
+#[test]
 fn option_holdings_are_marked_to_market_with_contract_multiplier() {
     let mut alg = QcAlgorithm::new("test", dec!(100_000));
     let option = spy_put();

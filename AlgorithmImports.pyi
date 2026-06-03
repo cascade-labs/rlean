@@ -70,6 +70,18 @@ class SecurityType:
     Cfd: SecurityType
     Crypto: SecurityType
     Index: SecurityType
+    CryptoFuture: SecurityType
+    CRYPTO_FUTURE: SecurityType
+
+# ── Market ───────────────────────────────────────────────────────────────────
+
+class Market:
+    USA: str
+    BINANCE: str
+    BYBIT: str
+    COINBASE: str
+    KRAKEN: str
+    HYPERLIQUID: str
 
 # ── OrderType ─────────────────────────────────────────────────────────────────
 
@@ -202,6 +214,46 @@ class TradeBars:
     def __len__(self) -> int: ...
     def values(self) -> List[TradeBar]: ...
 
+# ── MarginInterestRate ───────────────────────────────────────────────────────
+
+class MarginInterestRate:
+    symbol: Symbol
+    time: datetime
+    interest_rate: float
+    value: float
+
+class MarginInterestRates:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[MarginInterestRate]: ...
+
+# ── PerpetualContext ─────────────────────────────────────────────────────────
+
+class PerpetualContext:
+    symbol: Symbol
+    time: datetime
+    end_time: datetime
+    funding: float
+    open_interest: float
+    prev_day_px: float
+    day_ntl_vlm: float
+    premium: float
+    oracle_px: float
+    mark_px: float
+    mid_px: float
+    impact_bid_px: float
+    impact_ask_px: float
+    value: float
+
+class PerpetualContexts:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[PerpetualContext]: ...
+
 # ── Slice ─────────────────────────────────────────────────────────────────────
 
 class Slice:
@@ -211,6 +263,10 @@ class Slice:
 
     @property
     def bars(self) -> TradeBars: ...
+    @property
+    def margin_interest_rates(self) -> MarginInterestRates: ...
+    @property
+    def perpetual_contexts(self) -> PerpetualContexts: ...
 
     def get_bar(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
     def get(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
@@ -650,9 +706,11 @@ class BrokerageName:
     Default: BrokerageName
     InteractiveBrokersBrokerage: BrokerageName
     TradierBrokerage: BrokerageName
+    HyperliquidBrokerage: BrokerageName
     DEFAULT: BrokerageName
     INTERACTIVE_BROKERS_BROKERAGE: BrokerageName
     TRADIER_BROKERAGE: BrokerageName
+    HYPERLIQUID_BROKERAGE: BrokerageName
 
 # ── Algorithm Framework — Alpha Models ────────────────────────────────────────
 
@@ -693,7 +751,7 @@ class PortfolioBias:
 
 class EqualWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Equal-weight PCM: splits portfolio evenly across all Up-insight symbols."""
-    def __init__(self, rebalance: Any = None, portfolio_bias: PortfolioBias = ...) -> None: ...
+    def __init__(self, rebalance=None, portfolio_bias: PortfolioBias = PortfolioBias.LongShort, max_weight: float | None = None) -> None: ...
 
 class InsightWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Weights positions by insight magnitude."""
@@ -909,6 +967,7 @@ class QCAlgorithm:
     def set_brokerage_model(self, brokerage: BrokerageName, account_type: AccountType = AccountType.Margin) -> None: ...
     def add_cash(self, amount: float) -> None: ...
     def set_name(self, name: str) -> None: ...
+    def get_parameter(self, name: str, default: Optional[str] = None) -> Optional[str]: ...
     def set_warm_up(self, bars_or_days: int) -> None: ...
 
     # ── History ──────────────────────────────────────────────────────────────
@@ -925,7 +984,8 @@ class QCAlgorithm:
 
     def add_equity(self, ticker: str, resolution: Resolution = ...) -> Security: ...
     def add_forex(self, ticker: str, resolution: Resolution = ...) -> Security: ...
-    def add_crypto(self, ticker: str, resolution: Resolution = ...) -> Security: ...
+    def add_crypto(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
+    def add_crypto_future(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
     @property
     def universe_settings(self) -> UniverseSettings: ...
     @property
@@ -949,8 +1009,22 @@ class QCAlgorithm:
         Returns the canonical option ticker string (e.g. ``'?SPY'``).
         """
         ...
+    def remove_security(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def RemoveSecurity(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def remove_option_contract(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def RemoveOptionContract(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
 
     def get_option_chain(self, canonical_ticker: str) -> Optional[OptionChain]: ...
+    def calculate_implied_volatility(
+        self,
+        contract: OptionContract,
+        option_price: float,
+        underlying_price: Optional[float] = ...,
+        risk_free_rate: float = ...,
+        dividend_yield: float = ...,
+    ) -> Optional[float]:
+        """Compute Black-Scholes implied volatility for a selected option price."""
+        ...
     def sell_to_open(self, contract: OptionContract, quantity: float, premium: float) -> int: ...
     def buy_to_open(self, contract: OptionContract, quantity: float, premium: float) -> int: ...
     def buy_to_close(self, contract: OptionContract, quantity: float, premium: float) -> int: ...

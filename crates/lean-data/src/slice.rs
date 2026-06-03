@@ -1,5 +1,8 @@
 use crate::symbol_changed::SymbolChangedEvent;
-use crate::{CustomDataPoint, Delisting, Dividend, QuoteBar, Split, Tick, TradeBar};
+use crate::{
+    CustomDataPoint, Delisting, Dividend, MarginInterestRate, PerpetualContext, QuoteBar, Split,
+    Tick, TradeBar,
+};
 use lean_core::{DateTime, Symbol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +19,8 @@ pub struct Slice {
     pub splits: HashMap<u64, Split>,
     pub delistings: HashMap<u64, Delisting>,
     pub symbol_changed_events: HashMap<u64, SymbolChangedEvent>,
+    pub margin_interest_rates: HashMap<u64, MarginInterestRate>,
+    pub perpetual_contexts: HashMap<u64, PerpetualContext>,
     pub custom_data: HashMap<String, Vec<CustomDataPoint>>,
     pub has_data: bool,
 }
@@ -31,6 +36,8 @@ impl Slice {
             splits: std::collections::HashMap::new(),
             delistings: std::collections::HashMap::new(),
             symbol_changed_events: std::collections::HashMap::new(),
+            margin_interest_rates: std::collections::HashMap::new(),
+            perpetual_contexts: std::collections::HashMap::new(),
             custom_data: std::collections::HashMap::new(),
             has_data: false,
         }
@@ -71,6 +78,17 @@ impl Slice {
         self.has_data = true;
     }
 
+    pub fn add_margin_interest_rate(&mut self, rate: MarginInterestRate) {
+        self.margin_interest_rates.insert(rate.symbol.id.sid, rate);
+        self.has_data = true;
+    }
+
+    pub fn add_perpetual_context(&mut self, context: PerpetualContext) {
+        self.perpetual_contexts
+            .insert(context.symbol.id.sid, context);
+        self.has_data = true;
+    }
+
     pub fn get_bar(&self, symbol: &Symbol) -> Option<&TradeBar> {
         self.bars.get(&symbol.id.sid)
     }
@@ -81,5 +99,13 @@ impl Slice {
 
     pub fn get_ticks(&self, symbol: &Symbol) -> Option<&Vec<Tick>> {
         self.ticks.get(&symbol.id.sid)
+    }
+
+    pub fn get_margin_interest_rate(&self, symbol: &Symbol) -> Option<&MarginInterestRate> {
+        self.margin_interest_rates.get(&symbol.id.sid)
+    }
+
+    pub fn get_perpetual_context(&self, symbol: &Symbol) -> Option<&PerpetualContext> {
+        self.perpetual_contexts.get(&symbol.id.sid)
     }
 }

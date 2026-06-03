@@ -66,6 +66,28 @@ impl SecurityIdentifier {
         }
     }
 
+    pub fn generate_crypto_future(ticker: &str, market: &Market) -> Self {
+        let sid = Self::hash_sid(
+            ticker,
+            market,
+            SecurityType::CryptoFuture,
+            None,
+            None,
+            None,
+            None,
+        );
+        SecurityIdentifier {
+            ticker: ticker.to_uppercase(),
+            market: market.clone(),
+            security_type: SecurityType::CryptoFuture,
+            expiry: None,
+            strike: None,
+            option_right: None,
+            option_style: None,
+            sid,
+        }
+    }
+
     pub fn generate_option(
         underlying: &str,
         market: &Market,
@@ -189,6 +211,16 @@ impl Symbol {
 
     pub fn create_crypto(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_crypto(ticker, market);
+        Symbol {
+            value: ticker.to_uppercase(),
+            permtick: ticker.to_uppercase(),
+            id,
+            underlying: None,
+        }
+    }
+
+    pub fn create_crypto_future(ticker: &str, market: &Market) -> Self {
+        let id = SecurityIdentifier::generate_crypto_future(ticker, market);
         Symbol {
             value: ticker.to_uppercase(),
             permtick: ticker.to_uppercase(),

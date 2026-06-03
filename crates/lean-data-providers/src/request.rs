@@ -6,6 +6,8 @@ pub enum DataType {
     TradeBar,
     QuoteBar,
     Tick,
+    MarginInterestRate,
+    PerpetualContext,
     OpenInterest,
     /// Request a provider to generate/cache a factor file for the symbol.
     /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
@@ -44,6 +46,8 @@ pub struct MarketDataBatch {
     pub trade_bars: Vec<lean_data::TradeBar>,
     pub quote_bars: Vec<lean_data::QuoteBar>,
     pub ticks: Vec<lean_data::Tick>,
+    pub margin_interest_rates: Vec<lean_data::MarginInterestRate>,
+    pub perpetual_contexts: Vec<lean_data::PerpetualContext>,
 }
 
 /// Type of option data to request.

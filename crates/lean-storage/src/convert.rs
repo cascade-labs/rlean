@@ -2,7 +2,7 @@ use crate::schema::{
     date_to_ns, i64_to_price, ns_to_date, price_to_i64, OptionEodBar, OptionUniverseRow,
 };
 use arrow_array::*;
-use lean_data::{Bar, QuoteBar, Tick, TradeBar};
+use lean_data::{Bar, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use std::sync::Arc;
 
 // ─── TradeBar ────────────────────────────────────────────────────────────────
@@ -240,6 +240,221 @@ pub fn record_batch_to_ticks(
                 Some(sale_condition_col.value(i).to_string())
             },
             suspicious: suspicious_col.value(i),
+        })
+        .collect()
+}
+
+// ─── MarginInterestRate ─────────────────────────────────────────────────────
+
+pub fn margin_interest_rates_to_record_batch(
+    rates: &[MarginInterestRate],
+) -> arrow_array::RecordBatch {
+    let schema = crate::schema::margin_interest_rate_schema();
+
+    let time_ns: Vec<i64> = rates.iter().map(|r| r.time.0).collect();
+    let sym_sid: Vec<u64> = rates.iter().map(|r| r.symbol.id.sid).collect();
+    let sym_val: Vec<&str> = rates.iter().map(|r| r.symbol.value.as_str()).collect();
+    let interest_rate: Vec<i64> = rates
+        .iter()
+        .map(|r| price_to_i64(&r.interest_rate))
+        .collect();
+
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(time_ns)),
+            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(StringArray::from(sym_val)),
+            Arc::new(Int64Array::from(interest_rate)),
+        ],
+    )
+    .expect("schema/column count mismatch — this is a bug")
+}
+
+pub fn record_batch_to_margin_interest_rates(
+    batch: &arrow_array::RecordBatch,
+    symbol: lean_core::Symbol,
+) -> Vec<MarginInterestRate> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return vec![];
+    }
+
+    let time_ns = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rate_col = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    (0..n)
+        .map(|i| MarginInterestRate {
+            symbol: symbol.clone(),
+            time: lean_core::NanosecondTimestamp(time_ns.value(i)),
+            interest_rate: i64_to_price(rate_col.value(i)),
+        })
+        .collect()
+}
+
+// ─── PerpetualContext ───────────────────────────────────────────────────────
+
+pub fn perpetual_contexts_to_record_batch(
+    contexts: &[PerpetualContext],
+) -> arrow_array::RecordBatch {
+    let schema = crate::schema::perpetual_context_schema();
+
+    let time_ns: Vec<i64> = contexts.iter().map(|c| c.time.0).collect();
+    let end_time_ns: Vec<i64> = contexts.iter().map(|c| c.end_time.0).collect();
+    let sym_sid: Vec<u64> = contexts.iter().map(|c| c.symbol.id.sid).collect();
+    let sym_val: Vec<&str> = contexts.iter().map(|c| c.symbol.value.as_str()).collect();
+    let funding: Vec<i64> = contexts.iter().map(|c| price_to_i64(&c.funding)).collect();
+    let open_interest: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.open_interest))
+        .collect();
+    let prev_day_px: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.prev_day_px))
+        .collect();
+    let day_ntl_vlm: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.day_ntl_vlm))
+        .collect();
+    let premium: Vec<i64> = contexts.iter().map(|c| price_to_i64(&c.premium)).collect();
+    let oracle_px: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.oracle_px))
+        .collect();
+    let mark_px: Vec<i64> = contexts.iter().map(|c| price_to_i64(&c.mark_px)).collect();
+    let mid_px: Vec<i64> = contexts.iter().map(|c| price_to_i64(&c.mid_px)).collect();
+    let impact_bid_px: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.impact_bid_px))
+        .collect();
+    let impact_ask_px: Vec<i64> = contexts
+        .iter()
+        .map(|c| price_to_i64(&c.impact_ask_px))
+        .collect();
+    let period_ns: Vec<i64> = contexts.iter().map(|c| c.period.nanos).collect();
+
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(time_ns)),
+            Arc::new(Int64Array::from(end_time_ns)),
+            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(StringArray::from(sym_val)),
+            Arc::new(Int64Array::from(funding)),
+            Arc::new(Int64Array::from(open_interest)),
+            Arc::new(Int64Array::from(prev_day_px)),
+            Arc::new(Int64Array::from(day_ntl_vlm)),
+            Arc::new(Int64Array::from(premium)),
+            Arc::new(Int64Array::from(oracle_px)),
+            Arc::new(Int64Array::from(mark_px)),
+            Arc::new(Int64Array::from(mid_px)),
+            Arc::new(Int64Array::from(impact_bid_px)),
+            Arc::new(Int64Array::from(impact_ask_px)),
+            Arc::new(Int64Array::from(period_ns)),
+        ],
+    )
+    .expect("schema/column count mismatch — this is a bug")
+}
+
+pub fn record_batch_to_perpetual_contexts(
+    batch: &arrow_array::RecordBatch,
+    symbol: lean_core::Symbol,
+) -> Vec<PerpetualContext> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return vec![];
+    }
+
+    let time_ns = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let end_ns = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let funding = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let open_interest = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let prev_day_px = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let day_ntl_vlm = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let premium = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let oracle_px = batch
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mark_px = batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mid_px = batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let impact_bid_px = batch
+        .column(12)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let impact_ask_px = batch
+        .column(13)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let period_ns = batch
+        .column(14)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    (0..n)
+        .map(|i| PerpetualContext {
+            symbol: symbol.clone(),
+            time: lean_core::NanosecondTimestamp(time_ns.value(i)),
+            end_time: lean_core::NanosecondTimestamp(end_ns.value(i)),
+            funding: i64_to_price(funding.value(i)),
+            open_interest: i64_to_price(open_interest.value(i)),
+            prev_day_px: i64_to_price(prev_day_px.value(i)),
+            day_ntl_vlm: i64_to_price(day_ntl_vlm.value(i)),
+            premium: i64_to_price(premium.value(i)),
+            oracle_px: i64_to_price(oracle_px.value(i)),
+            mark_px: i64_to_price(mark_px.value(i)),
+            mid_px: i64_to_price(mid_px.value(i)),
+            impact_bid_px: i64_to_price(impact_bid_px.value(i)),
+            impact_ask_px: i64_to_price(impact_ask_px.value(i)),
+            period: lean_core::TimeSpan::from_nanos(period_ns.value(i)),
         })
         .collect()
 }

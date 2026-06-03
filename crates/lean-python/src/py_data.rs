@@ -1,11 +1,11 @@
 use crate::py_options::PyOptionChains;
 use crate::py_types::{PySecurity, PySymbol};
 use lean_core::TickType;
-use lean_data::QuoteBar;
 use lean_data::{
     CustomDataPoint, Delisting, DelistingType, Slice, SubscriptionDataConfig, SymbolChangedEvent,
     Tick, TradeBar,
 };
+use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar};
 use lean_options::OptionChain;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
@@ -376,6 +376,257 @@ impl PyQuoteBars {
     }
     fn __repr__(&self) -> String {
         format!("QuoteBars(count={})", self.bars.len())
+    }
+}
+
+/// Python-visible MarginInterestRate.
+#[pyclass(name = "MarginInterestRate")]
+#[derive(Debug, Clone)]
+pub struct PyMarginInterestRate {
+    #[pyo3(get)]
+    pub symbol: PySymbol,
+    #[pyo3(get)]
+    pub time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub interest_rate: f64,
+}
+
+impl From<&MarginInterestRate> for PyMarginInterestRate {
+    fn from(rate: &MarginInterestRate) -> Self {
+        PyMarginInterestRate {
+            symbol: PySymbol {
+                inner: rate.symbol.clone(),
+            },
+            time: ns_to_naive(rate.time.0),
+            interest_rate: rate.interest_rate.to_f64().unwrap_or(0.0),
+        }
+    }
+}
+
+#[pymethods]
+impl PyMarginInterestRate {
+    #[getter]
+    fn value(&self) -> f64 {
+        self.interest_rate
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MarginInterestRate({} rate={:.8})",
+            self.symbol.inner.value, self.interest_rate
+        )
+    }
+}
+
+/// LEAN API: `data.margin_interest_rates` — dict-like funding-rate collection.
+#[pyclass(name = "MarginInterestRates")]
+pub struct PyMarginInterestRates {
+    rates: HashMap<u64, Py<PyMarginInterestRate>>,
+    ticker_to_sid: HashMap<String, u64>,
+}
+
+impl PyMarginInterestRates {
+    pub fn empty() -> Self {
+        PyMarginInterestRates {
+            rates: HashMap::new(),
+            ticker_to_sid: HashMap::new(),
+        }
+    }
+
+    fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
+            return Ok(Some(sym.get().inner.id.sid));
+        }
+        if let Ok(sec) = arg.cast::<PySecurity>() {
+            return Ok(Some(sec.get().inner.inner.id.sid));
+        }
+        if let Ok(ticker) = arg.extract::<String>() {
+            return Ok(self.ticker_to_sid.get(&ticker).copied());
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security, Symbol, or str",
+        ))
+    }
+}
+
+#[pymethods]
+impl PyMarginInterestRates {
+    fn get(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyMarginInterestRate>>> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .and_then(|sid| self.rates.get(&sid).map(|r| r.clone_ref(py))))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyMarginInterestRate>>> {
+        self.get(py, symbol)
+    }
+
+    fn __contains__(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .map(|sid| self.rates.contains_key(&sid))
+            .unwrap_or(false))
+    }
+
+    fn __len__(&self) -> usize {
+        self.rates.len()
+    }
+
+    fn values(&self, py: Python<'_>) -> Vec<Py<PyMarginInterestRate>> {
+        self.rates.values().map(|r| r.clone_ref(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("MarginInterestRates(count={})", self.rates.len())
+    }
+}
+
+/// Python-visible PerpetualContext.
+#[pyclass(name = "PerpetualContext")]
+#[derive(Debug, Clone)]
+pub struct PyPerpetualContext {
+    #[pyo3(get)]
+    pub symbol: PySymbol,
+    #[pyo3(get)]
+    pub time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub end_time: chrono::NaiveDateTime,
+    #[pyo3(get)]
+    pub funding: f64,
+    #[pyo3(get)]
+    pub open_interest: f64,
+    #[pyo3(get)]
+    pub prev_day_px: f64,
+    #[pyo3(get)]
+    pub day_ntl_vlm: f64,
+    #[pyo3(get)]
+    pub premium: f64,
+    #[pyo3(get)]
+    pub oracle_px: f64,
+    #[pyo3(get)]
+    pub mark_px: f64,
+    #[pyo3(get)]
+    pub mid_px: f64,
+    #[pyo3(get)]
+    pub impact_bid_px: f64,
+    #[pyo3(get)]
+    pub impact_ask_px: f64,
+}
+
+impl From<&PerpetualContext> for PyPerpetualContext {
+    fn from(context: &PerpetualContext) -> Self {
+        let to_f = |d: rust_decimal::Decimal| d.to_f64().unwrap_or(0.0);
+        Self {
+            symbol: PySymbol {
+                inner: context.symbol.clone(),
+            },
+            time: ns_to_naive(context.time.0),
+            end_time: ns_to_naive(context.end_time.0),
+            funding: to_f(context.funding),
+            open_interest: to_f(context.open_interest),
+            prev_day_px: to_f(context.prev_day_px),
+            day_ntl_vlm: to_f(context.day_ntl_vlm),
+            premium: to_f(context.premium),
+            oracle_px: to_f(context.oracle_px),
+            mark_px: to_f(context.mark_px),
+            mid_px: to_f(context.mid_px),
+            impact_bid_px: to_f(context.impact_bid_px),
+            impact_ask_px: to_f(context.impact_ask_px),
+        }
+    }
+}
+
+#[pymethods]
+impl PyPerpetualContext {
+    #[getter]
+    fn value(&self) -> f64 {
+        self.mark_px
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PerpetualContext({} mark={:.4} mid={:.4} oi={:.4})",
+            self.symbol.inner.value, self.mark_px, self.mid_px, self.open_interest
+        )
+    }
+}
+
+/// LEAN-style dict-like collection for perpetual context rows.
+#[pyclass(name = "PerpetualContexts")]
+pub struct PyPerpetualContexts {
+    contexts: HashMap<u64, Py<PyPerpetualContext>>,
+    ticker_to_sid: HashMap<String, u64>,
+}
+
+impl PyPerpetualContexts {
+    pub fn empty() -> Self {
+        Self {
+            contexts: HashMap::new(),
+            ticker_to_sid: HashMap::new(),
+        }
+    }
+
+    fn resolve_sid(&self, arg: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        if let Ok(sym) = arg.cast::<PySymbol>() {
+            return Ok(Some(sym.get().inner.id.sid));
+        }
+        if let Ok(sec) = arg.cast::<PySecurity>() {
+            return Ok(Some(sec.get().inner.inner.id.sid));
+        }
+        if let Ok(ticker) = arg.extract::<String>() {
+            return Ok(self.ticker_to_sid.get(&ticker).copied());
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Expected Security, Symbol, or str",
+        ))
+    }
+}
+
+#[pymethods]
+impl PyPerpetualContexts {
+    fn get(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyPerpetualContext>>> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .and_then(|sid| self.contexts.get(&sid).map(|c| c.clone_ref(py))))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Py<PyPerpetualContext>>> {
+        self.get(py, symbol)
+    }
+
+    fn __contains__(&self, symbol: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self
+            .resolve_sid(symbol)?
+            .map(|sid| self.contexts.contains_key(&sid))
+            .unwrap_or(false))
+    }
+
+    fn __len__(&self) -> usize {
+        self.contexts.len()
+    }
+
+    fn values(&self, py: Python<'_>) -> Vec<Py<PyPerpetualContext>> {
+        self.contexts.values().map(|c| c.clone_ref(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PerpetualContexts(count={})", self.contexts.len())
     }
 }
 
@@ -790,6 +1041,8 @@ impl PySymbolChangedEvents {
 pub struct PySlice {
     bars_obj: Py<PyTradeBars>,
     quote_bars_obj: Py<PyQuoteBars>,
+    margin_interest_rates_obj: Py<PyMarginInterestRates>,
+    perpetual_contexts_obj: Py<PyPerpetualContexts>,
     ticks_obj: Py<PyTicks>,
     option_chains_obj: Py<PyOptionChains>,
     custom_data_obj: Py<PyCustomData>,
@@ -842,6 +1095,36 @@ impl PySlice {
                 ticker_to_sid: quote_ticker_to_sid,
             },
         )?;
+        let mut py_margin_rate_map: HashMap<u64, Py<PyMarginInterestRate>> = HashMap::new();
+        let mut margin_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        for (&sid, rate) in &slice.margin_interest_rates {
+            let py_rate = Py::new(py, PyMarginInterestRate::from(rate))?;
+            margin_ticker_to_sid.insert(rate.symbol.value.clone(), sid);
+            margin_ticker_to_sid.insert(rate.symbol.permtick.clone(), sid);
+            py_margin_rate_map.insert(sid, py_rate);
+        }
+        let py_margin_interest_rates = Py::new(
+            py,
+            PyMarginInterestRates {
+                rates: py_margin_rate_map,
+                ticker_to_sid: margin_ticker_to_sid,
+            },
+        )?;
+        let mut py_perpetual_context_map: HashMap<u64, Py<PyPerpetualContext>> = HashMap::new();
+        let mut context_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        for (&sid, context) in &slice.perpetual_contexts {
+            let py_context = Py::new(py, PyPerpetualContext::from(context))?;
+            context_ticker_to_sid.insert(context.symbol.value.clone(), sid);
+            context_ticker_to_sid.insert(context.symbol.permtick.clone(), sid);
+            py_perpetual_context_map.insert(sid, py_context);
+        }
+        let py_perpetual_contexts = Py::new(
+            py,
+            PyPerpetualContexts {
+                contexts: py_perpetual_context_map,
+                ticker_to_sid: context_ticker_to_sid,
+            },
+        )?;
         let mut py_ticks_map: HashMap<u64, Vec<Py<PyTick>>> = HashMap::new();
         let mut tick_ticker_to_sid: HashMap<String, u64> = HashMap::new();
         for (&sid, ticks) in &slice.ticks {
@@ -882,6 +1165,8 @@ impl PySlice {
         Ok(PySlice {
             bars_obj: py_bars,
             quote_bars_obj: py_quote_bars,
+            margin_interest_rates_obj: py_margin_interest_rates,
+            perpetual_contexts_obj: py_perpetual_contexts,
             ticks_obj: py_ticks,
             option_chains_obj: py_chains,
             custom_data_obj: py_custom,
@@ -904,6 +1189,18 @@ impl PySlice {
     #[getter]
     fn quote_bars(&self, py: Python<'_>) -> Py<PyQuoteBars> {
         self.quote_bars_obj.clone_ref(py)
+    }
+
+    /// LEAN API: `data.margin_interest_rates`.
+    #[getter]
+    fn margin_interest_rates(&self, py: Python<'_>) -> Py<PyMarginInterestRates> {
+        self.margin_interest_rates_obj.clone_ref(py)
+    }
+
+    /// LEAN-style perpetual context collection.
+    #[getter]
+    fn perpetual_contexts(&self, py: Python<'_>) -> Py<PyPerpetualContexts> {
+        self.perpetual_contexts_obj.clone_ref(py)
     }
 
     /// LEAN API: `data.ticks` — returns the Ticks collection (refcount bump only).
@@ -1201,6 +1498,10 @@ pub struct SliceProxy {
     quote_bar_cells: HashMap<u64, Py<PyQuoteBar>>,
     /// The QuoteBars container object (shared with py_slice).
     quote_bars_cell: Py<PyQuoteBars>,
+    /// The MarginInterestRates container object (shared with py_slice).
+    margin_interest_rates_cell: Py<PyMarginInterestRates>,
+    /// The PerpetualContexts container object (shared with py_slice).
+    perpetual_contexts_cell: Py<PyPerpetualContexts>,
     /// The Ticks container object (shared with py_slice).
     ticks_cell: Py<PyTicks>,
     /// Mutable option chains cell — updated in-place each bar.
@@ -1221,6 +1522,8 @@ impl SliceProxy {
         let mut quote_bar_cells: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
         let mut ticker_to_sid: HashMap<String, u64> = HashMap::new();
         let mut qb_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut margin_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut perpetual_context_ticker_to_sid: HashMap<String, u64> = HashMap::new();
 
         for sub in subscriptions {
             let sid = sub.symbol.id.sid;
@@ -1265,6 +1568,10 @@ impl SliceProxy {
             )?;
             qb_ticker_to_sid.insert(sub.symbol.value.clone(), sid);
             qb_ticker_to_sid.insert(sub.symbol.permtick.clone(), sid);
+            margin_ticker_to_sid.insert(sub.symbol.value.clone(), sid);
+            margin_ticker_to_sid.insert(sub.symbol.permtick.clone(), sid);
+            perpetual_context_ticker_to_sid.insert(sub.symbol.value.clone(), sid);
+            perpetual_context_ticker_to_sid.insert(sub.symbol.permtick.clone(), sid);
             quote_bar_cells.insert(sid, py_qbar);
         }
 
@@ -1283,6 +1590,20 @@ impl SliceProxy {
                 ticker_to_sid: qb_ticker_to_sid,
             },
         )?;
+        let py_margin_interest_rates = Py::new(
+            py,
+            PyMarginInterestRates {
+                rates: HashMap::new(),
+                ticker_to_sid: margin_ticker_to_sid,
+            },
+        )?;
+        let py_perpetual_contexts = Py::new(
+            py,
+            PyPerpetualContexts {
+                contexts: HashMap::new(),
+                ticker_to_sid: perpetual_context_ticker_to_sid,
+            },
+        )?;
         let py_ticks_obj = Py::new(py, PyTicks::empty())?;
         let py_custom = Py::new(py, PyCustomData::empty())?;
         let py_delistings = Py::new(py, PyDelistings::empty())?;
@@ -1292,6 +1613,8 @@ impl SliceProxy {
             PySlice {
                 bars_obj: py_bars_obj.clone_ref(py),
                 quote_bars_obj: py_qbars_obj.clone_ref(py),
+                margin_interest_rates_obj: py_margin_interest_rates.clone_ref(py),
+                perpetual_contexts_obj: py_perpetual_contexts.clone_ref(py),
                 ticks_obj: py_ticks_obj.clone_ref(py),
                 option_chains_obj: py_chains.clone_ref(py),
                 custom_data_obj: py_custom.clone_ref(py),
@@ -1307,6 +1630,8 @@ impl SliceProxy {
             bars_cell: py_bars_obj,
             quote_bar_cells,
             quote_bars_cell: py_qbars_obj,
+            margin_interest_rates_cell: py_margin_interest_rates,
+            perpetual_contexts_cell: py_perpetual_contexts,
             ticks_cell: py_ticks_obj,
             option_chains_cell: py_chains,
             custom_data_cell: py_custom,
@@ -1384,6 +1709,24 @@ impl SliceProxy {
                 .ticker_to_sid
                 .insert(sub.symbol.permtick.clone(), sid);
         }
+        {
+            let mut rates_obj = self.margin_interest_rates_cell.borrow_mut(py);
+            rates_obj
+                .ticker_to_sid
+                .insert(sub.symbol.value.clone(), sid);
+            rates_obj
+                .ticker_to_sid
+                .insert(sub.symbol.permtick.clone(), sid);
+        }
+        {
+            let mut contexts_obj = self.perpetual_contexts_cell.borrow_mut(py);
+            contexts_obj
+                .ticker_to_sid
+                .insert(sub.symbol.value.clone(), sid);
+            contexts_obj
+                .ticker_to_sid
+                .insert(sub.symbol.permtick.clone(), sid);
+        }
 
         Ok(())
     }
@@ -1414,6 +1757,22 @@ impl SliceProxy {
             let mut qbars_obj = self.quote_bars_cell.borrow_mut(py);
             qbars_obj.bars.retain(|sid, _| active_sids.contains(sid));
             qbars_obj
+                .ticker_to_sid
+                .retain(|_, sid| active_sids.contains(sid));
+        }
+        {
+            let mut rates_obj = self.margin_interest_rates_cell.borrow_mut(py);
+            rates_obj.rates.retain(|sid, _| active_sids.contains(sid));
+            rates_obj
+                .ticker_to_sid
+                .retain(|_, sid| active_sids.contains(sid));
+        }
+        {
+            let mut contexts_obj = self.perpetual_contexts_cell.borrow_mut(py);
+            contexts_obj
+                .contexts
+                .retain(|sid, _| active_sids.contains(sid));
+            contexts_obj
                 .ticker_to_sid
                 .retain(|_, sid| active_sids.contains(sid));
         }
@@ -1505,6 +1864,28 @@ impl SliceProxy {
                 if let Some(cell) = self.quote_bar_cells.get(&sid) {
                     qbars_obj.bars.insert(sid, cell.clone_ref(py));
                 }
+            }
+        }
+    }
+
+    /// Replace the `data.margin_interest_rates` container for this slice.
+    pub fn update_margin_interest_rates(&self, py: Python<'_>, slice: &Slice) {
+        let mut rates_obj = self.margin_interest_rates_cell.borrow_mut(py);
+        rates_obj.rates.clear();
+        for (&sid, rate) in &slice.margin_interest_rates {
+            if let Ok(py_rate) = Py::new(py, PyMarginInterestRate::from(rate)) {
+                rates_obj.rates.insert(sid, py_rate);
+            }
+        }
+    }
+
+    /// Replace the `data.perpetual_contexts` container for this slice.
+    pub fn update_perpetual_contexts(&self, py: Python<'_>, slice: &Slice) {
+        let mut contexts_obj = self.perpetual_contexts_cell.borrow_mut(py);
+        contexts_obj.contexts.clear();
+        for (&sid, context) in &slice.perpetual_contexts {
+            if let Ok(py_context) = Py::new(py, PyPerpetualContext::from(context)) {
+                contexts_obj.contexts.insert(sid, py_context);
             }
         }
     }

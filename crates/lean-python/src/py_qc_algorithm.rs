@@ -11,22 +11,19 @@ use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniver
 use crate::{PyAccountType, PyBrokerageName};
 use chrono::{Datelike, NaiveDate, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{DateTime, Market, Resolution, SymbolOptionsExt, TickType};
-use lean_data::{
-    CustomDataFormat, CustomDataPoint, CustomDataSubscription, CustomDataTransport, TradeBar,
-};
+use lean_core::{DateTime, Market, Resolution, SecurityType};
+use lean_data::{CustomDataPoint, CustomDataSubscription, TradeBar};
+use lean_engine::HistoryService;
 use lean_options::{implied_volatility, time_to_expiry_years};
-use lean_storage::{
-    custom_data_history_path, custom_data_path, ParquetReader, PathResolver, QueryParams,
-};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+pub use lean_engine::AlgorithmHistoryContext;
 
 /// Registry of auto-updating indicators keyed by symbol SID.
 /// Each entry maps a SID to a Python indicator object that will be updated
@@ -52,12 +49,6 @@ impl Default for IndicatorRegistry {
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
-}
-
-#[derive(Clone)]
-pub struct AlgorithmHistoryContext {
-    pub data_root: PathBuf,
-    pub custom_data_sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>>,
 }
 
 /// The base algorithm class that Python strategies inherit from.
@@ -394,10 +385,44 @@ impl PyQcAlgorithm {
         PySecurity::from_symbol(PySymbol { inner: sym })
     }
 
-    fn add_crypto(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
+    #[pyo3(signature = (ticker, resolution, market=None))]
+    fn add_crypto(
+        &mut self,
+        ticker: &str,
+        resolution: PyResolution,
+        market: Option<&str>,
+    ) -> PySecurity {
         let res: Resolution = resolution.into();
-        let market = Market::usa(); // default; crypto can override
+        let market = market.map(Market::new).unwrap_or_else(|| {
+            self.inner
+                .lock()
+                .unwrap()
+                .default_market_for_security(SecurityType::Crypto)
+        });
         let sym = self.inner.lock().unwrap().add_crypto(ticker, &market, res);
+        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        PySecurity::from_symbol(PySymbol { inner: sym })
+    }
+
+    #[pyo3(signature = (ticker, resolution, market=None))]
+    fn add_crypto_future(
+        &mut self,
+        ticker: &str,
+        resolution: PyResolution,
+        market: Option<&str>,
+    ) -> PySecurity {
+        let res: Resolution = resolution.into();
+        let market = market.map(Market::new).unwrap_or_else(|| {
+            self.inner
+                .lock()
+                .unwrap()
+                .default_market_for_security(SecurityType::CryptoFuture)
+        });
+        let sym = self
+            .inner
+            .lock()
+            .unwrap()
+            .add_crypto_future(ticker, &market, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
         PySecurity::from_symbol(PySymbol { inner: sym })
     }
@@ -461,12 +486,8 @@ impl PyQcAlgorithm {
     /// LEAN API: place a market order.
     fn market_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
-        if sym.option_symbol_id().is_some() {
-            self.option_market_order(sym, f2d(quantity))
-        } else {
-            self.inner.lock().unwrap().market_order(&sym, f2d(quantity));
-            Ok(())
-        }
+        self.inner.lock().unwrap().market_order(&sym, f2d(quantity));
+        Ok(())
     }
 
     /// LEAN API: `self.buy(symbol, quantity)` — market buy.
@@ -1437,29 +1458,6 @@ fn json_value_to_py_history(py: Python<'_>, v: &serde_json::Value) -> PyResult<P
     }
 }
 
-fn read_custom_parquet_points_blocking(
-    source: lean_data::CustomParquetSource,
-    query: lean_data::CustomDataQuery,
-    date: NaiveDate,
-) -> PyResult<Vec<CustomDataPoint>> {
-    let handle = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(async move {
-                ParquetReader::new()
-                    .read_custom_parquet_points(&source, &query, date)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-    });
-    handle
-        .join()
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("custom history worker panicked"))?
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-}
-
 impl PyQcAlgorithm {
     fn history_context(&self) -> PyResult<AlgorithmHistoryContext> {
         self.history_context.lock().unwrap().clone().ok_or_else(|| {
@@ -1467,6 +1465,10 @@ impl PyQcAlgorithm {
                 "history is only available while running under the rlean backtest runner",
             )
         })
+    }
+
+    fn history_service(&self) -> PyResult<HistoryService> {
+        Ok(HistoryService::new(self.history_context()?))
     }
 
     fn history_end_date(&self) -> NaiveDate {
@@ -1495,30 +1497,9 @@ impl PyQcAlgorithm {
         start: NaiveDate,
         end: NaiveDate,
     ) -> PyResult<Vec<TradeBar>> {
-        let context = self.history_context()?;
-        let resolver = PathResolver::new(&context.data_root);
-        let reader = ParquetReader::new();
-        let params = QueryParams::new().with_time_range(
-            date_to_datetime(start, 0, 0, 0),
-            date_to_datetime(end, 23, 59, 59),
-        );
-
-        let mut out = Vec::new();
-        let mut d = start;
-        while d <= end {
-            let path = resolver.market_data_partition(symbol, resolution, TickType::Trade, d);
-            if path.exists() {
-                out.extend(
-                    reader
-                        .read_trade_bar_partition(&path, symbol, &params)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|bar| bar.symbol.id.sid == symbol.id.sid),
-                );
-            }
-            d += chrono::Duration::days(1);
-        }
-        Ok(out)
+        self.history_service()?
+            .load_trade_bars_blocking(symbol, resolution, start, end)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     fn load_custom_history(
@@ -1527,112 +1508,9 @@ impl PyQcAlgorithm {
         start: NaiveDate,
         end: NaiveDate,
     ) -> PyResult<Vec<CustomDataPoint>> {
-        let context = self.history_context()?;
-        let reader = ParquetReader::new();
-        let full_history_path =
-            custom_data_history_path(&context.data_root, &sub.source_type, &sub.ticker);
-        if full_history_path.exists() {
-            return Ok(reader
-                .read_custom_data_points(&full_history_path)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| p.time >= start && p.time <= end)
-                .collect());
-        }
-
-        let source = context
-            .custom_data_sources
-            .iter()
-            .find(|source| source.name() == sub.source_type)
-            .cloned();
-        let mut out = Vec::new();
-        let mut d = start;
-        while d <= end {
-            let cache_path = custom_data_path(&context.data_root, &sub.source_type, &sub.ticker, d);
-            if cache_path.exists() {
-                out.extend(
-                    reader
-                        .read_custom_data_points(&cache_path)
-                        .unwrap_or_default(),
-                );
-                d += chrono::Duration::days(1);
-                continue;
-            }
-
-            let Some(source) = source.as_ref() else {
-                d += chrono::Duration::days(1);
-                continue;
-            };
-            let mut config = sub.config.clone();
-            let effective_query =
-                config
-                    .query
-                    .merge(&sub.dynamic_query)
-                    .merge(&lean_data::CustomDataQuery {
-                        start_date: Some(start),
-                        end_date: Some(end),
-                        ..Default::default()
-                    });
-            config.query = effective_query.clone();
-
-            if let Some(parquet_source) =
-                source.get_parquet_source(&sub.ticker, d, &config, &effective_query)
-            {
-                let points =
-                    read_custom_parquet_points_blocking(parquet_source, effective_query, d)?;
-                out.extend(points);
-                d += chrono::Duration::days(1);
-                continue;
-            }
-
-            if let Some(data_source) = source.get_source(&sub.ticker, d, &config) {
-                let raw = match data_source.transport {
-                    CustomDataTransport::LocalFile => {
-                        std::fs::read_to_string(&data_source.uri).unwrap_or_default()
-                    }
-                    CustomDataTransport::Http => reqwest::blocking::Client::builder()
-                        .timeout(std::time::Duration::from_secs(120))
-                        .user_agent("Mozilla/5.0 (compatible; rlean/0.1)")
-                        .build()
-                        .and_then(|client| client.get(&data_source.uri).send())
-                        .and_then(|response| response.text())
-                        .unwrap_or_default(),
-                };
-                match data_source.format {
-                    CustomDataFormat::Csv => {
-                        for line in raw.lines() {
-                            if let Some(point) = source.reader(line, d, &config) {
-                                out.push(point);
-                            }
-                        }
-                    }
-                    CustomDataFormat::Json => {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-                            match value {
-                                serde_json::Value::Array(rows) => {
-                                    for row in rows {
-                                        if let Some(point) =
-                                            source.reader(&row.to_string(), d, &config)
-                                        {
-                                            out.push(point);
-                                        }
-                                    }
-                                }
-                                row => {
-                                    if let Some(point) = source.reader(&row.to_string(), d, &config)
-                                    {
-                                        out.push(point);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            d += chrono::Duration::days(1);
-        }
-        out.retain(|p| p.time >= start && p.time <= end);
-        Ok(out)
+        self.history_service()?
+            .load_custom_history_blocking(sub, start, end)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     fn resolve_symbol(&self, arg: &Bound<'_, PyAny>) -> PyResult<lean_core::Symbol> {
@@ -1663,26 +1541,35 @@ impl PyQcAlgorithm {
             "Expected Security, Symbol, OptionContract, or ticker string",
         ))
     }
-
-    /// Route a market order for an option symbol through the normal order manager.
-    /// LEAN submits the order first; the fill model handles executable market data.
-    fn option_market_order(&mut self, sym: lean_core::Symbol, quantity: Decimal) -> PyResult<()> {
-        if quantity == Decimal::ZERO {
-            return Ok(());
-        }
-        let mut alg = self.inner.lock().unwrap();
-        alg.ensure_option_security(&sym, Resolution::Minute);
-        alg.market_order(&sym, quantity);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lean_core::TickType;
     use lean_data::TradeBarData;
-    use lean_storage::{ParquetWriter, WriterConfig};
+    use lean_data_providers::{LocalHistoryProvider, StackedHistoryProvider};
+    use lean_storage::{custom_data_path, ParquetWriter, PathResolver, WriterConfig};
     use rust_decimal_macros::dec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StaticHistoryProvider {
+        bars: Vec<TradeBar>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl lean_data_providers::IHistoryProvider for StaticHistoryProvider {
+        async fn get_history(
+            &self,
+            request: &lean_data_providers::HistoryRequest,
+        ) -> anyhow::Result<Vec<TradeBar>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.resolution, Resolution::Daily);
+            assert_eq!(request.data_type, lean_data_providers::DataType::TradeBar);
+            Ok(self.bars.clone())
+        }
+    }
 
     #[test]
     fn algorithm_history_range_reads_equity_fixture_rows() {
@@ -1693,6 +1580,7 @@ mod tests {
         let security = alg.add_equity("SPY", PyResolution::Daily);
         alg.set_history_context(AlgorithmHistoryContext {
             data_root: tmp.path().to_path_buf(),
+            history_provider: None,
             custom_data_sources: Vec::new(),
         });
 
@@ -1744,6 +1632,130 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_history_range_uses_configured_history_provider() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut alg = PyQcAlgorithm::new();
+        let security = alg.add_equity("SPY", PyResolution::Daily);
+        let symbol = security.inner.inner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bars = vec![
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100.5), dec!(1000)),
+            ),
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(101), dec!(102), dec!(100), dec!(101.5), dec!(2000)),
+            ),
+        ];
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            history_provider: Some(Arc::new(StaticHistoryProvider {
+                bars,
+                calls: Arc::clone(&calls),
+            })),
+            custom_data_sources: Vec::new(),
+        });
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();
+            let start = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 3]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![100.5, 101.5]);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn algorithm_history_range_prefers_local_cache_before_provider() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let mut alg = PyQcAlgorithm::new();
+        let security = alg.add_equity("SPY", PyResolution::Daily);
+        let symbol = security.inner.inner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let local_bars = vec![
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(200), dec!(201), dec!(199), dec!(200.5), dec!(1000)),
+            ),
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(201), dec!(202), dec!(200), dec!(201.5), dec!(2000)),
+            ),
+        ];
+        let provider_bars = vec![TradeBar::new(
+            symbol.clone(),
+            date_to_datetime(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), 16, 0, 0),
+            lean_core::TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100.5), dec!(1000)),
+        )];
+        let writer = ParquetWriter::new(WriterConfig::default());
+        for bar in &local_bars {
+            let path = resolver.market_data_partition(
+                &symbol,
+                Resolution::Daily,
+                TickType::Trade,
+                bar.time.date_utc(),
+            );
+            writer
+                .write_trade_bars(std::slice::from_ref(bar), &path)
+                .unwrap();
+        }
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            history_provider: Some(Arc::new(StackedHistoryProvider::new(vec![
+                Arc::new(LocalHistoryProvider::new(tmp.path())),
+                Arc::new(StaticHistoryProvider {
+                    bars: provider_bars,
+                    calls: Arc::clone(&calls),
+                }),
+            ]))),
+            custom_data_sources: Vec::new(),
+        });
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();
+            let start = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 3]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![200.5, 201.5]);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn algorithm_history_range_reads_custom_subscription_cache_rows() {
         Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
@@ -1751,6 +1763,7 @@ mod tests {
         alg.add_data("fixture", "ALT", None, None).unwrap();
         alg.set_history_context(AlgorithmHistoryContext {
             data_root: tmp.path().to_path_buf(),
+            history_provider: None,
             custom_data_sources: Vec::new(),
         });
 
@@ -1816,6 +1829,7 @@ mod tests {
         alg.add_data("fixture", "ALT", None, None).unwrap();
         alg.set_history_context(AlgorithmHistoryContext {
             data_root: tmp.path().to_path_buf(),
+            history_provider: None,
             custom_data_sources: Vec::new(),
         });
 

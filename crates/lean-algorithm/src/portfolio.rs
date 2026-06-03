@@ -1,4 +1,8 @@
-use lean_core::{Price, Quantity, Symbol, SymbolOptionsExt};
+use chrono::{TimeZone, Timelike, Utc};
+use lean_core::{
+    DateTime, Market, NanosecondTimestamp, Price, Quantity, SecurityType, Symbol, SymbolOptionsExt,
+};
+use lean_data::MarginInterestRate;
 use lean_orders::Order;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
@@ -15,6 +19,43 @@ fn signum(d: Decimal) -> Decimal {
 }
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+const HOUR_NANOS: i64 = 3_600_000_000_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MarginInterestState {
+    next_application: Option<DateTime>,
+}
+
+fn next_hourly_funding_time(current_time: DateTime) -> DateTime {
+    NanosecondTimestamp(current_time.0.div_euclid(HOUR_NANOS) * HOUR_NANOS + HOUR_NANOS)
+}
+
+fn next_eight_hour_funding_time(current_time: DateTime) -> DateTime {
+    let dt = current_time.to_utc();
+    let date = dt.date_naive();
+    let next = if dt.hour() >= 16 {
+        date.succ_opt()
+            .expect("funding date overflow")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid midnight")
+    } else if dt.hour() >= 8 {
+        date.and_hms_opt(16, 0, 0).expect("valid funding time")
+    } else {
+        date.and_hms_opt(8, 0, 0).expect("valid funding time")
+    };
+    Utc.from_utc_datetime(&next).into()
+}
+
+fn next_funding_time(symbol: &Symbol, current_time: DateTime) -> DateTime {
+    if symbol.security_type() == SecurityType::CryptoFuture
+        && symbol.market().as_str() == Market::HYPERLIQUID
+    {
+        next_hourly_funding_time(current_time)
+    } else {
+        next_eight_hour_funding_time(current_time)
+    }
+}
 
 /// Tracks position in a single security.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +123,13 @@ impl SecurityHolding {
         self.get_quantity_value(self.quantity, self.last_price)
     }
 
+    pub fn portfolio_value_contribution(&self) -> Price {
+        match self.symbol.security_type() {
+            SecurityType::CryptoFuture => self.unrealized_pnl,
+            _ => self.market_value(),
+        }
+    }
+
     pub fn update_price(&mut self, price: Price) {
         self.last_price = price;
         self.unrealized_pnl =
@@ -130,6 +178,7 @@ pub struct SecurityPortfolioManager {
     pub cash: RwLock<Price>,
     pub starting_cash: Price,
     holdings: RwLock<HashMap<u64, SecurityHolding>>,
+    margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
 }
 
@@ -139,6 +188,7 @@ impl SecurityPortfolioManager {
             cash: RwLock::new(starting_cash),
             starting_cash,
             holdings: RwLock::new(HashMap::new()),
+            margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
         }
     }
@@ -172,7 +222,7 @@ impl SecurityPortfolioManager {
             .holdings
             .read()
             .values()
-            .map(|h| h.market_value())
+            .map(|h| h.portfolio_value_contribution())
             .sum();
         cash + holdings_value
     }
@@ -189,7 +239,7 @@ impl SecurityPortfolioManager {
         self.holdings
             .read()
             .values()
-            .map(|h| h.market_value())
+            .map(|h| h.portfolio_value_contribution())
             .sum()
     }
 
@@ -255,12 +305,62 @@ impl SecurityPortfolioManager {
             h.set_contract_multiplier(contract_multiplier);
         }
 
+        let realized_pnl_before = h.realized_pnl;
         h.apply_fill(fill_price, fill_quantity, fee);
 
-        // Update cash
-        let cash_delta = -(fill_price * fill_quantity * contract_multiplier) - fee;
+        let cash_delta = match symbol.security_type() {
+            SecurityType::CryptoFuture => (h.realized_pnl - realized_pnl_before) - fee,
+            _ => -(fill_price * fill_quantity * contract_multiplier) - fee,
+        };
         *self.cash.write() += cash_delta;
         *self.total_fees.write() += fee;
+    }
+
+    pub fn apply_margin_interest_rate(&self, rate: &MarginInterestRate) -> Option<Price> {
+        let mut holdings = self.holdings.write();
+        let holding = holdings.get_mut(&rate.symbol.id.sid)?;
+        if !holding.is_invested() || holding.last_price.is_zero() {
+            self.margin_interest_states
+                .write()
+                .remove(&rate.symbol.id.sid);
+            return None;
+        }
+
+        let mut states = self.margin_interest_states.write();
+        let state = states.entry(rate.symbol.id.sid).or_default();
+        let mut next_application = match state.next_application {
+            Some(time) => time,
+            None => {
+                let time = next_funding_time(&rate.symbol, rate.time);
+                state.next_application = Some(time);
+                time
+            }
+        };
+
+        if rate.time < next_application {
+            return None;
+        }
+
+        let position_value = holding.market_value();
+        let mut funding_cash_delta = Decimal::ZERO;
+        while rate.time >= next_application {
+            funding_cash_delta -= rate.interest_rate * position_value;
+            next_application = next_funding_time(&rate.symbol, next_application);
+        }
+        state.next_application = Some(next_application);
+
+        *self.cash.write() += funding_cash_delta;
+        Some(funding_cash_delta)
+    }
+
+    pub fn apply_margin_interest_rates<'a>(
+        &self,
+        rates: impl IntoIterator<Item = &'a MarginInterestRate>,
+    ) -> Price {
+        rates
+            .into_iter()
+            .filter_map(|rate| self.apply_margin_interest_rate(rate))
+            .sum()
     }
 
     pub fn settle_fill_without_cash(

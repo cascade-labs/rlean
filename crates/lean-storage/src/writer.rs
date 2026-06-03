@@ -3,7 +3,7 @@ use crate::{convert, schema, QueryParams};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use fs2::FileExt;
 use lean_core::{Result as LeanResult, TickType};
-use lean_data::{CustomDataPoint, QuoteBar, Tick, TradeBar};
+use lean_data::{CustomDataPoint, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
@@ -164,6 +164,72 @@ impl ParquetWriter {
         Ok(())
     }
 
+    /// Write margin interest / funding rate rows to a parquet file.
+    pub fn write_margin_interest_rates(
+        &self,
+        rates: &[MarginInterestRate],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if rates.is_empty() {
+            return Ok(());
+        }
+        self.ensure_dir(path)?;
+
+        let batch = convert::margin_interest_rates_to_record_batch(rates);
+        let schema = schema::margin_interest_rate_schema();
+
+        let file = fs::File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        writer
+            .write(&batch)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        writer
+            .close()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        debug!(
+            "Wrote {} margin interest rows to {}",
+            rates.len(),
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Write perpetual context rows to a parquet file.
+    pub fn write_perpetual_contexts(
+        &self,
+        contexts: &[PerpetualContext],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if contexts.is_empty() {
+            return Ok(());
+        }
+        self.ensure_dir(path)?;
+
+        let batch = convert::perpetual_contexts_to_record_batch(contexts);
+        let schema = schema::perpetual_context_schema();
+
+        let file = fs::File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        writer
+            .write(&batch)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        writer
+            .close()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        debug!(
+            "Wrote {} perpetual context rows to {}",
+            contexts.len(),
+            path.display()
+        );
+        Ok(())
+    }
+
     /// Merge trade bars into a daily all-symbol partition. Existing rows for
     /// symbols present in `bars` are replaced; all other symbols are preserved.
     pub fn merge_trade_bar_partition(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
@@ -249,6 +315,69 @@ impl ParquetWriter {
         dedupe_ticks(&mut merged);
         sort_ticks_for_predicate_pruning(&mut merged);
         self.write_ticks_atomic(&merged, path)
+    }
+
+    /// Merge margin-interest rows into a daily all-symbol partition.
+    pub fn merge_margin_interest_rate_partition(
+        &self,
+        rates: &[MarginInterestRate],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if rates.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_symbols: HashSet<String> =
+            rates.iter().map(|rate| rate.symbol.value.clone()).collect();
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_margin_interest_rate_partition(path, &rates[0].symbol, &Default::default())?
+                .into_iter()
+                .filter(|rate| !replacement_symbols.contains(&rate.symbol.value))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(rates);
+        merged.sort_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
+        merged.dedup_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
+        self.write_margin_interest_rates_atomic(&merged, path)
+    }
+
+    /// Merge perpetual context rows into a daily all-symbol partition.
+    pub fn merge_perpetual_context_partition(
+        &self,
+        contexts: &[PerpetualContext],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if contexts.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_symbols: HashSet<String> = contexts
+            .iter()
+            .map(|context| context.symbol.value.clone())
+            .collect();
+        if partition_has_all_perpetual_context_rows(path, contexts)? {
+            return Ok(());
+        }
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_perpetual_context_partition(path, &contexts[0].symbol, &Default::default())?
+                .into_iter()
+                .filter(|context| !replacement_symbols.contains(&context.symbol.value))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(contexts);
+        dedupe_perpetual_contexts(&mut merged);
+        sort_perpetual_contexts_for_predicate_pruning(&mut merged);
+        self.write_perpetual_contexts_atomic(&merged, path)
     }
 
     /// Write option EOD bars to a parquet file at the given path.
@@ -497,6 +626,28 @@ impl ParquetWriter {
         fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    fn write_margin_interest_rates_atomic(
+        &self,
+        rates: &[MarginInterestRate],
+        path: &Path,
+    ) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_margin_interest_rates(rates, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn write_perpetual_contexts_atomic(
+        &self,
+        contexts: &[PerpetualContext],
+        path: &Path,
+    ) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_perpetual_contexts(contexts, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 struct PartitionLock {
@@ -558,6 +709,37 @@ fn partition_has_all_quote_rows(path: &Path, bars: &[QuoteBar]) -> LeanResult<bo
     }))
 }
 
+fn partition_has_all_perpetual_context_rows(
+    path: &Path,
+    contexts: &[PerpetualContext],
+) -> LeanResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = crate::reader::ParquetReader::new().read_perpetual_context_partition(
+        path,
+        &contexts[0].symbol,
+        &Default::default(),
+    )?;
+    Ok(contexts.iter().all(|context| {
+        existing.iter().any(|existing| {
+            existing.symbol.id.sid == context.symbol.id.sid
+                && existing.time.0 == context.time.0
+                && existing.funding == context.funding
+                && existing.open_interest == context.open_interest
+                && existing.prev_day_px == context.prev_day_px
+                && existing.day_ntl_vlm == context.day_ntl_vlm
+                && existing.premium == context.premium
+                && existing.oracle_px == context.oracle_px
+                && existing.mark_px == context.mark_px
+                && existing.mid_px == context.mid_px
+                && existing.impact_bid_px == context.impact_bid_px
+                && existing.impact_ask_px == context.impact_ask_px
+                && existing.period == context.period
+        })
+    }))
+}
+
 fn partition_has_all_tick_rows(path: &Path, ticks: &[Tick]) -> LeanResult<bool> {
     if !path.exists() {
         return Ok(false);
@@ -584,6 +766,11 @@ fn dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
     bars.retain(|bar| seen.insert((bar.symbol.id.sid, bar.time.0)));
 }
 
+fn dedupe_perpetual_contexts(contexts: &mut Vec<PerpetualContext>) {
+    let mut seen = HashSet::new();
+    contexts.retain(|context| seen.insert((context.symbol.id.sid, context.time.0)));
+}
+
 fn dedupe_ticks(ticks: &mut Vec<Tick>) {
     let mut seen = HashSet::new();
     ticks.retain(|tick| seen.insert(TickStorageKey::from(tick)));
@@ -595,6 +782,10 @@ fn sort_trade_bars_for_predicate_pruning(bars: &mut [TradeBar]) {
 
 fn sort_quote_bars_for_predicate_pruning(bars: &mut [QuoteBar]) {
     bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+}
+
+fn sort_perpetual_contexts_for_predicate_pruning(contexts: &mut [PerpetualContext]) {
+    contexts.sort_by_key(|context| (context.symbol.id.sid, context.time.0));
 }
 
 fn sort_ticks_for_predicate_pruning(ticks: &mut [Tick]) {

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lean_core::Symbol;
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
 
 use crate::request::{
@@ -29,6 +29,22 @@ pub trait IHistoryProvider: Send + Sync {
         Ok(vec![])
     }
 
+    /// Fetch historical margin-interest/funding-rate data for the symbol.
+    async fn get_margin_interest_rates(
+        &self,
+        _request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<MarginInterestRate>> {
+        Ok(vec![])
+    }
+
+    /// Fetch historical perpetual context data for the symbol.
+    async fn get_perpetual_contexts(
+        &self,
+        _request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<PerpetualContext>> {
+        Ok(vec![])
+    }
+
     /// Fetch/cache a multi-symbol batch. Providers with true batch APIs should
     /// override this; the default keeps existing providers correct by fanning
     /// out over the single-symbol async methods.
@@ -54,6 +70,16 @@ pub trait IHistoryProvider: Send + Sync {
                 }
                 DataType::Tick | DataType::OpenInterest => {
                     batch.ticks.extend(self.get_ticks(&single).await?);
+                }
+                DataType::MarginInterestRate => {
+                    batch
+                        .margin_interest_rates
+                        .extend(self.get_margin_interest_rates(&single).await?);
+                }
+                DataType::PerpetualContext => {
+                    batch
+                        .perpetual_contexts
+                        .extend(self.get_perpetual_contexts(&single).await?);
                 }
             }
         }

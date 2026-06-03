@@ -29,6 +29,7 @@ pub use fee_model::{
     FlatFeeModel,
     FxcmFeeModel,
     GDAXFeeModel,
+    HyperliquidFeeModel,
     // Broker-specific
     InteractiveBrokersFeeModel,
     KrakenFeeModel,

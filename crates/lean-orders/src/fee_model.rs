@@ -551,6 +551,48 @@ impl FeeModel for BybitFeeModel {
 
 // ─── CharlesSchwabFeeModel ────────────────────────────────────────────────────
 
+// ─── HyperliquidFeeModel ─────────────────────────────────────────────────────
+
+/// Hyperliquid perpetual futures fee model.
+///
+/// Base tier perps fees: maker 0.015%, taker 0.045%. Fees are charged on
+/// notional value in the quote currency.
+pub struct HyperliquidFeeModel {
+    pub maker_fee: Decimal,
+    pub taker_fee: Decimal,
+}
+
+impl Default for HyperliquidFeeModel {
+    fn default() -> Self {
+        HyperliquidFeeModel {
+            maker_fee: dec!(0.00015),
+            taker_fee: dec!(0.00045),
+        }
+    }
+}
+
+impl HyperliquidFeeModel {
+    pub fn new(maker_fee: Decimal, taker_fee: Decimal) -> Self {
+        HyperliquidFeeModel {
+            maker_fee,
+            taker_fee,
+        }
+    }
+}
+
+impl FeeModel for HyperliquidFeeModel {
+    fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
+        let fee_rate = if is_maker(params.order) {
+            self.maker_fee
+        } else {
+            self.taker_fee
+        };
+        let notional =
+            params.order.abs_quantity() * params.security_price * params.contract_multiplier;
+        OrderFee::new(notional * fee_rate, &params.quote_currency)
+    }
+}
+
 /// Charles Schwab fee model.
 ///
 /// Equities: $0.

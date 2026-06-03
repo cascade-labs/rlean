@@ -15,7 +15,7 @@ use std::{
 
 use async_trait::async_trait;
 use lean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt};
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{OptionEodBar, OptionUniverseRow};
 use tracing::debug;
 
@@ -37,6 +37,8 @@ fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> b
         }
         DataType::QuoteBar => batch.quote_bars.is_empty(),
         DataType::Tick | DataType::OpenInterest => batch.ticks.is_empty(),
+        DataType::MarginInterestRate => batch.margin_interest_rates.is_empty(),
+        DataType::PerpetualContext => batch.perpetual_contexts.is_empty(),
     }
 }
 
@@ -197,6 +199,36 @@ impl IHistoryProvider for StackedHistoryProvider {
     async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
         for provider in &self.providers {
             match provider.get_ticks(request).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_margin_interest_rates(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<MarginInterestRate>> {
+        for provider in &self.providers {
+            match provider.get_margin_interest_rates(request).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_perpetual_contexts(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<PerpetualContext>> {
+        for provider in &self.providers {
+            match provider.get_perpetual_contexts(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,

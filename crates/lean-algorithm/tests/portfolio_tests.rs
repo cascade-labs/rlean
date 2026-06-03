@@ -1,5 +1,6 @@
 use lean_algorithm::portfolio::{SecurityHolding, SecurityPortfolioManager};
 use lean_core::{Market, NanosecondTimestamp, Symbol};
+use lean_data::MarginInterestRate;
 use lean_orders::{Order, OrderStatus};
 use rust_decimal_macros::dec;
 
@@ -24,6 +25,9 @@ fn spy() -> Symbol {
 }
 fn aapl() -> Symbol {
     Symbol::create_equity("AAPL", &Market::usa())
+}
+fn btc_perp() -> Symbol {
+    Symbol::create_crypto_future("BTC", &Market::hyperliquid())
 }
 
 // ─── SecurityHolding ─────────────────────────────────────────────────────────
@@ -155,6 +159,72 @@ fn portfolio_apply_fill_updates_cash() {
     pm.apply_fill(&order, dec!(100), dec!(100), dec!(0));
     // Bought 100 shares at $100 → cash reduced by $10,000
     assert_eq!(*pm.cash.read(), dec!(90_000));
+}
+
+#[test]
+fn crypto_future_fill_does_not_debit_notional_cash() {
+    let pm = SecurityPortfolioManager::new(dec!(100_000));
+    let symbol = btc_perp();
+
+    pm.apply_fill_with_multiplier(&symbol, dec!(100_000), dec!(1), dec!(45), dec!(1));
+
+    let holding = pm.get_holding(&symbol);
+    assert_eq!(holding.quantity, dec!(1));
+    assert_eq!(holding.market_value(), dec!(100_000));
+    assert_eq!(*pm.cash.read(), dec!(99_955));
+    assert_eq!(pm.total_portfolio_value(), dec!(99_955));
+}
+
+#[test]
+fn crypto_future_realized_pnl_and_funding_settle_to_cash() {
+    let pm = SecurityPortfolioManager::new(dec!(100_000));
+    let symbol = btc_perp();
+
+    pm.apply_fill_with_multiplier(&symbol, dec!(100_000), dec!(1), dec!(0), dec!(1));
+    pm.update_prices(&symbol, dec!(101_000));
+    assert_eq!(pm.total_portfolio_value(), dec!(101_000));
+
+    let initial_rate = MarginInterestRate::new(symbol.clone(), ts(), dec!(0.0001));
+    assert_eq!(pm.apply_margin_interest_rate(&initial_rate), None);
+    assert_eq!(*pm.cash.read(), dec!(100_000));
+
+    let hourly_rate = MarginInterestRate::new(
+        symbol.clone(),
+        NanosecondTimestamp::from_secs(3_600),
+        dec!(0.0001),
+    );
+    assert_eq!(
+        pm.apply_margin_interest_rate(&hourly_rate),
+        Some(dec!(-10.1000))
+    );
+    assert_eq!(*pm.cash.read(), dec!(99_989.9000));
+
+    pm.apply_fill_with_multiplier(&symbol, dec!(101_000), dec!(-1), dec!(0), dec!(1));
+    assert_eq!(*pm.cash.read(), dec!(100_989.9000));
+    assert_eq!(pm.total_portfolio_value(), dec!(100_989.9000));
+}
+
+#[test]
+fn binance_style_crypto_future_funding_uses_eight_hour_boundaries() {
+    let pm = SecurityPortfolioManager::new(dec!(100_000));
+    let symbol = Symbol::create_crypto_future("BTCUSDT", &Market::binance());
+
+    pm.apply_fill_with_multiplier(&symbol, dec!(100_000), dec!(1), dec!(0), dec!(1));
+    pm.update_prices(&symbol, dec!(100_000));
+
+    let rate_at_midnight = MarginInterestRate::new(symbol.clone(), ts(), dec!(0.0001));
+    assert_eq!(pm.apply_margin_interest_rate(&rate_at_midnight), None);
+
+    let rate_at_8h = MarginInterestRate::new(
+        symbol.clone(),
+        NanosecondTimestamp::from_secs(8 * 3_600),
+        dec!(0.0001),
+    );
+    assert_eq!(
+        pm.apply_margin_interest_rate(&rate_at_8h),
+        Some(dec!(-10.0000))
+    );
+    assert_eq!(*pm.cash.read(), dec!(99_990.0000));
 }
 
 #[test]

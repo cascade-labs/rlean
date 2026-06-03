@@ -16,7 +16,7 @@ use serde_json;
 use tracing::{debug, info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
-use lean_algorithm::qc_algorithm::OptionFilter;
+use lean_algorithm::{portfolio::SecurityPortfolioManager, qc_algorithm::OptionFilter};
 use lean_core::{
     exchange_hours::ExchangeHours, DataNormalizationMode, DateTime, Market, OptionRight,
     OptionStyle, Resolution, SecurityType, Symbol, SymbolOptionsExt, TickType, TimeSpan,
@@ -24,8 +24,9 @@ use lean_core::{
 use lean_data::split::SplitType;
 use lean_data::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSubscription,
-    CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, QuoteBar, Slice, Split,
-    SubscriptionDataConfig, SymbolChangedEvent, Tick, TradeBar, TradeBarData,
+    CustomDataTransport, Delisting, DelistingType, IHistoricalDataProvider, MarginInterestRate,
+    PerpetualContext, QuoteBar, Slice, Split, SubscriptionDataConfig, SymbolChangedEvent, Tick,
+    TradeBar, TradeBarData,
 };
 use lean_options::payoff::{get_exercise_quantity, intrinsic_value};
 use lean_options::{
@@ -33,13 +34,10 @@ use lean_options::{
     OptionContractData,
 };
 use lean_orders::{
-    fee_model::{FeeModel, InteractiveBrokersFeeModel, OrderFeeParameters},
-    fill_model::ImmediateFillModel,
-    order_event::OrderEvent,
-    order_processor::OrderProcessor,
+    fill_model::ImmediateFillModel, order_event::OrderEvent, order_processor::OrderProcessor,
     slippage::NullSlippageModel,
 };
-use lean_statistics::{PortfolioStatistics, Trade};
+use lean_statistics::{PortfolioStatistics, Trade, TradeBuilder};
 use lean_storage::{
     custom_data_history_path, custom_data_path, DataCache, FactorFileEntry, MapFileEntry,
     OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver, QueryParams,
@@ -86,6 +84,37 @@ fn resolve_backtest_end_date(
 struct SubscriptionReconciliation {
     new_subs: Vec<Arc<SubscriptionDataConfig>>,
     removed_subs: Vec<Arc<SubscriptionDataConfig>>,
+}
+
+fn settle_fill_event(
+    adapter: &PyAlgorithmAdapter,
+    portfolio: &Arc<SecurityPortfolioManager>,
+    order_processor: &OrderProcessor,
+    event: &OrderEvent,
+) {
+    if !event.is_fill() {
+        return;
+    }
+    let Some(order) = order_processor
+        .transaction_manager
+        .get_order(event.order_id)
+    else {
+        return;
+    };
+    let (fee, contract_multiplier) = {
+        let alg = adapter.inner.lock().unwrap();
+        (
+            alg.order_fee(&order, event.fill_price).amount,
+            alg.contract_multiplier_for_symbol(&order.symbol),
+        )
+    };
+    portfolio.apply_fill_with_multiplier(
+        &order.symbol,
+        event.fill_price,
+        event.fill_quantity,
+        fee,
+        contract_multiplier,
+    );
 }
 
 fn reconcile_runner_subscriptions(
@@ -549,6 +578,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             py,
             AlgorithmHistoryContext {
                 data_root: config.data_root.clone(),
+                history_provider: config.history_provider.clone(),
                 custom_data_sources: config.custom_data_sources.clone(),
             },
         )
@@ -721,6 +751,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
     if let Some(ref provider) = config.history_provider {
         ensure_auxiliary_files_for_subscriptions(
+            provider.clone(),
+            &subscriptions,
+            start_date,
+            end_date,
+            &resolver,
+        )
+        .await?;
+        pre_fetch_crypto_future_margin_interest_rates(
+            provider.clone(),
+            &subscriptions,
+            start_date,
+            end_date,
+            &resolver,
+        )
+        .await?;
+        pre_fetch_crypto_future_perpetual_contexts(
             provider.clone(),
             &subscriptions,
             start_date,
@@ -1022,9 +1068,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         map
     };
 
-    // Trade tracking: open_positions maps symbol SID → (entry_time, entry_price, quantity).
-    // When a fill closes a position we emit a completed Trade.
-    let mut open_positions: HashMap<u64, (DateTime, Decimal, Decimal)> = HashMap::new();
+    // TradeBuilder assembles completed round-trip trades from fills.
+    let mut trade_builder = TradeBuilder::new();
     let mut completed_trades: Vec<Trade> = Vec::new();
 
     // Collect all order events emitted during the backtest.
@@ -1277,6 +1322,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 );
                 if let Some(ref provider) = config.history_provider {
                     ensure_auxiliary_files_for_subscriptions(
+                        provider.clone(),
+                        &reconciliation.new_subs,
+                        current_date,
+                        end_date,
+                        &resolver,
+                    )
+                    .await?;
+                    pre_fetch_crypto_future_margin_interest_rates(
+                        provider.clone(),
+                        &reconciliation.new_subs,
+                        current_date,
+                        end_date,
+                        &resolver,
+                    )
+                    .await?;
+                    pre_fetch_crypto_future_perpetual_contexts(
                         provider.clone(),
                         &reconciliation.new_subs,
                         current_date,
@@ -1555,6 +1616,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
+            let day_margin_interest_rates = load_margin_interest_rates_for_date(
+                reader.as_ref(),
+                &resolver,
+                &subscriptions,
+                current_date,
+            )?;
+            let day_perpetual_contexts = load_perpetual_contexts_for_date(
+                reader.as_ref(),
+                &resolver,
+                &subscriptions,
+                current_date,
+            )?;
+
             let (
                 option_subs,
                 option_filters,
@@ -1675,6 +1749,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     all_timestamps.insert(tick.time.0);
                 }
             }
+            for rates in day_margin_interest_rates.values() {
+                for rate in rates {
+                    all_timestamps.insert(rate.time.0);
+                }
+            }
+            for contexts in day_perpetual_contexts.values() {
+                for context in contexts {
+                    all_timestamps.insert(context.time.0);
+                }
+            }
             for runtime in &option_runtimes {
                 all_timestamps.extend(runtime.timestamps());
             }
@@ -1721,6 +1805,26 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                     ticks_by_ts.insert(sid, ts_map);
                 }
+                let mut margin_interest_by_ts: HashMap<i64, Vec<MarginInterestRate>> =
+                    HashMap::new();
+                for rates in day_margin_interest_rates.values() {
+                    for rate in rates {
+                        margin_interest_by_ts
+                            .entry(rate.time.0)
+                            .or_default()
+                            .push(rate.clone());
+                    }
+                }
+                let mut perpetual_context_by_ts: HashMap<i64, Vec<PerpetualContext>> =
+                    HashMap::new();
+                for contexts in day_perpetual_contexts.values() {
+                    for context in contexts {
+                        perpetual_context_by_ts
+                            .entry(context.time.0)
+                            .or_default()
+                            .push(context.clone());
+                    }
+                }
 
                 let mut option_chains_seeded = false;
                 let mut custom_data_seeded = false;
@@ -1740,10 +1844,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &option_underlying_sids,
                             &portfolio,
                             &order_processor,
-                            &mut open_positions,
+                            &mut trade_builder,
                         );
                         for split in &day_split_events {
                             minute_slice.add_split(split.clone());
+                        }
+                    }
+
+                    if let Some(rates) = margin_interest_by_ts.get(&ts_ns) {
+                        for rate in rates {
+                            portfolio.apply_margin_interest_rate(rate);
+                            minute_slice.add_margin_interest_rate(rate.clone());
+                        }
+                    }
+
+                    if let Some(contexts) = perpetual_context_by_ts.get(&ts_ns) {
+                        for context in contexts {
+                            minute_slice.add_perpetual_context(context.clone());
                         }
                     }
 
@@ -1980,6 +2097,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             minute_slice.bars.remove(sid);
                             minute_slice.quote_bars.remove(sid);
                             minute_slice.ticks.remove(sid);
+                            minute_slice.margin_interest_rates.remove(sid);
                             minute_quote_bars.remove(sid);
                             minute_ticks.remove(sid);
                             bars_for_orders.remove(sid);
@@ -1987,6 +2105,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         minute_slice.has_data = !minute_slice.bars.is_empty()
                             || !minute_slice.quote_bars.is_empty()
                             || !minute_slice.ticks.is_empty()
+                            || !minute_slice.margin_interest_rates.is_empty()
                             || !minute_slice.dividends.is_empty()
                             || !minute_slice.splits.is_empty()
                             || !minute_slice.delistings.is_empty()
@@ -2021,6 +2140,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                     if let Some(ref provider) = config.history_provider {
                         ensure_auxiliary_files_for_subscriptions(
+                            provider.clone(),
+                            &new_subs,
+                            current_date,
+                            end_date,
+                            &resolver,
+                        )
+                        .await?;
+                        pre_fetch_crypto_future_margin_interest_rates(
+                            provider.clone(),
+                            &new_subs,
+                            current_date,
+                            end_date,
+                            &resolver,
+                        )
+                        .await?;
+                        pre_fetch_crypto_future_perpetual_contexts(
                             provider.clone(),
                             &new_subs,
                             current_date,
@@ -2210,78 +2345,27 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     // market orders carried into a new bar: portfolio state is
                     // updated from executable market data before alpha/portfolio
                     // construction can emit new targets.
-                    let pre_existing_fill_events =
-                        order_processor.process_orders(&bars_for_orders, utc_time);
+                    let pre_existing_fill_events = order_processor.process_orders_with_quotes(
+                        &bars_for_orders,
+                        &minute_quote_bars,
+                        utc_time,
+                    );
                     all_order_events.extend(pre_existing_fill_events.iter().cloned());
                     if let Some(writer) = &live_writer {
                         writer.append_order_events(&pre_existing_fill_events);
                     }
-                    let ib_fee_model = InteractiveBrokersFeeModel::default();
                     for event in &pre_existing_fill_events {
                         if event.is_fill() {
-                            if let Some(order) = order_processor
-                                .transaction_manager
-                                .get_order(event.order_id)
-                            {
-                                let fee = ib_fee_model
-                                    .get_order_fee(&OrderFeeParameters::equity(
-                                        &order,
-                                        event.fill_price,
-                                    ))
-                                    .amount;
-                                let contract_multiplier = adapter
-                                    .inner
-                                    .lock()
-                                    .unwrap()
-                                    .securities
-                                    .get(&order.symbol)
-                                    .and_then(|sec| {
-                                        Decimal::from_f64_retain(
-                                            sec.symbol_properties.contract_multiplier,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        if order.symbol.option_symbol_id().is_some() {
-                                            rust_decimal_macros::dec!(100)
-                                        } else {
-                                            Decimal::ONE
-                                        }
-                                    });
-                                portfolio.apply_fill_with_multiplier(
-                                    &order.symbol,
-                                    event.fill_price,
-                                    event.fill_quantity,
-                                    fee,
-                                    contract_multiplier,
-                                );
-                            }
-                            let sid = event.symbol.id.sid;
-                            let fill_qty = event.fill_quantity;
-                            if let Some((entry_time, entry_price, open_qty)) =
-                                open_positions.remove(&sid)
-                            {
-                                let close_qty = if open_qty < Decimal::ZERO {
-                                    -open_qty.abs().min(fill_qty.abs())
-                                } else {
-                                    open_qty.abs().min(fill_qty.abs())
-                                };
-                                let trade = Trade::new(
-                                    event.symbol.clone(),
-                                    entry_time,
-                                    event.utc_time,
-                                    entry_price,
-                                    event.fill_price,
-                                    close_qty,
-                                    rust_decimal_macros::dec!(0),
-                                );
-                                if let Some(writer) = &live_writer {
-                                    writer.append_trades(std::slice::from_ref(&trade));
-                                }
-                                completed_trades.push(trade);
-                            } else {
-                                open_positions
-                                    .insert(sid, (event.utc_time, event.fill_price, fill_qty));
-                            }
+                            settle_fill_event(&adapter, &portfolio, &order_processor, event);
+                            record_trade_fill(
+                                &event.symbol,
+                                event.utc_time,
+                                event.fill_price,
+                                event.fill_quantity,
+                                &mut trade_builder,
+                                &mut completed_trades,
+                                live_writer.as_ref(),
+                            );
                         }
                         adapter.on_order_event(event);
                     }
@@ -2291,6 +2375,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             slice_proxy.update_option_chains(py, chains_snapshot);
                         }
                         slice_proxy.update_quote_bars(py, &minute_quote_bars);
+                        slice_proxy.update_margin_interest_rates(py, &minute_slice);
+                        slice_proxy.update_perpetual_contexts(py, &minute_slice);
                         slice_proxy.update_ticks(py, &minute_ticks);
                         if let Some(custom_data_for_slice) = custom_data_for_slice.as_ref() {
                             slice_proxy.update_custom_data(py, custom_data_for_slice);
@@ -2329,77 +2415,27 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                     }
 
-                    let fill_events = order_processor.process_orders(&bars_for_orders, utc_time);
+                    let fill_events = order_processor.process_orders_with_quotes(
+                        &bars_for_orders,
+                        &minute_quote_bars,
+                        utc_time,
+                    );
                     all_order_events.extend(fill_events.iter().cloned());
                     if let Some(writer) = &live_writer {
                         writer.append_order_events(&fill_events);
                     }
-                    let ib_fee_model = InteractiveBrokersFeeModel::default();
                     for event in &fill_events {
                         if event.is_fill() {
-                            if let Some(order) = order_processor
-                                .transaction_manager
-                                .get_order(event.order_id)
-                            {
-                                let fee = ib_fee_model
-                                    .get_order_fee(&OrderFeeParameters::equity(
-                                        &order,
-                                        event.fill_price,
-                                    ))
-                                    .amount;
-                                let contract_multiplier = adapter
-                                    .inner
-                                    .lock()
-                                    .unwrap()
-                                    .securities
-                                    .get(&order.symbol)
-                                    .and_then(|sec| {
-                                        Decimal::from_f64_retain(
-                                            sec.symbol_properties.contract_multiplier,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        if order.symbol.option_symbol_id().is_some() {
-                                            rust_decimal_macros::dec!(100)
-                                        } else {
-                                            Decimal::ONE
-                                        }
-                                    });
-                                portfolio.apply_fill_with_multiplier(
-                                    &order.symbol,
-                                    event.fill_price,
-                                    event.fill_quantity,
-                                    fee,
-                                    contract_multiplier,
-                                );
-                            }
-                            let sid = event.symbol.id.sid;
-                            let fill_qty = event.fill_quantity;
-                            if let Some((entry_time, entry_price, open_qty)) =
-                                open_positions.remove(&sid)
-                            {
-                                let close_qty = if open_qty < Decimal::ZERO {
-                                    -open_qty.abs().min(fill_qty.abs())
-                                } else {
-                                    open_qty.abs().min(fill_qty.abs())
-                                };
-                                let trade = Trade::new(
-                                    event.symbol.clone(),
-                                    entry_time,
-                                    event.utc_time,
-                                    entry_price,
-                                    event.fill_price,
-                                    close_qty,
-                                    rust_decimal_macros::dec!(0),
-                                );
-                                if let Some(writer) = &live_writer {
-                                    writer.append_trades(std::slice::from_ref(&trade));
-                                }
-                                completed_trades.push(trade);
-                            } else {
-                                open_positions
-                                    .insert(sid, (event.utc_time, event.fill_price, fill_qty));
-                            }
+                            settle_fill_event(&adapter, &portfolio, &order_processor, event);
+                            record_trade_fill(
+                                &event.symbol,
+                                event.utc_time,
+                                event.fill_price,
+                                event.fill_quantity,
+                                &mut trade_builder,
+                                &mut completed_trades,
+                                live_writer.as_ref(),
+                            );
                         }
                         adapter.on_order_event(event);
                     }
@@ -2494,6 +2530,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 &resolver,
                             )
                             .await?;
+                            pre_fetch_crypto_future_margin_interest_rates(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
+                            pre_fetch_crypto_future_perpetual_contexts(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
                         }
                         load_factor_rows_into_map(
                             &factor_reader,
@@ -2563,6 +2615,22 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 &resolver,
                             )
                             .await?;
+                            pre_fetch_crypto_future_margin_interest_rates(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
+                            pre_fetch_crypto_future_perpetual_contexts(
+                                provider.clone(),
+                                std::slice::from_ref(sub),
+                                start_date,
+                                end_date,
+                                &resolver,
+                            )
+                            .await?;
                         }
                         load_factor_rows_into_map(
                             &factor_reader,
@@ -2606,7 +2674,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 &option_underlying_sids,
                 &portfolio,
                 &order_processor,
-                &mut open_positions,
+                &mut trade_builder,
             );
             let split_ratios_today: HashMap<u64, f64> = day_split_events
                 .iter()
@@ -2647,6 +2715,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
+            let day_margin_interest_rates = load_margin_interest_rates_for_date(
+                reader.as_ref(),
+                &resolver,
+                &subscriptions,
+                current_date,
+            )?;
+            for rates in day_margin_interest_rates.values() {
+                for rate in rates {
+                    portfolio.apply_margin_interest_rate(rate);
+                    slice.add_margin_interest_rate(rate.clone());
+                }
+            }
+
             if !slice.has_data {
                 current_date += chrono::Duration::days(1);
                 continue;
@@ -2665,78 +2746,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             trading_days += 1;
 
-            let bars_map: HashMap<u64, lean_data::TradeBar> =
-                slice.bars.iter().map(|(&k, v)| (k, v.clone())).collect();
-
-            let fill_events = order_processor.process_orders(&bars_map, utc_time);
-            all_order_events.extend(fill_events.iter().cloned());
-            if let Some(writer) = &live_writer {
-                writer.append_order_events(&fill_events);
-            }
-            let ib_fee_model = InteractiveBrokersFeeModel::default();
-            for event in &fill_events {
-                if event.is_fill() {
-                    if let Some(order) = order_processor
-                        .transaction_manager
-                        .get_order(event.order_id)
-                    {
-                        let fee = ib_fee_model
-                            .get_order_fee(&OrderFeeParameters::equity(&order, event.fill_price))
-                            .amount;
-                        let contract_multiplier = adapter
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .securities
-                            .get(&order.symbol)
-                            .and_then(|sec| {
-                                Decimal::from_f64_retain(sec.symbol_properties.contract_multiplier)
-                            })
-                            .unwrap_or_else(|| {
-                                if order.symbol.option_symbol_id().is_some() {
-                                    rust_decimal_macros::dec!(100)
-                                } else {
-                                    Decimal::ONE
-                                }
-                            });
-                        portfolio.apply_fill_with_multiplier(
-                            &order.symbol,
-                            event.fill_price,
-                            event.fill_quantity,
-                            fee,
-                            contract_multiplier,
-                        );
-                    }
-
-                    let sid = event.symbol.id.sid;
-                    let fill_qty = event.fill_quantity;
-                    if let Some((entry_time, entry_price, open_qty)) = open_positions.remove(&sid) {
-                        let close_qty = if open_qty < Decimal::ZERO {
-                            -open_qty.abs().min(fill_qty.abs())
-                        } else {
-                            open_qty.abs().min(fill_qty.abs())
-                        };
-                        let trade = Trade::new(
-                            event.symbol.clone(),
-                            entry_time,
-                            event.utc_time,
-                            entry_price,
-                            event.fill_price,
-                            close_qty,
-                            rust_decimal_macros::dec!(0),
-                        );
-                        if let Some(writer) = &live_writer {
-                            writer.append_trades(std::slice::from_ref(&trade));
-                        }
-                        completed_trades.push(trade);
-                    } else {
-                        open_positions.insert(sid, (event.utc_time, event.fill_price, fill_qty));
-                    }
-                }
-                adapter.on_order_event(event);
-            }
-
             // Build option chains before calling on_data.
+            let pending_option_order_sids: HashSet<u64> = order_processor
+                .transaction_manager
+                .get_open_orders()
+                .into_iter()
+                .filter(|order| order.symbol.option_symbol_id().is_some())
+                .map(|order| order.symbol.id.sid)
+                .collect();
+            let mut option_order_bars: HashMap<u64, lean_data::TradeBar> = HashMap::new();
             {
                 let (option_subs, option_filters, open_option_symbols): (
                     Vec<Symbol>,
@@ -2757,6 +2775,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
                 for canonical in &option_subs {
                     let underlying_ticker = canonical.permtick.trim_start_matches('?');
+                    let underlying_sym: Symbol = canonical
+                        .underlying
+                        .as_ref()
+                        .map(|u| *u.clone())
+                        .unwrap_or_else(|| canonical.clone());
                     let spot = {
                         adapter
                             .inner
@@ -2769,29 +2792,40 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             .unwrap_or(Decimal::ZERO)
                     };
 
-                    let chain = {
-                        let ticker = underlying_ticker.to_uppercase();
-                        let bars = load_option_eod_bars(
-                            &config.data_root,
-                            &ticker,
-                            current_date,
-                            config.history_provider.as_ref(),
-                        )
-                        .await;
-                        if !bars.is_empty() {
-                            let held_contracts =
-                                option_contracts_for_canonical(&open_option_symbols, canonical);
-                            build_option_chain_from_eod_bars(
-                                canonical,
-                                spot,
-                                utc_time,
-                                &bars,
-                                option_filters.get(&canonical.permtick).copied(),
-                                &held_contracts,
-                            )
-                        } else {
-                            OptionChain::new(canonical.clone(), spot)
+                    let ticker = underlying_ticker.to_uppercase();
+                    let bars = load_option_eod_bars(
+                        &config.data_root,
+                        &ticker,
+                        current_date,
+                        config.history_provider.as_ref(),
+                    )
+                    .await;
+                    if !pending_option_order_sids.is_empty() {
+                        for bar in &bars {
+                            let Some(symbol) = option_eod_bar_symbol(bar, &underlying_sym) else {
+                                continue;
+                            };
+                            if pending_option_order_sids.contains(&symbol.id.sid) {
+                                option_order_bars.insert(
+                                    symbol.id.sid,
+                                    option_eod_bar_to_trade_bar(bar, symbol, utc_time),
+                                );
+                            }
                         }
+                    };
+                    let chain = if !bars.is_empty() {
+                        let held_contracts =
+                            option_contracts_for_canonical(&open_option_symbols, canonical);
+                        build_option_chain_from_eod_bars(
+                            canonical,
+                            spot,
+                            utc_time,
+                            &bars,
+                            option_filters.get(&canonical.permtick).copied(),
+                            &held_contracts,
+                        )
+                    } else {
+                        OptionChain::new(canonical.clone(), spot)
                     };
                     chains_for_day.push((canonical.permtick.clone(), chain));
                 }
@@ -2814,6 +2848,32 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 .map(|(permtick, chain)| (permtick.as_str(), chain))
                 .collect();
             sync_option_holdings_to_chain_prices(&adapter, &portfolio, &chains_snapshot_refs);
+
+            let mut bars_map: HashMap<u64, lean_data::TradeBar> =
+                slice.bars.iter().map(|(&k, v)| (k, v.clone())).collect();
+            bars_map.extend(option_order_bars);
+
+            let fill_events = order_processor.process_orders(&bars_map, utc_time);
+            all_order_events.extend(fill_events.iter().cloned());
+            if let Some(writer) = &live_writer {
+                writer.append_order_events(&fill_events);
+            }
+            for event in &fill_events {
+                if event.is_fill() {
+                    settle_fill_event(&adapter, &portfolio, &order_processor, event);
+
+                    record_trade_fill(
+                        &event.symbol,
+                        event.utc_time,
+                        event.fill_price,
+                        event.fill_quantity,
+                        &mut trade_builder,
+                        &mut completed_trades,
+                        live_writer.as_ref(),
+                    );
+                }
+                adapter.on_order_event(event);
+            }
 
             // ── Custom data fetch (daily) ─────────────────────────────────
             let custom_subs: Vec<CustomDataSubscription> = {
@@ -2925,6 +2985,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             Python::attach(|py| {
                 slice_proxy.update_option_chains(py, &chains_snapshot_refs);
                 slice_proxy.update_quote_bars(py, &HashMap::new());
+                slice_proxy.update_perpetual_contexts(py, &slice);
                 slice_proxy.update_ticks(py, &HashMap::new());
                 slice_proxy.update_custom_data(py, &custom_data_for_day);
                 adapter.on_data_proxy(py, &slice_proxy, &slice);
@@ -3248,6 +3309,13 @@ async fn pre_fetch_high_resolution_day_batched(
         if !sub.resolution.is_high_resolution() || !is_expected_market_date(&sub.symbol, date) {
             continue;
         }
+        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
+            debug!(
+                "Skipping optional Hyperliquid quote-bar fetch for {}; trade bars provide candleSnapshot history",
+                sub.symbol.value
+            );
+            continue;
+        }
 
         if matches!(sub.symbol.security_type(), SecurityType::Equity) {
             if let Some(ref fp) = factor_provider {
@@ -3262,20 +3330,25 @@ async fn pre_fetch_high_resolution_day_batched(
             }
         }
 
-        let ticker = sub.symbol.permtick.to_lowercase();
-        let market = sub.symbol.market().as_str().to_lowercase();
-        let map_path = resolver
-            .data_root
-            .join("equity")
-            .join(&market)
-            .join("map_files")
-            .join(format!("{ticker}.parquet"));
+        let map_rows = if matches!(sub.symbol.security_type(), SecurityType::Equity) {
+            let ticker = sub.symbol.permtick.to_lowercase();
+            let market = sub.symbol.market().as_str().to_lowercase();
+            let map_path = resolver
+                .data_root
+                .join("equity")
+                .join(&market)
+                .join("map_files")
+                .join(format!("{ticker}.parquet"));
 
-        let reader = ParquetReader::new();
-        let map_rows = reader.read_map_file(&map_path).unwrap_or_default();
-        if mapped_data_date_range(&map_rows, date, date).is_none() {
-            continue;
-        }
+            let reader = ParquetReader::new();
+            let rows = reader.read_map_file(&map_path).unwrap_or_default();
+            if mapped_data_date_range(&rows, date, date).is_none() {
+                continue;
+            }
+            rows
+        } else {
+            Vec::new()
+        };
 
         let requested_symbol = sub.symbol.clone();
         let provider_symbol = mapped_symbol_for_provider(sub.symbol.clone(), &map_rows, date);
@@ -3358,6 +3431,22 @@ async fn pre_fetch_high_resolution_day_batched(
                 rows_downloaded += batch.ticks.len();
                 batch.ticks.iter().map(|tick| tick.symbol.id.sid).collect()
             }
+            DataType::MarginInterestRate => {
+                rows_downloaded += batch.margin_interest_rates.len();
+                batch
+                    .margin_interest_rates
+                    .iter()
+                    .map(|rate| rate.symbol.id.sid)
+                    .collect()
+            }
+            DataType::PerpetualContext => {
+                rows_downloaded += batch.perpetual_contexts.len();
+                batch
+                    .perpetual_contexts
+                    .iter()
+                    .map(|context| context.symbol.id.sid)
+                    .collect()
+            }
             DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => HashSet::new(),
         };
 
@@ -3398,6 +3487,8 @@ async fn pre_fetch_high_resolution_day_batched(
             DataType::TradeBar => retry_batch.trade_bars.len(),
             DataType::QuoteBar => retry_batch.quote_bars.len(),
             DataType::Tick => retry_batch.ticks.len(),
+            DataType::MarginInterestRate => retry_batch.margin_interest_rates.len(),
+            DataType::PerpetualContext => retry_batch.perpetual_contexts.len(),
             DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => 0,
         };
     }
@@ -3413,6 +3504,7 @@ async fn pre_fetch_subscription(
     end: NaiveDate,
     resolver: PathResolver,
 ) -> Result<()> {
+    let is_equity = matches!(sub.symbol.security_type(), SecurityType::Equity);
     let ticker = sub.symbol.permtick.to_lowercase();
     let market = sub.symbol.market().as_str().to_lowercase();
     let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
@@ -3429,7 +3521,7 @@ async fn pre_fetch_subscription(
         .join("map_files")
         .join(format!("{ticker}.parquet"));
 
-    if !map_path.exists() {
+    if is_equity && !map_path.exists() {
         if let Some(ref fp) = factor_provider {
             debug!(
                 "Map file missing for {} — requesting from provider",
@@ -3454,9 +3546,13 @@ async fn pre_fetch_subscription(
         }
     }
 
-    let map_rows = ParquetReader::new()
-        .read_map_file(&map_path)
-        .unwrap_or_default();
+    let map_rows = if is_equity {
+        ParquetReader::new()
+            .read_map_file(&map_path)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let effective_range = mapped_data_date_range(&map_rows, start, end);
     let Some((mapped_start, mapped_end)) = effective_range else {
         debug!(
@@ -3471,11 +3567,12 @@ async fn pre_fetch_subscription(
     // Older rlean/Massive builds could write sentinel-only files for a narrow
     // later request; accepting those for a longer backtest skips historical
     // splits such as DPST's 2023-06-05 reverse split.
-    let factor_valid = factor_path.exists() && {
-        let r = ParquetReader::new();
-        r.read_factor_file(&factor_path)
-            .is_ok_and(|rows| factor_file_covers_range(&rows, mapped_start, mapped_end))
-    };
+    let factor_valid = !is_equity
+        || factor_path.exists() && {
+            let r = ParquetReader::new();
+            r.read_factor_file(&factor_path)
+                .is_ok_and(|rows| factor_file_covers_range(&rows, mapped_start, mapped_end))
+        };
 
     let data_covers_range =
         local_data_covers_range(&sub, mapped_start, mapped_end, &resolver).await;
@@ -3560,12 +3657,13 @@ async fn pre_fetch_subscription(
         );
     }
 
-    let factor_needs_update = !factor_path.exists() || {
-        let r = ParquetReader::new();
-        r.read_factor_file(&factor_path)
-            .map(|rows| !factor_file_covers_range(&rows, mapped_start, mapped_end))
-            .unwrap_or(true)
-    };
+    let factor_needs_update = is_equity
+        && (!factor_path.exists() || {
+            let r = ParquetReader::new();
+            r.read_factor_file(&factor_path)
+                .map(|rows| !factor_file_covers_range(&rows, mapped_start, mapped_end))
+                .unwrap_or(true)
+        });
     if factor_needs_update {
         if let Some(ref fp) = factor_provider {
             debug!(
@@ -3636,6 +3734,13 @@ async fn pre_fetch_missing_high_resolution_days(
     }
 
     if missing.is_empty() {
+        return Ok(0);
+    }
+    if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
+        debug!(
+            "Skipping optional Hyperliquid quote-bar fetch for {}; trade bars provide candleSnapshot history",
+            sub.symbol.value
+        );
         return Ok(0);
     }
 
@@ -3874,6 +3979,9 @@ fn cached_partition_has_symbol_data(
 ) -> bool {
     let path = subscription_data_path(resolver, sub, date);
     if !path.exists() {
+        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
+            return cached_trade_bar_partition_has_symbol_data(reader, resolver, sub, date);
+        }
         return false;
     }
 
@@ -3889,14 +3997,45 @@ fn cached_partition_has_symbol_data(
             .read_tick_partition(&path, &sub.symbol, &params)
             .is_ok_and(|rows| !rows.is_empty())
     } else if sub.tick_type == TickType::Quote {
-        reader
+        let has_quote_bars = reader
             .read_quote_bar_partition(&path, &sub.symbol, &params)
-            .is_ok_and(|rows| !rows.is_empty())
+            .is_ok_and(|rows| !rows.is_empty());
+        has_quote_bars
+            || hyperliquid_crypto_future_quote_bars_are_optional(sub)
+                && cached_trade_bar_partition_has_symbol_data(reader, resolver, sub, date)
     } else {
         reader
             .read_trade_bar_partition(&path, &sub.symbol, &params)
             .is_ok_and(|rows| !rows.is_empty())
     }
+}
+
+fn hyperliquid_crypto_future_quote_bars_are_optional(sub: &SubscriptionDataConfig) -> bool {
+    sub.tick_type == TickType::Quote
+        && sub.resolution != Resolution::Tick
+        && sub.symbol.security_type() == SecurityType::CryptoFuture
+        && sub.symbol.market().as_str() == Market::HYPERLIQUID
+}
+
+fn cached_trade_bar_partition_has_symbol_data(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    sub: &SubscriptionDataConfig,
+    date: NaiveDate,
+) -> bool {
+    let path = resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
+    if !path.exists() {
+        return false;
+    }
+    let params = QueryParams::new()
+        .with_time_range(
+            date_to_datetime(date, 0, 0, 0),
+            date_to_datetime(date, 23, 59, 59),
+        )
+        .with_symbols(vec![sub.symbol.id.sid]);
+    reader
+        .read_trade_bar_partition(&path, &sub.symbol, &params)
+        .is_ok_and(|rows| !rows.is_empty())
 }
 
 fn cached_partition_has_symbol_sid(
@@ -3908,6 +4047,15 @@ fn cached_partition_has_symbol_sid(
 ) -> bool {
     let path = subscription_data_path(resolver, sub, date);
     if !path.exists() {
+        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
+            return cached_trade_bar_partition_has_symbol_sid(
+                reader,
+                resolver,
+                sub,
+                date,
+                partition_sid_cache,
+            );
+        }
         return false;
     }
 
@@ -3919,6 +4067,35 @@ fn cached_partition_has_symbol_sid(
     let sids = partition_sid_cache.entry(path.clone()).or_insert_with(|| {
         reader
             .read_partition_symbol_sids(&path, symbol_sid_column)
+            .unwrap_or_default()
+    });
+    if sids.contains(&sub.symbol.id.sid) {
+        return true;
+    }
+    hyperliquid_crypto_future_quote_bars_are_optional(sub)
+        && cached_trade_bar_partition_has_symbol_sid(
+            reader,
+            resolver,
+            sub,
+            date,
+            partition_sid_cache,
+        )
+}
+
+fn cached_trade_bar_partition_has_symbol_sid(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    sub: &SubscriptionDataConfig,
+    date: NaiveDate,
+    partition_sid_cache: &mut HashMap<PathBuf, HashSet<u64>>,
+) -> bool {
+    let path = resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
+    if !path.exists() {
+        return false;
+    }
+    let sids = partition_sid_cache.entry(path.clone()).or_insert_with(|| {
+        reader
+            .read_partition_symbol_sids(&path, 2)
             .unwrap_or_default()
     });
     sids.contains(&sub.symbol.id.sid)
@@ -4049,9 +4226,182 @@ fn is_expected_market_date(symbol: &Symbol, date: NaiveDate) -> bool {
             let dow = date.weekday().num_days_from_sunday() as usize;
             hours.schedule[dow].is_open() && !hours.holidays.contains(&date)
         }
-        SecurityType::Crypto => true,
+        SecurityType::Crypto | SecurityType::CryptoFuture => true,
         _ => !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun),
     }
+}
+
+fn crypto_future_symbols(subscriptions: &[Arc<SubscriptionDataConfig>]) -> Vec<Symbol> {
+    let mut seen = HashSet::new();
+    let mut symbols = Vec::new();
+    for sub in subscriptions {
+        if sub.symbol.security_type() == SecurityType::CryptoFuture
+            && seen.insert(sub.symbol.id.sid)
+        {
+            symbols.push(sub.symbol.clone());
+        }
+    }
+    symbols
+}
+
+async fn pre_fetch_crypto_future_margin_interest_rates(
+    provider: Arc<dyn lean_data_providers::IHistoryProvider>,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: &PathResolver,
+) -> Result<usize> {
+    let mut rows = 0usize;
+    let reader = ParquetReader::new();
+    for symbol in crypto_future_symbols(subscriptions) {
+        let dates = expected_market_dates(&symbol, start, end);
+        if dates.iter().all(|date| {
+            margin_interest_partition_has_symbol_data(&reader, resolver, &symbol, *date)
+        }) {
+            continue;
+        }
+        let request = lean_data_providers::HistoryRequest {
+            symbol: symbol.clone(),
+            resolution: Resolution::Hour,
+            start: date_to_datetime(start, 0, 0, 0),
+            end: date_to_datetime(end, 23, 59, 59),
+            data_type: DataType::MarginInterestRate,
+        };
+        let fetched = provider.get_margin_interest_rates(&request).await?;
+        rows += fetched.len();
+    }
+    Ok(rows)
+}
+
+async fn pre_fetch_crypto_future_perpetual_contexts(
+    provider: Arc<dyn lean_data_providers::IHistoryProvider>,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    start: NaiveDate,
+    end: NaiveDate,
+    resolver: &PathResolver,
+) -> Result<usize> {
+    let mut rows = 0usize;
+    let reader = ParquetReader::new();
+    let mut missing_symbols = Vec::new();
+    for symbol in crypto_future_symbols(subscriptions) {
+        let dates = expected_market_dates(&symbol, start, end);
+        if dates.iter().all(|date| {
+            perpetual_context_partition_has_symbol_data(&reader, resolver, &symbol, *date)
+        }) {
+            continue;
+        }
+        missing_symbols.push(symbol);
+    }
+    if !missing_symbols.is_empty() {
+        let request = lean_data_providers::HistoryBatchRequest {
+            symbols: missing_symbols,
+            resolution: Resolution::Minute,
+            start: date_to_datetime(start, 0, 0, 0),
+            end: date_to_datetime(end, 23, 59, 59),
+            data_type: DataType::PerpetualContext,
+        };
+        let fetched = provider.get_history_batch(&request).await?;
+        rows += fetched.perpetual_contexts.len();
+    }
+    Ok(rows)
+}
+
+fn margin_interest_partition_has_symbol_data(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    symbol: &Symbol,
+    date: NaiveDate,
+) -> bool {
+    let path = resolver.margin_interest_partition(symbol, date);
+    if !path.exists() {
+        return false;
+    }
+    let params = QueryParams::new()
+        .with_time_range(
+            date_to_datetime(date, 0, 0, 0),
+            date_to_datetime(date, 23, 59, 59),
+        )
+        .with_symbols(vec![symbol.id.sid]);
+    reader
+        .read_margin_interest_rate_partition(&path, symbol, &params)
+        .is_ok_and(|rows| !rows.is_empty())
+}
+
+fn perpetual_context_partition_has_symbol_data(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    symbol: &Symbol,
+    date: NaiveDate,
+) -> bool {
+    let path = resolver.perpetual_context_partition(symbol, date);
+    if !path.exists() {
+        return false;
+    }
+    let params = QueryParams::new()
+        .with_time_range(
+            date_to_datetime(date, 0, 0, 0),
+            date_to_datetime(date, 23, 59, 59),
+        )
+        .with_symbols(vec![symbol.id.sid]);
+    reader
+        .read_perpetual_context_partition(&path, symbol, &params)
+        .is_ok_and(|rows| !rows.is_empty())
+}
+
+fn load_margin_interest_rates_for_date(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    date: NaiveDate,
+) -> Result<HashMap<u64, Vec<MarginInterestRate>>> {
+    let params = QueryParams::new().with_time_range(
+        date_to_datetime(date, 0, 0, 0),
+        date_to_datetime(date, 23, 59, 59),
+    );
+    let mut by_sid = HashMap::new();
+    for symbol in crypto_future_symbols(subscriptions) {
+        let path = resolver.margin_interest_partition(&symbol, date);
+        if !path.exists() {
+            continue;
+        }
+        let mut symbol_params = params.clone();
+        symbol_params.predicate = symbol_params.predicate.with_symbols(vec![symbol.id.sid]);
+        let mut rates =
+            reader.read_margin_interest_rate_partition(&path, &symbol, &symbol_params)?;
+        rates.retain(|rate| rate.symbol.id.sid == symbol.id.sid);
+        if !rates.is_empty() {
+            by_sid.insert(symbol.id.sid, rates);
+        }
+    }
+    Ok(by_sid)
+}
+
+fn load_perpetual_contexts_for_date(
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    date: NaiveDate,
+) -> Result<HashMap<u64, Vec<PerpetualContext>>> {
+    let params = QueryParams::new().with_time_range(
+        date_to_datetime(date, 0, 0, 0),
+        date_to_datetime(date, 23, 59, 59),
+    );
+    let mut by_sid = HashMap::new();
+    for symbol in crypto_future_symbols(subscriptions) {
+        let path = resolver.perpetual_context_partition(&symbol, date);
+        if !path.exists() {
+            continue;
+        }
+        let mut symbol_params = params.clone();
+        symbol_params.predicate = symbol_params.predicate.with_symbols(vec![symbol.id.sid]);
+        let mut contexts =
+            reader.read_perpetual_context_partition(&path, &symbol, &symbol_params)?;
+        contexts.retain(|context| context.symbol.id.sid == symbol.id.sid);
+        if !contexts.is_empty() {
+            by_sid.insert(symbol.id.sid, contexts);
+        }
+    }
+    Ok(by_sid)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -5123,6 +5473,51 @@ fn option_eod_bar_symbol(bar: &OptionEodBar, underlying_sym: &Symbol) -> Option<
     ))
 }
 
+fn option_eod_bar_to_trade_bar(
+    bar: &OptionEodBar,
+    symbol: Symbol,
+    valuation_time: DateTime,
+) -> TradeBar {
+    let mid = if bar.bid > Decimal::ZERO && bar.ask > Decimal::ZERO {
+        (bar.bid + bar.ask) / rust_decimal_macros::dec!(2)
+    } else {
+        Decimal::ZERO
+    };
+    let fallback = if bar.close > Decimal::ZERO {
+        bar.close
+    } else {
+        mid
+    };
+    let open = if bar.open > Decimal::ZERO {
+        bar.open
+    } else {
+        fallback
+    };
+    let high = if bar.high > Decimal::ZERO {
+        bar.high
+    } else {
+        open
+    };
+    let low = if bar.low > Decimal::ZERO {
+        bar.low
+    } else {
+        open
+    };
+    let close = if bar.close > Decimal::ZERO {
+        bar.close
+    } else {
+        open
+    };
+    let volume = Decimal::from_i64(bar.volume).unwrap_or(Decimal::ZERO);
+
+    TradeBar::new(
+        symbol,
+        valuation_time,
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(open, high, low, close, volume),
+    )
+}
+
 /// Build a real option chain from ThetaData EOD rows for a single trading day.
 ///
 /// Build an option chain directly from typed `OptionEodBar` rows.
@@ -5833,7 +6228,7 @@ fn apply_split_events_to_state(
     raw_equity_sids: &HashSet<u64>,
     portfolio: &lean_algorithm::portfolio::SecurityPortfolioManager,
     order_processor: &OrderProcessor,
-    open_positions: &mut HashMap<u64, (DateTime, Decimal, Decimal)>,
+    trade_builder: &mut TradeBuilder,
 ) {
     for split in splits {
         let sid = split.symbol.id.sid;
@@ -5857,12 +6252,7 @@ fn apply_split_events_to_state(
             .transaction_manager
             .apply_split_to_open_orders(sid, split.split_factor);
 
-        if let Some((_entry_time, entry_price, quantity)) = open_positions.get_mut(&sid) {
-            *entry_price *= split.split_factor;
-            if !split.split_factor.is_zero() {
-                *quantity /= split.split_factor;
-            }
-        }
+        trade_builder.apply_split(&split.symbol, split.split_factor);
 
         let after = portfolio.get_holding(&split.symbol);
         if before.is_invested() {
@@ -5877,6 +6267,30 @@ fn apply_split_events_to_state(
             );
         }
     }
+}
+
+fn record_trade_fill(
+    symbol: &Symbol,
+    event_time: DateTime,
+    fill_price: Decimal,
+    fill_qty: Decimal,
+    trade_builder: &mut TradeBuilder,
+    completed_trades: &mut Vec<Trade>,
+    live_writer: Option<&LiveBacktestWriter>,
+) {
+    let Some(trade) = trade_builder.record_fill(
+        symbol,
+        event_time,
+        fill_price,
+        fill_qty,
+        rust_decimal_macros::dec!(0),
+    ) else {
+        return;
+    };
+    if let Some(writer) = live_writer {
+        writer.append_trades(std::slice::from_ref(&trade));
+    }
+    completed_trades.push(trade);
 }
 
 /// factor-file row whose date is strictly earlier than `bar_date`.
@@ -6797,10 +7211,7 @@ mod tests {
         let event_time_utc = DateTime::from(event_time.with_timezone(&chrono::Utc));
         let end_time_utc = DateTime::from(end_time.with_timezone(&chrono::Utc));
         let mut fields = HashMap::new();
-        fields.insert(
-            "time".to_string(),
-            serde_json::json!("2026-04-20 09:30:00"),
-        );
+        fields.insert("time".to_string(), serde_json::json!("2026-04-20 09:30:00"));
         let point = CustomDataPoint {
             time: event_time.date_naive(),
             end_time: Some(end_time_utc),
@@ -6809,11 +7220,7 @@ mod tests {
         };
         let mut buckets = HashMap::new();
 
-        bucket_high_resolution_custom_points_by_end_time(
-            &mut buckets,
-            "flow_alerts",
-            vec![point],
-        );
+        bucket_high_resolution_custom_points_by_end_time(&mut buckets, "flow_alerts", vec![point]);
 
         assert!(!buckets.contains_key(&event_time_utc.0));
         let bucket = &buckets[&end_time_utc.0]["flow_alerts"];

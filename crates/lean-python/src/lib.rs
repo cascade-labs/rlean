@@ -18,7 +18,8 @@ use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
 use py_data::{
-    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyQuoteBar, PyQuoteBars,
+    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyMarginInterestRate,
+    PyMarginInterestRates, PyPerpetualContext, PyPerpetualContexts, PyQuoteBar, PyQuoteBars,
     PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
 };
 use py_framework::{
@@ -82,6 +83,7 @@ pub enum PyBrokerageName {
     Default = 0,
     InteractiveBrokersBrokerage = 1,
     TradierBrokerage = 2,
+    HyperliquidBrokerage = 3,
 }
 
 #[pymethods]
@@ -94,6 +96,8 @@ impl PyBrokerageName {
     const INTERACTIVE_BROKERS_BROKERAGE: Self = Self::InteractiveBrokersBrokerage;
     #[classattr]
     const TRADIER_BROKERAGE: Self = Self::TradierBrokerage;
+    #[classattr]
+    const HYPERLIQUID_BROKERAGE: Self = Self::HyperliquidBrokerage;
 }
 
 impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
@@ -102,6 +106,7 @@ impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
             PyBrokerageName::Default => Self::Default,
             PyBrokerageName::InteractiveBrokersBrokerage => Self::InteractiveBrokersBrokerage,
             PyBrokerageName::TradierBrokerage => Self::TradierBrokerage,
+            PyBrokerageName::HyperliquidBrokerage => Self::HyperliquidBrokerage,
         }
     }
 }
@@ -118,6 +123,7 @@ pub enum PySecurityType {
     Cfd = 5,
     Crypto = 7,
     Index = 8,
+    CryptoFuture = 11,
 }
 
 #[pymethods]
@@ -138,6 +144,8 @@ impl PySecurityType {
     const CRYPTO: Self = Self::Crypto;
     #[classattr]
     const INDEX: Self = Self::Index;
+    #[classattr]
+    const CRYPTO_FUTURE: Self = Self::CryptoFuture;
 }
 
 #[pyclass(name = "Market")]
@@ -147,6 +155,16 @@ pub struct PyMarket;
 impl PyMarket {
     #[classattr]
     const USA: &'static str = "usa";
+    #[classattr]
+    const BINANCE: &'static str = "binance";
+    #[classattr]
+    const BYBIT: &'static str = "bybit";
+    #[classattr]
+    const COINBASE: &'static str = "coinbase";
+    #[classattr]
+    const KRAKEN: &'static str = "kraken";
+    #[classattr]
+    const HYPERLIQUID: &'static str = "hyperliquid";
 }
 
 /// LEAN OrderType enum values.
@@ -236,6 +254,10 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBar>()?;
     m.add_class::<PyQuoteBar>()?;
     m.add_class::<PyQuoteBars>()?;
+    m.add_class::<PyMarginInterestRate>()?;
+    m.add_class::<PyMarginInterestRates>()?;
+    m.add_class::<PyPerpetualContext>()?;
+    m.add_class::<PyPerpetualContexts>()?;
     m.add_class::<PyTick>()?;
     m.add_class::<PyTicks>()?;
     m.add_class::<PySlice>()?;

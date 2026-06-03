@@ -1,6 +1,6 @@
 use chrono::{Datelike, Timelike};
 use lean_algorithm::qc_algorithm::{OptionFilter, QcAlgorithm};
-use lean_core::{DataNormalizationMode, Market, Resolution, Symbol};
+use lean_core::{DataNormalizationMode, Market, Resolution, SecurityType, Symbol};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -57,15 +57,25 @@ pub struct PySymbol {
 #[pymethods]
 impl PySymbol {
     #[staticmethod]
-    #[pyo3(signature = (ticker, _security_type=None, _market=None))]
+    #[pyo3(signature = (ticker, security_type=None, market=None))]
     fn create(
         ticker: &str,
-        _security_type: Option<&Bound<'_, PyAny>>,
-        _market: Option<&Bound<'_, PyAny>>,
+        security_type: Option<&Bound<'_, PyAny>>,
+        market: Option<&Bound<'_, PyAny>>,
     ) -> Self {
-        PySymbol {
-            inner: Symbol::create_equity(ticker, &Market::usa()),
-        }
+        let security_type = py_security_type(security_type).unwrap_or(SecurityType::Equity);
+        let market = py_market(market).unwrap_or_else(|| match security_type {
+            SecurityType::Crypto | SecurityType::CryptoFuture => Market::binance(),
+            SecurityType::Forex => Market::forex(),
+            _ => Market::usa(),
+        });
+        let inner = match security_type {
+            SecurityType::Crypto => Symbol::create_crypto(ticker, &market),
+            SecurityType::CryptoFuture => Symbol::create_crypto_future(ticker, &market),
+            SecurityType::Forex => Symbol::create_forex(ticker),
+            _ => Symbol::create_equity(ticker, &market),
+        };
+        PySymbol { inner }
     }
 
     #[staticmethod]
@@ -114,6 +124,49 @@ impl PySymbol {
             "'Symbol' object has no attribute '{name}'"
         )))
     }
+}
+
+fn py_security_type(value: Option<&Bound<'_, PyAny>>) -> Option<SecurityType> {
+    let value = value?;
+    if value.is_none() {
+        return None;
+    }
+    if let Ok(py_type) = value.extract::<crate::PySecurityType>() {
+        return Some(match py_type {
+            crate::PySecurityType::Base => SecurityType::Base,
+            crate::PySecurityType::Equity => SecurityType::Equity,
+            crate::PySecurityType::Option => SecurityType::Option,
+            crate::PySecurityType::Forex => SecurityType::Forex,
+            crate::PySecurityType::Future => SecurityType::Future,
+            crate::PySecurityType::Cfd => SecurityType::Cfd,
+            crate::PySecurityType::Crypto => SecurityType::Crypto,
+            crate::PySecurityType::Index => SecurityType::Index,
+            crate::PySecurityType::CryptoFuture => SecurityType::CryptoFuture,
+        });
+    }
+    if let Ok(raw) = value.extract::<i32>() {
+        return match raw {
+            0 => Some(SecurityType::Base),
+            1 => Some(SecurityType::Equity),
+            2 => Some(SecurityType::Option),
+            3 => Some(SecurityType::Forex),
+            4 => Some(SecurityType::Future),
+            5 => Some(SecurityType::Cfd),
+            7 => Some(SecurityType::Crypto),
+            8 => Some(SecurityType::Index),
+            11 => Some(SecurityType::CryptoFuture),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn py_market(value: Option<&Bound<'_, PyAny>>) -> Option<Market> {
+    let value = value?;
+    if value.is_none() {
+        return None;
+    }
+    value.extract::<String>().ok().map(Market::new)
 }
 
 impl From<Symbol> for PySymbol {

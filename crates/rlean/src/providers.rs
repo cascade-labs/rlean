@@ -72,6 +72,14 @@ impl IHistoryProvider for LazyPluginProvider {
         provider.get_ticks(request).await
     }
 
+    async fn get_margin_interest_rates(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::MarginInterestRate>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_margin_interest_rates(request).await
+    }
+
     async fn get_history_batch(
         &self,
         request: &lean_data_providers::HistoryBatchRequest,

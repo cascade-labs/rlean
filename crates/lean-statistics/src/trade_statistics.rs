@@ -2,6 +2,7 @@ use lean_core::{DateTime, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
@@ -48,6 +49,141 @@ impl Trade {
             is_win: pnl > dec!(0),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenPositionTrade {
+    pub entry_time: DateTime,
+    pub entry_price: Price,
+    pub quantity: Quantity,
+}
+
+/// Builds completed round-trip trades from a stream of fills.
+///
+/// The builder keeps the open position state needed by statistics code and
+/// emits a `Trade` whenever a fill closes all or part of an existing position.
+#[derive(Debug, Clone, Default)]
+pub struct TradeBuilder {
+    open_positions: HashMap<u64, OpenPositionTrade>,
+}
+
+impl TradeBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn open_position(&self, symbol: &Symbol) -> Option<OpenPositionTrade> {
+        self.open_positions.get(&symbol.id.sid).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.open_positions.is_empty()
+    }
+
+    pub fn record_fill(
+        &mut self,
+        symbol: &Symbol,
+        event_time: DateTime,
+        fill_price: Price,
+        fill_quantity: Quantity,
+        fees: Price,
+    ) -> Option<Trade> {
+        if fill_quantity.is_zero() {
+            return None;
+        }
+
+        let sid = symbol.id.sid;
+        let Some(open) = self.open_positions.remove(&sid) else {
+            self.open_positions.insert(
+                sid,
+                OpenPositionTrade {
+                    entry_time: event_time,
+                    entry_price: fill_price,
+                    quantity: fill_quantity,
+                },
+            );
+            return None;
+        };
+
+        if open.quantity.is_zero() {
+            self.open_positions.insert(
+                sid,
+                OpenPositionTrade {
+                    entry_time: event_time,
+                    entry_price: fill_price,
+                    quantity: fill_quantity,
+                },
+            );
+            return None;
+        }
+
+        if same_position_side(open.quantity, fill_quantity) {
+            let new_quantity = open.quantity + fill_quantity;
+            if !new_quantity.is_zero() {
+                let new_price = ((open.entry_price * open.quantity.abs())
+                    + (fill_price * fill_quantity.abs()))
+                    / new_quantity.abs();
+                self.open_positions.insert(
+                    sid,
+                    OpenPositionTrade {
+                        entry_time: open.entry_time,
+                        entry_price: new_price,
+                        quantity: new_quantity,
+                    },
+                );
+            }
+            return None;
+        }
+
+        let close_abs = open.quantity.abs().min(fill_quantity.abs());
+        let close_quantity = if open.quantity < Decimal::ZERO {
+            -close_abs
+        } else {
+            close_abs
+        };
+        let trade = Trade::new(
+            symbol.clone(),
+            open.entry_time,
+            event_time,
+            open.entry_price,
+            fill_price,
+            close_quantity,
+            fees,
+        );
+
+        let remaining_quantity = open.quantity + fill_quantity;
+        if !remaining_quantity.is_zero() {
+            let remaining = if same_position_side(open.quantity, remaining_quantity) {
+                OpenPositionTrade {
+                    entry_time: open.entry_time,
+                    entry_price: open.entry_price,
+                    quantity: remaining_quantity,
+                }
+            } else {
+                OpenPositionTrade {
+                    entry_time: event_time,
+                    entry_price: fill_price,
+                    quantity: remaining_quantity,
+                }
+            };
+            self.open_positions.insert(sid, remaining);
+        }
+
+        Some(trade)
+    }
+
+    pub fn apply_split(&mut self, symbol: &Symbol, split_factor: Decimal) {
+        if let Some(open) = self.open_positions.get_mut(&symbol.id.sid) {
+            open.entry_price *= split_factor;
+            if !split_factor.is_zero() {
+                open.quantity /= split_factor;
+            }
+        }
+    }
+}
+
+fn same_position_side(a: Decimal, b: Decimal) -> bool {
+    (a > Decimal::ZERO && b > Decimal::ZERO) || (a < Decimal::ZERO && b < Decimal::ZERO)
 }
 
 #[cfg(test)]
@@ -108,6 +244,71 @@ mod tests {
         assert_eq!(trade.pnl, dec!(10));
         assert_eq!(trade.pnl_pct, dec!(0.01));
         assert!(trade.is_win);
+    }
+
+    #[test]
+    fn trade_builder_keeps_residual_after_partial_close() {
+        let sym = spy();
+        let mut builder = TradeBuilder::new();
+
+        assert!(builder
+            .record_fill(&sym, DateTime::EPOCH, dec!(10), dec!(100), dec!(0))
+            .is_none());
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-40), dec!(0))
+            .unwrap();
+
+        assert_eq!(trade.quantity, dec!(40));
+        assert_eq!(trade.pnl, dec!(80));
+        assert_eq!(builder.open_position(&sym).unwrap().quantity, dec!(60));
+
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(3), dec!(11), dec!(-60), dec!(0))
+            .unwrap();
+
+        assert_eq!(trade.quantity, dec!(60));
+        assert_eq!(trade.pnl, dec!(60));
+        assert!(builder.is_empty());
+    }
+
+    #[test]
+    fn trade_builder_handles_reversal() {
+        let sym = spy();
+        let mut builder = TradeBuilder::new();
+
+        assert!(builder
+            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(0))
+            .is_none());
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-150), dec!(0))
+            .unwrap();
+
+        assert_eq!(trade.quantity, dec!(100));
+        assert_eq!(trade.pnl, dec!(200));
+        let open = builder.open_position(&sym).unwrap();
+        assert_eq!(open.entry_price, dec!(12));
+        assert_eq!(open.quantity, dec!(-50));
+
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(3), dec!(10), dec!(20), dec!(0))
+            .unwrap();
+
+        assert_eq!(trade.quantity, dec!(-20));
+        assert_eq!(trade.pnl, dec!(40));
+        assert_eq!(builder.open_position(&sym).unwrap().quantity, dec!(-30));
+    }
+
+    #[test]
+    fn trade_builder_applies_split_to_open_position() {
+        let sym = spy();
+        let mut builder = TradeBuilder::new();
+        builder.record_fill(&sym, DateTime::from_secs(1), dec!(100), dec!(10), dec!(0));
+
+        builder.apply_split(&sym, dec!(0.5));
+
+        let open = builder.open_position(&sym).unwrap();
+        assert_eq!(open.entry_price, dec!(50.0));
+        assert_eq!(open.quantity, dec!(20));
     }
 }
 
