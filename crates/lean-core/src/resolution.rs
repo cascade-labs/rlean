@@ -56,11 +56,19 @@ impl Resolution {
         matches!(self, Resolution::Tick)
     }
 
-    /// Lower resolutions use daily files; higher use per-date files.
+    /// Minute-or-finer data resolutions.
     pub fn is_high_resolution(&self) -> bool {
         matches!(
             self,
             Resolution::Tick | Resolution::Second | Resolution::Minute
+        )
+    }
+
+    /// Event-stream resolutions that should be processed at their own timestamps.
+    pub fn is_intraday(&self) -> bool {
+        matches!(
+            self,
+            Resolution::Tick | Resolution::Second | Resolution::Minute | Resolution::Hour
         )
     }
 

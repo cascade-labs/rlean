@@ -410,7 +410,7 @@ pub fn load_custom_data_plugins(
     let glob_pattern = pattern.to_string_lossy().to_string();
 
     let mut sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>> = Vec::new();
-    let context = CustomDataContext::new(data_root);
+    let plugin_configs = crate::config::PluginConfigs::load().unwrap_or_default();
 
     let paths: Vec<_> = match glob::glob(&glob_pattern) {
         Ok(paths) => paths.filter_map(|r| r.ok()).collect(),
@@ -446,6 +446,11 @@ pub fn load_custom_data_plugins(
         // Box<dyn ICustomDataSource> (double-boxed to keep a thin pointer over FFI).
         let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
             unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+        let source_name = source_box.name().to_string();
+        let context = CustomDataContext::with_plugin_config(
+            data_root,
+            plugin_configs.get_plugin(&source_name),
+        );
         source_box.initialize(&context);
         let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
 

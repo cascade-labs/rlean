@@ -730,11 +730,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // C# LEAN resolves date-partitioned high-resolution sources lazily: the
     // subscription reader asks for the current tradable date's source and the
     // data provider reports whether that file exists. Mirror that behavior by
-    // leaving minute/second/tick data to the intraday loop below.
+    // leaving hour/minute/second/tick data to the intraday loop below.
     if let Some(ref provider) = config.historical_provider {
         let startup_prefetch_subscriptions: Vec<_> = subscriptions
             .iter()
-            .filter(|sub| !sub.resolution.is_high_resolution() && sub.tick_type != TickType::Quote)
+            .filter(|sub| !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote)
             .cloned()
             .collect();
 
@@ -962,10 +962,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             .map(|universe| universe.bind(py).borrow().settings().resolution)
             .min()
     });
-    let is_intraday = subscriptions
-        .iter()
-        .any(|s| s.resolution.is_high_resolution())
-        || highest_universe_resolution.is_some_and(|resolution| resolution.is_high_resolution());
+    let is_intraday = subscriptions.iter().any(|s| s.resolution.is_intraday())
+        || highest_universe_resolution.is_some_and(|resolution| resolution.is_intraday());
 
     // ── pre-load all subscription bars (daily mode only) ─────────────────────
     // For daily resolutions, pre-loading the date-partitioned cache up front
@@ -1261,16 +1259,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut equity_curve: Vec<Decimal> = Vec::new();
     let mut daily_dates: Vec<String> = Vec::new();
 
-    let resolution_label = if subscriptions
+    let finest_resolution = subscriptions
         .iter()
-        .any(|s| s.resolution == Resolution::Tick)
-        || highest_universe_resolution == Some(Resolution::Tick)
-    {
-        "tick"
-    } else if is_intraday {
-        "minute"
-    } else {
-        "daily"
+        .map(|s| s.resolution)
+        .chain(highest_universe_resolution)
+        .min()
+        .unwrap_or(Resolution::Daily);
+    let resolution_label = match finest_resolution {
+        Resolution::Tick => "tick",
+        Resolution::Second => "second",
+        Resolution::Minute => "minute",
+        Resolution::Hour => "hour",
+        Resolution::Daily => "daily",
     };
     info!(
         "Backtest: {} → {} ({})",
@@ -1383,7 +1383,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             if let Some(ref provider) = config.history_provider {
                 let missing_factor_subs: Vec<_> = subscriptions
                     .iter()
-                    .filter(|sub| sub.resolution.is_high_resolution())
+                    .filter(|sub| sub.resolution.is_intraday())
                     .filter(|sub| matches!(sub.symbol.security_type(), SecurityType::Equity))
                     .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
                     .filter(|sub| {
@@ -1423,7 +1423,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             let day_symbol_sids: Vec<u64> = subscriptions
                 .iter()
-                .filter(|sub| sub.resolution.is_high_resolution())
+                .filter(|sub| sub.resolution.is_intraday())
                 .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
                 .filter(|sub| {
                     subscription_has_mapped_data_for_range(
@@ -1438,7 +1438,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 .collect();
             let day_symbols_by_sid: HashMap<u64, Symbol> = subscriptions
                 .iter()
-                .filter(|sub| sub.resolution.is_high_resolution())
+                .filter(|sub| sub.resolution.is_intraday())
                 .filter(|sub| is_expected_market_date(&sub.symbol, current_date))
                 .filter(|sub| {
                     subscription_has_mapped_data_for_range(
@@ -1462,7 +1462,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let mut partition_sid_cache: HashMap<PathBuf, HashSet<u64>> = HashMap::new();
                 let mut missing_subs = Vec::new();
                 for sub in subscriptions.iter() {
-                    if !sub.resolution.is_high_resolution()
+                    if !sub.resolution.is_intraday()
                         || !is_expected_market_date(&sub.symbol, current_date)
                         || !subscription_has_mapped_data_for_range(
                             &cache_reader,
@@ -1510,7 +1510,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 // underlying equity subscription that add_option() creates internally).
                 // They share the same SID as the high-resolution subscription and
                 // would overwrite the correct intraday bars with daily bars.
-                if !sub.resolution.is_high_resolution() {
+                if !sub.resolution.is_intraday() {
                     continue;
                 }
                 if !is_expected_market_date(&sub.symbol, current_date) {
@@ -1689,7 +1689,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             > = HashMap::new();
             for sub in custom_subs
                 .iter()
-                .filter(|sub| sub.config.resolution.is_high_resolution())
+                .filter(|sub| sub.config.resolution.is_intraday())
             {
                 let source = config
                     .custom_data_sources
@@ -2041,19 +2041,29 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     };
 
                     Python::attach(|py| {
-                        adapter.apply_universe_selection(py, utc_time.0, Resolution::Minute);
+                        adapter.apply_universe_selection(py, utc_time.0, finest_resolution);
                     });
 
+                    let mut custom_selection_resolutions: Vec<Resolution> = Vec::new();
                     let custom_data_for_slice = if let Some(points_by_ticker) =
                         high_resolution_custom_by_ts.get(&utc_time.0)
                     {
                         let mut merged = custom_data_for_day.clone();
                         for (ticker, points) in points_by_ticker {
                             merged.insert(ticker.clone(), points.clone());
+                            for sub in custom_subs
+                                .iter()
+                                .filter(|sub| sub.ticker.eq_ignore_ascii_case(ticker))
+                            {
+                                if !custom_selection_resolutions.contains(&sub.config.resolution) {
+                                    custom_selection_resolutions.push(sub.config.resolution);
+                                }
+                            }
                         }
                         Some(merged)
                     } else if !custom_data_seeded {
                         custom_data_seeded = true;
+                        custom_selection_resolutions.push(Resolution::Daily);
                         Some(custom_data_for_day.clone())
                     } else {
                         None
@@ -2063,12 +2073,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         minute_slice.custom_data = custom_data_for_slice.clone();
                         minute_slice.has_data = true;
                         Python::attach(|py| {
-                            adapter.apply_custom_universe_selection(
-                                py,
-                                utc_time.0,
-                                Resolution::Minute,
-                                custom_data_for_slice,
-                            );
+                            for custom_resolution in custom_selection_resolutions {
+                                adapter.apply_custom_universe_selection(
+                                    py,
+                                    utc_time.0,
+                                    custom_resolution,
+                                    custom_data_for_slice,
+                                );
+                            }
                         });
                     }
 
@@ -2121,7 +2133,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                     let new_high_res_subs: Vec<_> = new_subs
                         .iter()
-                        .filter(|sub| sub.resolution.is_high_resolution())
+                        .filter(|sub| sub.resolution.is_intraday())
                         .cloned()
                         .collect();
                     if !new_high_res_subs.is_empty() {
@@ -2167,7 +2179,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                     for sub in &new_subs {
                         let sid = sub.symbol.id.sid;
-                        if !sub.resolution.is_high_resolution() {
+                        if !sub.resolution.is_intraday() {
                             continue;
                         }
 
@@ -3306,17 +3318,9 @@ async fn pre_fetch_high_resolution_day_batched(
 
     let mut items = Vec::new();
     for sub in subscriptions {
-        if !sub.resolution.is_high_resolution() || !is_expected_market_date(&sub.symbol, date) {
+        if !sub.resolution.is_intraday() || !is_expected_market_date(&sub.symbol, date) {
             continue;
         }
-        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
-            debug!(
-                "Skipping optional Hyperliquid quote-bar fetch for {}; trade bars provide candleSnapshot history",
-                sub.symbol.value
-            );
-            continue;
-        }
-
         if matches!(sub.symbol.security_type(), SecurityType::Equity) {
             if let Some(ref fp) = factor_provider {
                 ensure_auxiliary_files_for_subscriptions(
@@ -3597,9 +3601,7 @@ async fn pre_fetch_subscription(
     let start_dt = date_to_datetime(effective_start, 0, 0, 0);
     let end_dt = date_to_datetime(mapped_end, 23, 59, 59);
 
-    if !data_covers_range
-        && (sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote)
-    {
+    if !data_covers_range && (sub.resolution.is_intraday() || sub.tick_type == TickType::Quote) {
         let rows_downloaded = pre_fetch_missing_high_resolution_days(
             provider.clone(),
             factor_provider.clone(),
@@ -3736,14 +3738,6 @@ async fn pre_fetch_missing_high_resolution_days(
     if missing.is_empty() {
         return Ok(0);
     }
-    if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
-        debug!(
-            "Skipping optional Hyperliquid quote-bar fetch for {}; trade bars provide candleSnapshot history",
-            sub.symbol.value
-        );
-        return Ok(0);
-    }
-
     debug!(
         "Local data missing or incomplete for {} — fetching {} missing {} files date-by-date with parallelism {} ({} → {})",
         sub.symbol.value,
@@ -3933,7 +3927,7 @@ async fn local_data_covers_range(
         return true;
     }
 
-    if sub.resolution.is_high_resolution() || sub.tick_type == TickType::Quote {
+    if sub.resolution.is_intraday() || sub.tick_type == TickType::Quote {
         let reader = ParquetReader::new();
         for current in &expected_dates {
             if !cached_partition_has_symbol_data(&reader, resolver, sub, *current) {
@@ -3979,9 +3973,6 @@ fn cached_partition_has_symbol_data(
 ) -> bool {
     let path = subscription_data_path(resolver, sub, date);
     if !path.exists() {
-        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
-            return cached_trade_bar_partition_has_symbol_data(reader, resolver, sub, date);
-        }
         return false;
     }
 
@@ -3997,45 +3988,14 @@ fn cached_partition_has_symbol_data(
             .read_tick_partition(&path, &sub.symbol, &params)
             .is_ok_and(|rows| !rows.is_empty())
     } else if sub.tick_type == TickType::Quote {
-        let has_quote_bars = reader
+        reader
             .read_quote_bar_partition(&path, &sub.symbol, &params)
-            .is_ok_and(|rows| !rows.is_empty());
-        has_quote_bars
-            || hyperliquid_crypto_future_quote_bars_are_optional(sub)
-                && cached_trade_bar_partition_has_symbol_data(reader, resolver, sub, date)
+            .is_ok_and(|rows| !rows.is_empty())
     } else {
         reader
             .read_trade_bar_partition(&path, &sub.symbol, &params)
             .is_ok_and(|rows| !rows.is_empty())
     }
-}
-
-fn hyperliquid_crypto_future_quote_bars_are_optional(sub: &SubscriptionDataConfig) -> bool {
-    sub.tick_type == TickType::Quote
-        && sub.resolution != Resolution::Tick
-        && sub.symbol.security_type() == SecurityType::CryptoFuture
-        && sub.symbol.market().as_str() == Market::HYPERLIQUID
-}
-
-fn cached_trade_bar_partition_has_symbol_data(
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    sub: &SubscriptionDataConfig,
-    date: NaiveDate,
-) -> bool {
-    let path = resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
-    if !path.exists() {
-        return false;
-    }
-    let params = QueryParams::new()
-        .with_time_range(
-            date_to_datetime(date, 0, 0, 0),
-            date_to_datetime(date, 23, 59, 59),
-        )
-        .with_symbols(vec![sub.symbol.id.sid]);
-    reader
-        .read_trade_bar_partition(&path, &sub.symbol, &params)
-        .is_ok_and(|rows| !rows.is_empty())
 }
 
 fn cached_partition_has_symbol_sid(
@@ -4047,15 +4007,6 @@ fn cached_partition_has_symbol_sid(
 ) -> bool {
     let path = subscription_data_path(resolver, sub, date);
     if !path.exists() {
-        if hyperliquid_crypto_future_quote_bars_are_optional(sub) {
-            return cached_trade_bar_partition_has_symbol_sid(
-                reader,
-                resolver,
-                sub,
-                date,
-                partition_sid_cache,
-            );
-        }
         return false;
     }
 
@@ -4072,33 +4023,7 @@ fn cached_partition_has_symbol_sid(
     if sids.contains(&sub.symbol.id.sid) {
         return true;
     }
-    hyperliquid_crypto_future_quote_bars_are_optional(sub)
-        && cached_trade_bar_partition_has_symbol_sid(
-            reader,
-            resolver,
-            sub,
-            date,
-            partition_sid_cache,
-        )
-}
-
-fn cached_trade_bar_partition_has_symbol_sid(
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    sub: &SubscriptionDataConfig,
-    date: NaiveDate,
-    partition_sid_cache: &mut HashMap<PathBuf, HashSet<u64>>,
-) -> bool {
-    let path = resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
-    if !path.exists() {
-        return false;
-    }
-    let sids = partition_sid_cache.entry(path.clone()).or_insert_with(|| {
-        reader
-            .read_partition_symbol_sids(&path, 2)
-            .unwrap_or_default()
-    });
-    sids.contains(&sub.symbol.id.sid)
+    false
 }
 
 fn load_trade_bar_partitions(
@@ -5686,7 +5611,7 @@ async fn load_low_resolution_custom_data_for_day(
 ) -> Result<HashMap<String, Vec<CustomDataPoint>>> {
     let mut custom_data_for_day: HashMap<String, Vec<CustomDataPoint>> = HashMap::new();
     for sub in custom_subs {
-        if sub.config.resolution.is_high_resolution() {
+        if sub.config.resolution.is_intraday() {
             continue;
         }
         let key = sub.ticker.to_uppercase();

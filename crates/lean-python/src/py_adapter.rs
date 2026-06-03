@@ -149,7 +149,7 @@ impl PyAlgorithmAdapter {
                         {
                             let mut alg = self.inner.lock().unwrap();
                             for symbol in &changes.added {
-                                alg.add_equity(&symbol.value, settings.resolution);
+                                alg.add_security_symbol(symbol.clone(), settings.resolution);
                             }
                             for symbol in &changes.removed {
                                 if !alg.is_invested(symbol) && !alg.is_option_underlying(symbol) {
@@ -192,7 +192,7 @@ impl PyAlgorithmAdapter {
                         {
                             let mut alg = self.inner.lock().unwrap();
                             for symbol in &changes.added {
-                                alg.add_equity(&symbol.value, settings.resolution);
+                                alg.add_security_symbol(symbol.clone(), settings.resolution);
                             }
                             for symbol in &changes.removed {
                                 if !alg.is_invested(symbol) && !alg.is_option_underlying(symbol) {

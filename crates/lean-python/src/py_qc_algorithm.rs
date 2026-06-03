@@ -8,7 +8,7 @@ use crate::py_types::{
     PyAlgorithmSettings, PyOptionSecurity, PyResolution, PySecurity, PySecurityManager, PySymbol,
 };
 use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
-use crate::{PyAccountType, PyBrokerageName};
+use crate::{PyAccountType, PyBrokerageName, PySecurityType};
 use chrono::{Datelike, NaiveDate, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Market, Resolution, SecurityType};
@@ -121,6 +121,39 @@ impl PyQcAlgorithm {
     pub fn set_history_context(&self, context: AlgorithmHistoryContext) {
         *self.history_context.lock().unwrap() = Some(context);
     }
+
+    fn register_custom_data_subscription(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        resolution: Resolution,
+        properties: HashMap<String, String>,
+    ) {
+        let query = custom_query_from_properties(&properties);
+        let config = lean_data::CustomDataConfig {
+            ticker: ticker.to_string(),
+            source_type: source_type.to_string(),
+            resolution,
+            properties,
+            query,
+        };
+        let sub = lean_data::CustomDataSubscription {
+            source_type: source_type.to_string(),
+            ticker: ticker.to_string(),
+            config,
+            dynamic_query: lean_data::CustomDataQuery::default(),
+        };
+
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.custom_data_subscriptions.iter_mut().find(|existing| {
+            existing.source_type.eq_ignore_ascii_case(source_type)
+                && existing.ticker.eq_ignore_ascii_case(ticker)
+        }) {
+            *existing = sub;
+        } else {
+            inner.custom_data_subscriptions.push(sub);
+        }
+    }
 }
 
 fn py_properties_to_map(
@@ -232,6 +265,64 @@ fn custom_query_from_properties(
     }
     query.properties = properties.clone();
     query
+}
+
+fn security_type_from_py(value: &Bound<'_, PyAny>) -> PyResult<SecurityType> {
+    if let Ok(py_type) = value.extract::<PySecurityType>() {
+        return Ok(match py_type {
+            PySecurityType::Base => SecurityType::Base,
+            PySecurityType::Equity => SecurityType::Equity,
+            PySecurityType::Option => SecurityType::Option,
+            PySecurityType::Forex => SecurityType::Forex,
+            PySecurityType::Future => SecurityType::Future,
+            PySecurityType::Cfd => SecurityType::Cfd,
+            PySecurityType::Crypto => SecurityType::Crypto,
+            PySecurityType::Index => SecurityType::Index,
+            PySecurityType::CryptoFuture => SecurityType::CryptoFuture,
+        });
+    }
+    if let Ok(raw) = value.extract::<String>() {
+        return match raw.trim().to_ascii_lowercase().as_str() {
+            "base" => Ok(SecurityType::Base),
+            "equity" => Ok(SecurityType::Equity),
+            "option" => Ok(SecurityType::Option),
+            "forex" => Ok(SecurityType::Forex),
+            "future" => Ok(SecurityType::Future),
+            "cfd" => Ok(SecurityType::Cfd),
+            "crypto" => Ok(SecurityType::Crypto),
+            "index" => Ok(SecurityType::Index),
+            "cryptofuture" | "crypto_future" | "crypto-future" => Ok(SecurityType::CryptoFuture),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported SecurityType '{raw}'"
+            ))),
+        };
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected SecurityType or security type name",
+    ))
+}
+
+fn normalize_hyperliquid_universe(value: &str) -> String {
+    let cleaned = value
+        .trim()
+        .replace(['-', '.', ':', ' '], "_")
+        .to_ascii_uppercase();
+    match cleaned.as_str() {
+        "PERP" | "PERPS" | "CRYPTOFUTURE" | "CRYPTO_FUTURE" | "CRYPTO_PERPS" => {
+            "CRYPTO_PERP".to_string()
+        }
+        "SPOT" | "CRYPTO" => "CRYPTO_SPOT".to_string(),
+        "HIP3_TRADING_XYZ" => "HIP3_XYZ".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn hyperliquid_universe_security_type(universe: &str) -> SecurityType {
+    if universe == "CRYPTO_SPOT" {
+        SecurityType::Crypto
+    } else {
+        SecurityType::CryptoFuture
+    }
 }
 
 impl Default for PyQcAlgorithm {
@@ -450,10 +541,38 @@ impl PyQcAlgorithm {
             return Ok(());
         }
 
+        if args.len() >= 5 {
+            let first = args.get_item(0)?;
+            if let Ok(security_type) = security_type_from_py(&first) {
+                let name = args.get_item(1)?.extract::<String>()?;
+                let resolution = args.get_item(2)?.extract::<PyResolution>()?;
+                let market = Market::new(args.get_item(3)?.extract::<String>()?);
+                let selector_index = if args.len() >= 6 { 5 } else { 4 };
+                let selector = args.get_item(selector_index)?.unbind();
+                let universe = PyScheduledUniverse::user_defined_typed(
+                    selector,
+                    resolution.into(),
+                    self.universe_settings.snapshot(),
+                    security_type,
+                    market,
+                );
+                self.universes.lock().unwrap().push(Py::new(py, universe)?);
+                let _ = name;
+                return Ok(());
+            }
+        }
+
         if args.len() >= 4 {
+            let source_type = args.get_item(0)?.extract::<String>()?;
             let ticker = args.get_item(1)?.extract::<String>()?;
             let resolution = args.get_item(2)?.extract::<PyResolution>()?;
             let selector = args.get_item(3)?.unbind();
+            self.register_custom_data_subscription(
+                &source_type,
+                &ticker,
+                resolution.into(),
+                HashMap::new(),
+            );
             let universe = PyScheduledUniverse::custom_data(
                 ticker,
                 selector,
@@ -477,8 +596,71 @@ impl PyQcAlgorithm {
         }
 
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "add_universe expects ScheduledUniverse, (name, resolution, selector), or (source, name, resolution, selector)",
+            "add_universe expects ScheduledUniverse, (name, resolution, selector), (source, name, resolution, selector), or (security_type, name, resolution, market, selector)",
         ))
+    }
+
+    #[pyo3(signature = (universe, resolution, selector, market=None))]
+    fn add_crypto_universe(
+        &mut self,
+        py: Python<'_>,
+        universe: &str,
+        resolution: PyResolution,
+        selector: Py<PyAny>,
+        market: Option<&str>,
+    ) -> PyResult<()> {
+        let universe = normalize_hyperliquid_universe(universe);
+        let market = Market::new(market.unwrap_or(Market::HYPERLIQUID));
+        let security_type = hyperliquid_universe_security_type(&universe);
+        let mut properties = HashMap::new();
+        properties.insert("universe".to_string(), universe.clone());
+        properties.insert("market".to_string(), market.as_str().to_string());
+        properties.insert("security_type".to_string(), security_type.to_string());
+        self.register_custom_data_subscription(
+            "hyperliquid",
+            &universe,
+            resolution.into(),
+            properties,
+        );
+        let universe = PyScheduledUniverse::custom_data_typed(
+            universe,
+            selector,
+            resolution.into(),
+            self.universe_settings.snapshot(),
+            security_type,
+            market,
+        );
+        self.universes.lock().unwrap().push(Py::new(py, universe)?);
+        Ok(())
+    }
+
+    #[pyo3(name = "AddCryptoUniverse", signature = (universe, resolution, selector, market=None))]
+    fn add_crypto_universe_pascal(
+        &mut self,
+        py: Python<'_>,
+        universe: &str,
+        resolution: PyResolution,
+        selector: Py<PyAny>,
+        market: Option<&str>,
+    ) -> PyResult<()> {
+        self.add_crypto_universe(py, universe, resolution, selector, market)
+    }
+
+    #[pyo3(signature = (universe, resolution, selector))]
+    fn add_hyperliquid_universe(
+        &mut self,
+        py: Python<'_>,
+        universe: &str,
+        resolution: PyResolution,
+        selector: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.add_crypto_universe(
+            py,
+            universe,
+            resolution,
+            selector,
+            Some(Market::HYPERLIQUID),
+        )
     }
 
     // ─── Ordering ─────────────────────────────────────────────────────────────
@@ -586,7 +768,6 @@ impl PyQcAlgorithm {
         properties: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySecurity> {
         use lean_core::Resolution;
-        use lean_data::{CustomDataConfig, CustomDataQuery, CustomDataSubscription};
 
         let res = match resolution {
             Some(r) => {
@@ -609,27 +790,7 @@ impl PyQcAlgorithm {
         };
 
         let properties = py_properties_to_map(properties)?;
-        let query = custom_query_from_properties(&properties);
-
-        let config = CustomDataConfig {
-            ticker: ticker.to_string(),
-            source_type: source_type.to_string(),
-            resolution: res,
-            properties,
-            query,
-        };
-        let sub = CustomDataSubscription {
-            source_type: source_type.to_string(),
-            ticker: ticker.to_string(),
-            config,
-            dynamic_query: CustomDataQuery::default(),
-        };
-
-        self.inner
-            .lock()
-            .unwrap()
-            .custom_data_subscriptions
-            .push(sub);
+        self.register_custom_data_subscription(source_type, ticker, res, properties);
 
         // Return a synthetic security object so callers can do:
         //   self.unrate = self.add_data("fred", "UNRATE").symbol

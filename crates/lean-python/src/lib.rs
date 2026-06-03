@@ -167,6 +167,33 @@ impl PyMarket {
     const HYPERLIQUID: &'static str = "hyperliquid";
 }
 
+#[pyclass(name = "HyperliquidUniverse")]
+pub struct PyHyperliquidUniverse;
+
+#[pymethods]
+impl PyHyperliquidUniverse {
+    #[classattr]
+    const CRYPTO_PERP: &'static str = "CRYPTO_PERP";
+    #[classattr]
+    const CRYPTO_SPOT: &'static str = "CRYPTO_SPOT";
+    #[classattr]
+    const HIP3_XYZ: &'static str = "HIP3_XYZ";
+    #[classattr]
+    const HIP3_TRADING_XYZ: &'static str = "HIP3_XYZ";
+    #[classattr]
+    const HIP3_VNTL: &'static str = "HIP3_VNTL";
+
+    #[staticmethod]
+    fn hip3(dex: &str) -> String {
+        format!(
+            "HIP3_{}",
+            dex.trim()
+                .replace(['-', '.', ':', ' '], "_")
+                .to_ascii_uppercase()
+        )
+    }
+}
+
 /// LEAN OrderType enum values.
 #[pyclass(name = "OrderType", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +335,7 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBrokerageName>()?;
     m.add_class::<PySecurityType>()?;
     m.add_class::<PyMarket>()?;
+    m.add_class::<PyHyperliquidUniverse>()?;
     m.add_class::<PyOrderType>()?;
     m.add_class::<PyOrderStatus>()?;
     m.add_class::<PyOrderDirection>()?;

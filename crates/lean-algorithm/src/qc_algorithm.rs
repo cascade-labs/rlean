@@ -294,6 +294,10 @@ impl QcAlgorithm {
     pub fn add_equity(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
         let market = Market::usa();
         let symbol = Symbol::create_equity(ticker, &market);
+        self.add_equity_symbol(symbol, resolution)
+    }
+
+    fn add_equity_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         self.add_equity_subscriptions(symbol.clone(), resolution);
 
         // Idempotent: if the security already exists (e.g. called again during
@@ -309,6 +313,26 @@ impl QcAlgorithm {
         security.set_leverage(self.default_leverage_for_security(&symbol));
         self.securities.add(security);
         symbol
+    }
+
+    pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        match symbol.security_type() {
+            SecurityType::Equity => self.add_equity_symbol(symbol, resolution),
+            SecurityType::Forex => self.add_forex(&symbol.value, resolution),
+            SecurityType::Crypto => {
+                let market = symbol.market().clone();
+                self.add_crypto(&symbol.value, &market, resolution)
+            }
+            SecurityType::CryptoFuture => {
+                let market = symbol.market().clone();
+                self.add_crypto_future(&symbol.value, &market, resolution)
+            }
+            SecurityType::Option => {
+                self.ensure_option_security(&symbol, resolution);
+                symbol
+            }
+            other => panic!("Universe selection does not support {other:?} securities yet"),
+        }
     }
 
     fn add_equity_subscriptions(&self, symbol: Symbol, resolution: Resolution) {

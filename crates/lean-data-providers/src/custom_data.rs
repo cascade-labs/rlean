@@ -2,6 +2,7 @@ use chrono::NaiveDate;
 use lean_data::custom::{
     CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource, CustomParquetSource,
 };
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,17 +14,33 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct CustomDataContext {
     data_root: PathBuf,
+    plugin_config: Map<String, Value>,
 }
 
 impl CustomDataContext {
     pub fn new(data_root: impl AsRef<Path>) -> Self {
         Self {
             data_root: data_root.as_ref().to_path_buf(),
+            plugin_config: Map::new(),
+        }
+    }
+
+    pub fn with_plugin_config(
+        data_root: impl AsRef<Path>,
+        plugin_config: Map<String, Value>,
+    ) -> Self {
+        Self {
+            data_root: data_root.as_ref().to_path_buf(),
+            plugin_config,
         }
     }
 
     pub fn data_root(&self) -> &Path {
         &self.data_root
+    }
+
+    pub fn plugin_config(&self) -> &Map<String, Value> {
+        &self.plugin_config
     }
 }
 

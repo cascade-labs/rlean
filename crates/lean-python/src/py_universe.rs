@@ -1,7 +1,7 @@
 use crate::py_data::PyCustomDataPoint;
 use crate::py_types::{PyResolution, PySecurity, PySymbol};
 use lean_algorithm::algorithm::SecurityChanges;
-use lean_core::{Market, Resolution, Symbol};
+use lean_core::{Market, Resolution, SecurityType, Symbol};
 use lean_data::CustomDataPoint;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -242,6 +242,8 @@ pub struct PyScheduledUniverse {
     selector: Py<PyAny>,
     settings: UniverseSettingsState,
     trigger_resolution: Resolution,
+    symbol_security_type: SecurityType,
+    symbol_market: Market,
     custom_ticker: Option<String>,
     last_custom_trigger: Option<i64>,
     selected: HashMap<u64, UniverseMember>,
@@ -255,6 +257,23 @@ impl PyScheduledUniverse {
     ) -> Self {
         let mut settings = settings;
         settings.resolution = resolution;
+        Self::user_defined_typed(
+            selector,
+            resolution,
+            settings,
+            SecurityType::Equity,
+            Market::usa(),
+        )
+    }
+
+    pub fn user_defined_typed(
+        selector: Py<PyAny>,
+        resolution: Resolution,
+        mut settings: UniverseSettingsState,
+        symbol_security_type: SecurityType,
+        symbol_market: Market,
+    ) -> Self {
+        settings.resolution = resolution;
         Self {
             date_rule: PyDateRule {
                 kind: DateRuleKind::EveryDay,
@@ -265,6 +284,8 @@ impl PyScheduledUniverse {
             selector,
             settings,
             trigger_resolution: resolution,
+            symbol_security_type,
+            symbol_market,
             custom_ticker: None,
             last_custom_trigger: None,
             selected: HashMap::new(),
@@ -277,6 +298,25 @@ impl PyScheduledUniverse {
         resolution: Resolution,
         settings: UniverseSettingsState,
     ) -> Self {
+        Self::custom_data_typed(
+            ticker,
+            selector,
+            resolution,
+            settings,
+            SecurityType::Equity,
+            Market::usa(),
+        )
+    }
+
+    pub fn custom_data_typed(
+        ticker: String,
+        selector: Py<PyAny>,
+        resolution: Resolution,
+        mut settings: UniverseSettingsState,
+        symbol_security_type: SecurityType,
+        symbol_market: Market,
+    ) -> Self {
+        settings.resolution = resolution;
         Self {
             date_rule: PyDateRule {
                 kind: DateRuleKind::EveryDay,
@@ -287,6 +327,8 @@ impl PyScheduledUniverse {
             selector,
             settings,
             trigger_resolution: resolution,
+            symbol_security_type,
+            symbol_market,
             custom_ticker: Some(ticker.to_uppercase()),
             last_custom_trigger: None,
             selected: HashMap::new(),
@@ -368,7 +410,7 @@ impl PyScheduledUniverse {
         if result.is_none() {
             return Ok(SecurityChanges::empty());
         }
-        let symbols = extract_symbols(result)?;
+        let symbols = extract_symbols(result, self.symbol_security_type, &self.symbol_market)?;
         let mut next = HashMap::new();
         for symbol in symbols {
             next.insert(symbol.id.sid, symbol);
@@ -424,6 +466,8 @@ impl PyScheduledUniverse {
             selector,
             settings: settings.map(|s| s.snapshot()).unwrap_or_default(),
             trigger_resolution: Resolution::Daily,
+            symbol_security_type: SecurityType::Equity,
+            symbol_market: Market::usa(),
             custom_ticker: None,
             last_custom_trigger: None,
             selected: HashMap::new(),
@@ -526,17 +570,31 @@ impl PySecurityChanges {
     }
 }
 
-fn extract_symbols(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Symbol>> {
+fn extract_symbols(
+    obj: &Bound<'_, PyAny>,
+    security_type: SecurityType,
+    market: &Market,
+) -> PyResult<Vec<Symbol>> {
     if let Ok(list) = obj.cast::<PyList>() {
-        return list.iter().map(|item| extract_symbol(&item)).collect();
+        return list
+            .iter()
+            .map(|item| extract_symbol(&item, security_type, market))
+            .collect();
     }
     if let Ok(tuple) = obj.cast::<PyTuple>() {
-        return tuple.iter().map(|item| extract_symbol(&item)).collect();
+        return tuple
+            .iter()
+            .map(|item| extract_symbol(&item, security_type, market))
+            .collect();
     }
-    Ok(vec![extract_symbol(obj)?])
+    Ok(vec![extract_symbol(obj, security_type, market)?])
 }
 
-fn extract_symbol(obj: &Bound<'_, PyAny>) -> PyResult<Symbol> {
+fn extract_symbol(
+    obj: &Bound<'_, PyAny>,
+    security_type: SecurityType,
+    market: &Market,
+) -> PyResult<Symbol> {
     if let Ok(sym) = obj.cast::<PySymbol>() {
         return Ok(sym.get().inner.clone());
     }
@@ -544,17 +602,31 @@ fn extract_symbol(obj: &Bound<'_, PyAny>) -> PyResult<Symbol> {
         return Ok(sec.get().inner.inner.clone());
     }
     if let Ok(ticker) = obj.extract::<String>() {
-        return Ok(Symbol::create_equity(&ticker, &Market::usa()));
+        return Ok(create_symbol_for_universe(&ticker, security_type, market));
     }
     if let Ok(symbol_attr) = obj.getattr("symbol") {
-        return extract_symbol(&symbol_attr);
+        return extract_symbol(&symbol_attr, security_type, market);
     }
     if let Ok(symbol_attr) = obj.getattr("Symbol") {
-        return extract_symbol(&symbol_attr);
+        return extract_symbol(&symbol_attr, security_type, market);
     }
     Err(pyo3::exceptions::PyTypeError::new_err(
         "Universe selector must return Symbols, Securities, or ticker strings",
     ))
+}
+
+fn create_symbol_for_universe(
+    ticker: &str,
+    security_type: SecurityType,
+    market: &Market,
+) -> Symbol {
+    match security_type {
+        SecurityType::Crypto => Symbol::create_crypto(ticker, market),
+        SecurityType::CryptoFuture => Symbol::create_crypto_future(ticker, market),
+        SecurityType::Forex => Symbol::create_forex(ticker),
+        SecurityType::Equity => Symbol::create_equity(ticker, market),
+        _ => Symbol::create_equity(ticker, market),
+    }
 }
 
 fn can_remove_member(added_ns: i64, utc_ns: i64, minimum_secs: f64) -> bool {
@@ -777,6 +849,48 @@ mod tests {
             let removed: Vec<_> = second.removed.iter().map(|s| s.value.as_str()).collect();
             assert_eq!(added, vec!["MSFT"]);
             assert_eq!(removed, vec!["SPY"]);
+        });
+    }
+
+    #[test]
+    fn typed_custom_universe_converts_string_symbols_with_security_type_and_market() {
+        crate::test_python::init();
+        Python::attach(|py| {
+            let selector = py
+                .eval(c"lambda rows: ['BTC', 'xyz:TSLA']", None, None)
+                .unwrap()
+                .unbind();
+            let mut universe = PyScheduledUniverse::custom_data_typed(
+                "HIP3_XYZ".to_string(),
+                selector,
+                Resolution::Hour,
+                UniverseSettingsState::default(),
+                SecurityType::CryptoFuture,
+                Market::hyperliquid(),
+            );
+            let mut custom_data = HashMap::new();
+            custom_data.insert(
+                "HIP3_XYZ".to_string(),
+                vec![CustomDataPoint {
+                    time: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    end_time: Some(lean_core::NanosecondTimestamp(dt_ns(2026, 1, 1, 0, 0))),
+                    value: rust_decimal::Decimal::ZERO,
+                    fields: HashMap::new(),
+                }],
+            );
+
+            let changes = universe
+                .select_custom_data(py, dt_ns(2026, 1, 1, 0, 0), Resolution::Hour, &custom_data)
+                .unwrap();
+            assert_eq!(changes.added.len(), 2);
+            assert!(changes
+                .added
+                .iter()
+                .all(|symbol| symbol.security_type() == SecurityType::CryptoFuture));
+            assert!(changes
+                .added
+                .iter()
+                .all(|symbol| symbol.market().as_str() == Market::HYPERLIQUID));
         });
     }
 

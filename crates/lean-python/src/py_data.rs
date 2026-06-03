@@ -1352,6 +1352,17 @@ impl PyCustomDataPoint {
                 return Ok(attr.unbind());
             }
         }
+        {
+            let borrowed = slf.borrow();
+            if let Some(value) = borrowed.fields_inner.get(name) {
+                return json_value_to_py(slf.py(), value);
+            }
+            if snake != name {
+                if let Some(value) = borrowed.fields_inner.get(&snake) {
+                    return json_value_to_py(slf.py(), value);
+                }
+            }
+        }
         Err(pyo3::exceptions::PyAttributeError::new_err(format!(
             "'CustomDataPoint' object has no attribute '{name}'"
         )))

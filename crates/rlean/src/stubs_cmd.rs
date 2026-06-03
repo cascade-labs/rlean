@@ -119,6 +119,15 @@ class Market:
     KRAKEN: str
     HYPERLIQUID: str
 
+class HyperliquidUniverse:
+    CRYPTO_PERP: str
+    CRYPTO_SPOT: str
+    HIP3_XYZ: str
+    HIP3_TRADING_XYZ: str
+    HIP3_VNTL: str
+    @staticmethod
+    def hip3(dex: str) -> str: ...
+
 # ── OrderType ─────────────────────────────────────────────────────────────────
 
 class OrderType:
@@ -1036,6 +1045,9 @@ class QCAlgorithm:
     def TimeRules(self) -> TimeRules: ...
     def add_universe(self, *args: Any) -> None: ...
     def AddUniverse(self, *args: Any) -> None: ...
+    def add_crypto_universe(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any], market: Optional[str] = None) -> None: ...
+    def AddCryptoUniverse(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any], market: Optional[str] = None) -> None: ...
+    def add_hyperliquid_universe(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any]) -> None: ...
 
     # ── Options ───────────────────────────────────────────────────────────────
 
