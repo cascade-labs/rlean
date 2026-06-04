@@ -56,6 +56,7 @@ pub struct OpenPositionTrade {
     pub entry_time: DateTime,
     pub entry_price: Price,
     pub quantity: Quantity,
+    pub fees: Price,
 }
 
 /// Builds completed round-trip trades from a stream of fills.
@@ -100,6 +101,7 @@ impl TradeBuilder {
                     entry_time: event_time,
                     entry_price: fill_price,
                     quantity: fill_quantity,
+                    fees,
                 },
             );
             return None;
@@ -112,6 +114,7 @@ impl TradeBuilder {
                     entry_time: event_time,
                     entry_price: fill_price,
                     quantity: fill_quantity,
+                    fees,
                 },
             );
             return None;
@@ -129,6 +132,7 @@ impl TradeBuilder {
                         entry_time: open.entry_time,
                         entry_price: new_price,
                         quantity: new_quantity,
+                        fees: open.fees + fees,
                     },
                 );
             }
@@ -136,6 +140,12 @@ impl TradeBuilder {
         }
 
         let close_abs = open.quantity.abs().min(fill_quantity.abs());
+        let open_abs = open.quantity.abs();
+        let fill_abs = fill_quantity.abs();
+        let entry_fees = prorate(open.fees, close_abs, open_abs);
+        let closing_fees = prorate(fees, close_abs, fill_abs);
+        let remaining_fill_fees = fees - closing_fees;
+        let remaining_open_fees = open.fees - entry_fees;
         let close_quantity = if open.quantity < Decimal::ZERO {
             -close_abs
         } else {
@@ -148,7 +158,7 @@ impl TradeBuilder {
             open.entry_price,
             fill_price,
             close_quantity,
-            fees,
+            entry_fees + closing_fees,
         );
 
         let remaining_quantity = open.quantity + fill_quantity;
@@ -158,12 +168,14 @@ impl TradeBuilder {
                     entry_time: open.entry_time,
                     entry_price: open.entry_price,
                     quantity: remaining_quantity,
+                    fees: remaining_open_fees,
                 }
             } else {
                 OpenPositionTrade {
                     entry_time: event_time,
                     entry_price: fill_price,
                     quantity: remaining_quantity,
+                    fees: remaining_fill_fees,
                 }
             };
             self.open_positions.insert(sid, remaining);
@@ -184,6 +196,14 @@ impl TradeBuilder {
 
 fn same_position_side(a: Decimal, b: Decimal) -> bool {
     (a > Decimal::ZERO && b > Decimal::ZERO) || (a < Decimal::ZERO && b < Decimal::ZERO)
+}
+
+fn prorate(value: Decimal, part: Decimal, total: Decimal) -> Decimal {
+    if value.is_zero() || part.is_zero() || total.is_zero() {
+        Decimal::ZERO
+    } else {
+        value * part / total
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +316,44 @@ mod tests {
         assert_eq!(trade.quantity, dec!(-20));
         assert_eq!(trade.pnl, dec!(40));
         assert_eq!(builder.open_position(&sym).unwrap().quantity, dec!(-30));
+    }
+
+    #[test]
+    fn trade_builder_prorates_entry_and_exit_fees_on_partial_close() {
+        let sym = spy();
+        let mut builder = TradeBuilder::new();
+
+        assert!(builder
+            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(10))
+            .is_none());
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-40), dec!(4))
+            .unwrap();
+
+        assert_eq!(trade.fees, dec!(8));
+        assert_eq!(trade.pnl, dec!(72));
+        let open = builder.open_position(&sym).unwrap();
+        assert_eq!(open.quantity, dec!(60));
+        assert_eq!(open.fees, dec!(6));
+    }
+
+    #[test]
+    fn trade_builder_splits_reversal_fill_fees_between_closed_and_new_position() {
+        let sym = spy();
+        let mut builder = TradeBuilder::new();
+
+        assert!(builder
+            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(10))
+            .is_none());
+        let trade = builder
+            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-150), dec!(15))
+            .unwrap();
+
+        assert_eq!(trade.fees, dec!(20));
+        assert_eq!(trade.pnl, dec!(180));
+        let open = builder.open_position(&sym).unwrap();
+        assert_eq!(open.quantity, dec!(-50));
+        assert_eq!(open.fees, dec!(5));
     }
 
     #[test]

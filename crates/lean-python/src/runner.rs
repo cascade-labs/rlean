@@ -90,16 +90,16 @@ fn settle_fill_event(
     adapter: &PyAlgorithmAdapter,
     portfolio: &Arc<SecurityPortfolioManager>,
     order_processor: &OrderProcessor,
-    event: &OrderEvent,
-) {
+    event: &mut OrderEvent,
+) -> Option<Decimal> {
     if !event.is_fill() {
-        return;
+        return None;
     }
     let Some(order) = order_processor
         .transaction_manager
         .get_order(event.order_id)
     else {
-        return;
+        return None;
     };
     let (fee, contract_multiplier) = {
         let alg = adapter.inner.lock().unwrap();
@@ -115,6 +115,47 @@ fn settle_fill_event(
         fee,
         contract_multiplier,
     );
+    event.order_fee = fee;
+    Some(fee)
+}
+
+fn process_order_events(
+    adapter: &mut PyAlgorithmAdapter,
+    portfolio: &Arc<SecurityPortfolioManager>,
+    order_processor: &OrderProcessor,
+    events: &mut [OrderEvent],
+    all_order_events: &mut Vec<OrderEvent>,
+    trade_builder: &mut TradeBuilder,
+    completed_trades: &mut Vec<Trade>,
+    live_writer: Option<&LiveBacktestWriter>,
+) {
+    for event in events {
+        let fee = if event.is_fill() {
+            settle_fill_event(adapter, portfolio, order_processor, event)
+        } else {
+            None
+        };
+
+        all_order_events.push(event.clone());
+        if let Some(writer) = live_writer {
+            writer.append_order_events(std::slice::from_ref(event));
+        }
+
+        if let Some(fee) = fee {
+            record_trade_fill(
+                &event.symbol,
+                event.utc_time,
+                event.fill_price,
+                event.fill_quantity,
+                fee,
+                trade_builder,
+                completed_trades,
+                live_writer,
+            );
+        }
+
+        adapter.on_order_event(event);
+    }
 }
 
 fn reconcile_runner_subscriptions(
@@ -2354,30 +2395,21 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     // market orders carried into a new bar: portfolio state is
                     // updated from executable market data before alpha/portfolio
                     // construction can emit new targets.
-                    let pre_existing_fill_events = order_processor.process_orders_with_quotes(
+                    let mut pre_existing_fill_events = order_processor.process_orders_with_quotes(
                         &bars_for_orders,
                         &minute_quote_bars,
                         utc_time,
                     );
-                    all_order_events.extend(pre_existing_fill_events.iter().cloned());
-                    if let Some(writer) = &live_writer {
-                        writer.append_order_events(&pre_existing_fill_events);
-                    }
-                    for event in &pre_existing_fill_events {
-                        if event.is_fill() {
-                            settle_fill_event(&adapter, &portfolio, &order_processor, event);
-                            record_trade_fill(
-                                &event.symbol,
-                                event.utc_time,
-                                event.fill_price,
-                                event.fill_quantity,
-                                &mut trade_builder,
-                                &mut completed_trades,
-                                live_writer.as_ref(),
-                            );
-                        }
-                        adapter.on_order_event(event);
-                    }
+                    process_order_events(
+                        &mut adapter,
+                        &portfolio,
+                        &order_processor,
+                        &mut pre_existing_fill_events,
+                        &mut all_order_events,
+                        &mut trade_builder,
+                        &mut completed_trades,
+                        live_writer.as_ref(),
+                    );
 
                     Python::attach(|py| {
                         if let Some(chains_snapshot) = chains_snapshot.as_ref() {
@@ -2424,30 +2456,21 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                     }
 
-                    let fill_events = order_processor.process_orders_with_quotes(
+                    let mut fill_events = order_processor.process_orders_with_quotes(
                         &bars_for_orders,
                         &minute_quote_bars,
                         utc_time,
                     );
-                    all_order_events.extend(fill_events.iter().cloned());
-                    if let Some(writer) = &live_writer {
-                        writer.append_order_events(&fill_events);
-                    }
-                    for event in &fill_events {
-                        if event.is_fill() {
-                            settle_fill_event(&adapter, &portfolio, &order_processor, event);
-                            record_trade_fill(
-                                &event.symbol,
-                                event.utc_time,
-                                event.fill_price,
-                                event.fill_quantity,
-                                &mut trade_builder,
-                                &mut completed_trades,
-                                live_writer.as_ref(),
-                            );
-                        }
-                        adapter.on_order_event(event);
-                    }
+                    process_order_events(
+                        &mut adapter,
+                        &portfolio,
+                        &order_processor,
+                        &mut fill_events,
+                        &mut all_order_events,
+                        &mut trade_builder,
+                        &mut completed_trades,
+                        live_writer.as_ref(),
+                    );
                 }
 
                 // End-of-day calls.
@@ -2868,27 +2891,17 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 slice.bars.iter().map(|(&k, v)| (k, v.clone())).collect();
             bars_map.extend(option_order_bars);
 
-            let fill_events = order_processor.process_orders(&bars_map, utc_time);
-            all_order_events.extend(fill_events.iter().cloned());
-            if let Some(writer) = &live_writer {
-                writer.append_order_events(&fill_events);
-            }
-            for event in &fill_events {
-                if event.is_fill() {
-                    settle_fill_event(&adapter, &portfolio, &order_processor, event);
-
-                    record_trade_fill(
-                        &event.symbol,
-                        event.utc_time,
-                        event.fill_price,
-                        event.fill_quantity,
-                        &mut trade_builder,
-                        &mut completed_trades,
-                        live_writer.as_ref(),
-                    );
-                }
-                adapter.on_order_event(event);
-            }
+            let mut fill_events = order_processor.process_orders(&bars_map, utc_time);
+            process_order_events(
+                &mut adapter,
+                &portfolio,
+                &order_processor,
+                &mut fill_events,
+                &mut all_order_events,
+                &mut trade_builder,
+                &mut completed_trades,
+                live_writer.as_ref(),
+            );
 
             // ── Custom data fetch (daily) ─────────────────────────────────
             let custom_subs: Vec<CustomDataSubscription> = {
@@ -6194,17 +6207,13 @@ fn record_trade_fill(
     event_time: DateTime,
     fill_price: Decimal,
     fill_qty: Decimal,
+    fees: Decimal,
     trade_builder: &mut TradeBuilder,
     completed_trades: &mut Vec<Trade>,
     live_writer: Option<&LiveBacktestWriter>,
 ) {
-    let Some(trade) = trade_builder.record_fill(
-        symbol,
-        event_time,
-        fill_price,
-        fill_qty,
-        rust_decimal_macros::dec!(0),
-    ) else {
+    let Some(trade) = trade_builder.record_fill(symbol, event_time, fill_price, fill_qty, fees)
+    else {
         return;
     };
     if let Some(writer) = live_writer {
