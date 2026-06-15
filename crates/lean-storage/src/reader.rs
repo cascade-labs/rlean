@@ -11,6 +11,7 @@ use arrow_array::{
     RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_cast::display::array_value_to_string;
+use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use datafusion::common::config::ConfigOptions;
 use datafusion::prelude::*;
@@ -108,8 +109,11 @@ impl ParquetReader {
         date: chrono::NaiveDate,
     ) -> LeanResult<Vec<CustomDataPoint>> {
         validate_custom_parquet_source(source)?;
-        if source.paths.is_empty() {
+        if source.paths.is_empty() && source.buffers.is_empty() {
             return Ok(vec![]);
+        }
+        if !source.buffers.is_empty() {
+            return read_custom_parquet_points_from_buffers(source, query, date);
         }
         if source.paths.len() > 1 {
             return read_custom_parquet_points_from_files(source, query, date);
@@ -1348,6 +1352,32 @@ fn read_custom_parquet_points_from_files(
     Ok(out)
 }
 
+fn read_custom_parquet_points_from_buffers(
+    source: &CustomParquetSource,
+    query: &CustomDataQuery,
+    date: chrono::NaiveDate,
+) -> LeanResult<Vec<CustomDataPoint>> {
+    let mut out = Vec::new();
+    for buffer in &source.buffers {
+        let bytes = Bytes::from(buffer.clone());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let reader = builder
+            .build()
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            append_custom_batch_points(&mut out, &batch, source, query, date)?;
+        }
+    }
+    debug!(
+        "Read {} custom parquet points from {} in-memory file(s)",
+        out.len(),
+        source.buffers.len()
+    );
+    Ok(out)
+}
+
 fn append_custom_batch_points(
     out: &mut Vec<CustomDataPoint>,
     batch: &RecordBatch,
@@ -2110,6 +2140,7 @@ mod tests {
         };
         let source = CustomParquetSource {
             paths: vec![],
+            buffers: vec![],
             time_column: None,
             time_format: None,
             time_zone: None,

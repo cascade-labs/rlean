@@ -85,7 +85,13 @@ impl CustomDataQuery {
 /// A parquet-native source returned by custom data providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomParquetSource {
+    /// Local parquet paths. Historical/backtest providers commonly use these
+    /// so data can be cached and reused.
     pub paths: Vec<String>,
+    /// In-memory parquet files. Live providers can use these to avoid durable
+    /// local writes when objects are small or ephemeral.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<Vec<u8>>,
     /// Column used as the data timestamp/date. If absent, the runner uses the
     /// requested date for every row.
     pub time_column: Option<String>,

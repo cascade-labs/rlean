@@ -8590,31 +8590,19 @@ async fn load_universe_data_points_for_subscription(
     ticker: String,
     date: NaiveDate,
     source: Option<Arc<dyn lean_data_providers::ICustomDataSource>>,
-    mut config: CustomDataConfig,
+    config: CustomDataConfig,
 ) -> Result<Vec<CustomDataPoint>> {
-    let data_root_string = data_root.display().to_string();
-    config
-        .properties
-        .entry("data_root".to_string())
-        .or_insert_with(|| data_root_string.clone());
-    config
-        .query
-        .properties
-        .entry("data_root".to_string())
-        .or_insert_with(|| data_root_string.clone());
-
-    Ok(tokio::task::spawn_blocking(move || {
-        load_custom_data_points(
-            &data_root,
-            &source_type,
-            &ticker,
-            date,
-            source.as_ref(),
-            &config,
-        )
-    })
-    .await
-    .unwrap_or_default())
+    Ok(load_custom_data_points_for_subscription_with_status(
+        data_root,
+        source_type,
+        ticker,
+        date,
+        source,
+        config,
+        lean_data::CustomDataQuery::default(),
+    )
+    .await?
+    .points)
 }
 
 struct CustomDataLoadResult {
