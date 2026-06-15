@@ -27,13 +27,14 @@ use py_framework::{
     PyBlackLittermanPcm, PyConfidenceWeightingPcm, PyConstantAlphaModel, PyEmaCrossAlphaModel,
     PyEqualWeightingPcm, PyExecutionModelBase, PyHistoricalReturnsAlphaModel,
     PyImmediateExecutionModel, PyInsight, PyInsightDirection, PyInsightWeightingPcm,
-    PyMacdAlphaModel, PyMaxDrawdownPercentPerSecurity, PyMaxDrawdownPercentPortfolio,
-    PyMaxSectorExposureRiskModel, PyMaxSharpeRatioPcm, PyMaxUnrealizedProfitPerSecurity,
-    PyMeanReversionPcm, PyMeanVariancePcm, PyNullExecutionModel, PyNullRiskManagementModel,
-    PyPassiveMakerExecutionModel, PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias,
-    PyPortfolioConstructionModelBase, PyPortfolioTarget, PyRiskManagementModelBase,
-    PyRiskParityPcm, PyRsiAlphaModel, PySpreadExecutionModel, PyStandardDeviationExecutionModel,
-    PyTrailingStopRiskModel, PyVwapExecutionModel,
+    PyMacdAlphaModel, PyMakerThenTakerExecutionModel, PyMaxDrawdownPercentPerSecurity,
+    PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel, PyMaxSharpeRatioPcm,
+    PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm, PyNullExecutionModel,
+    PyNullRiskManagementModel, PyPassiveMakerExecutionModel,
+    PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias, PyPortfolioConstructionModelBase,
+    PyPortfolioTarget, PyRiskManagementModelBase, PyRiskParityPcm, PyRsiAlphaModel,
+    PySpreadExecutionModel, PyStandardDeviationExecutionModel, PyTrailingStopRiskModel,
+    PyVwapExecutionModel,
 };
 use py_indicators::{
     PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyMomp, PyRsi, PySma, PyStd,
@@ -413,6 +414,7 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySpreadExecutionModel>()?;
     m.add_class::<PyPassiveMakerExecutionModel>()?;
     m.add_class::<PyAdaptiveMakerTakerExecutionModel>()?;
+    m.add_class::<PyMakerThenTakerExecutionModel>()?;
     m.add_class::<PyStandardDeviationExecutionModel>()?;
 
     // ── Algorithm Framework — Risk Management Models ──────────────────────────

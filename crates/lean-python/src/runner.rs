@@ -1938,17 +1938,24 @@ fn submit_execution_order_request(alg: &mut QcAlgorithm, request: lean_execution
     use lean_execution::ExecutionOrderType;
     match request.order_type {
         ExecutionOrderType::Market => {
-            alg.market_order(&request.symbol, request.quantity);
+            alg.market_order_with_options_and_tag(
+                &request.symbol,
+                request.quantity,
+                None,
+                false,
+                &request.tag,
+            );
         }
         ExecutionOrderType::Limit => {
             if let Some(limit_price) = request.limit_price {
-                alg.limit_order_with_properties(
+                alg.limit_order_with_properties_and_tag(
                     &request.symbol,
                     request.quantity,
                     limit_price,
                     None,
                     false,
                     request.post_only,
+                    &request.tag,
                 );
             }
         }

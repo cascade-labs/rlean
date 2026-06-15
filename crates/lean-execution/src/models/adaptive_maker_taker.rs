@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
+    SecurityData,
 };
 use crate::models::passive_maker::PassiveMakerExecutionModel;
 use lean_core::Symbol;
@@ -50,17 +51,18 @@ impl Default for AdaptiveMakerTakerExecutionModel {
 }
 
 impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
-    fn execute(
+    fn execute_with_context(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
+        context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         let mut passive_targets = Vec::new();
         let mut market_orders = Vec::new();
 
         for target in targets {
             let key = target.symbol.value.clone();
-            if securities
+            if context
+                .securities
                 .get(&key)
                 .map(|security| self.spread_is_tight(security))
                 .unwrap_or(false)
@@ -80,7 +82,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
             .collect();
 
         for (key, symbol, target_quantity) in tight_snapshot {
-            let Some(security) = securities.get(&key) else {
+            let Some(security) = context.securities.get(&key) else {
                 continue;
             };
             if !self.spread_is_tight(security) {
@@ -109,7 +111,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
             });
         }
 
-        let mut passive_orders = self.passive.execute(&passive_targets, securities);
+        let mut passive_orders = self.passive.execute_with_context(&passive_targets, context);
         market_orders.append(&mut passive_orders);
         market_orders
     }

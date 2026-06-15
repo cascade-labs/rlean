@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use lean_alpha::{IAlphaModel, InsightCollection, InsightDirection as AlphaDir};
 use lean_core::{Symbol, TickType, TimeSpan};
 use lean_execution::{
-    AdaptiveMakerTakerExecutionModel, ExecutionTarget, IExecutionModel, ImmediateExecutionModel,
+    AdaptiveMakerTakerExecutionModel, ExecutionContext, ExecutionOpenOrder, ExecutionOrderType,
+    ExecutionTarget, IExecutionModel, ImmediateExecutionModel, MakerThenTakerExecutionModel,
     OrderRequest, SecurityData,
 };
 use lean_portfolio_construction::{
@@ -72,7 +73,7 @@ impl FrameworkState {
         securities: &[Symbol],
         portfolio_value: Decimal,
         prices: &HashMap<String, Decimal>,
-        security_data: &HashMap<String, SecurityData>,
+        execution_context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         // 1. Alpha: gather insights from all registered models.
         let alpha_insights: Vec<lean_alpha::Insight> = self
@@ -100,7 +101,7 @@ impl FrameworkState {
         }
 
         if !has_insight_changes && self.pending_flat_targets.is_empty() {
-            return self.exec_model.execute(&[], security_data);
+            return self.exec_model.execute_with_context(&[], execution_context);
         }
 
         let mut target_insights = self.insights.latest_active_per_symbol(slice.time);
@@ -118,7 +119,7 @@ impl FrameworkState {
         target_insights.append(&mut self.pending_flat_targets);
 
         if target_insights.is_empty() {
-            return self.exec_model.execute(&[], security_data);
+            return self.exec_model.execute_with_context(&[], execution_context);
         }
 
         // 2. Convert active alpha Insights → InsightForPcm.
@@ -165,7 +166,8 @@ impl FrameworkState {
             })
             .collect();
 
-        self.exec_model.execute(&exec_targets, security_data)
+        self.exec_model
+            .execute_with_context(&exec_targets, execution_context)
     }
 
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
@@ -205,7 +207,7 @@ pub fn run_framework_pipeline(
         }
     }
 
-    let (securities, prices, portfolio_value, security_data) = {
+    let (securities, prices, portfolio_value, security_data, open_order_data) = {
         let alg = alg_inner.lock().unwrap();
         let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
         let prices: HashMap<String, Decimal> = alg
@@ -220,10 +222,31 @@ pub fn run_framework_pipeline(
             .map(|h| (h.symbol.value.clone(), h.quantity))
             .collect();
         let mut open_orders: HashMap<String, Decimal> = HashMap::new();
+        let mut open_order_data = Vec::new();
         for order in alg.transactions.get_open_orders() {
+            let order_type = match order.order_type {
+                lean_orders::OrderType::Market => ExecutionOrderType::Market,
+                lean_orders::OrderType::Limit => ExecutionOrderType::Limit,
+                lean_orders::OrderType::MarketOnOpen => ExecutionOrderType::MarketOnOpen,
+                lean_orders::OrderType::MarketOnClose => ExecutionOrderType::MarketOnClose,
+                _ => ExecutionOrderType::Market,
+            };
+            let remaining_quantity = order.remaining_quantity();
             *open_orders
                 .entry(order.symbol.value.clone())
-                .or_insert(Decimal::ZERO) += order.quantity;
+                .or_insert(Decimal::ZERO) += remaining_quantity;
+            open_order_data.push(ExecutionOpenOrder {
+                id: order.id,
+                symbol: order.symbol.clone(),
+                quantity: order.quantity,
+                remaining_quantity,
+                order_type,
+                limit_price: order.limit_price,
+                post_only: order.properties.post_only,
+                tag: order.tag.clone(),
+                created_time: order.created_time,
+                last_update_time: order.last_update_time,
+            });
         }
         let pv = alg.portfolio.total_portfolio_value();
         let security_data = alg
@@ -249,11 +272,23 @@ pub fn run_framework_pipeline(
                 (key, data)
             })
             .collect();
-        (securities, prices, pv, security_data)
+        (securities, prices, pv, security_data, open_order_data)
     };
 
     let mut fw = framework.lock().unwrap();
-    fw.run_pipeline(slice, &securities, portfolio_value, &prices, &security_data)
+    let execution_context = ExecutionContext::new(
+        slice.time,
+        &security_data,
+        &open_order_data,
+        portfolio_value,
+    );
+    fw.run_pipeline(
+        slice,
+        &securities,
+        portfolio_value,
+        &prices,
+        &execution_context,
+    )
 }
 
 fn execution_security_data_from_slice(
@@ -1024,6 +1059,60 @@ impl PyAdaptiveMakerTakerExecutionModel {
     #[getter]
     pub fn adverse_selection_threshold(&self) -> f64 {
         self.adverse_selection_threshold
+    }
+}
+
+#[pyclass(name = "MakerThenTakerExecutionModel")]
+pub struct PyMakerThenTakerExecutionModel {
+    pub model: Option<Box<dyn IExecutionModel>>,
+    passive_duration_seconds: f64,
+    adverse_selection_threshold: f64,
+    maximum_order_value: f64,
+}
+
+#[pymethods]
+impl PyMakerThenTakerExecutionModel {
+    #[new]
+    #[pyo3(signature = (passive_duration_seconds=300.0, adverse_selection_threshold=0.005, maximum_order_value=0.0, asynchronous=true))]
+    pub fn new(
+        passive_duration_seconds: f64,
+        adverse_selection_threshold: f64,
+        maximum_order_value: f64,
+        asynchronous: bool,
+    ) -> Self {
+        let _ = asynchronous;
+        let passive_duration_seconds = passive_duration_seconds.max(0.0);
+        let passive_duration =
+            TimeSpan::from_millis((passive_duration_seconds * 1000.0).round() as i64);
+        let adverse_selection_threshold = adverse_selection_threshold.abs();
+        let maximum_order_value = maximum_order_value.abs();
+        Self {
+            model: Some(Box::new(
+                MakerThenTakerExecutionModel::with_maximum_order_value(
+                    passive_duration,
+                    Decimal::from_f64(adverse_selection_threshold).unwrap_or(Decimal::ZERO),
+                    Decimal::from_f64(maximum_order_value).unwrap_or(Decimal::ZERO),
+                ),
+            )),
+            passive_duration_seconds,
+            adverse_selection_threshold,
+            maximum_order_value,
+        }
+    }
+
+    #[getter]
+    pub fn passive_duration_seconds(&self) -> f64 {
+        self.passive_duration_seconds
+    }
+
+    #[getter]
+    pub fn adverse_selection_threshold(&self) -> f64 {
+        self.adverse_selection_threshold
+    }
+
+    #[getter]
+    pub fn maximum_order_value(&self) -> f64 {
+        self.maximum_order_value
     }
 }
 
@@ -1893,6 +1982,9 @@ pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyAdaptiveMakerTakerExecutionModel>() {
+        return m.borrow_mut().model.take();
+    }
+    if let Ok(m) = model.cast::<PyMakerThenTakerExecutionModel>() {
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyStandardDeviationExecutionModel>() {

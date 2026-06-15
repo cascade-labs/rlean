@@ -31,6 +31,20 @@ pub enum ExecutionOrderType {
     Cancel,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionOpenOrder {
+    pub id: i64,
+    pub symbol: Symbol,
+    pub quantity: Decimal,
+    pub remaining_quantity: Decimal,
+    pub order_type: ExecutionOrderType,
+    pub limit_price: Option<Decimal>,
+    pub post_only: bool,
+    pub tag: String,
+    pub created_time: DateTime,
+    pub last_update_time: Option<DateTime>,
+}
+
 /// Current security data needed by execution models
 #[derive(Debug, Clone)]
 pub struct SecurityData {
@@ -50,13 +64,73 @@ pub struct SecurityData {
     pub open_order_quantity: Decimal,
 }
 
+/// Algorithm-aware execution context.
+///
+/// C# LEAN passes the full QCAlgorithm instance into IExecutionModel.Execute.
+/// rlean keeps execution models in a lower-level crate, so this context is the
+/// framework boundary: time, securities, portfolio state, and transaction state
+/// are passed together instead of as a reduced security snapshot.
+pub struct ExecutionContext<'a> {
+    pub time: DateTime,
+    pub securities: &'a HashMap<String, SecurityData>,
+    pub open_orders: &'a [ExecutionOpenOrder],
+    pub portfolio_value: Decimal,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub fn new(
+        time: DateTime,
+        securities: &'a HashMap<String, SecurityData>,
+        open_orders: &'a [ExecutionOpenOrder],
+        portfolio_value: Decimal,
+    ) -> Self {
+        Self {
+            time,
+            securities,
+            open_orders,
+            portfolio_value,
+        }
+    }
+
+    pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {
+        self.securities.get(&symbol.value)
+    }
+
+    pub fn open_orders_for_symbol<'b>(
+        &'b self,
+        symbol: &'b Symbol,
+    ) -> impl Iterator<Item = &'b ExecutionOpenOrder> + 'b {
+        self.open_orders
+            .iter()
+            .filter(move |order| order.symbol.id.sid == symbol.id.sid)
+    }
+
+    pub fn open_order_quantity(&self, symbol: &Symbol) -> Decimal {
+        self.open_orders_for_symbol(symbol)
+            .map(|order| order.remaining_quantity)
+            .sum()
+    }
+}
+
 /// Converts portfolio targets into orders. Mirrors C# IExecutionModel.
 pub trait IExecutionModel: Send + Sync {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
         securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest>;
+    ) -> Vec<OrderRequest> {
+        let open_orders = Vec::new();
+        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
+        self.execute_with_context(targets, &context)
+    }
+
+    fn execute_with_context(
+        &mut self,
+        targets: &[ExecutionTarget],
+        context: &ExecutionContext<'_>,
+    ) -> Vec<OrderRequest> {
+        self.execute(targets, context.securities)
+    }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}
     fn name(&self) -> &str {

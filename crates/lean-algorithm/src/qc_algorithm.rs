@@ -839,11 +839,28 @@ impl QcAlgorithm {
         time_in_force: Option<TimeInForce>,
         outside_regular_trading_hours: bool,
     ) -> OrderTicket {
+        self.market_order_with_options_and_tag(
+            symbol,
+            quantity,
+            time_in_force,
+            outside_regular_trading_hours,
+            "",
+        )
+    }
+
+    pub fn market_order_with_options_and_tag(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+        tag: &str,
+    ) -> OrderTicket {
         if symbol.option_symbol_id().is_some() {
             self.ensure_option_security(symbol, Resolution::Minute);
         }
         let id = self.next_order_id();
-        let mut order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
+        let mut order = Order::market(id, symbol.clone(), quantity, self.utc_time, tag);
         if let Some(time_in_force) = time_in_force {
             order.time_in_force = time_in_force;
         }
@@ -897,8 +914,36 @@ impl QcAlgorithm {
         outside_regular_trading_hours: bool,
         post_only: bool,
     ) -> OrderTicket {
+        self.limit_order_with_properties_and_tag(
+            symbol,
+            quantity,
+            limit_price,
+            time_in_force,
+            outside_regular_trading_hours,
+            post_only,
+            "",
+        )
+    }
+
+    pub fn limit_order_with_properties_and_tag(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+        post_only: bool,
+        tag: &str,
+    ) -> OrderTicket {
         let id = self.next_order_id();
-        let mut order = Order::limit(id, symbol.clone(), quantity, limit_price, self.utc_time, "");
+        let mut order = Order::limit(
+            id,
+            symbol.clone(),
+            quantity,
+            limit_price,
+            self.utc_time,
+            tag,
+        );
         if let Some(time_in_force) = time_in_force {
             order.time_in_force = time_in_force;
         }

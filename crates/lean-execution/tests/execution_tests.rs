@@ -1,8 +1,9 @@
-use lean_core::{DateTime, Market, Symbol};
+use lean_core::{DateTime, Market, Symbol, TimeSpan};
 use lean_execution::{
-    AdaptiveMakerTakerExecutionModel, ExecutionOrderType, ExecutionTarget, IExecutionModel,
-    ImmediateExecutionModel, NullExecutionModel, PassiveMakerExecutionModel, SecurityData,
-    SpreadExecutionModel, StandardDeviationExecutionModel, VwapExecutionModel,
+    AdaptiveMakerTakerExecutionModel, ExecutionContext, ExecutionOpenOrder, ExecutionOrderType,
+    ExecutionTarget, IExecutionModel, ImmediateExecutionModel, MakerThenTakerExecutionModel,
+    NullExecutionModel, PassiveMakerExecutionModel, SecurityData, SpreadExecutionModel,
+    StandardDeviationExecutionModel, VwapExecutionModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -68,6 +69,28 @@ fn securities_map(data: Vec<SecurityData>) -> HashMap<String, SecurityData> {
     data.into_iter()
         .map(|s| (s.symbol.value.clone(), s))
         .collect()
+}
+
+fn make_open_limit_order(
+    id: i64,
+    ticker: &str,
+    quantity: Decimal,
+    limit_price: Decimal,
+    created_time: DateTime,
+    tag: &str,
+) -> ExecutionOpenOrder {
+    ExecutionOpenOrder {
+        id,
+        symbol: make_symbol(ticker),
+        quantity,
+        remaining_quantity: quantity,
+        order_type: ExecutionOrderType::Limit,
+        limit_price: Some(limit_price),
+        post_only: true,
+        tag: tag.to_string(),
+        created_time,
+        last_update_time: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,5 +1648,166 @@ mod adaptive_maker_taker_execution_tests {
         assert_eq!(second[0].order_type, ExecutionOrderType::Market);
         assert!(second[0].cancel_open_orders);
         assert!(second[0].tag.contains("passive-timeout"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MakerThenTakerExecutionModel tests
+// ---------------------------------------------------------------------------
+
+mod maker_then_taker_execution_tests {
+    use super::*;
+
+    fn context_orders<'a>(
+        time: DateTime,
+        securities: &'a HashMap<String, SecurityData>,
+        open_orders: &'a [ExecutionOpenOrder],
+    ) -> ExecutionContext<'a> {
+        ExecutionContext::new(time, securities, open_orders, dec!(100000))
+    }
+
+    #[test]
+    fn posts_post_only_limit_first() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let context = context_orders(DateTime::from_secs(1), &securities, &open_orders);
+
+        let orders = model.execute_with_context(&[make_target("AAPL", 10.0)], &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].limit_price, Some(dec!(99.95)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn leaves_resting_order_before_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        let first = model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn reprices_when_same_side_quote_improves_before_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100.25),
+            dec!(100.10),
+            dec!(100.30),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].limit_price, Some(dec!(100.10)));
+        assert!(second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn crosses_residual_after_passive_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(301), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(second[0].quantity, dec!(10));
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("deadline"));
     }
 }

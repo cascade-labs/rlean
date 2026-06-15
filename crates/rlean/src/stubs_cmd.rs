@@ -955,6 +955,13 @@ class AdaptiveMakerTakerExecutionModel(ExecutionModel):
     adverse_selection_threshold: float
     def __init__(self, accepting_spread_percent: float = 0.001, max_passive_attempts: int = 1, adverse_selection_threshold: float = 0.005, asynchronous: bool = True) -> None: ...
 
+class MakerThenTakerExecutionModel(ExecutionModel):
+    """Posts post-only maker limits until a passive deadline, then crosses the residual."""
+    passive_duration_seconds: float
+    adverse_selection_threshold: float
+    maximum_order_value: float
+    def __init__(self, passive_duration_seconds: float = 300.0, adverse_selection_threshold: float = 0.005, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
+
 class StandardDeviationExecutionModel(ExecutionModel):
     """Executes when price deviates by N standard deviations from mean."""
     maximum_order_value: float
