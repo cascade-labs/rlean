@@ -29,6 +29,7 @@ struct PassiveState {
     direction: Decimal,
     initial_bid: Decimal,
     initial_ask: Decimal,
+    active_limit_price: Decimal,
     passive_attempts: usize,
 }
 
@@ -55,12 +56,16 @@ impl PassiveMakerExecutionModel {
         }
     }
 
-    fn cap_order_quantity(&self, sec: &SecurityData, quantity: Decimal) -> Decimal {
-        if self.maximum_order_value <= Decimal::ZERO || sec.price <= Decimal::ZERO {
+    fn cap_order_quantity(
+        maximum_order_value: Decimal,
+        sec: &SecurityData,
+        quantity: Decimal,
+    ) -> Decimal {
+        if maximum_order_value <= Decimal::ZERO || sec.price <= Decimal::ZERO {
             return adjust_by_lot_size(sec.lot_size, quantity);
         }
 
-        let capped = (self.maximum_order_value / sec.price).min(quantity.abs()) * sign(quantity);
+        let capped = (maximum_order_value / sec.price).min(quantity.abs()) * sign(quantity);
         adjust_by_lot_size(sec.lot_size, capped)
     }
 
@@ -90,6 +95,7 @@ impl PassiveMakerExecutionModel {
                     direction,
                     initial_bid: bid,
                     initial_ask: ask,
+                    active_limit_price: Decimal::ZERO,
                     passive_attempts: 0,
                 },
             );
@@ -135,6 +141,30 @@ fn cancel_request(symbol: &Symbol, tag: &str) -> OrderRequest {
         post_only: false,
         cancel_open_orders: true,
         tag: tag.to_string(),
+    }
+}
+
+fn passive_limit_price(direction: Decimal, bid: Decimal, ask: Decimal) -> Decimal {
+    if direction > Decimal::ZERO {
+        bid
+    } else {
+        ask
+    }
+}
+
+fn should_reprice_passive_order(
+    direction: Decimal,
+    active_limit_price: Decimal,
+    passive_price: Decimal,
+) -> bool {
+    if active_limit_price <= Decimal::ZERO {
+        return true;
+    }
+
+    if direction > Decimal::ZERO {
+        passive_price > active_limit_price
+    } else {
+        passive_price < active_limit_price
     }
 }
 
@@ -203,6 +233,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
             let direction = sign(target_delta);
             let adverse_selection_threshold = self.adverse_selection_threshold;
             let max_passive_attempts = self.max_passive_attempts;
+            let maximum_order_value = self.maximum_order_value;
             let (state, target_changed) = Self::reset_state_if_needed(
                 &mut self.states,
                 &key,
@@ -218,10 +249,11 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                 bid <= state.initial_bid * (Decimal::ONE - adverse_selection_threshold)
             };
             let use_taker = state.passive_attempts >= max_passive_attempts || adverse_move;
+            let passive_price = passive_limit_price(direction, bid, ask);
 
             if use_taker {
                 state.passive_attempts = 0;
-                let order_qty = self.cap_order_quantity(sec, target_delta);
+                let order_qty = Self::cap_order_quantity(maximum_order_value, sec, target_delta);
                 if order_qty == Decimal::ZERO {
                     continue;
                 }
@@ -242,7 +274,13 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                 state.passive_attempts += 1;
                 let open_order_direction = sign(sec.open_order_quantity);
                 let replace_open_order = sec.open_order_quantity != Decimal::ZERO
-                    && (target_changed || open_order_direction != direction);
+                    && (target_changed
+                        || open_order_direction != direction
+                        || should_reprice_passive_order(
+                            direction,
+                            state.active_limit_price,
+                            passive_price,
+                        ));
                 let unordered_quantity = if replace_open_order {
                     target_delta
                 } else {
@@ -260,15 +298,17 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                     continue;
                 }
 
-                let order_qty = self.cap_order_quantity(sec, unordered_quantity);
+                let order_qty =
+                    Self::cap_order_quantity(maximum_order_value, sec, unordered_quantity);
                 if order_qty == Decimal::ZERO {
                     continue;
                 }
+                state.active_limit_price = passive_price;
                 orders.push(OrderRequest {
                     symbol: symbol.clone(),
                     quantity: order_qty,
                     order_type: ExecutionOrderType::Limit,
-                    limit_price: Some(if direction > Decimal::ZERO { bid } else { ask }),
+                    limit_price: Some(passive_price),
                     post_only: true,
                     cancel_open_orders: replace_open_order,
                     tag: "PassiveMakerExecutionModel post-only".to_string(),

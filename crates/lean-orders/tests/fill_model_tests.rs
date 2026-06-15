@@ -101,6 +101,17 @@ fn sell_limit_does_not_fill_when_high_below_limit() {
     );
 }
 
+#[test]
+fn limit_fill_event_preserves_limit_price() {
+    let model = no_slippage_model();
+    let bar = make_bar(100.0, 105.0, 95.0, 102.0);
+    let order = Order::limit(1, spy(), dec!(100), dec!(97), ts(0), "");
+
+    let fill = model.limit_fill(&order, &bar, ts(0)).unwrap();
+
+    assert_eq!(fill.order_event.limit_price, Some(dec!(97)));
+}
+
 // ─── Stop market fill ────────────────────────────────────────────────────────
 
 #[test]
@@ -123,6 +134,17 @@ fn buy_stop_does_not_fill_when_high_below_stop() {
 
     let fill = model.stop_market_fill(&order, &bar, ts(0));
     assert!(fill.is_none(), "Buy stop should not fill when high < stop");
+}
+
+#[test]
+fn stop_market_fill_event_preserves_stop_price() {
+    let model = no_slippage_model();
+    let bar = make_bar(100.0, 107.0, 95.0, 102.0);
+    let order = Order::stop_market(1, spy(), dec!(100), dec!(103), ts(0), "");
+
+    let fill = model.stop_market_fill(&order, &bar, ts(0)).unwrap();
+
+    assert_eq!(fill.order_event.stop_price, Some(dec!(103)));
 }
 
 // ─── Market on close ────────────────────────────────────────────────────────

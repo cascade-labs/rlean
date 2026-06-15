@@ -193,13 +193,17 @@ fn passive_limit_fill_with_quotes(
 }
 
 fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price) -> Fill {
-    let event = OrderEvent::filled(
+    let mut event = OrderEvent::filled(
         order.id,
         order.symbol.clone(),
         time,
         fill_price,
         order.quantity,
     );
+    event.limit_price = order.limit_price;
+    event.stop_price = order.stop_price;
+    event.trailing_amount = order.trailing_amount;
+    event.trailing_as_percentage = order.trailing_as_percent;
     Fill {
         order_event: event,
         slippage,
@@ -235,17 +239,7 @@ impl FillModel for ImmediateFillModel {
             bar.open - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
     }
 
     fn market_fill_with_quotes(
@@ -288,17 +282,7 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.open)
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: dec!(0),
-        })
+        Some(make_filled(order, time, fill_price, dec!(0)))
     }
 
     fn stop_market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -321,17 +305,7 @@ impl FillModel for ImmediateFillModel {
             stop.min(bar.open) - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: slip,
-        })
+        Some(make_filled(order, time, fill_price, slip))
     }
 
     fn stop_limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -365,17 +339,7 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.low)
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: dec!(0),
-        })
+        Some(make_filled(order, time, fill_price, dec!(0)))
     }
 
     fn market_on_open_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -386,17 +350,7 @@ impl FillModel for ImmediateFillModel {
             bar.open - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
     }
 
     fn market_on_close_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -407,17 +361,7 @@ impl FillModel for ImmediateFillModel {
             bar.close - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
     }
 }
 

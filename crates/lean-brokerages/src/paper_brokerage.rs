@@ -99,6 +99,23 @@ impl PaperBrokerage {
         self.transactions.process_order_event(event.clone());
         self.order_events.lock().push(event);
     }
+
+    fn order_event(
+        &self,
+        order: &Order,
+        status: OrderStatus,
+        message: impl Into<String>,
+    ) -> OrderEvent {
+        let mut event = OrderEvent::new(order.id, order.symbol.clone(), order.time, status);
+        event.direction = order.direction();
+        event.quantity = order.quantity;
+        event.limit_price = order.limit_price;
+        event.stop_price = order.stop_price;
+        event.trailing_amount = order.trailing_amount;
+        event.trailing_as_percentage = order.trailing_as_percent;
+        event.message = message.into();
+        event
+    }
 }
 
 impl Brokerage for PaperBrokerage {
@@ -124,13 +141,7 @@ impl Brokerage for PaperBrokerage {
         self.orders.insert(order.id, order.clone());
         self.transactions.add_or_update_order(order.clone());
 
-        let mut event = OrderEvent::new(
-            order.id,
-            order.symbol.clone(),
-            order.time,
-            OrderStatus::Submitted,
-        );
-        event.message = "Order submitted".to_string();
+        let event = self.order_event(&order, OrderStatus::Submitted, "Order submitted");
         self.record_event(event);
         Ok(true)
     }
@@ -143,13 +154,11 @@ impl Brokerage for PaperBrokerage {
             *entry = updated.clone();
             self.transactions.update_order(updated.clone());
 
-            let mut event = OrderEvent::new(
-                updated.id,
-                updated.symbol.clone(),
-                updated.time,
+            let event = self.order_event(
+                &updated,
                 OrderStatus::UpdateSubmitted,
+                "Order update submitted",
             );
-            event.message = "Order update submitted".to_string();
             self.record_event(event);
             Ok(true)
         } else {
@@ -163,13 +172,7 @@ impl Brokerage for PaperBrokerage {
             entry.canceled_time = Some(order.time);
             self.transactions.update_order(entry.clone());
 
-            let mut event = OrderEvent::new(
-                order.id,
-                order.symbol.clone(),
-                order.time,
-                OrderStatus::Canceled,
-            );
-            event.message = "Order canceled".to_string();
+            let event = self.order_event(order, OrderStatus::Canceled, "Order canceled");
             self.record_event(event);
             Ok(true)
         } else {

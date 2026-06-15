@@ -38,6 +38,20 @@ fn place_order_records_submitted_event_and_shared_transaction_state() {
 }
 
 #[test]
+fn limit_order_submitted_event_preserves_limit_price() {
+    let portfolio = Arc::new(SecurityPortfolioManager::new(dec!(10000)));
+    let transactions = Arc::new(TransactionManager::new());
+    let mut brokerage =
+        PaperBrokerage::new_with_transactions(dec!(10000), portfolio, transactions.clone());
+    let order = Order::limit(1, symbol(), dec!(10), dec!(99), DateTime::EPOCH, "paper");
+
+    assert!(brokerage.place_order(order).unwrap());
+
+    assert_eq!(brokerage.order_events()[0].status, OrderStatus::Submitted);
+    assert_eq!(brokerage.order_events()[0].limit_price, Some(dec!(99)));
+}
+
+#[test]
 fn scan_fills_market_order_and_settles_portfolio() {
     let portfolio = Arc::new(SecurityPortfolioManager::new(dec!(10000)));
     let transactions = Arc::new(TransactionManager::new());

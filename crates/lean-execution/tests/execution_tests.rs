@@ -1366,6 +1366,110 @@ mod passive_maker_execution_tests {
     }
 
     #[test]
+    fn replaces_resting_buy_when_bid_improves_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let mut second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.20),
+            dec!(0),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(99.90)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security.clone()]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].quantity, dec!(10));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(second[0].post_only);
+        assert!(second[0].cancel_open_orders);
+
+        second_security.open_order_quantity = dec!(10);
+        let third = model.execute(&targets, &securities_map(vec![second_security]));
+        assert!(third.is_empty());
+    }
+
+    #[test]
+    fn keeps_resting_buy_when_bid_moves_lower_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.80),
+            dec!(100.00),
+            dec!(0),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(99.90)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security]));
+
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn replaces_resting_sell_when_ask_improves_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", -10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.80),
+            dec!(100.00),
+            dec!(0),
+            dec!(-10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(100.10)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].quantity, dec!(-10));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(second[0].post_only);
+        assert!(second[0].cancel_open_orders);
+    }
+
+    #[test]
     fn falls_back_to_taker_on_adverse_buy_quote_move() {
         let mut model = PassiveMakerExecutionModel::new(10, dec!(0.001));
         let targets = vec![make_target("AAPL", 10.0)];

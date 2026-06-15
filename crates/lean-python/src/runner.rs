@@ -236,12 +236,34 @@ fn update_event_from_order(order: &Order, time: DateTime, message: String) -> Or
     event
 }
 
+fn submit_event_from_order(order: &Order, time: DateTime, message: String) -> OrderEvent {
+    let mut event = OrderEvent::new(order.id, order.symbol.clone(), time, OrderStatus::Submitted);
+    event.direction = order.direction();
+    event.quantity = order.quantity;
+    event.message = message;
+    event
+}
+
 fn active_status_after_update_rejection(order: &Order) -> OrderStatus {
     if !order.filled_quantity.is_zero() {
         OrderStatus::PartiallyFilled
     } else {
         OrderStatus::Submitted
     }
+}
+
+fn drain_local_new_orders(
+    order_processor: &OrderProcessor,
+    time: DateTime,
+    source: &str,
+) -> Vec<OrderEvent> {
+    order_processor
+        .transaction_manager
+        .get_open_orders()
+        .into_iter()
+        .filter(|order| order.status == OrderStatus::New)
+        .map(|order| submit_event_from_order(&order, time, format!("{source} accepted order")))
+        .collect()
 }
 
 fn drain_local_update_requests(
@@ -2176,6 +2198,27 @@ fn process_live_slice(
             }
         }
     } else {
+        let mut submit_events =
+            drain_local_new_orders(order_processor, live_slice.time, "local paper brokerage");
+        if !submit_events.is_empty() {
+            for event in &submit_events {
+                info!(
+                    "Live brokerage event: order_id={} symbol={} status={:?} message={}",
+                    event.order_id, event.symbol.value, event.status, event.message
+                );
+            }
+            OrderEventProcessingContext {
+                adapter,
+                portfolio,
+                order_processor,
+                all_order_events,
+                trade_builder,
+                completed_trades,
+                live_writer: as_sidecar_writer(live_writer),
+            }
+            .process(&mut submit_events);
+        }
+
         let mut update_events =
             drain_local_update_requests(order_processor, live_slice.time, "local paper fills");
         if !update_events.is_empty() {
@@ -10145,6 +10188,50 @@ mod tests {
     }
 
     #[test]
+    fn local_paper_new_orders_emit_submitted_events_before_fills() {
+        let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        transactions.add_order(lean_orders::Order::market(
+            1,
+            symbol.clone(),
+            dec!(1),
+            DateTime::EPOCH,
+            "",
+        ));
+        let processor = OrderProcessor::new(
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            transactions,
+        );
+
+        let events = drain_local_new_orders(&processor, DateTime::EPOCH, "local paper brokerage");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, OrderStatus::Submitted);
+        assert_eq!(events[0].quantity, dec!(1));
+        processor
+            .transaction_manager
+            .process_order_event(events[0].clone());
+        assert_eq!(
+            processor.transaction_manager.get_order(1).unwrap().status,
+            OrderStatus::Submitted
+        );
+
+        let bar = TradeBar::new(
+            symbol.clone(),
+            DateTime::EPOCH,
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(450), dec!(451), dec!(449), dec!(450), dec!(1000)),
+        );
+        let bars = HashMap::from([(symbol.id.sid, bar)]);
+        let fills =
+            processor.generate_order_events_with_quotes(&bars, &HashMap::new(), DateTime::EPOCH);
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::Filled);
+        assert_eq!(fills[0].fill_quantity, dec!(1));
+    }
+
+    #[test]
     fn live_brokerage_bridge_places_orders_in_real_order_mode() {
         let placed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let brokerage = Box::new(RecordingBrokerage {
@@ -11108,6 +11195,56 @@ class NoWarmupCallback(QCAlgorithm):
 
         let config = RunConfig {
             data_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sub = custom_subscription_for_test(
+            "fixture",
+            "ALT",
+            Resolution::Daily,
+            lean_data::CustomDataSubscriptionRole::Universe,
+        );
+        let rows = load_low_resolution_universe_data_for_day(&[sub], &config, date)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.get("ALT").map(Vec::len), Some(1));
+        assert_eq!(rows["ALT"][0].value, dec!(42));
+    }
+
+    struct FullHistoryFixtureSource;
+
+    impl lean_data_providers::ICustomDataSource for FullHistoryFixtureSource {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn is_full_history_source(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn low_resolution_universe_loader_reads_full_history_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let path = custom_data_history_path(tmp.path(), "fixture", "ALT");
+        let mut fields = HashMap::new();
+        fields.insert("symbol".to_string(), serde_json::json!("ALT"));
+        ParquetWriter::new(WriterConfig::default())
+            .write_custom_data_points(
+                &[CustomDataPoint {
+                    time: date,
+                    end_time: Some(date_to_datetime(date, 16, 0, 0)),
+                    value: dec!(42),
+                    fields,
+                }],
+                &path,
+            )
+            .unwrap();
+
+        let config = RunConfig {
+            data_root: tmp.path().to_path_buf(),
+            custom_data_sources: vec![Arc::new(FullHistoryFixtureSource)],
             ..Default::default()
         };
         let sub = custom_subscription_for_test(
