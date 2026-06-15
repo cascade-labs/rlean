@@ -699,7 +699,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
                 "live mode requires --brokerage paper or a live brokerage plugin, for example --brokerage tradier"
             )
         })?;
-    let paper_trading = is_paper_brokerage_name(requested_brokerage);
+    let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
 
     ensure_python_baseline_packages()?;
     use lean_python::AlgorithmImports;
@@ -714,7 +714,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     };
     let live_data_queue =
         providers::build_live_data_queue(live_provider_names, provider_args.clone())?;
-    let brokerage = if paper_trading {
+    let brokerage = if requested_paper_brokerage {
         None
     } else {
         Some(providers::load_brokerage_plugin(
@@ -722,7 +722,12 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             &provider_args,
         )?)
     };
-    let brokerage_name = if paper_trading {
+    let paper_trading = requested_paper_brokerage
+        || brokerage
+            .as_ref()
+            .map(|brokerage| brokerage.uses_local_paper_fills())
+            .unwrap_or(false);
+    let brokerage_name = if requested_paper_brokerage {
         Some("Paper".to_string())
     } else {
         brokerage

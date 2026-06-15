@@ -23,6 +23,11 @@ pub struct BrokerageTransaction {
 pub trait Brokerage: Send + Sync {
     fn name(&self) -> &str;
     fn is_connected(&self) -> bool;
+    /// Returns true when the brokerage adapter should be exercised for
+    /// order validation/state, but fills should be generated locally.
+    fn uses_local_paper_fills(&self) -> bool {
+        false
+    }
     fn connect(&mut self) -> LeanResult<()>;
     fn disconnect(&mut self);
     fn place_order(&mut self, order: Order) -> LeanResult<bool>;

@@ -373,18 +373,15 @@ impl LiveBrokerageBridge {
                 continue;
             }
 
-            let brokerage_ids = if self.paper_fills {
-                Some(Vec::new())
-            } else {
-                self.brokerage
-                    .place_order_with_brokerage_ids(order.clone())
-                    .with_context(|| {
-                        format!(
-                            "brokerage {} failed to submit order {} for {}",
-                            brokerage_name, order.id, order.symbol
-                        )
-                    })?
-            };
+            let brokerage_ids = self
+                .brokerage
+                .place_order_with_brokerage_ids(order.clone())
+                .with_context(|| {
+                    format!(
+                        "brokerage {} failed to submit order {} for {}",
+                        brokerage_name, order.id, order.symbol
+                    )
+                })?;
             self.submitted_order_ids.insert(order.id);
 
             let mut event = if let Some(brokerage_ids) = brokerage_ids {
@@ -449,7 +446,7 @@ impl LiveBrokerageBridge {
                 continue;
             }
 
-            let needs_broker_update = !self.paper_fills && !order.brokerage_id.is_empty();
+            let needs_broker_update = self.paper_fills || !order.brokerage_id.is_empty();
             let accepted = if needs_broker_update {
                 if !self.brokerage.can_update_order(&order, &request) {
                     false
@@ -524,7 +521,7 @@ impl LiveBrokerageBridge {
                 continue;
             }
 
-            let needs_broker_cancel = !self.paper_fills && !order.brokerage_id.is_empty();
+            let needs_broker_cancel = self.paper_fills || !order.brokerage_id.is_empty();
             let accepted = if needs_broker_cancel {
                 self.brokerage.cancel_order(&order).with_context(|| {
                     format!(
@@ -10152,7 +10149,7 @@ mod tests {
     }
 
     #[test]
-    fn live_brokerage_bridge_does_not_place_orders_in_paper_fill_mode() {
+    fn live_brokerage_bridge_places_orders_in_paper_fill_mode() {
         let placed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let brokerage = Box::new(RecordingBrokerage {
             placed: placed.clone(),
@@ -10181,10 +10178,18 @@ mod tests {
             .submit_new_orders(&processor, DateTime::EPOCH)
             .unwrap();
 
-        assert_eq!(placed.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(placed.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].status, OrderStatus::Submitted);
         assert!(events[0].message.contains("paper fill mode"));
+        assert_eq!(
+            processor
+                .transaction_manager
+                .get_order(1)
+                .unwrap()
+                .brokerage_id,
+            vec!["brokerage-1".to_string()]
+        );
     }
 
     #[test]
@@ -10377,6 +10382,43 @@ mod tests {
             .transaction_manager
             .get_cancel_requests()
             .is_empty());
+    }
+
+    #[test]
+    fn live_brokerage_bridge_routes_paper_fill_cancel_requests_to_brokerage() {
+        let canceled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let brokerage = Box::new(RecordingBrokerage {
+            placed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            updated: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            canceled: canceled.clone(),
+            last_updated_order: Arc::new(Mutex::new(None)),
+            account_orders: Arc::new(Mutex::new(Vec::new())),
+            connected: false,
+        });
+        let mut bridge = LiveBrokerageBridge::connect(brokerage, true).unwrap();
+        let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let mut order =
+            lean_orders::Order::limit(1, symbol.clone(), dec!(1), dec!(450), DateTime::EPOCH, "");
+        order.status = OrderStatus::Submitted;
+        transactions.add_order(order);
+        let processor = OrderProcessor::new(
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            transactions,
+        );
+
+        assert!(processor.transaction_manager.request_cancel_order(
+            1,
+            DateTime::EPOCH,
+            "cancel".to_string(),
+        ));
+        let events = bridge
+            .process_cancel_requests(&processor, DateTime::EPOCH)
+            .unwrap();
+
+        assert_eq!(canceled.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, OrderStatus::Canceled);
     }
 
     #[test]
