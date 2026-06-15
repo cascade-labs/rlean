@@ -1,3 +1,4 @@
+pub mod adaptive_maker_taker;
 pub mod immediate;
 pub mod null;
 pub mod passive_maker;

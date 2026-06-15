@@ -1,8 +1,8 @@
 use lean_core::{DateTime, Market, Symbol};
 use lean_execution::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, ImmediateExecutionModel,
-    NullExecutionModel, PassiveMakerExecutionModel, SecurityData, SpreadExecutionModel,
-    StandardDeviationExecutionModel, VwapExecutionModel,
+    AdaptiveMakerTakerExecutionModel, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    ImmediateExecutionModel, NullExecutionModel, PassiveMakerExecutionModel, SecurityData,
+    SpreadExecutionModel, StandardDeviationExecutionModel, VwapExecutionModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -1530,5 +1530,100 @@ mod passive_maker_execution_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Cancel);
         assert!(second[0].cancel_open_orders);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveMakerTakerExecutionModel tests
+// ---------------------------------------------------------------------------
+
+mod adaptive_maker_taker_execution_tests {
+    use super::*;
+
+    #[test]
+    fn crosses_immediately_when_spread_is_tight() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert!(!orders[0].post_only);
+        assert!(orders[0].tag.contains("tight-spread"));
+    }
+
+    #[test]
+    fn crosses_immediately_when_spread_is_locked() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.001), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    #[test]
+    fn posts_passive_limit_when_spread_is_wide() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.001), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].limit_price, Some(dec!(99.00)));
+        assert!(orders[0].post_only);
+    }
+
+    #[test]
+    fn wide_spread_passive_order_falls_back_after_timeout() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.001), 1, dec!(0.005));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let mut security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![security.clone()]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        security.open_order_quantity = dec!(10);
+        let second = model.execute(&targets, &securities_map(vec![security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("passive-timeout"));
     }
 }

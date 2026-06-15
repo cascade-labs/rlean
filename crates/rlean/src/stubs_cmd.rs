@@ -948,6 +948,13 @@ class PassiveMakerExecutionModel(ExecutionModel):
     maximum_order_value: float
     def __init__(self, max_passive_attempts: int = 3, adverse_selection_threshold: float = 0.001, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
 
+class AdaptiveMakerTakerExecutionModel(ExecutionModel):
+    """Crosses immediately on tight spreads and uses passive maker execution when spreads are wide."""
+    accepting_spread_percent: float
+    max_passive_attempts: int
+    adverse_selection_threshold: float
+    def __init__(self, accepting_spread_percent: float = 0.001, max_passive_attempts: int = 1, adverse_selection_threshold: float = 0.005, asynchronous: bool = True) -> None: ...
+
 class StandardDeviationExecutionModel(ExecutionModel):
     """Executes when price deviates by N standard deviations from mean."""
     maximum_order_value: float

@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use lean_alpha::{IAlphaModel, InsightCollection, InsightDirection as AlphaDir};
 use lean_core::{Symbol, TickType, TimeSpan};
 use lean_execution::{
-    ExecutionTarget, IExecutionModel, ImmediateExecutionModel, OrderRequest, SecurityData,
+    AdaptiveMakerTakerExecutionModel, ExecutionTarget, IExecutionModel, ImmediateExecutionModel,
+    OrderRequest, SecurityData,
 };
 use lean_portfolio_construction::{
     AccumulativeInsightPortfolioConstructionModel,
@@ -976,6 +977,56 @@ impl PyPassiveMakerExecutionModel {
     }
 }
 
+#[pyclass(name = "AdaptiveMakerTakerExecutionModel")]
+pub struct PyAdaptiveMakerTakerExecutionModel {
+    pub model: Option<Box<dyn IExecutionModel>>,
+    accepting_spread_percent: f64,
+    max_passive_attempts: usize,
+    adverse_selection_threshold: f64,
+}
+
+#[pymethods]
+impl PyAdaptiveMakerTakerExecutionModel {
+    #[new]
+    #[pyo3(signature = (accepting_spread_percent=0.001, max_passive_attempts=1, adverse_selection_threshold=0.005, asynchronous=true))]
+    pub fn new(
+        accepting_spread_percent: f64,
+        max_passive_attempts: usize,
+        adverse_selection_threshold: f64,
+        asynchronous: bool,
+    ) -> Self {
+        let _ = asynchronous;
+        let accepting_spread_percent = accepting_spread_percent.abs();
+        let max_passive_attempts = max_passive_attempts.max(1);
+        let adverse_selection_threshold = adverse_selection_threshold.abs();
+        Self {
+            model: Some(Box::new(AdaptiveMakerTakerExecutionModel::new(
+                Decimal::from_f64(accepting_spread_percent).unwrap_or(Decimal::ZERO),
+                max_passive_attempts,
+                Decimal::from_f64(adverse_selection_threshold).unwrap_or(Decimal::ZERO),
+            ))),
+            accepting_spread_percent,
+            max_passive_attempts,
+            adverse_selection_threshold,
+        }
+    }
+
+    #[getter]
+    pub fn accepting_spread_percent(&self) -> f64 {
+        self.accepting_spread_percent
+    }
+
+    #[getter]
+    pub fn max_passive_attempts(&self) -> usize {
+        self.max_passive_attempts
+    }
+
+    #[getter]
+    pub fn adverse_selection_threshold(&self) -> f64 {
+        self.adverse_selection_threshold
+    }
+}
+
 #[pyclass(name = "StandardDeviationExecutionModel")]
 pub struct PyStandardDeviationExecutionModel {
     pub model: Option<Box<dyn IExecutionModel>>,
@@ -1839,6 +1890,9 @@ pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyPassiveMakerExecutionModel>() {
+        return m.borrow_mut().model.take();
+    }
+    if let Ok(m) = model.cast::<PyAdaptiveMakerTakerExecutionModel>() {
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyStandardDeviationExecutionModel>() {

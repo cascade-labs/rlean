@@ -4,6 +4,7 @@ pub mod models;
 pub use execution_model::{
     ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
 };
+pub use models::adaptive_maker_taker::AdaptiveMakerTakerExecutionModel;
 pub use models::immediate::ImmediateExecutionModel;
 pub use models::null::NullExecutionModel;
 pub use models::passive_maker::PassiveMakerExecutionModel;
