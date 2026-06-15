@@ -113,6 +113,8 @@ impl IExecutionModel for TwapExecutionModel {
                 quantity: slice_qty,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,
+                post_only: false,
+                cancel_open_orders: false,
                 tag: format!(
                     "TwapExecutionModel slice {}/{}",
                     state.slices_submitted + 1,

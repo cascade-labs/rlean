@@ -19,3 +19,4 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 parking_lot = { workspace = true }
 indexmap = { workspace = true }
+crossbeam-channel = { workspace = true }

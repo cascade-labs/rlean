@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use lean_alpha::{IAlphaModel, InsightCollection, InsightDirection as AlphaDir};
-use lean_core::{Symbol, TimeSpan};
+use lean_core::{Symbol, TickType, TimeSpan};
 use lean_execution::{
     ExecutionTarget, IExecutionModel, ImmediateExecutionModel, OrderRequest, SecurityData,
 };
@@ -71,8 +71,7 @@ impl FrameworkState {
         securities: &[Symbol],
         portfolio_value: Decimal,
         prices: &HashMap<String, Decimal>,
-        holdings: &HashMap<String, Decimal>,
-        open_orders: &HashMap<String, Decimal>,
+        security_data: &HashMap<String, SecurityData>,
     ) -> Vec<OrderRequest> {
         // 1. Alpha: gather insights from all registered models.
         let alpha_insights: Vec<lean_alpha::Insight> = self
@@ -100,7 +99,7 @@ impl FrameworkState {
         }
 
         if !has_insight_changes && self.pending_flat_targets.is_empty() {
-            return Vec::new();
+            return self.exec_model.execute(&[], security_data);
         }
 
         let mut target_insights = self.insights.latest_active_per_symbol(slice.time);
@@ -118,7 +117,7 @@ impl FrameworkState {
         target_insights.append(&mut self.pending_flat_targets);
 
         if target_insights.is_empty() {
-            return Vec::new();
+            return self.exec_model.execute(&[], security_data);
         }
 
         // 2. Convert active alpha Insights → InsightForPcm.
@@ -156,34 +155,7 @@ impl FrameworkState {
                     targets
                 });
 
-        // 5. Build SecurityData map for execution model.
-        let security_data: HashMap<String, SecurityData> = securities
-            .iter()
-            .map(|sym| {
-                let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
-                let current_qty = holdings.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
-                let open_order_qty = open_orders
-                    .get(&sym.value)
-                    .copied()
-                    .unwrap_or(Decimal::ZERO);
-                (
-                    sym.value.clone(),
-                    SecurityData {
-                        symbol: sym.clone(),
-                        price,
-                        bid: None,
-                        ask: None,
-                        volume: None,
-                        average_volume: None,
-                        daily_std_dev: None,
-                        current_quantity: current_qty,
-                        open_order_quantity: open_order_qty,
-                    },
-                )
-            })
-            .collect();
-
-        // 6. Execution: convert targets to concrete order requests.
+        // 5. Execution: convert targets to concrete order requests.
         let exec_targets: Vec<ExecutionTarget> = adjusted_by_symbol
             .iter()
             .map(|t| ExecutionTarget {
@@ -192,7 +164,7 @@ impl FrameworkState {
             })
             .collect();
 
-        self.exec_model.execute(&exec_targets, &security_data)
+        self.exec_model.execute(&exec_targets, security_data)
     }
 
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
@@ -232,7 +204,7 @@ pub fn run_framework_pipeline(
         }
     }
 
-    let (securities, prices, holdings, open_orders, portfolio_value) = {
+    let (securities, prices, portfolio_value, security_data) = {
         let alg = alg_inner.lock().unwrap();
         let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
         let prices: HashMap<String, Decimal> = alg
@@ -253,18 +225,152 @@ pub fn run_framework_pipeline(
                 .or_insert(Decimal::ZERO) += order.quantity;
         }
         let pv = alg.portfolio.total_portfolio_value();
-        (securities, prices, holdings, open_orders, pv)
+        let security_data = alg
+            .securities
+            .all()
+            .map(|security| {
+                let symbol = security.symbol.clone();
+                let key = symbol.value.clone();
+                let base_price = security.current_price();
+                let current_qty = holdings.get(&key).copied().unwrap_or(Decimal::ZERO);
+                let open_order_qty = open_orders.get(&key).copied().unwrap_or(Decimal::ZERO);
+                let lot_size = Decimal::from_f64(security.symbol_properties.lot_size)
+                    .filter(|lot| *lot > Decimal::ZERO)
+                    .unwrap_or(Decimal::ONE);
+                let data = execution_security_data_from_slice(
+                    slice,
+                    symbol,
+                    base_price,
+                    current_qty,
+                    open_order_qty,
+                    lot_size,
+                );
+                (key, data)
+            })
+            .collect();
+        (securities, prices, pv, security_data)
     };
 
     let mut fw = framework.lock().unwrap();
-    fw.run_pipeline(
-        slice,
-        &securities,
-        portfolio_value,
-        &prices,
-        &holdings,
-        &open_orders,
-    )
+    fw.run_pipeline(slice, &securities, portfolio_value, &prices, &security_data)
+}
+
+fn execution_security_data_from_slice(
+    slice: &lean_data::Slice,
+    symbol: Symbol,
+    base_price: Decimal,
+    current_quantity: Decimal,
+    open_order_quantity: Decimal,
+    lot_size: Decimal,
+) -> SecurityData {
+    let sid = symbol.id.sid;
+    let mut price = base_price;
+    let mut bid = None;
+    let mut ask = None;
+    let mut volume = None;
+    let mut vwap_price = None;
+    let mut end_time = None;
+
+    if let Some(bar) = slice.bars.get(&sid) {
+        if bar.close > Decimal::ZERO {
+            price = bar.close;
+            bid = Some(bar.close);
+            ask = Some(bar.close);
+        }
+        volume = Some(bar.volume);
+        vwap_price = Some((bar.high + bar.low + bar.close) / Decimal::from(3u32));
+        end_time = Some(bar.end_time);
+    }
+
+    if let Some(quote_bar) = slice.quote_bars.get(&sid) {
+        let quote_price = quote_bar.mid_close();
+        if quote_price > Decimal::ZERO {
+            price = quote_price;
+        }
+        if let Some(bid_bar) = &quote_bar.bid {
+            if bid_bar.close > Decimal::ZERO {
+                bid = Some(bid_bar.close);
+            }
+        }
+        if let Some(ask_bar) = &quote_bar.ask {
+            if ask_bar.close > Decimal::ZERO {
+                ask = Some(ask_bar.close);
+            }
+        }
+        end_time = Some(quote_bar.end_time);
+    }
+
+    if let Some(ticks) = slice.ticks.get(&sid) {
+        let mut tick_volume = Decimal::ZERO;
+        let mut tick_value = Decimal::ZERO;
+        for tick in ticks {
+            match tick.tick_type {
+                TickType::Trade => {
+                    if tick.value > Decimal::ZERO {
+                        price = tick.value;
+                    }
+                    if tick.quantity > Decimal::ZERO && tick.value > Decimal::ZERO {
+                        tick_volume += tick.quantity;
+                        tick_value += tick.value * tick.quantity;
+                    }
+                    end_time = Some(tick.time);
+                }
+                TickType::Quote => {
+                    if tick.bid_price > Decimal::ZERO {
+                        bid = Some(tick.bid_price);
+                    }
+                    if tick.ask_price > Decimal::ZERO {
+                        ask = Some(tick.ask_price);
+                    }
+                    if tick.value > Decimal::ZERO {
+                        price = tick.value;
+                    }
+                    end_time = Some(tick.time);
+                }
+                TickType::OpenInterest => {}
+            }
+        }
+        if tick_volume > Decimal::ZERO {
+            volume = Some(tick_volume);
+            vwap_price = Some(tick_value / tick_volume);
+        }
+    }
+
+    if let Some(book) = slice.order_books.get(&sid) {
+        if let Some(best_bid) = book.best_bid() {
+            bid = Some(best_bid.price);
+        }
+        if let Some(best_ask) = book.best_ask() {
+            ask = Some(best_ask.price);
+        }
+        let book_price = book.mid_price();
+        if book_price > Decimal::ZERO {
+            price = book_price;
+        }
+        end_time = Some(book.time);
+    }
+
+    if let Some(context) = slice.perpetual_contexts.get(&sid) {
+        if context.mark_px > Decimal::ZERO {
+            price = context.mark_px;
+        }
+        end_time = Some(context.time);
+    }
+
+    SecurityData {
+        symbol,
+        price,
+        bid,
+        ask,
+        volume,
+        vwap_price,
+        average_volume: None,
+        daily_std_dev: None,
+        end_time,
+        lot_size,
+        current_quantity,
+        open_order_quantity,
+    }
 }
 
 pub fn notify_framework_securities_changed(
@@ -761,17 +867,40 @@ impl Default for PyNullExecutionModel {
 #[pyclass(name = "VolumeWeightedAveragePriceExecutionModel")]
 pub struct PyVwapExecutionModel {
     pub model: Option<Box<dyn IExecutionModel>>,
+    maximum_order_quantity_percent_volume: f64,
 }
 
 #[pymethods]
 impl PyVwapExecutionModel {
     #[new]
-    #[pyo3(signature = (participation_rate=0.2))]
-    pub fn new(participation_rate: f64) -> Self {
+    #[pyo3(signature = (asynchronous=true))]
+    pub fn new(asynchronous: bool) -> Self {
+        let _ = asynchronous;
+        Self::with_maximum_order_quantity_percent_volume(0.01)
+    }
+
+    #[getter]
+    pub fn maximum_order_quantity_percent_volume(&self) -> f64 {
+        self.maximum_order_quantity_percent_volume
+    }
+
+    #[setter]
+    pub fn set_maximum_order_quantity_percent_volume(&mut self, value: f64) {
+        let rate = value.abs();
+        self.maximum_order_quantity_percent_volume = rate;
+        self.model = Some(Box::new(lean_execution::VwapExecutionModel::new(
+            Decimal::from_f64(rate).unwrap_or(Decimal::ZERO),
+        )));
+    }
+
+    #[staticmethod]
+    pub fn with_maximum_order_quantity_percent_volume(value: f64) -> Self {
         use lean_execution::VwapExecutionModel;
-        let rate = Decimal::from_f64(participation_rate).unwrap_or(Decimal::ZERO);
+        let rate_f64 = value.abs();
+        let rate = Decimal::from_f64(rate_f64).unwrap_or(Decimal::ZERO);
         Self {
             model: Some(Box::new(VwapExecutionModel::new(rate))),
+            maximum_order_quantity_percent_volume: rate_f64,
         }
     }
 }
@@ -783,12 +912,11 @@ pub struct PySpreadExecutionModel {
 
 #[pymethods]
 impl PySpreadExecutionModel {
-    /// accepting_spread_percent: maximum spread as a fraction of price (default 0.5% = 0.005).
-    /// Mirrors C# SpreadExecutionModel(decimal acceptingSpreadPercent = 0.005m).
     #[new]
-    #[pyo3(signature = (accepting_spread_percent=0.005))]
-    pub fn new(accepting_spread_percent: f64) -> Self {
+    #[pyo3(signature = (accepting_spread_percent=0.005, asynchronous=true))]
+    pub fn new(accepting_spread_percent: f64, asynchronous: bool) -> Self {
         use lean_execution::SpreadExecutionModel;
+        let _ = asynchronous;
         let pct = Decimal::from_f64(accepting_spread_percent).unwrap_or(Decimal::ZERO);
         Self {
             model: Some(Box::new(SpreadExecutionModel::new(pct))),
@@ -796,26 +924,125 @@ impl PySpreadExecutionModel {
     }
 }
 
+#[pyclass(name = "PassiveMakerExecutionModel")]
+pub struct PyPassiveMakerExecutionModel {
+    pub model: Option<Box<dyn IExecutionModel>>,
+    max_passive_attempts: usize,
+    adverse_selection_threshold: f64,
+    maximum_order_value: f64,
+}
+
+#[pymethods]
+impl PyPassiveMakerExecutionModel {
+    #[new]
+    #[pyo3(signature = (max_passive_attempts=3, adverse_selection_threshold=0.001, maximum_order_value=0.0, asynchronous=true))]
+    pub fn new(
+        max_passive_attempts: usize,
+        adverse_selection_threshold: f64,
+        maximum_order_value: f64,
+        asynchronous: bool,
+    ) -> Self {
+        let _ = asynchronous;
+        let max_passive_attempts = max_passive_attempts.max(1);
+        let threshold = adverse_selection_threshold.abs();
+        let maximum_order_value = maximum_order_value.abs();
+        Self {
+            model: Some(Box::new(
+                lean_execution::PassiveMakerExecutionModel::with_maximum_order_value(
+                    max_passive_attempts,
+                    Decimal::from_f64(threshold).unwrap_or(Decimal::ZERO),
+                    Decimal::from_f64(maximum_order_value).unwrap_or(Decimal::ZERO),
+                ),
+            )),
+            max_passive_attempts,
+            adverse_selection_threshold: threshold,
+            maximum_order_value,
+        }
+    }
+
+    #[getter]
+    pub fn max_passive_attempts(&self) -> usize {
+        self.max_passive_attempts
+    }
+
+    #[getter]
+    pub fn adverse_selection_threshold(&self) -> f64 {
+        self.adverse_selection_threshold
+    }
+
+    #[getter]
+    pub fn maximum_order_value(&self) -> f64 {
+        self.maximum_order_value
+    }
+}
+
 #[pyclass(name = "StandardDeviationExecutionModel")]
 pub struct PyStandardDeviationExecutionModel {
     pub model: Option<Box<dyn IExecutionModel>>,
+    period: usize,
+    deviations: f64,
+    maximum_order_value: f64,
 }
 
 #[pymethods]
 impl PyStandardDeviationExecutionModel {
     /// deviations: number of std deviations from the mean required to trigger execution (default 2.0).
     /// Mirrors C# StandardDeviationExecutionModel(int period = 60, decimal deviations = 2m, ...).
-    /// Note: period is accepted for API compatibility but the Rust model uses security.daily_std_dev
-    /// directly rather than maintaining a rolling indicator, so period is unused.
     #[new]
-    #[pyo3(signature = (period=60, deviations=2.0))]
-    pub fn new(period: i64, deviations: f64) -> Self {
+    #[pyo3(signature = (period=60, deviations=2.0, asynchronous=true))]
+    pub fn new(period: i64, deviations: f64, asynchronous: bool) -> Self {
+        let _ = asynchronous;
+        Self::with_maximum_order_value(period, deviations, 20000.0)
+    }
+
+    #[getter]
+    pub fn maximum_order_value(&self) -> f64 {
+        self.maximum_order_value
+    }
+
+    #[setter]
+    pub fn set_maximum_order_value(&mut self, value: f64) {
+        self.maximum_order_value = value.abs();
+        self.rebuild_model();
+    }
+
+    #[staticmethod]
+    pub fn with_maximum_order_value(
+        period: i64,
+        deviations: f64,
+        maximum_order_value: f64,
+    ) -> Self {
         use lean_execution::StandardDeviationExecutionModel;
-        let _ = period; // API-compatible; Rust model uses pre-computed daily_std_dev
+        let period = usize::try_from(period).unwrap_or(60).max(1);
         let devs = Decimal::from_f64(deviations).unwrap_or(Decimal::from(2));
+        let max_order_value = maximum_order_value.abs();
         Self {
-            model: Some(Box::new(StandardDeviationExecutionModel::new(devs))),
+            model: Some(Box::new(
+                StandardDeviationExecutionModel::with_maximum_order_value(
+                    period,
+                    devs,
+                    Decimal::from_f64(max_order_value).unwrap_or(Decimal::ZERO),
+                ),
+            )),
+            period,
+            deviations,
+            maximum_order_value: max_order_value,
         }
+    }
+}
+
+impl PyStandardDeviationExecutionModel {
+    fn rebuild_model(&mut self) {
+        use lean_execution::StandardDeviationExecutionModel;
+        let devs = Decimal::from_f64(self.deviations).unwrap_or(Decimal::from(2));
+        let max_order_value = Decimal::from_f64(self.maximum_order_value).unwrap_or(Decimal::ZERO);
+        self.model = Some(Box::new(
+            StandardDeviationExecutionModel::with_maximum_order_value(
+                self.period,
+                devs,
+                max_order_value,
+            ),
+        ));
     }
 }
 
@@ -1609,6 +1836,9 @@ pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PySpreadExecutionModel>() {
+        return m.borrow_mut().model.take();
+    }
+    if let Ok(m) = model.cast::<PyPassiveMakerExecutionModel>() {
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyStandardDeviationExecutionModel>() {

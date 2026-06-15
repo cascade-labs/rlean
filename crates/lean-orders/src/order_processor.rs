@@ -38,6 +38,27 @@ impl OrderProcessor {
         quote_bars: &std::collections::HashMap<u64, QuoteBar>,
         time: DateTime,
     ) -> Vec<OrderEvent> {
+        let events = self.generate_order_events_with_quotes(bars, quote_bars, time);
+        for event in &events {
+            self.transaction_manager.process_order_event(event.clone());
+        }
+        events
+    }
+
+    pub fn generate_order_events(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
+        self.generate_order_events_with_quotes(bars, &std::collections::HashMap::new(), time)
+    }
+
+    pub fn generate_order_events_with_quotes(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        quote_bars: &std::collections::HashMap<u64, QuoteBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
         let open = self.transaction_manager.get_open_orders();
         let mut events = Vec::new();
 
@@ -45,7 +66,6 @@ impl OrderProcessor {
             let sid = order.symbol.id.sid;
             if let Some(bar) = bars.get(&sid) {
                 if let Some(event) = self.try_fill(&order, bar, quote_bars.get(&sid), time) {
-                    self.transaction_manager.process_order_event(event.clone());
                     events.push(event);
                 }
             }

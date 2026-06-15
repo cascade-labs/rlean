@@ -131,7 +131,7 @@ impl Statistics {
     pub fn beta(returns: &[Decimal], benchmark_returns: &[Decimal]) -> Decimal {
         let n = returns.len().min(benchmark_returns.len());
         if n < 2 {
-            return dec!(1);
+            return dec!(0);
         }
 
         let n_dec = Decimal::from(n);
@@ -152,7 +152,7 @@ impl Statistics {
             / (n_dec - dec!(1));
 
         if var_b.is_zero() {
-            dec!(1)
+            dec!(0)
         } else {
             cov / var_b
         }

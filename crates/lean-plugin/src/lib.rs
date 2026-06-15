@@ -133,6 +133,27 @@ pub type CreateCustomDataSourceFn = unsafe extern "C" fn() -> *mut ();
 /// Free a custom data source created by `CreateCustomDataSourceFn`.
 pub type DestroyCustomDataSourceFn = unsafe extern "C" fn(ptr: *mut ());
 
+/// C-stable factory: create a live data queue handler from a JSON config string.
+///
+/// Returns a heap-allocated `Box<Box<dyn lean_data::DataQueueHandler>>` cast to
+/// `*mut ()`. The caller casts it back to that trait object and keeps the
+/// plugin library loaded for the process lifetime.
+pub type CreateLiveDataProviderFn =
+    unsafe extern "C" fn(config_json: *const std::os::raw::c_char) -> *mut ();
+
+/// Free a live data provider created by `CreateLiveDataProviderFn`.
+pub type DestroyLiveDataProviderFn = unsafe extern "C" fn(ptr: *mut ());
+
+/// C-stable factory: create a brokerage from a JSON config string.
+///
+/// Returns a heap-allocated `Box<Box<dyn lean_brokerages::Brokerage>>` cast to
+/// `*mut ()`.
+pub type CreateBrokerageFn =
+    unsafe extern "C" fn(config_json: *const std::os::raw::c_char) -> *mut ();
+
+/// Free a brokerage created by `CreateBrokerageFn`.
+pub type DestroyBrokerageFn = unsafe extern "C" fn(ptr: *mut ());
+
 /// Convenience macro for plugin crates to implement the required export.
 ///
 /// ```rust,ignore

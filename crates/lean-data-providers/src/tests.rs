@@ -302,6 +302,29 @@ mod provider_tests {
         }
     }
 
+    fn make_option_universe_row(
+        date: NaiveDate,
+        underlying: &str,
+        symbol_value: &str,
+    ) -> OptionUniverseRow {
+        OptionUniverseRow {
+            date,
+            symbol_value: symbol_value.to_string(),
+            underlying: underlying.to_string(),
+            expiration: NaiveDate::from_ymd_opt(2024, 2, 16).unwrap(),
+            strike: dec!(100),
+            right: "C".to_string(),
+        }
+    }
+
+    fn write_option_universe(root: &std::path::Path, date: NaiveDate, rows: &[OptionUniverseRow]) {
+        let resolver = PathResolver::new(root);
+        let writer = ParquetWriter::new(WriterConfig::default());
+        writer
+            .write_option_universe(rows, &resolver.option_universe_partition(date))
+            .unwrap();
+    }
+
     // ── ProviderConfig ────────────────────────────────────────────────────────
 
     #[test]
@@ -587,6 +610,33 @@ mod provider_tests {
         let bars = provider.get_history(&request).await.unwrap();
 
         assert_eq!(bars.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn local_provider_batches_option_universe_by_underlying() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = LocalHistoryProvider::new(dir.path());
+        let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        write_option_universe(
+            dir.path(),
+            date,
+            &[
+                make_option_universe_row(date, "SPY", "SPY240216C00100000"),
+                make_option_universe_row(date, "QQQ", "QQQ240216C00100000"),
+                make_option_universe_row(date, "AAPL", "AAPL240216C00100000"),
+            ],
+        );
+
+        let batch = provider
+            .get_option_universes(&["SPY".to_string(), "AAPL".to_string()], date)
+            .await
+            .unwrap();
+
+        assert_eq!(batch["SPY"].len(), 1);
+        assert_eq!(batch["AAPL"].len(), 1);
+        assert!(!batch.contains_key("QQQ"));
+        assert_eq!(batch["SPY"][0].symbol_value, "SPY240216C00100000");
+        assert_eq!(batch["AAPL"][0].symbol_value, "AAPL240216C00100000");
     }
 
     // ── HistoryRequest construction ───────────────────────────────────────────

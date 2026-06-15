@@ -15,6 +15,7 @@ pub enum BaseDataType {
     Fundamental,
     MarginInterestRate,
     PerpetualContext,
+    OrderBook,
     Custom,
 }
 

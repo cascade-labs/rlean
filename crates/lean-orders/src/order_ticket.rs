@@ -49,6 +49,14 @@ impl OrderTicket {
         self.inner.read().order.quantity
     }
 
+    pub fn order(&self) -> Order {
+        self.inner.read().order.clone()
+    }
+
+    pub fn set_order(&self, order: Order) {
+        self.inner.write().order = order;
+    }
+
     pub fn average_fill_price(&self) -> Price {
         self.inner.read().order.average_fill_price
     }
@@ -68,6 +76,9 @@ impl OrderTicket {
     pub fn add_order_event(&self, event: OrderEvent) {
         let mut inner = self.inner.write();
         inner.order.status = event.status;
+        if event.status == OrderStatus::Canceled {
+            inner.order.canceled_time = Some(event.utc_time);
+        }
         if event.is_fill() {
             inner.order.last_fill_time = Some(event.utc_time);
             inner.order.filled_quantity += event.fill_quantity;

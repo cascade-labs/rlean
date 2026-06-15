@@ -6,7 +6,7 @@ use crate::py_qc_algorithm::{AlgorithmHistoryContext, IndicatorRegistry, PyQcAlg
 use crate::py_universe::{PyScheduledUniverse, PySecurityChanges};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{DateTime, Result as LeanResult, Symbol};
+use lean_core::{DateTime, Market, Result as LeanResult, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, Slice};
 use lean_orders::{Order, OrderEvent};
 use pyo3::prelude::*;
@@ -191,6 +191,11 @@ impl PyAlgorithmAdapter {
                         let settings = bound.settings();
                         {
                             let mut alg = self.inner.lock().unwrap();
+                            register_custom_universe_leverage_metadata(
+                                &mut alg,
+                                &changes.added,
+                                custom_data,
+                            );
                             for symbol in &changes.added {
                                 alg.add_security_symbol(symbol.clone(), settings.resolution);
                             }
@@ -214,6 +219,48 @@ impl PyAlgorithmAdapter {
         }
         merged
     }
+}
+
+fn register_custom_universe_leverage_metadata(
+    alg: &mut QcAlgorithm,
+    symbols: &[Symbol],
+    custom_data: &std::collections::HashMap<String, Vec<CustomDataPoint>>,
+) {
+    let mut leverage_by_symbol = std::collections::HashMap::new();
+    for point in custom_data.values().flatten() {
+        let Some(symbol_value) = point
+            .fields
+            .get("symbol")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(leverage) = point.fields.get("max_leverage").and_then(json_to_f64) else {
+            continue;
+        };
+        leverage_by_symbol.insert(symbol_value, leverage);
+    }
+
+    for symbol in symbols {
+        if symbol.security_type() != SecurityType::CryptoFuture
+            || symbol.market().as_str() != Market::HYPERLIQUID
+        {
+            continue;
+        }
+        let key = symbol.value.trim().to_ascii_uppercase();
+        if let Some(leverage) = leverage_by_symbol.get(&key).copied() {
+            alg.register_security_leverage(symbol, leverage);
+        }
+    }
+}
+
+fn json_to_f64(value: &serde_json::Value) -> Option<f64> {
+    if let Some(raw) = value.as_f64() {
+        return Some(raw);
+    }
+    value.as_str()?.trim().parse::<f64>().ok()
 }
 
 impl IAlgorithm for PyAlgorithmAdapter {

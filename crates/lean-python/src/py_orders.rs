@@ -1,9 +1,202 @@
 use crate::py_types::PySymbol;
 use crate::{PyOrderDirection, PyOrderStatus};
+use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_orders::order::{OrderDirection, OrderStatus};
-use lean_orders::OrderEvent;
+use lean_orders::{OrderEvent, OrderTicket, UpdateOrderFields};
 use pyo3::prelude::*;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use std::sync::{Arc, Mutex};
+
+fn f2d(value: f64) -> rust_decimal::Decimal {
+    rust_decimal::Decimal::from_f64(value).unwrap_or_default()
+}
+
+fn py_order_status(status: OrderStatus) -> PyOrderStatus {
+    match status {
+        OrderStatus::New => PyOrderStatus::New,
+        OrderStatus::Submitted => PyOrderStatus::Submitted,
+        OrderStatus::PartiallyFilled => PyOrderStatus::PartiallyFilled,
+        OrderStatus::Filled => PyOrderStatus::Filled,
+        OrderStatus::Canceled => PyOrderStatus::Canceled,
+        OrderStatus::None => PyOrderStatus::Invalid,
+        OrderStatus::Invalid => PyOrderStatus::Invalid,
+        OrderStatus::CancelPending => PyOrderStatus::CancelPending,
+        OrderStatus::UpdateSubmitted => PyOrderStatus::UpdateSubmitted,
+    }
+}
+
+#[pyclass(name = "OrderTicket")]
+#[derive(Clone)]
+pub struct PyOrderTicket {
+    pub order_id: i64,
+    algorithm: Arc<Mutex<QcAlgorithm>>,
+}
+
+impl PyOrderTicket {
+    pub fn new(ticket: OrderTicket, algorithm: Arc<Mutex<QcAlgorithm>>) -> Self {
+        Self {
+            order_id: ticket.order_id,
+            algorithm,
+        }
+    }
+
+    fn ticket(&self) -> PyResult<OrderTicket> {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .transactions
+            .get_ticket(self.order_id)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "order ticket {} no longer exists",
+                    self.order_id
+                ))
+            })
+    }
+}
+
+#[pymethods]
+impl PyOrderTicket {
+    #[getter]
+    fn order_id(&self) -> i64 {
+        self.order_id
+    }
+
+    #[getter]
+    fn id(&self) -> i64 {
+        self.order_id
+    }
+
+    #[getter]
+    fn symbol(&self) -> PyResult<PySymbol> {
+        Ok(PySymbol {
+            inner: self.ticket()?.symbol,
+        })
+    }
+
+    #[getter]
+    fn status(&self) -> PyResult<PyOrderStatus> {
+        Ok(py_order_status(self.ticket()?.status()))
+    }
+
+    #[getter]
+    fn quantity(&self) -> PyResult<f64> {
+        Ok(self.ticket()?.quantity().to_f64().unwrap_or(0.0))
+    }
+
+    #[getter]
+    fn filled_quantity(&self) -> PyResult<f64> {
+        Ok(self.ticket()?.filled_quantity().to_f64().unwrap_or(0.0))
+    }
+
+    #[getter]
+    fn average_fill_price(&self) -> PyResult<f64> {
+        Ok(self.ticket()?.average_fill_price().to_f64().unwrap_or(0.0))
+    }
+
+    #[getter]
+    fn limit_price(&self) -> PyResult<Option<f64>> {
+        Ok(self.ticket()?.order().limit_price.and_then(|p| p.to_f64()))
+    }
+
+    #[getter]
+    fn stop_price(&self) -> PyResult<Option<f64>> {
+        Ok(self.ticket()?.order().stop_price.and_then(|p| p.to_f64()))
+    }
+
+    #[getter]
+    fn tag(&self) -> PyResult<String> {
+        Ok(self.ticket()?.order().tag)
+    }
+
+    #[getter]
+    fn is_open(&self) -> PyResult<bool> {
+        Ok(self.ticket()?.is_open())
+    }
+
+    #[getter]
+    fn order_events(&self) -> PyResult<Vec<PyOrderEvent>> {
+        Ok(self
+            .ticket()?
+            .order_events()
+            .iter()
+            .map(PyOrderEvent::from)
+            .collect())
+    }
+
+    #[pyo3(signature = (tag=None))]
+    fn cancel(&self, tag: Option<String>) -> bool {
+        let algorithm = self.algorithm.lock().unwrap();
+        algorithm.transactions.request_cancel_order(
+            self.order_id,
+            algorithm.utc_time,
+            tag.unwrap_or_default(),
+        )
+    }
+
+    #[pyo3(name = "Cancel", signature = (tag=None))]
+    fn cancel_pascal(&self, tag: Option<String>) -> bool {
+        self.cancel(tag)
+    }
+
+    #[pyo3(signature = (limit_price=None, stop_price=None, tag=None))]
+    fn update(
+        &self,
+        limit_price: Option<f64>,
+        stop_price: Option<f64>,
+        tag: Option<String>,
+    ) -> bool {
+        let fields = UpdateOrderFields {
+            quantity: None,
+            limit_price: limit_price.map(f2d),
+            stop_price: stop_price.map(f2d),
+            tag,
+        };
+        let algorithm = self.algorithm.lock().unwrap();
+        algorithm
+            .transactions
+            .request_update_order(self.order_id, algorithm.utc_time, fields)
+    }
+
+    #[pyo3(name = "Update", signature = (limit_price=None, stop_price=None, tag=None))]
+    fn update_pascal(
+        &self,
+        limit_price: Option<f64>,
+        stop_price: Option<f64>,
+        tag: Option<String>,
+    ) -> bool {
+        self.update(limit_price, stop_price, tag)
+    }
+
+    #[pyo3(signature = (limit_price, tag=None))]
+    fn update_limit_price(&self, limit_price: f64, tag: Option<String>) -> bool {
+        self.update(Some(limit_price), None, tag)
+    }
+
+    #[pyo3(name = "UpdateLimitPrice", signature = (limit_price, tag=None))]
+    fn update_limit_price_pascal(&self, limit_price: f64, tag: Option<String>) -> bool {
+        self.update_limit_price(limit_price, tag)
+    }
+
+    #[pyo3(signature = (stop_price, tag=None))]
+    fn update_stop_price(&self, stop_price: f64, tag: Option<String>) -> bool {
+        self.update(None, Some(stop_price), tag)
+    }
+
+    #[pyo3(name = "UpdateStopPrice", signature = (stop_price, tag=None))]
+    fn update_stop_price_pascal(&self, stop_price: f64, tag: Option<String>) -> bool {
+        self.update_stop_price(stop_price, tag)
+    }
+
+    fn update_tag(&self, tag: String) -> bool {
+        self.update(None, None, Some(tag))
+    }
+
+    #[pyo3(name = "UpdateTag")]
+    fn update_tag_pascal(&self, tag: String) -> bool {
+        self.update_tag(tag)
+    }
+}
 
 /// Python-visible OrderEvent — mirrors C# LEAN's `OrderEvent` 1:1.
 ///
@@ -163,17 +356,7 @@ impl PyOrderEvent {
     /// Order status as a `OrderStatus` enum value.
     #[getter]
     fn status(&self) -> PyOrderStatus {
-        match self.status_raw {
-            OrderStatus::New => PyOrderStatus::New,
-            OrderStatus::Submitted => PyOrderStatus::Submitted,
-            OrderStatus::PartiallyFilled => PyOrderStatus::PartiallyFilled,
-            OrderStatus::Filled => PyOrderStatus::Filled,
-            OrderStatus::Canceled => PyOrderStatus::Canceled,
-            OrderStatus::None => PyOrderStatus::Invalid,
-            OrderStatus::Invalid => PyOrderStatus::Invalid,
-            OrderStatus::CancelPending => PyOrderStatus::CancelPending,
-            OrderStatus::UpdateSubmitted => PyOrderStatus::UpdateSubmitted,
-        }
+        py_order_status(self.status_raw)
     }
 
     /// Order direction as an `OrderDirection` enum value.

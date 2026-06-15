@@ -12,6 +12,7 @@ pub struct Trade {
     pub entry_price: Price,
     pub exit_price: Price,
     pub quantity: Quantity,
+    pub contract_multiplier: Decimal,
     pub pnl: Price,
     pub pnl_pct: Price,
     pub fees: Price,
@@ -26,9 +27,10 @@ impl Trade {
         entry_price: Price,
         exit_price: Price,
         quantity: Quantity,
+        contract_multiplier: Decimal,
         fees: Price,
     ) -> Self {
-        let pnl = (exit_price - entry_price) * quantity - fees;
+        let pnl = (exit_price - entry_price) * quantity * contract_multiplier - fees;
         let pnl_pct = if entry_price.is_zero() {
             dec!(0)
         } else if quantity < dec!(0) {
@@ -43,6 +45,7 @@ impl Trade {
             entry_price,
             exit_price,
             quantity,
+            contract_multiplier,
             pnl,
             pnl_pct,
             fees,
@@ -87,6 +90,7 @@ impl TradeBuilder {
         event_time: DateTime,
         fill_price: Price,
         fill_quantity: Quantity,
+        contract_multiplier: Decimal,
         fees: Price,
     ) -> Option<Trade> {
         if fill_quantity.is_zero() {
@@ -158,6 +162,7 @@ impl TradeBuilder {
             open.entry_price,
             fill_price,
             close_quantity,
+            contract_multiplier,
             entry_fees + closing_fees,
         );
 
@@ -224,6 +229,7 @@ mod tests {
             dec!(100),
             dec!(101),
             dec!(10),
+            dec!(1),
             dec!(0),
         );
 
@@ -241,6 +247,7 @@ mod tests {
             dec!(100),
             dec!(101),
             dec!(-10),
+            dec!(1),
             dec!(0),
         );
 
@@ -258,6 +265,7 @@ mod tests {
             dec!(100),
             dec!(99),
             dec!(-10),
+            dec!(1),
             dec!(0),
         );
 
@@ -267,15 +275,41 @@ mod tests {
     }
 
     #[test]
+    fn trade_profit_uses_contract_multiplier() {
+        let trade = Trade::new(
+            spy(),
+            DateTime::EPOCH,
+            DateTime::EPOCH,
+            dec!(2.00),
+            dec!(2.25),
+            dec!(1),
+            dec!(100),
+            dec!(1.40),
+        );
+
+        assert_eq!(trade.contract_multiplier, dec!(100));
+        assert_eq!(trade.pnl, dec!(23.60));
+        assert_eq!(trade.pnl_pct, dec!(0.125));
+        assert!(trade.is_win);
+    }
+
+    #[test]
     fn trade_builder_keeps_residual_after_partial_close() {
         let sym = spy();
         let mut builder = TradeBuilder::new();
 
         assert!(builder
-            .record_fill(&sym, DateTime::EPOCH, dec!(10), dec!(100), dec!(0))
+            .record_fill(&sym, DateTime::EPOCH, dec!(10), dec!(100), dec!(1), dec!(0))
             .is_none());
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-40), dec!(0))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(2),
+                dec!(12),
+                dec!(-40),
+                dec!(1),
+                dec!(0),
+            )
             .unwrap();
 
         assert_eq!(trade.quantity, dec!(40));
@@ -283,7 +317,14 @@ mod tests {
         assert_eq!(builder.open_position(&sym).unwrap().quantity, dec!(60));
 
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(3), dec!(11), dec!(-60), dec!(0))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(3),
+                dec!(11),
+                dec!(-60),
+                dec!(1),
+                dec!(0),
+            )
             .unwrap();
 
         assert_eq!(trade.quantity, dec!(60));
@@ -297,10 +338,24 @@ mod tests {
         let mut builder = TradeBuilder::new();
 
         assert!(builder
-            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(0))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(1),
+                dec!(10),
+                dec!(100),
+                dec!(1),
+                dec!(0),
+            )
             .is_none());
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-150), dec!(0))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(2),
+                dec!(12),
+                dec!(-150),
+                dec!(1),
+                dec!(0),
+            )
             .unwrap();
 
         assert_eq!(trade.quantity, dec!(100));
@@ -310,7 +365,14 @@ mod tests {
         assert_eq!(open.quantity, dec!(-50));
 
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(3), dec!(10), dec!(20), dec!(0))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(3),
+                dec!(10),
+                dec!(20),
+                dec!(1),
+                dec!(0),
+            )
             .unwrap();
 
         assert_eq!(trade.quantity, dec!(-20));
@@ -324,10 +386,24 @@ mod tests {
         let mut builder = TradeBuilder::new();
 
         assert!(builder
-            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(10))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(1),
+                dec!(10),
+                dec!(100),
+                dec!(1),
+                dec!(10),
+            )
             .is_none());
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-40), dec!(4))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(2),
+                dec!(12),
+                dec!(-40),
+                dec!(1),
+                dec!(4),
+            )
             .unwrap();
 
         assert_eq!(trade.fees, dec!(8));
@@ -343,10 +419,24 @@ mod tests {
         let mut builder = TradeBuilder::new();
 
         assert!(builder
-            .record_fill(&sym, DateTime::from_secs(1), dec!(10), dec!(100), dec!(10))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(1),
+                dec!(10),
+                dec!(100),
+                dec!(1),
+                dec!(10),
+            )
             .is_none());
         let trade = builder
-            .record_fill(&sym, DateTime::from_secs(2), dec!(12), dec!(-150), dec!(15))
+            .record_fill(
+                &sym,
+                DateTime::from_secs(2),
+                dec!(12),
+                dec!(-150),
+                dec!(1),
+                dec!(15),
+            )
             .unwrap();
 
         assert_eq!(trade.fees, dec!(20));
@@ -360,7 +450,14 @@ mod tests {
     fn trade_builder_applies_split_to_open_position() {
         let sym = spy();
         let mut builder = TradeBuilder::new();
-        builder.record_fill(&sym, DateTime::from_secs(1), dec!(100), dec!(10), dec!(0));
+        builder.record_fill(
+            &sym,
+            DateTime::from_secs(1),
+            dec!(100),
+            dec!(10),
+            dec!(1),
+            dec!(0),
+        );
 
         builder.apply_split(&sym, dec!(0.5));
 

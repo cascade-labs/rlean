@@ -3,18 +3,20 @@ use crate::py_framework::{
     try_take_alpha, try_take_exec, try_take_pcm, try_take_risk, FrameworkState,
 };
 use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
+use crate::py_orders::PyOrderTicket;
 use crate::py_portfolio::PyPortfolio;
 use crate::py_types::{
     PyAlgorithmSettings, PyOptionSecurity, PyResolution, PySecurity, PySecurityManager, PySymbol,
 };
 use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
-use crate::{PyAccountType, PyBrokerageName, PySecurityType};
+use crate::{PyAccountType, PyBrokerageName, PySecurityType, PyTimeInForce};
 use chrono::{Datelike, NaiveDate, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{DateTime, Market, Resolution, SecurityType};
+use lean_core::{DateTime, Market, Resolution, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, CustomDataSubscription, TradeBar};
 use lean_engine::HistoryService;
 use lean_options::{implied_volatility, time_to_expiry_years};
+use lean_orders::order::TimeInForce;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -49,6 +51,36 @@ impl Default for IndicatorRegistry {
 
 fn f2d(f: f64) -> Decimal {
     Decimal::from_f64(f).unwrap_or_default()
+}
+
+fn py_time_in_force(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<TimeInForce>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(time_in_force) = value.extract::<PyTimeInForce>() {
+        return Ok(Some(time_in_force.into()));
+    }
+    if let Ok(text) = value.extract::<String>() {
+        let normalized = text
+            .trim()
+            .replace([' ', '-', '_'], "")
+            .to_ascii_lowercase();
+        return match normalized.as_str() {
+            "day" => Ok(Some(TimeInForce::Day)),
+            "gtc" | "goodtilcanceled" | "goodtilcancelled" => {
+                Ok(Some(TimeInForce::GoodTilCanceled))
+            }
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported time_in_force: {text}"
+            ))),
+        };
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "time_in_force must be TimeInForce.DAY, TimeInForce.GTC, 'day', or 'gtc'",
+    ))
 }
 
 /// The base algorithm class that Python strategies inherit from.
@@ -128,6 +160,7 @@ impl PyQcAlgorithm {
         ticker: &str,
         resolution: Resolution,
         properties: HashMap<String, String>,
+        role: lean_data::CustomDataSubscriptionRole,
     ) {
         let query = custom_query_from_properties(&properties);
         let config = lean_data::CustomDataConfig {
@@ -142,6 +175,7 @@ impl PyQcAlgorithm {
             ticker: ticker.to_string(),
             config,
             dynamic_query: lean_data::CustomDataQuery::default(),
+            role,
         };
 
         let mut inner = self.inner.lock().unwrap();
@@ -153,6 +187,22 @@ impl PyQcAlgorithm {
         } else {
             inner.custom_data_subscriptions.push(sub);
         }
+    }
+
+    fn register_custom_universe_subscription(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        resolution: Resolution,
+        properties: HashMap<String, String>,
+    ) {
+        self.register_custom_data_subscription(
+            source_type,
+            ticker,
+            resolution,
+            properties,
+            lean_data::CustomDataSubscriptionRole::Universe,
+        );
     }
 }
 
@@ -278,6 +328,7 @@ fn security_type_from_py(value: &Bound<'_, PyAny>) -> PyResult<SecurityType> {
             PySecurityType::Cfd => SecurityType::Cfd,
             PySecurityType::Crypto => SecurityType::Crypto,
             PySecurityType::Index => SecurityType::Index,
+            PySecurityType::IndexOption => SecurityType::IndexOption,
             PySecurityType::CryptoFuture => SecurityType::CryptoFuture,
         });
     }
@@ -291,6 +342,7 @@ fn security_type_from_py(value: &Bound<'_, PyAny>) -> PyResult<SecurityType> {
             "cfd" => Ok(SecurityType::Cfd),
             "crypto" => Ok(SecurityType::Crypto),
             "index" => Ok(SecurityType::Index),
+            "indexoption" | "index_option" | "index-option" => Ok(SecurityType::IndexOption),
             "cryptofuture" | "crypto_future" | "crypto-future" => Ok(SecurityType::CryptoFuture),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unsupported SecurityType '{raw}'"
@@ -466,14 +518,14 @@ impl PyQcAlgorithm {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_equity(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity::from_symbol(PySymbol { inner: sym })
+        PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
     fn add_forex(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_forex(ticker, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity::from_symbol(PySymbol { inner: sym })
+        PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
     #[pyo3(signature = (ticker, resolution, market=None))]
@@ -492,15 +544,16 @@ impl PyQcAlgorithm {
         });
         let sym = self.inner.lock().unwrap().add_crypto(ticker, &market, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity::from_symbol(PySymbol { inner: sym })
+        PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
-    #[pyo3(signature = (ticker, resolution, market=None))]
+    #[pyo3(signature = (ticker, resolution, market=None, leverage=None))]
     fn add_crypto_future(
         &mut self,
         ticker: &str,
         resolution: PyResolution,
         market: Option<&str>,
+        leverage: Option<f64>,
     ) -> PySecurity {
         let res: Resolution = resolution.into();
         let market = market.map(Market::new).unwrap_or_else(|| {
@@ -509,13 +562,20 @@ impl PyQcAlgorithm {
                 .unwrap()
                 .default_market_for_security(SecurityType::CryptoFuture)
         });
+        if let Some(leverage) = leverage {
+            let symbol = Symbol::create_crypto_future(ticker, &market);
+            self.inner
+                .lock()
+                .unwrap()
+                .register_security_leverage(&symbol, leverage);
+        }
         let sym = self
             .inner
             .lock()
             .unwrap()
             .add_crypto_future(ticker, &market, res);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity::from_symbol(PySymbol { inner: sym })
+        PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
     #[getter]
@@ -567,13 +627,14 @@ impl PyQcAlgorithm {
             let ticker = args.get_item(1)?.extract::<String>()?;
             let resolution = args.get_item(2)?.extract::<PyResolution>()?;
             let selector = args.get_item(3)?.unbind();
-            self.register_custom_data_subscription(
+            self.register_custom_universe_subscription(
                 &source_type,
                 &ticker,
                 resolution.into(),
                 HashMap::new(),
             );
             let universe = PyScheduledUniverse::custom_data(
+                source_type,
                 ticker,
                 selector,
                 resolution.into(),
@@ -616,20 +677,23 @@ impl PyQcAlgorithm {
         properties.insert("universe".to_string(), universe.clone());
         properties.insert("market".to_string(), market.as_str().to_string());
         properties.insert("security_type".to_string(), security_type.to_string());
-        self.register_custom_data_subscription(
+        let universe_properties = properties.clone();
+        self.register_custom_universe_subscription(
             "hyperliquid",
             &universe,
             resolution.into(),
             properties,
         );
         let universe = PyScheduledUniverse::custom_data_typed(
+            "hyperliquid".to_string(),
             universe,
             selector,
             resolution.into(),
             self.universe_settings.snapshot(),
             security_type,
             market,
-        );
+        )
+        .with_custom_properties(universe_properties);
         self.universes.lock().unwrap().push(Py::new(py, universe)?);
         Ok(())
     }
@@ -666,55 +730,120 @@ impl PyQcAlgorithm {
     // ─── Ordering ─────────────────────────────────────────────────────────────
 
     /// LEAN API: place a market order.
-    fn market_order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
+    #[pyo3(signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=false))]
+    fn market_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+    ) -> PyResult<PyOrderTicket> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner.lock().unwrap().market_order(&sym, f2d(quantity));
-        Ok(())
+        let time_in_force = py_time_in_force(time_in_force)?;
+        let ticket = self.inner.lock().unwrap().market_order_with_options(
+            &sym,
+            f2d(quantity),
+            time_in_force,
+            outside_regular_trading_hours,
+        );
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
     }
 
     /// LEAN API: `self.buy(symbol, quantity)` — market buy.
-    fn buy(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
-        self.market_order(symbol, quantity.abs())
+    #[pyo3(signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=false))]
+    fn buy(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+    ) -> PyResult<PyOrderTicket> {
+        self.market_order(
+            symbol,
+            quantity.abs(),
+            time_in_force,
+            outside_regular_trading_hours,
+        )
     }
 
     /// LEAN API: `self.sell(symbol, quantity)` — market sell.
-    fn sell(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
-        self.market_order(symbol, -quantity.abs())
+    #[pyo3(signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=false))]
+    fn sell(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+    ) -> PyResult<PyOrderTicket> {
+        self.market_order(
+            symbol,
+            -quantity.abs(),
+            time_in_force,
+            outside_regular_trading_hours,
+        )
     }
 
     /// LEAN API: `self.order(symbol, quantity)` — alias for market_order.
-    fn order(&mut self, symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<()> {
-        self.market_order(symbol, quantity)
+    #[pyo3(signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=false))]
+    fn order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+    ) -> PyResult<PyOrderTicket> {
+        self.market_order(
+            symbol,
+            quantity,
+            time_in_force,
+            outside_regular_trading_hours,
+        )
     }
 
     /// Place a limit order.
+    #[pyo3(signature = (symbol, quantity, limit_price, time_in_force=None, outside_regular_trading_hours=false, post_only=false))]
     fn limit_order(
         &mut self,
         symbol: &Bound<'_, PyAny>,
         quantity: f64,
         limit_price: f64,
-    ) -> PyResult<()> {
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+        post_only: bool,
+    ) -> PyResult<PyOrderTicket> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner
-            .lock()
-            .unwrap()
-            .limit_order(&sym, f2d(quantity), f2d(limit_price));
-        Ok(())
+        let time_in_force = py_time_in_force(time_in_force)?;
+        let ticket = self.inner.lock().unwrap().limit_order_with_properties(
+            &sym,
+            f2d(quantity),
+            f2d(limit_price),
+            time_in_force,
+            outside_regular_trading_hours,
+            post_only,
+        );
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
     }
 
     /// Place a stop-market order.
+    #[pyo3(signature = (symbol, quantity, stop_price, time_in_force=None, outside_regular_trading_hours=false))]
     fn stop_market_order(
         &mut self,
         symbol: &Bound<'_, PyAny>,
         quantity: f64,
         stop_price: f64,
-    ) -> PyResult<()> {
+        time_in_force: Option<&Bound<'_, PyAny>>,
+        outside_regular_trading_hours: bool,
+    ) -> PyResult<PyOrderTicket> {
         let sym = self.resolve_symbol(symbol)?;
-        self.inner
-            .lock()
-            .unwrap()
-            .stop_market_order(&sym, f2d(quantity), f2d(stop_price));
-        Ok(())
+        let time_in_force = py_time_in_force(time_in_force)?;
+        let ticket = self.inner.lock().unwrap().stop_market_order_with_options(
+            &sym,
+            f2d(quantity),
+            f2d(stop_price),
+            time_in_force,
+            outside_regular_trading_hours,
+        );
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
     }
 
     /// Target a portfolio weight (0.0 to 1.0). Automatically computes the delta order.
@@ -790,14 +919,23 @@ impl PyQcAlgorithm {
         };
 
         let properties = py_properties_to_map(properties)?;
-        self.register_custom_data_subscription(source_type, ticker, res, properties);
+        self.register_custom_data_subscription(
+            source_type,
+            ticker,
+            res,
+            properties,
+            lean_data::CustomDataSubscriptionRole::Data,
+        );
 
         // Return a synthetic security object so callers can do:
         //   self.unrate = self.add_data("fred", "UNRATE").symbol
         let market = lean_core::Market::usa();
         let sym = lean_core::Symbol::create_equity(ticker, &market);
         self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        Ok(PySecurity::from_symbol(PySymbol { inner: sym }))
+        Ok(PySecurity::from_algorithm_symbol(
+            PySymbol { inner: sym },
+            self.inner.clone(),
+        ))
     }
 
     /// Update dynamic custom-data query hints for an existing subscription.
@@ -976,6 +1114,43 @@ impl PyQcAlgorithm {
         })
     }
 
+    /// Subscribe to a specific option or index-option contract.
+    #[pyo3(signature = (symbol, resolution=None))]
+    fn add_option_contract(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        resolution: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::py_types::PySymbol> {
+        use lean_core::Resolution;
+        let res = match resolution {
+            Some(r) => {
+                if let Ok(py_res) = r.extract::<PyResolution>() {
+                    Resolution::from(py_res)
+                } else if let Ok(s) = r.extract::<String>() {
+                    match s.to_lowercase().as_str() {
+                        "tick" => Resolution::Tick,
+                        "second" => Resolution::Second,
+                        "daily" => Resolution::Daily,
+                        "hour" => Resolution::Hour,
+                        "minute" => Resolution::Minute,
+                        _ => Resolution::Daily,
+                    }
+                } else {
+                    Resolution::Daily
+                }
+            }
+            None => Resolution::Daily,
+        };
+        let symbol = self.resolve_symbol(symbol)?;
+        if !symbol.security_type().is_option_like() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "add_option_contract requires an option or index-option Symbol",
+            ));
+        }
+        let contract = self.inner.lock().unwrap().add_option_contract(symbol, res);
+        Ok(crate::py_types::PySymbol { inner: contract })
+    }
+
     /// LEAN API: remove a security subscription.
     ///
     /// Mirrors C# LEAN's `RemoveSecurity(symbol, tag=None)` surface. For a
@@ -1011,6 +1186,7 @@ impl PyQcAlgorithm {
                 PySecurityManager::build_entry(
                     sec.symbol.clone(),
                     sec.current_price().to_f64().unwrap_or(0.0),
+                    self.inner.clone(),
                 ),
             );
         }
@@ -1730,6 +1906,31 @@ mod tests {
             assert_eq!(request.data_type, lean_data_providers::DataType::TradeBar);
             Ok(self.bars.clone())
         }
+    }
+
+    #[test]
+    fn add_crypto_universe_keeps_universe_settings_resolution_for_selected_symbols() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut alg = PyQcAlgorithm::new();
+            alg.universe_settings.inner.lock().unwrap().resolution = Resolution::Minute;
+            let selector = py
+                .eval(c"lambda rows: ['BTC']", None, None)
+                .unwrap()
+                .unbind();
+
+            alg.add_crypto_universe(py, "HIP3_XYZ", PyResolution::Hour, selector, None)
+                .unwrap();
+
+            let universes = alg.universes.lock().unwrap();
+            assert_eq!(universes.len(), 1);
+            let universe = universes[0].bind(py).borrow();
+            assert_eq!(universe.settings().resolution, Resolution::Minute);
+            assert_eq!(
+                universe.live_universe_subscription().unwrap().resolution,
+                Resolution::Hour
+            );
+        });
     }
 
     #[test]

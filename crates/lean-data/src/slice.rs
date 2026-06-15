@@ -1,7 +1,7 @@
 use crate::symbol_changed::SymbolChangedEvent;
 use crate::{
-    CustomDataPoint, Delisting, Dividend, MarginInterestRate, PerpetualContext, QuoteBar, Split,
-    Tick, TradeBar,
+    CustomDataPoint, Delisting, Dividend, MarginInterestRate, OrderBook, PerpetualContext,
+    QuoteBar, Split, Tick, TradeBar,
 };
 use lean_core::{DateTime, Symbol};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub struct Slice {
     pub symbol_changed_events: HashMap<u64, SymbolChangedEvent>,
     pub margin_interest_rates: HashMap<u64, MarginInterestRate>,
     pub perpetual_contexts: HashMap<u64, PerpetualContext>,
+    pub order_books: HashMap<u64, OrderBook>,
     pub custom_data: HashMap<String, Vec<CustomDataPoint>>,
     pub has_data: bool,
 }
@@ -38,6 +39,7 @@ impl Slice {
             symbol_changed_events: std::collections::HashMap::new(),
             margin_interest_rates: std::collections::HashMap::new(),
             perpetual_contexts: std::collections::HashMap::new(),
+            order_books: std::collections::HashMap::new(),
             custom_data: std::collections::HashMap::new(),
             has_data: false,
         }
@@ -89,6 +91,18 @@ impl Slice {
         self.has_data = true;
     }
 
+    pub fn add_order_book(&mut self, book: OrderBook) {
+        self.order_books.insert(book.symbol.id.sid, book);
+        self.has_data = true;
+    }
+
+    pub fn add_custom_data(&mut self, source_type: String, ticker: String, point: CustomDataPoint) {
+        let _ = source_type;
+        let key = ticker.to_ascii_uppercase();
+        self.custom_data.entry(key).or_default().push(point);
+        self.has_data = true;
+    }
+
     pub fn get_bar(&self, symbol: &Symbol) -> Option<&TradeBar> {
         self.bars.get(&symbol.id.sid)
     }
@@ -107,5 +121,9 @@ impl Slice {
 
     pub fn get_perpetual_context(&self, symbol: &Symbol) -> Option<&PerpetualContext> {
         self.perpetual_contexts.get(&symbol.id.sid)
+    }
+
+    pub fn get_order_book(&self, symbol: &Symbol) -> Option<&OrderBook> {
+        self.order_books.get(&symbol.id.sid)
     }
 }

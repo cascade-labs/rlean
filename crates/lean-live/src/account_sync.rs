@@ -1,4 +1,4 @@
-use lean_brokerages::Brokerage;
+use lean_brokerages::{Brokerage, BrokerageHolding};
 use lean_orders::order::Order;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -12,6 +12,8 @@ pub struct AccountState {
     pub cash_balances: Vec<(String, Decimal)>,
     /// Ticker → quantity for all held positions.
     pub positions: HashMap<String, Decimal>,
+    /// Detailed symbol holdings, including average price when the brokerage exposes it.
+    pub holdings: Vec<BrokerageHolding>,
     pub open_orders: Vec<Order>,
     pub last_sync_time: chrono::DateTime<chrono::Utc>,
 }
@@ -40,18 +42,19 @@ impl AccountSynchronizer {
             .map(|(_, amt)| *amt)
             .sum();
 
-        let holdings = brokerage.get_account_holdings();
+        let holdings = brokerage.get_account_detailed_holdings();
         let open_orders = brokerage.get_open_orders();
 
         let positions: HashMap<String, Decimal> = holdings
-            .into_iter()
-            .map(|(sym, qty)| (sym.id.ticker.clone(), qty))
+            .iter()
+            .map(|holding| (holding.symbol.id.ticker.clone(), holding.quantity))
             .collect();
 
         Ok(AccountState {
             cash,
             cash_balances,
             positions,
+            holdings,
             open_orders,
             last_sync_time: chrono::Utc::now(),
         })

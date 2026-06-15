@@ -1,8 +1,12 @@
-use crate::brokerage::Brokerage;
+use crate::brokerage::{Brokerage, BrokerageHolding};
 use dashmap::DashMap;
 use lean_algorithm::portfolio::SecurityPortfolioManager;
 use lean_core::{Price, Quantity, Result as LeanResult, Symbol};
-use lean_orders::{Order, OrderStatus};
+use lean_data::Slice;
+use lean_orders::{
+    FillModel, ImmediateFillModel, NullSlippageModel, Order, OrderEvent, OrderProcessor,
+    OrderStatus, TransactionManager,
+};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,21 +18,86 @@ pub struct PaperBrokerage {
     orders: Arc<DashMap<i64, Order>>,
     cash: Arc<Mutex<Price>>,
     portfolio: Arc<SecurityPortfolioManager>,
+    transactions: Arc<TransactionManager>,
+    order_processor: OrderProcessor,
+    order_events: Arc<Mutex<Vec<OrderEvent>>>,
 }
 
 impl PaperBrokerage {
     pub fn new(starting_cash: Price, portfolio: Arc<SecurityPortfolioManager>) -> Self {
+        let transactions = Arc::new(TransactionManager::new());
+        Self::new_with_transactions(starting_cash, portfolio, transactions)
+    }
+
+    pub fn new_with_transactions(
+        starting_cash: Price,
+        portfolio: Arc<SecurityPortfolioManager>,
+        transactions: Arc<TransactionManager>,
+    ) -> Self {
+        let fill_model: Box<dyn FillModel> =
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel)));
+        let order_processor = OrderProcessor::new(fill_model, transactions.clone());
         PaperBrokerage {
             name: "Paper".to_string(),
             connected: false,
             orders: Arc::new(DashMap::new()),
             cash: Arc::new(Mutex::new(starting_cash)),
             portfolio,
+            transactions,
+            order_processor,
+            order_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn cash_balance(&self) -> Price {
-        *self.cash.lock()
+        *self.portfolio.cash.read()
+    }
+
+    pub fn transaction_manager(&self) -> Arc<TransactionManager> {
+        self.transactions.clone()
+    }
+
+    pub fn order_events(&self) -> Vec<OrderEvent> {
+        self.order_events.lock().clone()
+    }
+
+    pub fn scan(&mut self, slice: &Slice) -> LeanResult<Vec<OrderEvent>> {
+        let events = self.order_processor.process_orders_with_quotes(
+            &slice.bars,
+            &slice.quote_bars,
+            slice.time,
+        );
+
+        for event in &events {
+            if let Some(order) = self.transactions.get_order(event.order_id) {
+                self.orders.insert(order.id, order.clone());
+                if event.is_fill() && !event.fill_quantity.is_zero() {
+                    self.portfolio.apply_fill(
+                        &order,
+                        event.fill_price,
+                        event.fill_quantity,
+                        event.order_fee,
+                    );
+                }
+            }
+        }
+
+        self.order_events.lock().extend(events.iter().cloned());
+        *self.cash.lock() = *self.portfolio.cash.read();
+        Ok(events)
+    }
+
+    pub fn scan_order_events(&self, slice: &Slice) -> Vec<OrderEvent> {
+        self.order_processor.generate_order_events_with_quotes(
+            &slice.bars,
+            &slice.quote_bars,
+            slice.time,
+        )
+    }
+
+    fn record_event(&self, event: OrderEvent) {
+        self.transactions.process_order_event(event.clone());
+        self.order_events.lock().push(event);
     }
 }
 
@@ -50,13 +119,38 @@ impl Brokerage for PaperBrokerage {
     }
 
     fn place_order(&mut self, order: Order) -> LeanResult<bool> {
-        self.orders.insert(order.id, order);
+        let mut order = order;
+        order.status = OrderStatus::Submitted;
+        self.orders.insert(order.id, order.clone());
+        self.transactions.add_or_update_order(order.clone());
+
+        let mut event = OrderEvent::new(
+            order.id,
+            order.symbol.clone(),
+            order.time,
+            OrderStatus::Submitted,
+        );
+        event.message = "Order submitted".to_string();
+        self.record_event(event);
         Ok(true)
     }
 
     fn update_order(&mut self, order: &Order) -> LeanResult<bool> {
         if let Some(mut entry) = self.orders.get_mut(&order.id) {
-            *entry = order.clone();
+            let mut updated = order.clone();
+            updated.status = OrderStatus::UpdateSubmitted;
+            updated.last_update_time = Some(order.time);
+            *entry = updated.clone();
+            self.transactions.update_order(updated.clone());
+
+            let mut event = OrderEvent::new(
+                updated.id,
+                updated.symbol.clone(),
+                updated.time,
+                OrderStatus::UpdateSubmitted,
+            );
+            event.message = "Order update submitted".to_string();
+            self.record_event(event);
             Ok(true)
         } else {
             Ok(false)
@@ -66,6 +160,17 @@ impl Brokerage for PaperBrokerage {
     fn cancel_order(&mut self, order: &Order) -> LeanResult<bool> {
         if let Some(mut entry) = self.orders.get_mut(&order.id) {
             entry.status = OrderStatus::Canceled;
+            entry.canceled_time = Some(order.time);
+            self.transactions.update_order(entry.clone());
+
+            let mut event = OrderEvent::new(
+                order.id,
+                order.symbol.clone(),
+                order.time,
+                OrderStatus::Canceled,
+            );
+            event.message = "Order canceled".to_string();
+            self.record_event(event);
             Ok(true)
         } else {
             Ok(false)
@@ -81,7 +186,7 @@ impl Brokerage for PaperBrokerage {
     }
 
     fn get_cash_balance(&self) -> Vec<(String, Price)> {
-        vec![("USD".to_string(), *self.cash.lock())]
+        vec![("USD".to_string(), self.cash_balance())]
     }
 
     fn get_account_holdings(&self) -> HashMap<Symbol, Quantity> {
@@ -90,6 +195,19 @@ impl Brokerage for PaperBrokerage {
             .into_iter()
             .filter(|h| h.is_invested())
             .map(|h| (h.symbol.clone(), h.quantity))
+            .collect()
+    }
+
+    fn get_account_detailed_holdings(&self) -> Vec<BrokerageHolding> {
+        self.portfolio
+            .all_holdings()
+            .into_iter()
+            .filter(|h| h.is_invested())
+            .map(|h| BrokerageHolding {
+                symbol: h.symbol,
+                quantity: h.quantity,
+                average_price: h.average_price,
+            })
             .collect()
     }
 }

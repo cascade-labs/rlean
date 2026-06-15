@@ -1,4 +1,6 @@
-use crate::schema::{i64_to_price, FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
+use crate::schema::{
+    i64_to_price, ns_to_date, FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow,
+};
 use crate::{convert, predicate::Predicate, schema};
 use arrow_array::types::{
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
@@ -56,6 +58,24 @@ impl QueryParams {
         self.limit = Some(n);
         self
     }
+}
+
+fn parquet_reader_panic_error(
+    path: &Path,
+    panic: Box<dyn std::any::Any + Send>,
+) -> lean_core::LeanError {
+    let message = if let Some(message) = panic.downcast_ref::<&'static str>() {
+        *message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic"
+    };
+    lean_core::LeanError::DataError(format!(
+        "{}: parquet reader panicked: {}",
+        path.display(),
+        message
+    ))
 }
 
 /// Parquet reader with predicate pushdown via DataFusion.
@@ -148,6 +168,9 @@ impl ParquetReader {
         }
         for (column, value) in &query.numeric_max {
             filters.push(col(column).lt_eq(lit(*value)));
+        }
+        for column in custom_query_not_null_columns(query) {
+            filters.push(col(&column).is_not_null());
         }
         if let Some(filter) = filters.into_iter().reduce(|a, b| a.and(b)) {
             df = df
@@ -946,20 +969,28 @@ impl ParquetReader {
         let mut result: Vec<OptionEodBar> = Vec::new();
 
         for path in paths {
-            let file = std::fs::File::open(path).map_err(|e| {
-                lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
-            })?;
+            let mut rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> LeanResult<Vec<OptionEodBar>> {
+                    let file = std::fs::File::open(path).map_err(|e| {
+                        lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
+                    })?;
 
-            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-                .build()
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                        .build()
+                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-            for batch_result in reader {
-                let batch =
-                    batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-                result.extend(convert::record_batch_to_option_eod_bars(&batch));
-            }
+                    let mut rows = Vec::new();
+                    for batch_result in reader {
+                        let batch = batch_result
+                            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                        rows.extend(convert::record_batch_to_option_eod_bars(&batch));
+                    }
+                    Ok(rows)
+                },
+            ))
+            .map_err(|panic| parquet_reader_panic_error(path, panic))??;
+            result.append(&mut rows);
         }
 
         debug!(
@@ -979,24 +1010,132 @@ impl ParquetReader {
         let mut result: Vec<OptionUniverseRow> = Vec::new();
 
         for path in paths {
-            let file = std::fs::File::open(path).map_err(|e| {
-                lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
-            })?;
+            let mut rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> LeanResult<Vec<OptionUniverseRow>> {
+                    let file = std::fs::File::open(path).map_err(|e| {
+                        lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
+                    })?;
 
-            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-                .build()
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                        .build()
+                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-            for batch_result in reader {
-                let batch =
-                    batch_result.map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-                result.extend(convert::record_batch_to_option_universe_rows(&batch));
-            }
+                    let mut rows = Vec::new();
+                    for batch_result in reader {
+                        let batch = batch_result
+                            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                        rows.extend(convert::record_batch_to_option_universe_rows(&batch));
+                    }
+                    Ok(rows)
+                },
+            ))
+            .map_err(|panic| parquet_reader_panic_error(path, panic))??;
+            result.append(&mut rows);
         }
 
         debug!(
             "Read {} option universe rows from {} file(s)",
+            result.len(),
+            paths.len()
+        );
+        Ok(result)
+    }
+
+    /// Read option universe rows constrained to the requested underlyings.
+    pub async fn read_option_universe_filtered(
+        &self,
+        paths: &[PathBuf],
+        underlyings: &[String],
+    ) -> LeanResult<Vec<OptionUniverseRow>> {
+        if paths.is_empty() || underlyings.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let requested_underlyings: HashSet<String> = underlyings
+            .iter()
+            .map(|ticker| ticker.to_ascii_uppercase())
+            .collect();
+        if requested_underlyings.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let table_name = format!(
+            "option_universe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+
+        if paths.len() == 1 {
+            self.ctx
+                .register_parquet(
+                    &table_name,
+                    paths[0].to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        } else {
+            let listing_opts = datafusion::datasource::listing::ListingOptions::new(Arc::new(
+                datafusion::datasource::file_format::parquet::ParquetFormat::new(),
+            ))
+            .with_file_extension(".parquet");
+
+            let listing_table_url = datafusion::datasource::listing::ListingTableUrl::parse(
+                paths[0].parent().unwrap().to_str().unwrap(),
+            )
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            let listing_config =
+                datafusion::datasource::listing::ListingTableConfig::new(listing_table_url)
+                    .with_listing_options(listing_opts)
+                    .with_schema(schema::option_universe_schema());
+
+            let listing_table =
+                datafusion::datasource::listing::ListingTable::try_new(listing_config)
+                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            self.ctx
+                .register_table(&table_name, Arc::new(listing_table))
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let mut df = self
+            .ctx
+            .table(&table_name)
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let filter = requested_underlyings
+            .iter()
+            .flat_map(|ticker| {
+                [
+                    ticker.clone(),
+                    ticker.to_ascii_lowercase(),
+                    ticker.to_ascii_uppercase(),
+                ]
+            })
+            .map(|ticker| col("underlying").eq(lit(ticker)))
+            .reduce(|a, b| a.or(b))
+            .unwrap();
+        df = df
+            .filter(filter)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        let _ = self.ctx.deregister_table(&table_name);
+
+        let mut result = option_universe_batches_to_rows(&batches)?;
+        result.retain(|row| requested_underlyings.contains(&row.underlying.to_ascii_uppercase()));
+
+        debug!(
+            "Read {} filtered option universe rows from {} file(s)",
             result.len(),
             paths.len()
         );
@@ -1334,7 +1473,26 @@ fn custom_row_matches_query(
             return false;
         }
     }
+    for column in custom_query_not_null_columns(query) {
+        let Ok(idx) = schema.index_of(&column) else {
+            return false;
+        };
+        if batch.column(idx).is_null(row) {
+            return false;
+        }
+    }
     true
+}
+
+fn custom_query_not_null_columns(query: &CustomDataQuery) -> Vec<String> {
+    ["not_null", "required_columns"]
+        .into_iter()
+        .filter_map(|key| query.properties.get(key))
+        .flat_map(|columns| columns.split(','))
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn custom_data_end_time(time: DateTime, offset_nanos: Option<i64>) -> LeanResult<DateTime> {
@@ -1539,6 +1697,44 @@ fn quote_batches_to_grouped(
     }
 
     Ok(grouped)
+}
+
+fn option_universe_batches_to_rows(batches: &[RecordBatch]) -> LeanResult<Vec<OptionUniverseRow>> {
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        let date_ns_col = int64_column_named(batch, "date_ns")?;
+        let symbol_value_idx = column_index(batch, "symbol_value")?;
+        let underlying_idx = column_index(batch, "underlying")?;
+        let expiration_ns_col = int64_column_named(batch, "expiration_ns")?;
+        let strike_col = int64_column_named(batch, "strike")?;
+        let right_idx = column_index(batch, "right")?;
+
+        for row_idx in 0..batch.num_rows() {
+            let symbol_value =
+                string_cell_as_string(batch.column(symbol_value_idx).as_ref(), row_idx)
+                    .ok_or_else(|| {
+                        lean_core::LeanError::DataError("symbol_value column missing".into())
+                    })?;
+            let underlying = string_cell_as_string(batch.column(underlying_idx).as_ref(), row_idx)
+                .ok_or_else(|| {
+                    lean_core::LeanError::DataError("underlying column missing".into())
+                })?;
+            let right = string_cell_as_string(batch.column(right_idx).as_ref(), row_idx)
+                .ok_or_else(|| lean_core::LeanError::DataError("right column missing".into()))?;
+
+            rows.push(OptionUniverseRow {
+                date: ns_to_date(date_ns_col.value(row_idx)),
+                symbol_value,
+                underlying,
+                expiration: ns_to_date(expiration_ns_col.value(row_idx)),
+                strike: i64_to_price(strike_col.value(row_idx)),
+                right,
+            });
+        }
+    }
+
+    Ok(rows)
 }
 
 fn record_batches(path: &Path) -> LeanResult<Vec<arrow_array::RecordBatch>> {
@@ -1850,6 +2046,7 @@ impl Default for ParquetReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, Schema};
 
     #[test]
     fn custom_data_end_time_applies_offset() {
@@ -1894,5 +2091,34 @@ mod tests {
         };
 
         assert!(custom_time_matches_query(None, &query));
+    }
+
+    #[test]
+    fn custom_row_matches_query_rejects_null_required_column() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ivol_chg",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![Some(-0.1), None]))],
+        )
+        .unwrap();
+        let query = CustomDataQuery {
+            properties: HashMap::from([("not_null".to_string(), "ivol_chg".to_string())]),
+            ..Default::default()
+        };
+        let source = CustomParquetSource {
+            paths: vec![],
+            time_column: None,
+            time_format: None,
+            time_zone: None,
+            end_time_offset_nanos: None,
+            symbol_column: None,
+            value_column: None,
+        };
+
+        assert!(custom_row_matches_query(&batch, 0, &source, &query));
+        assert!(!custom_row_matches_query(&batch, 1, &source, &query));
     }
 }

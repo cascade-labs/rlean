@@ -44,6 +44,14 @@ pub trait FillModel: Send + Sync {
         quote_bar: Option<&QuoteBar>,
         time: DateTime,
     ) -> Option<Fill> {
+        if time <= order.time {
+            return None;
+        }
+        if order.properties.post_only {
+            if let Some(fill) = passive_limit_fill_with_quotes(order, quote_bar, time) {
+                return Some(fill);
+            }
+        }
         if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
             self.limit_fill(order, &bar, time)
         } else {
@@ -159,6 +167,29 @@ fn directional_quote_trade_bar(
         quote_bar.period,
         TradeBarData::new(side.open, side.high, side.low, side.close, fallback.volume),
     ))
+}
+
+fn passive_limit_fill_with_quotes(
+    order: &Order,
+    quote_bar: Option<&QuoteBar>,
+    time: DateTime,
+) -> Option<Fill> {
+    let limit = order.limit_price?;
+    let quote_bar = quote_bar?;
+
+    if order.quantity > dec!(0) {
+        let bid = quote_bar.bid.as_ref()?;
+        if bid.low < limit {
+            return Some(make_filled(order, time, limit, dec!(0)));
+        }
+    } else {
+        let ask = quote_bar.ask.as_ref()?;
+        if ask.high > limit {
+            return Some(make_filled(order, time, limit, dec!(0)));
+        }
+    }
+
+    None
 }
 
 fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price) -> Fill {

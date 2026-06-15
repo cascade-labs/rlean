@@ -97,6 +97,36 @@ impl OrderEvent {
         }
     }
 
+    pub fn invalid(
+        order_id: i64,
+        symbol: Symbol,
+        time: DateTime,
+        message: impl Into<String>,
+    ) -> Self {
+        OrderEvent {
+            id: 0,
+            order_id,
+            symbol,
+            utc_time: time,
+            status: OrderStatus::Invalid,
+            direction: crate::order::OrderDirection::Hold,
+            fill_price: dec!(0),
+            fill_price_currency: "USD".into(),
+            fill_quantity: dec!(0),
+            is_assignment: false,
+            is_in_the_money: false,
+            quantity: dec!(0),
+            message: message.into(),
+            shortable_inventory: None,
+            order_fee: dec!(0),
+            limit_price: None,
+            stop_price: None,
+            trigger_price: None,
+            trailing_amount: None,
+            trailing_as_percentage: false,
+        }
+    }
+
     pub fn is_fill(&self) -> bool {
         matches!(
             self.status,

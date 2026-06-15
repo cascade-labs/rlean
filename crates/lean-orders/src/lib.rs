@@ -50,11 +50,11 @@ pub use fill_model::{
 };
 pub use limit_if_touched_order::LimitIfTouchedOrder;
 pub use option_exercise_order::OptionExerciseOrder;
-pub use order::{Order, OrderDirection, OrderStatus, OrderType, TimeInForce};
+pub use order::{Order, OrderDirection, OrderStatus, OrderSubmissionData, OrderType, TimeInForce};
 pub use order_event::OrderEvent;
 pub use order_processor::OrderProcessor;
 pub use order_ticket::{OrderTicket, UpdateOrderFields};
 pub use security_transaction_model::SecurityTransactionModel;
-pub use slippage::{ConstantSlippageModel, SlippageModel, SpreadSlippageModel};
+pub use slippage::{ConstantSlippageModel, NullSlippageModel, SlippageModel, SpreadSlippageModel};
 pub use trailing_stop_order::TrailingStopOrder;
-pub use transaction_manager::TransactionManager;
+pub use transaction_manager::{CancelOrderRequest, TransactionManager, UpdateOrderRequest};

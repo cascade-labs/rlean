@@ -1,7 +1,8 @@
 use crate::{
     algorithm::AlgorithmStatus, logging::AlgorithmLogging, portfolio::SecurityPortfolioManager,
-    runtime_statistics::RuntimeStatistics, securities::SecurityManager,
+    runtime_statistics::RuntimeStatistics, securities::SecurityManager, BuyingPowerModel,
 };
+use chrono::Timelike;
 use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{
     DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SecurityType,
@@ -13,9 +14,10 @@ use lean_orders::{
     combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
     fee_model::{
         BybitFeeModel, FeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, OrderFee,
-        OrderFeeParameters,
+        OrderFeeParameters, TradierFeeModel,
     },
-    order::{Order, OrderType},
+    order::{Order, OrderStatus, OrderSubmissionData, OrderType, TimeInForce},
+    order_event::OrderEvent,
     order_ticket::OrderTicket,
     trailing_stop_order::TrailingStopOrderParams,
     transaction_manager::TransactionManager,
@@ -44,6 +46,16 @@ impl Default for OptionFilter {
             min_expiry_days: 0,
             max_expiry_days: 35,
         }
+    }
+}
+
+fn tradier_extended_session(time: DateTime) -> Option<&'static str> {
+    let local = time.to_tz(lean_core::time::tz::NEW_YORK);
+    let seconds = local.num_seconds_from_midnight();
+    match seconds {
+        14_400..33_840 => Some("pre"),
+        57_600..71_700 => Some("post"),
+        _ => None,
     }
 }
 
@@ -158,6 +170,7 @@ pub struct QcAlgorithm {
 
     pub brokerage_name: BrokerageName,
     pub account_type: AccountType,
+    security_leverage_overrides: HashMap<u64, f64>,
 }
 
 impl QcAlgorithm {
@@ -189,6 +202,7 @@ impl QcAlgorithm {
             custom_data_subscriptions: Vec::new(),
             brokerage_name: BrokerageName::Default,
             account_type: AccountType::Margin,
+            security_leverage_overrides: HashMap::new(),
         }
     }
 
@@ -199,7 +213,7 @@ impl QcAlgorithm {
         self.brokerage_name = brokerage;
         self.account_type = account_type;
         for security in self.securities.all() {
-            security.set_leverage(self.default_leverage_for_security(&security.symbol));
+            self.initialize_security_models(security);
         }
     }
 
@@ -221,12 +235,39 @@ impl QcAlgorithm {
         if self.account_type == AccountType::Cash {
             return 1.0;
         }
+        if let Some(leverage) = self.security_leverage_overrides.get(&symbol.id.sid) {
+            return *leverage;
+        }
+        if symbol.security_type() == SecurityType::CryptoFuture
+            && symbol.market().as_str() == Market::HYPERLIQUID
+        {
+            panic!(
+                "Hyperliquid CryptoFuture {} requires maxLeverage metadata before security initialization",
+                symbol.value
+            );
+        }
         match symbol.security_type() {
             SecurityType::Equity => 2.0,
             SecurityType::Forex | SecurityType::Cfd => 50.0,
             SecurityType::CryptoFuture => 25.0,
             _ => 1.0,
         }
+    }
+
+    pub fn register_security_leverage(&mut self, symbol: &Symbol, leverage: f64) {
+        BuyingPowerModel::validate_leverage(leverage);
+        self.security_leverage_overrides
+            .insert(symbol.id.sid, leverage);
+        if let Some(security) = self.securities.get(symbol) {
+            security.set_leverage(leverage);
+        }
+    }
+
+    fn initialize_security_models(&self, security: &crate::securities::Security) {
+        let model =
+            BuyingPowerModel::default_for(&security.symbol, self.account_type == AccountType::Cash);
+        security.set_buying_power_model(model);
+        security.set_leverage(self.default_leverage_for_security(&security.symbol));
     }
 
     /// Set the benchmark symbol (e.g. "SPY"). When not called, the runner
@@ -310,7 +351,7 @@ impl QcAlgorithm {
         let hours = ExchangeHours::us_equity();
         let props = SymbolProperties::default();
         let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
-        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
     }
@@ -355,7 +396,7 @@ impl QcAlgorithm {
         let hours = ExchangeHours::forex_24h();
         let props = SymbolProperties::default();
         let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
-        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
     }
@@ -370,7 +411,7 @@ impl QcAlgorithm {
         let hours = ExchangeHours::crypto_24_7();
         let props = self.symbol_properties_for_symbol(&symbol);
         let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
-        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
     }
@@ -396,7 +437,7 @@ impl QcAlgorithm {
         let hours = ExchangeHours::crypto_24_7();
         let props = self.symbol_properties_for_symbol(&symbol);
         let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
-        security.set_leverage(self.default_leverage_for_security(&symbol));
+        self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
     }
@@ -472,11 +513,159 @@ impl QcAlgorithm {
                 Box::new(HyperliquidFeeModel::default())
             }
             (_, SecurityType::CryptoFuture, Market::BYBIT) => Box::new(BybitFeeModel::perpetuals()),
+            (BrokerageName::TradierBrokerage, _, _) => Box::new(TradierFeeModel),
             (BrokerageName::InteractiveBrokersBrokerage, _, _) => {
                 Box::new(InteractiveBrokersFeeModel::default())
             }
             _ => Box::new(InteractiveBrokersFeeModel::default()),
         }
+    }
+
+    fn security_contract_multiplier(&self, symbol: &Symbol) -> Decimal {
+        self.securities
+            .get(symbol)
+            .and_then(|security| {
+                Decimal::from_f64_retain(security.symbol_properties.contract_multiplier)
+            })
+            .unwrap_or_else(|| self.contract_multiplier_for_symbol(symbol))
+    }
+
+    fn quote_currency_for_symbol(&self, symbol: &Symbol) -> String {
+        self.securities
+            .get(symbol)
+            .map(|security| security.symbol_properties.quote_currency.clone())
+            .unwrap_or_else(|| self.symbol_properties_for_symbol(symbol).quote_currency)
+    }
+
+    fn shares_buying_power_pool(&self, left: &Symbol, right: &Symbol) -> bool {
+        if left.security_type() == SecurityType::CryptoFuture
+            || right.security_type() == SecurityType::CryptoFuture
+        {
+            return left.security_type() == SecurityType::CryptoFuture
+                && right.security_type() == SecurityType::CryptoFuture
+                && self
+                    .quote_currency_for_symbol(left)
+                    .eq_ignore_ascii_case(&self.quote_currency_for_symbol(right));
+        }
+        true
+    }
+
+    fn margin_used_after_order(
+        &self,
+        order: Option<(&Order, Price)>,
+        scope_symbol: &Symbol,
+    ) -> Price {
+        let mut total = Decimal::ZERO;
+        let mut order_symbol_in_holdings = false;
+        for mut holding in self.portfolio.all_holdings() {
+            if !self.shares_buying_power_pool(scope_symbol, &holding.symbol) {
+                continue;
+            }
+            if let Some((order, fill_price)) = order {
+                if holding.symbol.id.sid == order.symbol.id.sid {
+                    holding.quantity += order.remaining_quantity();
+                    holding.update_price(fill_price);
+                    order_symbol_in_holdings = true;
+                }
+            }
+            let Some(security) = self.securities.get(&holding.symbol) else {
+                continue;
+            };
+            total += security
+                .buying_power_model()
+                .maintenance_margin_requirement(
+                    holding.quantity,
+                    holding.last_price,
+                    holding.contract_multiplier,
+                    security.leverage(),
+                );
+        }
+
+        if let Some((order, fill_price)) = order {
+            if !order_symbol_in_holdings
+                && self.shares_buying_power_pool(scope_symbol, &order.symbol)
+            {
+                if let Some(security) = self.securities.get(&order.symbol) {
+                    total += security
+                        .buying_power_model()
+                        .maintenance_margin_requirement(
+                            order.remaining_quantity(),
+                            fill_price,
+                            self.security_contract_multiplier(&order.symbol),
+                            security.leverage(),
+                        );
+                }
+            }
+        }
+        total
+    }
+
+    pub fn total_margin_used(&self) -> Price {
+        let mut total = Decimal::ZERO;
+        for holding in self.portfolio.all_holdings() {
+            let Some(security) = self.securities.get(&holding.symbol) else {
+                continue;
+            };
+            total += security
+                .buying_power_model()
+                .reserved_buying_power_for_holding(&holding, security.leverage());
+        }
+        total
+    }
+
+    pub fn margin_remaining_for_symbol(&self, symbol: &Symbol) -> Price {
+        let collateral = if symbol.security_type() == SecurityType::CryptoFuture {
+            *self.portfolio.cash.read()
+        } else {
+            self.portfolio.total_portfolio_value()
+        };
+        let used = self.margin_used_after_order(None, symbol);
+        (collateral - used).max(Decimal::ZERO)
+    }
+
+    pub fn validate_order_buying_power(
+        &self,
+        order: &Order,
+        fill_price: Price,
+        order_fee: Price,
+    ) -> Result<(), String> {
+        if order.remaining_quantity().is_zero() {
+            return Ok(());
+        }
+        let Some(security) = self.securities.get(&order.symbol) else {
+            return Err(format!(
+                "Insufficient buying power: security {} is not initialized",
+                order.symbol.value
+            ));
+        };
+        if fill_price <= Decimal::ZERO {
+            return Err(format!(
+                "Insufficient buying power: {} has no positive fill price",
+                order.symbol.value
+            ));
+        }
+
+        let collateral = if order.symbol.security_type() == SecurityType::CryptoFuture {
+            *self.portfolio.cash.read()
+        } else {
+            self.portfolio.total_portfolio_value()
+        };
+        let collateral_after_fee = (collateral - order_fee.max(Decimal::ZERO)).max(Decimal::ZERO);
+        let used_after = self.margin_used_after_order(Some((order, fill_price)), &order.symbol);
+        if used_after > collateral_after_fee {
+            let leverage = security.leverage();
+            return Err(format!(
+                "Insufficient buying power for order {} {} {} @ {}. Margin required after order: {}, collateral available after fees: {}, leverage: {}",
+                order.id,
+                order.symbol.value,
+                order.remaining_quantity(),
+                fill_price,
+                used_after,
+                collateral_after_fee,
+                leverage
+            ));
+        }
+        Ok(())
     }
 
     // ─── Ordering ────────────────────────────────────────────────────────────
@@ -486,13 +675,180 @@ impl QcAlgorithm {
         self.order_id_counter
     }
 
+    fn submit_order(&self, mut order: Order) -> OrderTicket {
+        self.apply_order_submission_data(&mut order);
+
+        if let Some(message) = self.validate_brokerage_order(&order) {
+            let event = OrderEvent::invalid(order.id, order.symbol.clone(), self.utc_time, message);
+            order.status = OrderStatus::Invalid;
+            let ticket = self.transactions.add_order(order);
+            self.transactions.process_order_event(event);
+            return ticket;
+        }
+
+        self.transactions.add_order(order)
+    }
+
+    fn apply_order_submission_data(&self, order: &mut Order) {
+        if order.order_submission_data.is_some() {
+            return;
+        }
+
+        if let Some(security) = self.securities.get(&order.symbol) {
+            let last = security.current_price();
+            let bid = {
+                let bid = security.bid_price();
+                if bid > Decimal::ZERO {
+                    bid
+                } else {
+                    last
+                }
+            };
+            let ask = {
+                let ask = security.ask_price();
+                if ask > Decimal::ZERO {
+                    ask
+                } else {
+                    last
+                }
+            };
+            order.order_submission_data = Some(OrderSubmissionData::new(bid, ask, last));
+        }
+    }
+
+    fn validate_brokerage_order(&self, order: &Order) -> Option<String> {
+        if self.brokerage_name != BrokerageName::TradierBrokerage {
+            return None;
+        }
+
+        if !matches!(
+            order.order_type,
+            OrderType::Limit | OrderType::Market | OrderType::StopMarket | OrderType::StopLimit
+        ) {
+            return Some(format!(
+                "Tradier does not support {:?} orders",
+                order.order_type
+            ));
+        }
+
+        if !matches!(
+            order.symbol.security_type(),
+            SecurityType::Equity | SecurityType::Option | SecurityType::IndexOption
+        ) {
+            return Some(format!(
+                "Tradier does not support {:?} securities",
+                order.symbol.security_type()
+            ));
+        }
+
+        if !matches!(
+            order.time_in_force,
+            TimeInForce::GoodTilCanceled | TimeInForce::Day
+        ) {
+            return Some(format!(
+                "Tradier does not support {:?} time in force",
+                order.time_in_force
+            ));
+        }
+
+        let absolute_quantity = order.abs_quantity();
+        if absolute_quantity < dec!(1) || absolute_quantity > dec!(10000000) {
+            return Some(format!(
+                "Tradier order quantity must be between 1 and 10000000, got {}",
+                absolute_quantity
+            ));
+        }
+
+        let holding_quantity = self.portfolio.get_holding(&order.symbol).quantity;
+        let projected_quantity = holding_quantity + order.quantity;
+        if projected_quantity < dec!(0) {
+            if order.time_in_force == TimeInForce::GoodTilCanceled {
+                return Some(
+                    "Tradier does not support GTC orders that leave a short position".into(),
+                );
+            }
+
+            let security_price = self
+                .securities
+                .get(&order.symbol)
+                .map(|security| security.current_price())
+                .unwrap_or(order.price);
+            if security_price < dec!(5) {
+                return Some(
+                    "Tradier does not support short sale orders for securities priced below $5"
+                        .into(),
+                );
+            }
+        }
+
+        if order.properties.outside_regular_trading_hours
+            && !self.tradier_can_execute_order_at(order, order.time)
+        {
+            return Some(
+                "Tradier extended-hours orders must be equity limit orders submitted during the current pre-market or post-market session"
+                    .into(),
+            );
+        }
+
+        None
+    }
+
+    pub fn can_execute_order_with_brokerage_model(&self, order: &Order) -> bool {
+        if self.brokerage_name != BrokerageName::TradierBrokerage {
+            return true;
+        }
+
+        self.tradier_can_execute_order_at(order, self.utc_time)
+    }
+
+    fn tradier_can_execute_order_at(&self, order: &Order, time: DateTime) -> bool {
+        let Some(security) = self.securities.get(&order.symbol) else {
+            return true;
+        };
+
+        if security.exchange_hours.is_open_at(time) {
+            return true;
+        }
+
+        if !order.properties.outside_regular_trading_hours {
+            return false;
+        }
+
+        order.order_type == OrderType::Limit
+            && order.symbol.security_type() == SecurityType::Equity
+            && tradier_extended_session(time).is_some()
+    }
+
     pub fn market_order(&mut self, symbol: &Symbol, quantity: Quantity) -> OrderTicket {
+        self.market_order_with_time_in_force(symbol, quantity, None)
+    }
+
+    pub fn market_order_with_time_in_force(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+    ) -> OrderTicket {
+        self.market_order_with_options(symbol, quantity, time_in_force, false)
+    }
+
+    pub fn market_order_with_options(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+    ) -> OrderTicket {
         if symbol.option_symbol_id().is_some() {
             self.ensure_option_security(symbol, Resolution::Minute);
         }
         let id = self.next_order_id();
-        let order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
-        self.transactions.add_order(order)
+        let mut order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
+        if let Some(time_in_force) = time_in_force {
+            order.time_in_force = time_in_force;
+        }
+        order.properties.outside_regular_trading_hours = outside_regular_trading_hours;
+        self.submit_order(order)
     }
 
     pub fn limit_order(
@@ -501,9 +857,54 @@ impl QcAlgorithm {
         quantity: Quantity,
         limit_price: Price,
     ) -> OrderTicket {
+        self.limit_order_with_time_in_force(symbol, quantity, limit_price, None)
+    }
+
+    pub fn limit_order_with_time_in_force(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+    ) -> OrderTicket {
+        self.limit_order_with_options(symbol, quantity, limit_price, time_in_force, false)
+    }
+
+    pub fn limit_order_with_options(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+    ) -> OrderTicket {
+        self.limit_order_with_properties(
+            symbol,
+            quantity,
+            limit_price,
+            time_in_force,
+            outside_regular_trading_hours,
+            false,
+        )
+    }
+
+    pub fn limit_order_with_properties(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+        post_only: bool,
+    ) -> OrderTicket {
         let id = self.next_order_id();
-        let order = Order::limit(id, symbol.clone(), quantity, limit_price, self.utc_time, "");
-        self.transactions.add_order(order)
+        let mut order = Order::limit(id, symbol.clone(), quantity, limit_price, self.utc_time, "");
+        if let Some(time_in_force) = time_in_force {
+            order.time_in_force = time_in_force;
+        }
+        order.properties.outside_regular_trading_hours = outside_regular_trading_hours;
+        order.properties.post_only = post_only;
+        self.submit_order(order)
     }
 
     pub fn stop_market_order(
@@ -512,9 +913,35 @@ impl QcAlgorithm {
         quantity: Quantity,
         stop_price: Price,
     ) -> OrderTicket {
+        self.stop_market_order_with_time_in_force(symbol, quantity, stop_price, None)
+    }
+
+    pub fn stop_market_order_with_time_in_force(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        time_in_force: Option<TimeInForce>,
+    ) -> OrderTicket {
+        self.stop_market_order_with_options(symbol, quantity, stop_price, time_in_force, false)
+    }
+
+    pub fn stop_market_order_with_options(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+    ) -> OrderTicket {
         let id = self.next_order_id();
-        let order = Order::stop_market(id, symbol.clone(), quantity, stop_price, self.utc_time, "");
-        self.transactions.add_order(order)
+        let mut order =
+            Order::stop_market(id, symbol.clone(), quantity, stop_price, self.utc_time, "");
+        if let Some(time_in_force) = time_in_force {
+            order.time_in_force = time_in_force;
+        }
+        order.properties.outside_regular_trading_hours = outside_regular_trading_hours;
+        self.submit_order(order)
     }
 
     pub fn stop_limit_order(
@@ -524,8 +951,38 @@ impl QcAlgorithm {
         stop_price: Price,
         limit_price: Price,
     ) -> OrderTicket {
+        self.stop_limit_order_with_time_in_force(symbol, quantity, stop_price, limit_price, None)
+    }
+
+    pub fn stop_limit_order_with_time_in_force(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+    ) -> OrderTicket {
+        self.stop_limit_order_with_options(
+            symbol,
+            quantity,
+            stop_price,
+            limit_price,
+            time_in_force,
+            false,
+        )
+    }
+
+    pub fn stop_limit_order_with_options(
+        &mut self,
+        symbol: &Symbol,
+        quantity: Quantity,
+        stop_price: Price,
+        limit_price: Price,
+        time_in_force: Option<TimeInForce>,
+        outside_regular_trading_hours: bool,
+    ) -> OrderTicket {
         let id = self.next_order_id();
-        let order = Order::stop_limit(
+        let mut order = Order::stop_limit(
             id,
             symbol.clone(),
             quantity,
@@ -534,7 +991,11 @@ impl QcAlgorithm {
             self.utc_time,
             "",
         );
-        self.transactions.add_order(order)
+        if let Some(time_in_force) = time_in_force {
+            order.time_in_force = time_in_force;
+        }
+        order.properties.outside_regular_trading_hours = outside_regular_trading_hours;
+        self.submit_order(order)
     }
 
     /// Market-on-open order.
@@ -542,7 +1003,7 @@ impl QcAlgorithm {
         let id = self.next_order_id();
         let mut order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
         order.order_type = OrderType::MarketOnOpen;
-        self.transactions.add_order(order)
+        self.submit_order(order)
     }
 
     /// Market-on-close order.
@@ -550,7 +1011,7 @@ impl QcAlgorithm {
         let id = self.next_order_id();
         let mut order = Order::market(id, symbol.clone(), quantity, self.utc_time, "");
         order.order_type = OrderType::MarketOnClose;
-        self.transactions.add_order(order)
+        self.submit_order(order)
     }
 
     /// Trailing stop order.
@@ -580,7 +1041,7 @@ impl QcAlgorithm {
                 tag: "",
             },
         );
-        self.transactions.add_order(tso.order)
+        self.submit_order(tso.order)
     }
 
     /// Limit-if-touched order.
@@ -603,7 +1064,7 @@ impl QcAlgorithm {
             self.utc_time,
             "",
         );
-        self.transactions.add_order(lit.order)
+        self.submit_order(lit.order)
     }
 
     /// Combo market order — all legs execute simultaneously at market prices.
@@ -618,7 +1079,7 @@ impl QcAlgorithm {
     ) -> OrderTicket {
         let id = self.next_order_id();
         let cmo = ComboMarketOrder::new(id, symbol.clone(), quantity, self.utc_time, "", legs);
-        self.transactions.add_order(cmo.order)
+        self.submit_order(cmo.order)
     }
 
     /// Combo limit order — all legs execute as a unit at a net `limit_price`.
@@ -639,7 +1100,7 @@ impl QcAlgorithm {
             "",
             legs,
         );
-        self.transactions.add_order(clo.order)
+        self.submit_order(clo.order)
     }
 
     /// Combo leg limit order — each leg has its own per-leg limit price.
@@ -660,30 +1121,46 @@ impl QcAlgorithm {
             "",
             legs,
         );
-        self.transactions.add_order(cll.order)
+        self.submit_order(cll.order)
     }
 
-    /// Set holdings to a target portfolio weight (0.0 = 0%, 1.0 = 100% of portfolio).
+    /// Set holdings to a target portfolio weight (0.0 = 0%, 1.0 = 100% of portfolio value).
     pub fn set_holdings(&mut self, symbol: &Symbol, target: Decimal) -> Option<OrderTicket> {
         let portfolio_value = self.portfolio.total_portfolio_value();
-        let current_price = self.securities.get(symbol)?.current_price();
+        let security = self.securities.get(symbol)?;
+        let current_price = security.current_price();
 
         if current_price.is_zero() {
             return None;
         }
 
-        let target_value = portfolio_value * target;
         let current_holding = self.portfolio.get_holding(symbol);
-        let current_value = current_holding.market_value();
-        let delta_value = target_value - current_value;
+        let contract_multiplier = self.security_contract_multiplier(symbol);
+        let leverage = security.leverage();
+        let target_margin_percent = target / BuyingPowerModel::leverage_decimal(leverage);
+        let target_quantity = security
+            .buying_power_model()
+            .target_quantity_for_buying_power(
+                portfolio_value,
+                target_margin_percent,
+                current_price,
+                contract_multiplier,
+                leverage,
+            );
+        let delta_quantity = target_quantity - current_holding.quantity;
+        let delta_margin = security.buying_power_model().initial_margin_requirement(
+            delta_quantity,
+            current_price,
+            contract_multiplier,
+            leverage,
+        );
 
-        if delta_value.abs() < dec!(1) {
+        if delta_margin.abs() < dec!(1) {
             return None;
         } // avoid tiny orders
 
-        let qty = delta_value / current_price;
         // Truncate (floor toward zero) to integer, matching C# LEAN's lot-size behavior
-        let qty_rounded = qty.trunc();
+        let qty_rounded = delta_quantity.trunc();
 
         if qty_rounded.is_zero() {
             return None;
@@ -953,6 +1430,7 @@ impl QcAlgorithm {
     }
 
     pub fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
+        self.add_option_contract_subscriptions(symbol.clone(), resolution);
         if self.securities.contains(symbol) {
             return;
         }
@@ -961,12 +1439,26 @@ impl QcAlgorithm {
             contract_multiplier: 100.0,
             ..SymbolProperties::default()
         };
-        self.securities.add(crate::securities::Security::new(
-            symbol.clone(),
-            resolution,
-            props,
-            hours,
-        ));
+        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        self.initialize_security_models(&security);
+        self.securities.add(security);
+    }
+
+    fn add_option_contract_subscriptions(&self, symbol: Symbol, resolution: Resolution) {
+        if symbol.is_canonical_option() {
+            return;
+        }
+
+        self.subscription_manager
+            .add(SubscriptionDataConfig::new_equity(
+                symbol.clone(),
+                resolution,
+            ));
+        if resolution != Resolution::Hour && resolution != Resolution::Daily {
+            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            quote_config.tick_type = lean_core::TickType::Quote;
+            self.subscription_manager.add(quote_config);
+        }
     }
 
     fn option_contract_multiplier(&self, symbol: &Symbol) -> Decimal {

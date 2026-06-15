@@ -4,8 +4,8 @@ use lean_orders::{
     AlpacaFeeModel, BinanceFeeModel, BybitFeeModel, CharlesSchwabFeeModel, ConstantFeeModel,
     EtradeFeeModel, ExchangeFeeModel, FeeModel, FidelityFeeModel, FlatFeeModel, FxcmFeeModel,
     GDAXFeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, KrakenFeeModel, NullFeeModel,
-    OandaFeeModel, Order, OrderType, PercentFeeModel, RobinhoodFeeModel, TDAmeritradeFeeModel,
-    TradierFeeModel, ZeroFeeModel,
+    OandaFeeModel, Order, OrderSubmissionData, OrderType, PercentFeeModel, RobinhoodFeeModel,
+    TDAmeritradeFeeModel, TradierFeeModel, ZeroFeeModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -400,8 +400,7 @@ fn tradier_equity_is_free() {
 }
 
 #[test]
-fn tradier_options_per_contract() {
-    // 10 contracts * $0.35 = $3.50
+fn tradier_options_are_free_to_match_lean_brokerage_model() {
     let model = TradierFeeModel;
     let sym = Symbol::create_equity("AAPL", &Market::usa());
     let order = Order::market(1, sym, dec!(10), ts(0), "");
@@ -414,7 +413,7 @@ fn tradier_options_per_contract() {
         dec!(100),
     );
     let fee = model.get_order_fee(&p);
-    assert_eq!(fee.amount, dec!(3.50));
+    assert_eq!(fee.amount, dec!(0));
 }
 
 // ─── GDAXFeeModel / CoinbaseFeeModel ─────────────────────────────────────────
@@ -563,6 +562,97 @@ fn hyperliquid_crypto_future_fee_uses_base_perp_tiers() {
     assert_eq!(taker.currency, "USDC");
     assert_eq!(maker.amount, dec!(30.00000));
     assert_eq!(maker.currency, "USDC");
+}
+
+#[test]
+fn hyperliquid_submitted_marketable_limit_uses_taker_fee() {
+    let model = HyperliquidFeeModel::default();
+    let mut order = Order::limit(
+        1,
+        crypto_future_sym("BTC"),
+        dec!(2),
+        dec!(100_100),
+        ts(0),
+        "",
+    );
+    order.order_submission_data = Some(OrderSubmissionData::new(
+        dec!(99_900),
+        dec!(100_000),
+        dec!(99_950),
+    ));
+
+    let fee = model.get_order_fee(&params_full(
+        &order,
+        dec!(100_000),
+        SecurityType::CryptoFuture,
+        "USDC",
+        Some("BTC".into()),
+        dec!(1),
+    ));
+
+    assert_eq!(fee.amount, dec!(90.00000));
+    assert_eq!(fee.currency, "USDC");
+}
+
+#[test]
+fn hyperliquid_submitted_passive_limit_uses_maker_fee() {
+    let model = HyperliquidFeeModel::default();
+    let mut order = Order::limit(
+        1,
+        crypto_future_sym("BTC"),
+        dec!(2),
+        dec!(99_900),
+        ts(0),
+        "",
+    );
+    order.order_submission_data = Some(OrderSubmissionData::new(
+        dec!(99_900),
+        dec!(100_000),
+        dec!(99_950),
+    ));
+
+    let fee = model.get_order_fee(&params_full(
+        &order,
+        dec!(100_000),
+        SecurityType::CryptoFuture,
+        "USDC",
+        Some("BTC".into()),
+        dec!(1),
+    ));
+
+    assert_eq!(fee.amount, dec!(30.00000));
+    assert_eq!(fee.currency, "USDC");
+}
+
+#[test]
+fn hyperliquid_post_only_limit_uses_maker_fee_even_if_marketable() {
+    let model = HyperliquidFeeModel::default();
+    let mut order = Order::limit(
+        1,
+        crypto_future_sym("BTC"),
+        dec!(2),
+        dec!(100_100),
+        ts(0),
+        "",
+    );
+    order.properties.post_only = true;
+    order.order_submission_data = Some(OrderSubmissionData::new(
+        dec!(99_900),
+        dec!(100_000),
+        dec!(99_950),
+    ));
+
+    let fee = model.get_order_fee(&params_full(
+        &order,
+        dec!(100_000),
+        SecurityType::CryptoFuture,
+        "USDC",
+        Some("BTC".into()),
+        dec!(1),
+    ));
+
+    assert_eq!(fee.amount, dec!(30.00000));
+    assert_eq!(fee.currency, "USDC");
 }
 
 // ─── CharlesSchwabFeeModel ────────────────────────────────────────────────────

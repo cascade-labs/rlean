@@ -1,5 +1,5 @@
 use lean_algorithm::qc_algorithm::{BrokerageName, QcAlgorithm};
-use lean_core::{Market, Resolution, SecurityType, TickType};
+use lean_core::{Market, OptionRight, OptionStyle, Resolution, SecurityType, Symbol, TickType};
 use rust_decimal_macros::dec;
 
 #[test]
@@ -44,6 +44,8 @@ fn add_equity_existing_security_still_adds_later_minute_quote_subscription() {
 #[test]
 fn add_crypto_future_adds_trade_and_quote_subscriptions() {
     let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let expected_symbol = Symbol::create_crypto_future("BTC", &Market::hyperliquid());
+    algorithm.register_security_leverage(&expected_symbol, 50.0);
 
     let symbol = algorithm.add_crypto_future("BTC", &Market::hyperliquid(), Resolution::Minute);
 
@@ -58,8 +60,36 @@ fn add_crypto_future_adds_trade_and_quote_subscriptions() {
         .iter()
         .any(|sub| sub.symbol == symbol && sub.tick_type == TickType::Quote));
     let security = algorithm.securities.get(&symbol).unwrap();
-    assert_eq!(security.leverage(), 25.0);
+    assert_eq!(security.leverage(), 50.0);
     assert_eq!(security.symbol_properties.quote_currency, "USDC");
+}
+
+#[test]
+fn add_option_contract_minute_adds_trade_and_quote_subscriptions() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let underlying = Symbol::create_equity("SPY", &Market::usa());
+    let option = Symbol::create_option(
+        underlying,
+        &Market::usa(),
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+        dec!(450),
+        OptionRight::Call,
+        OptionStyle::American,
+    );
+
+    let symbol = algorithm.add_option_contract(option.clone(), Resolution::Minute);
+
+    let subscriptions = algorithm.subscription_manager.get_all();
+    assert!(subscriptions.iter().any(|sub| {
+        sub.symbol == symbol
+            && sub.resolution == Resolution::Minute
+            && sub.tick_type == TickType::Trade
+    }));
+    assert!(subscriptions.iter().any(|sub| {
+        sub.symbol == symbol
+            && sub.resolution == Resolution::Minute
+            && sub.tick_type == TickType::Quote
+    }));
 }
 
 #[test]

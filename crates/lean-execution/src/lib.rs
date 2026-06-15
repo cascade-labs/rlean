@@ -6,6 +6,7 @@ pub use execution_model::{
 };
 pub use models::immediate::ImmediateExecutionModel;
 pub use models::null::NullExecutionModel;
+pub use models::passive_maker::PassiveMakerExecutionModel;
 pub use models::spread::SpreadExecutionModel;
 pub use models::standard_deviation::StandardDeviationExecutionModel;
 pub use models::twap::TwapExecutionModel;

@@ -1,10 +1,12 @@
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Timelike};
+use lean_core::{DateTime, Resolution};
 use lean_data::custom::{
     CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource, CustomParquetSource,
 };
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Engine-owned context passed to custom-data plugins at load time.
 ///
@@ -104,6 +106,38 @@ pub trait ICustomDataSource: Send + Sync {
         None
     }
 
+    /// Return parquet files for a live custom data request.
+    ///
+    /// This is the provider-side equivalent of C# LEAN custom data
+    /// `GetSource(config, date, isLiveMode: true)`: the engine supplies the
+    /// current UTC frontier and the provider decides which live source, if any,
+    /// is currently available.
+    fn get_live_parquet_source(
+        &self,
+        ticker: &str,
+        utc_time: DateTime,
+        config: &CustomDataConfig,
+        query: &CustomDataQuery,
+    ) -> Option<CustomParquetSource> {
+        self.get_parquet_source(ticker, utc_time.date_utc(), config, query)
+    }
+
+    /// Delay before the engine asks this provider for live data again.
+    ///
+    /// Providers with delayed object arrival or market-hours windows can
+    /// override this without the framework knowing provider-specific paths or
+    /// schedules.
+    fn live_poll_delay(
+        &self,
+        _ticker: &str,
+        utc_time: DateTime,
+        source_available: bool,
+        config: &CustomDataConfig,
+        _query: &CustomDataQuery,
+    ) -> Duration {
+        default_live_poll_delay(utc_time, source_available, config.resolution)
+    }
+
     /// Returns `true` for providers whose canonical storage is native parquet.
     /// The runner will not call `get_source()`/`reader()` for these providers;
     /// a missing parquet source means no data for that request.
@@ -169,3 +203,37 @@ pub trait ICustomDataSource: Send + Sync {
 
 /// Type-erased `Arc` wrapper — cloneable for use across threads and `RunConfig`.
 pub type ArcCustomDataSource = Arc<dyn ICustomDataSource>;
+
+fn default_live_poll_delay(
+    utc_time: DateTime,
+    source_available: bool,
+    resolution: Resolution,
+) -> Duration {
+    if source_available {
+        return match resolution {
+            Resolution::Tick | Resolution::Second => Duration::from_secs(1),
+            Resolution::Minute => sleep_until_next_utc_minute(utc_time),
+            Resolution::Hour => Duration::from_secs(300),
+            Resolution::Daily => Duration::from_secs(300),
+        };
+    }
+
+    match resolution {
+        Resolution::Tick | Resolution::Second | Resolution::Minute => Duration::from_secs(1),
+        Resolution::Hour => Duration::from_secs(60),
+        Resolution::Daily => Duration::from_secs(300),
+    }
+}
+
+fn sleep_until_next_utc_minute(utc_time: DateTime) -> Duration {
+    let utc = utc_time.to_utc();
+    let next = utc + chrono::Duration::minutes(1);
+    let Some(next_minute) = next.date_naive().and_hms_opt(next.hour(), next.minute(), 0) else {
+        return Duration::from_secs(1);
+    };
+    let next_utc =
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(next_minute, chrono::Utc);
+    (next_utc - chrono::Utc::now())
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(1))
+}

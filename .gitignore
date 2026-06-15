@@ -6,6 +6,10 @@ examples/data/
 
 # Runtime data — never commit
 data/
+logs/
+
+# Local secrets
+.env
 
 # Claude memory files — may contain secrets
 .claude/projects/

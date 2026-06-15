@@ -16,15 +16,15 @@ use rust_decimal_macros::dec;
 pub struct SpreadExecutionModel {
     /// Maximum acceptable spread as a fraction of price (default 0.005 = 0.5%)
     pub accepting_spread_percent: Decimal,
-    /// Pending targets: symbol ticker -> desired delta
-    pending: HashMap<String, (Symbol, Decimal)>,
+    /// Desired target quantity per symbol (ticker -> target quantity).
+    targets: HashMap<String, (Symbol, Decimal)>,
 }
 
 impl SpreadExecutionModel {
     pub fn new(accepting_spread_percent: Decimal) -> Self {
         Self {
             accepting_spread_percent: accepting_spread_percent.abs(),
-            pending: HashMap::new(),
+            targets: HashMap::new(),
         }
     }
 }
@@ -41,31 +41,29 @@ impl IExecutionModel for SpreadExecutionModel {
         targets: &[ExecutionTarget],
         securities: &HashMap<String, SecurityData>,
     ) -> Vec<OrderRequest> {
-        // Merge new targets into pending, computing delta vs current holdings
+        // Merge new targets into the persistent target collection.
         for target in targets {
             let key = target.symbol.value.clone();
-            let current_qty = securities
-                .get(&key)
-                .map(|s| s.current_quantity)
-                .unwrap_or(Decimal::ZERO);
-            let delta = target.quantity - current_qty;
-            self.pending.insert(key, (target.symbol.clone(), delta));
+            self.targets
+                .insert(key, (target.symbol.clone(), target.quantity));
         }
 
         let mut orders = Vec::new();
+        let mut fulfilled = Vec::new();
 
-        for (key, (symbol, remaining)) in &mut self.pending {
-            if *remaining == Decimal::ZERO {
-                continue;
-            }
-
+        for (key, (symbol, target_quantity)) in &self.targets {
             let sec = match securities.get(key) {
                 Some(s) => s,
                 None => continue,
             };
 
-            // Check spread acceptability: (ask - bid) / price <= threshold
-            // Requires both bid and ask to be available and price > 0
+            let unordered_quantity =
+                *target_quantity - sec.current_quantity - sec.open_order_quantity;
+            if unordered_quantity == Decimal::ZERO {
+                fulfilled.push(key.clone());
+                continue;
+            }
+
             let price = sec.price;
             if price <= Decimal::ZERO {
                 continue;
@@ -75,8 +73,7 @@ impl IExecutionModel for SpreadExecutionModel {
                 (Some(bid), Some(ask)) if bid > Decimal::ZERO && ask > Decimal::ZERO => {
                     (ask - bid) / price <= self.accepting_spread_percent
                 }
-                // If bid/ask not available, fall back to allowing execution
-                _ => true,
+                _ => false,
             };
 
             if !spread_ok {
@@ -85,24 +82,25 @@ impl IExecutionModel for SpreadExecutionModel {
 
             orders.push(OrderRequest {
                 symbol: symbol.clone(),
-                quantity: *remaining,
+                quantity: unordered_quantity,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,
+                post_only: false,
+                cancel_open_orders: false,
                 tag: "SpreadExecutionModel".to_string(),
             });
-
-            *remaining = Decimal::ZERO;
         }
 
-        // Remove fulfilled entries
-        self.pending.retain(|_, (_, r)| *r != Decimal::ZERO);
+        for key in fulfilled {
+            self.targets.remove(&key);
+        }
 
         orders
     }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.pending.remove(&sym.value);
+            self.targets.remove(&sym.value);
         }
     }
 

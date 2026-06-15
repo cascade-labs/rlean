@@ -46,6 +46,8 @@ impl IExecutionModel for ImmediateExecutionModel {
                     quantity: delta,
                     order_type: ExecutionOrderType::Market,
                     limit_price: None,
+                    post_only: false,
+                    cancel_open_orders: false,
                     tag: "ImmediateExecutionModel".to_string(),
                 });
             }

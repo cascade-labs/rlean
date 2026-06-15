@@ -74,7 +74,7 @@ pub trait FeeModel: Send + Sync {
 /// marketable limits as *taker*.
 #[inline]
 fn is_maker(order: &Order) -> bool {
-    order.order_type == OrderType::Limit
+    order.order_type == OrderType::Limit && (order.properties.post_only || !order.is_marketable())
 }
 
 // ─── NullFeeModel ─────────────────────────────────────────────────────────────
@@ -370,18 +370,15 @@ impl FeeModel for AlpacaFeeModel {
 
 // ─── TradierFeeModel ──────────────────────────────────────────────────────────
 
-/// Tradier fee model — $0 equities, $0.35/contract options.
+/// Tradier fee model.
+///
+/// C# LEAN's `TradierBrokerageModel.GetFeeModel` returns a constant zero fee
+/// model for all supported security types.
 pub struct TradierFeeModel;
 
 impl FeeModel for TradierFeeModel {
-    fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
-        match params.security_type {
-            SecurityType::Option => {
-                let fee = params.order.abs_quantity() * dec!(0.35);
-                OrderFee::new(fee, "USD")
-            }
-            _ => OrderFee::zero(),
-        }
+    fn get_order_fee(&self, _params: &OrderFeeParameters<'_>) -> OrderFee {
+        OrderFee::zero()
     }
 }
 

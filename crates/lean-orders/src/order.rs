@@ -117,6 +117,8 @@ pub struct Order {
     pub time_in_force: TimeInForce,
     pub tag: String,
     pub properties: OrderProperties,
+    #[serde(default)]
+    pub order_submission_data: Option<OrderSubmissionData>,
     // For limit/stop orders
     pub limit_price: Option<Price>,
     pub stop_price: Option<Price>,
@@ -128,6 +130,25 @@ pub struct Order {
 pub struct OrderProperties {
     pub exchange: Option<String>,
     pub time_in_force: Option<TimeInForce>,
+    pub outside_regular_trading_hours: bool,
+    pub post_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OrderSubmissionData {
+    pub bid_price: Price,
+    pub ask_price: Price,
+    pub last_price: Price,
+}
+
+impl OrderSubmissionData {
+    pub fn new(bid_price: Price, ask_price: Price, last_price: Price) -> Self {
+        Self {
+            bid_price,
+            ask_price,
+            last_price,
+        }
+    }
 }
 
 impl Order {
@@ -152,6 +173,7 @@ impl Order {
             time_in_force: TimeInForce::GoodTilCanceled,
             tag: tag.to_string(),
             properties: Default::default(),
+            order_submission_data: None,
             limit_price: None,
             stop_price: None,
             trailing_amount: None,
@@ -206,6 +228,30 @@ impl Order {
 
     pub fn direction(&self) -> OrderDirection {
         OrderDirection::from_quantity(self.quantity)
+    }
+
+    /// Mirrors LEAN's `Order.IsMarketable` for limit orders. Without
+    /// submission bid/ask data, a limit order is treated as non-marketable.
+    pub fn is_marketable(&self) -> bool {
+        if self.order_type != OrderType::Limit {
+            return false;
+        }
+        let Some(limit_price) = self.limit_price else {
+            return false;
+        };
+        let Some(submission) = self.order_submission_data else {
+            return false;
+        };
+
+        match self.direction() {
+            OrderDirection::Buy => {
+                submission.ask_price > dec!(0) && limit_price >= submission.ask_price
+            }
+            OrderDirection::Sell => {
+                submission.bid_price > dec!(0) && limit_price <= submission.bid_price
+            }
+            OrderDirection::Hold => false,
+        }
     }
 
     pub fn abs_quantity(&self) -> Quantity {

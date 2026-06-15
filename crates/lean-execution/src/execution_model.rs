@@ -1,4 +1,4 @@
-use lean_core::Symbol;
+use lean_core::{DateTime, Symbol};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -17,6 +17,8 @@ pub struct OrderRequest {
     pub quantity: Decimal,
     pub order_type: ExecutionOrderType,
     pub limit_price: Option<Decimal>,
+    pub post_only: bool,
+    pub cancel_open_orders: bool,
     pub tag: String,
 }
 
@@ -26,6 +28,7 @@ pub enum ExecutionOrderType {
     Limit,
     MarketOnOpen,
     MarketOnClose,
+    Cancel,
 }
 
 /// Current security data needed by execution models
@@ -35,9 +38,14 @@ pub struct SecurityData {
     pub price: Decimal,
     pub bid: Option<Decimal>,
     pub ask: Option<Decimal>,
+    /// Current trade volume used by Lean's percent-volume order sizing.
     pub volume: Option<Decimal>,
+    /// Average trade price for the current VWAP input, if trade data is present.
+    pub vwap_price: Option<Decimal>,
     pub average_volume: Option<Decimal>,
     pub daily_std_dev: Option<Decimal>,
+    pub end_time: Option<DateTime>,
+    pub lot_size: Decimal,
     pub current_quantity: Decimal, // currently held
     pub open_order_quantity: Decimal,
 }

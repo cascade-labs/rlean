@@ -16,15 +16,23 @@
 ///   rlean create-project my_strategy
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
+use lean_algorithm::qc_algorithm::BrokerageName;
 use lean_data::IHistoricalDataProvider;
 use lean_data_providers::IHistoryProvider;
 
@@ -89,8 +97,8 @@ enum Command {
     /// Run a backtest
     Backtest(RunArgs),
 
-    /// Run live trading
-    Live(RunArgs),
+    /// Run live trading or inspect local live deployments
+    Live(LiveArgs),
 
     /// Launch an interactive research session for a project (opens research.ipynb)
     Research(ResearchArgs),
@@ -120,9 +128,14 @@ struct RunArgs {
     #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
     data_provider_historical: Option<String>,
 
-    /// Live data provider (polygon | thetadata) — live trading only
+    /// Live data provider plugin(s), comma-separated for stacked live feeds
     #[arg(long, env = "RLEAN_DATA_PROVIDER_LIVE")]
     data_provider_live: Option<String>,
+
+    /// Brokerage for live runs. Use "paper" for simulated fills, or a real
+    /// brokerage plugin name such as "tradier" or "hyperliquid" for live orders.
+    #[arg(long, env = "RLEAN_BROKERAGE")]
+    brokerage: Option<String>,
 
     // ── Date range override ───────────────────────────────────────────────────
     /// Override the strategy start date (YYYY-MM-DD)
@@ -155,10 +168,146 @@ struct RunArgs {
     #[arg(long)]
     report: Option<PathBuf>,
 
+    /// Stop a live run after N slices. Useful for smoke tests.
+    #[arg(long, hide = true)]
+    live_max_slices: Option<usize>,
+
+    /// Stop a live run after this many wall-clock seconds. Useful for paper soaks.
+    #[arg(long, hide = true)]
+    live_max_runtime_seconds: Option<u64>,
+
     // ── Logging ───────────────────────────────────────────────────────────────
     /// Enable debug logging for rlean crates
     #[arg(long, short = 'v')]
     verbose: bool,
+}
+
+#[derive(clap::Args, Clone)]
+struct LiveArgs {
+    #[command(subcommand)]
+    command: Option<LiveSubcommand>,
+
+    /// Path to the strategy file (.py) or project directory containing main.py
+    strategy: Option<PathBuf>,
+
+    /// Parquet data root directory
+    #[arg(long, default_value = "data", env = "RLEAN_DATA")]
+    data: PathBuf,
+
+    /// Comma-separated provider priority list (e.g. thetadata,polygon)
+    #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
+    data_provider_historical: Option<String>,
+
+    /// Live data provider plugin(s), comma-separated for stacked live feeds
+    #[arg(long, env = "RLEAN_DATA_PROVIDER_LIVE")]
+    data_provider_live: Option<String>,
+
+    /// Brokerage for live runs. Use "paper" for simulated fills, or a real
+    /// brokerage plugin name such as "tradier" or "hyperliquid" for live orders.
+    #[arg(long, env = "RLEAN_BROKERAGE")]
+    brokerage: Option<String>,
+
+    /// Override the strategy start date (YYYY-MM-DD)
+    #[arg(long)]
+    start_date: Option<String>,
+
+    /// Override the strategy end date (YYYY-MM-DD)
+    #[arg(long)]
+    end_date: Option<String>,
+
+    /// Algorithm parameter as KEY=VALUE for LEAN-style GetParameter access.
+    #[arg(long = "parameter", short = 'p', value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    parameters: Vec<String>,
+
+    /// Polygon/Massive requests/second (default: 5)
+    #[arg(long, default_value_t = 5.0)]
+    polygon_rate: f64,
+
+    /// ThetaData requests/second (default: 4)
+    #[arg(long, default_value_t = 4.0)]
+    thetadata_rate: f64,
+
+    /// ThetaData max concurrent requests (default: 4)
+    #[arg(long, default_value_t = 4)]
+    thetadata_concurrent: usize,
+
+    /// Override the live deployment directory.
+    #[arg(long, hide = true)]
+    live_deploy_dir: Option<PathBuf>,
+
+    /// Run live trading in the foreground instead of creating a detached deployment.
+    #[arg(long, hide = true)]
+    foreground: bool,
+
+    /// Stop a live run after N slices. Useful for smoke tests.
+    #[arg(long, hide = true)]
+    live_max_slices: Option<usize>,
+
+    /// Stop a live run after this many wall-clock seconds. Useful for paper soaks.
+    #[arg(long, hide = true)]
+    live_max_runtime_seconds: Option<u64>,
+
+    /// Enable debug logging for rlean crates
+    #[arg(long, short = 'v')]
+    verbose: bool,
+}
+
+#[derive(Subcommand, Clone)]
+enum LiveSubcommand {
+    /// List local live deployments
+    List {
+        /// Filter by deployment status
+        #[arg(long, value_enum)]
+        status: Option<LiveStatusFilter>,
+    },
+    /// Show one local live deployment status
+    Status { deploy_id: String },
+    /// Print the latest portfolio snapshot for a live deployment
+    Portfolio { deploy_id: String },
+    /// Print the latest orders snapshot for a live deployment
+    Orders { deploy_id: String },
+    /// Print live deployment logs
+    Logs {
+        deploy_id: String,
+        /// Number of trailing log lines to print
+        #[arg(long, default_value_t = 250)]
+        lines: usize,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum LiveStatusFilter {
+    Running,
+    Stopped,
+    RuntimeError,
+    Liquidated,
+}
+
+impl LiveArgs {
+    fn to_run_args(&self) -> Result<RunArgs> {
+        let strategy = self
+            .strategy
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing strategy path"))?;
+        Ok(RunArgs {
+            strategy,
+            data: self.data.clone(),
+            data_provider_historical: self.data_provider_historical.clone(),
+            data_provider_live: self.data_provider_live.clone(),
+            brokerage: self.brokerage.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+            parameters: self.parameters.clone(),
+            polygon_rate: self.polygon_rate,
+            thetadata_rate: self.thetadata_rate,
+            thetadata_concurrent: self.thetadata_concurrent,
+            report: None,
+            live_max_slices: self.live_max_slices,
+            live_max_runtime_seconds: self.live_max_runtime_seconds,
+            verbose: self.verbose,
+        })
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -168,7 +317,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let verbose = match &cli.command {
-        Command::Backtest(args) | Command::Live(args) => args.verbose,
+        Command::Backtest(args) => args.verbose,
+        Command::Live(args) => args.verbose,
         _ => false,
     };
 
@@ -213,6 +363,42 @@ fn parse_algorithm_parameters(raw: &[String]) -> Result<HashMap<String, String>>
         parameters.insert(key.to_string(), value.to_string());
     }
     Ok(parameters)
+}
+
+fn parse_algorithm_parameters_for_strategy(
+    strategy: &Path,
+    raw: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut parameters = project_config_parameters(strategy)?;
+    parameters.extend(parse_algorithm_parameters(raw)?);
+    Ok(parameters)
+}
+
+fn project_config_parameters(strategy: &Path) -> Result<HashMap<String, String>> {
+    let project_dir = strategy.parent().unwrap_or_else(|| Path::new("."));
+    let path = project_dir.join("config.json");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let config = config::ProjectConfig::load(project_dir)?;
+    config
+        .parameters
+        .into_iter()
+        .map(|(key, value)| Ok((key, project_parameter_value_to_string(value)?)))
+        .collect()
+}
+
+fn project_parameter_value_to_string(value: serde_json::Value) -> Result<String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Null => bail!("project config parameter values cannot be null"),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            bail!("project config parameter values must be strings, numbers, or booleans")
+        }
+    }
 }
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
@@ -287,7 +473,7 @@ async fn run_python_backtest(
     };
     let start_date_override = args.start_date.as_deref().map(parse_date).transpose()?;
     let end_date_override = args.end_date.as_deref().map(parse_date).transpose()?;
-    let parameters = parse_algorithm_parameters(&args.parameters)?;
+    let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 
     // Each backtest creates a LEAN-compatible output directory:
     //   <project>/backtests/YYYY-MM-DD_<strategy-name>/
@@ -424,8 +610,756 @@ fn run_rust_plugin_backtest(args: RunArgs) -> Result<()> {
 
 // ── Live ──────────────────────────────────────────────────────────────────────
 
-async fn run_live(_args: RunArgs) -> Result<()> {
-    bail!("Live trading not yet implemented. Coming soon.")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveDeploymentMetadata {
+    deploy_id: String,
+    strategy: PathBuf,
+    strategy_name: String,
+    deployment_dir: PathBuf,
+    pid: Option<u32>,
+    status: String,
+    launched: String,
+    stopped: Option<String>,
+    updated_at: String,
+    brokerage: Option<String>,
+    data_provider_live: Option<String>,
+    data_provider_historical: Option<String>,
+    data: PathBuf,
+    paper_trading: bool,
+    command: Vec<String>,
+    error: Option<String>,
+    exit_code: Option<i32>,
+}
+
+async fn run_live(args: LiveArgs) -> Result<()> {
+    if let Some(command) = args.command.clone() {
+        return run_live_control(command);
+    }
+
+    if args.foreground {
+        if let Some(dir) = args.live_deploy_dir.as_ref() {
+            update_live_deployment_status(dir, "running", None, None, Some(std::process::id()));
+        }
+        let deploy_dir = args.live_deploy_dir.clone();
+        let result = run_live_foreground(args).await;
+        if let Some(dir) = deploy_dir.as_ref() {
+            match &result {
+                Ok(()) => update_live_deployment_status(dir, "stopped", None, Some(0), None),
+                Err(error) => update_live_deployment_status(
+                    dir,
+                    "runtime-error",
+                    Some(error.to_string()),
+                    Some(1),
+                    None,
+                ),
+            }
+        }
+        return result;
+    }
+
+    launch_live_detached(args)
+}
+
+async fn run_live_foreground(args: LiveArgs) -> Result<()> {
+    let deploy_dir = args.live_deploy_dir.clone();
+    let mut args = args.to_run_args()?;
+    args.strategy = resolve_strategy_file(args.strategy)?;
+    if let Ok(canonical) = std::fs::canonicalize(&args.strategy) {
+        args.strategy = canonical;
+    }
+    if args.strategy.is_dir() {
+        args.strategy = resolve_strategy_file(args.strategy)?;
+    }
+
+    validate_strategy_path(&args.strategy)?;
+
+    if args.data == std::path::Path::new("data") {
+        if let Some(folder) = config::configured_data_folder(&args.strategy)? {
+            args.data = folder;
+        }
+    }
+    tracing::info!("Data folder: {}", args.data.display());
+
+    let live_provider_names = args
+        .data_provider_live
+        .as_deref()
+        .or(args.data_provider_historical.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "live trading requires --data-provider-live, for example --data-provider-live tradier"
+            )
+        })?;
+    let requested_brokerage = args
+        .brokerage
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "live mode requires --brokerage paper or a live brokerage plugin, for example --brokerage tradier"
+            )
+        })?;
+    let paper_trading = is_paper_brokerage_name(requested_brokerage);
+
+    ensure_python_baseline_packages()?;
+    use lean_python::AlgorithmImports;
+    pyo3::append_to_inittab!(AlgorithmImports);
+    pyo3::Python::initialize();
+
+    let provider_args = providers::ProviderArgs {
+        data_root: args.data.clone(),
+        polygon_rate: args.polygon_rate,
+        thetadata_rate: args.thetadata_rate,
+        thetadata_concurrent: args.thetadata_concurrent,
+    };
+    let live_data_queue =
+        providers::build_live_data_queue(live_provider_names, provider_args.clone())?;
+    let brokerage = if paper_trading {
+        None
+    } else {
+        Some(providers::load_brokerage_plugin(
+            requested_brokerage,
+            &provider_args,
+        )?)
+    };
+    let brokerage_name = if paper_trading {
+        Some("Paper".to_string())
+    } else {
+        brokerage
+            .as_ref()
+            .map(|brokerage| brokerage.name().to_string())
+    };
+    let brokerage_model = live_brokerage_model_for_name(requested_brokerage);
+
+    let (_, history_provider) = build_providers(&args)?;
+    let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
+    let custom_data_sources = crate::providers::load_custom_data_plugins(&args.data);
+
+    let ext = args
+        .strategy
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext != "py" {
+        bail!("Live trading currently supports Python strategies only");
+    }
+
+    let result = lean_python::runner::run_live_strategy(
+        &args.strategy,
+        lean_python::runner::LiveRunConfig {
+            data_root: args.data.clone(),
+            history_provider,
+            parameters,
+            custom_data_sources,
+            live_data_queue,
+            brokerage,
+            brokerage_model,
+            paper_trading,
+            max_slices: args.live_max_slices,
+            max_runtime: args.live_max_runtime_seconds.map(Duration::from_secs),
+            output_dir: deploy_dir,
+        },
+    )
+    .await?;
+
+    if let Some(brokerage_name) = brokerage_name {
+        let mode = if paper_trading {
+            "paper-fill"
+        } else {
+            "live-order"
+        };
+        println!(
+            "Live brokerage {} run stopped: brokerage={} slices={} final_value=${:.2} order_events={} started_at={} stopped_at={}",
+            mode,
+            brokerage_name,
+            result.slices_processed,
+            result.final_value,
+            result.order_events.len(),
+            result.started_at.to_rfc3339(),
+            result.stopped_at.to_rfc3339()
+        );
+    } else {
+        println!(
+            "Live paper run stopped: slices={} final_value=${:.2} order_events={} started_at={} stopped_at={}",
+            result.slices_processed,
+            result.final_value,
+            result.order_events.len(),
+            result.started_at.to_rfc3339(),
+            result.stopped_at.to_rfc3339()
+        );
+    }
+    Ok(())
+}
+
+fn live_brokerage_model_for_name(name: &str) -> Option<BrokerageName> {
+    let normalized = normalized_brokerage_name(name);
+    match normalized.as_str() {
+        "tradier" | "tradierbrokerage" => Some(BrokerageName::TradierBrokerage),
+        "hyperliquid" | "hyperliquidbrokerage" => Some(BrokerageName::HyperliquidBrokerage),
+        "interactivebrokers" | "interactivebrokersbrokerage" | "ib" | "ibkr" => {
+            Some(BrokerageName::InteractiveBrokersBrokerage)
+        }
+        "quantconnect" | "quantconnectbrokerage" => Some(BrokerageName::QuantConnectBrokerage),
+        "default" | "paper" | "paperbrokerage" => Some(BrokerageName::Default),
+        _ => None,
+    }
+}
+
+fn is_paper_brokerage_name(name: &str) -> bool {
+    matches!(
+        normalized_brokerage_name(name).as_str(),
+        "paper" | "paperbrokerage"
+    )
+}
+
+fn normalized_brokerage_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "")
+}
+
+fn launch_live_detached(args: LiveArgs) -> Result<()> {
+    let mut run_args = args.to_run_args()?;
+    run_args.strategy = resolve_strategy_file(run_args.strategy)?;
+    if let Ok(canonical) = std::fs::canonicalize(&run_args.strategy) {
+        run_args.strategy = canonical;
+    }
+    validate_strategy_path(&run_args.strategy)?;
+
+    if run_args.data == std::path::Path::new("data") {
+        if let Some(folder) = config::configured_data_folder(&run_args.strategy)? {
+            run_args.data = folder;
+        }
+    }
+    if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
+        run_args.data = canonical;
+    }
+    let requested_brokerage = run_args
+        .brokerage
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "live mode requires --brokerage paper or a live brokerage plugin, for example --brokerage tradier"
+            )
+        })?;
+    let paper_trading = is_paper_brokerage_name(requested_brokerage);
+
+    let strategy_name = strategy_name_from_path(&run_args.strategy);
+    let live_root = run_args
+        .strategy
+        .parent()
+        .map(|p| p.join("live"))
+        .unwrap_or_else(|| PathBuf::from("live"));
+    let deployment_dir = reserve_live_dir(&live_root, chrono::Utc::now(), &strategy_name)?;
+    snapshot_strategy_code(&run_args.strategy, &deployment_dir);
+
+    let deploy_id = deployment_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("deployment")
+        .to_string();
+    let exe = std::env::current_exe().context("failed to resolve current rlean executable")?;
+    let child_args = live_child_args(&run_args, &deployment_dir);
+    let command = std::iter::once(exe.to_string_lossy().to_string())
+        .chain(child_args.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let initial_metadata = LiveDeploymentMetadata {
+        deploy_id: deploy_id.clone(),
+        strategy: run_args.strategy.clone(),
+        strategy_name,
+        deployment_dir: deployment_dir.clone(),
+        pid: None,
+        status: "launching".to_string(),
+        launched: now.clone(),
+        stopped: None,
+        updated_at: now,
+        brokerage: run_args.brokerage.clone(),
+        data_provider_live: run_args.data_provider_live.clone(),
+        data_provider_historical: run_args.data_provider_historical.clone(),
+        data: run_args.data.clone(),
+        paper_trading,
+        command,
+        error: None,
+        exit_code: None,
+    };
+    write_live_deployment_metadata(&deployment_dir, &initial_metadata)?;
+
+    let log_path = deployment_dir.join("live.log");
+    let log_file = File::create(&log_path)
+        .with_context(|| format!("failed to create {}", log_path.display()))?;
+    let stderr_file = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let mut command = ProcessCommand::new(&exe);
+    command
+        .args(&child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file));
+    if let Some(strategy_dir) = run_args.strategy.parent() {
+        command.current_dir(strategy_dir);
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .context("failed to launch detached live deployment")?;
+
+    write_pid_file(&deployment_dir, child.id())?;
+    if let Ok(mut metadata) = read_live_deployment_metadata(&deployment_dir) {
+        if !is_terminal_live_status(&metadata.status) {
+            metadata.pid = Some(child.id());
+            metadata.status = "running".to_string();
+            metadata.updated_at = chrono::Utc::now().to_rfc3339();
+            write_live_deployment_metadata(&deployment_dir, &metadata)?;
+        }
+    }
+    register_live_deployment(&deployment_dir);
+
+    println!(
+        "Live deployment started: deploy_id={} pid={} dir={} log={}",
+        deploy_id,
+        child.id(),
+        deployment_dir.display(),
+        log_path.display()
+    );
+    Ok(())
+}
+
+fn run_live_control(command: LiveSubcommand) -> Result<()> {
+    match command {
+        LiveSubcommand::List { status } => list_live_deployments(status),
+        LiveSubcommand::Status { deploy_id } => {
+            let dir = find_live_deployment_dir(&deploy_id)?;
+            let metadata = read_live_deployment_metadata(&dir)?;
+            let effective_status = effective_live_status(&metadata);
+            let process_alive = metadata.pid.map(process_is_alive).unwrap_or(false);
+            let payload = serde_json::json!({
+                "deploy_id": metadata.deploy_id,
+                "status": effective_status,
+                "recorded_status": metadata.status,
+                "process_alive": process_alive,
+                "pid": metadata.pid,
+                "strategy": metadata.strategy,
+                "strategy_name": metadata.strategy_name,
+                "deployment_dir": metadata.deployment_dir,
+                "launched": metadata.launched,
+                "stopped": metadata.stopped,
+                "updated_at": metadata.updated_at,
+                "brokerage": metadata.brokerage,
+                "data_provider_live": metadata.data_provider_live,
+                "data_provider_historical": metadata.data_provider_historical,
+                "data": metadata.data,
+                "paper_trading": metadata.paper_trading,
+                "error": metadata.error,
+                "exit_code": metadata.exit_code,
+                "files": {
+                    "pid": dir.join("pid"),
+                    "log": dir.join("live.log"),
+                    "portfolio": dir.join("portfolio.json"),
+                    "orders": dir.join("orders.json"),
+                    "order_events": dir.join("order-events.jsonl"),
+                    "trades": dir.join("trades.jsonl"),
+                    "progress": dir.join("progress.json"),
+                    "deployment": dir.join("deployment.json")
+                }
+            });
+            print_json_value(&payload)
+        }
+        LiveSubcommand::Portfolio { deploy_id } => {
+            let dir = find_live_deployment_dir(&deploy_id)?;
+            print_json_file(&dir.join("portfolio.json"))
+        }
+        LiveSubcommand::Orders { deploy_id } => {
+            let dir = find_live_deployment_dir(&deploy_id)?;
+            print_json_file(&dir.join("orders.json"))
+        }
+        LiveSubcommand::Logs { deploy_id, lines } => {
+            let dir = find_live_deployment_dir(&deploy_id)?;
+            print_tail(&dir.join("live.log"), lines)
+        }
+    }
+}
+
+fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> {
+    let mut rows = discover_live_deployments()
+        .into_iter()
+        .filter_map(|dir| {
+            read_live_deployment_metadata(&dir)
+                .ok()
+                .map(|metadata| (dir, metadata))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|(_, a), (_, b)| b.launched.cmp(&a.launched));
+
+    let filter = status_filter.map(|status| status.as_str().to_string());
+    println!(
+        "{:<36} {:<14} {:<8} {:<24} {:<16} {}",
+        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE", "STRATEGY"
+    );
+    for (_, metadata) in rows {
+        let status = effective_live_status(&metadata);
+        if filter.as_ref().is_some_and(|wanted| wanted != &status) {
+            continue;
+        }
+        println!(
+            "{:<36} {:<14} {:<8} {:<24} {:<16} {}",
+            metadata.deploy_id,
+            status,
+            metadata
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            metadata.launched,
+            metadata.brokerage.as_deref().unwrap_or("Paper"),
+            metadata.strategy.display()
+        );
+    }
+    Ok(())
+}
+
+impl LiveStatusFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            LiveStatusFilter::Running => "running",
+            LiveStatusFilter::Stopped => "stopped",
+            LiveStatusFilter::RuntimeError => "runtime-error",
+            LiveStatusFilter::Liquidated => "liquidated",
+        }
+    }
+}
+
+fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
+    let mut values = vec![
+        "live".to_string(),
+        "--foreground".to_string(),
+        "--live-deploy-dir".to_string(),
+        deployment_dir.to_string_lossy().to_string(),
+        args.strategy.to_string_lossy().to_string(),
+        "--data".to_string(),
+        args.data.to_string_lossy().to_string(),
+    ];
+
+    if let Some(value) = &args.data_provider_historical {
+        values.extend(["--data-provider-historical".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.data_provider_live {
+        values.extend(["--data-provider-live".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.brokerage {
+        values.extend(["--brokerage".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.start_date {
+        values.extend(["--start-date".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.end_date {
+        values.extend(["--end-date".to_string(), value.clone()]);
+    }
+    for parameter in &args.parameters {
+        values.extend(["--parameter".to_string(), parameter.clone()]);
+    }
+    values.extend(["--polygon-rate".to_string(), args.polygon_rate.to_string()]);
+    values.extend([
+        "--thetadata-rate".to_string(),
+        args.thetadata_rate.to_string(),
+    ]);
+    values.extend([
+        "--thetadata-concurrent".to_string(),
+        args.thetadata_concurrent.to_string(),
+    ]);
+    if let Some(value) = args.live_max_slices {
+        values.extend(["--live-max-slices".to_string(), value.to_string()]);
+    }
+    if let Some(value) = args.live_max_runtime_seconds {
+        values.extend(["--live-max-runtime-seconds".to_string(), value.to_string()]);
+    }
+    if args.verbose {
+        values.push("--verbose".to_string());
+    }
+    values
+}
+
+fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {
+    if path.is_dir() {
+        let candidate = path.join("main.py");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        bail!(
+            "'{}' is a directory but contains no main.py. \
+             Pass the strategy file directly or run `rlean create-project` to scaffold one.",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn live_dir_name(datetime: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
+    backtest_dir_name(datetime, strategy_name)
+}
+
+fn reserve_live_dir(
+    live_root: &Path,
+    datetime: chrono::DateTime<chrono::Utc>,
+    strategy_name: &str,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(live_root)?;
+    let base = live_dir_name(datetime, strategy_name);
+    for attempt in 0..1000 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{}", attempt + 1)
+        };
+        let candidate = live_root.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!(
+        "could not reserve unique live directory under {} for {}",
+        live_root.display(),
+        base
+    )
+}
+
+fn snapshot_strategy_code(strategy: &Path, deployment_dir: &Path) {
+    let code_dir = deployment_dir.join("code");
+    if std::fs::create_dir_all(&code_dir).is_err() {
+        return;
+    }
+    let dest = code_dir.join(
+        strategy
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("main.py")),
+    );
+    let _ = std::fs::copy(strategy, dest);
+}
+
+fn deployment_metadata_path(dir: &Path) -> PathBuf {
+    dir.join("deployment.json")
+}
+
+fn write_live_deployment_metadata(dir: &Path, metadata: &LiveDeploymentMetadata) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = deployment_metadata_path(dir);
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(metadata)?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn read_live_deployment_metadata(dir: &Path) -> Result<LiveDeploymentMetadata> {
+    let path = deployment_metadata_path(dir);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_pid_file(dir: &Path, pid: u32) -> Result<()> {
+    std::fs::write(dir.join("pid"), format!("{pid}\n"))?;
+    Ok(())
+}
+
+fn update_live_deployment_status(
+    dir: &Path,
+    status: &str,
+    error: Option<String>,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+) {
+    let Ok(mut metadata) = read_live_deployment_metadata(dir) else {
+        return;
+    };
+    metadata.status = status.to_string();
+    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    if let Some(error) = error {
+        metadata.error = Some(error);
+    }
+    if let Some(exit_code) = exit_code {
+        metadata.exit_code = Some(exit_code);
+    }
+    if let Some(pid) = pid {
+        metadata.pid = Some(pid);
+        let _ = write_pid_file(dir, pid);
+    }
+    if is_terminal_live_status(status) {
+        metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
+    }
+    let _ = write_live_deployment_metadata(dir, &metadata);
+}
+
+fn is_terminal_live_status(status: &str) -> bool {
+    matches!(status, "stopped" | "runtime-error" | "liquidated")
+}
+
+fn effective_live_status(metadata: &LiveDeploymentMetadata) -> String {
+    if matches!(metadata.status.as_str(), "running" | "launching") {
+        if let Some(pid) = metadata.pid {
+            if process_is_alive(pid) {
+                return "running".to_string();
+            }
+            return "stopped".to_string();
+        }
+    }
+    metadata.status.clone()
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        return error.raw_os_error() == Some(libc::EPERM);
+    }
+    #[cfg(not(unix))]
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn register_live_deployment(dir: &Path) {
+    let Some(path) = live_registry_path() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")));
+    let mut dirs = read_live_registry();
+    dirs.insert(dir.to_path_buf());
+    if let Ok(json) = serde_json::to_string_pretty(
+        &dirs
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+    ) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn read_live_registry() -> BTreeSet<PathBuf> {
+    let Some(path) = live_registry_path() else {
+        return BTreeSet::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn live_registry_path() -> Option<PathBuf> {
+    let home = std::env::var_os("RLEAN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rlean")))?;
+    Some(home.join("live").join("registry.json"))
+}
+
+fn discover_live_deployments() -> Vec<PathBuf> {
+    let mut dirs = read_live_registry();
+    if let Ok(current_dir) = std::env::current_dir() {
+        collect_live_deployments_under(&current_dir, &mut dirs);
+        if let Ok(entries) = std::fs::read_dir(&current_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_live_deployments_under(&path, &mut dirs);
+                }
+            }
+        }
+    }
+    dirs.into_iter()
+        .filter(|dir| deployment_metadata_path(dir).exists())
+        .collect()
+}
+
+fn collect_live_deployments_under(root: &Path, dirs: &mut BTreeSet<PathBuf>) {
+    let live_root = root.join("live");
+    let Ok(entries) = std::fs::read_dir(live_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if deployment_metadata_path(&path).exists() {
+            dirs.insert(path);
+        }
+    }
+}
+
+fn find_live_deployment_dir(deploy_id: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(deploy_id);
+    if deployment_metadata_path(&path).exists() {
+        return Ok(path);
+    }
+    for dir in discover_live_deployments() {
+        if dir.file_name().and_then(|name| name.to_str()) == Some(deploy_id) {
+            return Ok(dir);
+        }
+        if let Ok(metadata) = read_live_deployment_metadata(&dir) {
+            if metadata.deploy_id == deploy_id {
+                return Ok(dir);
+            }
+        }
+    }
+    bail!("live deployment not found: {deploy_id}")
+}
+
+fn print_json_file(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => print_json_value(&value),
+        Err(_) => {
+            print!("{text}");
+            Ok(())
+        }
+    }
+}
+
+fn print_json_value(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn print_tail(path: &Path, lines: usize) -> Result<()> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    if lines == 0 {
+        return Ok(());
+    }
+    let all_lines = text.lines().collect::<Vec<_>>();
+    let start = all_lines.len().saturating_sub(lines);
+    for line in &all_lines[start..] {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -729,6 +1663,42 @@ mod tests {
         assert_eq!(strategy_name_from_path(p), "my_strategy");
     }
 
+    #[test]
+    fn test_project_config_parameters_are_loaded_and_cli_overrides() {
+        let root =
+            std::env::temp_dir().join(format!("rlean-project-params-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.py"), "").unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{
+  "algorithm-language": "python",
+  "parameters": {
+    "max_holds": "30",
+    "enabled": true,
+    "threshold": 2.5
+  },
+  "description": "",
+  "local-id": 123
+}"#,
+        )
+        .unwrap();
+
+        let parameters = parse_algorithm_parameters_for_strategy(
+            &root.join("main.py"),
+            &["max_holds=12".to_string(), "extra=value".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(parameters.get("max_holds").map(String::as_str), Some("12"));
+        assert_eq!(parameters.get("enabled").map(String::as_str), Some("true"));
+        assert_eq!(parameters.get("threshold").map(String::as_str), Some("2.5"));
+        assert_eq!(parameters.get("extra").map(String::as_str), Some("value"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── backtest_dir_name ──────────────────────────────────────────────────────
 
     #[test]
@@ -780,5 +1750,174 @@ mod tests {
         assert!(second.is_dir());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_live_cli_strategy_launch_parse() {
+        let cli = Cli::try_parse_from([
+            "rlean",
+            "live",
+            "main.py",
+            "--data",
+            "/data",
+            "--data-provider-live",
+            "hyperliquid",
+            "--brokerage",
+            "hyperliquid",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Live(args) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
+                assert_eq!(args.data, PathBuf::from("/data"));
+                assert_eq!(args.data_provider_live.as_deref(), Some("hyperliquid"));
+                assert_eq!(args.brokerage.as_deref(), Some("hyperliquid"));
+            }
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_rejects_removed_live_trading_flag() {
+        assert!(Cli::try_parse_from([
+            "rlean",
+            "live",
+            "main.py",
+            "--data-provider-live",
+            "tradier",
+            "--brokerage",
+            "tradier",
+            "--live-trading",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_live_cli_list_parse() {
+        let cli =
+            Cli::try_parse_from(["rlean", "live", "list", "--status", "runtime-error"]).unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::List { status }) => {
+                    assert_eq!(status, Some(LiveStatusFilter::RuntimeError));
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live list command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_foreground_child_parse() {
+        let cli = Cli::try_parse_from([
+            "rlean",
+            "live",
+            "--foreground",
+            "--live-deploy-dir",
+            "/tmp/deploy",
+            "/tmp/strategy/main.py",
+            "--data",
+            "/tmp/data",
+            "--data-provider-live",
+            "hyperliquid",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Live(args) => {
+                assert!(args.foreground);
+                assert_eq!(args.live_deploy_dir, Some(PathBuf::from("/tmp/deploy")));
+                assert_eq!(
+                    args.strategy.as_deref(),
+                    Some(Path::new("/tmp/strategy/main.py"))
+                );
+                assert_eq!(args.data, PathBuf::from("/tmp/data"));
+                assert_eq!(args.data_provider_live.as_deref(), Some("hyperliquid"));
+            }
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_reserve_live_dir_adds_suffix_on_collision() {
+        use chrono::{TimeZone, Utc};
+        let root = std::env::temp_dir().join(format!("rlean-live-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dt = Utc.with_ymd_and_hms(2026, 6, 13, 14, 30, 0).unwrap();
+
+        let first = reserve_live_dir(&root, dt, "strategy").unwrap();
+        let second = reserve_live_dir(&root, dt, "strategy").unwrap();
+
+        assert_eq!(
+            first.file_name().and_then(|n| n.to_str()),
+            Some("2026-06-13_143000_strategy")
+        );
+        assert_eq!(
+            second.file_name().and_then(|n| n.to_str()),
+            Some("2026-06-13_143000_strategy_2")
+        );
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_live_child_args_include_foreground_and_deploy_dir() {
+        let args = RunArgs {
+            strategy: PathBuf::from("/tmp/strategy/main.py"),
+            data: PathBuf::from("/tmp/data"),
+            data_provider_historical: Some("hyperliquid".to_string()),
+            data_provider_live: Some("hyperliquid".to_string()),
+            brokerage: Some("hyperliquid".to_string()),
+            start_date: None,
+            end_date: None,
+            parameters: vec!["foo=bar".to_string()],
+            polygon_rate: 5.0,
+            thetadata_rate: 4.0,
+            thetadata_concurrent: 4,
+            report: None,
+            live_max_slices: Some(2),
+            live_max_runtime_seconds: Some(10),
+            verbose: true,
+        };
+        let child_args = live_child_args(&args, Path::new("/tmp/strategy/live/deploy"));
+
+        assert_eq!(child_args[0], "live");
+        assert!(child_args.contains(&"--foreground".to_string()));
+        assert!(child_args.contains(&"--live-deploy-dir".to_string()));
+        assert!(!child_args.contains(&"--live-trading".to_string()));
+        assert!(child_args.contains(&"/tmp/strategy/live/deploy".to_string()));
+        assert!(child_args.contains(&"--parameter".to_string()));
+        assert!(child_args.contains(&"foo=bar".to_string()));
+        assert!(child_args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn test_live_brokerage_model_name_mapping() {
+        assert_eq!(
+            live_brokerage_model_for_name("tradier"),
+            Some(BrokerageName::TradierBrokerage)
+        );
+        assert_eq!(
+            live_brokerage_model_for_name("Tradier-Brokerage"),
+            Some(BrokerageName::TradierBrokerage)
+        );
+        assert_eq!(
+            live_brokerage_model_for_name("hyperliquid"),
+            Some(BrokerageName::HyperliquidBrokerage)
+        );
+        assert_eq!(
+            live_brokerage_model_for_name("PaperBrokerage"),
+            Some(BrokerageName::Default)
+        );
+        assert!(is_paper_brokerage_name("paper"));
+        assert!(is_paper_brokerage_name("PaperBrokerage"));
+        assert!(!is_paper_brokerage_name("tradier"));
+        assert_eq!(live_brokerage_model_for_name("custom"), None);
     }
 }

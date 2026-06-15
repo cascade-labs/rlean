@@ -34,7 +34,7 @@ pub struct WriterConfig {
     pub compression_level: i32,
     /// Row group size in rows. Default 8k to make SID predicates skip chunks.
     pub row_group_size: usize,
-    /// Write statistics (min/max per column) for predicate pushdown.
+    /// Write row-group statistics (min/max per column) for predicate pushdown.
     pub write_statistics: bool,
     /// Write bloom filters for high-cardinality columns.
     pub bloom_filter: bool,
@@ -47,7 +47,7 @@ impl Default for WriterConfig {
             compression_level: 1,
             row_group_size: 8_192,
             write_statistics: true,
-            bloom_filter: true,
+            bloom_filter: false,
         }
     }
 }
@@ -77,7 +77,7 @@ impl ParquetWriter {
             .set_compression(compression)
             .set_max_row_group_size(self.config.row_group_size)
             .set_statistics_enabled(if self.config.write_statistics {
-                parquet::file::properties::EnabledStatistics::Page
+                parquet::file::properties::EnabledStatistics::Chunk
             } else {
                 parquet::file::properties::EnabledStatistics::None
             });
@@ -380,6 +380,41 @@ impl ParquetWriter {
         self.write_perpetual_contexts_atomic(&merged, path)
     }
 
+    /// Merge option universe rows into a daily all-underlying partition.
+    /// Existing rows for underlyings present in `rows` are replaced; all other
+    /// underlyings are preserved.
+    pub fn merge_option_universe_partition(
+        &self,
+        rows: &[OptionUniverseRow],
+        path: &Path,
+    ) -> LeanResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = self.lock_partition(path)?;
+        let replacement_underlyings: HashSet<String> = rows
+            .iter()
+            .map(|row| row.underlying.to_ascii_uppercase())
+            .collect();
+        let mut merged = if path.exists() {
+            crate::reader::ParquetReader::new()
+                .read_option_universe(&[path.to_path_buf()])?
+                .into_iter()
+                .filter(|row| {
+                    !replacement_underlyings.contains(&row.underlying.to_ascii_uppercase())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        merged.extend_from_slice(rows);
+        dedupe_option_universe_rows(&mut merged);
+        sort_option_universe_rows(&mut merged);
+        self.write_option_universe_atomic(&merged, path)
+    }
+
     /// Write option EOD bars to a parquet file at the given path.
     pub fn write_option_eod_bars(&self, rows: &[OptionEodBar], path: &Path) -> LeanResult<()> {
         if rows.is_empty() {
@@ -648,6 +683,17 @@ impl ParquetWriter {
         fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    fn write_option_universe_atomic(
+        &self,
+        rows: &[OptionUniverseRow],
+        path: &Path,
+    ) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_option_universe(rows, &tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 struct PartitionLock {
@@ -662,6 +708,51 @@ impl Drop for PartitionLock {
 
 fn temp_path(path: &Path) -> std::path::PathBuf {
     path.with_file_name(format!("data.parquet.tmp.{}", uuid::Uuid::new_v4()))
+}
+
+fn dedupe_option_universe_rows(rows: &mut Vec<OptionUniverseRow>) {
+    rows.sort_by(|a, b| {
+        (
+            a.underlying.as_str(),
+            a.symbol_value.as_str(),
+            a.expiration,
+            a.strike,
+            a.right.as_str(),
+        )
+            .cmp(&(
+                b.underlying.as_str(),
+                b.symbol_value.as_str(),
+                b.expiration,
+                b.strike,
+                b.right.as_str(),
+            ))
+    });
+    rows.dedup_by(|a, b| {
+        a.underlying.eq_ignore_ascii_case(&b.underlying)
+            && a.symbol_value == b.symbol_value
+            && a.expiration == b.expiration
+            && a.strike == b.strike
+            && a.right == b.right
+    });
+}
+
+fn sort_option_universe_rows(rows: &mut [OptionUniverseRow]) {
+    rows.sort_by(|a, b| {
+        (
+            a.underlying.as_str(),
+            a.expiration,
+            a.strike,
+            a.right.as_str(),
+            a.symbol_value.as_str(),
+        )
+            .cmp(&(
+                b.underlying.as_str(),
+                b.expiration,
+                b.strike,
+                b.right.as_str(),
+                b.symbol_value.as_str(),
+            ))
+    });
 }
 
 fn partition_has_all_trade_rows(path: &Path, bars: &[TradeBar]) -> LeanResult<bool> {

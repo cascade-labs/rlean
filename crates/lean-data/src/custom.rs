@@ -27,6 +27,9 @@ pub struct CustomDataQuery {
     pub numeric_min: HashMap<String, f64>,
     pub numeric_max: HashMap<String, f64>,
     /// Provider-specific settings not covered by the generic fields.
+    ///
+    /// The parquet reader also recognizes comma-separated `not_null` and
+    /// `required_columns` values here as opt-in non-null row filters.
     pub properties: HashMap<String, String>,
 }
 
@@ -160,6 +163,22 @@ pub struct CustomDataPoint {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+/// How a custom-data subscription is consumed by the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomDataSubscriptionRole {
+    /// Ordinary `add_data` subscription delivered to `Slice.custom_data`.
+    Data,
+    /// Universe-selection input consumed before `OnData`, like C# LEAN
+    /// `FuncUniverse<T>` data.
+    Universe,
+}
+
+impl Default for CustomDataSubscriptionRole {
+    fn default() -> Self {
+        Self::Data
+    }
+}
+
 /// Active custom data subscription for one ticker + source type.
 #[derive(Debug, Clone)]
 pub struct CustomDataSubscription {
@@ -167,4 +186,11 @@ pub struct CustomDataSubscription {
     pub ticker: String,
     pub config: CustomDataConfig,
     pub dynamic_query: CustomDataQuery,
+    pub role: CustomDataSubscriptionRole,
+}
+
+impl CustomDataSubscription {
+    pub fn is_universe(&self) -> bool {
+        self.role == CustomDataSubscriptionRole::Universe
+    }
 }

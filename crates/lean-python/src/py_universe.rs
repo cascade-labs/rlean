@@ -2,7 +2,7 @@ use crate::py_data::PyCustomDataPoint;
 use crate::py_types::{PyResolution, PySecurity, PySymbol};
 use lean_algorithm::algorithm::SecurityChanges;
 use lean_core::{Market, Resolution, SecurityType, Symbol};
-use lean_data::CustomDataPoint;
+use lean_data::{CustomDataPoint, LiveUniverseSubscriptionConfig};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 use std::collections::HashMap;
@@ -244,7 +244,9 @@ pub struct PyScheduledUniverse {
     trigger_resolution: Resolution,
     symbol_security_type: SecurityType,
     symbol_market: Market,
+    custom_source_type: Option<String>,
     custom_ticker: Option<String>,
+    custom_properties: HashMap<String, String>,
     last_custom_trigger: Option<i64>,
     selected: HashMap<u64, UniverseMember>,
 }
@@ -286,19 +288,23 @@ impl PyScheduledUniverse {
             trigger_resolution: resolution,
             symbol_security_type,
             symbol_market,
+            custom_source_type: None,
             custom_ticker: None,
+            custom_properties: HashMap::new(),
             last_custom_trigger: None,
             selected: HashMap::new(),
         }
     }
 
     pub fn custom_data(
+        source_type: String,
         ticker: String,
         selector: Py<PyAny>,
         resolution: Resolution,
         settings: UniverseSettingsState,
     ) -> Self {
         Self::custom_data_typed(
+            source_type,
             ticker,
             selector,
             resolution,
@@ -309,14 +315,14 @@ impl PyScheduledUniverse {
     }
 
     pub fn custom_data_typed(
+        source_type: String,
         ticker: String,
         selector: Py<PyAny>,
         resolution: Resolution,
-        mut settings: UniverseSettingsState,
+        settings: UniverseSettingsState,
         symbol_security_type: SecurityType,
         symbol_market: Market,
     ) -> Self {
-        settings.resolution = resolution;
         Self {
             date_rule: PyDateRule {
                 kind: DateRuleKind::EveryDay,
@@ -329,14 +335,30 @@ impl PyScheduledUniverse {
             trigger_resolution: resolution,
             symbol_security_type,
             symbol_market,
+            custom_source_type: Some(source_type),
             custom_ticker: Some(ticker.to_uppercase()),
+            custom_properties: HashMap::new(),
             last_custom_trigger: None,
             selected: HashMap::new(),
         }
     }
 
+    pub fn with_custom_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.custom_properties = properties;
+        self
+    }
+
     pub fn settings(&self) -> UniverseSettingsState {
         self.settings.clone()
+    }
+
+    pub fn live_universe_subscription(&self) -> Option<LiveUniverseSubscriptionConfig> {
+        Some(LiveUniverseSubscriptionConfig {
+            source_type: self.custom_source_type.as_ref()?.clone(),
+            ticker: self.custom_ticker.as_ref()?.clone(),
+            resolution: self.trigger_resolution,
+            properties: self.custom_properties.clone(),
+        })
     }
 
     pub fn should_trigger(&self, utc_ns: i64, resolution: Resolution) -> bool {
@@ -387,9 +409,6 @@ impl PyScheduledUniverse {
         else {
             return Ok(SecurityChanges::empty());
         };
-        if points.is_empty() {
-            return Ok(SecurityChanges::empty());
-        }
 
         let py_points = PyList::empty(py);
         for point in points {
@@ -468,7 +487,9 @@ impl PyScheduledUniverse {
             trigger_resolution: Resolution::Daily,
             symbol_security_type: SecurityType::Equity,
             symbol_market: Market::usa(),
+            custom_source_type: None,
             custom_ticker: None,
+            custom_properties: HashMap::new(),
             last_custom_trigger: None,
             selected: HashMap::new(),
         }
@@ -861,6 +882,7 @@ mod tests {
                 .unwrap()
                 .unbind();
             let mut universe = PyScheduledUniverse::custom_data_typed(
+                "hyperliquid".to_string(),
                 "HIP3_XYZ".to_string(),
                 selector,
                 Resolution::Hour,
@@ -891,6 +913,69 @@ mod tests {
                 .added
                 .iter()
                 .all(|symbol| symbol.market().as_str() == Market::HYPERLIQUID));
+        });
+    }
+
+    #[test]
+    fn custom_data_universe_uses_universe_settings_resolution_for_selected_symbols() {
+        crate::test_python::init();
+        Python::attach(|py| {
+            let selector = py
+                .eval(c"lambda rows: ['SPY']", None, None)
+                .unwrap()
+                .unbind();
+            let mut settings = UniverseSettingsState::default();
+            settings.resolution = Resolution::Minute;
+            let mut universe = PyScheduledUniverse::custom_data(
+                "fixture".to_string(),
+                "snapshot".to_string(),
+                selector,
+                Resolution::Daily,
+                settings,
+            );
+            let mut custom_data = HashMap::new();
+            custom_data.insert(
+                "SNAPSHOT".to_string(),
+                vec![CustomDataPoint {
+                    time: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    end_time: Some(lean_core::NanosecondTimestamp(dt_ns(2026, 1, 1, 0, 0))),
+                    value: rust_decimal::Decimal::ZERO,
+                    fields: HashMap::new(),
+                }],
+            );
+
+            let changes = universe
+                .select_custom_data(py, dt_ns(2026, 1, 1, 0, 0), Resolution::Daily, &custom_data)
+                .unwrap();
+
+            assert_eq!(changes.added.len(), 1);
+            assert_eq!(universe.settings().resolution, Resolution::Minute);
+        });
+    }
+
+    #[test]
+    fn custom_data_universe_builds_live_universe_subscription_descriptor() {
+        crate::test_python::init();
+        Python::attach(|py| {
+            let selector = py.eval(c"lambda rows: []", None, None).unwrap().unbind();
+            let mut properties = HashMap::new();
+            properties.insert("market".to_string(), Market::HYPERLIQUID.to_string());
+            let universe = PyScheduledUniverse::custom_data_typed(
+                "hyperliquid".to_string(),
+                "HIP3_XYZ".to_string(),
+                selector,
+                Resolution::Hour,
+                UniverseSettingsState::default(),
+                SecurityType::CryptoFuture,
+                Market::hyperliquid(),
+            )
+            .with_custom_properties(properties.clone());
+
+            let subscription = universe.live_universe_subscription().unwrap();
+            assert_eq!(subscription.source_type, "hyperliquid");
+            assert_eq!(subscription.ticker, "HIP3_XYZ");
+            assert_eq!(subscription.resolution, Resolution::Hour);
+            assert_eq!(subscription.properties, properties);
         });
     }
 

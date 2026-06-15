@@ -1,14 +1,35 @@
-use crate::{order::Order, order_event::OrderEvent, order_ticket::OrderTicket};
+use crate::{
+    order::{Order, OrderStatus},
+    order_event::OrderEvent,
+    order_ticket::{OrderTicket, UpdateOrderFields},
+};
 use dashmap::DashMap;
 use lean_core::{DateTime, Price};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelOrderRequest {
+    pub order_id: i64,
+    pub time: DateTime,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateOrderRequest {
+    pub order_id: i64,
+    pub time: DateTime,
+    pub fields: UpdateOrderFields,
+    pub previous_order: Order,
+}
+
 /// Thread-safe store for all orders in a strategy run.
 pub struct TransactionManager {
     orders: DashMap<i64, Arc<RwLock<Order>>>,
     tickets: DashMap<i64, OrderTicket>,
+    cancel_requests: DashMap<i64, CancelOrderRequest>,
+    update_requests: DashMap<i64, UpdateOrderRequest>,
     next_order_id: AtomicI64,
 }
 
@@ -17,6 +38,8 @@ impl TransactionManager {
         TransactionManager {
             orders: DashMap::new(),
             tickets: DashMap::new(),
+            cancel_requests: DashMap::new(),
+            update_requests: DashMap::new(),
             next_order_id: AtomicI64::new(1),
         }
     }
@@ -33,6 +56,30 @@ impl TransactionManager {
         ticket
     }
 
+    pub fn add_or_update_order(&self, order: Order) -> OrderTicket {
+        let id = order.id;
+        if let Some(order_lock) = self.orders.get(&id) {
+            *order_lock.write() = order.clone();
+            if let Some(ticket) = self.tickets.get(&id) {
+                ticket.set_order(order);
+                return ticket.clone();
+            }
+        }
+        self.add_order(order)
+    }
+
+    pub fn update_order(&self, order: Order) -> bool {
+        if let Some(order_lock) = self.orders.get(&order.id) {
+            *order_lock.write() = order.clone();
+            if let Some(ticket) = self.tickets.get(&order.id) {
+                ticket.set_order(order);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn get_order(&self, id: i64) -> Option<Order> {
         self.orders.get(&id).map(|o| o.read().clone())
     }
@@ -44,8 +91,22 @@ impl TransactionManager {
     pub fn process_order_event(&self, event: OrderEvent) {
         // Update the order's status so it no longer appears in get_open_orders().
         if let Some(order_lock) = self.orders.get(&event.order_id) {
-            let new_status = event.status;
-            order_lock.write().status = new_status;
+            let mut order = order_lock.write();
+            order.status = event.status;
+            if event.status == OrderStatus::Canceled {
+                order.canceled_time = Some(event.utc_time);
+            }
+            if event.is_fill() {
+                order.last_fill_time = Some(event.utc_time);
+                let previous_filled = order.filled_quantity;
+                let new_filled = previous_filled + event.fill_quantity;
+                let previous_value = order.average_fill_price * previous_filled;
+                let new_value = event.fill_price * event.fill_quantity;
+                if !new_filled.is_zero() {
+                    order.average_fill_price = (previous_value + new_value) / new_filled;
+                }
+                order.filled_quantity = new_filled;
+            }
         }
         if let Some(ticket) = self.tickets.get(&event.order_id) {
             ticket.add_order_event(event);
@@ -99,10 +160,115 @@ impl TransactionManager {
             .collect()
     }
 
+    pub fn request_cancel_order(&self, order_id: i64, time: DateTime, tag: String) -> bool {
+        let Some(order_lock) = self.orders.get(&order_id) else {
+            return false;
+        };
+
+        {
+            let mut order = order_lock.write();
+            if !order.is_open() {
+                return false;
+            }
+            order.status = OrderStatus::CancelPending;
+            order.canceled_time = None;
+        }
+
+        let event_symbol = order_lock.read().symbol.clone();
+        if let Some(ticket) = self.tickets.get(&order_id) {
+            ticket.add_order_event(OrderEvent::new(
+                order_id,
+                event_symbol,
+                time,
+                OrderStatus::CancelPending,
+            ));
+        }
+        self.cancel_requests.insert(
+            order_id,
+            CancelOrderRequest {
+                order_id,
+                time,
+                tag,
+            },
+        );
+        self.update_requests.remove(&order_id);
+        true
+    }
+
+    pub fn get_cancel_requests(&self) -> Vec<CancelOrderRequest> {
+        self.cancel_requests
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub fn clear_cancel_request(&self, order_id: i64) {
+        self.cancel_requests.remove(&order_id);
+    }
+
+    pub fn request_update_order(
+        &self,
+        order_id: i64,
+        time: DateTime,
+        fields: UpdateOrderFields,
+    ) -> bool {
+        let Some(order_lock) = self.orders.get(&order_id) else {
+            return false;
+        };
+
+        let previous_order = order_lock.read().clone();
+        if !previous_order.is_open() || previous_order.status == OrderStatus::CancelPending {
+            return false;
+        }
+
+        let mut updated_order = apply_update_fields(previous_order.clone(), &fields);
+        updated_order.last_update_time = Some(time);
+
+        if previous_order.status == OrderStatus::New {
+            updated_order.status = OrderStatus::New;
+            return self.update_order(updated_order);
+        }
+
+        updated_order.status = OrderStatus::UpdateSubmitted;
+        self.update_order(updated_order.clone());
+        if let Some(ticket) = self.tickets.get(&order_id) {
+            ticket.add_order_event(OrderEvent::new(
+                order_id,
+                updated_order.symbol.clone(),
+                time,
+                OrderStatus::UpdateSubmitted,
+            ));
+        }
+        self.update_requests.insert(
+            order_id,
+            UpdateOrderRequest {
+                order_id,
+                time,
+                fields,
+                previous_order,
+            },
+        );
+        true
+    }
+
+    pub fn get_update_requests(&self) -> Vec<UpdateOrderRequest> {
+        self.update_requests
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub fn clear_update_request(&self, order_id: i64) {
+        self.update_requests.remove(&order_id);
+    }
+
     pub fn cancel_open_orders(&self, time: DateTime) {
         for entry in self.orders.iter() {
-            if entry.read().is_open() {
-                if let Some(ticket) = self.tickets.get(&entry.read().id) {
+            let mut order = entry.write();
+            if order.is_open() {
+                order.status = OrderStatus::Canceled;
+                order.canceled_time = Some(time);
+                if let Some(ticket) = self.tickets.get(&order.id) {
                     ticket.cancel(time);
                 }
             }
@@ -111,8 +277,10 @@ impl TransactionManager {
 
     pub fn cancel_open_orders_for_symbol(&self, symbol_sid: u64, time: DateTime) {
         for entry in self.orders.iter() {
-            let order = entry.read();
+            let mut order = entry.write();
             if order.symbol.id.sid == symbol_sid && order.is_open() {
+                order.status = OrderStatus::Canceled;
+                order.canceled_time = Some(time);
                 if let Some(ticket) = self.tickets.get(&order.id) {
                     ticket.cancel(time);
                 }
@@ -143,4 +311,29 @@ impl Default for TransactionManager {
     fn default() -> Self {
         TransactionManager::new()
     }
+}
+
+fn apply_update_fields(mut order: Order, fields: &UpdateOrderFields) -> Order {
+    if let Some(quantity) = fields.quantity {
+        order.quantity = quantity;
+    }
+    if let Some(limit_price) = fields.limit_price {
+        order.limit_price = Some(limit_price);
+        if matches!(
+            order.order_type,
+            crate::order::OrderType::Limit | crate::order::OrderType::StopLimit
+        ) {
+            order.price = limit_price;
+        }
+    }
+    if let Some(stop_price) = fields.stop_price {
+        order.stop_price = Some(stop_price);
+        if order.order_type == crate::order::OrderType::StopMarket {
+            order.price = stop_price;
+        }
+    }
+    if let Some(tag) = &fields.tag {
+        order.tag = tag.clone();
+    }
+    order
 }

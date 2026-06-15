@@ -195,6 +195,32 @@ fn test_option_universe_round_trip() {
     assert_eq!(call.strike, dec!(400.00));
 }
 
+#[tokio::test]
+async fn test_read_option_universe_filtered_by_underlying() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("option_universe.parquet");
+    let expiry = date(2021, 4, 16);
+    let rows = vec![
+        sample_universe_row("SPY", "SPY210416P00480000", expiry),
+        sample_universe_row("QQQ", "QQQ210416P00350000", expiry),
+        sample_universe_row("AAPL", "AAPL210416P00150000", expiry),
+    ];
+
+    let writer = ParquetWriter::new(WriterConfig::default());
+    writer.write_option_universe(&rows, &path).unwrap();
+
+    let reader = ParquetReader::new();
+    let filtered = reader
+        .read_option_universe_filtered(&[path], &["SPY".to_string(), "AAPL".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.iter().any(|row| row.underlying == "SPY"));
+    assert!(filtered.iter().any(|row| row.underlying == "AAPL"));
+    assert!(!filtered.iter().any(|row| row.underlying == "QQQ"));
+}
+
 /// Writing an empty slice should be a no-op (no file created).
 #[test]
 fn test_write_empty_option_eod_bars_noop() {

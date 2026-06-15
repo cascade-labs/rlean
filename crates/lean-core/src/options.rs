@@ -125,6 +125,16 @@ pub trait SymbolOptionsExt {
         market: &Market,
     ) -> Symbol;
 
+    /// Create a specific index option symbol in OSI ticker format.
+    fn create_index_option_osi(
+        underlying: Symbol,
+        strike: Decimal,
+        expiry: NaiveDate,
+        right: OptionRight,
+        style: OptionStyle,
+        market: &Market,
+    ) -> Symbol;
+
     /// Create a canonical (chain-level) option symbol — no specific strike/expiry.
     /// The value is `?{underlying_ticker}`, mirroring LEAN's canonical option convention.
     fn create_canonical_option(underlying: &Symbol, market: &Market) -> Symbol;
@@ -156,6 +166,33 @@ impl SymbolOptionsExt for Symbol {
         use crate::symbol::SecurityIdentifier;
 
         let id = SecurityIdentifier::generate_option(
+            &underlying.permtick,
+            market,
+            expiry,
+            strike,
+            right,
+            style,
+        );
+        let osi = format_option_ticker(&underlying.permtick, strike, expiry, right);
+        Symbol {
+            value: osi.clone(),
+            permtick: osi,
+            id,
+            underlying: Some(Box::new(underlying)),
+        }
+    }
+
+    fn create_index_option_osi(
+        underlying: Symbol,
+        strike: Decimal,
+        expiry: NaiveDate,
+        right: OptionRight,
+        style: OptionStyle,
+        market: &Market,
+    ) -> Symbol {
+        use crate::symbol::SecurityIdentifier;
+
+        let id = SecurityIdentifier::generate_index_option(
             &underlying.permtick,
             market,
             expiry,

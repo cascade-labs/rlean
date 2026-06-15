@@ -66,10 +66,9 @@ impl Predicate {
         if let Some(ref sids) = self.symbol_sids {
             if sids.len() == 1 {
                 exprs.push(col("symbol_sid").eq(lit(sids[0])));
-            } else {
-                let sid_exprs: Vec<Expr> =
-                    sids.iter().map(|&s| col("symbol_sid").eq(lit(s))).collect();
-                exprs.push(sid_exprs.into_iter().reduce(|a, b| a.or(b)).unwrap());
+            } else if !sids.is_empty() {
+                let sid_exprs: Vec<Expr> = sids.iter().map(|&s| lit(s)).collect();
+                exprs.push(col("symbol_sid").in_list(sid_exprs, false));
             }
         }
         if let Some(min_c) = self.min_close {
@@ -89,5 +88,22 @@ impl Predicate {
 impl Default for Predicate {
     fn default() -> Self {
         Predicate::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Predicate;
+
+    #[test]
+    fn multiple_symbol_sids_use_in_list_predicate() {
+        let expr = Predicate::new()
+            .with_symbols(vec![1, 2, 3, 4, 5])
+            .to_datafusion_expr()
+            .unwrap();
+        let text = expr.to_string();
+
+        assert!(text.contains("IN"), "{text}");
+        assert!(!text.contains(" OR "), "{text}");
     }
 }

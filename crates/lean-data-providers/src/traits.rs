@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use lean_core::Symbol;
 use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
+use std::collections::{HashMap, HashSet};
 
 use crate::request::{
     DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,
@@ -110,6 +111,28 @@ pub trait IHistoryProvider: Send + Sync {
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
         Ok(vec![])
+    }
+
+    /// Fetch option universes for a set of underlyings on `date`.
+    ///
+    /// Providers that can batch chain lookups should override this. The default
+    /// preserves existing provider behavior by fanning out to the one-underlying
+    /// method.
+    async fn get_option_universes(
+        &self,
+        tickers: &[String],
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<HashMap<String, Vec<OptionUniverseRow>>> {
+        let mut out = HashMap::new();
+        let mut seen = HashSet::new();
+        for ticker in tickers {
+            let key = ticker.to_ascii_uppercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            out.insert(key, self.get_option_universe(ticker, date).await?);
+        }
+        Ok(out)
     }
 
     /// Fetch intraday option trade bars for all contracts of `ticker` on `date`.
@@ -299,15 +322,7 @@ pub trait IMapFileProvider: Send + Sync {
     fn get(&self, symbol: &Symbol, date: chrono::NaiveDate) -> Option<String>;
 }
 
-/// Subscribes to a live data stream — Rust equivalent of C# `IDataQueueHandler`.
-#[async_trait]
-pub trait ILiveDataProvider: Send + Sync {
-    /// Subscribe to live data for `symbol`.
-    async fn subscribe(&self, symbol: &Symbol) -> anyhow::Result<()>;
+/// Live data providers implement LEAN's `IDataQueueHandler` contract.
+pub trait ILiveDataProvider: lean_data::DataQueueHandler {}
 
-    /// Unsubscribe from live data for `symbol`.
-    async fn unsubscribe(&self, symbol: &Symbol) -> anyhow::Result<()>;
-
-    /// Whether the provider is currently connected to the live feed.
-    fn is_connected(&self) -> bool;
-}
+impl<T> ILiveDataProvider for T where T: lean_data::DataQueueHandler {}
