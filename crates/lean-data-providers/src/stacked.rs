@@ -6,8 +6,9 @@
 /// its file because success is represented by a filesystem side effect, not
 /// returned rows.  A provider that returns `Ok(vec![])` for market data or an
 /// `anyhow::Error` whose message starts with "NotImplemented:" is treated as
-/// "I don't have this data — try the next one".  Any other error short-circuits
-/// and is returned immediately.
+/// "I don't have this data — try the next one".  With a single provider,
+/// unexpected provider errors are returned. With multiple providers, a provider
+/// error is treated as a miss so fallback providers can satisfy the request.
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -33,6 +34,10 @@ pub fn is_not_implemented(err: &anyhow::Error) -> bool {
 fn is_recoverable_cache_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("Parquet error") || message.contains("Invalid Parquet file")
+}
+
+fn should_fall_through_provider_error(provider_count: usize) -> bool {
+    provider_count > 1
 }
 
 fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> bool {
@@ -199,6 +204,18 @@ impl IHistoryProvider for StackedHistoryProvider {
                     );
                     continue;
                 }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for {:?} {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -218,6 +235,17 @@ impl IHistoryProvider for StackedHistoryProvider {
                     );
                     continue;
                 }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for quote bars {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -234,6 +262,17 @@ impl IHistoryProvider for StackedHistoryProvider {
                     debug!(
                         "History provider #{} hit recoverable tick cache error for {}: {}",
                         idx, request.symbol.value, e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for ticks {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
                     );
                     continue;
                 }
@@ -323,6 +362,18 @@ impl IHistoryProvider for StackedHistoryProvider {
                     debug!(
                         "History provider #{} hit recoverable batched cache error for {:?}: {}",
                         idx, request.data_type, e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for batched {:?} ({} symbols, {} → {}); trying next provider: {}",
+                        idx,
+                        request.data_type,
+                        request.symbols.len(),
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
                     );
                     continue;
                 }

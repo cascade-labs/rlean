@@ -237,17 +237,21 @@ mod provider_tests {
 
     use crate::config::ProviderConfig;
     use crate::local::LocalHistoryProvider;
-    use crate::request::{DataType, HistoryRequest};
+    use crate::request::{DataType, HistoryBatchRequest, HistoryRequest, MarketDataBatch};
     use crate::stacked::StackedHistoryProvider;
     use crate::traits::IHistoryProvider;
 
-    fn make_symbol() -> Symbol {
+    fn make_symbol_for(ticker: &str) -> Symbol {
         Symbol {
-            id: SecurityIdentifier::generate_equity("SPY", &Market::usa()),
-            value: "SPY".to_string(),
-            permtick: "SPY".to_string(),
+            id: SecurityIdentifier::generate_equity(ticker, &Market::usa()),
+            value: ticker.to_string(),
+            permtick: ticker.to_string(),
             underlying: None,
         }
+    }
+
+    fn make_symbol() -> Symbol {
+        make_symbol_for("SPY")
     }
 
     fn make_history_request() -> HistoryRequest {
@@ -273,13 +277,27 @@ mod provider_tests {
         }
     }
 
+    fn make_history_batch_request(symbols: Vec<Symbol>) -> HistoryBatchRequest {
+        HistoryBatchRequest {
+            symbols,
+            resolution: Resolution::Daily,
+            start: date_time(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), 0, 0, 0),
+            end: date_time(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(), 0, 0, 0),
+            data_type: DataType::TradeBar,
+        }
+    }
+
     fn date_time(date: NaiveDate, h: u32, m: u32, s: u32) -> NanosecondTimestamp {
         NanosecondTimestamp::from(Utc.from_utc_datetime(&date.and_hms_opt(h, m, s).unwrap()))
     }
 
     fn make_bar(date: NaiveDate) -> TradeBar {
+        make_bar_for(make_symbol(), date)
+    }
+
+    fn make_bar_for(symbol: Symbol, date: NaiveDate) -> TradeBar {
         TradeBar::new(
-            make_symbol(),
+            symbol,
             date_time(date, 16, 0, 0),
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
@@ -429,6 +447,56 @@ mod provider_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailingSymbolProvider {
+        failed_symbol: String,
+    }
+
+    #[async_trait::async_trait]
+    impl IHistoryProvider for FailingSymbolProvider {
+        async fn get_history(
+            &self,
+            request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            if request.symbol.value == self.failed_symbol {
+                anyhow::bail!("provider has no data for {}", request.symbol.value);
+            }
+            Ok(vec![make_bar_for(
+                request.symbol.clone(),
+                request.start.date_utc(),
+            )])
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockBatchProvider {
+        fail_batch: bool,
+        bars: Vec<TradeBar>,
+    }
+
+    #[async_trait::async_trait]
+    impl IHistoryProvider for MockBatchProvider {
+        async fn get_history(
+            &self,
+            _request: &HistoryRequest,
+        ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+            Ok(vec![])
+        }
+
+        async fn get_history_batch(
+            &self,
+            _request: &HistoryBatchRequest,
+        ) -> anyhow::Result<MarketDataBatch> {
+            if self.fail_batch {
+                anyhow::bail!("provider batch request failed");
+            }
+            Ok(MarketDataBatch {
+                trade_bars: self.bars.clone(),
+                ..Default::default()
+            })
+        }
+    }
+
     fn sample_option_row() -> OptionEodBar {
         OptionEodBar {
             date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
@@ -515,6 +583,58 @@ mod provider_tests {
 
         assert_eq!(first, second);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_batch_provider_skips_failed_symbol() {
+        let provider = FailingSymbolProvider {
+            failed_symbol: "TRVN".to_string(),
+        };
+        let request =
+            make_history_batch_request(vec![make_symbol_for("TRVN"), make_symbol_for("SPY")]);
+
+        let batch = provider.get_history_batch(&request).await.unwrap();
+
+        assert_eq!(batch.trade_bars.len(), 1);
+        assert_eq!(batch.trade_bars[0].symbol.value, "SPY");
+    }
+
+    #[tokio::test]
+    async fn stacked_batch_provider_falls_back_after_provider_error() {
+        let provider = StackedHistoryProvider::new(vec![
+            Arc::new(MockBatchProvider {
+                fail_batch: true,
+                bars: vec![],
+            }),
+            Arc::new(MockBatchProvider {
+                fail_batch: false,
+                bars: vec![make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap())],
+            }),
+        ]);
+        let request = make_history_batch_request(vec![make_symbol()]);
+
+        let batch = provider.get_history_batch(&request).await.unwrap();
+
+        assert_eq!(batch.trade_bars.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stacked_batch_provider_returns_empty_after_all_fallbacks_fail_or_empty() {
+        let provider = StackedHistoryProvider::new(vec![
+            Arc::new(MockBatchProvider {
+                fail_batch: true,
+                bars: vec![],
+            }),
+            Arc::new(MockBatchProvider {
+                fail_batch: false,
+                bars: vec![],
+            }),
+        ]);
+        let request = make_history_batch_request(vec![make_symbol_for("TRVN")]);
+
+        let batch = provider.get_history_batch(&request).await.unwrap();
+
+        assert!(batch.trade_bars.is_empty());
     }
 
     #[test]

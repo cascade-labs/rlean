@@ -109,6 +109,7 @@ impl IExecutionModel for TwapExecutionModel {
             }
 
             orders.push(OrderRequest {
+                order_id: None,
                 symbol: sec.symbol.clone(),
                 quantity: slice_qty,
                 order_type: ExecutionOrderType::Market,

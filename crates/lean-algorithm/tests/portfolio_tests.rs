@@ -198,6 +198,8 @@ fn crypto_future_realized_pnl_and_funding_settle_to_cash() {
         Some(dec!(-10.1000))
     );
     assert_eq!(*pm.cash.read(), dec!(99_989.9000));
+    assert_eq!(*pm.total_funding.read(), dec!(-10.1000));
+    assert_eq!(pm.get_holding(&symbol).total_funding, dec!(-10.1000));
 
     pm.apply_fill_with_multiplier(&symbol, dec!(101_000), dec!(-1), dec!(0), dec!(1));
     assert_eq!(*pm.cash.read(), dec!(100_989.9000));

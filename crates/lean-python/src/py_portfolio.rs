@@ -14,6 +14,7 @@ pub struct PySecurityHolding {
     pub unrealized_pnl: f64,
     pub realized_pnl: f64,
     pub total_fees: f64,
+    pub total_funding: f64,
     pub last_price: f64,
     pub is_long: bool,
     pub is_short: bool,
@@ -32,6 +33,7 @@ impl From<&SecurityHolding> for PySecurityHolding {
             unrealized_pnl: h.unrealized_pnl.to_f64().unwrap_or(0.0),
             realized_pnl: h.realized_pnl.to_f64().unwrap_or(0.0),
             total_fees: h.total_fees.to_f64().unwrap_or(0.0),
+            total_funding: h.total_funding.to_f64().unwrap_or(0.0),
             last_price: h.last_price.to_f64().unwrap_or(0.0),
             is_long: h.is_long(),
             is_short: h.is_short(),
@@ -114,6 +116,16 @@ impl PyPortfolio {
     #[getter]
     fn total_holdings_value(&self) -> f64 {
         self.inner.total_holdings_value().to_f64().unwrap_or(0.0)
+    }
+
+    #[getter]
+    fn total_fees(&self) -> f64 {
+        self.inner.total_fees.read().to_f64().unwrap_or(0.0)
+    }
+
+    #[getter]
+    fn total_funding(&self) -> f64 {
+        self.inner.total_funding.read().to_f64().unwrap_or(0.0)
     }
 
     /// Compatibility spelling for whole-portfolio investment state.

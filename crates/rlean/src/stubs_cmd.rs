@@ -421,6 +421,7 @@ class SecurityHolding:
     unrealized_pnl: float
     realized_pnl: float
     total_fees: float
+    total_funding: float
     last_price: float
     is_long: bool
     is_short: bool
@@ -463,6 +464,12 @@ class Portfolio:
 
     @property
     def total_holdings_value(self) -> float: ...
+
+    @property
+    def total_fees(self) -> float: ...
+
+    @property
+    def total_funding(self) -> float: ...
 
     @property
     def is_invested(self) -> bool:
@@ -949,11 +956,12 @@ class PassiveMakerExecutionModel(ExecutionModel):
     def __init__(self, max_passive_attempts: int = 3, adverse_selection_threshold: float = 0.001, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
 
 class AdaptiveMakerTakerExecutionModel(ExecutionModel):
-    """Crosses immediately on tight spreads and uses passive maker execution when spreads are wide."""
+    """Crosses immediately on tight spreads and uses time-based passive maker execution when spreads are wide."""
     accepting_spread_percent: float
     max_passive_attempts: int
     adverse_selection_threshold: float
-    def __init__(self, accepting_spread_percent: float = 0.001, max_passive_attempts: int = 1, adverse_selection_threshold: float = 0.005, asynchronous: bool = True) -> None: ...
+    passive_duration_seconds: float
+    def __init__(self, accepting_spread_percent: float = 0.001, max_passive_attempts: int = 5, adverse_selection_threshold: float = 0.005, asynchronous: bool = True, passive_duration_seconds: float | None = None) -> None: ...
 
 class MakerThenTakerExecutionModel(ExecutionModel):
     """Posts post-only maker limits until a passive deadline, then crosses the residual."""
@@ -961,6 +969,11 @@ class MakerThenTakerExecutionModel(ExecutionModel):
     adverse_selection_threshold: float
     maximum_order_value: float
     def __init__(self, passive_duration_seconds: float = 300.0, adverse_selection_threshold: float = 0.005, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
+
+class AggressivePostOnlyExecutionModel(ExecutionModel):
+    """Posts one tick inside the spread as post-only and never crosses the residual."""
+    maximum_order_value: float
+    def __init__(self, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
 
 class StandardDeviationExecutionModel(ExecutionModel):
     """Executes when price deviates by N standard deviations from mean."""

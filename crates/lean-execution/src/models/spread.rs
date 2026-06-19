@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use crate::execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
+    SecurityData,
 };
-use lean_core::Symbol;
+use lean_core::{DateTime, Symbol};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -41,6 +42,16 @@ impl IExecutionModel for SpreadExecutionModel {
         targets: &[ExecutionTarget],
         securities: &HashMap<String, SecurityData>,
     ) -> Vec<OrderRequest> {
+        let open_orders = Vec::new();
+        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
+        self.execute_with_context(targets, &context)
+    }
+
+    fn execute_with_context(
+        &mut self,
+        targets: &[ExecutionTarget],
+        context: &ExecutionContext<'_>,
+    ) -> Vec<OrderRequest> {
         // Merge new targets into the persistent target collection.
         for target in targets {
             let key = target.symbol.value.clone();
@@ -51,16 +62,26 @@ impl IExecutionModel for SpreadExecutionModel {
         let mut orders = Vec::new();
         let mut fulfilled = Vec::new();
 
-        for (key, (symbol, target_quantity)) in &self.targets {
-            let sec = match securities.get(key) {
+        let mut target_snapshot: Vec<_> = self
+            .targets
+            .iter()
+            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .collect();
+        context.sort_targets_by_margin_impact(&mut target_snapshot);
+
+        for (key, symbol, target_quantity) in target_snapshot {
+            let sec = match context.securities.get(&key) {
                 Some(s) => s,
                 None => continue,
             };
 
-            let unordered_quantity =
-                *target_quantity - sec.current_quantity - sec.open_order_quantity;
-            if unordered_quantity == Decimal::ZERO {
+            if context.actual_holding_delta(sec, target_quantity) == Decimal::ZERO {
                 fulfilled.push(key.clone());
+                continue;
+            }
+
+            let unordered_quantity = context.unordered_quantity(&symbol, sec, target_quantity);
+            if unordered_quantity == Decimal::ZERO {
                 continue;
             }
 
@@ -81,7 +102,8 @@ impl IExecutionModel for SpreadExecutionModel {
             }
 
             orders.push(OrderRequest {
-                symbol: symbol.clone(),
+                order_id: None,
+                symbol,
                 quantity: unordered_quantity,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,

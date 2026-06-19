@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    OrderRequest, SecurityData,
 };
 use lean_core::Symbol;
 use rust_decimal::Decimal;
@@ -56,6 +57,11 @@ impl PassiveMakerExecutionModel {
         }
     }
 
+    pub fn remove_target(&mut self, symbol: &Symbol) {
+        self.targets.remove(&symbol.value);
+        self.states.remove(&symbol.value);
+    }
+
     fn cap_order_quantity(
         maximum_order_value: Decimal,
         sec: &SecurityData,
@@ -103,6 +109,10 @@ impl PassiveMakerExecutionModel {
 
         (states.get_mut(key).expect("state inserted"), reset)
     }
+
+    fn open_order_quantity(context: &ExecutionContext<'_>, sec: &SecurityData) -> Decimal {
+        context.projected_open_order_quantity(&sec.symbol, sec)
+    }
 }
 
 impl Default for PassiveMakerExecutionModel {
@@ -134,12 +144,31 @@ fn adjust_by_lot_size(lot_size: Decimal, quantity: Decimal) -> Decimal {
 
 fn cancel_request(symbol: &Symbol, tag: &str) -> OrderRequest {
     OrderRequest {
+        order_id: None,
         symbol: symbol.clone(),
         quantity: Decimal::ZERO,
         order_type: ExecutionOrderType::Cancel,
         limit_price: None,
         post_only: false,
         cancel_open_orders: true,
+        tag: tag.to_string(),
+    }
+}
+
+fn update_limit_request(
+    order: &ExecutionOpenOrder,
+    remaining_quantity: Decimal,
+    limit_price: Decimal,
+    tag: &str,
+) -> OrderRequest {
+    OrderRequest {
+        order_id: Some(order.id),
+        symbol: order.symbol.clone(),
+        quantity: order.filled_quantity + remaining_quantity,
+        order_type: ExecutionOrderType::Update,
+        limit_price: Some(limit_price),
+        post_only: order.post_only,
+        cancel_open_orders: false,
         tag: tag.to_string(),
     }
 }
@@ -168,11 +197,41 @@ fn should_reprice_passive_order(
     }
 }
 
+fn single_updateable_passive_order<'a>(
+    context: &'a ExecutionContext<'_>,
+    symbol: &Symbol,
+    direction: Decimal,
+    open_order_quantity: Decimal,
+) -> Option<&'a ExecutionOpenOrder> {
+    if open_order_quantity == Decimal::ZERO || sign(open_order_quantity) != direction {
+        return None;
+    }
+
+    let mut found = None;
+    for order in context.open_orders_for_symbol(symbol) {
+        if order.remaining_quantity == Decimal::ZERO {
+            continue;
+        }
+        if order.order_type != ExecutionOrderType::Limit
+            || !order.post_only
+            || sign(order.remaining_quantity) != direction
+            || order.remaining_quantity != open_order_quantity
+        {
+            return None;
+        }
+        if found.replace(order).is_some() {
+            return None;
+        }
+    }
+
+    found
+}
+
 impl IExecutionModel for PassiveMakerExecutionModel {
-    fn execute(
+    fn execute_with_context(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
+        context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for target in targets {
             let key = target.symbol.value.clone();
@@ -183,22 +242,24 @@ impl IExecutionModel for PassiveMakerExecutionModel {
         let mut orders = Vec::new();
         let mut fulfilled = Vec::new();
 
-        let target_snapshot: Vec<_> = self
+        let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
             .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
             .collect();
+        context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let Some(sec) = securities.get(&key) else {
+            let Some(sec) = context.securities.get(&key) else {
                 continue;
             };
+            let open_order_quantity = Self::open_order_quantity(context, sec);
 
-            let target_delta = target_quantity - sec.current_quantity;
+            let target_delta = context.actual_holding_delta(sec, target_quantity);
             if target_delta == Decimal::ZERO {
                 fulfilled.push(key.clone());
                 self.states.remove(&key);
-                if sec.open_order_quantity != Decimal::ZERO {
+                if open_order_quantity != Decimal::ZERO {
                     orders.push(cancel_request(
                         &symbol,
                         "PassiveMakerExecutionModel cancel fulfilled target",
@@ -208,7 +269,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
             }
 
             let (Some(bid), Some(ask)) = (sec.bid, sec.ask) else {
-                if sec.open_order_quantity != Decimal::ZERO {
+                if open_order_quantity != Decimal::ZERO {
                     orders.push(cancel_request(
                         &symbol,
                         "PassiveMakerExecutionModel cancel missing quote",
@@ -221,7 +282,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                 || bid >= ask
                 || sec.price <= Decimal::ZERO
             {
-                if sec.open_order_quantity != Decimal::ZERO {
+                if open_order_quantity != Decimal::ZERO {
                     orders.push(cancel_request(
                         &symbol,
                         "PassiveMakerExecutionModel cancel invalid quote",
@@ -258,6 +319,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                     continue;
                 }
                 orders.push(OrderRequest {
+                    order_id: None,
                     symbol: symbol.clone(),
                     quantity: order_qty,
                     order_type: ExecutionOrderType::Market,
@@ -272,19 +334,40 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                 });
             } else {
                 state.passive_attempts += 1;
-                let open_order_direction = sign(sec.open_order_quantity);
-                let replace_open_order = sec.open_order_quantity != Decimal::ZERO
-                    && (target_changed
-                        || open_order_direction != direction
-                        || should_reprice_passive_order(
-                            direction,
-                            state.active_limit_price,
+                let open_order_direction = sign(open_order_quantity);
+                let quote_reprice = should_reprice_passive_order(
+                    direction,
+                    state.active_limit_price,
+                    passive_price,
+                );
+                let replace_open_order = open_order_quantity != Decimal::ZERO
+                    && (target_changed || open_order_direction != direction || quote_reprice);
+                if replace_open_order
+                    && !target_changed
+                    && open_order_direction == direction
+                    && quote_reprice
+                {
+                    if let Some(order) = single_updateable_passive_order(
+                        context,
+                        &symbol,
+                        direction,
+                        open_order_quantity,
+                    ) {
+                        state.active_limit_price = passive_price;
+                        orders.push(update_limit_request(
+                            order,
+                            order.remaining_quantity,
                             passive_price,
+                            "PassiveMakerExecutionModel update post-only",
                         ));
+                        continue;
+                    }
+                }
+
                 let unordered_quantity = if replace_open_order {
                     target_delta
                 } else {
-                    target_delta - sec.open_order_quantity
+                    context.unordered_quantity(&symbol, sec, target_quantity)
                 };
 
                 if unordered_quantity == Decimal::ZERO {
@@ -305,6 +388,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
                 }
                 state.active_limit_price = passive_price;
                 orders.push(OrderRequest {
+                    order_id: None,
                     symbol: symbol.clone(),
                     quantity: order_qty,
                     order_type: ExecutionOrderType::Limit,

@@ -6,6 +6,7 @@ pub use execution_model::{
     OrderRequest, SecurityData,
 };
 pub use models::adaptive_maker_taker::AdaptiveMakerTakerExecutionModel;
+pub use models::aggressive_post_only::AggressivePostOnlyExecutionModel;
 pub use models::immediate::ImmediateExecutionModel;
 pub use models::maker_then_taker::MakerThenTakerExecutionModel;
 pub use models::null::NullExecutionModel;

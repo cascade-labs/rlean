@@ -67,6 +67,7 @@ pub struct SecurityHolding {
     pub unrealized_pnl: Price,
     pub realized_pnl: Price,
     pub total_fees: Price,
+    pub total_funding: Price,
     pub last_price: Price,
 }
 
@@ -85,6 +86,7 @@ impl SecurityHolding {
             unrealized_pnl: dec!(0),
             realized_pnl: dec!(0),
             total_fees: dec!(0),
+            total_funding: dec!(0),
             last_price: dec!(0),
         }
     }
@@ -180,6 +182,7 @@ pub struct SecurityPortfolioManager {
     holdings: RwLock<HashMap<u64, SecurityHolding>>,
     margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
+    pub total_funding: RwLock<Price>,
 }
 
 impl SecurityPortfolioManager {
@@ -190,6 +193,7 @@ impl SecurityPortfolioManager {
             holdings: RwLock::new(HashMap::new()),
             margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
+            total_funding: RwLock::new(dec!(0)),
         }
     }
 
@@ -235,11 +239,16 @@ impl SecurityPortfolioManager {
             .sum()
     }
 
+    /// Sum of absolute holdings notional, matching LEAN's
+    /// `SecurityPortfolioManager.TotalHoldingsValue` (sum of
+    /// `AbsoluteHoldingsValue`). This is the gross market value of all
+    /// positions — distinct from `total_portfolio_value`, which for margin
+    /// instruments (CryptoFuture/CFD) contributes only unrealized PnL.
     pub fn total_holdings_value(&self) -> Price {
         self.holdings
             .read()
             .values()
-            .map(|h| h.portfolio_value_contribution())
+            .map(|h| h.market_value().abs())
             .sum()
     }
 
@@ -349,7 +358,9 @@ impl SecurityPortfolioManager {
         }
         state.next_application = Some(next_application);
 
+        holding.total_funding += funding_cash_delta;
         *self.cash.write() += funding_cash_delta;
+        *self.total_funding.write() += funding_cash_delta;
         Some(funding_cash_delta)
     }
 

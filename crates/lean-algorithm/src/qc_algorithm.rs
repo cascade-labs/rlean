@@ -717,6 +717,12 @@ impl QcAlgorithm {
     }
 
     fn validate_brokerage_order(&self, order: &Order) -> Option<String> {
+        if self.hyperliquid_post_only_order_crosses_book(order) {
+            return Some(
+                "Hyperliquid post-only limit orders must not cross the current bid/ask".into(),
+            );
+        }
+
         if self.brokerage_name != BrokerageName::TradierBrokerage {
             return None;
         }
@@ -791,6 +797,36 @@ impl QcAlgorithm {
         }
 
         None
+    }
+
+    fn hyperliquid_post_only_order_crosses_book(&self, order: &Order) -> bool {
+        if self.brokerage_name != BrokerageName::HyperliquidBrokerage
+            && !matches!(
+                (order.symbol.security_type(), order.symbol.market().as_str()),
+                (SecurityType::CryptoFuture, Market::HYPERLIQUID)
+            )
+        {
+            return false;
+        }
+        if order.order_type != OrderType::Limit || !order.properties.post_only {
+            return false;
+        }
+        let Some(limit_price) = order.limit_price else {
+            return false;
+        };
+        let Some(security) = self.securities.get(&order.symbol) else {
+            return false;
+        };
+        let bid = security.bid_price();
+        let ask = security.ask_price();
+
+        if order.quantity > Decimal::ZERO {
+            ask > Decimal::ZERO && limit_price >= ask
+        } else if order.quantity < Decimal::ZERO {
+            bid > Decimal::ZERO && limit_price <= bid
+        } else {
+            false
+        }
     }
 
     pub fn can_execute_order_with_brokerage_model(&self, order: &Order) -> bool {

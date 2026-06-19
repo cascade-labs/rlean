@@ -1,5 +1,5 @@
 use crate::portfolio_target::PortfolioTarget;
-use lean_core::Symbol;
+use lean_core::{Symbol, TimeSpan};
 use std::collections::HashMap;
 
 /// Direction of an alpha insight.
@@ -48,6 +48,21 @@ pub trait IPortfolioConstructionModel: Send + Sync {
     /// (e.g. Black-Litterman, Mean-Variance) override this to accumulate data
     /// so their warm-up period runs concurrently with the alpha warm-up.
     fn update_security_prices(&mut self, _prices: &HashMap<String, rust_decimal::Decimal>) {}
+
+    /// Rebalance frequency for models that follow LEAN's scheduled PCM behavior.
+    /// `None` preserves the legacy rlean behavior of creating targets whenever
+    /// active insights are present.
+    fn rebalance_period(&self) -> Option<TimeSpan> {
+        None
+    }
+
+    fn rebalance_on_security_changes(&self) -> bool {
+        true
+    }
+
+    fn rebalance_on_insight_changes(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "PortfolioConstructionModel"

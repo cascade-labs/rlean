@@ -107,12 +107,7 @@ impl PaperBrokerage {
         message: impl Into<String>,
     ) -> OrderEvent {
         let mut event = OrderEvent::new(order.id, order.symbol.clone(), order.time, status);
-        event.direction = order.direction();
-        event.quantity = order.quantity;
-        event.limit_price = order.limit_price;
-        event.stop_price = order.stop_price;
-        event.trailing_amount = order.trailing_amount;
-        event.trailing_as_percentage = order.trailing_as_percent;
+        event.apply_order_fields(order);
         event.message = message.into();
         event
     }

@@ -13,9 +13,9 @@
 /// }
 /// ```
 ///
-/// rlean loads all `.dylib`/`.so` files in `~/.rlean/plugins/` at startup,
-/// calls `rlean_plugin_descriptor()` on each, and routes provider/brokerage
-/// registration accordingly.
+/// rlean loads installed `.dylib`/`.so` files from `~/.rlean/plugins/` on
+/// demand, calls `rlean_plugin_descriptor()` before invoking plugin factories,
+/// and routes provider/brokerage registration accordingly.
 /// The type of capability a plugin provides.
 ///
 /// A single plugin crate may implement multiple kinds by exporting multiple
@@ -154,6 +154,19 @@ pub type CreateBrokerageFn =
 /// Free a brokerage created by `CreateBrokerageFn`.
 pub type DestroyBrokerageFn = unsafe extern "C" fn(ptr: *mut ());
 
+/// Install the process-level rustls crypto provider used by rlean plugins.
+///
+/// rustls 0.23 cannot auto-select a provider when plugin dependency feature
+/// unification enables both `aws-lc-rs` and `ring`; installing `ring` here
+/// keeps that process-global setup in the plugin ABI instead of in each
+/// individual networked plugin.
+pub fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Convenience macro for plugin crates to implement the required export.
 ///
 /// ```rust,ignore
@@ -170,6 +183,7 @@ macro_rules! rlean_plugin {
     (name = $name:literal, version = $ver:literal, kind = $kind:expr $(,)?) => {
         #[no_mangle]
         pub extern "C" fn rlean_plugin_descriptor() -> $crate::PluginDescriptor {
+            $crate::ensure_crypto_provider();
             $crate::PluginDescriptor {
                 name: concat!($name, "\0").as_ptr(),
                 version: concat!($ver, "\0").as_ptr(),

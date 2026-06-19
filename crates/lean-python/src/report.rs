@@ -21,6 +21,12 @@ pub fn write_order_events_json(result: &BacktestResult, path: &Path) -> std::io:
     std::fs::write(path, json)
 }
 
+/// Write `<id>-orders.json` — serialised final order states.
+pub fn write_orders_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(&result.orders).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
 /// Summary statistics struct written to `<id>-summary.json`.
 #[derive(Serialize)]
 struct SummaryJson {
@@ -72,6 +78,10 @@ struct SummaryJson {
     starting_cash: f64,
     #[serde(rename = "FinalValue")]
     final_value: f64,
+    #[serde(rename = "TotalFees")]
+    total_fees: f64,
+    #[serde(rename = "TotalFunding")]
+    total_funding: f64,
     #[serde(rename = "TradingDays")]
     trading_days: i64,
 }
@@ -105,6 +115,8 @@ pub fn write_summary_json(result: &BacktestResult, path: &Path) -> std::io::Resu
         average_trade_duration_days: s.average_trade_duration_days.to_f64().unwrap_or(0.0),
         starting_cash: result.starting_cash,
         final_value: result.final_value,
+        total_fees: result.total_fees,
+        total_funding: result.total_funding,
         trading_days: result.trading_days,
     };
     let json = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
@@ -135,6 +147,8 @@ pub fn write_log_txt(result: &BacktestResult, path: &Path) -> std::io::Result<()
     lines.push(format!("Trading Days:      {}", result.trading_days));
     lines.push(format!("Starting Cash:     {:.2}", result.starting_cash));
     lines.push(format!("Final Value:       {:.2}", result.final_value));
+    lines.push(format!("Total Fees:        {:.2}", result.total_fees));
+    lines.push(format!("Total Funding:     {:.2}", result.total_funding));
     lines.push(format!("Total Return:      {:.4}", result.total_return));
     lines.push(format!(
         "CAGR:              {:.4}",
@@ -169,6 +183,10 @@ pub fn write_report(result: &BacktestResult, path: &Path) -> std::io::Result<()>
 struct BacktestResultJson<'a> {
     #[serde(rename = "Statistics")]
     statistics: &'a lean_statistics::PortfolioStatistics,
+    #[serde(rename = "Orders")]
+    orders: std::collections::BTreeMap<i64, &'a lean_orders::Order>,
+    #[serde(rename = "OrderEvents")]
+    order_events: &'a [lean_orders::OrderEvent],
     #[serde(rename = "Charts")]
     charts: ChartCollection,
     /// Equity curve as {date → portfolio value} pairs (LEAN "Strategy Equity" series).
@@ -182,6 +200,10 @@ struct BacktestResultJson<'a> {
     starting_cash: f64,
     #[serde(rename = "FinalValue")]
     final_value: f64,
+    #[serde(rename = "TotalFees")]
+    total_fees: f64,
+    #[serde(rename = "TotalFunding")]
+    total_funding: f64,
     #[serde(rename = "TotalReturn")]
     total_return: f64,
 }
@@ -199,15 +221,24 @@ pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Resu
         .zip(result.benchmark_curve.iter())
         .map(|(d, &v)| (d.as_str(), v))
         .collect();
+    let orders = result
+        .orders
+        .iter()
+        .map(|order| (order.id, order))
+        .collect();
 
     let json_obj = BacktestResultJson {
         statistics: &result.statistics,
+        orders,
+        order_events: &result.order_events,
         charts: charts_with_benchmark(result),
         equity,
         benchmark,
         trading_days: result.trading_days,
         starting_cash: result.starting_cash,
         final_value: result.final_value,
+        total_fees: result.total_fees,
+        total_funding: result.total_funding,
         total_return: result.total_return,
     };
 
@@ -440,6 +471,8 @@ fn generate_html(r: &BacktestResult) -> String {
       <tr><td>CAGR</td><td>{cagr}</td></tr>
       <tr><td>Annual Std Dev</td><td>{ann_std}</td></tr>
       <tr><td>Max Drawdown</td><td>{drawdown}</td></tr>
+      <tr><td>Total Fees</td><td>{total_fees}</td></tr>
+      <tr><td>Total Funding</td><td>{total_funding}</td></tr>
       <tr><td>Sharpe Ratio</td><td>{sharpe}</td></tr>
       <tr><td>Sortino Ratio</td><td>{sortino}</td></tr>
       <tr><td>Calmar Ratio</td><td>{calmar}</td></tr>
@@ -547,6 +580,8 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         total_return_pct = pct(r.total_return),
         benchmark_symbol = r.benchmark_symbol,
         benchmark_return_pct = pct(benchmark_return),
+        total_fees = dollar(r.total_fees),
+        total_funding = dollar(r.total_funding),
         cagr = pct(cagr),
         ann_std = pct(ann_std),
         drawdown = pct(drawdown),
@@ -877,6 +912,8 @@ fn ret_color(pct: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lean_core::{DateTime, Market, Symbol};
+    use lean_orders::Order;
     use lean_statistics::PortfolioStatistics;
     use rust_decimal_macros::dec;
 
@@ -895,6 +932,8 @@ mod tests {
             final_value: 102_000.0,
             total_return: 0.02,
             starting_cash: 100_000.0,
+            total_fees: 12.5,
+            total_funding: -3.25,
             start_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
             end_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 4).unwrap(),
             equity_curve: vec![100_000.0, 101_000.0, 102_000.0],
@@ -912,6 +951,13 @@ mod tests {
             statistics: stats,
             charts: crate::charting::ChartCollection::default(),
             order_events: vec![],
+            orders: vec![Order::market(
+                1,
+                Symbol::create_equity("SPY", &Market::usa()),
+                dec!(10),
+                DateTime::EPOCH,
+                "test order",
+            )],
             succeeded_data_requests: vec!["SPY/2026-01-02".to_string()],
             failed_data_requests: vec!["SPY/2026-01-05".to_string()],
             backtest_id: 1_744_000_000,
@@ -934,10 +980,17 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v.get("Statistics").is_some(), "missing 'Statistics' key");
+        assert!(v.get("Orders").is_some(), "missing 'Orders' key");
+        assert!(v.get("OrderEvents").is_some(), "missing 'OrderEvents' key");
         assert!(v.get("Equity").is_some(), "missing 'Equity' key");
         assert!(v.get("Benchmark").is_some(), "missing 'Benchmark' key");
         assert!(v.get("TradingDays").is_some(), "missing 'TradingDays' key");
         assert!(v.get("TotalReturn").is_some(), "missing 'TotalReturn' key");
+        assert!(v.get("TotalFees").is_some(), "missing 'TotalFees' key");
+        assert!(
+            v.get("TotalFunding").is_some(),
+            "missing 'TotalFunding' key"
+        );
         let charts = v.get("Charts").expect("missing 'Charts' key");
         assert!(
             charts
@@ -963,6 +1016,24 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v.is_array(), "order-events.json must be a JSON array");
+    }
+
+    // ── write_orders_json ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_orders_json_is_valid_array_with_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = make_result();
+        let id = result.backtest_id;
+        let path = dir.path().join(format!("{id}-orders.json"));
+
+        write_orders_json(&result, &path).unwrap();
+
+        assert!(path.exists(), "{id}-orders.json should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let orders = v.as_array().expect("orders.json must be a JSON array");
+        assert_eq!(orders[0]["tag"], "test order");
     }
 
     // ── write_summary_json ─────────────────────────────────────────────────────
@@ -993,6 +1064,8 @@ mod tests {
             "TotalTrades",
             "StartingCash",
             "FinalValue",
+            "TotalFees",
+            "TotalFunding",
             "TradingDays",
         ];
         for key in &required_keys {
@@ -1068,6 +1141,7 @@ mod tests {
         write_results_json(&result, &dir.path().join(format!("{id}.json"))).unwrap();
         write_order_events_json(&result, &dir.path().join(format!("{id}-order-events.json")))
             .unwrap();
+        write_orders_json(&result, &dir.path().join(format!("{id}-orders.json"))).unwrap();
         write_summary_json(&result, &dir.path().join(format!("{id}-summary.json"))).unwrap();
         write_log_txt(&result, &dir.path().join(format!("{id}-log.txt"))).unwrap();
         std::fs::copy(
@@ -1087,6 +1161,7 @@ mod tests {
         let expected = [
             format!("{id}.json"),
             format!("{id}-order-events.json"),
+            format!("{id}-orders.json"),
             format!("{id}-summary.json"),
             format!("{id}-log.txt"),
             "log.txt".to_string(),

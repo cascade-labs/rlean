@@ -17,12 +17,12 @@
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -273,12 +273,31 @@ enum LiveSubcommand {
         #[arg(long, default_value_t = 250)]
         lines: usize,
     },
+    /// Pause a running local live deployment
+    Pause {
+        deploy_id: String,
+        /// Seconds to wait for the process to exit after SIGTERM
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+    /// Resume a paused or stopped local live deployment
+    Resume { deploy_id: String },
+    /// Upgrade the code snapshot for a paused live deployment
+    Upgrade { deploy_id: String },
+    /// Remove a local live deployment and its deployment directory
+    Remove {
+        deploy_id: String,
+        /// Terminate and remove even if the deployment is running
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 enum LiveStatusFilter {
     Running,
+    Paused,
     Stopped,
     RuntimeError,
     Liquidated,
@@ -454,8 +473,8 @@ async fn run_python_backtest(
     history_provider: Option<Arc<dyn IHistoryProvider>>,
 ) -> Result<()> {
     use lean_python::report::{
-        write_data_request_files, write_log_txt, write_order_events_json, write_report,
-        write_results_json, write_summary_json,
+        write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
+        write_report, write_results_json, write_summary_json,
     };
     use lean_python::runner::{run_strategy, RunConfig};
     use lean_python::AlgorithmImports;
@@ -538,6 +557,7 @@ async fn run_python_backtest(
     // ── write all output files ────────────────────────────────────────────────
     let json_path = backtest_dir.join(format!("{id}.json"));
     let order_events_path = backtest_dir.join(format!("{id}-order-events.json"));
+    let orders_path = backtest_dir.join(format!("{id}-orders.json"));
     let summary_path = backtest_dir.join(format!("{id}-summary.json"));
     let id_log_path = backtest_dir.join(format!("{id}-log.txt"));
     let top_log_path = backtest_dir.join("log.txt");
@@ -550,6 +570,9 @@ async fn run_python_backtest(
     }
     if let Err(e) = write_order_events_json(&results, &order_events_path) {
         eprintln!("Failed to write order events: {e}");
+    }
+    if let Err(e) = write_orders_json(&results, &orders_path) {
+        eprintln!("Failed to write orders: {e}");
     }
     if let Err(e) = write_summary_json(&results, &summary_path) {
         eprintln!("Failed to write summary: {e}");
@@ -858,7 +881,10 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .map(|p| p.join("live"))
         .unwrap_or_else(|| PathBuf::from("live"));
     let deployment_dir = reserve_live_dir(&live_root, chrono::Utc::now(), &strategy_name)?;
-    snapshot_strategy_code(&run_args.strategy, &deployment_dir);
+    let source_strategy = run_args.strategy.clone();
+    let deployment_strategy = snapshot_strategy_code(&source_strategy, &deployment_dir)?;
+    let mut child_run_args = run_args.clone();
+    child_run_args.strategy = deployment_strategy.clone();
 
     let deploy_id = deployment_dir
         .file_name()
@@ -866,7 +892,7 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .unwrap_or("deployment")
         .to_string();
     let exe = std::env::current_exe().context("failed to resolve current rlean executable")?;
-    let child_args = live_child_args(&run_args, &deployment_dir);
+    let child_args = live_child_args(&child_run_args, &deployment_dir);
     let command = std::iter::once(exe.to_string_lossy().to_string())
         .chain(child_args.iter().cloned())
         .collect::<Vec<_>>();
@@ -874,7 +900,7 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let initial_metadata = LiveDeploymentMetadata {
         deploy_id: deploy_id.clone(),
-        strategy: run_args.strategy.clone(),
+        strategy: source_strategy,
         strategy_name,
         deployment_dir: deployment_dir.clone(),
         pid: None,
@@ -906,7 +932,7 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file));
-    if let Some(strategy_dir) = run_args.strategy.parent() {
+    if let Some(strategy_dir) = deployment_strategy.parent() {
         command.current_dir(strategy_dir);
     }
     #[cfg(unix)]
@@ -949,15 +975,17 @@ fn run_live_control(command: LiveSubcommand) -> Result<()> {
         LiveSubcommand::List { status } => list_live_deployments(status),
         LiveSubcommand::Status { deploy_id } => {
             let dir = find_live_deployment_dir(&deploy_id)?;
-            let metadata = read_live_deployment_metadata(&dir)?;
+            let metadata =
+                normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
             let effective_status = effective_live_status(&metadata);
-            let process_alive = metadata.pid.map(process_is_alive).unwrap_or(false);
+            let running_pid = running_live_pid(&metadata);
+            let process_alive = running_pid.is_some();
             let payload = serde_json::json!({
                 "deploy_id": metadata.deploy_id,
                 "status": effective_status,
                 "recorded_status": metadata.status,
                 "process_alive": process_alive,
-                "pid": metadata.pid,
+                "pid": running_pid,
                 "strategy": metadata.strategy,
                 "strategy_name": metadata.strategy_name,
                 "deployment_dir": metadata.deployment_dir,
@@ -996,16 +1024,199 @@ fn run_live_control(command: LiveSubcommand) -> Result<()> {
             let dir = find_live_deployment_dir(&deploy_id)?;
             print_tail(&dir.join("live.log"), lines)
         }
+        LiveSubcommand::Pause {
+            deploy_id,
+            timeout_seconds,
+        } => pause_live_deployment(&deploy_id, Duration::from_secs(timeout_seconds)),
+        LiveSubcommand::Resume { deploy_id } => resume_live_deployment(&deploy_id),
+        LiveSubcommand::Upgrade { deploy_id } => upgrade_live_deployment(&deploy_id),
+        LiveSubcommand::Remove { deploy_id, force } => remove_live_deployment(&deploy_id, force),
     }
+}
+
+fn pause_live_deployment(deploy_id: &str, timeout: Duration) -> Result<()> {
+    let dir = find_live_deployment_dir(deploy_id)?;
+    let mut metadata =
+        normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
+    let effective_status = effective_live_status(&metadata);
+    if effective_status == "paused" {
+        println!(
+            "Live deployment already paused: deploy_id={}",
+            metadata.deploy_id
+        );
+        return Ok(());
+    }
+    if effective_status != "running" {
+        bail!("live deployment {deploy_id} is not running; current status is {effective_status}");
+    }
+
+    let pid = metadata
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("live deployment {deploy_id} has no recorded pid"))?;
+    terminate_process(pid)?;
+    if !wait_for_process_exit(pid, timeout) {
+        bail!(
+            "timed out waiting for live deployment {deploy_id} pid {pid} to exit after {}s",
+            timeout.as_secs()
+        );
+    }
+
+    metadata.pid = None;
+    metadata.status = "paused".to_string();
+    metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
+    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    metadata.error = None;
+    metadata.exit_code = None;
+    write_live_deployment_metadata(&dir, &metadata)?;
+    let _ = std::fs::remove_file(dir.join("pid"));
+
+    println!(
+        "Live deployment paused: deploy_id={} pid={pid}",
+        metadata.deploy_id
+    );
+    Ok(())
+}
+
+fn resume_live_deployment(deploy_id: &str) -> Result<()> {
+    let dir = find_live_deployment_dir(deploy_id)?;
+    let mut metadata =
+        normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
+    let effective_status = effective_live_status(&metadata);
+    if effective_status == "running" {
+        bail!("live deployment {deploy_id} is already running");
+    }
+    if metadata.command.is_empty() {
+        bail!("live deployment {deploy_id} has no stored command to resume");
+    }
+
+    let deployment_strategy = deployment_strategy_path(&metadata, &dir);
+    if deployment_strategy.exists() {
+        rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
+    }
+
+    let exe = PathBuf::from(&metadata.command[0]);
+    let child_args = metadata.command[1..].to_vec();
+    let log_path = dir.join("live.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let stderr_file = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let mut command = ProcessCommand::new(&exe);
+    command
+        .args(&child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file));
+    if let Some(strategy_dir) = deployment_strategy
+        .parent()
+        .or_else(|| metadata.strategy.parent())
+    {
+        command.current_dir(strategy_dir);
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+
+    let child = command
+        .spawn()
+        .context("failed to resume live deployment")?;
+    write_pid_file(&dir, child.id())?;
+    metadata.pid = Some(child.id());
+    metadata.status = "running".to_string();
+    metadata.stopped = None;
+    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    metadata.error = None;
+    metadata.exit_code = None;
+    write_live_deployment_metadata(&dir, &metadata)?;
+    register_live_deployment(&dir);
+
+    println!(
+        "Live deployment resumed: deploy_id={} pid={} dir={} log={}",
+        metadata.deploy_id,
+        child.id(),
+        dir.display(),
+        log_path.display()
+    );
+    Ok(())
+}
+
+fn upgrade_live_deployment(deploy_id: &str) -> Result<()> {
+    let dir = find_live_deployment_dir(deploy_id)?;
+    let mut metadata =
+        normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
+    let effective_status = effective_live_status(&metadata);
+    if effective_status != "paused" {
+        bail!(
+            "live deployment {deploy_id} must be paused before upgrade; current status is {effective_status}"
+        );
+    }
+
+    let deployment_strategy = snapshot_strategy_code(&metadata.strategy, &dir)?;
+    rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
+    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    metadata.error = None;
+    metadata.exit_code = None;
+    write_live_deployment_metadata(&dir, &metadata)?;
+
+    println!(
+        "Live deployment upgraded: deploy_id={} code={}",
+        metadata.deploy_id,
+        deployment_strategy.display()
+    );
+    Ok(())
+}
+
+fn remove_live_deployment(deploy_id: &str, force: bool) -> Result<()> {
+    let dir = find_live_deployment_dir(deploy_id)?;
+    let metadata = normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
+    let effective_status = effective_live_status(&metadata);
+    if effective_status == "running" {
+        if !force {
+            bail!("live deployment {deploy_id} is running; pause it first or pass --force");
+        }
+        if let Some(pid) = metadata.pid {
+            terminate_process(pid)?;
+            if !wait_for_process_exit(pid, Duration::from_secs(30)) {
+                bail!("timed out waiting for live deployment {deploy_id} pid {pid} to exit");
+            }
+        }
+    }
+
+    unregister_live_deployment(&dir);
+    std::fs::remove_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to remove live deployment directory {}",
+            dir.display()
+        )
+    })?;
+    println!(
+        "Live deployment removed: deploy_id={} dir={}",
+        metadata.deploy_id,
+        dir.display()
+    );
+    Ok(())
 }
 
 fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> {
     let mut rows = discover_live_deployments()
         .into_iter()
         .filter_map(|dir| {
-            read_live_deployment_metadata(&dir)
-                .ok()
-                .map(|metadata| (dir, metadata))
+            read_live_deployment_metadata(&dir).ok().map(|metadata| {
+                let normalized = normalize_live_deployment_metadata(&dir, metadata);
+                (dir, normalized)
+            })
         })
         .collect::<Vec<_>>();
     rows.sort_by(|(_, a), (_, b)| b.launched.cmp(&a.launched));
@@ -1024,8 +1235,7 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
             "{:<36} {:<14} {:<8} {:<24} {:<16} {}",
             metadata.deploy_id,
             status,
-            metadata
-                .pid
+            running_live_pid(&metadata)
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             metadata.launched,
@@ -1040,6 +1250,7 @@ impl LiveStatusFilter {
     fn as_str(self) -> &'static str {
         match self {
             LiveStatusFilter::Running => "running",
+            LiveStatusFilter::Paused => "paused",
             LiveStatusFilter::Stopped => "stopped",
             LiveStatusFilter::RuntimeError => "runtime-error",
             LiveStatusFilter::Liquidated => "liquidated",
@@ -1143,17 +1354,57 @@ fn reserve_live_dir(
     )
 }
 
-fn snapshot_strategy_code(strategy: &Path, deployment_dir: &Path) {
+fn snapshot_strategy_code(strategy: &Path, deployment_dir: &Path) -> Result<PathBuf> {
     let code_dir = deployment_dir.join("code");
-    if std::fs::create_dir_all(&code_dir).is_err() {
-        return;
-    }
+    std::fs::create_dir_all(&code_dir)
+        .with_context(|| format!("failed to create {}", code_dir.display()))?;
     let dest = code_dir.join(
         strategy
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("main.py")),
     );
-    let _ = std::fs::copy(strategy, dest);
+    std::fs::copy(strategy, &dest).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            strategy.display(),
+            dest.display()
+        )
+    })?;
+    Ok(dest)
+}
+
+fn deployment_strategy_path(metadata: &LiveDeploymentMetadata, dir: &Path) -> PathBuf {
+    dir.join("code").join(
+        metadata
+            .strategy
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("main.py")),
+    )
+}
+
+fn rewrite_live_command_strategy(command: &mut [String], deployment_strategy: &Path) {
+    let Some(live_index) = command.iter().position(|arg| arg == "live") else {
+        return;
+    };
+    let mut index = live_index + 1;
+    while index < command.len() {
+        let arg = command[index].as_str();
+        if arg == "--foreground"
+            || arg == "--verbose"
+            || arg == "-v"
+            || arg == "--help"
+            || arg == "-h"
+        {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 2;
+            continue;
+        }
+        command[index] = deployment_strategy.to_string_lossy().to_string();
+        return;
+    }
 }
 
 fn deployment_metadata_path(dir: &Path) -> PathBuf {
@@ -1216,14 +1467,64 @@ fn is_terminal_live_status(status: &str) -> bool {
 
 fn effective_live_status(metadata: &LiveDeploymentMetadata) -> String {
     if matches!(metadata.status.as_str(), "running" | "launching") {
-        if let Some(pid) = metadata.pid {
-            if process_is_alive(pid) {
-                return "running".to_string();
-            }
-            return "stopped".to_string();
+        if running_live_pid(metadata).is_some() {
+            return "running".to_string();
         }
+        return "stopped".to_string();
     }
     metadata.status.clone()
+}
+
+fn normalize_live_deployment_metadata(
+    dir: &Path,
+    mut metadata: LiveDeploymentMetadata,
+) -> LiveDeploymentMetadata {
+    let effective_status = effective_live_status(&metadata);
+    let should_clear_pid = effective_status != "running" && metadata.pid.is_some();
+    let should_update_status = metadata.status != effective_status;
+    if should_clear_pid || should_update_status {
+        metadata.status = effective_status;
+        if metadata.status != "running" {
+            metadata.pid = None;
+            let _ = std::fs::remove_file(dir.join("pid"));
+            if metadata.stopped.is_none() {
+                metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+        metadata.updated_at = chrono::Utc::now().to_rfc3339();
+        let _ = write_live_deployment_metadata(dir, &metadata);
+    }
+    metadata
+}
+
+fn running_live_pid(metadata: &LiveDeploymentMetadata) -> Option<u32> {
+    if !matches!(metadata.status.as_str(), "running" | "launching") {
+        return None;
+    }
+    let pid = metadata.pid?;
+    if process_matches_live_deployment(pid, &metadata.deployment_dir) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn process_matches_live_deployment(pid: u32, deployment_dir: &Path) -> bool {
+    if !process_is_alive(pid) {
+        return false;
+    }
+    let Ok(output) = ProcessCommand::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let deployment_dir = deployment_dir.to_string_lossy();
+    command.contains("--live-deploy-dir") && command.contains(deployment_dir.as_ref())
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -1247,6 +1548,45 @@ fn process_is_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn terminate_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("failed to terminate pid {pid}"));
+    }
+    #[cfg(not(unix))]
+    {
+        let status = ProcessCommand::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| format!("failed to invoke kill for pid {pid}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("failed to terminate pid {pid}: kill exited with {status}");
+    }
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn register_live_deployment(dir: &Path) {
     let Some(path) = live_registry_path() else {
         return;
@@ -1254,6 +1594,25 @@ fn register_live_deployment(dir: &Path) {
     let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")));
     let mut dirs = read_live_registry();
     dirs.insert(dir.to_path_buf());
+    if let Ok(json) = serde_json::to_string_pretty(
+        &dirs
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+    ) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn unregister_live_deployment(dir: &Path) {
+    let Some(path) = live_registry_path() else {
+        return;
+    };
+    let mut dirs = read_live_registry();
+    dirs.remove(dir);
+    if let Ok(canonical) = std::fs::canonicalize(dir) {
+        dirs.remove(&canonical);
+    }
     if let Ok(json) = serde_json::to_string_pretty(
         &dirs
             .into_iter()
@@ -1814,6 +2173,119 @@ mod tests {
             },
             _ => panic!("expected live command"),
         }
+    }
+
+    #[test]
+    fn test_live_cli_list_parse_paused_status() {
+        let cli = Cli::try_parse_from(["rlean", "live", "list", "--status", "paused"]).unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::List { status }) => {
+                    assert_eq!(status, Some(LiveStatusFilter::Paused));
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live list command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_pause_parse() {
+        let cli = Cli::try_parse_from([
+            "rlean",
+            "live",
+            "pause",
+            "deploy-1",
+            "--timeout-seconds",
+            "5",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::Pause {
+                    deploy_id,
+                    timeout_seconds,
+                }) => {
+                    assert_eq!(deploy_id, "deploy-1");
+                    assert_eq!(timeout_seconds, 5);
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live pause command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_resume_parse() {
+        let cli = Cli::try_parse_from(["rlean", "live", "resume", "deploy-1"]).unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::Resume { deploy_id }) => {
+                    assert_eq!(deploy_id, "deploy-1");
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live resume command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_upgrade_parse() {
+        let cli = Cli::try_parse_from(["rlean", "live", "upgrade", "deploy-1"]).unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::Upgrade { deploy_id }) => {
+                    assert_eq!(deploy_id, "deploy-1");
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live upgrade command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_live_cli_remove_parse() {
+        let cli = Cli::try_parse_from(["rlean", "live", "remove", "deploy-1", "--force"]).unwrap();
+
+        match cli.command {
+            Command::Live(args) => match args.command {
+                Some(LiveSubcommand::Remove { deploy_id, force }) => {
+                    assert_eq!(deploy_id, "deploy-1");
+                    assert!(force);
+                    assert!(args.strategy.is_none());
+                }
+                _ => panic!("expected live remove command"),
+            },
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_live_command_strategy_uses_snapshot_path() {
+        let mut command = vec![
+            "/usr/local/bin/rlean".to_string(),
+            "live".to_string(),
+            "--foreground".to_string(),
+            "--live-deploy-dir".to_string(),
+            "/tmp/deploy".to_string(),
+            "/tmp/source/main.py".to_string(),
+            "--data".to_string(),
+            "/tmp/data".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        rewrite_live_command_strategy(&mut command, Path::new("/tmp/deploy/code/main.py"));
+
+        assert_eq!(command[5], "/tmp/deploy/code/main.py");
+        assert_eq!(command[7], "/tmp/data");
     }
 
     #[test]

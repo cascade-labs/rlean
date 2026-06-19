@@ -4,8 +4,8 @@ use crate::execution_model::{
     ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
     SecurityData,
 };
-use crate::models::passive_maker::PassiveMakerExecutionModel;
-use lean_core::Symbol;
+use crate::models::maker_then_taker::MakerThenTakerExecutionModel;
+use lean_core::{Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -13,7 +13,7 @@ use rust_decimal_macros::dec;
 /// post-only maker order before falling back to taker execution.
 pub struct AdaptiveMakerTakerExecutionModel {
     pub accepting_spread_percent: Decimal,
-    passive: PassiveMakerExecutionModel,
+    passive: MakerThenTakerExecutionModel,
     tight_targets: HashMap<String, (Symbol, Decimal)>,
 }
 
@@ -23,10 +23,23 @@ impl AdaptiveMakerTakerExecutionModel {
         max_passive_attempts: usize,
         adverse_selection_threshold: Decimal,
     ) -> Self {
+        let passive_minutes = max_passive_attempts.max(1) as i64;
+        Self::with_passive_duration(
+            accepting_spread_percent,
+            TimeSpan::from_mins(passive_minutes),
+            adverse_selection_threshold,
+        )
+    }
+
+    pub fn with_passive_duration(
+        accepting_spread_percent: Decimal,
+        passive_duration: TimeSpan,
+        adverse_selection_threshold: Decimal,
+    ) -> Self {
         Self {
             accepting_spread_percent: accepting_spread_percent.abs(),
-            passive: PassiveMakerExecutionModel::new(
-                max_passive_attempts,
+            passive: MakerThenTakerExecutionModel::new(
+                passive_duration,
                 adverse_selection_threshold,
             ),
             tight_targets: HashMap::new(),
@@ -42,11 +55,15 @@ impl AdaptiveMakerTakerExecutionModel {
             && security.price > Decimal::ZERO
             && (ask - bid) / security.price <= self.accepting_spread_percent
     }
+
+    fn open_order_quantity(context: &ExecutionContext<'_>, security: &SecurityData) -> Decimal {
+        context.projected_open_order_quantity(&security.symbol, security)
+    }
 }
 
 impl Default for AdaptiveMakerTakerExecutionModel {
     fn default() -> Self {
-        Self::new(dec!(0.001), 1, dec!(0.005))
+        Self::with_passive_duration(dec!(0.001), TimeSpan::from_mins(5), dec!(0.005))
     }
 }
 
@@ -67,6 +84,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
                 .map(|security| self.spread_is_tight(security))
                 .unwrap_or(false)
             {
+                self.passive.remove_target(&target.symbol);
                 self.tight_targets
                     .insert(key, (target.symbol.clone(), target.quantity));
             } else {
@@ -75,16 +93,18 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
             }
         }
 
-        let tight_snapshot: Vec<_> = self
+        let mut tight_snapshot: Vec<_> = self
             .tight_targets
             .iter()
             .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
             .collect();
+        context.sort_targets_by_margin_impact(&mut tight_snapshot);
 
         for (key, symbol, target_quantity) in tight_snapshot {
             let Some(security) = context.securities.get(&key) else {
                 continue;
             };
+            let open_order_quantity = Self::open_order_quantity(context, security);
             if !self.spread_is_tight(security) {
                 self.tight_targets.remove(&key);
                 passive_targets.push(ExecutionTarget {
@@ -94,19 +114,41 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
                 continue;
             }
 
-            let delta = target_quantity - security.current_quantity - security.open_order_quantity;
-            if delta == Decimal::ZERO {
+            let holding_delta = context.actual_holding_delta(security, target_quantity);
+            if holding_delta == Decimal::ZERO {
                 self.tight_targets.remove(&key);
+                if open_order_quantity != Decimal::ZERO {
+                    market_orders.push(OrderRequest {
+                        order_id: None,
+                        symbol,
+                        quantity: Decimal::ZERO,
+                        order_type: ExecutionOrderType::Cancel,
+                        limit_price: None,
+                        post_only: false,
+                        cancel_open_orders: true,
+                        tag: "AdaptiveMakerTakerExecutionModel cancel stale passive".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            let order_quantity = if open_order_quantity != Decimal::ZERO {
+                holding_delta
+            } else {
+                context.unordered_quantity(&symbol, security, target_quantity)
+            };
+            if order_quantity == Decimal::ZERO {
                 continue;
             }
 
             market_orders.push(OrderRequest {
+                order_id: None,
                 symbol,
-                quantity: delta,
+                quantity: order_quantity,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,
                 post_only: false,
-                cancel_open_orders: false,
+                cancel_open_orders: open_order_quantity != Decimal::ZERO,
                 tag: "AdaptiveMakerTakerExecutionModel tight-spread".to_string(),
             });
         }

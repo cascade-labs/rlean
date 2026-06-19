@@ -53,16 +53,56 @@ impl OrderProcessor {
         self.generate_order_events_with_quotes(bars, &std::collections::HashMap::new(), time)
     }
 
+    pub fn generate_post_algorithm_order_events(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
+        self.generate_post_algorithm_order_events_with_quotes(
+            bars,
+            &std::collections::HashMap::new(),
+            time,
+        )
+    }
+
     pub fn generate_order_events_with_quotes(
         &self,
         bars: &std::collections::HashMap<u64, TradeBar>,
         quote_bars: &std::collections::HashMap<u64, QuoteBar>,
         time: DateTime,
     ) -> Vec<OrderEvent> {
+        self.generate_order_events_with_quotes_matching(bars, quote_bars, time, |_| true)
+    }
+
+    pub fn generate_post_algorithm_order_events_with_quotes(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        quote_bars: &std::collections::HashMap<u64, QuoteBar>,
+        time: DateTime,
+    ) -> Vec<OrderEvent> {
+        self.generate_order_events_with_quotes_matching(bars, quote_bars, time, |order| {
+            order.order_type == OrderType::Market
+                || (order.time < time
+                    && order
+                        .last_update_time
+                        .is_none_or(|last_update_time| last_update_time < time))
+        })
+    }
+
+    fn generate_order_events_with_quotes_matching(
+        &self,
+        bars: &std::collections::HashMap<u64, TradeBar>,
+        quote_bars: &std::collections::HashMap<u64, QuoteBar>,
+        time: DateTime,
+        predicate: impl Fn(&Order) -> bool,
+    ) -> Vec<OrderEvent> {
         let open = self.transaction_manager.get_open_orders();
         let mut events = Vec::new();
 
         for order in open {
+            if !predicate(&order) {
+                continue;
+            }
             let sid = order.symbol.id.sid;
             if let Some(bar) = bars.get(&sid) {
                 if let Some(event) = self.try_fill(&order, bar, quote_bars.get(&sid), time) {

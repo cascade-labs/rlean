@@ -47,11 +47,6 @@ pub trait FillModel: Send + Sync {
         if time <= order.time {
             return None;
         }
-        if order.properties.post_only {
-            if let Some(fill) = passive_limit_fill_with_quotes(order, quote_bar, time) {
-                return Some(fill);
-            }
-        }
         if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
             self.limit_fill(order, &bar, time)
         } else {
@@ -169,29 +164,6 @@ fn directional_quote_trade_bar(
     ))
 }
 
-fn passive_limit_fill_with_quotes(
-    order: &Order,
-    quote_bar: Option<&QuoteBar>,
-    time: DateTime,
-) -> Option<Fill> {
-    let limit = order.limit_price?;
-    let quote_bar = quote_bar?;
-
-    if order.quantity > dec!(0) {
-        let bid = quote_bar.bid.as_ref()?;
-        if bid.low < limit {
-            return Some(make_filled(order, time, limit, dec!(0)));
-        }
-    } else {
-        let ask = quote_bar.ask.as_ref()?;
-        if ask.high > limit {
-            return Some(make_filled(order, time, limit, dec!(0)));
-        }
-    }
-
-    None
-}
-
 fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price) -> Fill {
     let mut event = OrderEvent::filled(
         order.id,
@@ -200,10 +172,7 @@ fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price
         fill_price,
         order.quantity,
     );
-    event.limit_price = order.limit_price;
-    event.stop_price = order.stop_price;
-    event.trailing_amount = order.trailing_amount;
-    event.trailing_as_percentage = order.trailing_as_percent;
+    event.apply_order_fields(order);
     Fill {
         order_event: event,
         slippage,
@@ -216,10 +185,11 @@ fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price
 
 /// Immediate fill model.
 ///
-/// With trade bars only, market orders fill at the bar open. When quote bars are
-/// supplied, fills use the order-direction side of the quote bar: buys use ask
-/// prices and sells use bid prices. This mirrors LEAN's `GetPrices` selection
-/// model for subscribed quote data while preserving the trade-bar path.
+/// With trade bars only, market orders fill at the bar close/current price.
+/// When quote bars are supplied, fills use the order-direction side of the
+/// quote bar: buys use ask prices and sells use bid prices. This mirrors
+/// LEAN's `GetPrices` selection model for subscribed quote data while
+/// preserving the trade-bar path.
 pub struct ImmediateFillModel {
     pub slippage: Box<dyn SlippageModel>,
 }
@@ -234,9 +204,9 @@ impl FillModel for ImmediateFillModel {
     fn market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
         let fill_price = if order.quantity > dec!(0) {
-            bar.open + slip
+            bar.close + slip
         } else {
-            bar.open - slip
+            bar.close - slip
         };
 
         make_filled(order, time, fill_price, slip)
@@ -265,11 +235,12 @@ impl FillModel for ImmediateFillModel {
     fn limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
         let limit = order.limit_price?;
 
-        // Buy limit fills if low <= limit; sell limit fills if high >= limit
+        // Match LEAN's base FillModel: a limit order fills only after the bar
+        // penetrates the limit price, not merely when it touches it.
         let fills = if order.quantity > dec!(0) {
-            bar.low <= limit
+            bar.low < limit
         } else {
-            bar.high >= limit
+            bar.high > limit
         };
 
         if !fills {
@@ -322,11 +293,12 @@ impl FillModel for ImmediateFillModel {
             return None;
         }
 
-        // Now check if limit is also triggered
+        // Now check if limit is also triggered. Use the same strict
+        // penetration semantics as limit orders.
         let limit_fills = if order.quantity > dec!(0) {
-            bar.low <= limit
+            bar.low < limit
         } else {
-            bar.high >= limit
+            bar.high > limit
         };
 
         if !limit_fills {

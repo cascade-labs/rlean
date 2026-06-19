@@ -328,6 +328,7 @@ pub fn load_brokerage_plugin(
         unsafe { Library::new(&plugin_path) }
             .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
     ));
+    initialize_plugin_library(lib, name);
     let create: Symbol<lean_plugin::CreateBrokerageFn> = unsafe {
         lib.get(b"rlean_create_brokerage\0")
     }
@@ -403,6 +404,7 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         unsafe { Library::new(&plugin_path) }
             .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
     ));
+    initialize_plugin_library(lib, name);
 
     let create: Symbol<unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut ()> =
         unsafe { lib.get(b"rlean_create_history_provider\0") }.map_err(|_| {
@@ -450,6 +452,7 @@ fn load_plugin_live_data_provider(
         unsafe { Library::new(&plugin_path) }
             .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
     ));
+    initialize_plugin_library(lib, name);
 
     let create: Symbol<lean_plugin::CreateLiveDataProviderFn> =
         unsafe { lib.get(b"rlean_create_live_data_provider\0") }.map_err(|_| {
@@ -537,6 +540,7 @@ pub fn load_custom_data_plugins(
                 continue;
             }
         };
+        initialize_plugin_library(&lib, &path.display().to_string());
 
         let factory: Symbol<unsafe extern "C" fn() -> *mut ()> =
             match unsafe { lib.get(b"rlean_custom_data_factory\0") } {
@@ -577,6 +581,30 @@ pub fn load_custom_data_plugins(
     }
 
     sources
+}
+
+fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) {
+    type DescriptorFn = unsafe extern "C" fn() -> lean_plugin::PluginDescriptor;
+
+    let descriptor: libloading::Symbol<DescriptorFn> =
+        match unsafe { lib.get(b"rlean_plugin_descriptor\0") } {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                tracing::debug!(
+                    "Plugin {requested_plugin} does not export rlean_plugin_descriptor: {error}"
+                );
+                return;
+            }
+        };
+
+    let descriptor = unsafe { descriptor() };
+    tracing::debug!(
+        requested_plugin,
+        plugin = descriptor.name_str(),
+        version = descriptor.version_str(),
+        kind = %descriptor.kind,
+        "Initialized plugin descriptor"
+    );
 }
 
 fn dylib_ext() -> &'static str {

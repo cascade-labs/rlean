@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::py_types::PyResolution;
 use lean_alpha::{IAlphaModel, InsightCollection, InsightDirection as AlphaDir};
-use lean_core::{Symbol, TickType, TimeSpan};
+use lean_core::{DateTime, Resolution, Symbol, TickType, TimeSpan};
 use lean_execution::{
-    AdaptiveMakerTakerExecutionModel, ExecutionContext, ExecutionOpenOrder, ExecutionOrderType,
-    ExecutionTarget, IExecutionModel, ImmediateExecutionModel, MakerThenTakerExecutionModel,
-    OrderRequest, SecurityData,
+    AdaptiveMakerTakerExecutionModel, AggressivePostOnlyExecutionModel, ExecutionContext,
+    ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    ImmediateExecutionModel, MakerThenTakerExecutionModel, OrderRequest, SecurityData,
 };
 use lean_portfolio_construction::{
     AccumulativeInsightPortfolioConstructionModel,
@@ -45,6 +46,8 @@ pub struct FrameworkState {
     /// LEAN-style active insight collection owned by the framework pipeline.
     pub insights: InsightCollection,
     pending_flat_targets: Vec<lean_alpha::Insight>,
+    pending_security_changes: bool,
+    next_rebalance_time: Option<DateTime>,
 }
 
 impl FrameworkState {
@@ -56,6 +59,8 @@ impl FrameworkState {
             risk_model: Box::new(NullRiskManagement),
             insights: InsightCollection::new(),
             pending_flat_targets: Vec::new(),
+            pending_security_changes: false,
+            next_rebalance_time: None,
         }
     }
 
@@ -88,7 +93,7 @@ impl FrameworkState {
         self.pcm.update_security_prices(prices);
 
         let expired_insights = self.insights.remove_expired(slice.time);
-        let has_insight_changes = !alpha_insights.is_empty() || !expired_insights.is_empty();
+        let expired_insight_count = expired_insights.len();
 
         for insight in &alpha_insights {
             if insight.direction == AlphaDir::Flat {
@@ -98,10 +103,6 @@ impl FrameworkState {
             } else {
                 self.insights.add(insight.clone());
             }
-        }
-
-        if !has_insight_changes && self.pending_flat_targets.is_empty() {
-            return self.exec_model.execute_with_context(&[], execution_context);
         }
 
         let mut target_insights = self.insights.latest_active_per_symbol(slice.time);
@@ -116,10 +117,17 @@ impl FrameworkState {
             }
         }
 
+        let pending_flat_count = self.pending_flat_targets.len();
         target_insights.append(&mut self.pending_flat_targets);
 
         if target_insights.is_empty() {
             return self.exec_model.execute_with_context(&[], execution_context);
+        }
+
+        let insight_changes =
+            !alpha_insights.is_empty() || expired_insight_count != 0 || pending_flat_count != 0;
+        if !self.is_rebalance_due(slice.time, insight_changes) {
+            return Vec::new();
         }
 
         // 2. Convert active alpha Insights → InsightForPcm.
@@ -171,6 +179,9 @@ impl FrameworkState {
     }
 
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
+        if !added.is_empty() || !removed.is_empty() {
+            self.pending_security_changes = true;
+        }
         for model in &mut self.alpha_models {
             model.on_securities_changed(added, removed);
         }
@@ -182,6 +193,41 @@ impl FrameworkState {
             insight.direction = AlphaDir::Flat;
             self.pending_flat_targets.push(insight);
         }
+    }
+
+    fn is_rebalance_due(&mut self, now: DateTime, insight_changes: bool) -> bool {
+        let Some(period) = self.pcm.rebalance_period() else {
+            return true;
+        };
+
+        if self.next_rebalance_time.is_none() {
+            self.next_rebalance_time = Some(now + period);
+        }
+
+        if self.pcm.rebalance_on_security_changes() && self.pending_security_changes {
+            self.refresh_rebalance(now);
+            return true;
+        }
+
+        if self.pcm.rebalance_on_insight_changes() && insight_changes {
+            self.refresh_rebalance(now);
+            return true;
+        }
+
+        if self
+            .next_rebalance_time
+            .is_some_and(|rebalance_time| rebalance_time <= now)
+        {
+            self.refresh_rebalance(now);
+            return true;
+        }
+
+        false
+    }
+
+    fn refresh_rebalance(&mut self, now: DateTime) {
+        self.next_rebalance_time = self.pcm.rebalance_period().map(|period| now + period);
+        self.pending_security_changes = false;
     }
 }
 
@@ -210,11 +256,6 @@ pub fn run_framework_pipeline(
     let (securities, prices, portfolio_value, security_data, open_order_data) = {
         let alg = alg_inner.lock().unwrap();
         let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
-        let prices: HashMap<String, Decimal> = alg
-            .securities
-            .all()
-            .map(|s| (s.symbol.value.clone(), s.current_price()))
-            .collect();
         let holdings: HashMap<String, Decimal> = alg
             .portfolio
             .all_holdings()
@@ -239,6 +280,7 @@ pub fn run_framework_pipeline(
                 id: order.id,
                 symbol: order.symbol.clone(),
                 quantity: order.quantity,
+                filled_quantity: order.filled_quantity,
                 remaining_quantity,
                 order_type,
                 limit_price: order.limit_price,
@@ -249,7 +291,7 @@ pub fn run_framework_pipeline(
             });
         }
         let pv = alg.portfolio.total_portfolio_value();
-        let security_data = alg
+        let security_data: HashMap<String, SecurityData> = alg
             .securities
             .all()
             .map(|security| {
@@ -261,6 +303,10 @@ pub fn run_framework_pipeline(
                 let lot_size = Decimal::from_f64(security.symbol_properties.lot_size)
                     .filter(|lot| *lot > Decimal::ZERO)
                     .unwrap_or(Decimal::ONE);
+                let minimum_price_variation =
+                    Decimal::from_f64(security.symbol_properties.minimum_price_variation)
+                        .filter(|tick| *tick > Decimal::ZERO)
+                        .unwrap_or(Decimal::new(1, 2));
                 let data = execution_security_data_from_slice(
                     slice,
                     symbol,
@@ -268,9 +314,14 @@ pub fn run_framework_pipeline(
                     current_qty,
                     open_order_qty,
                     lot_size,
+                    minimum_price_variation,
                 );
                 (key, data)
             })
+            .collect();
+        let prices: HashMap<String, Decimal> = security_data
+            .iter()
+            .map(|(key, data)| (key.clone(), data.price))
             .collect();
         (securities, prices, pv, security_data, open_order_data)
     };
@@ -298,6 +349,7 @@ fn execution_security_data_from_slice(
     current_quantity: Decimal,
     open_order_quantity: Decimal,
     lot_size: Decimal,
+    minimum_price_variation: Decimal,
 ) -> SecurityData {
     let sid = symbol.id.sid;
     let mut price = base_price;
@@ -404,6 +456,7 @@ fn execution_security_data_from_slice(
         daily_std_dev: None,
         end_time,
         lot_size,
+        minimum_price_variation,
         current_quantity,
         open_order_quantity,
     }
@@ -606,24 +659,47 @@ pub struct PyEqualWeightingPcm {
 #[pymethods]
 impl PyEqualWeightingPcm {
     #[new]
-    #[pyo3(signature = (_rebalance=None, portfolio_bias=PyPortfolioBias::LongShort, max_weight=None))]
+    #[pyo3(signature = (rebalance=None, portfolio_bias=PyPortfolioBias::LongShort, max_weight=None))]
     pub fn new(
-        _rebalance: Option<&Bound<'_, PyAny>>,
+        rebalance: Option<&Bound<'_, PyAny>>,
         portfolio_bias: PyPortfolioBias,
         max_weight: Option<f64>,
     ) -> Self {
         let max_weight = max_weight
             .filter(|value| value.is_finite() && *value > 0.0)
             .and_then(Decimal::from_f64_retain);
+        let rebalance_period = py_rebalance_period(rebalance);
         Self {
             model: Some(Box::new(
-                EqualWeightingPortfolioConstructionModel::with_bias_and_max_weight(
+                EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance(
                     portfolio_bias.into(),
                     max_weight,
+                    rebalance_period,
                 ),
             )),
         }
     }
+}
+
+fn py_rebalance_period(rebalance: Option<&Bound<'_, PyAny>>) -> Option<TimeSpan> {
+    let Some(rebalance) = rebalance else {
+        return Some(TimeSpan::ONE_DAY);
+    };
+
+    if let Ok(py_resolution) = rebalance.extract::<PyResolution>() {
+        let resolution: Resolution = py_resolution.into();
+        return resolution.to_time_span();
+    }
+
+    if let Ok(seconds_obj) = rebalance.call_method0("total_seconds") {
+        if let Ok(seconds) = seconds_obj.extract::<f64>() {
+            if seconds.is_finite() && seconds > 0.0 {
+                return Some(TimeSpan::from_nanos((seconds * 1_000_000_000.0) as i64));
+            }
+        }
+    }
+
+    Some(TimeSpan::ONE_DAY)
 }
 
 impl Default for PyEqualWeightingPcm {
@@ -1018,31 +1094,41 @@ pub struct PyAdaptiveMakerTakerExecutionModel {
     accepting_spread_percent: f64,
     max_passive_attempts: usize,
     adverse_selection_threshold: f64,
+    passive_duration_seconds: f64,
 }
 
 #[pymethods]
 impl PyAdaptiveMakerTakerExecutionModel {
     #[new]
-    #[pyo3(signature = (accepting_spread_percent=0.001, max_passive_attempts=1, adverse_selection_threshold=0.005, asynchronous=true))]
+    #[pyo3(signature = (accepting_spread_percent=0.001, max_passive_attempts=5, adverse_selection_threshold=0.005, asynchronous=true, passive_duration_seconds=None))]
     pub fn new(
         accepting_spread_percent: f64,
         max_passive_attempts: usize,
         adverse_selection_threshold: f64,
         asynchronous: bool,
+        passive_duration_seconds: Option<f64>,
     ) -> Self {
         let _ = asynchronous;
         let accepting_spread_percent = accepting_spread_percent.abs();
         let max_passive_attempts = max_passive_attempts.max(1);
         let adverse_selection_threshold = adverse_selection_threshold.abs();
+        let passive_duration_seconds = passive_duration_seconds
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .unwrap_or(max_passive_attempts as f64 * 60.0);
+        let passive_duration =
+            TimeSpan::from_millis((passive_duration_seconds * 1000.0).round() as i64);
         Self {
-            model: Some(Box::new(AdaptiveMakerTakerExecutionModel::new(
-                Decimal::from_f64(accepting_spread_percent).unwrap_or(Decimal::ZERO),
-                max_passive_attempts,
-                Decimal::from_f64(adverse_selection_threshold).unwrap_or(Decimal::ZERO),
-            ))),
+            model: Some(Box::new(
+                AdaptiveMakerTakerExecutionModel::with_passive_duration(
+                    Decimal::from_f64(accepting_spread_percent).unwrap_or(Decimal::ZERO),
+                    passive_duration,
+                    Decimal::from_f64(adverse_selection_threshold).unwrap_or(Decimal::ZERO),
+                ),
+            )),
             accepting_spread_percent,
             max_passive_attempts,
             adverse_selection_threshold,
+            passive_duration_seconds,
         }
     }
 
@@ -1059,6 +1145,11 @@ impl PyAdaptiveMakerTakerExecutionModel {
     #[getter]
     pub fn adverse_selection_threshold(&self) -> f64 {
         self.adverse_selection_threshold
+    }
+
+    #[getter]
+    pub fn passive_duration_seconds(&self) -> f64 {
+        self.passive_duration_seconds
     }
 }
 
@@ -1108,6 +1199,35 @@ impl PyMakerThenTakerExecutionModel {
     #[getter]
     pub fn adverse_selection_threshold(&self) -> f64 {
         self.adverse_selection_threshold
+    }
+
+    #[getter]
+    pub fn maximum_order_value(&self) -> f64 {
+        self.maximum_order_value
+    }
+}
+
+#[pyclass(name = "AggressivePostOnlyExecutionModel")]
+pub struct PyAggressivePostOnlyExecutionModel {
+    pub model: Option<Box<dyn IExecutionModel>>,
+    maximum_order_value: f64,
+}
+
+#[pymethods]
+impl PyAggressivePostOnlyExecutionModel {
+    #[new]
+    #[pyo3(signature = (maximum_order_value=0.0, asynchronous=true))]
+    pub fn new(maximum_order_value: f64, asynchronous: bool) -> Self {
+        let _ = asynchronous;
+        let maximum_order_value = maximum_order_value.abs();
+        Self {
+            model: Some(Box::new(
+                AggressivePostOnlyExecutionModel::with_maximum_order_value(
+                    Decimal::from_f64(maximum_order_value).unwrap_or(Decimal::ZERO),
+                ),
+            )),
+            maximum_order_value,
+        }
     }
 
     #[getter]
@@ -1885,6 +2005,222 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_algorithm::qc_algorithm::QcAlgorithm;
+    use lean_core::{Market, Resolution};
+    use lean_data::quote_bar::{Bar, QuoteBar};
+    use rust_decimal_macros::dec;
+
+    struct OneShotAlpha {
+        symbol: Symbol,
+        emitted: bool,
+    }
+
+    impl IAlphaModel for OneShotAlpha {
+        fn update(
+            &mut self,
+            _slice: &lean_data::Slice,
+            _securities: &[Symbol],
+        ) -> Vec<lean_alpha::Insight> {
+            if self.emitted {
+                Vec::new()
+            } else {
+                self.emitted = true;
+                vec![lean_alpha::Insight::new(
+                    self.symbol.clone(),
+                    AlphaDir::Up,
+                    TimeSpan::from_mins(30),
+                    None,
+                    None,
+                    "one-shot",
+                )]
+            }
+        }
+    }
+
+    struct CountingPcm {
+        symbol: Symbol,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl IPortfolioConstructionModel for CountingPcm {
+        fn create_targets(
+            &mut self,
+            insights: &[InsightForPcm],
+            _portfolio_value: Decimal,
+            _prices: &HashMap<String, Decimal>,
+        ) -> Vec<lean_portfolio_construction::PortfolioTarget> {
+            *self.calls.lock().unwrap() += 1;
+            assert!(!insights.is_empty());
+            vec![lean_portfolio_construction::PortfolioTarget::new(
+                self.symbol.clone(),
+                dec!(10),
+            )]
+        }
+
+        fn rebalance_period(&self) -> Option<TimeSpan> {
+            Some(TimeSpan::ONE_DAY)
+        }
+    }
+
+    struct RecordingPricePcm {
+        symbol: Symbol,
+        seen_price: Arc<Mutex<Option<Decimal>>>,
+    }
+
+    impl IPortfolioConstructionModel for RecordingPricePcm {
+        fn create_targets(
+            &mut self,
+            _insights: &[InsightForPcm],
+            _portfolio_value: Decimal,
+            prices: &HashMap<String, Decimal>,
+        ) -> Vec<lean_portfolio_construction::PortfolioTarget> {
+            *self.seen_price.lock().unwrap() = prices.get(&self.symbol.value).copied();
+            Vec::new()
+        }
+    }
+
+    struct RecordingExecution {
+        target_counts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl IExecutionModel for RecordingExecution {
+        fn execute_with_context(
+            &mut self,
+            targets: &[ExecutionTarget],
+            _context: &ExecutionContext<'_>,
+        ) -> Vec<OrderRequest> {
+            self.target_counts.lock().unwrap().push(targets.len());
+            Vec::new()
+        }
+    }
+
+    fn security_data(symbol: Symbol, time: lean_core::DateTime) -> SecurityData {
+        SecurityData {
+            symbol,
+            price: dec!(100),
+            bid: Some(dec!(99)),
+            ask: Some(dec!(101)),
+            volume: None,
+            vwap_price: None,
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(time),
+            lot_size: dec!(1),
+            minimum_price_variation: dec!(0.01),
+            current_quantity: Decimal::ZERO,
+            open_order_quantity: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn active_insights_do_not_drive_pcm_between_alpha_updates() {
+        let symbol = Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let pcm_calls = Arc::new(Mutex::new(0usize));
+        let execution_target_counts = Arc::new(Mutex::new(Vec::new()));
+        let mut framework = FrameworkState::new();
+        framework.alpha_models.push(Box::new(OneShotAlpha {
+            symbol: symbol.clone(),
+            emitted: false,
+        }));
+        framework.pcm = Box::new(CountingPcm {
+            symbol: symbol.clone(),
+            calls: pcm_calls.clone(),
+        });
+        framework.exec_model = Box::new(RecordingExecution {
+            target_counts: execution_target_counts.clone(),
+        });
+
+        let securities = vec![symbol.clone()];
+        let prices = HashMap::from([(symbol.value.clone(), dec!(100))]);
+        let first_security_data = HashMap::from([(
+            symbol.value.clone(),
+            security_data(symbol.clone(), lean_core::DateTime::from_secs(0)),
+        )]);
+        let second_security_data = HashMap::from([(
+            symbol.value.clone(),
+            security_data(symbol.clone(), lean_core::DateTime::from_secs(60)),
+        )]);
+        let open_orders = Vec::new();
+
+        let first_slice = lean_data::Slice::new(lean_core::DateTime::from_secs(0));
+        let first_context = ExecutionContext::new(
+            first_slice.time,
+            &first_security_data,
+            &open_orders,
+            dec!(100000),
+        );
+        framework.run_pipeline(
+            &first_slice,
+            &securities,
+            dec!(100000),
+            &prices,
+            &first_context,
+        );
+
+        let second_slice = lean_data::Slice::new(lean_core::DateTime::from_secs(60));
+        let second_context = ExecutionContext::new(
+            second_slice.time,
+            &second_security_data,
+            &open_orders,
+            dec!(100000),
+        );
+        framework.run_pipeline(
+            &second_slice,
+            &securities,
+            dec!(100000),
+            &prices,
+            &second_context,
+        );
+
+        assert_eq!(*pcm_calls.lock().unwrap(), 1);
+        assert_eq!(execution_target_counts.lock().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn framework_percent_targets_use_current_slice_price_snapshot() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+        algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm.securities.update_price(&symbol, dec!(1));
+
+        let framework = Arc::new(Mutex::new(FrameworkState::new()));
+        let seen_price = Arc::new(Mutex::new(None));
+        {
+            let mut fw = framework.lock().unwrap();
+            fw.alpha_models.push(Box::new(OneShotAlpha {
+                symbol: symbol.clone(),
+                emitted: false,
+            }));
+            fw.pcm = Box::new(RecordingPricePcm {
+                symbol: symbol.clone(),
+                seen_price: seen_price.clone(),
+            });
+            fw.exec_model = Box::new(RecordingExecution {
+                target_counts: Arc::new(Mutex::new(Vec::new())),
+            });
+        }
+
+        let mut slice = lean_data::Slice::new(lean_core::DateTime::from_secs(0));
+        slice.add_quote_bar(QuoteBar::new(
+            symbol.clone(),
+            lean_core::DateTime::from_secs(0),
+            TimeSpan::from_mins(1),
+            Some(Bar::new(dec!(49), dec!(49), dec!(49), dec!(49))),
+            Some(Bar::new(dec!(51), dec!(51), dec!(51), dec!(51))),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        ));
+
+        let algorithm = Arc::new(Mutex::new(algorithm));
+        run_framework_pipeline(&framework, &algorithm, &slice);
+
+        assert_eq!(*seen_price.lock().unwrap(), Some(dec!(50)));
+    }
+}
+
 // ─── Extraction helpers ───────────────────────────────────────────────────────
 
 /// Try to extract an IAlphaModel Box from a Python object.
@@ -1985,6 +2321,9 @@ pub fn try_take_exec(model: &Bound<'_, PyAny>) -> Option<Box<dyn IExecutionModel
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyMakerThenTakerExecutionModel>() {
+        return m.borrow_mut().model.take();
+    }
+    if let Ok(m) = model.cast::<PyAggressivePostOnlyExecutionModel>() {
         return m.borrow_mut().model.take();
     }
     if let Ok(m) = model.cast::<PyStandardDeviationExecutionModel>() {
