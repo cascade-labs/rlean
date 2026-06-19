@@ -924,8 +924,10 @@ mod tests {
                 .eval(c"lambda rows: ['SPY']", None, None)
                 .unwrap()
                 .unbind();
-            let mut settings = UniverseSettingsState::default();
-            settings.resolution = Resolution::Minute;
+            let settings = UniverseSettingsState {
+                resolution: Resolution::Minute,
+                ..Default::default()
+            };
             let mut universe = PyScheduledUniverse::custom_data(
                 "fixture".to_string(),
                 "snapshot".to_string(),

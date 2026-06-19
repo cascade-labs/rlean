@@ -1223,8 +1223,8 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
 
     let filter = status_filter.map(|status| status.as_str().to_string());
     println!(
-        "{:<36} {:<14} {:<8} {:<24} {:<16} {}",
-        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE", "STRATEGY"
+        "{:<36} {:<14} {:<8} {:<24} {:<16} STRATEGY",
+        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE"
     );
     for (_, metadata) in rows {
         let status = effective_live_status(&metadata);
@@ -1535,7 +1535,7 @@ fn process_is_alive(pid: u32) -> bool {
             return true;
         }
         let error = std::io::Error::last_os_error();
-        return error.raw_os_error() == Some(libc::EPERM);
+        error.raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     ProcessCommand::new("kill")
@@ -1559,7 +1559,7 @@ fn terminate_process(pid: u32) -> Result<()> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        return Err(error).with_context(|| format!("failed to terminate pid {pid}"));
+        Err(error).with_context(|| format!("failed to terminate pid {pid}"))
     }
     #[cfg(not(unix))]
     {

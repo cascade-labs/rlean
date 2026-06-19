@@ -170,19 +170,14 @@ pub struct CustomDataPoint {
 }
 
 /// How a custom-data subscription is consumed by the engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CustomDataSubscriptionRole {
     /// Ordinary `add_data` subscription delivered to `Slice.custom_data`.
+    #[default]
     Data,
     /// Universe-selection input consumed before `OnData`, like C# LEAN
     /// `FuncUniverse<T>` data.
     Universe,
-}
-
-impl Default for CustomDataSubscriptionRole {
-    fn default() -> Self {
-        Self::Data
-    }
 }
 
 /// Active custom data subscription for one ticker + source type.

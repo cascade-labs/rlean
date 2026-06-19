@@ -961,6 +961,7 @@ impl QcAlgorithm {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn limit_order_with_properties_and_tag(
         &mut self,
         symbol: &Symbol,

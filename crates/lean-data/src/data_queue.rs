@@ -24,7 +24,7 @@ pub struct LiveNodePacket {
 #[derive(Debug, Clone)]
 pub enum LiveDataSubscriptionConfig {
     Market(SubscriptionDataConfig),
-    Custom(CustomDataSubscription),
+    Custom(Box<CustomDataSubscription>),
     Universe(LiveUniverseSubscriptionConfig),
 }
 

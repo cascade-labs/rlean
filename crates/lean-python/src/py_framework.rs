@@ -2006,6 +2006,7 @@ fn extract_py_insights(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<lean_alph
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use lean_algorithm::qc_algorithm::QcAlgorithm;

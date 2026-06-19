@@ -39,62 +39,6 @@ pub struct OrderEvent {
     pub trailing_as_percentage: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::limit_if_touched_order::LimitIfTouchedOrder;
-    use rust_decimal_macros::dec;
-
-    fn spy() -> Symbol {
-        Symbol::create_equity("SPY", &lean_core::Market::usa())
-    }
-
-    #[test]
-    fn apply_order_fields_copies_limit_order_prices() {
-        let order = Order::limit(1, spy(), dec!(10), dec!(451), DateTime::EPOCH, "limit");
-        let mut event = OrderEvent::new(
-            order.id,
-            order.symbol.clone(),
-            DateTime::EPOCH,
-            OrderStatus::Submitted,
-        );
-
-        event.apply_order_fields(&order);
-
-        assert_eq!(event.direction, crate::order::OrderDirection::Buy);
-        assert_eq!(event.quantity, dec!(10));
-        assert_eq!(event.limit_price, Some(dec!(451)));
-        assert_eq!(event.stop_price, None);
-        assert_eq!(event.trigger_price, None);
-    }
-
-    #[test]
-    fn apply_order_fields_maps_limit_if_touched_trigger_price() {
-        let order = LimitIfTouchedOrder::new(
-            1,
-            spy(),
-            dec!(10),
-            dec!(445),
-            dec!(444),
-            DateTime::EPOCH,
-            "lit",
-        )
-        .order;
-        let mut event = OrderEvent::new(
-            order.id,
-            order.symbol.clone(),
-            DateTime::EPOCH,
-            OrderStatus::Submitted,
-        );
-
-        event.apply_order_fields(&order);
-
-        assert_eq!(event.limit_price, Some(dec!(444)));
-        assert_eq!(event.stop_price, None);
-        assert_eq!(event.trigger_price, Some(dec!(445)));
-    }
-}
-
 impl OrderEvent {
     pub fn new(order_id: i64, symbol: Symbol, time: DateTime, status: OrderStatus) -> Self {
         OrderEvent {
@@ -206,5 +150,61 @@ impl OrderEvent {
         };
         self.trailing_amount = order.trailing_amount;
         self.trailing_as_percentage = order.trailing_as_percent;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limit_if_touched_order::LimitIfTouchedOrder;
+    use rust_decimal_macros::dec;
+
+    fn spy() -> Symbol {
+        Symbol::create_equity("SPY", &lean_core::Market::usa())
+    }
+
+    #[test]
+    fn apply_order_fields_copies_limit_order_prices() {
+        let order = Order::limit(1, spy(), dec!(10), dec!(451), DateTime::EPOCH, "limit");
+        let mut event = OrderEvent::new(
+            order.id,
+            order.symbol.clone(),
+            DateTime::EPOCH,
+            OrderStatus::Submitted,
+        );
+
+        event.apply_order_fields(&order);
+
+        assert_eq!(event.direction, crate::order::OrderDirection::Buy);
+        assert_eq!(event.quantity, dec!(10));
+        assert_eq!(event.limit_price, Some(dec!(451)));
+        assert_eq!(event.stop_price, None);
+        assert_eq!(event.trigger_price, None);
+    }
+
+    #[test]
+    fn apply_order_fields_maps_limit_if_touched_trigger_price() {
+        let order = LimitIfTouchedOrder::new(
+            1,
+            spy(),
+            dec!(10),
+            dec!(445),
+            dec!(444),
+            DateTime::EPOCH,
+            "lit",
+        )
+        .order;
+        let mut event = OrderEvent::new(
+            order.id,
+            order.symbol.clone(),
+            DateTime::EPOCH,
+            OrderStatus::Submitted,
+        );
+
+        event.apply_order_fields(&order);
+
+        assert_eq!(event.limit_price, Some(dec!(444)));
+        assert_eq!(event.stop_price, None);
+        assert_eq!(event.trigger_price, Some(dec!(445)));
     }
 }

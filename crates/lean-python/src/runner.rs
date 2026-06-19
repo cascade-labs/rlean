@@ -884,6 +884,7 @@ fn reconcile_runner_subscriptions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_runner_data_for_new_subscriptions(
     config: &RunConfig,
     new_subs: &[Arc<SubscriptionDataConfig>],
@@ -1713,7 +1714,7 @@ fn subscribe_custom_data_source_live(
         })?;
     let (sender, receiver) = live_data_channel();
     let live_subscription = LiveDataSubscription::new(
-        LiveDataSubscriptionConfig::Custom(subscription.clone()),
+        LiveDataSubscriptionConfig::Custom(Box::new(subscription.clone())),
         receiver,
     );
     tokio::spawn(poll_custom_data_source_subscription(
@@ -2202,6 +2203,7 @@ fn submit_execution_order_request(alg: &mut QcAlgorithm, request: lean_execution
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_live_universe_data(
     adapter: &mut PyAlgorithmAdapter,
     slice_proxy: &mut SliceProxy,
@@ -6029,7 +6031,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 .map(|order| order.symbol.id.sid)
                 .collect();
             if !pending_option_order_sids.is_empty() {
-                for (_, (underlying_sym, bars)) in &option_eod_bars_for_day {
+                for (underlying_sym, bars) in option_eod_bars_for_day.values() {
                     for bar in bars {
                         let Some(symbol) = option_eod_bar_symbol(bar, underlying_sym) else {
                             continue;
@@ -8671,6 +8673,7 @@ fn synthesize_trade_bar_from_quote_bar(bar: &QuoteBar) -> Option<TradeBar> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_quote_bar_to_minute<F>(
     sid: u64,
     raw_qbar: QuoteBar,
@@ -10296,6 +10299,7 @@ fn subscription_has_mapped_data_for_range(
     subscription_has_mapped_data_for_range_from_rows(sub, &rows, start, end)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_factor_rows_into_map(
     reader: &ParquetReader,
     data_root: &Path,

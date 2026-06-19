@@ -20,6 +20,7 @@ pub struct Trade {
 }
 
 impl Trade {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         symbol: Symbol,
         entry_time: DateTime,
