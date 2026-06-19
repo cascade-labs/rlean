@@ -6,16 +6,17 @@
 /// its file because success is represented by a filesystem side effect, not
 /// returned rows.  A provider that returns `Ok(vec![])` for market data or an
 /// `anyhow::Error` whose message starts with "NotImplemented:" is treated as
-/// "I don't have this data — try the next one".  Any other error short-circuits
-/// and is returned immediately.
+/// "I don't have this data — try the next one".  With a single provider,
+/// unexpected provider errors are returned. With multiple providers, a provider
+/// error is treated as a miss so fallback providers can satisfy the request.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use lean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol, SymbolOptionsExt};
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{OptionEodBar, OptionUniverseRow};
 use tracing::debug;
 
@@ -30,6 +31,15 @@ pub fn is_not_implemented(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("NotImplemented:")
 }
 
+fn is_recoverable_cache_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("Parquet error") || message.contains("Invalid Parquet file")
+}
+
+fn should_fall_through_provider_error(provider_count: usize) -> bool {
+    provider_count > 1
+}
+
 fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> bool {
     match data_type {
         DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
@@ -37,6 +47,8 @@ fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> b
         }
         DataType::QuoteBar => batch.quote_bars.is_empty(),
         DataType::Tick | DataType::OpenInterest => batch.ticks.is_empty(),
+        DataType::MarginInterestRate => batch.margin_interest_rates.is_empty(),
+        DataType::PerpetualContext => batch.perpetual_contexts.is_empty(),
     }
 }
 
@@ -101,6 +113,10 @@ fn option_contract_symbol_values(ticker: &str, contracts: &[OptionUniverseRow]) 
             )
         })
         .collect()
+}
+
+fn normalize_underlying(ticker: &str) -> String {
+    ticker.trim().trim_start_matches('?').to_ascii_uppercase()
 }
 
 /// Wraps multiple `IHistoryProvider` implementations and tries them in
@@ -176,6 +192,30 @@ impl IHistoryProvider for StackedHistoryProvider {
                     );
                     continue;
                 }
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable cache error for {:?} {} ({} → {}): {}",
+                        idx,
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for {:?} {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.data_type,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -183,8 +223,71 @@ impl IHistoryProvider for StackedHistoryProvider {
     }
 
     async fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider.get_quote_bars(request).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable quote cache error for {}: {}",
+                        idx, request.symbol.value, e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for quote bars {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            match provider.get_ticks(request).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable tick cache error for {}: {}",
+                        idx, request.symbol.value, e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for ticks {} ({} → {}); trying next provider: {}",
+                        idx,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_margin_interest_rates(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<MarginInterestRate>> {
+        for provider in &self.providers {
+            match provider.get_margin_interest_rates(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -194,9 +297,12 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(vec![])
     }
 
-    async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
+    async fn get_perpetual_contexts(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<PerpetualContext>> {
         for provider in &self.providers {
-            match provider.get_ticks(request).await {
+            match provider.get_perpetual_contexts(request).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
@@ -252,6 +358,25 @@ impl IHistoryProvider for StackedHistoryProvider {
                     );
                     continue;
                 }
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable batched cache error for {:?}: {}",
+                        idx, request.data_type, e
+                    );
+                    continue;
+                }
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider #{} failed for batched {:?} ({} symbols, {} → {}); trying next provider: {}",
+                        idx,
+                        request.data_type,
+                        request.symbols.len(),
+                        request.start.date_utc(),
+                        request.end.date_utc(),
+                        e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -263,11 +388,18 @@ impl IHistoryProvider for StackedHistoryProvider {
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionEodBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider.get_option_eod_bars(ticker, date).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable option EOD cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -279,7 +411,7 @@ impl IHistoryProvider for StackedHistoryProvider {
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
-        let key = ticker.to_ascii_uppercase();
+        let key = normalize_underlying(ticker);
         if let Some(rows) = self
             .option_universe_cache
             .lock()
@@ -318,13 +450,96 @@ impl IHistoryProvider for StackedHistoryProvider {
         Ok(rows)
     }
 
+    async fn get_option_universes(
+        &self,
+        tickers: &[String],
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<HashMap<String, Vec<OptionUniverseRow>>> {
+        let mut requested = Vec::new();
+        let mut seen = HashSet::new();
+        for ticker in tickers {
+            let key = normalize_underlying(ticker);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            requested.push(key);
+        }
+
+        let mut out = HashMap::new();
+        let mut remaining = Vec::new();
+        {
+            let cache = self
+                .option_universe_cache
+                .lock()
+                .expect("option universe cache poisoned");
+            for ticker in requested {
+                if let Some(rows) = cache
+                    .get(&ticker)
+                    .filter(|entry| entry.date == date)
+                    .map(|entry| entry.rows.as_ref().clone())
+                {
+                    out.insert(ticker, rows);
+                } else {
+                    remaining.push(ticker);
+                }
+            }
+        }
+
+        for provider in &self.providers {
+            if remaining.is_empty() {
+                break;
+            }
+
+            match provider.get_option_universes(&remaining, date).await {
+                Ok(batch) => {
+                    let normalized_batch = batch
+                        .into_iter()
+                        .map(|(ticker, rows)| (normalize_underlying(&ticker), rows))
+                        .collect::<HashMap<_, _>>();
+                    let mut still_missing = Vec::new();
+                    for ticker in remaining {
+                        match normalized_batch.get(&ticker) {
+                            Some(rows) if !rows.is_empty() => {
+                                out.insert(ticker, rows.clone());
+                            }
+                            _ => still_missing.push(ticker),
+                        }
+                    }
+                    remaining = still_missing;
+                }
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        for ticker in remaining {
+            out.entry(ticker).or_insert_with(Vec::new);
+        }
+
+        let mut cache = self
+            .option_universe_cache
+            .lock()
+            .expect("option universe cache poisoned");
+        for (ticker, rows) in &out {
+            cache.insert(
+                ticker.clone(),
+                OptionUniverseCacheEntry {
+                    date,
+                    rows: Arc::new(rows.clone()),
+                },
+            );
+        }
+
+        Ok(out)
+    }
+
     async fn get_option_trade_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<TradeBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider
                 .get_option_trade_bars(ticker, resolution, date)
                 .await
@@ -332,6 +547,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable option trade cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -345,7 +567,7 @@ impl IHistoryProvider for StackedHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[lean_storage::OptionUniverseRow],
     ) -> anyhow::Result<Vec<TradeBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider
                 .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
                 .await
@@ -353,6 +575,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable filtered option trade cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -365,7 +594,7 @@ impl IHistoryProvider for StackedHistoryProvider {
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider
                 .get_option_quote_bars(ticker, resolution, date)
                 .await
@@ -373,6 +602,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable option quote cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -387,7 +623,7 @@ impl IHistoryProvider for StackedHistoryProvider {
         contracts: &[lean_storage::OptionUniverseRow],
     ) -> anyhow::Result<Vec<QuoteBar>> {
         let mut best_partial = Vec::new();
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider
                 .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
                 .await
@@ -406,6 +642,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                 }
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable filtered option quote cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -417,11 +660,18 @@ impl IHistoryProvider for StackedHistoryProvider {
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<Tick>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider.get_option_ticks(ticker, date).await {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable option tick cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -434,7 +684,7 @@ impl IHistoryProvider for StackedHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[lean_storage::OptionUniverseRow],
     ) -> anyhow::Result<Vec<Tick>> {
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             match provider
                 .get_option_ticks_filtered(ticker, date, contracts)
                 .await
@@ -442,6 +692,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable filtered option tick cache error for {} {}: {}",
+                        idx, ticker, date, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -504,6 +761,13 @@ impl IHistoryProvider for StackedHistoryProvider {
                     debug!(
                         "History provider #{} does not implement batched option {:?}",
                         idx, request.data_type
+                    );
+                    continue;
+                }
+                Err(ref e) if is_recoverable_cache_error(e) => {
+                    debug!(
+                        "History provider #{} hit recoverable batched option cache error for {:?}: {}",
+                        idx, request.data_type, e
                     );
                     continue;
                 }

@@ -13,9 +13,9 @@
 /// }
 /// ```
 ///
-/// rlean loads all `.dylib`/`.so` files in `~/.rlean/plugins/` at startup,
-/// calls `rlean_plugin_descriptor()` on each, and routes provider/brokerage
-/// registration accordingly.
+/// rlean loads installed `.dylib`/`.so` files from `~/.rlean/plugins/` on
+/// demand, calls `rlean_plugin_descriptor()` before invoking plugin factories,
+/// and routes provider/brokerage registration accordingly.
 /// The type of capability a plugin provides.
 ///
 /// A single plugin crate may implement multiple kinds by exporting multiple
@@ -133,6 +133,40 @@ pub type CreateCustomDataSourceFn = unsafe extern "C" fn() -> *mut ();
 /// Free a custom data source created by `CreateCustomDataSourceFn`.
 pub type DestroyCustomDataSourceFn = unsafe extern "C" fn(ptr: *mut ());
 
+/// C-stable factory: create a live data queue handler from a JSON config string.
+///
+/// Returns a heap-allocated `Box<Box<dyn lean_data::DataQueueHandler>>` cast to
+/// `*mut ()`. The caller casts it back to that trait object and keeps the
+/// plugin library loaded for the process lifetime.
+pub type CreateLiveDataProviderFn =
+    unsafe extern "C" fn(config_json: *const std::os::raw::c_char) -> *mut ();
+
+/// Free a live data provider created by `CreateLiveDataProviderFn`.
+pub type DestroyLiveDataProviderFn = unsafe extern "C" fn(ptr: *mut ());
+
+/// C-stable factory: create a brokerage from a JSON config string.
+///
+/// Returns a heap-allocated `Box<Box<dyn lean_brokerages::Brokerage>>` cast to
+/// `*mut ()`.
+pub type CreateBrokerageFn =
+    unsafe extern "C" fn(config_json: *const std::os::raw::c_char) -> *mut ();
+
+/// Free a brokerage created by `CreateBrokerageFn`.
+pub type DestroyBrokerageFn = unsafe extern "C" fn(ptr: *mut ());
+
+/// Install the process-level rustls crypto provider used by rlean plugins.
+///
+/// rustls 0.23 cannot auto-select a provider when plugin dependency feature
+/// unification enables both `aws-lc-rs` and `ring`; installing `ring` here
+/// keeps that process-global setup in the plugin ABI instead of in each
+/// individual networked plugin.
+pub fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Convenience macro for plugin crates to implement the required export.
 ///
 /// ```rust,ignore
@@ -149,6 +183,7 @@ macro_rules! rlean_plugin {
     (name = $name:literal, version = $ver:literal, kind = $kind:expr $(,)?) => {
         #[no_mangle]
         pub extern "C" fn rlean_plugin_descriptor() -> $crate::PluginDescriptor {
+            $crate::ensure_crypto_provider();
             $crate::PluginDescriptor {
                 name: concat!($name, "\0").as_ptr(),
                 version: concat!($ver, "\0").as_ptr(),

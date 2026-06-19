@@ -1,5 +1,9 @@
+pub mod adaptive_maker_taker;
+pub mod aggressive_post_only;
 pub mod immediate;
+pub mod maker_then_taker;
 pub mod null;
+pub mod passive_maker;
 pub mod spread;
 pub mod standard_deviation;
 pub mod twap;

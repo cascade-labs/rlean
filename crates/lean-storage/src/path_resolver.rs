@@ -53,6 +53,24 @@ impl PathResolver {
         self.partition("option", "usa", "daily", "universe", date)
     }
 
+    pub fn margin_interest_partition(&self, symbol: &Symbol, date: NaiveDate) -> PathBuf {
+        self.data_root
+            .join(format!("{}", symbol.security_type()).to_lowercase())
+            .join(symbol.market().as_str().to_lowercase())
+            .join("margin_interest")
+            .join(format!("date={date}"))
+            .join("data.parquet")
+    }
+
+    pub fn perpetual_context_partition(&self, symbol: &Symbol, date: NaiveDate) -> PathBuf {
+        self.data_root
+            .join(format!("{}", symbol.security_type()).to_lowercase())
+            .join(symbol.market().as_str().to_lowercase())
+            .join("perpetual_context")
+            .join(format!("date={date}"))
+            .join("data.parquet")
+    }
+
     fn partition(
         &self,
         security_type: &str,

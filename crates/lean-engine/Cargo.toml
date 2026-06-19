@@ -10,6 +10,7 @@ lean-storage = { path = "../lean-storage" }
 lean-orders = { path = "../lean-orders" }
 lean-algorithm = { path = "../lean-algorithm" }
 lean-statistics = { path = "../lean-statistics" }
+lean-data-providers = { path = "../lean-data-providers" }
 lean-risk = { path = "../lean-risk" }
 lean-universe = { path = "../lean-universe" }
 lean-scheduling = { path = "../lean-scheduling" }
@@ -22,6 +23,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

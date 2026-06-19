@@ -34,6 +34,16 @@ fn create_crypto_symbol_has_correct_type() {
 }
 
 #[test]
+fn create_crypto_future_symbol_has_correct_type_and_market() {
+    let market = Market::hyperliquid();
+    let sym = Symbol::create_crypto_future("btc", &market);
+    assert_eq!(sym.security_type(), SecurityType::CryptoFuture);
+    assert_eq!(sym.value, "BTC");
+    assert_eq!(sym.market().as_str(), "hyperliquid");
+    assert!(sym.id.expiry.is_none());
+}
+
+#[test]
 fn create_future_symbol_has_expiry() {
     let market = Market::cme();
     let expiry = NaiveDate::from_ymd_opt(2024, 12, 20).unwrap();

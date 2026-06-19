@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use lean_core::Symbol;
-use lean_data::{QuoteBar, Tick, TradeBar};
+use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
+use std::collections::{HashMap, HashSet};
+use tracing::debug;
 
 use crate::request::{
     DataType, DownloadRequest, HistoryBatchRequest, HistoryRequest, MarketDataBatch,
@@ -29,6 +31,22 @@ pub trait IHistoryProvider: Send + Sync {
         Ok(vec![])
     }
 
+    /// Fetch historical margin-interest/funding-rate data for the symbol.
+    async fn get_margin_interest_rates(
+        &self,
+        _request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<MarginInterestRate>> {
+        Ok(vec![])
+    }
+
+    /// Fetch historical perpetual context data for the symbol.
+    async fn get_perpetual_contexts(
+        &self,
+        _request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<PerpetualContext>> {
+        Ok(vec![])
+    }
+
     /// Fetch/cache a multi-symbol batch. Providers with true batch APIs should
     /// override this; the default keeps existing providers correct by fanning
     /// out over the single-symbol async methods.
@@ -45,16 +63,55 @@ pub trait IHistoryProvider: Send + Sync {
                 end: request.end,
                 data_type: request.data_type,
             };
-            match request.data_type {
+            let result: anyhow::Result<()> = match request.data_type {
                 DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
-                    batch.trade_bars.extend(self.get_history(&single).await?);
+                    match self.get_history(&single).await {
+                        Ok(rows) => {
+                            batch.trade_bars.extend(rows);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
-                DataType::QuoteBar => {
-                    batch.quote_bars.extend(self.get_quote_bars(&single).await?);
-                }
-                DataType::Tick | DataType::OpenInterest => {
-                    batch.ticks.extend(self.get_ticks(&single).await?);
-                }
+                DataType::QuoteBar => match self.get_quote_bars(&single).await {
+                    Ok(rows) => {
+                        batch.quote_bars.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                DataType::Tick | DataType::OpenInterest => match self.get_ticks(&single).await {
+                    Ok(rows) => {
+                        batch.ticks.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                DataType::MarginInterestRate => match self.get_margin_interest_rates(&single).await
+                {
+                    Ok(rows) => {
+                        batch.margin_interest_rates.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                DataType::PerpetualContext => match self.get_perpetual_contexts(&single).await {
+                    Ok(rows) => {
+                        batch.perpetual_contexts.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+            if let Err(err) = result {
+                debug!(
+                    "Skipping failed {:?} batch symbol {} ({} → {}): {}",
+                    request.data_type,
+                    symbol.value,
+                    request.start.date_utc(),
+                    request.end.date_utc(),
+                    err
+                );
             }
         }
         Ok(batch)
@@ -84,6 +141,28 @@ pub trait IHistoryProvider: Send + Sync {
         _date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
         Ok(vec![])
+    }
+
+    /// Fetch option universes for a set of underlyings on `date`.
+    ///
+    /// Providers that can batch chain lookups should override this. The default
+    /// preserves existing provider behavior by fanning out to the one-underlying
+    /// method.
+    async fn get_option_universes(
+        &self,
+        tickers: &[String],
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<HashMap<String, Vec<OptionUniverseRow>>> {
+        let mut out = HashMap::new();
+        let mut seen = HashSet::new();
+        for ticker in tickers {
+            let key = ticker.to_ascii_uppercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            out.insert(key, self.get_option_universe(ticker, date).await?);
+        }
+        Ok(out)
     }
 
     /// Fetch intraday option trade bars for all contracts of `ticker` on `date`.
@@ -195,34 +274,58 @@ pub trait IHistoryProvider: Send + Sync {
     ) -> anyhow::Result<OptionMarketDataBatch> {
         let mut batch = OptionMarketDataBatch::default();
         for ticker in &request.tickers {
-            match request.data_type {
+            let result: anyhow::Result<()> = match request.data_type {
                 OptionDataType::EodBar => {
-                    batch
-                        .eod_bars
-                        .extend(self.get_option_eod_bars(ticker, request.date).await?);
+                    match self.get_option_eod_bars(ticker, request.date).await {
+                        Ok(rows) => {
+                            batch.eod_bars.extend(rows);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
                 OptionDataType::Universe => {
-                    batch
-                        .universe
-                        .extend(self.get_option_universe(ticker, request.date).await?);
+                    match self.get_option_universe(ticker, request.date).await {
+                        Ok(rows) => {
+                            batch.universe.extend(rows);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
-                OptionDataType::TradeBar => {
-                    batch.trade_bars.extend(
-                        self.get_option_trade_bars(ticker, request.resolution, request.date)
-                            .await?,
-                    );
-                }
-                OptionDataType::QuoteBar => {
-                    batch.quote_bars.extend(
-                        self.get_option_quote_bars(ticker, request.resolution, request.date)
-                            .await?,
-                    );
-                }
-                OptionDataType::Tick => {
-                    batch
-                        .ticks
-                        .extend(self.get_option_ticks(ticker, request.date).await?);
-                }
+                OptionDataType::TradeBar => match self
+                    .get_option_trade_bars(ticker, request.resolution, request.date)
+                    .await
+                {
+                    Ok(rows) => {
+                        batch.trade_bars.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                OptionDataType::QuoteBar => match self
+                    .get_option_quote_bars(ticker, request.resolution, request.date)
+                    .await
+                {
+                    Ok(rows) => {
+                        batch.quote_bars.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+                OptionDataType::Tick => match self.get_option_ticks(ticker, request.date).await {
+                    Ok(rows) => {
+                        batch.ticks.extend(rows);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+            if let Err(err) = result {
+                debug!(
+                    "Skipping failed option {:?} batch ticker {} ({}): {}",
+                    request.data_type, ticker, request.date, err
+                );
             }
         }
         Ok(batch)
@@ -273,15 +376,7 @@ pub trait IMapFileProvider: Send + Sync {
     fn get(&self, symbol: &Symbol, date: chrono::NaiveDate) -> Option<String>;
 }
 
-/// Subscribes to a live data stream — Rust equivalent of C# `IDataQueueHandler`.
-#[async_trait]
-pub trait ILiveDataProvider: Send + Sync {
-    /// Subscribe to live data for `symbol`.
-    async fn subscribe(&self, symbol: &Symbol) -> anyhow::Result<()>;
+/// Live data providers implement LEAN's `IDataQueueHandler` contract.
+pub trait ILiveDataProvider: lean_data::DataQueueHandler {}
 
-    /// Unsubscribe from live data for `symbol`.
-    async fn unsubscribe(&self, symbol: &Symbol) -> anyhow::Result<()>;
-
-    /// Whether the provider is currently connected to the live feed.
-    fn is_connected(&self) -> bool;
-}
+impl<T> ILiveDataProvider for T where T: lean_data::DataQueueHandler {}

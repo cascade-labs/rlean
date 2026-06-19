@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
+    SecurityData,
 };
-use lean_core::Symbol;
+use lean_core::{DateTime, Symbol};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -13,29 +15,104 @@ use rust_decimal_macros::dec;
 /// Mirrors C# StandardDeviationExecutionModel:
 /// - For buys: execute if bid < SMA - (deviations * std_dev)  → price dipped below mean
 /// - For sells: execute if ask > SMA + (deviations * std_dev) → price spiked above mean
-///
-/// Since we lack a running SMA/STD indicator here, we use the current price as the mean proxy
-/// and `security_data.daily_std_dev` as the standard deviation. When daily_std_dev is None,
-/// execution is always allowed (no filter applied).
 pub struct StandardDeviationExecutionModel {
+    /// Period of the rolling SMA/std-dev indicators.
+    pub period: usize,
     /// Number of std deviations required before executing (default: 2.0)
     pub deviations: Decimal,
-    /// Pending targets: symbol ticker -> (symbol, remaining delta)
-    pending: HashMap<String, (Symbol, Decimal)>,
+    /// Maximum order notional in account currency per execution slice.
+    ///
+    /// Mirrors C# StandardDeviationExecutionModel.MaximumOrderValue.
+    pub maximum_order_value: Decimal,
+    /// Desired target quantity per symbol (ticker -> target quantity).
+    targets: HashMap<String, (Symbol, Decimal)>,
+    prices: HashMap<String, VecDeque<Decimal>>,
 }
 
 impl StandardDeviationExecutionModel {
-    pub fn new(deviations: Decimal) -> Self {
+    pub fn new(period: usize, deviations: Decimal) -> Self {
+        Self::with_maximum_order_value(period, deviations, dec!(20000))
+    }
+
+    pub fn with_maximum_order_value(
+        period: usize,
+        deviations: Decimal,
+        maximum_order_value: Decimal,
+    ) -> Self {
         Self {
+            period: period.max(1),
             deviations,
-            pending: HashMap::new(),
+            maximum_order_value,
+            targets: HashMap::new(),
+            prices: HashMap::new(),
         }
+    }
+
+    fn update_price(&mut self, security: &SecurityData) {
+        if security.price <= Decimal::ZERO {
+            return;
+        }
+
+        let window = self
+            .prices
+            .entry(security.symbol.value.clone())
+            .or_default();
+        window.push_back(security.price);
+        while window.len() > self.period {
+            window.pop_front();
+        }
+    }
+
+    fn ready_mean_std_dev(&self, key: &str) -> Option<(Decimal, Decimal)> {
+        let window = self.prices.get(key)?;
+        if window.len() < self.period {
+            return None;
+        }
+
+        let count = Decimal::from(window.len());
+        let mean = window.iter().copied().sum::<Decimal>() / count;
+        let variance = window
+            .iter()
+            .map(|price| {
+                let diff = *price - mean;
+                diff * diff
+            })
+            .sum::<Decimal>()
+            / count;
+        let std_dev =
+            Decimal::from_f64(variance.to_f64().unwrap_or(0.0).sqrt()).unwrap_or(Decimal::ZERO);
+        Some((mean, std_dev))
+    }
+
+    fn adjust_by_lot_size(lot_size: Decimal, quantity: Decimal) -> Decimal {
+        if lot_size <= Decimal::ZERO || quantity == Decimal::ZERO {
+            return quantity;
+        }
+
+        let abs_quantity = quantity.abs();
+        let mut remainder = abs_quantity % lot_size;
+        let missing_for_lot_size = lot_size - remainder;
+        if missing_for_lot_size < lot_size / dec!(1000000) {
+            remainder -= lot_size;
+        }
+
+        (abs_quantity - remainder) * sign(quantity)
+    }
+}
+
+fn sign(value: Decimal) -> Decimal {
+    if value < Decimal::ZERO {
+        -Decimal::ONE
+    } else if value > Decimal::ZERO {
+        Decimal::ONE
+    } else {
+        Decimal::ZERO
     }
 }
 
 impl Default for StandardDeviationExecutionModel {
     fn default() -> Self {
-        Self::new(dec!(2.0))
+        Self::new(60, dec!(2.0))
     }
 }
 
@@ -45,82 +122,118 @@ impl IExecutionModel for StandardDeviationExecutionModel {
         targets: &[ExecutionTarget],
         securities: &HashMap<String, SecurityData>,
     ) -> Vec<OrderRequest> {
-        // Merge new targets into pending
+        let open_orders = Vec::new();
+        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
+        self.execute_with_context(targets, &context)
+    }
+
+    fn execute_with_context(
+        &mut self,
+        targets: &[ExecutionTarget],
+        context: &ExecutionContext<'_>,
+    ) -> Vec<OrderRequest> {
+        for sec in context.securities.values() {
+            self.update_price(sec);
+        }
+
+        // Merge new targets into the persistent target collection.
         for target in targets {
             let key = target.symbol.value.clone();
-            let current_qty = securities
-                .get(&key)
-                .map(|s| s.current_quantity)
-                .unwrap_or(Decimal::ZERO);
-            let delta = target.quantity - current_qty;
-            self.pending.insert(key, (target.symbol.clone(), delta));
+            self.targets
+                .insert(key, (target.symbol.clone(), target.quantity));
         }
 
         let mut orders = Vec::new();
+        let mut fulfilled = Vec::new();
 
-        for (key, (symbol, remaining)) in &mut self.pending {
-            if *remaining == Decimal::ZERO {
-                continue;
-            }
+        let mut target_snapshot: Vec<_> = self
+            .targets
+            .iter()
+            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .collect();
+        context.sort_targets_by_margin_impact(&mut target_snapshot);
 
-            let sec = match securities.get(key) {
+        for (key, symbol, target_quantity) in target_snapshot {
+            let sec = match context.securities.get(&key) {
                 Some(s) => s,
                 None => continue,
             };
+
+            if context.actual_holding_delta(sec, target_quantity) == Decimal::ZERO {
+                fulfilled.push(key.clone());
+                continue;
+            }
+
+            let unordered_quantity = context.unordered_quantity(&symbol, sec, target_quantity);
+            if unordered_quantity == Decimal::ZERO {
+                continue;
+            }
 
             let price = sec.price;
             if price <= Decimal::ZERO {
                 continue;
             }
 
-            // Check if price is favorable relative to std dev bands.
-            // We use current price as the SMA proxy (no running indicator).
-            // Favorable = price has moved enough std devs in the right direction.
-            let price_favorable = match sec.daily_std_dev {
-                Some(std_dev) if std_dev > Decimal::ZERO => {
-                    let threshold = self.deviations * std_dev;
-                    let is_buy = *remaining > Decimal::ZERO;
-                    if is_buy {
-                        // Buy when bid is below price - threshold
-                        let bid = sec.bid.unwrap_or(price);
-                        bid < price - threshold
-                    } else {
-                        // Sell when ask is above price + threshold
-                        let ask = sec.ask.unwrap_or(price);
-                        ask > price + threshold
-                    }
-                }
-                // No std dev data: allow execution unconditionally
-                _ => true,
+            let Some((mean, std_dev)) = self.ready_mean_std_dev(&key) else {
+                continue;
+            };
+            if std_dev <= Decimal::ZERO {
+                continue;
+            }
+
+            let threshold = self.deviations * std_dev;
+            let is_buy = unordered_quantity > Decimal::ZERO;
+            let price_favorable = if is_buy {
+                let bid = sec.bid.unwrap_or(price);
+                bid < mean - threshold
+            } else {
+                let ask = sec.ask.unwrap_or(price);
+                ask > mean + threshold
             };
 
             if !price_favorable {
                 continue;
             }
 
+            let max_order_size = if self.maximum_order_value > Decimal::ZERO {
+                self.maximum_order_value / price
+            } else {
+                Decimal::ZERO
+            };
+            let order_size = max_order_size.min(unordered_quantity.abs());
+            let order_qty =
+                Self::adjust_by_lot_size(sec.lot_size, order_size) * sign(unordered_quantity);
+
+            if order_qty == Decimal::ZERO {
+                continue;
+            }
+
             orders.push(OrderRequest {
-                symbol: symbol.clone(),
-                quantity: *remaining,
+                order_id: None,
+                symbol,
+                quantity: order_qty,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,
+                post_only: false,
+                cancel_open_orders: false,
                 tag: format!(
-                    "StandardDeviationExecutionModel deviations={}",
-                    self.deviations
+                    "StandardDeviationExecutionModel period={} deviations={}",
+                    self.period, self.deviations
                 ),
             });
-
-            *remaining = Decimal::ZERO;
         }
 
-        // Remove fulfilled entries
-        self.pending.retain(|_, (_, r)| *r != Decimal::ZERO);
+        for key in fulfilled {
+            self.targets.remove(&key);
+        }
 
         orders
     }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.pending.remove(&sym.value);
+            self.targets.remove(&sym.value);
+            self.prices.remove(&sym.value);
         }
     }
 

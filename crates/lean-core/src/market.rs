@@ -42,6 +42,7 @@ impl Market {
     market_const!(BYBIT, "bybit");
     market_const!(COINBASE, "coinbase");
     market_const!(KRAKEN, "kraken");
+    market_const!(HYPERLIQUID, "hyperliquid");
     market_const!(FTXUS, "ftxus");
     market_const!(BITMEX, "bitmex");
     market_const!(CME, "cme");
@@ -81,6 +82,9 @@ impl Market {
     pub fn coinbase() -> Self {
         Market::new(Self::COINBASE)
     }
+    pub fn hyperliquid() -> Self {
+        Market::new(Self::HYPERLIQUID)
+    }
     pub fn cme() -> Self {
         Market::new(Self::CME)
     }
@@ -102,6 +106,7 @@ static MARKET_CODES: Lazy<RwLock<HashMap<String, u32>>> = Lazy::new(|| {
     m.insert(Market::BINANCE.to_string(), 9);
     m.insert(Market::COINBASE.to_string(), 10);
     m.insert(Market::KRAKEN.to_string(), 11);
+    m.insert(Market::HYPERLIQUID.to_string(), 12);
     RwLock::new(m)
 });
 

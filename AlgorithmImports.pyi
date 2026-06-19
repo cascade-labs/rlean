@@ -70,6 +70,29 @@ class SecurityType:
     Cfd: SecurityType
     Crypto: SecurityType
     Index: SecurityType
+    IndexOption: SecurityType
+    INDEX_OPTION: SecurityType
+    CryptoFuture: SecurityType
+    CRYPTO_FUTURE: SecurityType
+
+# ── Market ───────────────────────────────────────────────────────────────────
+
+class Market:
+    USA: str
+    BINANCE: str
+    BYBIT: str
+    COINBASE: str
+    KRAKEN: str
+    HYPERLIQUID: str
+
+class HyperliquidUniverse:
+    CRYPTO_PERP: str
+    CRYPTO_SPOT: str
+    HIP3_XYZ: str
+    HIP3_TRADING_XYZ: str
+    HIP3_VNTL: str
+    @staticmethod
+    def hip3(dex: str) -> str: ...
 
 # ── OrderType ─────────────────────────────────────────────────────────────────
 
@@ -102,6 +125,16 @@ class OrderStatus:
     CancelPending: OrderStatus
     UpdateSubmitted: OrderStatus
 
+# ── TimeInForce ───────────────────────────────────────────────────────────────
+
+class TimeInForce:
+    """LEAN TimeInForce enum."""
+
+    GOOD_TIL_CANCELED: TimeInForce
+    GOOD_TIL_CANCELLED: TimeInForce
+    GTC: TimeInForce
+    DAY: TimeInForce
+
 # ── OptionRight ───────────────────────────────────────────────────────────────
 
 class OptionRight:
@@ -117,6 +150,47 @@ class OptionRight:
 
 class Symbol:
     """Immutable identifier for a tradeable security."""
+
+    @staticmethod
+    def create(ticker: str, security_type: Any = None, market: Optional[str] = None) -> Symbol: ...
+    @staticmethod
+    def Create(ticker: str, security_type: Any = None, market: Optional[str] = None) -> Symbol: ...
+    @staticmethod
+    def create_option_osi(
+        underlying: Symbol | str,
+        strike: float,
+        expiry: datetime | str | int,
+        right: OptionRight | str | int,
+        style: str | int | None = None,
+        market: Optional[str] = None,
+    ) -> Symbol: ...
+    @staticmethod
+    def CreateOptionOsi(
+        underlying: Symbol | str,
+        strike: float,
+        expiry: datetime | str | int,
+        right: OptionRight | str | int,
+        style: str | int | None = None,
+        market: Optional[str] = None,
+    ) -> Symbol: ...
+    @staticmethod
+    def create_index_option_osi(
+        underlying: Symbol | str,
+        strike: float,
+        expiry: datetime | str | int,
+        right: OptionRight | str | int,
+        style: str | int | None = None,
+        market: Optional[str] = None,
+    ) -> Symbol: ...
+    @staticmethod
+    def CreateIndexOptionOsi(
+        underlying: Symbol | str,
+        strike: float,
+        expiry: datetime | str | int,
+        right: OptionRight | str | int,
+        style: str | int | None = None,
+        market: Optional[str] = None,
+    ) -> Symbol: ...
 
     @property
     def value(self) -> str:
@@ -202,6 +276,46 @@ class TradeBars:
     def __len__(self) -> int: ...
     def values(self) -> List[TradeBar]: ...
 
+# ── MarginInterestRate ───────────────────────────────────────────────────────
+
+class MarginInterestRate:
+    symbol: Symbol
+    time: datetime
+    interest_rate: float
+    value: float
+
+class MarginInterestRates:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[MarginInterestRate]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[MarginInterestRate]: ...
+
+# ── PerpetualContext ─────────────────────────────────────────────────────────
+
+class PerpetualContext:
+    symbol: Symbol
+    time: datetime
+    end_time: datetime
+    funding: float
+    open_interest: float
+    prev_day_px: float
+    day_ntl_vlm: float
+    premium: float
+    oracle_px: float
+    mark_px: float
+    mid_px: float
+    impact_bid_px: float
+    impact_ask_px: float
+    value: float
+
+class PerpetualContexts:
+    def __getitem__(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def get(self, symbol: Symbol | Security | str) -> Optional[PerpetualContext]: ...
+    def __contains__(self, symbol: Symbol | Security | str) -> bool: ...
+    def __len__(self) -> int: ...
+    def values(self) -> List[PerpetualContext]: ...
+
 # ── Slice ─────────────────────────────────────────────────────────────────────
 
 class Slice:
@@ -211,6 +325,10 @@ class Slice:
 
     @property
     def bars(self) -> TradeBars: ...
+    @property
+    def margin_interest_rates(self) -> MarginInterestRates: ...
+    @property
+    def perpetual_contexts(self) -> PerpetualContexts: ...
 
     def get_bar(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
     def get(self, symbol: Symbol | Security | str) -> Optional[TradeBar]: ...
@@ -228,6 +346,33 @@ class OrderEvent:
     fill_quantity: float
     is_fill: bool
     message: str
+
+class OrderTicket:
+    """Handle returned by order submission methods."""
+
+    order_id: int
+    id: int
+    symbol: Symbol
+    status: OrderStatus
+    quantity: float
+    filled_quantity: float
+    average_fill_price: float
+    limit_price: Optional[float]
+    stop_price: Optional[float]
+    tag: str
+    is_open: bool
+    order_events: List[OrderEvent]
+
+    def cancel(self, tag: Optional[str] = ...) -> bool: ...
+    def Cancel(self, tag: Optional[str] = ...) -> bool: ...
+    def update(self, limit_price: Optional[float] = ..., stop_price: Optional[float] = ..., tag: Optional[str] = ...) -> bool: ...
+    def Update(self, limit_price: Optional[float] = ..., stop_price: Optional[float] = ..., tag: Optional[str] = ...) -> bool: ...
+    def update_limit_price(self, limit_price: float, tag: Optional[str] = ...) -> bool: ...
+    def UpdateLimitPrice(self, limit_price: float, tag: Optional[str] = ...) -> bool: ...
+    def update_stop_price(self, stop_price: float, tag: Optional[str] = ...) -> bool: ...
+    def UpdateStopPrice(self, stop_price: float, tag: Optional[str] = ...) -> bool: ...
+    def update_tag(self, tag: str) -> bool: ...
+    def UpdateTag(self, tag: str) -> bool: ...
 
 # ── SecurityHolding ───────────────────────────────────────────────────────────
 
@@ -650,9 +795,11 @@ class BrokerageName:
     Default: BrokerageName
     InteractiveBrokersBrokerage: BrokerageName
     TradierBrokerage: BrokerageName
+    HyperliquidBrokerage: BrokerageName
     DEFAULT: BrokerageName
     INTERACTIVE_BROKERS_BROKERAGE: BrokerageName
     TRADIER_BROKERAGE: BrokerageName
+    HYPERLIQUID_BROKERAGE: BrokerageName
 
 # ── Algorithm Framework — Alpha Models ────────────────────────────────────────
 
@@ -693,7 +840,7 @@ class PortfolioBias:
 
 class EqualWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Equal-weight PCM: splits portfolio evenly across all Up-insight symbols."""
-    def __init__(self, rebalance: Any = None, portfolio_bias: PortfolioBias = ...) -> None: ...
+    def __init__(self, rebalance=None, portfolio_bias: PortfolioBias = PortfolioBias.LongShort, max_weight: float | None = None) -> None: ...
 
 class InsightWeightingPortfolioConstructionModel(PortfolioConstructionModel):
     """Weights positions by insight magnitude."""
@@ -748,16 +895,29 @@ class NullExecutionModel(ExecutionModel):
     def __init__(self) -> None: ...
 
 class VolumeWeightedAveragePriceExecutionModel(ExecutionModel):
-    """VWAP execution — slices orders by volume participation rate."""
-    def __init__(self, participation_rate: float = 0.2) -> None: ...
+    """VWAP execution — slices orders by current bar volume."""
+    maximum_order_quantity_percent_volume: float
+    def __init__(self, asynchronous: bool = True) -> None: ...
+    @staticmethod
+    def with_maximum_order_quantity_percent_volume(value: float) -> "VolumeWeightedAveragePriceExecutionModel": ...
 
 class SpreadExecutionModel(ExecutionModel):
     """Only executes when bid-ask spread is within an acceptable threshold."""
-    def __init__(self, accepting_spread_percent: float = 0.005) -> None: ...
+    def __init__(self, accepting_spread_percent: float = 0.005, asynchronous: bool = True) -> None: ...
+
+class PassiveMakerExecutionModel(ExecutionModel):
+    """Posts passive post-only limits and falls back to taker execution after passive misses or adverse quote movement."""
+    max_passive_attempts: int
+    adverse_selection_threshold: float
+    maximum_order_value: float
+    def __init__(self, max_passive_attempts: int = 3, adverse_selection_threshold: float = 0.001, maximum_order_value: float = 0.0, asynchronous: bool = True) -> None: ...
 
 class StandardDeviationExecutionModel(ExecutionModel):
     """Executes when price deviates by N standard deviations from mean."""
-    def __init__(self, period: int = 60, deviations: float = 2.0) -> None: ...
+    maximum_order_value: float
+    def __init__(self, period: int = 60, deviations: float = 2.0, asynchronous: bool = True) -> None: ...
+    @staticmethod
+    def with_maximum_order_value(period: int, deviations: float, maximum_order_value: float) -> "StandardDeviationExecutionModel": ...
 
 # ── Algorithm Framework — Risk Management Models ──────────────────────────────
 
@@ -909,6 +1069,7 @@ class QCAlgorithm:
     def set_brokerage_model(self, brokerage: BrokerageName, account_type: AccountType = AccountType.Margin) -> None: ...
     def add_cash(self, amount: float) -> None: ...
     def set_name(self, name: str) -> None: ...
+    def get_parameter(self, name: str, default: Optional[str] = None) -> Optional[str]: ...
     def set_warm_up(self, bars_or_days: int) -> None: ...
 
     # ── History ──────────────────────────────────────────────────────────────
@@ -925,7 +1086,8 @@ class QCAlgorithm:
 
     def add_equity(self, ticker: str, resolution: Resolution = ...) -> Security: ...
     def add_forex(self, ticker: str, resolution: Resolution = ...) -> Security: ...
-    def add_crypto(self, ticker: str, resolution: Resolution = ...) -> Security: ...
+    def add_crypto(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
+    def add_crypto_future(self, ticker: str, resolution: Resolution = ..., market: str | None = None, leverage: float | None = None) -> Security: ...
     @property
     def universe_settings(self) -> UniverseSettings: ...
     @property
@@ -940,6 +1102,9 @@ class QCAlgorithm:
     def TimeRules(self) -> TimeRules: ...
     def add_universe(self, *args: Any) -> None: ...
     def AddUniverse(self, *args: Any) -> None: ...
+    def add_crypto_universe(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any], market: Optional[str] = None) -> None: ...
+    def AddCryptoUniverse(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any], market: Optional[str] = None) -> None: ...
+    def add_hyperliquid_universe(self, universe: str, resolution: Resolution, selector: Callable[[List[CustomDataPoint]], Any]) -> None: ...
 
     # ── Options ───────────────────────────────────────────────────────────────
 
@@ -949,8 +1114,24 @@ class QCAlgorithm:
         Returns the canonical option ticker string (e.g. ``'?SPY'``).
         """
         ...
+    def add_option_contract(self, symbol: Symbol | str, resolution: Optional[str] = None) -> Symbol: ...
+    def AddOptionContract(self, symbol: Symbol | str, resolution: Optional[str] = None) -> Symbol: ...
+    def remove_security(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def RemoveSecurity(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def remove_option_contract(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
+    def RemoveOptionContract(self, symbol: Symbol | Security | str, tag: Optional[str] = None) -> bool: ...
 
     def get_option_chain(self, canonical_ticker: str) -> Optional[OptionChain]: ...
+    def calculate_implied_volatility(
+        self,
+        contract: OptionContract,
+        option_price: float,
+        underlying_price: Optional[float] = ...,
+        risk_free_rate: float = ...,
+        dividend_yield: float = ...,
+    ) -> Optional[float]:
+        """Compute Black-Scholes implied volatility for a selected option price."""
+        ...
     def sell_to_open(self, contract: OptionContract, quantity: float, premium: float) -> int: ...
     def buy_to_open(self, contract: OptionContract, quantity: float, premium: float) -> int: ...
     def buy_to_close(self, contract: OptionContract, quantity: float, premium: float) -> int: ...
@@ -959,9 +1140,12 @@ class QCAlgorithm:
 
     # ── Ordering ──────────────────────────────────────────────────────────────
 
-    def market_order(self, symbol: Symbol | Security | str, quantity: float) -> None: ...
-    def limit_order(self, symbol: Symbol | Security | str, quantity: float, limit_price: float) -> None: ...
-    def stop_market_order(self, symbol: Symbol | Security | str, quantity: float, stop_price: float) -> None: ...
+    def market_order(self, symbol: Symbol | Security | str, quantity: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ...) -> OrderTicket: ...
+    def buy(self, symbol: Symbol | Security | str, quantity: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ...) -> OrderTicket: ...
+    def sell(self, symbol: Symbol | Security | str, quantity: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ...) -> OrderTicket: ...
+    def order(self, symbol: Symbol | Security | str, quantity: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ...) -> OrderTicket: ...
+    def limit_order(self, symbol: Symbol | Security | str, quantity: float, limit_price: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ..., post_only: bool = ...) -> OrderTicket: ...
+    def stop_market_order(self, symbol: Symbol | Security | str, quantity: float, stop_price: float, time_in_force: TimeInForce | str | None = ..., outside_regular_trading_hours: bool = ...) -> OrderTicket: ...
     def set_holdings(self, symbol: Symbol | Security | str, target: float) -> None:
         """Target a portfolio weight in [0, 1].  Computes and places the delta order."""
         ...

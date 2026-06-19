@@ -50,6 +50,15 @@ fn high_resolution_flag() {
 }
 
 #[test]
+fn intraday_flag() {
+    assert!(Resolution::Tick.is_intraday());
+    assert!(Resolution::Second.is_intraday());
+    assert!(Resolution::Minute.is_intraday());
+    assert!(Resolution::Hour.is_intraday());
+    assert!(!Resolution::Daily.is_intraday());
+}
+
+#[test]
 fn folder_names() {
     assert_eq!(Resolution::Tick.folder_name(), "tick");
     assert_eq!(Resolution::Second.folder_name(), "second");

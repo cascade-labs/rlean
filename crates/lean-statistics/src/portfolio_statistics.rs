@@ -84,15 +84,18 @@ impl PortfolioStatistics {
         let sharpe = Statistics::sharpe_ratio(&daily_returns, daily_rf);
         let sortino = Statistics::sortino_ratio(&daily_returns, daily_rf);
         let beta = Statistics::beta(&daily_returns, &benchmark_returns);
-        let bench_annual = if benchmark_returns.len() >= 2 {
-            Statistics::annual_performance(
-                benchmark_returns.iter().product::<Decimal>(),
-                trading_days,
-            )
+        let benchmark_total_return = if benchmark_curve.len() >= 2 && !benchmark_curve[0].is_zero()
+        {
+            (benchmark_curve[benchmark_curve.len() - 1] - benchmark_curve[0]) / benchmark_curve[0]
         } else {
             dec!(0)
         };
-        let alpha = Statistics::alpha(annual_return, beta, bench_annual, risk_free_rate);
+        let bench_annual = Statistics::annual_performance(benchmark_total_return, trading_days);
+        let alpha = if beta.is_zero() {
+            dec!(0)
+        } else {
+            Statistics::alpha(annual_return, beta, bench_annual, risk_free_rate)
+        };
         let tracking_error = Statistics::tracking_error(&daily_returns, &benchmark_returns);
         let information_ratio = Statistics::information_ratio(&daily_returns, &benchmark_returns);
         let psr = Statistics::probabilistic_sharpe_ratio(&daily_returns, daily_rf, 0.0);

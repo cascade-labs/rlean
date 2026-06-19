@@ -109,10 +109,13 @@ impl IExecutionModel for TwapExecutionModel {
             }
 
             orders.push(OrderRequest {
+                order_id: None,
                 symbol: sec.symbol.clone(),
                 quantity: slice_qty,
                 order_type: ExecutionOrderType::Market,
                 limit_price: None,
+                post_only: false,
+                cancel_open_orders: false,
                 tag: format!(
                     "TwapExecutionModel slice {}/{}",
                     state.slices_submitted + 1,

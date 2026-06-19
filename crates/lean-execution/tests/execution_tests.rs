@@ -1,7 +1,10 @@
-use lean_core::{Market, Symbol};
+use lean_core::{DateTime, Market, Symbol, TimeSpan};
 use lean_execution::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, ImmediateExecutionModel,
-    NullExecutionModel, SecurityData, SpreadExecutionModel, StandardDeviationExecutionModel,
+    AdaptiveMakerTakerExecutionModel, AggressivePostOnlyExecutionModel, ExecutionContext,
+    ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    ImmediateExecutionModel, MakerThenTakerExecutionModel, NullExecutionModel,
+    PassiveMakerExecutionModel, SecurityData, SpreadExecutionModel,
+    StandardDeviationExecutionModel, VwapExecutionModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -22,10 +25,39 @@ fn make_security(ticker: &str, price: f64, current_qty: f64) -> SecurityData {
         bid: None,
         ask: None,
         volume: None,
+        vwap_price: None,
         average_volume: None,
         daily_std_dev: None,
+        end_time: None,
+        lot_size: dec!(1),
+        minimum_price_variation: dec!(0.01),
         current_quantity: Decimal::try_from(current_qty).unwrap(),
         open_order_quantity: Decimal::ZERO,
+    }
+}
+
+fn make_security_with_quote(
+    ticker: &str,
+    price: Decimal,
+    bid: Decimal,
+    ask: Decimal,
+    current_qty: Decimal,
+    open_order_qty: Decimal,
+) -> SecurityData {
+    SecurityData {
+        symbol: make_symbol(ticker),
+        price,
+        bid: Some(bid),
+        ask: Some(ask),
+        volume: None,
+        vwap_price: None,
+        average_volume: None,
+        daily_std_dev: None,
+        end_time: None,
+        lot_size: dec!(1),
+        minimum_price_variation: dec!(0.01),
+        current_quantity: current_qty,
+        open_order_quantity: open_order_qty,
     }
 }
 
@@ -40,6 +72,37 @@ fn securities_map(data: Vec<SecurityData>) -> HashMap<String, SecurityData> {
     data.into_iter()
         .map(|s| (s.symbol.value.clone(), s))
         .collect()
+}
+
+fn make_open_limit_order(
+    id: i64,
+    ticker: &str,
+    quantity: Decimal,
+    limit_price: Decimal,
+    created_time: DateTime,
+    tag: &str,
+) -> ExecutionOpenOrder {
+    ExecutionOpenOrder {
+        id,
+        symbol: make_symbol(ticker),
+        quantity,
+        filled_quantity: Decimal::ZERO,
+        remaining_quantity: quantity,
+        order_type: ExecutionOrderType::Limit,
+        limit_price: Some(limit_price),
+        post_only: true,
+        tag: tag.to_string(),
+        created_time,
+        last_update_time: None,
+    }
+}
+
+fn context_orders<'a>(
+    time: DateTime,
+    securities: &'a HashMap<String, SecurityData>,
+    open_orders: &'a [ExecutionOpenOrder],
+) -> ExecutionContext<'a> {
+    ExecutionContext::new(time, securities, open_orders, dec!(100000))
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +172,95 @@ mod immediate_execution_tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(30));
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    #[test]
+    fn retained_target_resubmits_until_projected_holdings_match() {
+        let mut model = ImmediateExecutionModel::new();
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 10.0)]);
+        let targets = vec![make_target("AAPL", 100.0)];
+
+        let first = model.execute(&targets, &securities);
+        let second = model.execute(&[], &securities);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].quantity, dec!(90));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].quantity, dec!(90));
+    }
+
+    #[test]
+    fn context_open_orders_defer_target_until_actual_holdings_match() {
+        let mut model = ImmediateExecutionModel::new();
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 10.0)]);
+        let targets = vec![make_target("AAPL", 100.0)];
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &securities, &empty_open_orders);
+
+        let first = model.execute_with_context(&targets, &first_context);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].quantity, dec!(90));
+
+        let open_orders = vec![ExecutionOpenOrder {
+            id: 1,
+            symbol: make_symbol("AAPL"),
+            quantity: dec!(90),
+            filled_quantity: Decimal::ZERO,
+            remaining_quantity: dec!(90),
+            order_type: ExecutionOrderType::Market,
+            limit_price: None,
+            post_only: false,
+            tag: "ImmediateExecutionModel".to_string(),
+            created_time: DateTime::from_secs(0),
+            last_update_time: None,
+        }];
+        let projected_context = context_orders(DateTime::from_secs(1), &securities, &open_orders);
+        let second = model.execute_with_context(&[], &projected_context);
+        let third = model.execute_with_context(&[], &first_context);
+
+        assert!(second.is_empty());
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].quantity, dec!(90));
+    }
+
+    #[test]
+    fn context_orders_by_transaction_projected_holdings() {
+        let securities = securities_map(vec![
+            make_security("REDUCE", 100.0, 100.0),
+            make_security("INCREASE", 100.0, 0.0),
+        ]);
+        let open_orders = vec![ExecutionOpenOrder {
+            id: 1,
+            symbol: make_symbol("INCREASE"),
+            quantity: dec!(90),
+            filled_quantity: Decimal::ZERO,
+            remaining_quantity: dec!(90),
+            order_type: ExecutionOrderType::Market,
+            limit_price: None,
+            post_only: false,
+            tag: "pending".to_string(),
+            created_time: DateTime::from_secs(0),
+            last_update_time: None,
+        }];
+        let context = context_orders(DateTime::from_secs(1), &securities, &open_orders);
+        let targets = vec![
+            ("INCREASE".to_string(), make_symbol("INCREASE"), dec!(100)),
+            ("REDUCE".to_string(), make_symbol("REDUCE"), dec!(50)),
+        ];
+
+        let ordered = context.order_targets_by_margin_impact(&targets);
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].1.value, "REDUCE");
+        assert_eq!(ordered[1].1.value, "INCREASE");
+        assert_eq!(
+            context.unordered_quantity(
+                &make_symbol("INCREASE"),
+                context.securities.get("INCREASE").unwrap(),
+                dec!(100),
+            ),
+            dec!(10)
+        );
     }
 
     /// Target=-100, current=-10, open sell=-60 → market sell 30.
@@ -196,9 +348,36 @@ mod immediate_execution_tests {
         assert_eq!(msft_order.quantity, dec!(10)); // 30 - 20 = 10
     }
 
-    /// Security not present in securities map → treats current_qty as 0 and still orders.
+    /// Mirrors C# PortfolioTargetCollection.OrderByMarginImpact:
+    /// position-reducing orders first, then larger order value.
     #[test]
-    fn unknown_security_defaults_current_qty_to_zero() {
+    fn orders_by_margin_impact() {
+        let mut model = ImmediateExecutionModel::new();
+        let securities = securities_map(vec![
+            make_security("AAPL", 10.0, 100.0),
+            make_security("MSFT", 100.0, 0.0),
+            make_security("GOOG", 20.0, 0.0),
+        ]);
+        let targets = vec![
+            make_target("MSFT", 1.0),
+            make_target("GOOG", 50.0),
+            make_target("AAPL", 50.0),
+        ];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 3);
+        assert_eq!(orders[0].symbol.value, "AAPL");
+        assert_eq!(orders[0].quantity, dec!(-50));
+        assert_eq!(orders[1].symbol.value, "GOOG");
+        assert_eq!(orders[1].quantity, dec!(50));
+        assert_eq!(orders[2].symbol.value, "MSFT");
+        assert_eq!(orders[2].quantity, dec!(1));
+    }
+
+    /// Security not present in securities map -> no execution.
+    #[test]
+    fn unknown_security_defers_execution() {
         let mut model = ImmediateExecutionModel::new();
         // Provide an empty securities map (security data missing for AAPL)
         let securities: HashMap<String, SecurityData> = HashMap::new();
@@ -206,8 +385,7 @@ mod immediate_execution_tests {
 
         let orders = model.execute(&targets, &securities);
 
-        assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].quantity, dec!(50));
+        assert!(orders.is_empty());
     }
 
     /// Verifies the order type is always Market for ImmediateExecutionModel.
@@ -369,6 +547,248 @@ mod null_execution_tests {
 }
 
 // ---------------------------------------------------------------------------
+// VolumeWeightedAveragePriceExecutionModel tests
+// ---------------------------------------------------------------------------
+// Based on C# VolumeWeightedAveragePriceExecutionModelTests:
+// - Orders are not submitted when no targets are provided.
+// - Buys execute only when bid < intraday VWAP.
+// - Sells execute only when ask > intraday VWAP.
+// - Order quantity is capped at 1% of the current bar volume by default.
+// - Pending targets are retried on subsequent execute calls.
+
+mod vwap_execution_tests {
+    use super::*;
+
+    fn make_security_with_vwap_input(
+        ticker: &str,
+        price: Decimal,
+        bid: Decimal,
+        ask: Decimal,
+        volume: Decimal,
+        current_qty: Decimal,
+        seconds: i64,
+    ) -> SecurityData {
+        SecurityData {
+            symbol: make_symbol(ticker),
+            price,
+            bid: Some(bid),
+            ask: Some(ask),
+            volume: Some(volume),
+            vwap_price: Some(price),
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(DateTime::from_secs(seconds)),
+            lot_size: dec!(1),
+            minimum_price_variation: dec!(0.01),
+            current_quantity: current_qty,
+            open_order_quantity: Decimal::ZERO,
+        }
+    }
+
+    fn seed_vwap(model: &mut VwapExecutionModel, prices: &[Decimal]) {
+        for (index, price) in prices.iter().enumerate() {
+            let securities = securities_map(vec![make_security_with_vwap_input(
+                "AAPL",
+                *price,
+                *price,
+                *price,
+                dec!(100),
+                Decimal::ZERO,
+                60 * index as i64,
+            )]);
+            let orders = model.execute(&[], &securities);
+            assert!(orders.is_empty());
+        }
+    }
+
+    #[test]
+    fn no_targets_no_orders() {
+        let mut model = VwapExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(249),
+            dec!(251),
+            dec!(5000),
+            Decimal::ZERO,
+            0,
+        )]);
+
+        let orders = model.execute(&[], &securities);
+
+        assert!(orders.is_empty(), "Expected no orders for empty targets");
+    }
+
+    #[test]
+    fn default_participation_rate_is_one_percent_current_volume() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(270), dec!(260), dec!(250)]);
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(250),
+            dec!(250),
+            dec!(500),
+            Decimal::ZERO,
+            600,
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(5));
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    #[test]
+    fn buy_order_caps_at_target_when_current_volume_is_large() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(270), dec!(260), dec!(250)]);
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(250),
+            dec!(250),
+            dec!(5000),
+            Decimal::ZERO,
+            600,
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(10));
+    }
+
+    #[test]
+    fn buy_order_below_lot_size_is_deferred() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(270), dec!(260), dec!(250)]);
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(250),
+            dec!(250),
+            dec!(50),
+            Decimal::ZERO,
+            600,
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+
+        assert!(orders.is_empty(), "0.5 shares rounds down to zero lots");
+    }
+
+    #[test]
+    fn buy_order_is_deferred_when_bid_is_not_below_vwap() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(230), dec!(240), dec!(250)]);
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(250),
+            dec!(250),
+            dec!(50000),
+            Decimal::ZERO,
+            600,
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn sell_order_executes_when_ask_is_above_vwap() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(230), dec!(240), dec!(250)]);
+        let securities = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(250),
+            dec!(250),
+            dec!(250),
+            dec!(5000),
+            dec!(10),
+            600,
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 0.0)], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(-10));
+    }
+
+    #[test]
+    fn deferred_target_retries_when_price_becomes_favorable() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(270), dec!(260), dec!(250)]);
+
+        let unfavorable = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(265),
+            dec!(265),
+            dec!(265),
+            dec!(1000),
+            Decimal::ZERO,
+            600,
+        )]);
+        let first_orders = model.execute(&[make_target("AAPL", 10.0)], &unfavorable);
+        assert!(first_orders.is_empty());
+
+        let favorable = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(240),
+            dec!(240),
+            dec!(240),
+            dec!(1000),
+            Decimal::ZERO,
+            660,
+        )]);
+        let second_orders = model.execute(&[], &favorable);
+
+        assert_eq!(second_orders.len(), 1);
+        assert_eq!(second_orders[0].quantity, dec!(10));
+    }
+
+    #[test]
+    fn removed_security_clears_pending_and_vwap_state() {
+        let mut model = VwapExecutionModel::default();
+        seed_vwap(&mut model, &[dec!(270), dec!(260), dec!(250)]);
+
+        let unfavorable = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(265),
+            dec!(265),
+            dec!(265),
+            dec!(1000),
+            Decimal::ZERO,
+            600,
+        )]);
+        model.execute(&[make_target("AAPL", 10.0)], &unfavorable);
+        model.on_securities_changed(&[], &[make_symbol("AAPL")]);
+
+        let favorable = securities_map(vec![make_security_with_vwap_input(
+            "AAPL",
+            dec!(240),
+            dec!(240),
+            dec!(240),
+            dec!(1000),
+            Decimal::ZERO,
+            660,
+        )]);
+        let orders = model.execute(&[], &favorable);
+
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn model_name_is_correct() {
+        let model = VwapExecutionModel::default();
+        assert_eq!(model.name(), "VolumeWeightedAveragePriceExecutionModel");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ExecutionOrderType tests
 // ---------------------------------------------------------------------------
 
@@ -403,6 +823,8 @@ mod order_type_tests {
             ExecutionOrderType::MarketOnOpen,
             ExecutionOrderType::MarketOnClose
         );
+        assert_ne!(ExecutionOrderType::Limit, ExecutionOrderType::Update);
+        assert_ne!(ExecutionOrderType::Cancel, ExecutionOrderType::Update);
     }
 
     /// ExecutionOrderType copies correctly.
@@ -438,8 +860,12 @@ mod struct_tests {
             bid: Some(dec!(299.5)),
             ask: Some(dec!(300.5)),
             volume: Some(dec!(1000000)),
+            vwap_price: None,
             average_volume: Some(dec!(900000)),
             daily_std_dev: Some(dec!(5)),
+            end_time: None,
+            lot_size: dec!(1),
+            minimum_price_variation: dec!(0.01),
             current_quantity: dec!(50),
             open_order_quantity: dec!(7),
         };
@@ -447,6 +873,7 @@ mod struct_tests {
         assert_eq!(s.price, dec!(300));
         assert_eq!(s.bid, Some(dec!(299.5)));
         assert_eq!(s.ask, Some(dec!(300.5)));
+        assert_eq!(s.minimum_price_variation, dec!(0.01));
         assert_eq!(s.current_quantity, dec!(50));
         assert_eq!(s.open_order_quantity, dec!(7));
     }
@@ -490,8 +917,12 @@ mod spread_execution_tests {
             bid: Some(Decimal::try_from(bid).unwrap()),
             ask: Some(Decimal::try_from(ask).unwrap()),
             volume: None,
+            vwap_price: None,
             average_volume: None,
             daily_std_dev: None,
+            end_time: None,
+            lot_size: dec!(1),
+            minimum_price_variation: dec!(0.01),
             current_quantity: Decimal::try_from(current_qty).unwrap(),
             open_order_quantity: Decimal::ZERO,
         }
@@ -608,20 +1039,16 @@ mod spread_execution_tests {
         );
     }
 
-    /// No bid/ask data → execution is allowed (fallback).
+    /// No bid/ask data → execution is deferred, matching C# SpreadExecutionModel.
     #[test]
-    fn no_bid_ask_allows_execution() {
+    fn no_bid_ask_defers_execution() {
         let mut model = SpreadExecutionModel::default();
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
         let orders = model.execute(&targets, &securities);
 
-        assert_eq!(
-            orders.len(),
-            1,
-            "No bid/ask should fall back to allowing execution"
-        );
+        assert!(orders.is_empty(), "Missing bid/ask should defer execution");
     }
 
     /// Delta ordering: target=100, current=60 → order 40 shares.
@@ -637,6 +1064,27 @@ mod spread_execution_tests {
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(40));
+    }
+
+    /// Pending targets recalculate unordered quantity against current holdings and open orders.
+    #[test]
+    fn pending_target_recomputes_unordered_quantity() {
+        let mut model = SpreadExecutionModel::default();
+
+        let wide_sec = securities_map(vec![make_security_with_quotes(
+            "AAPL", 250.0, 250.0, 275.0, 0.0,
+        )]);
+        let targets = vec![make_target("AAPL", 100.0)];
+        let first_orders = model.execute(&targets, &wide_sec);
+        assert!(first_orders.is_empty(), "Wide spread should defer target");
+
+        let mut security = make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 40.0);
+        security.open_order_quantity = dec!(25);
+        let tight_sec = securities_map(vec![security]);
+        let second_orders = model.execute(&[], &tight_sec);
+
+        assert_eq!(second_orders.len(), 1);
+        assert_eq!(second_orders[0].quantity, dec!(35));
     }
 
     /// on_securities_changed: removed symbol discards pending order.
@@ -701,7 +1149,7 @@ mod spread_execution_tests {
 // - Buy orders submitted when bid < SMA - (deviations * std_dev) (price dipped below mean).
 // - Sell orders submitted when ask > SMA + (deviations * std_dev) (price spiked above mean).
 // - No order when price is within the std dev band.
-// - No daily_std_dev → unconditional execution.
+// - Indicators must be ready before orders are submitted.
 // - on_securities_changed removes pending targets for removed symbols.
 
 mod standard_deviation_execution_tests {
@@ -721,10 +1169,27 @@ mod standard_deviation_execution_tests {
             bid: Some(Decimal::try_from(bid).unwrap()),
             ask: Some(Decimal::try_from(ask).unwrap()),
             volume: None,
+            vwap_price: None,
             average_volume: None,
             daily_std_dev: Some(Decimal::try_from(daily_std_dev).unwrap()),
+            end_time: None,
+            lot_size: dec!(1),
+            minimum_price_variation: dec!(0.01),
             current_quantity: Decimal::try_from(current_qty).unwrap(),
             open_order_quantity: Decimal::ZERO,
+        }
+    }
+
+    fn seed_prices(model: &mut StandardDeviationExecutionModel, ticker: &str, prices: &[f64]) {
+        for price in prices {
+            let securities = securities_map(vec![make_security_with_std_dev(
+                ticker, *price, *price, *price, 0.0, 0.0,
+            )]);
+            let orders = model.execute(&[], &securities);
+            assert!(
+                orders.is_empty(),
+                "Seeding without targets should not submit orders"
+            );
         }
     }
 
@@ -745,11 +1210,11 @@ mod standard_deviation_execution_tests {
     /// SMA ≈ 260, STD ≈ 10. Threshold = 260 - 1.5*10 = 245. bid=240 < 245 → buy.
     #[test]
     fn buy_order_when_bid_below_lower_band() {
-        // price=260 (proxy SMA), std_dev=10, deviations=1.5 → lower band = 260 - 15 = 245
-        // bid=240 < 245 → execute buy
-        let mut model = StandardDeviationExecutionModel::new(dec!(1.5));
+        // window=[270,260,230], deviations=1.0 → bid=230 below lower band
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[270.0, 260.0]);
         let securities = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 260.0, 240.0, 265.0, 10.0, 0.0,
+            "AAPL", 230.0, 230.0, 235.0, 0.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
@@ -767,11 +1232,11 @@ mod standard_deviation_execution_tests {
     /// Mirrors C#: historicalPrices=[250,250,250], currentPrice=250, expectedOrders=0
     #[test]
     fn no_buy_order_when_bid_within_band() {
-        // price=250, std_dev=5, deviations=2 → lower band = 250 - 10 = 240
-        // bid=248 > 240 → within band, no order
-        let mut model = StandardDeviationExecutionModel::default(); // deviations=2
+        // Constant rolling price creates a zero-width band, so bid=250 is not below it.
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(2.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
         let securities = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 248.0, 252.0, 5.0, 0.0,
+            "AAPL", 250.0, 250.0, 252.0, 0.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
@@ -786,11 +1251,11 @@ mod standard_deviation_execution_tests {
     /// Sell: ask well above SMA + N*std_dev → order submitted.
     #[test]
     fn sell_order_when_ask_above_upper_band() {
-        // price=250 (SMA proxy), std_dev=10, deviations=2 → upper band = 250 + 20 = 270
-        // ask=280 > 270 → execute sell
-        let mut model = StandardDeviationExecutionModel::default(); // deviations=2
+        // window=[230,240,270], deviations=1.0 → ask=280 above upper band
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[230.0, 240.0]);
         let securities = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 245.0, 280.0, 10.0, 100.0,
+            "AAPL", 270.0, 265.0, 280.0, 0.0, 100.0,
         )]);
         let targets = vec![make_target("AAPL", 0.0)]; // sell all (liquidate)
 
@@ -807,11 +1272,10 @@ mod standard_deviation_execution_tests {
     /// Sell: ask within band → order deferred.
     #[test]
     fn no_sell_order_when_ask_within_band() {
-        // price=250, std_dev=10, deviations=2 → upper band = 270
-        // ask=265 < 270 → within band, no order
-        let mut model = StandardDeviationExecutionModel::default();
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(2.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
         let securities = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 245.0, 265.0, 10.0, 100.0,
+            "AAPL", 250.0, 245.0, 250.0, 0.0, 100.0,
         )]);
         let targets = vec![make_target("AAPL", 0.0)];
 
@@ -823,30 +1287,28 @@ mod standard_deviation_execution_tests {
         );
     }
 
-    /// No daily_std_dev data → unconditional execution.
+    /// Indicator not ready → execution is deferred.
     #[test]
-    fn no_std_dev_allows_unconditional_execution() {
-        let mut model = StandardDeviationExecutionModel::default();
+    fn not_ready_defers_execution() {
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
         let orders = model.execute(&targets, &securities);
 
-        assert_eq!(
-            orders.len(),
-            1,
-            "No std_dev data should allow unconditional execution"
+        assert!(
+            orders.is_empty(),
+            "Model should wait for the rolling indicator window"
         );
     }
 
     /// Delta ordering: only the unmet quantity is ordered.
     #[test]
     fn delta_only_ordered() {
-        // price=250, std_dev=50, deviations=2 → lower band = 250 - 100 = 150
-        // bid=140 < 150 → execute buy for delta
-        let mut model = StandardDeviationExecutionModel::default();
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
         let securities = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 140.0, 260.0, 50.0, 60.0,
+            "AAPL", 140.0, 140.0, 150.0, 0.0, 60.0,
         )]);
         let targets = vec![make_target("AAPL", 100.0)]; // need 40 more
 
@@ -856,24 +1318,40 @@ mod standard_deviation_execution_tests {
         assert_eq!(orders[0].quantity, dec!(40));
     }
 
+    /// MaximumOrderValue caps each submitted slice, matching C# OrderSizing.GetOrderSizeForMaximumValue.
+    #[test]
+    fn maximum_order_value_caps_order_quantity() {
+        let mut model =
+            StandardDeviationExecutionModel::with_maximum_order_value(3, dec!(1.0), dec!(2000));
+        seed_prices(&mut model, "AAPL", &[200.0, 200.0]);
+        let securities = securities_map(vec![make_security_with_std_dev(
+            "AAPL", 100.0, 100.0, 105.0, 0.0, 0.0,
+        )]);
+        let targets = vec![make_target("AAPL", 100.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(20));
+    }
+
     /// Deferred order is retried when price moves into favorable range.
     #[test]
     fn deferred_then_favorable_submits() {
-        let mut model = StandardDeviationExecutionModel::new(dec!(2.0));
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
 
-        // First call: bid within band → defer
-        // price=250, std_dev=10, band=[230,270], bid=245 (within band)
+        // First call: zero std-dev window, bid is not below the lower band.
         let within_sec = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 245.0, 255.0, 10.0, 0.0,
+            "AAPL", 250.0, 250.0, 255.0, 0.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
         let first_orders = model.execute(&targets, &within_sec);
         assert!(first_orders.is_empty(), "Should defer when within band");
 
-        // Second call: bid below band → submit
-        // price=250, std_dev=10, lower_band=230, bid=220 → execute
+        // Second call: [250,250,140] makes the bid favorable.
         let favorable_sec = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 220.0, 255.0, 10.0, 0.0,
+            "AAPL", 140.0, 140.0, 150.0, 0.0, 0.0,
         )]);
         let second_orders = model.execute(&[], &favorable_sec);
         assert_eq!(
@@ -887,11 +1365,12 @@ mod standard_deviation_execution_tests {
     /// on_securities_changed: removed symbol discards pending order.
     #[test]
     fn removed_security_clears_pending() {
-        let mut model = StandardDeviationExecutionModel::default();
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
 
         // Queue a pending order (bid within band → deferred)
         let within_sec = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 248.0, 252.0, 5.0, 0.0,
+            "AAPL", 250.0, 250.0, 252.0, 0.0, 0.0,
         )]);
         model.execute(&[make_target("AAPL", 10.0)], &within_sec);
 
@@ -900,7 +1379,7 @@ mod standard_deviation_execution_tests {
 
         // Now provide favorable conditions — should produce no order
         let favorable_sec = securities_map(vec![make_security_with_std_dev(
-            "AAPL", 250.0, 220.0, 255.0, 10.0, 0.0,
+            "AAPL", 140.0, 140.0, 150.0, 0.0, 0.0,
         )]);
         let orders = model.execute(&[], &favorable_sec);
         assert!(
@@ -919,9 +1398,11 @@ mod standard_deviation_execution_tests {
     /// Order tag identifies the model and includes the deviations value.
     #[test]
     fn order_tag_identifies_model() {
-        let mut model = StandardDeviationExecutionModel::default();
-        // No std_dev → unconditional execution
-        let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
+        let mut model = StandardDeviationExecutionModel::new(3, dec!(1.0));
+        seed_prices(&mut model, "AAPL", &[250.0, 250.0]);
+        let securities = securities_map(vec![make_security_with_std_dev(
+            "AAPL", 140.0, 140.0, 150.0, 0.0, 0.0,
+        )]);
         let targets = vec![make_target("AAPL", 5.0)];
 
         let orders = model.execute(&targets, &securities);
@@ -932,5 +1413,1021 @@ mod standard_deviation_execution_tests {
             "Tag should identify model, got: {}",
             orders[0].tag
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PassiveMakerExecutionModel tests
+// ---------------------------------------------------------------------------
+
+mod passive_maker_execution_tests {
+    use super::*;
+
+    #[test]
+    fn posts_buy_limit_at_bid_as_post_only() {
+        let mut model = PassiveMakerExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert_eq!(orders[0].limit_price, Some(dec!(99.90)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn posts_sell_limit_at_ask_as_post_only() {
+        let mut model = PassiveMakerExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", -10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].quantity, dec!(-10));
+        assert_eq!(orders[0].limit_price, Some(dec!(100.10)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn falls_back_to_taker_after_passive_attempt_limit() {
+        let mut model = PassiveMakerExecutionModel::new(1, dec!(0.01));
+        let mut security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let first = model.execute(&targets, &securities_map(vec![security.clone()]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert!(first[0].post_only);
+
+        security.open_order_quantity = dec!(10);
+        let second = model.execute(&targets, &securities_map(vec![security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(second[0].quantity, dec!(10));
+        assert!(!second[0].post_only);
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("passive-timeout"));
+    }
+
+    #[test]
+    fn leaves_matching_passive_order_resting_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let mut security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let first = model.execute(&targets, &securities_map(vec![security.clone()]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        security.open_order_quantity = dec!(10);
+        let second = model.execute(&targets, &securities_map(vec![security.clone()]));
+        let third = model.execute(&targets, &securities_map(vec![security]));
+
+        assert!(second.is_empty());
+        assert!(third.is_empty());
+    }
+
+    #[test]
+    fn uses_execution_context_open_orders_before_snapshot_quantity() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let first_securities = securities_map(vec![first_security]);
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(
+            DateTime::from_secs(0),
+            &first_securities,
+            &empty_open_orders,
+        );
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let first = model.execute_with_context(&targets, &first_context);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let stale_snapshot = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.90),
+            DateTime::from_secs(0),
+            "PassiveMakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &stale_snapshot, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn replaces_resting_buy_when_bid_improves_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let mut second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.20),
+            dec!(0),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(99.90)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security.clone()]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].quantity, dec!(10));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(second[0].post_only);
+        assert!(second[0].cancel_open_orders);
+
+        second_security.open_order_quantity = dec!(10);
+        let third = model.execute(&targets, &securities_map(vec![second_security]));
+        assert!(third.is_empty());
+    }
+
+    #[test]
+    fn updates_context_open_buy_when_bid_improves_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(
+            DateTime::from_secs(0),
+            &first_securities,
+            &empty_open_orders,
+        );
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.20),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            7,
+            "AAPL",
+            dec!(10),
+            dec!(99.90),
+            DateTime::from_secs(0),
+            "PassiveMakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Update);
+        assert_eq!(second[0].order_id, Some(7));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(!second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn replaces_context_open_buy_when_same_side_target_changes() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(
+            DateTime::from_secs(0),
+            &first_securities,
+            &empty_open_orders,
+        );
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.20),
+            dec!(4),
+            dec!(6),
+        )]);
+        let mut resting_order = make_open_limit_order(
+            7,
+            "AAPL",
+            dec!(10),
+            dec!(99.90),
+            DateTime::from_secs(0),
+            "PassiveMakerExecutionModel post-only",
+        );
+        resting_order.filled_quantity = dec!(4);
+        resting_order.remaining_quantity = dec!(6);
+        let resting = vec![resting_order];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[make_target("AAPL", 15.0)], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].order_id, None);
+        assert_eq!(second[0].quantity, dec!(11));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn keeps_resting_buy_when_bid_moves_lower_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.80),
+            dec!(100.00),
+            dec!(0),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(99.90)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security]));
+
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn replaces_resting_sell_when_ask_improves_before_timeout() {
+        let mut model = PassiveMakerExecutionModel::new(3, dec!(0.01));
+        let targets = vec![make_target("AAPL", -10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.80),
+            dec!(100.00),
+            dec!(0),
+            dec!(-10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(100.10)));
+
+        let second = model.execute(&targets, &securities_map(vec![second_security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].quantity, dec!(-10));
+        assert_eq!(second[0].limit_price, Some(dec!(100.00)));
+        assert!(second[0].post_only);
+        assert!(second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn falls_back_to_taker_on_adverse_buy_quote_move() {
+        let mut model = PassiveMakerExecutionModel::new(10, dec!(0.001));
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let second_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.10),
+            dec!(100.30),
+            dec!(0),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let second = model.execute(&targets, &securities_map(vec![second_security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("adverse-selection"));
+    }
+
+    #[test]
+    fn cancels_open_order_when_target_is_fulfilled() {
+        let mut model = PassiveMakerExecutionModel::default();
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        );
+        let fulfilled_security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(10),
+            dec!(10),
+        );
+
+        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let second = model.execute(&targets, &securities_map(vec![fulfilled_security]));
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Cancel);
+        assert!(second[0].cancel_open_orders);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveMakerTakerExecutionModel tests
+// ---------------------------------------------------------------------------
+
+mod aggressive_post_only_execution_tests {
+    use super::*;
+
+    #[test]
+    fn posts_buy_one_tick_inside_spread() {
+        let mut model = AggressivePostOnlyExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert_eq!(orders[0].limit_price, Some(dec!(100.09)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn posts_sell_one_tick_inside_spread() {
+        let mut model = AggressivePostOnlyExecutionModel::default();
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+
+        let orders = model.execute(&[make_target("AAPL", -10.0)], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].quantity, dec!(-10));
+        assert_eq!(orders[0].limit_price, Some(dec!(99.91)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn one_tick_spread_uses_touch_prices_without_crossing() {
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.01),
+            dec!(0),
+            dec!(0),
+        )]);
+
+        let buy_orders = AggressivePostOnlyExecutionModel::default()
+            .execute(&[make_target("AAPL", 10.0)], &securities);
+        let sell_orders = AggressivePostOnlyExecutionModel::default()
+            .execute(&[make_target("AAPL", -10.0)], &securities);
+
+        assert_eq!(buy_orders[0].limit_price, Some(dec!(100.00)));
+        assert_eq!(sell_orders[0].limit_price, Some(dec!(100.01)));
+        assert!(buy_orders[0].post_only);
+        assert!(sell_orders[0].post_only);
+    }
+
+    #[test]
+    fn later_quote_move_reprices_without_market_fallback() {
+        let mut model = AggressivePostOnlyExecutionModel::default();
+        let targets = vec![make_target("AAPL", 10.0)];
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.90),
+            dec!(100.10),
+            dec!(0),
+            dec!(0),
+        )]);
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(
+            DateTime::from_secs(0),
+            &first_securities,
+            &empty_open_orders,
+        );
+
+        let first = model.execute_with_context(&targets, &first_context);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(first[0].limit_price, Some(dec!(100.09)));
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(101),
+            dec!(101.00),
+            dec!(102.00),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            7,
+            "AAPL",
+            dec!(10),
+            dec!(100.09),
+            DateTime::from_secs(0),
+            "AggressivePostOnlyExecutionModel post-only",
+        )];
+        let second_context =
+            context_orders(DateTime::from_secs(3600), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Update);
+        assert_eq!(second[0].order_id, Some(7));
+        assert_eq!(second[0].limit_price, Some(dec!(101.99)));
+        assert!(second[0].post_only);
+        assert!(!second[0].cancel_open_orders);
+    }
+}
+
+mod adaptive_maker_taker_execution_tests {
+    use super::*;
+
+    #[test]
+    fn crosses_immediately_when_spread_is_tight() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert!(!orders[0].post_only);
+        assert!(orders[0].tag.contains("tight-spread"));
+    }
+
+    #[test]
+    fn crosses_immediately_when_spread_is_locked() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.001), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+    }
+
+    #[test]
+    fn tight_spread_market_order_replaces_existing_passive_order() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 3, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let first = model.execute(&targets, &securities);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let tightened = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(4),
+            dec!(6),
+        )]);
+        let second = model.execute(&targets, &tightened);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(second[0].quantity, dec!(6));
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("tight-spread"));
+    }
+
+    #[test]
+    fn tight_spread_uses_context_open_orders_for_replacement() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 3, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.90),
+            DateTime::from_secs(0),
+            "PassiveMakerExecutionModel post-only",
+        )];
+        let context = context_orders(DateTime::from_secs(60), &securities, &resting);
+
+        let orders = model.execute_with_context(&[make_target("AAPL", 10.0)], &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(orders[0].quantity, dec!(10));
+        assert!(orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn tight_spread_cancels_passive_order_after_target_is_filled() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 3, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let first = model.execute(&targets, &securities);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let filled_with_stale_open_order = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(10),
+            dec!(10),
+        )]);
+        let second = model.execute(&targets, &filled_with_stale_open_order);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Cancel);
+        assert_eq!(second[0].quantity, dec!(0));
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("cancel stale passive"));
+    }
+
+    #[test]
+    fn tight_spread_cancels_context_open_order_after_target_is_filled() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.002), 3, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(10),
+            dec!(0),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.90),
+            DateTime::from_secs(0),
+            "PassiveMakerExecutionModel post-only",
+        )];
+        let context = context_orders(DateTime::from_secs(60), &securities, &resting);
+
+        let orders = model.execute_with_context(&[make_target("AAPL", 10.0)], &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Cancel);
+        assert_eq!(orders[0].quantity, dec!(0));
+        assert!(orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn posts_passive_limit_when_spread_is_wide() {
+        let mut model = AdaptiveMakerTakerExecutionModel::new(dec!(0.001), 1, dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        )]);
+        let targets = vec![make_target("AAPL", 10.0)];
+
+        let orders = model.execute(&targets, &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].limit_price, Some(dec!(100.00)));
+        assert!(orders[0].post_only);
+    }
+
+    #[test]
+    fn wide_spread_passive_order_falls_back_after_timeout() {
+        let mut model = AdaptiveMakerTakerExecutionModel::with_passive_duration(
+            dec!(0.001),
+            TimeSpan::from_mins(5),
+            dec!(0.005),
+        );
+        let targets = vec![make_target("AAPL", 10.0)];
+        let security = make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(0),
+        );
+        let first_securities = securities_map(vec![security]);
+        let empty_open_orders = Vec::new();
+        let first_context = context_orders(
+            DateTime::from_secs(0),
+            &first_securities,
+            &empty_open_orders,
+        );
+
+        let first = model.execute_with_context(&targets, &first_context);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.00),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let before_deadline_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(10),
+        )]);
+        let before_deadline_context = context_orders(
+            DateTime::from_secs(60),
+            &before_deadline_securities,
+            &resting,
+        );
+        let before_deadline = model.execute_with_context(&[], &before_deadline_context);
+        assert!(before_deadline.is_empty());
+
+        let after_deadline_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.00),
+            dec!(101.00),
+            dec!(0),
+            dec!(10),
+        )]);
+        let after_deadline_context = context_orders(
+            DateTime::from_secs(301),
+            &after_deadline_securities,
+            &resting,
+        );
+        let second = model.execute_with_context(&[], &after_deadline_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("taker deadline"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MakerThenTakerExecutionModel tests
+// ---------------------------------------------------------------------------
+
+mod maker_then_taker_execution_tests {
+    use super::*;
+
+    fn context_orders<'a>(
+        time: DateTime,
+        securities: &'a HashMap<String, SecurityData>,
+        open_orders: &'a [ExecutionOpenOrder],
+    ) -> ExecutionContext<'a> {
+        ExecutionContext::new(time, securities, open_orders, dec!(100000))
+    }
+
+    #[test]
+    fn posts_post_only_limit_first() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let context = context_orders(DateTime::from_secs(1), &securities, &open_orders);
+
+        let orders = model.execute_with_context(&[make_target("AAPL", 10.0)], &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(orders[0].limit_price, Some(dec!(100.00)));
+        assert!(orders[0].post_only);
+        assert!(!orders[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn leaves_resting_order_before_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        let first = model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+        assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.05),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn reprices_when_same_side_quote_improves_before_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100.25),
+            dec!(100.10),
+            dec!(100.30),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Update);
+        assert_eq!(second[0].order_id, Some(1));
+        assert_eq!(second[0].limit_price, Some(dec!(100.20)));
+        assert!(!second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn replaces_same_side_limit_when_target_changes_before_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100.25),
+            dec!(100.10),
+            dec!(100.30),
+            dec!(4),
+            dec!(6),
+        )]);
+        let mut resting_order = make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        );
+        resting_order.filled_quantity = dec!(4);
+        resting_order.remaining_quantity = dec!(6);
+        let resting = vec![resting_order];
+        let second_context = context_orders(DateTime::from_secs(60), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[make_target("AAPL", 15.0)], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
+        assert_eq!(second[0].order_id, None);
+        assert_eq!(second[0].quantity, dec!(11));
+        assert_eq!(second[0].limit_price, Some(dec!(100.20)));
+        assert!(second[0].cancel_open_orders);
+    }
+
+    #[test]
+    fn crosses_residual_after_passive_deadline() {
+        let mut model = MakerThenTakerExecutionModel::new(TimeSpan::from_mins(5), dec!(0.005));
+        let first_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(100.00),
+            dec!(100.05),
+            dec!(0),
+            dec!(0),
+        )]);
+        let open_orders = Vec::new();
+        let first_context = context_orders(DateTime::from_secs(0), &first_securities, &open_orders);
+        model.execute_with_context(&[make_target("AAPL", 10.0)], &first_context);
+
+        let second_securities = securities_map(vec![make_security_with_quote(
+            "AAPL",
+            dec!(100),
+            dec!(99.95),
+            dec!(100.05),
+            dec!(0),
+            dec!(10),
+        )]);
+        let resting = vec![make_open_limit_order(
+            1,
+            "AAPL",
+            dec!(10),
+            dec!(99.95),
+            DateTime::from_secs(0),
+            "MakerThenTakerExecutionModel post-only",
+        )];
+        let second_context = context_orders(DateTime::from_secs(301), &second_securities, &resting);
+
+        let second = model.execute_with_context(&[], &second_context);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].order_type, ExecutionOrderType::Market);
+        assert_eq!(second[0].quantity, dec!(10));
+        assert!(second[0].cancel_open_orders);
+        assert!(second[0].tag.contains("deadline"));
     }
 }

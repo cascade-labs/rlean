@@ -108,18 +108,18 @@ fn beta_identical_returns_is_one() {
 }
 
 #[test]
-fn beta_zero_variance_benchmark_returns_one() {
+fn beta_zero_variance_benchmark_returns_zero() {
     let returns = vec![dec!(0.01), dec!(-0.005), dec!(0.02)];
     let flat: Vec<Decimal> = vec![dec!(0); 3];
     let beta = Statistics::beta(&returns, &flat);
-    assert_eq!(beta, dec!(1)); // fallback when benchmark variance is 0
+    assert_eq!(beta, dec!(0));
 }
 
 #[test]
-fn beta_short_series_returns_one() {
+fn beta_short_series_returns_zero() {
     let r = vec![dec!(0.01)];
     let b = vec![dec!(0.01)];
-    assert_eq!(Statistics::beta(&r, &b), dec!(1));
+    assert_eq!(Statistics::beta(&r, &b), dec!(0));
 }
 
 // ─── Alpha ───────────────────────────────────────────────────────────────────

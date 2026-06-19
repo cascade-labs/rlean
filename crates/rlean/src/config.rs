@@ -229,7 +229,8 @@ impl PluginConfigs {
         let path = plugin_configs_path()?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = serde_json::to_string_pretty(&self.0)?;
-        atomic_write(&path, &text)
+        atomic_write(&path, &text)?;
+        secure_owner_read_write(&path)
     }
 
     /// Return the stored config map for the given plugin (empty map if not set).
@@ -254,4 +255,21 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     std::fs::write(&tmp, content).with_context(|| format!("Failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("Failed to rename {} → {}", tmp.display(), path.display()))
+}
+
+#[cfg(unix)]
+fn secure_owner_read_write(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("Failed to set secure permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_owner_read_write(_path: &Path) -> Result<()> {
+    Ok(())
 }

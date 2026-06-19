@@ -65,6 +65,21 @@ impl SubscriptionDataConfig {
         }
     }
 
+    pub fn new_crypto_future(symbol: Symbol, resolution: Resolution) -> Self {
+        SubscriptionDataConfig {
+            symbol,
+            resolution,
+            tick_type: TickType::Trade,
+            normalization_mode: DataNormalizationMode::Raw,
+            fill_data_forward: true,
+            extended_market_hours: true,
+            is_internal_feed: false,
+            is_filtered_subscription: false,
+            data_time_zone: "UTC".into(),
+            exchange_time_zone: "UTC".into(),
+        }
+    }
+
     pub fn unique_id(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hash;

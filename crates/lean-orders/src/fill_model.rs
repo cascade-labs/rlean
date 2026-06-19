@@ -1,6 +1,6 @@
 use crate::{order::Order, order_event::OrderEvent, slippage::SlippageModel};
 use lean_core::{DateTime, Price};
-use lean_data::{QuoteBar, TradeBar};
+use lean_data::{QuoteBar, TradeBar, TradeBarData};
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
@@ -35,6 +35,79 @@ pub trait FillModel: Send + Sync {
     ) -> Fill {
         let _ = quote_bar;
         self.market_fill(order, bar, time)
+    }
+
+    fn limit_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Option<Fill> {
+        if time <= order.time {
+            return None;
+        }
+        if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
+            self.limit_fill(order, &bar, time)
+        } else {
+            self.limit_fill(order, bar, time)
+        }
+    }
+
+    fn stop_market_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Option<Fill> {
+        if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
+            self.stop_market_fill(order, &bar, time)
+        } else {
+            self.stop_market_fill(order, bar, time)
+        }
+    }
+
+    fn stop_limit_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Option<Fill> {
+        if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
+            self.stop_limit_fill(order, &bar, time)
+        } else {
+            self.stop_limit_fill(order, bar, time)
+        }
+    }
+
+    fn market_on_open_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Fill {
+        if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
+            self.market_on_open_fill(order, &bar, time)
+        } else {
+            self.market_on_open_fill(order, bar, time)
+        }
+    }
+
+    fn market_on_close_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Fill {
+        if let Some(bar) = directional_quote_trade_bar(order, bar, quote_bar) {
+            self.market_on_close_fill(order, &bar, time)
+        } else {
+            self.market_on_close_fill(order, bar, time)
+        }
     }
 }
 
@@ -71,14 +144,35 @@ fn mid_price(bar: &TradeBar, qb: Option<&QuoteBar>) -> Price {
     }
 }
 
+fn directional_quote_trade_bar(
+    order: &Order,
+    fallback: &TradeBar,
+    quote_bar: Option<&QuoteBar>,
+) -> Option<TradeBar> {
+    let quote_bar = quote_bar?;
+    let side = if order.quantity > dec!(0) {
+        quote_bar.ask.as_ref().or(quote_bar.bid.as_ref())
+    } else {
+        quote_bar.bid.as_ref().or(quote_bar.ask.as_ref())
+    }?;
+
+    Some(TradeBar::new(
+        fallback.symbol.clone(),
+        quote_bar.time,
+        quote_bar.period,
+        TradeBarData::new(side.open, side.high, side.low, side.close, fallback.volume),
+    ))
+}
+
 fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price) -> Fill {
-    let event = OrderEvent::filled(
+    let mut event = OrderEvent::filled(
         order.id,
         order.symbol.clone(),
         time,
         fill_price,
         order.quantity,
     );
+    event.apply_order_fields(order);
     Fill {
         order_event: event,
         slippage,
@@ -86,15 +180,16 @@ fn make_filled(order: &Order, time: DateTime, fill_price: Price, slippage: Price
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ImmediateFillModel  (original — unchanged behaviour)
+// ImmediateFillModel
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Immediate fill model — fills market orders at the bar's open price.
+/// Immediate fill model.
 ///
-/// Matches C# LEAN's default `ImmediateFillModel` behaviour: an order
-/// submitted inside `on_data` on day N is processed by `process_orders` at
-/// the start of day N+1, so the fill bar is already the next day's bar.
-/// Using `bar.open` replicates C# LEAN's next-day-open fill semantics.
+/// With trade bars only, market orders fill at the bar close/current price.
+/// When quote bars are supplied, fills use the order-direction side of the
+/// quote bar: buys use ask prices and sells use bid prices. This mirrors
+/// LEAN's `GetPrices` selection model for subscribed quote data while
+/// preserving the trade-bar path.
 pub struct ImmediateFillModel {
     pub slippage: Box<dyn SlippageModel>,
 }
@@ -109,32 +204,43 @@ impl FillModel for ImmediateFillModel {
     fn market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
         let fill_price = if order.quantity > dec!(0) {
-            bar.open + slip
+            bar.close + slip
         } else {
-            bar.open - slip
+            bar.close - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
+    }
+
+    fn market_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Fill {
+        let Some(quote_bar) = directional_quote_trade_bar(order, bar, quote_bar) else {
+            return self.market_fill(order, bar, time);
+        };
+
+        let slip = self.slippage.get_slippage_amount(order, &quote_bar);
+        let fill_price = if order.quantity > dec!(0) {
+            quote_bar.close + slip
+        } else {
+            quote_bar.close - slip
+        };
+        make_filled(order, time, fill_price, slip)
     }
 
     fn limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
         let limit = order.limit_price?;
 
-        // Buy limit fills if low <= limit; sell limit fills if high >= limit
+        // Match LEAN's base FillModel: a limit order fills only after the bar
+        // penetrates the limit price, not merely when it touches it.
         let fills = if order.quantity > dec!(0) {
-            bar.low <= limit
+            bar.low < limit
         } else {
-            bar.high >= limit
+            bar.high > limit
         };
 
         if !fills {
@@ -147,17 +253,7 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.open)
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: dec!(0),
-        })
+        Some(make_filled(order, time, fill_price, dec!(0)))
     }
 
     fn stop_market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -180,17 +276,7 @@ impl FillModel for ImmediateFillModel {
             stop.min(bar.open) - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: slip,
-        })
+        Some(make_filled(order, time, fill_price, slip))
     }
 
     fn stop_limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
@@ -207,11 +293,12 @@ impl FillModel for ImmediateFillModel {
             return None;
         }
 
-        // Now check if limit is also triggered
+        // Now check if limit is also triggered. Use the same strict
+        // penetration semantics as limit orders.
         let limit_fills = if order.quantity > dec!(0) {
-            bar.low <= limit
+            bar.low < limit
         } else {
-            bar.high >= limit
+            bar.high > limit
         };
 
         if !limit_fills {
@@ -224,17 +311,7 @@ impl FillModel for ImmediateFillModel {
             limit.max(bar.low)
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Some(Fill {
-            order_event: event,
-            slippage: dec!(0),
-        })
+        Some(make_filled(order, time, fill_price, dec!(0)))
     }
 
     fn market_on_open_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -245,17 +322,7 @@ impl FillModel for ImmediateFillModel {
             bar.open - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
     }
 
     fn market_on_close_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
@@ -266,17 +333,7 @@ impl FillModel for ImmediateFillModel {
             bar.close - slip
         };
 
-        let event = OrderEvent::filled(
-            order.id,
-            order.symbol.clone(),
-            time,
-            fill_price,
-            order.quantity,
-        );
-        Fill {
-            order_event: event,
-            slippage: slip,
-        }
+        make_filled(order, time, fill_price, slip)
     }
 }
 
@@ -645,8 +702,8 @@ impl FillModel for OptionFillModel {
     fn limit_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Option<Fill> {
         let limit = order.limit_price?;
 
-        // For options, limit check against trade bar high/low (no quote data path).
-        // With quotes, callers should check bid/ask directly.
+        // For options, limit check against trade bar high/low. The trait-level
+        // quote-aware path first converts bid/ask quotes into directional bars.
         let fills = if order.quantity > dec!(0) {
             bar.low < limit
         } else {

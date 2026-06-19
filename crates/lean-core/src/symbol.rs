@@ -66,6 +66,42 @@ impl SecurityIdentifier {
         }
     }
 
+    pub fn generate_crypto_future(ticker: &str, market: &Market) -> Self {
+        let sid = Self::hash_sid(
+            ticker,
+            market,
+            SecurityType::CryptoFuture,
+            None,
+            None,
+            None,
+            None,
+        );
+        SecurityIdentifier {
+            ticker: ticker.to_uppercase(),
+            market: market.clone(),
+            security_type: SecurityType::CryptoFuture,
+            expiry: None,
+            strike: None,
+            option_right: None,
+            option_style: None,
+            sid,
+        }
+    }
+
+    pub fn generate_index(ticker: &str, market: &Market) -> Self {
+        let sid = Self::hash_sid(ticker, market, SecurityType::Index, None, None, None, None);
+        SecurityIdentifier {
+            ticker: ticker.to_uppercase(),
+            market: market.clone(),
+            security_type: SecurityType::Index,
+            expiry: None,
+            strike: None,
+            option_right: None,
+            option_style: None,
+            sid,
+        }
+    }
+
     pub fn generate_option(
         underlying: &str,
         market: &Market,
@@ -87,6 +123,35 @@ impl SecurityIdentifier {
             ticker: underlying.to_uppercase(),
             market: market.clone(),
             security_type: SecurityType::Option,
+            expiry: Some(expiry),
+            strike: Some(strike),
+            option_right: Some(right),
+            option_style: Some(style),
+            sid,
+        }
+    }
+
+    pub fn generate_index_option(
+        underlying: &str,
+        market: &Market,
+        expiry: NaiveDate,
+        strike: Price,
+        right: OptionRight,
+        style: OptionStyle,
+    ) -> Self {
+        let sid = Self::hash_sid(
+            underlying,
+            market,
+            SecurityType::IndexOption,
+            Some(expiry),
+            Some(strike),
+            Some(right),
+            Some(style),
+        );
+        SecurityIdentifier {
+            ticker: underlying.to_uppercase(),
+            market: market.clone(),
+            security_type: SecurityType::IndexOption,
             expiry: Some(expiry),
             strike: Some(strike),
             option_right: Some(right),
@@ -189,6 +254,26 @@ impl Symbol {
 
     pub fn create_crypto(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_crypto(ticker, market);
+        Symbol {
+            value: ticker.to_uppercase(),
+            permtick: ticker.to_uppercase(),
+            id,
+            underlying: None,
+        }
+    }
+
+    pub fn create_crypto_future(ticker: &str, market: &Market) -> Self {
+        let id = SecurityIdentifier::generate_crypto_future(ticker, market);
+        Symbol {
+            value: ticker.to_uppercase(),
+            permtick: ticker.to_uppercase(),
+            id,
+            underlying: None,
+        }
+    }
+
+    pub fn create_index(ticker: &str, market: &Market) -> Self {
+        let id = SecurityIdentifier::generate_index(ticker, market);
         Symbol {
             value: ticker.to_uppercase(),
             permtick: ticker.to_uppercase(),

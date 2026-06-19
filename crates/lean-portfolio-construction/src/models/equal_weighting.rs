@@ -1,4 +1,4 @@
-use lean_core::Symbol;
+use lean_core::{Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -20,6 +20,7 @@ use crate::PortfolioBias;
 pub struct EqualWeightingPortfolioConstructionModel {
     portfolio_bias: PortfolioBias,
     max_weight: Option<Decimal>,
+    rebalance_period: Option<TimeSpan>,
 }
 
 impl EqualWeightingPortfolioConstructionModel {
@@ -27,6 +28,7 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias: PortfolioBias::LongShort,
             max_weight: None,
+            rebalance_period: Some(TimeSpan::ONE_DAY),
         }
     }
 
@@ -34,6 +36,7 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias,
             max_weight: None,
+            rebalance_period: Some(TimeSpan::ONE_DAY),
         }
     }
 
@@ -44,6 +47,19 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias,
             max_weight,
+            rebalance_period: Some(TimeSpan::ONE_DAY),
+        }
+    }
+
+    pub fn with_bias_max_weight_and_rebalance(
+        portfolio_bias: PortfolioBias,
+        max_weight: Option<Decimal>,
+        rebalance_period: Option<TimeSpan>,
+    ) -> Self {
+        Self {
+            portfolio_bias,
+            max_weight,
+            rebalance_period,
         }
     }
 
@@ -108,6 +124,10 @@ impl IPortfolioConstructionModel for EqualWeightingPortfolioConstructionModel {
 
     fn name(&self) -> &str {
         "EqualWeightingPortfolioConstructionModel"
+    }
+
+    fn rebalance_period(&self) -> Option<TimeSpan> {
+        self.rebalance_period
     }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}

@@ -27,6 +27,9 @@ pub struct CustomDataQuery {
     pub numeric_min: HashMap<String, f64>,
     pub numeric_max: HashMap<String, f64>,
     /// Provider-specific settings not covered by the generic fields.
+    ///
+    /// The parquet reader also recognizes comma-separated `not_null` and
+    /// `required_columns` values here as opt-in non-null row filters.
     pub properties: HashMap<String, String>,
 }
 
@@ -82,7 +85,13 @@ impl CustomDataQuery {
 /// A parquet-native source returned by custom data providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomParquetSource {
+    /// Local parquet paths. Historical/backtest providers commonly use these
+    /// so data can be cached and reused.
     pub paths: Vec<String>,
+    /// In-memory parquet files. Live providers can use these to avoid durable
+    /// local writes when objects are small or ephemeral.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<Vec<u8>>,
     /// Column used as the data timestamp/date. If absent, the runner uses the
     /// requested date for every row.
     pub time_column: Option<String>,
@@ -160,6 +169,17 @@ pub struct CustomDataPoint {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+/// How a custom-data subscription is consumed by the engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CustomDataSubscriptionRole {
+    /// Ordinary `add_data` subscription delivered to `Slice.custom_data`.
+    #[default]
+    Data,
+    /// Universe-selection input consumed before `OnData`, like C# LEAN
+    /// `FuncUniverse<T>` data.
+    Universe,
+}
+
 /// Active custom data subscription for one ticker + source type.
 #[derive(Debug, Clone)]
 pub struct CustomDataSubscription {
@@ -167,4 +187,11 @@ pub struct CustomDataSubscription {
     pub ticker: String,
     pub config: CustomDataConfig,
     pub dynamic_query: CustomDataQuery,
+    pub role: CustomDataSubscriptionRole,
+}
+
+impl CustomDataSubscription {
+    pub fn is_universe(&self) -> bool {
+        self.role == CustomDataSubscriptionRole::Universe
+    }
 }

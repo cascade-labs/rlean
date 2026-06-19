@@ -1,7 +1,7 @@
 use lean_core::{Market, NanosecondTimestamp, Symbol};
 use lean_orders::{
     transaction_manager::TransactionManager, Order, OrderDirection, OrderStatus, OrderType,
-    TimeInForce,
+    TimeInForce, UpdateOrderFields,
 };
 use rust_decimal_macros::dec;
 
@@ -142,4 +142,105 @@ fn transaction_manager_apply_split_updates_open_orders() {
     assert_eq!(adjusted.quantity, dec!(200));
     assert_eq!(adjusted.stop_price, Some(dec!(45.0)));
     assert_eq!(adjusted.limit_price, Some(dec!(47.5)));
+}
+
+#[test]
+fn transaction_manager_cancel_open_orders_updates_canonical_order() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    let ticket = tm.add_order(Order::market(1, symbol, dec!(100), ts(0), ""));
+
+    tm.cancel_open_orders(ts(1));
+
+    let order = tm.get_order(1).expect("order should exist");
+    assert_eq!(order.status, OrderStatus::Canceled);
+    assert_eq!(order.canceled_time, Some(ts(1)));
+    assert_eq!(ticket.status(), OrderStatus::Canceled);
+    assert!(tm.get_open_orders().is_empty());
+}
+
+#[test]
+fn transaction_manager_request_cancel_sets_cancel_pending_and_tracks_request() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    let ticket = tm.add_order(Order::market(1, symbol.clone(), dec!(100), ts(0), ""));
+
+    assert!(tm.request_cancel_order(1, ts(1), "cancel".to_string()));
+
+    let order = tm.get_order(1).expect("order should exist");
+    assert_eq!(order.status, OrderStatus::CancelPending);
+    assert_eq!(ticket.status(), OrderStatus::CancelPending);
+    assert!(tm.get_open_orders().is_empty());
+    let requests = tm.get_cancel_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].order_id, 1);
+    assert_eq!(requests[0].tag, "cancel");
+}
+
+#[test]
+fn transaction_manager_update_new_order_applies_without_queueing_request() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    let ticket = tm.add_order(Order::limit(1, symbol, dec!(100), dec!(450), ts(0), ""));
+
+    assert!(tm.request_update_order(
+        1,
+        ts(1),
+        UpdateOrderFields {
+            limit_price: Some(dec!(451)),
+            tag: Some("adjusted".to_string()),
+            ..Default::default()
+        },
+    ));
+
+    let order = tm.get_order(1).expect("order should exist");
+    assert_eq!(order.status, OrderStatus::New);
+    assert_eq!(order.limit_price, Some(dec!(451)));
+    assert_eq!(order.tag, "adjusted");
+    assert_eq!(ticket.order().limit_price, Some(dec!(451)));
+    assert!(tm.get_update_requests().is_empty());
+}
+
+#[test]
+fn transaction_manager_update_submitted_order_sets_update_submitted_and_tracks_request() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    let mut order = Order::limit(1, symbol, dec!(100), dec!(450), ts(0), "");
+    order.status = OrderStatus::Submitted;
+    let ticket = tm.add_order(order);
+
+    assert!(tm.request_update_order(
+        1,
+        ts(1),
+        UpdateOrderFields {
+            limit_price: Some(dec!(451)),
+            ..Default::default()
+        },
+    ));
+
+    let order = tm.get_order(1).expect("order should exist");
+    assert_eq!(order.status, OrderStatus::UpdateSubmitted);
+    assert_eq!(order.limit_price, Some(dec!(451)));
+    assert_eq!(ticket.status(), OrderStatus::UpdateSubmitted);
+    let requests = tm.get_update_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].order_id, 1);
+    assert_eq!(requests[0].previous_order.limit_price, Some(dec!(450)));
+}
+
+#[test]
+fn transaction_manager_cancel_open_orders_for_symbol_leaves_other_symbols_open() {
+    let tm = TransactionManager::new();
+    let spy = spy();
+    let aapl = Symbol::create_equity("AAPL", &Market::usa());
+    tm.add_order(Order::market(1, spy.clone(), dec!(100), ts(0), ""));
+    tm.add_order(Order::market(2, aapl.clone(), dec!(100), ts(0), ""));
+
+    tm.cancel_open_orders_for_symbol(spy.id.sid, ts(1));
+
+    assert_eq!(tm.get_order(1).unwrap().status, OrderStatus::Canceled);
+    assert_eq!(tm.get_order(2).unwrap().status, OrderStatus::New);
+    let open = tm.get_open_orders();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].symbol, aapl);
 }

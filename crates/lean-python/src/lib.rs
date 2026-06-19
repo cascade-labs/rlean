@@ -18,25 +18,28 @@ use pyo3::prelude::*;
 
 use py_charting::PyChartCollection;
 use py_data::{
-    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyQuoteBar, PyQuoteBars,
+    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyMarginInterestRate,
+    PyMarginInterestRates, PyPerpetualContext, PyPerpetualContexts, PyQuoteBar, PyQuoteBars,
     PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
 };
 use py_framework::{
-    PyAccumulativeInsightPcm, PyAlphaModelBase, PyBlackLittermanPcm, PyConfidenceWeightingPcm,
-    PyConstantAlphaModel, PyEmaCrossAlphaModel, PyEqualWeightingPcm, PyExecutionModelBase,
-    PyHistoricalReturnsAlphaModel, PyImmediateExecutionModel, PyInsight, PyInsightDirection,
-    PyInsightWeightingPcm, PyMacdAlphaModel, PyMaxDrawdownPercentPerSecurity,
-    PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel, PyMaxSharpeRatioPcm,
-    PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm, PyNullExecutionModel,
-    PyNullRiskManagementModel, PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias,
-    PyPortfolioConstructionModelBase, PyPortfolioTarget, PyRiskManagementModelBase,
-    PyRiskParityPcm, PyRsiAlphaModel, PySpreadExecutionModel, PyStandardDeviationExecutionModel,
-    PyTrailingStopRiskModel, PyVwapExecutionModel,
+    PyAccumulativeInsightPcm, PyAdaptiveMakerTakerExecutionModel,
+    PyAggressivePostOnlyExecutionModel, PyAlphaModelBase, PyBlackLittermanPcm,
+    PyConfidenceWeightingPcm, PyConstantAlphaModel, PyEmaCrossAlphaModel, PyEqualWeightingPcm,
+    PyExecutionModelBase, PyHistoricalReturnsAlphaModel, PyImmediateExecutionModel, PyInsight,
+    PyInsightDirection, PyInsightWeightingPcm, PyMacdAlphaModel, PyMakerThenTakerExecutionModel,
+    PyMaxDrawdownPercentPerSecurity, PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel,
+    PyMaxSharpeRatioPcm, PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm,
+    PyNullExecutionModel, PyNullRiskManagementModel, PyPassiveMakerExecutionModel,
+    PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias, PyPortfolioConstructionModelBase,
+    PyPortfolioTarget, PyRiskManagementModelBase, PyRiskParityPcm, PyRsiAlphaModel,
+    PySpreadExecutionModel, PyStandardDeviationExecutionModel, PyTrailingStopRiskModel,
+    PyVwapExecutionModel,
 };
 use py_indicators::{
     PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyMomp, PyRsi, PySma, PyStd,
 };
-use py_orders::PyOrderEvent;
+use py_orders::{PyOrderEvent, PyOrderTicket};
 use py_portfolio::{PyPortfolio, PySecurityHolding};
 use py_qc_algorithm::PyQcAlgorithm;
 use py_quant_book::PyQuantBook;
@@ -82,6 +85,7 @@ pub enum PyBrokerageName {
     Default = 0,
     InteractiveBrokersBrokerage = 1,
     TradierBrokerage = 2,
+    HyperliquidBrokerage = 3,
 }
 
 #[pymethods]
@@ -94,6 +98,8 @@ impl PyBrokerageName {
     const INTERACTIVE_BROKERS_BROKERAGE: Self = Self::InteractiveBrokersBrokerage;
     #[classattr]
     const TRADIER_BROKERAGE: Self = Self::TradierBrokerage;
+    #[classattr]
+    const HYPERLIQUID_BROKERAGE: Self = Self::HyperliquidBrokerage;
 }
 
 impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
@@ -102,6 +108,7 @@ impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
             PyBrokerageName::Default => Self::Default,
             PyBrokerageName::InteractiveBrokersBrokerage => Self::InteractiveBrokersBrokerage,
             PyBrokerageName::TradierBrokerage => Self::TradierBrokerage,
+            PyBrokerageName::HyperliquidBrokerage => Self::HyperliquidBrokerage,
         }
     }
 }
@@ -118,6 +125,8 @@ pub enum PySecurityType {
     Cfd = 5,
     Crypto = 7,
     Index = 8,
+    IndexOption = 9,
+    CryptoFuture = 11,
 }
 
 #[pymethods]
@@ -138,6 +147,39 @@ impl PySecurityType {
     const CRYPTO: Self = Self::Crypto;
     #[classattr]
     const INDEX: Self = Self::Index;
+    #[classattr]
+    const INDEX_OPTION: Self = Self::IndexOption;
+    #[classattr]
+    const CRYPTO_FUTURE: Self = Self::CryptoFuture;
+}
+
+/// LEAN TimeInForce enum values.
+#[pyclass(name = "TimeInForce", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyTimeInForce {
+    GoodTilCanceled = 0,
+    Day = 1,
+}
+
+#[pymethods]
+impl PyTimeInForce {
+    #[classattr]
+    const GOOD_TIL_CANCELED: Self = Self::GoodTilCanceled;
+    #[classattr]
+    const GOOD_TIL_CANCELLED: Self = Self::GoodTilCanceled;
+    #[classattr]
+    const GTC: Self = Self::GoodTilCanceled;
+    #[classattr]
+    const DAY: Self = Self::Day;
+}
+
+impl From<PyTimeInForce> for lean_orders::order::TimeInForce {
+    fn from(value: PyTimeInForce) -> Self {
+        match value {
+            PyTimeInForce::GoodTilCanceled => Self::GoodTilCanceled,
+            PyTimeInForce::Day => Self::Day,
+        }
+    }
 }
 
 #[pyclass(name = "Market")]
@@ -147,6 +189,43 @@ pub struct PyMarket;
 impl PyMarket {
     #[classattr]
     const USA: &'static str = "usa";
+    #[classattr]
+    const BINANCE: &'static str = "binance";
+    #[classattr]
+    const BYBIT: &'static str = "bybit";
+    #[classattr]
+    const COINBASE: &'static str = "coinbase";
+    #[classattr]
+    const KRAKEN: &'static str = "kraken";
+    #[classattr]
+    const HYPERLIQUID: &'static str = "hyperliquid";
+}
+
+#[pyclass(name = "HyperliquidUniverse")]
+pub struct PyHyperliquidUniverse;
+
+#[pymethods]
+impl PyHyperliquidUniverse {
+    #[classattr]
+    const CRYPTO_PERP: &'static str = "CRYPTO_PERP";
+    #[classattr]
+    const CRYPTO_SPOT: &'static str = "CRYPTO_SPOT";
+    #[classattr]
+    const HIP3_XYZ: &'static str = "HIP3_XYZ";
+    #[classattr]
+    const HIP3_TRADING_XYZ: &'static str = "HIP3_XYZ";
+    #[classattr]
+    const HIP3_VNTL: &'static str = "HIP3_VNTL";
+
+    #[staticmethod]
+    fn hip3(dex: &str) -> String {
+        format!(
+            "HIP3_{}",
+            dex.trim()
+                .replace(['-', '.', ':', ' '], "_")
+                .to_ascii_uppercase()
+        )
+    }
 }
 
 /// LEAN OrderType enum values.
@@ -236,6 +315,10 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBar>()?;
     m.add_class::<PyQuoteBar>()?;
     m.add_class::<PyQuoteBars>()?;
+    m.add_class::<PyMarginInterestRate>()?;
+    m.add_class::<PyMarginInterestRates>()?;
+    m.add_class::<PyPerpetualContext>()?;
+    m.add_class::<PyPerpetualContexts>()?;
     m.add_class::<PyTick>()?;
     m.add_class::<PyTicks>()?;
     m.add_class::<PySlice>()?;
@@ -248,6 +331,7 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Orders
     m.add_class::<PyOrderEvent>()?;
+    m.add_class::<PyOrderTicket>()?;
 
     // Portfolio
     m.add_class::<PySecurityHolding>()?;
@@ -286,9 +370,11 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBrokerageName>()?;
     m.add_class::<PySecurityType>()?;
     m.add_class::<PyMarket>()?;
+    m.add_class::<PyHyperliquidUniverse>()?;
     m.add_class::<PyOrderType>()?;
     m.add_class::<PyOrderStatus>()?;
     m.add_class::<PyOrderDirection>()?;
+    m.add_class::<PyTimeInForce>()?;
 
     // ── Insight types ─────────────────────────────────────────────────────────
     m.add_class::<PyInsightDirection>()?;
@@ -326,6 +412,10 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNullExecutionModel>()?;
     m.add_class::<PyVwapExecutionModel>()?;
     m.add_class::<PySpreadExecutionModel>()?;
+    m.add_class::<PyPassiveMakerExecutionModel>()?;
+    m.add_class::<PyAdaptiveMakerTakerExecutionModel>()?;
+    m.add_class::<PyMakerThenTakerExecutionModel>()?;
+    m.add_class::<PyAggressivePostOnlyExecutionModel>()?;
     m.add_class::<PyStandardDeviationExecutionModel>()?;
 
     // ── Algorithm Framework — Risk Management Models ──────────────────────────
@@ -519,7 +609,35 @@ assert hasattr(OrderDirection, 'Hold')
             );
             assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
 
-            // Test 9: security identity and market-hours API surface mirrors LEAN names.
+            // Test 9: TimeInForce is exposed and accepted by order helpers.
+            let result = py.run(
+                c"
+from AlgorithmImports import QCAlgorithm, BrokerageName, OrderStatus, OrderTicket, Resolution, TimeInForce
+
+algorithm = QCAlgorithm()
+algorithm.set_brokerage_model(BrokerageName.TRADIER_BROKERAGE)
+spy = algorithm.add_equity('SPY', Resolution.DAILY).symbol
+ticket = algorithm.market_order(spy, 1, TimeInForce.DAY)
+limit_ticket = algorithm.limit_order(spy, 1, 500, 'gtc')
+extended_ticket = algorithm.market_order(spy, 1, TimeInForce.DAY, outside_regular_trading_hours=True)
+
+assert isinstance(ticket, OrderTicket)
+assert ticket.status == OrderStatus.New
+assert extended_ticket.status == OrderStatus.Invalid
+assert limit_ticket.update_limit_price(501, 'adjusted') is True
+assert limit_ticket.limit_price == 501.0
+assert limit_ticket.tag == 'adjusted'
+assert ticket.cancel('test cancel') is True
+assert ticket.status == OrderStatus.CancelPending
+assert hasattr(TimeInForce, 'DAY')
+assert hasattr(TimeInForce, 'GTC')
+",
+                None,
+                None,
+            );
+            assert!(result.is_ok(), "TimeInForce API test failed: {:?}", result);
+
+            // Test 10: security identity and market-hours API surface mirrors LEAN names.
             let result = py.run(
                 c"
 import datetime
@@ -528,9 +646,16 @@ algorithm = QCAlgorithm()
 spy = Symbol.Create('SPY', SecurityType.EQUITY, Market.USA)
 assert spy.Value == 'SPY'
 assert SecurityType.EQUITY == SecurityType.Equity
+assert SecurityType.INDEX_OPTION == SecurityType.IndexOption
 assert Market.USA == 'usa'
+option = Symbol.CreateOptionOsi('SPY', 450, 20250117, OptionRight.Call)
+assert option.Value == 'SPY250117C00450000'
+spx = Symbol.Create('SPX', SecurityType.INDEX, Market.USA)
+index_option = Symbol.CreateIndexOptionOsi(spx, 4500, '2025-01-17', 'put', 'European')
+assert index_option.Value == 'SPX250117P04500000'
 security = algorithm.AddEquity('SPY', Resolution.Minute)
 assert algorithm.Securities.ContainsKey(spy)
+assert algorithm.AddOptionContract(index_option, Resolution.Minute).Value == index_option.Value
 assert security.Exchange.Hours.IsOpen(
     datetime.datetime(2022, 1, 3, 10, 0),
     datetime.datetime(2022, 1, 3, 10, 1),
@@ -542,7 +667,7 @@ assert security.Exchange.Hours.IsOpen(
             );
             assert!(result.is_ok(), "Security API test failed: {:?}", result);
 
-            // Test 10: universe selection API surface mirrors LEAN names.
+            // Test 11: universe selection API surface mirrors LEAN names.
             let result = py.run(
                 c"
 from AlgorithmImports import *

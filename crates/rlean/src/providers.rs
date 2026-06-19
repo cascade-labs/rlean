@@ -15,10 +15,12 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
+use lean_data::DataQueueHandler;
 use lean_data_providers::{
     config::ProviderConfig, CustomDataContext, IHistoryProvider, LocalHistoryProvider,
     StackedHistoryProvider,
 };
+use lean_live::DataQueueHandlerManager;
 
 /// A lazy wrapper around a named plugin provider.
 ///
@@ -70,6 +72,14 @@ impl IHistoryProvider for LazyPluginProvider {
     ) -> anyhow::Result<Vec<lean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_ticks(request).await
+    }
+
+    async fn get_margin_interest_rates(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::MarginInterestRate>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_margin_interest_rates(request).await
     }
 
     async fn get_history_batch(
@@ -273,6 +283,71 @@ pub fn build_history_provider(
     }
 }
 
+/// Build the stacked live data queue handler set for a live deployment.
+///
+/// Provider order is significant: the first handler accepting a subscription
+/// owns it, matching LEAN's `DataQueueHandlerManager`.
+pub fn build_live_data_queue(names: &str, args: ProviderArgs) -> Result<DataQueueHandlerManager> {
+    let handlers = names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| load_plugin_live_data_provider(name, &args))
+        .collect::<Result<Vec<_>>>()?;
+
+    if handlers.is_empty() {
+        bail!("no live data providers were specified");
+    }
+
+    Ok(DataQueueHandlerManager::new(handlers))
+}
+
+/// Load a brokerage plugin from an installed dylib.
+///
+/// Paper brokerage is built into `lean-brokerages`; this loader is for
+/// real-money brokerage plugins that export `rlean_create_brokerage`.
+#[allow(dead_code)]
+pub fn load_brokerage_plugin(
+    name: &str,
+    args: &ProviderArgs,
+) -> Result<Box<dyn lean_brokerages::Brokerage>> {
+    use libloading::{Library, Symbol};
+
+    let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
+    let plugin_path = home_dir()?.join(".rlean").join("plugins").join(&lib_name);
+    if !plugin_path.exists() {
+        bail!(
+            "Brokerage plugin '{}' is not installed. Run: rlean plugin install {}",
+            name,
+            name
+        );
+    }
+
+    let config_json = plugin_config_json(name, args)?;
+    let lib = Box::leak(Box::new(
+        unsafe { Library::new(&plugin_path) }
+            .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
+    ));
+    initialize_plugin_library(lib, name);
+    let create: Symbol<lean_plugin::CreateBrokerageFn> = unsafe {
+        lib.get(b"rlean_create_brokerage\0")
+    }
+    .map_err(|_| anyhow::anyhow!("Plugin '{}' does not export rlean_create_brokerage", name))?;
+
+    let config_cstr = std::ffi::CString::new(config_json)?;
+    let raw = unsafe { create(config_cstr.as_ptr()) };
+    if raw.is_null() {
+        bail!(
+            "Plugin '{}' returned null from rlean_create_brokerage",
+            name
+        );
+    }
+
+    let brokerage: Box<dyn lean_brokerages::Brokerage> =
+        unsafe { *Box::from_raw(raw as *mut Box<dyn lean_brokerages::Brokerage>) };
+    Ok(brokerage)
+}
+
 /// Build a single named provider, drawing credentials from `args`.
 ///
 /// Plugin providers are returned as [`LazyPluginProvider`] wrappers so the
@@ -321,31 +396,7 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         );
     }
 
-    let max_concurrent = if args.thetadata_concurrent > 0 {
-        args.thetadata_concurrent
-    } else {
-        4
-    };
-
-    // Start with stored plugin config from ~/.rlean/plugin-configs.json.
-    // This lets users set plugin-specific keys (e.g. api_key, base_url) via
-    // `rlean config set <plugin>.<key> <value>`.
-    use crate::config::PluginConfigs;
-    let plugin_configs = PluginConfigs::load().unwrap_or_default();
-    let mut plugin_cfg = plugin_configs.get_plugin(name);
-
-    // Add rlean-managed fields (do not overwrite if the plugin explicitly set them).
-    plugin_cfg
-        .entry("data_root".to_string())
-        .or_insert_with(|| serde_json::json!(args.data_root.display().to_string()));
-    plugin_cfg
-        .entry("requests_per_second".to_string())
-        .or_insert_with(|| serde_json::json!(args.rps_for(name)));
-    plugin_cfg
-        .entry("max_concurrent".to_string())
-        .or_insert_with(|| serde_json::json!(max_concurrent));
-
-    let config_json = serde_json::Value::Object(plugin_cfg).to_string();
+    let config_json = plugin_config_json(name, args)?;
 
     // Leak the library so it lives for the process lifetime.
     // Providers are long-lived (process-scoped) so this is intentional.
@@ -353,6 +404,7 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         unsafe { Library::new(&plugin_path) }
             .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
     ));
+    initialize_plugin_library(lib, name);
 
     let create: Symbol<unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut ()> =
         unsafe { lib.get(b"rlean_create_history_provider\0") }.map_err(|_| {
@@ -376,6 +428,76 @@ fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHist
         unsafe { *Box::from_raw(raw as *mut Arc<dyn IHistoryProvider>) };
 
     Ok(provider)
+}
+
+fn load_plugin_live_data_provider(
+    name: &str,
+    args: &ProviderArgs,
+) -> Result<Box<dyn DataQueueHandler>> {
+    use libloading::{Library, Symbol};
+
+    let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
+    let plugin_path = home_dir()?.join(".rlean").join("plugins").join(&lib_name);
+
+    if !plugin_path.exists() {
+        bail!(
+            "Live data plugin '{}' is not installed. Run: rlean plugin install {}",
+            name,
+            name
+        );
+    }
+
+    let config_json = plugin_config_json(name, args)?;
+    let lib = Box::leak(Box::new(
+        unsafe { Library::new(&plugin_path) }
+            .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
+    ));
+    initialize_plugin_library(lib, name);
+
+    let create: Symbol<lean_plugin::CreateLiveDataProviderFn> =
+        unsafe { lib.get(b"rlean_create_live_data_provider\0") }.map_err(|_| {
+            anyhow::anyhow!(
+                "Plugin '{}' does not export rlean_create_live_data_provider",
+                name
+            )
+        })?;
+
+    let config_cstr = std::ffi::CString::new(config_json)?;
+    let raw = unsafe { create(config_cstr.as_ptr()) };
+    if raw.is_null() {
+        bail!(
+            "Plugin '{}' returned null from rlean_create_live_data_provider",
+            name
+        );
+    }
+
+    let provider: Box<dyn DataQueueHandler> =
+        unsafe { *Box::from_raw(raw as *mut Box<dyn DataQueueHandler>) };
+    Ok(provider)
+}
+
+fn plugin_config_json(name: &str, args: &ProviderArgs) -> Result<String> {
+    let max_concurrent = if args.thetadata_concurrent > 0 {
+        args.thetadata_concurrent
+    } else {
+        4
+    };
+
+    use crate::config::PluginConfigs;
+    let plugin_configs = PluginConfigs::load().unwrap_or_default();
+    let mut plugin_cfg = plugin_configs.get_plugin(name);
+
+    plugin_cfg
+        .entry("data_root".to_string())
+        .or_insert_with(|| serde_json::json!(args.data_root.display().to_string()));
+    plugin_cfg
+        .entry("requests_per_second".to_string())
+        .or_insert_with(|| serde_json::json!(args.rps_for(name)));
+    plugin_cfg
+        .entry("max_concurrent".to_string())
+        .or_insert_with(|| serde_json::json!(max_concurrent));
+
+    Ok(serde_json::Value::Object(plugin_cfg).to_string())
 }
 
 /// Scan `~/.rlean/plugins/` for dylibs that export `rlean_custom_data_factory`
@@ -402,7 +524,7 @@ pub fn load_custom_data_plugins(
     let glob_pattern = pattern.to_string_lossy().to_string();
 
     let mut sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>> = Vec::new();
-    let context = CustomDataContext::new(data_root);
+    let plugin_configs = crate::config::PluginConfigs::load().unwrap_or_default();
 
     let paths: Vec<_> = match glob::glob(&glob_pattern) {
         Ok(paths) => paths.filter_map(|r| r.ok()).collect(),
@@ -418,6 +540,7 @@ pub fn load_custom_data_plugins(
                 continue;
             }
         };
+        initialize_plugin_library(&lib, &path.display().to_string());
 
         let factory: Symbol<unsafe extern "C" fn() -> *mut ()> =
             match unsafe { lib.get(b"rlean_custom_data_factory\0") } {
@@ -438,6 +561,11 @@ pub fn load_custom_data_plugins(
         // Box<dyn ICustomDataSource> (double-boxed to keep a thin pointer over FFI).
         let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
             unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+        let source_name = source_box.name().to_string();
+        let context = CustomDataContext::with_plugin_config(
+            data_root,
+            plugin_configs.get_plugin(&source_name),
+        );
         source_box.initialize(&context);
         let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
 
@@ -453,6 +581,30 @@ pub fn load_custom_data_plugins(
     }
 
     sources
+}
+
+fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) {
+    type DescriptorFn = unsafe extern "C" fn() -> lean_plugin::PluginDescriptor;
+
+    let descriptor: libloading::Symbol<DescriptorFn> =
+        match unsafe { lib.get(b"rlean_plugin_descriptor\0") } {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                tracing::debug!(
+                    "Plugin {requested_plugin} does not export rlean_plugin_descriptor: {error}"
+                );
+                return;
+            }
+        };
+
+    let descriptor = unsafe { descriptor() };
+    tracing::debug!(
+        requested_plugin,
+        plugin = descriptor.name_str(),
+        version = descriptor.version_str(),
+        kind = %descriptor.kind,
+        "Initialized plugin descriptor"
+    );
 }
 
 fn dylib_ext() -> &'static str {

@@ -4,4 +4,4 @@ pub mod trade_statistics;
 
 pub use portfolio_statistics::PortfolioStatistics;
 pub use statistics::{Statistics, StatisticsResults};
-pub use trade_statistics::{Trade, TradeStatistics};
+pub use trade_statistics::{OpenPositionTrade, Trade, TradeBuilder, TradeStatistics};

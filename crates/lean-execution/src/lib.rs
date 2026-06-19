@@ -2,10 +2,15 @@ pub mod execution_model;
 pub mod models;
 
 pub use execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    OrderRequest, SecurityData,
 };
+pub use models::adaptive_maker_taker::AdaptiveMakerTakerExecutionModel;
+pub use models::aggressive_post_only::AggressivePostOnlyExecutionModel;
 pub use models::immediate::ImmediateExecutionModel;
+pub use models::maker_then_taker::MakerThenTakerExecutionModel;
 pub use models::null::NullExecutionModel;
+pub use models::passive_maker::PassiveMakerExecutionModel;
 pub use models::spread::SpreadExecutionModel;
 pub use models::standard_deviation::StandardDeviationExecutionModel;
 pub use models::twap::TwapExecutionModel;

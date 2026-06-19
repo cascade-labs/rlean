@@ -1,5 +1,6 @@
 pub mod algorithm;
 pub mod benchmark;
+pub mod buying_power;
 pub mod history;
 pub mod logging;
 pub mod notification;
@@ -9,6 +10,7 @@ pub mod runtime_statistics;
 pub mod securities;
 
 pub use algorithm::{AlgorithmStatus, IAlgorithm};
+pub use buying_power::BuyingPowerModel;
 pub use history::HistoryRequest;
 pub use logging::AlgorithmLogging;
 pub use portfolio::{SecurityHolding, SecurityPortfolioManager};
