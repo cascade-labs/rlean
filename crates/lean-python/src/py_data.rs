@@ -1681,7 +1681,7 @@ impl FrameworkSliceProxy {
                     .ticker_to_sid
                     .insert(qbar.symbol.permtick.clone(), sid);
             }
-            if !previous_sids.iter().any(|previous| *previous == sid) {
+            if !previous_sids.contains(&sid) {
                 if let Some(cell) = self.quote_bar_cells.get(&sid) {
                     qbars_obj.bars.insert(sid, cell.clone_ref(py));
                 }
@@ -1722,7 +1722,7 @@ impl FrameworkSliceProxy {
                     .ticker_to_sid
                     .insert(bar.symbol.permtick.clone(), sid);
             }
-            if !previous_sids.iter().any(|previous| *previous == sid) {
+            if !previous_sids.contains(&sid) {
                 if let Some(cell) = self.bar_cells.get(&sid) {
                     bars_obj.bars.insert(sid, cell.clone_ref(py));
                 }
@@ -1735,10 +1735,10 @@ impl FrameworkSliceProxy {
         self.bar_cells
             .reserve(slice.bars.len().saturating_sub(self.bar_cells.len()));
         for (&sid, bar) in &slice.bars {
-            if !self.bar_cells.contains_key(&sid) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.bar_cells.entry(sid) {
                 match Py::new(py, PyTradeBar::from(bar)) {
                     Ok(py_bar) => {
-                        self.bar_cells.insert(sid, py_bar);
+                        slot.insert(py_bar);
                     }
                     Err(e) => {
                         tracing::warn!("FrameworkSliceProxy: TradeBar alloc error: {e}");
@@ -1770,10 +1770,10 @@ impl FrameworkSliceProxy {
         self.quote_bar_cells
             .reserve(quote_bars.len().saturating_sub(self.quote_bar_cells.len()));
         for (&sid, qbar) in quote_bars {
-            if !self.quote_bar_cells.contains_key(&sid) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.quote_bar_cells.entry(sid) {
                 match Py::new(py, PyQuoteBar::from(qbar)) {
                     Ok(py_qbar) => {
-                        self.quote_bar_cells.insert(sid, py_qbar);
+                        slot.insert(py_qbar);
                     }
                     Err(e) => {
                         tracing::warn!("FrameworkSliceProxy: QuoteBar alloc error: {e}");

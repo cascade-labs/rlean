@@ -10470,6 +10470,7 @@ fn equity_map_file_resolver_for_subscription<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_map_rows_for_subscription(
     reader: &ParquetReader,
     data_root: &Path,
