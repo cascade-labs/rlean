@@ -115,7 +115,9 @@ fn process_orders_with_quotes_uses_quote_side_for_limit_trigger() {
     let events = processor.process_orders_with_quotes(&bars, &quotes, ts(60));
 
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].fill_price, dec!(101));
+    // Buy limit @100 triggers off the quote side (ask low 99 <= 100) but fills AT the
+    // limit price — a buy can't fill above its limit, so 100 (not the 101 ask).
+    assert_eq!(events[0].fill_price, dec!(100));
     assert_eq!(events[0].fill_quantity, dec!(10));
 }
 
