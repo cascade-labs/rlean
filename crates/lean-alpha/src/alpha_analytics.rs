@@ -562,14 +562,15 @@ fn solve_spd(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         if d.abs() < 1e-12 {
             continue; // singular pivot; leave this coordinate at ~0
         }
-        for r in 0..n {
+        let pivot = m[col].clone();
+        for (r, row) in m.iter_mut().enumerate() {
             if r == col {
                 continue;
             }
-            let f = m[r][col] / d;
+            let f = row[col] / d;
             if f != 0.0 {
-                for c in col..=n {
-                    m[r][c] -= f * m[col][c];
+                for (c, &pv) in pivot.iter().enumerate().skip(col) {
+                    row[c] -= f * pv;
                 }
             }
         }
