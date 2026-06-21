@@ -846,6 +846,38 @@ impl PyQcAlgorithm {
         Ok(PyOrderTicket::new(ticket, self.inner.clone()))
     }
 
+    /// Place a market-on-open order.
+    #[pyo3(signature = (symbol, quantity))]
+    fn market_on_open_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+    ) -> PyResult<PyOrderTicket> {
+        let sym = self.resolve_symbol(symbol)?;
+        let ticket = self
+            .inner
+            .lock()
+            .unwrap()
+            .market_on_open_order(&sym, f2d(quantity));
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
+    }
+
+    /// Place a market-on-close order.
+    #[pyo3(signature = (symbol, quantity))]
+    fn market_on_close_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+    ) -> PyResult<PyOrderTicket> {
+        let sym = self.resolve_symbol(symbol)?;
+        let ticket = self
+            .inner
+            .lock()
+            .unwrap()
+            .market_on_close_order(&sym, f2d(quantity));
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
+    }
+
     /// Target a portfolio weight (0.0 to 1.0). Automatically computes the delta order.
     fn set_holdings(&mut self, symbol: &Bound<'_, PyAny>, target: f64) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
@@ -1356,6 +1388,12 @@ impl PyQcAlgorithm {
     fn add_alpha(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
         let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
         let fw = slf.borrow().framework.clone();
+        {
+            let mut g = fw.lock().unwrap();
+            if g.alg_py.is_none() {
+                g.alg_py = Some(slf.clone().into_any().unbind());
+            }
+        }
         if let Some(m) = try_take_alpha(model, alg_py) {
             fw.lock().unwrap().alpha_models.push(m);
         }
@@ -1368,6 +1406,10 @@ impl PyQcAlgorithm {
     fn set_portfolio_construction(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
         let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
         let fw = slf.borrow().framework.clone();
+        {
+            let mut g = fw.lock().unwrap();
+            g.alg_py = Some(slf.clone().into_any().unbind());
+        }
         if let Some(m) = try_take_pcm(model, alg_py) {
             fw.lock().unwrap().pcm = m;
         }
@@ -2234,5 +2276,29 @@ mod tests {
             .map(|p| p.value.to_f64().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn market_on_open_order_is_exposed_to_python_algorithm() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut alg = PyQcAlgorithm::new();
+            let security = alg.add_equity("SPY", PyResolution::Daily);
+            let symbol = Py::new(py, security.inner.clone()).unwrap();
+
+            let ticket = alg
+                .market_on_open_order(symbol.bind(py).as_any(), 10.0)
+                .unwrap();
+
+            let order = alg
+                .inner
+                .lock()
+                .unwrap()
+                .transactions
+                .get_order(ticket.order_id)
+                .unwrap();
+            assert_eq!(order.order_type, lean_orders::OrderType::MarketOnOpen);
+            assert_eq!(order.quantity, dec!(10));
+        });
     }
 }

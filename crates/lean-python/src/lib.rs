@@ -236,13 +236,14 @@ pub enum PyOrderType {
     Limit = 1,
     StopMarket = 2,
     StopLimit = 3,
-    MarketOnClose = 4,
-    OptionExercise = 5,
-    LimitIfTouched = 6,
-    ComboMarket = 7,
-    ComboLimit = 8,
-    ComboLegLimit = 9,
-    TrailingStop = 10,
+    MarketOnOpen = 4,
+    MarketOnClose = 5,
+    OptionExercise = 6,
+    LimitIfTouched = 7,
+    ComboMarket = 8,
+    ComboLimit = 9,
+    ComboLegLimit = 10,
+    TrailingStop = 11,
 }
 
 /// LEAN OrderStatus enum values.

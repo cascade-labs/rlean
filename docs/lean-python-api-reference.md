@@ -70,6 +70,8 @@ Source: [Portfolio Key Concepts](https://www.quantconnect.com/docs/v2/writing-al
 | C# LEAN | Python LEAN |
 | --- | --- |
 | `MarketOrder("IBM", 100)` | `self.market_order("IBM", 100)` |
+| `MarketOnOpenOrder("IBM", 100)` | `self.market_on_open_order("IBM", 100)` |
+| `MarketOnCloseOrder("IBM", 100)` | `self.market_on_close_order("IBM", 100)` |
 | `Buy("AAPL", 10)` | `self.buy("AAPL", 10)` |
 | `Sell("TSLA", 25)` | `self.sell("TSLA", 25)` |
 | `Order("SPY", 20)` | `self.order("SPY", 20)` |

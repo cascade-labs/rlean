@@ -1,4 +1,5 @@
 use crate::risk_management::{PortfolioTarget, RiskContext, RiskManagementModel};
+use lean_core::Symbol;
 use rust_decimal::Decimal;
 
 /// Liquidates a security when its unrealized profit exceeds the threshold
@@ -11,12 +12,14 @@ use rust_decimal::Decimal;
 /// * Only invested securities are checked.
 pub struct MaximumUnrealizedProfitPercentPerSecurity {
     pub maximum_unrealized_profit_pct: Decimal,
+    canceled_symbols: Vec<Symbol>,
 }
 
 impl MaximumUnrealizedProfitPercentPerSecurity {
     pub fn new(maximum_unrealized_profit_pct: Decimal) -> Self {
         MaximumUnrealizedProfitPercentPerSecurity {
             maximum_unrealized_profit_pct: maximum_unrealized_profit_pct.abs(),
+            canceled_symbols: Vec::new(),
         }
     }
 }
@@ -33,6 +36,7 @@ impl RiskManagementModel for MaximumUnrealizedProfitPercentPerSecurity {
         ctx: &RiskContext,
     ) -> Vec<PortfolioTarget> {
         let mut result = Vec::new();
+        self.canceled_symbols.clear();
 
         for holding in &ctx.holdings {
             if !holding.is_invested() {
@@ -51,10 +55,15 @@ impl RiskManagementModel for MaximumUnrealizedProfitPercentPerSecurity {
             };
 
             if pnl_pct > self.maximum_unrealized_profit_pct {
+                self.canceled_symbols.push(holding.symbol.clone());
                 result.push(PortfolioTarget::new(holding.symbol.clone(), Decimal::ZERO));
             }
         }
 
         result
+    }
+
+    fn canceled_insights(&mut self) -> Vec<Symbol> {
+        std::mem::take(&mut self.canceled_symbols)
     }
 }

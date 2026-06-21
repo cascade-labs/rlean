@@ -1,21 +1,56 @@
 use crate::insight::Insight;
 use lean_core::{DateTime, Symbol};
-use std::collections::HashMap;
+use rust_decimal::Decimal;
+use std::collections::{BTreeMap, HashMap};
+
+/// Max number of closed (scored) insights retained for `get_insights` history.
+/// Bounds memory while covering well beyond any realistic source-IC lookback.
+const MAX_CLOSED_HISTORY: usize = 50_000;
 
 /// Maintains a set of active insights, indexed by symbol.
 #[derive(Debug, Clone)]
 pub struct InsightCollection {
-    /// keyed by symbol.id.sid for O(1) lookup
-    insights: HashMap<u64, Vec<Insight>>,
+    /// keyed by symbol.id.sid; BTreeMap (not HashMap) so every iteration order is
+    /// deterministic (sorted by sid) — HashMap's per-process RandomState reordered
+    /// insight delivery to the PCM / framework scoring, causing run-to-run numeric
+    /// drift in backtests.
+    insights: BTreeMap<u64, Vec<Insight>>,
+    /// Closed insights retained with their final scores (FIFO-pruned history).
+    closed: Vec<Insight>,
     total_count: usize,
 }
 
 impl InsightCollection {
     pub fn new() -> Self {
         Self {
-            insights: HashMap::new(),
+            insights: BTreeMap::new(),
+            closed: Vec::new(),
             total_count: 0,
         }
+    }
+
+    /// Update direction/magnitude scores of all active insights from current prices.
+    /// `prices` is keyed by `symbol.value` (ticker), matching the framework pipeline.
+    pub fn score_active(&mut self, prices: &HashMap<String, Decimal>, utc_now: DateTime) {
+        for v in self.insights.values_mut() {
+            for insight in v.iter_mut() {
+                if insight.is_active(utc_now) {
+                    if let Some(price) = prices.get(&insight.symbol.value) {
+                        if insight.reference_value.is_none() {
+                            insight.reference_value = Some(*price);
+                        }
+                        insight.update_score(*price);
+                    }
+                }
+            }
+        }
+    }
+
+    /// All insights (active + retained closed history), for `GetInsights`.
+    pub fn get_insights(&self) -> Vec<Insight> {
+        let mut out: Vec<Insight> = self.insights.values().flatten().cloned().collect();
+        out.extend(self.closed.iter().cloned());
+        out
     }
 
     pub fn add(&mut self, insight: Insight) {
@@ -57,19 +92,39 @@ impl InsightCollection {
             .collect()
     }
 
+    pub fn active(&self, utc_now: DateTime) -> Vec<Insight> {
+        self.insights
+            .values()
+            .flat_map(|symbol_insights| {
+                symbol_insights
+                    .iter()
+                    .filter(move |i| i.is_active(utc_now))
+                    .cloned()
+            })
+            .collect()
+    }
+
     pub fn remove_expired(&mut self, utc_now: DateTime) -> Vec<Insight> {
         let mut expired = Vec::new();
         for v in self.insights.values_mut() {
             let mut i = 0;
             while i < v.len() {
                 if v[i].is_expired(utc_now) {
-                    expired.push(v.remove(i));
+                    let mut closed = v.remove(i);
+                    closed.finalize_score();
+                    self.closed.push(closed.clone());
+                    expired.push(closed);
                 } else {
                     i += 1;
                 }
             }
         }
         self.insights.retain(|_, v| !v.is_empty());
+        // Bound retained history (FIFO).
+        if self.closed.len() > MAX_CLOSED_HISTORY {
+            let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
+            self.closed.drain(0..overflow);
+        }
         expired
     }
 

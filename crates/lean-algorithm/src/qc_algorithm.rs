@@ -13,8 +13,8 @@ use lean_options::OptionChain;
 use lean_orders::{
     combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
     fee_model::{
-        BybitFeeModel, FeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, OrderFee,
-        OrderFeeParameters, TradierFeeModel,
+        BybitFeeModel, FeeModel, FlatFeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel,
+        OrderFee, OrderFeeParameters, TradierFeeModel,
     },
     order::{Order, OrderStatus, OrderSubmissionData, OrderType, TimeInForce},
     order_event::OrderEvent,
@@ -513,6 +513,15 @@ impl QcAlgorithm {
                 Box::new(HyperliquidFeeModel::default())
             }
             (_, SecurityType::CryptoFuture, Market::BYBIT) => Box::new(BybitFeeModel::perpetuals()),
+            (
+                BrokerageName::Default,
+                SecurityType::Equity
+                | SecurityType::Option
+                | SecurityType::Future
+                | SecurityType::FutureOption,
+                _,
+            ) => Box::new(InteractiveBrokersFeeModel::default()),
+            (BrokerageName::Default, _, _) => Box::new(FlatFeeModel::new(dec!(0))),
             (BrokerageName::TradierBrokerage, _, _) => Box::new(TradierFeeModel),
             (BrokerageName::InteractiveBrokersBrokerage, _, _) => {
                 Box::new(InteractiveBrokersFeeModel::default())
@@ -1706,6 +1715,57 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn default_brokerage_fee_model_matches_lean_security_type_defaults() {
+        let time = DateTime::from_secs(0);
+
+        let alg = QcAlgorithm::new("test", dec!(100_000));
+        let equity = Symbol::create_equity("SPY", &Market::usa());
+        let equity_order = Order::market(1, equity, dec!(471), time, "");
+        let equity_fee = alg.order_fee(&equity_order, dec!(42.48));
+        assert_eq!(equity_fee.amount, dec!(2.355));
+        assert_eq!(equity_fee.currency, "USD");
+
+        let crypto = Symbol::create_crypto("BTCUSD", &Market::coinbase());
+        let crypto_order = Order::market(2, crypto, dec!(1), time, "");
+        let crypto_fee = alg.order_fee(&crypto_order, dec!(50_000));
+        assert_eq!(crypto_fee.amount, dec!(0));
+
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let option = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+            dec!(500),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let option_order = Order::market(3, option, dec!(2), time, "");
+        let option_fee = alg.order_fee(&option_order, dec!(3.25));
+        assert_eq!(option_fee.amount, dec!(1.40));
+
+        let future = Symbol::create_future(
+            "ES",
+            &Market::cme(),
+            NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        );
+        let future_order = Order::market(4, future, dec!(3), time, "");
+        let future_fee = alg.order_fee(&future_order, dec!(5_000));
+        assert_eq!(future_fee.amount, dec!(2.55));
+    }
+
+    #[test]
+    fn tradier_equity_fee_model_remains_zero_fee() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        alg.set_brokerage_model(BrokerageName::TradierBrokerage, AccountType::Margin);
+
+        let equity = Symbol::create_equity("SPY", &Market::usa());
+        let order = Order::market(1, equity, dec!(471), DateTime::from_secs(0), "");
+        let fee = alg.order_fee(&order, dec!(42.48));
+
+        assert_eq!(fee.amount, dec!(0));
+    }
 
     #[test]
     fn remove_security_removes_equity_subscription_and_security() {

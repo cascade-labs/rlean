@@ -1,8 +1,13 @@
+pub mod alpha_analytics;
 pub mod alpha_model;
 pub mod insight;
 pub mod insight_collection;
 pub mod models;
 
+pub use alpha_analytics::{
+    AlphaAnalytics, AlphaCorrelationMatrix, AlphaIcPoint, AlphaIcSeries, AlphaPerformanceTracker,
+    AlphaRanking,
+};
 pub use alpha_model::{CompositeAlphaModel, ConstantAlphaModel, IAlphaModel, NullAlphaModel};
 pub use insight::{Insight, InsightDirection, InsightType};
 pub use insight_collection::InsightCollection;

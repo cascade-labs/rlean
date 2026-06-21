@@ -10,7 +10,7 @@
 ///   - C# LEAN BlackLittermanOptimizationPortfolioConstructionModel.cs
 use std::collections::{HashMap, VecDeque};
 
-use lean_core::Symbol;
+use lean_core::{Symbol, TimeSpan};
 use rust_decimal::Decimal;
 
 use crate::portfolio_construction_model::{
@@ -100,10 +100,12 @@ pub enum PortfolioBias {
 pub struct BlackLittermanOptimizationPortfolioConstructionModel {
     lookback: usize,
     period: usize,
+    rebalance_period: Option<TimeSpan>,
     risk_free_rate: f64,
     delta: f64,
     tau: f64,
     portfolio_bias: PortfolioBias,
+    target_gross: f64,
     /// Per-symbol rolling price history.
     asset_data: HashMap<String, AssetReturns>,
 }
@@ -122,13 +124,38 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
         tau: f64,
         portfolio_bias: PortfolioBias,
     ) -> Self {
-        Self {
+        Self::with_params_and_rebalance(
             lookback,
             period,
             risk_free_rate,
             delta,
             tau,
             portfolio_bias,
+            None,
+            1.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_params_and_rebalance(
+        lookback: usize,
+        period: usize,
+        risk_free_rate: f64,
+        delta: f64,
+        tau: f64,
+        portfolio_bias: PortfolioBias,
+        rebalance_period: Option<TimeSpan>,
+        target_gross: f64,
+    ) -> Self {
+        Self {
+            lookback,
+            period,
+            rebalance_period,
+            risk_free_rate,
+            delta,
+            tau,
+            portfolio_bias,
+            target_gross: target_gross.max(0.0),
             asset_data: HashMap::new(),
         }
     }
@@ -463,7 +490,10 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         }
 
         // Optimize: Maximum Sharpe Ratio
-        let weights = self.max_sharpe_optimize(&pi, &sigma, n);
+        let mut weights = self.max_sharpe_optimize(&pi, &sigma, n);
+        if (self.target_gross - 1.0).abs() > 1e-12 {
+            weights.iter_mut().for_each(|w| *w *= self.target_gross);
+        }
 
         // Build portfolio targets
         insights
@@ -497,6 +527,14 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         prices: &std::collections::HashMap<String, rust_decimal::Decimal>,
     ) {
         self.update_prices(prices);
+    }
+
+    fn rebalance_period(&self) -> Option<TimeSpan> {
+        self.rebalance_period
+    }
+
+    fn use_all_active_insights(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &str {

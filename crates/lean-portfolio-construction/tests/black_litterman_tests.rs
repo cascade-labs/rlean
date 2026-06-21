@@ -177,6 +177,53 @@ fn long_only_bias_produces_non_negative_weights() {
     }
 }
 
+/// Target gross exposure scales optimized portfolio weights without changing
+/// the alpha inputs.
+#[test]
+fn target_gross_scales_portfolio_weights() {
+    let mut model = BlackLittermanOptimizationPortfolioConstructionModel::with_params_and_rebalance(
+        1,
+        30,
+        0.0,
+        2.5,
+        0.05,
+        PortfolioBias::Long,
+        None,
+        1.20,
+    );
+
+    warm_up_model(&mut model, &["SPY", "QQQ", "TLT"], 50);
+
+    let prices = HashMap::from([
+        ("SPY".to_string(), dec!(415)),
+        ("QQQ".to_string(), dec!(360)),
+        ("TLT".to_string(), dec!(95)),
+    ]);
+    let portfolio_value = dec!(100_000);
+    let insights = vec![
+        make_insight(make_equity("SPY"), InsightDirection::Up, 0.08),
+        make_insight(make_equity("QQQ"), InsightDirection::Up, 0.10),
+        make_insight(make_equity("TLT"), InsightDirection::Up, 0.03),
+    ];
+
+    let targets = model.create_targets(&insights, portfolio_value, &prices);
+    assert_eq!(targets.len(), insights.len());
+
+    let gross: f64 = targets
+        .iter()
+        .map(|target| {
+            let quantity: f64 = target.quantity.to_string().parse().unwrap();
+            let price: f64 = prices[&target.symbol.value].to_string().parse().unwrap();
+            (quantity * price / 100_000.0).abs()
+        })
+        .sum();
+
+    assert!(
+        (gross - 1.20).abs() < 0.01,
+        "Expected gross exposure near 1.20, got {gross:.4}"
+    );
+}
+
 /// Model name should match LEAN's class name.
 #[test]
 fn model_name_matches_lean() {

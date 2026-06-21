@@ -45,9 +45,9 @@ use lean_orders::{
 };
 use lean_statistics::{PortfolioStatistics, Statistics, Trade, TradeBuilder};
 use lean_storage::{
-    custom_data_history_path, custom_data_path, DataCache, FactorFileEntry, MapFileEntry,
-    OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver, QueryParams,
-    WriterConfig,
+    custom_data_history_path, custom_data_path, DataCache, FactorFileEntry, MapFile, MapFileEntry,
+    MapFileResolver, OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver,
+    QueryParams, WriterConfig,
 };
 
 use crate::charting::ChartCollection;
@@ -892,7 +892,9 @@ async fn ensure_runner_data_for_new_subscriptions(
     end_date: NaiveDate,
     resolver: &PathResolver,
     factor_reader: &ParquetReader,
+    map_file_resolver: Option<&MapFileResolver>,
     map_file_map: &mut HashMap<u64, Vec<MapFileEntry>>,
+    map_file_permtick_map: &mut HashMap<u64, String>,
     loaded_map_sids: &mut HashSet<u64>,
     factor_map: &mut HashMap<u64, Vec<FactorFileEntry>>,
     require_factor_files: bool,
@@ -908,6 +910,7 @@ async fn ensure_runner_data_for_new_subscriptions(
             start_date,
             end_date,
             resolver,
+            map_file_resolver,
         )
         .await?;
         ensure_crypto_future_margin_interest_rates_for_date(
@@ -931,7 +934,10 @@ async fn ensure_runner_data_for_new_subscriptions(
             factor_reader,
             &config.data_root,
             sub,
+            equity_map_file_resolver_for_subscription(map_file_resolver, sub),
+            start_date,
             map_file_map,
+            map_file_permtick_map,
             loaded_map_sids,
         );
         load_factor_rows_into_map(
@@ -939,6 +945,11 @@ async fn ensure_runner_data_for_new_subscriptions(
             &config.data_root,
             sub,
             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+            map_file_permtick_map
+                .get(&sub.symbol.id.sid)
+                .map(String::as_str),
+            equity_map_file_resolver_for_subscription(map_file_resolver, sub),
+            start_date,
             start_date,
             end_date,
             factor_map,
@@ -1055,6 +1066,8 @@ pub struct BacktestResult {
     pub backtest_id: i64,
     /// The ticker used as the benchmark (e.g. "SPY").
     pub benchmark_symbol: String,
+    /// Alpha-framework diagnostics: rolling IC, signal correlation, ranking.
+    pub alpha_analytics: lean_alpha::AlphaAnalytics,
 }
 
 struct LiveBacktestWriter {
@@ -3316,6 +3329,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── build infrastructure ────────────────────────────────────────────────
     let reader = Arc::new(ParquetReader::new());
     let resolver = PathResolver::new(config.data_root.clone());
+    let factor_reader = ParquetReader::new();
+    let usa_map_file_resolver = Arc::new(MapFileResolver::from_directory(
+        &factor_reader,
+        &config
+            .data_root
+            .join("equity")
+            .join("usa")
+            .join("map_files"),
+    )?);
     let cache = DataCache::new(50_000);
     let transactions = adapter.inner.lock().unwrap().transactions.clone();
     let portfolio = adapter.inner.lock().unwrap().portfolio.clone();
@@ -3368,6 +3390,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             warmup_start.unwrap_or(start_date),
             end_date,
             &resolver,
+            Some(usa_map_file_resolver.clone()),
         )
         .await?;
     }
@@ -3379,6 +3402,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             start_date,
             end_date,
             &resolver,
+            Some(usa_map_file_resolver.as_ref()),
         )
         .await?;
     }
@@ -3387,15 +3411,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // Map files are Parquet; key = symbol SID → rows sorted newest first.
     // Used for mapped data range checks and to fire SymbolChangedEvent
     // (rename) and Delisting events each day.
-    let factor_reader = ParquetReader::new();
     let mut map_file_map: HashMap<u64, Vec<MapFileEntry>> = HashMap::new();
+    let mut map_file_permtick_map: HashMap<u64, String> = HashMap::new();
     let mut loaded_map_sids: HashSet<u64> = HashSet::new();
     for sub in &subscriptions {
         ensure_map_rows_for_subscription(
             &factor_reader,
             &config.data_root,
             sub,
+            equity_map_file_resolver_for_subscription(Some(usa_map_file_resolver.as_ref()), sub),
+            start_date,
             &mut map_file_map,
+            &mut map_file_permtick_map,
             &mut loaded_map_sids,
         );
     }
@@ -3420,6 +3447,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             &config.data_root,
             sub,
             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+            map_file_permtick_map
+                .get(&sub.symbol.id.sid)
+                .map(String::as_str),
+            equity_map_file_resolver_for_subscription(Some(usa_map_file_resolver.as_ref()), sub),
+            start_date,
             start_date,
             end_date,
             &mut factor_map,
@@ -3555,7 +3587,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     end_date,
                     &resolver,
                     &factor_reader,
+                    Some(usa_map_file_resolver.as_ref()),
                     &mut map_file_map,
+                    &mut map_file_permtick_map,
                     &mut loaded_map_sids,
                     &mut factor_map,
                     require_factor_files,
@@ -3650,7 +3684,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 end_date,
                                 &resolver,
                                 &factor_reader,
+                                Some(usa_map_file_resolver.as_ref()),
                                 &mut map_file_map,
+                                &mut map_file_permtick_map,
                                 &mut loaded_map_sids,
                                 &mut factor_map,
                                 require_factor_files,
@@ -4039,6 +4075,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         current_date,
                         end_date,
                         &resolver,
+                        Some(usa_map_file_resolver.as_ref()),
                     )
                     .await?;
                     ensure_crypto_future_margin_interest_rates_for_date(
@@ -4061,7 +4098,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         &factor_reader,
                         &config.data_root,
                         sub,
+                        equity_map_file_resolver_for_subscription(
+                            Some(usa_map_file_resolver.as_ref()),
+                            sub,
+                        ),
+                        current_date,
                         &mut map_file_map,
+                        &mut map_file_permtick_map,
                         &mut loaded_map_sids,
                     );
                     load_factor_rows_into_map(
@@ -4069,6 +4112,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         &config.data_root,
                         sub,
                         map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+                        map_file_permtick_map
+                            .get(&sub.symbol.id.sid)
+                            .map(String::as_str),
+                        equity_map_file_resolver_for_subscription(
+                            Some(usa_map_file_resolver.as_ref()),
+                            sub,
+                        ),
+                        current_date,
                         current_date,
                         end_date,
                         &mut factor_map,
@@ -4165,6 +4216,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         current_date,
                         end_date,
                         &resolver,
+                        Some(usa_map_file_resolver.as_ref()),
                     )
                     .await?;
                     for sub in &missing_factor_subs {
@@ -4173,6 +4225,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &config.data_root,
                             sub,
                             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+                            map_file_permtick_map
+                                .get(&sub.symbol.id.sid)
+                                .map(String::as_str),
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             current_date,
                             end_date,
                             &mut factor_map,
@@ -4219,6 +4279,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         current_date,
                         end_date,
                         &resolver,
+                        Some(usa_map_file_resolver.as_ref()),
                     )
                     .await?;
                 }
@@ -4936,6 +4997,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 current_date,
                                 end_date,
                                 &resolver,
+                                Some(usa_map_file_resolver.as_ref()),
                             )
                             .await?;
                         }
@@ -4948,6 +5010,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             current_date,
                             end_date,
                             &resolver,
+                            Some(usa_map_file_resolver.as_ref()),
                         )
                         .await?;
                         ensure_crypto_future_margin_interest_rates_for_date(
@@ -4976,7 +5039,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &factor_reader,
                             &config.data_root,
                             sub,
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             &mut map_file_map,
+                            &mut map_file_permtick_map,
                             &mut loaded_map_sids,
                         );
                         load_factor_rows_into_map(
@@ -4984,6 +5053,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &config.data_root,
                             sub,
                             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+                            map_file_permtick_map
+                                .get(&sub.symbol.id.sid)
+                                .map(String::as_str),
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             current_date,
                             end_date,
                             &mut factor_map,
@@ -5427,6 +5504,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     start_date,
                                     end_date,
                                     &resolver,
+                                    Some(usa_map_file_resolver.clone()),
                                 )
                                 .await?;
                             }
@@ -5438,6 +5516,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 start_date,
                                 end_date,
                                 &resolver,
+                                Some(usa_map_file_resolver.as_ref()),
                             )
                             .await?;
                             ensure_crypto_future_margin_interest_rates_for_date(
@@ -5459,7 +5538,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &factor_reader,
                             &config.data_root,
                             sub,
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             &mut map_file_map,
+                            &mut map_file_permtick_map,
                             &mut loaded_map_sids,
                         );
                         load_factor_rows_into_map(
@@ -5467,6 +5552,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &config.data_root,
                             sub,
                             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+                            map_file_permtick_map
+                                .get(&sub.symbol.id.sid)
+                                .map(String::as_str),
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             start_date,
                             end_date,
                             &mut factor_map,
@@ -5543,6 +5636,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     start_date,
                                     end_date,
                                     &resolver,
+                                    Some(usa_map_file_resolver.clone()),
                                 )
                                 .await?;
                             }
@@ -5554,6 +5648,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 start_date,
                                 end_date,
                                 &resolver,
+                                Some(usa_map_file_resolver.as_ref()),
                             )
                             .await?;
                             ensure_crypto_future_margin_interest_rates_for_date(
@@ -5575,7 +5670,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &factor_reader,
                             &config.data_root,
                             sub,
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             &mut map_file_map,
+                            &mut map_file_permtick_map,
                             &mut loaded_map_sids,
                         );
                         load_factor_rows_into_map(
@@ -5583,6 +5684,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &config.data_root,
                             sub,
                             map_file_map.get(&sub.symbol.id.sid).map(Vec::as_slice),
+                            map_file_permtick_map
+                                .get(&sub.symbol.id.sid)
+                                .map(String::as_str),
+                            equity_map_file_resolver_for_subscription(
+                                Some(usa_map_file_resolver.as_ref()),
+                                sub,
+                            ),
+                            current_date,
                             start_date,
                             end_date,
                             &mut factor_map,
@@ -5733,6 +5842,21 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     )
                 };
 
+                // Read the day's market-wide option EOD partition ONCE for all
+                // subscribed underlyings via DataFusion predicate pushdown, then
+                // serve each canonical from that single grouped read.
+                let day_tickers: Vec<String> = option_subs
+                    .iter()
+                    .map(|canonical| canonical.permtick.trim_start_matches('?').to_uppercase())
+                    .collect();
+                let bars_by_ticker = load_option_eod_bars_for_day(
+                    &config.data_root,
+                    &day_tickers,
+                    current_date,
+                    config.history_provider.as_ref(),
+                )
+                .await;
+
                 let mut chains_for_day: Vec<(String, OptionChain)> = Vec::new();
                 for canonical in &option_subs {
                     let underlying_ticker = canonical.permtick.trim_start_matches('?');
@@ -5754,13 +5878,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     };
 
                     let ticker = underlying_ticker.to_uppercase();
-                    let bars = load_option_eod_bars(
-                        &config.data_root,
-                        &ticker,
-                        current_date,
-                        config.history_provider.as_ref(),
-                    )
-                    .await;
+                    let bars = bars_by_ticker.get(&ticker).cloned().unwrap_or_default();
                     if !bars.is_empty() {
                         option_eod_bars_for_day.insert(
                             canonical.permtick.clone(),
@@ -6047,7 +6165,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             }
 
-            let mut fill_events = order_processor.generate_order_events(&bars_map, utc_time);
+            let mut fill_events =
+                order_processor.generate_post_algorithm_order_events(&bars_map, utc_time);
             OrderEventProcessingContext {
                 adapter: &mut adapter,
                 portfolio: &portfolio,
@@ -6153,6 +6272,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
     // Collect charts from the strategy after the backtest completes.
     let charts = adapter.charts.lock().map(|c| c.clone()).unwrap_or_default();
+    // Reduce accumulated alpha observations into IC / correlation / ranking.
+    let alpha_analytics = adapter
+        .framework
+        .lock()
+        .map(|fw| fw.compute_alpha_analytics())
+        .unwrap_or_default();
     let total_fees = portfolio.total_fees.read().to_f64().unwrap_or(0.0);
     let total_funding = portfolio.total_funding.read().to_f64().unwrap_or(0.0);
     let mut orders = order_processor.transaction_manager.get_all_orders();
@@ -6179,6 +6304,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         failed_data_requests,
         backtest_id,
         benchmark_symbol: effective_benchmark_ticker,
+        alpha_analytics,
     })
 }
 
@@ -6194,6 +6320,7 @@ async fn pre_fetch_all(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
+    map_file_resolver: Option<Arc<MapFileResolver>>,
 ) -> Result<()> {
     if subscriptions.is_empty() {
         return Ok(());
@@ -6207,6 +6334,7 @@ async fn pre_fetch_all(
             start,
             end,
             resolver,
+            map_file_resolver.as_deref(),
         )
         .await;
     }
@@ -6226,8 +6354,18 @@ async fn pre_fetch_all(
             let factor_provider = factor_provider.clone();
             let sub = sub.clone();
             let resolver = resolver.clone();
+            let map_file_resolver = map_file_resolver.clone();
             tasks.spawn(async move {
-                pre_fetch_subscription(provider, factor_provider, sub, start, end, resolver).await
+                pre_fetch_subscription(
+                    provider,
+                    factor_provider,
+                    sub,
+                    start,
+                    end,
+                    resolver,
+                    map_file_resolver.as_deref(),
+                )
+                .await
             });
         }
 
@@ -6246,6 +6384,7 @@ async fn pre_fetch_low_resolution_batched(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
+    map_file_resolver: Option<&MapFileResolver>,
 ) -> Result<()> {
     #[derive(Clone)]
     struct BatchItem {
@@ -6258,8 +6397,15 @@ async fn pre_fetch_low_resolution_batched(
     }
 
     if let Some(ref fp) = factor_provider {
-        ensure_auxiliary_files_for_subscriptions(fp.clone(), subscriptions, start, end, resolver)
-            .await?;
+        ensure_auxiliary_files_for_subscriptions(
+            fp.clone(),
+            subscriptions,
+            start,
+            end,
+            resolver,
+            map_file_resolver,
+        )
+        .await?;
     }
 
     let reader = ParquetReader::new();
@@ -6271,15 +6417,14 @@ async fn pre_fetch_low_resolution_batched(
 
         let is_equity = matches!(sub.symbol.security_type(), SecurityType::Equity);
         let map_rows = if is_equity {
-            let ticker = sub.symbol.permtick.to_lowercase();
-            let market = sub.symbol.market().as_str().to_lowercase();
-            let map_path = resolver
-                .data_root
-                .join("equity")
-                .join(&market)
-                .join("map_files")
-                .join(format!("{ticker}.parquet"));
-            reader.read_map_file(&map_path).unwrap_or_default()
+            resolve_map_file_for_subscription(
+                &reader,
+                &resolver.data_root,
+                sub,
+                equity_map_file_resolver_for_subscription(map_file_resolver, sub),
+                start,
+            )
+            .rows
         } else {
             Vec::new()
         };
@@ -6429,6 +6574,7 @@ async fn ensure_auxiliary_files_for_subscriptions(
     start: NaiveDate,
     end: NaiveDate,
     resolver: &PathResolver,
+    map_file_resolver: Option<&MapFileResolver>,
 ) -> Result<()> {
     let reader = ParquetReader::new();
     let mut seen = HashSet::new();
@@ -6440,7 +6586,15 @@ async fn ensure_auxiliary_files_for_subscriptions(
             continue;
         }
 
-        let ticker = sub.symbol.permtick.to_lowercase();
+        let map_file = resolve_map_file_for_subscription(
+            &reader,
+            &resolver.data_root,
+            sub,
+            equity_map_file_resolver_for_subscription(map_file_resolver, sub),
+            start,
+        );
+        let factor_permtick = map_file.permtick.clone();
+        let ticker = factor_permtick.to_lowercase();
         let market = sub.symbol.market().as_str().to_lowercase();
         let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
         let map_path = resolver
@@ -6487,7 +6641,7 @@ async fn ensure_auxiliary_files_for_subscriptions(
         }
 
         let request = lean_data_providers::HistoryRequest {
-            symbol: sub.symbol.clone(),
+            symbol: symbol_with_mapped_ticker(&sub.symbol, &factor_permtick),
             resolution: Resolution::Daily,
             start: date_to_datetime(mapped_start, 0, 0, 0),
             end: date_to_datetime(mapped_end, 23, 59, 59),
@@ -6528,6 +6682,7 @@ async fn pre_fetch_high_resolution_day_batched(
     date: NaiveDate,
     factor_end: NaiveDate,
     resolver: &PathResolver,
+    map_file_resolver: Option<&MapFileResolver>,
 ) -> Result<usize> {
     #[derive(Clone)]
     struct BatchItem {
@@ -6551,23 +6706,22 @@ async fn pre_fetch_high_resolution_day_batched(
                     date,
                     factor_end.max(date),
                     resolver,
+                    map_file_resolver,
                 )
                 .await?;
             }
         }
 
         let map_rows = if matches!(sub.symbol.security_type(), SecurityType::Equity) {
-            let ticker = sub.symbol.permtick.to_lowercase();
-            let market = sub.symbol.market().as_str().to_lowercase();
-            let map_path = resolver
-                .data_root
-                .join("equity")
-                .join(&market)
-                .join("map_files")
-                .join(format!("{ticker}.parquet"));
-
             let reader = ParquetReader::new();
-            let rows = reader.read_map_file(&map_path).unwrap_or_default();
+            let rows = resolve_map_file_for_subscription(
+                &reader,
+                &resolver.data_root,
+                sub,
+                equity_map_file_resolver_for_subscription(map_file_resolver, sub),
+                date,
+            )
+            .rows;
             if mapped_data_date_range(&rows, date, date).is_none() {
                 continue;
             }
@@ -6760,9 +6914,21 @@ async fn pre_fetch_subscription(
     start: NaiveDate,
     end: NaiveDate,
     resolver: PathResolver,
+    map_file_resolver: Option<&MapFileResolver>,
 ) -> Result<()> {
     let is_equity = matches!(sub.symbol.security_type(), SecurityType::Equity);
-    let ticker = sub.symbol.permtick.to_lowercase();
+    let map_file = if is_equity {
+        resolve_map_file_for_subscription(
+            &ParquetReader::new(),
+            &resolver.data_root,
+            &sub,
+            equity_map_file_resolver_for_subscription(map_file_resolver, &sub),
+            start,
+        )
+    } else {
+        MapFile::empty(&sub.symbol.permtick)
+    };
+    let ticker = map_file.permtick.to_lowercase();
     let market = sub.symbol.market().as_str().to_lowercase();
     let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
     let factor_path = resolver
@@ -6803,13 +6969,7 @@ async fn pre_fetch_subscription(
         }
     }
 
-    let map_rows = if is_equity {
-        ParquetReader::new()
-            .read_map_file(&map_path)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let map_rows = if is_equity { map_file.rows } else { Vec::new() };
     let effective_range = mapped_data_date_range(&map_rows, start, end);
     let Some((mapped_start, mapped_end)) = effective_range else {
         debug!(
@@ -6926,7 +7086,7 @@ async fn pre_fetch_subscription(
             );
             let fp = Arc::clone(fp);
             let request = lean_data_providers::HistoryRequest {
-                symbol: sub.symbol.clone(),
+                symbol: symbol_with_mapped_ticker(&sub.symbol, &ticker),
                 resolution: lean_core::Resolution::Daily,
                 start: start_dt,
                 end: end_dt,
@@ -9183,67 +9343,98 @@ fn build_option_chain_from_eod_bars(
     chain
 }
 
-/// Check the local partitioned Parquet cache for option EOD bars; download and cache on miss.
-async fn load_option_eod_bars(
+/// Load a day's option EOD bars for every requested underlying in a SINGLE read
+/// of the market-wide daily partition, using DataFusion predicate pushdown on
+/// `underlying IN (...)`. The day's file is decoded once and shared across all
+/// underlyings instead of being fully decoded once per ticker.
+///
+/// Returns a map keyed by uppercase underlying ticker. Underlyings missing from
+/// the local cache are fetched from the history provider (when available),
+/// merged back into the day's cache file, and included in the result, so the set
+/// of contracts delivered is identical to the previous per-ticker path.
+async fn load_option_eod_bars_for_day(
     data_root: &Path,
-    ticker: &str,
+    tickers: &[String],
     date: NaiveDate,
     provider: Option<&Arc<dyn lean_data_providers::IHistoryProvider>>,
-) -> Vec<OptionEodBar> {
+) -> HashMap<String, Vec<OptionEodBar>> {
+    if tickers.is_empty() {
+        return HashMap::new();
+    }
+
     let cache_path =
         PathResolver::new(data_root).option_partition(Resolution::Daily, TickType::Trade, date);
 
-    if cache_path.exists() {
-        let reader = ParquetReader::new();
-        let cached = reader
-            .read_option_eod_bars(std::slice::from_ref(&cache_path))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|bar| bar.underlying.eq_ignore_ascii_case(ticker))
-            .collect::<Vec<_>>();
+    let mut result: HashMap<String, Vec<OptionEodBar>> = ParquetReader::new()
+        .read_option_eod_partition_grouped(&cache_path, tickers)
+        .await
+        .unwrap_or_default();
 
-        if !cached.is_empty() {
-            return cached;
-        }
-    }
-
+    // Underlyings absent from the local cache fall back to the provider.
     let Some(provider) = provider else {
-        return vec![];
+        return result;
     };
-    let bars = match provider.get_option_eod_bars(ticker, date).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("option EOD fetch failed for {ticker} {date}: {e}");
-            return vec![];
+    let missing: Vec<String> = tickers
+        .iter()
+        .map(|ticker| ticker.to_ascii_uppercase())
+        .filter(|ticker| !result.contains_key(ticker))
+        .collect();
+    if missing.is_empty() {
+        return result;
+    }
+
+    let mut fetched: Vec<OptionEodBar> = Vec::new();
+    for ticker in &missing {
+        let bars = match provider.get_option_eod_bars(ticker, date).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("option EOD fetch failed for {ticker} {date}: {e}");
+                continue;
+            }
+        };
+        if bars.is_empty() {
+            continue;
         }
-    };
-
-    if bars.is_empty() {
-        return vec![];
+        result.insert(ticker.clone(), bars.clone());
+        fetched.extend(bars);
     }
 
-    let mut merged = if cache_path.exists() {
-        ParquetReader::new()
-            .read_option_eod_bars(std::slice::from_ref(&cache_path))
+    if !fetched.is_empty() {
+        // Merge the freshly fetched underlyings into the day's cache file,
+        // preserving any underlyings already present.
+        let mut merged = ParquetReader::new()
+            .read_option_eod_partition_grouped(
+                &cache_path,
+                &tickers
+                    .iter()
+                    .map(|t| t.to_ascii_uppercase())
+                    .collect::<Vec<_>>(),
+            )
+            .await
             .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    merged.retain(|bar| !bar.underlying.eq_ignore_ascii_case(ticker));
-    merged.extend_from_slice(&bars);
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        let fetched_underlyings: HashSet<String> = fetched
+            .iter()
+            .map(|bar| bar.underlying.to_ascii_uppercase())
+            .collect();
+        merged.retain(|bar| !fetched_underlyings.contains(&bar.underlying.to_ascii_uppercase()));
+        merged.extend(fetched);
 
-    // parquet-rs 53.x can panic reading set/map thrift metadata emitted by
-    // optional statistics; match the safer cache writer settings used nearby.
-    let writer = ParquetWriter::new(WriterConfig {
-        bloom_filter: false,
-        write_statistics: false,
-        ..WriterConfig::default()
-    });
-    if let Err(e) = writer.write_option_eod_bars(&merged, &cache_path) {
-        warn!("failed to cache option EOD bars for {ticker} {date}: {e}");
+        // parquet-rs 53.x can panic reading set/map thrift metadata emitted by
+        // optional statistics; match the safer cache writer settings used nearby.
+        let writer = ParquetWriter::new(WriterConfig {
+            bloom_filter: false,
+            write_statistics: false,
+            ..WriterConfig::default()
+        });
+        if let Err(e) = writer.write_option_eod_bars(&merged, &cache_path) {
+            warn!("failed to cache option EOD bars for {date}: {e}");
+        }
     }
 
-    bars
+    result
 }
 
 /// Load custom data points for one subscription/date.
@@ -10211,8 +10402,11 @@ fn read_factor_rows_for_subscription(
     reader: &ParquetReader,
     data_root: &Path,
     sub: &SubscriptionDataConfig,
+    factor_permtick: Option<&str>,
 ) -> lean_core::Result<Vec<FactorFileEntry>> {
-    let ticker = sub.symbol.permtick.to_lowercase();
+    let ticker = factor_permtick
+        .unwrap_or(&sub.symbol.permtick)
+        .to_lowercase();
     let market = sub.symbol.market().as_str().to_lowercase();
     let sec = format!("{}", sub.symbol.security_type()).to_lowercase();
     let factor_path = data_root
@@ -10223,21 +10417,67 @@ fn read_factor_rows_for_subscription(
     reader.read_factor_file(&factor_path)
 }
 
-fn map_file_path_for_subscription(data_root: &Path, sub: &SubscriptionDataConfig) -> PathBuf {
-    let ticker = sub.symbol.permtick.to_lowercase();
+fn map_file_directory_for_subscription(data_root: &Path, sub: &SubscriptionDataConfig) -> PathBuf {
     let market = sub.symbol.market().as_str().to_lowercase();
-    data_root
-        .join("equity")
-        .join(&market)
-        .join("map_files")
-        .join(format!("{ticker}.parquet"))
+    data_root.join("equity").join(&market).join("map_files")
+}
+
+fn map_file_path_for_ticker(
+    data_root: &Path,
+    sub: &SubscriptionDataConfig,
+    ticker: &str,
+) -> PathBuf {
+    let ticker = ticker.to_lowercase();
+    map_file_directory_for_subscription(data_root, sub).join(format!("{ticker}.parquet"))
+}
+
+fn direct_map_file_for_subscription(
+    reader: &ParquetReader,
+    data_root: &Path,
+    sub: &SubscriptionDataConfig,
+) -> MapFile {
+    let map_path = map_file_path_for_ticker(data_root, sub, &sub.symbol.permtick);
+    let rows = reader.read_map_file(&map_path).unwrap_or_default();
+    MapFile::new(&sub.symbol.permtick, rows)
+}
+
+fn resolve_map_file_for_subscription(
+    reader: &ParquetReader,
+    data_root: &Path,
+    sub: &SubscriptionDataConfig,
+    map_file_resolver: Option<&MapFileResolver>,
+    resolve_date: NaiveDate,
+) -> MapFile {
+    if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
+        return MapFile::empty(&sub.symbol.permtick);
+    }
+    map_file_resolver
+        .map(|resolver| resolver.resolve_map_file(&sub.symbol.permtick, resolve_date))
+        .filter(|map_file| !map_file.rows.is_empty())
+        .unwrap_or_else(|| direct_map_file_for_subscription(reader, data_root, sub))
+}
+
+fn equity_map_file_resolver_for_subscription<'a>(
+    map_file_resolver: Option<&'a MapFileResolver>,
+    sub: &SubscriptionDataConfig,
+) -> Option<&'a MapFileResolver> {
+    if matches!(sub.symbol.security_type(), SecurityType::Equity)
+        && sub.symbol.market().as_str().eq_ignore_ascii_case("usa")
+    {
+        map_file_resolver
+    } else {
+        None
+    }
 }
 
 fn ensure_map_rows_for_subscription(
     reader: &ParquetReader,
     data_root: &Path,
     sub: &SubscriptionDataConfig,
+    map_file_resolver: Option<&MapFileResolver>,
+    resolve_date: NaiveDate,
     map_file_map: &mut HashMap<u64, Vec<MapFileEntry>>,
+    map_file_permtick_map: &mut HashMap<u64, String>,
     loaded_map_sids: &mut HashSet<u64>,
 ) {
     if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
@@ -10247,15 +10487,10 @@ fn ensure_map_rows_for_subscription(
         return;
     }
 
-    let map_path = map_file_path_for_subscription(data_root, sub);
-    match reader.read_map_file(&map_path) {
-        Ok(rows) => {
-            map_file_map.insert(sub.symbol.id.sid, rows);
-        }
-        Err(e) => {
-            debug!("Skipping map file for {}: {}", sub.symbol.value, e);
-        }
-    }
+    let map_file =
+        resolve_map_file_for_subscription(reader, data_root, sub, map_file_resolver, resolve_date);
+    map_file_permtick_map.insert(sub.symbol.id.sid, map_file.permtick);
+    map_file_map.insert(sub.symbol.id.sid, map_file.rows);
 }
 
 fn subscription_has_mapped_data_for_range_from_rows(
@@ -10288,15 +10523,17 @@ fn subscription_has_mapped_data_for_range(
     reader: &ParquetReader,
     data_root: &Path,
     sub: &SubscriptionDataConfig,
+    map_file_resolver: Option<&MapFileResolver>,
+    resolve_date: NaiveDate,
     start: NaiveDate,
     end: NaiveDate,
 ) -> bool {
     if !matches!(sub.symbol.security_type(), SecurityType::Equity) {
         return true;
     }
-    let map_path = map_file_path_for_subscription(data_root, sub);
-    let rows = reader.read_map_file(&map_path).unwrap_or_default();
-    subscription_has_mapped_data_for_range_from_rows(sub, &rows, start, end)
+    let map_file =
+        resolve_map_file_for_subscription(reader, data_root, sub, map_file_resolver, resolve_date);
+    subscription_has_mapped_data_for_range_from_rows(sub, &map_file.rows, start, end)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10305,6 +10542,9 @@ fn load_factor_rows_into_map(
     data_root: &Path,
     sub: &SubscriptionDataConfig,
     map_rows: Option<&[MapFileEntry]>,
+    factor_permtick: Option<&str>,
+    map_file_resolver: Option<&MapFileResolver>,
+    resolve_date: NaiveDate,
     start: NaiveDate,
     end: NaiveDate,
     factor_map: &mut HashMap<u64, Vec<FactorFileEntry>>,
@@ -10314,7 +10554,17 @@ fn load_factor_rows_into_map(
         return Ok(());
     }
     let has_mapped_data = map_rows.map_or_else(
-        || subscription_has_mapped_data_for_range(reader, data_root, sub, start, end),
+        || {
+            subscription_has_mapped_data_for_range(
+                reader,
+                data_root,
+                sub,
+                map_file_resolver,
+                resolve_date,
+                start,
+                end,
+            )
+        },
         |rows| subscription_has_mapped_data_for_range_from_rows(sub, rows, start, end),
     );
     if !has_mapped_data {
@@ -10325,7 +10575,7 @@ fn load_factor_rows_into_map(
         return Ok(());
     }
 
-    match read_factor_rows_for_subscription(reader, data_root, sub) {
+    match read_factor_rows_for_subscription(reader, data_root, sub, factor_permtick) {
         Ok(rows) if !rows.is_empty() => {
             debug!("Loaded {} factor rows for {}", rows.len(), sub.symbol.value);
             factor_map.insert(sub.symbol.id.sid, rows);
@@ -10379,6 +10629,44 @@ mod factor_tests {
             split_factor: sf,
             reference_price: 0.0,
         }
+    }
+
+    #[test]
+    fn subscription_map_file_resolution_uses_owning_map_file_for_rename_chain() {
+        let resolver = MapFileResolver::new(vec![MapFile::new(
+            "bbby",
+            vec![
+                MapFileEntry {
+                    date: d(2002, 5, 30),
+                    ticker: "OSTK".to_string(),
+                },
+                MapFileEntry {
+                    date: d(2025, 8, 28),
+                    ticker: "BYON".to_string(),
+                },
+                MapFileEntry {
+                    date: d(2050, 12, 31),
+                    ticker: "BBBY".to_string(),
+                },
+            ],
+        )])
+        .unwrap();
+        let sub = SubscriptionDataConfig::new_equity(
+            Symbol::create_equity("BYON", &Market::usa()),
+            Resolution::Minute,
+        );
+
+        let map_file = resolve_map_file_for_subscription(
+            &ParquetReader::new(),
+            Path::new("/unused"),
+            &sub,
+            Some(&resolver),
+            d(2025, 8, 28),
+        );
+
+        assert_eq!(map_file.permtick, "BBBY");
+        assert_eq!(ticker_at_date(&map_file.rows, d(2025, 8, 28)), Some("BYON"));
+        assert_eq!(ticker_at_date(&map_file.rows, d(2025, 8, 29)), Some("BBBY"));
     }
 
     /// Factor rows for `test_correctly_determines_price_factors`.
@@ -12158,6 +12446,7 @@ class NoWarmupCallback(QCAlgorithm):
             failed_data_requests: vec![],
             backtest_id: 1_700_000_000,
             benchmark_symbol: "QQQ".to_string(),
+            alpha_analytics: Default::default(),
         };
         assert_eq!(result.benchmark_symbol, "QQQ");
     }

@@ -961,48 +961,102 @@ impl ParquetReader {
         Ok(result)
     }
 
-    /// Read option EOD bars from one or more parquet files.
+    /// Read a day's market-wide option EOD partition ONCE, pushing an
+    /// `underlying IN (...)` predicate down to the parquet layer, and return the
+    /// matching rows grouped by uppercase underlying ticker.
     ///
-    /// Each file typically covers all contracts for one underlying.  The rows
-    /// from all provided files are concatenated and returned unsorted.
-    pub fn read_option_eod_bars(&self, paths: &[PathBuf]) -> LeanResult<Vec<OptionEodBar>> {
-        if paths.is_empty() {
-            return Ok(vec![]);
+    /// This is the option analogue of [`read_trade_bar_partition_grouped`]: the
+    /// single all-underlyings file is decoded once and the requested underlyings
+    /// are served from that read. Only the requested underlyings appear as keys;
+    /// underlyings absent from the file simply have no entry.
+    pub async fn read_option_eod_partition_grouped(
+        &self,
+        path: &Path,
+        underlyings: &[String],
+    ) -> LeanResult<HashMap<String, Vec<OptionEodBar>>> {
+        if !path.exists() || underlyings.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        let mut result: Vec<OptionEodBar> = Vec::new();
+        let requested: HashSet<String> = underlyings
+            .iter()
+            .map(|ticker| ticker.to_ascii_uppercase())
+            .collect();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
 
-        for path in paths {
-            let mut rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> LeanResult<Vec<OptionEodBar>> {
-                    let file = std::fs::File::open(path).map_err(|e| {
-                        lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
-                    })?;
+        let table_name = format!(
+            "option_eod_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
 
-                    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-                        .build()
-                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        self.ctx
+            .register_parquet(
+                &table_name,
+                path.to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
-                    let mut rows = Vec::new();
-                    for batch_result in reader {
-                        let batch = batch_result
-                            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-                        rows.extend(convert::record_batch_to_option_eod_bars(&batch));
-                    }
-                    Ok(rows)
-                },
-            ))
-            .map_err(|panic| parquet_reader_panic_error(path, panic))??;
-            result.append(&mut rows);
+        let result = async {
+            let mut df = self
+                .ctx
+                .table(&table_name)
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            // Predicate pushdown: underlying IN (...). The cached files store the
+            // underlying as-written by the provider (case may vary), so match
+            // against the canonical, lower- and upper-case spellings.
+            let filter = requested
+                .iter()
+                .flat_map(|ticker| {
+                    [
+                        ticker.clone(),
+                        ticker.to_ascii_lowercase(),
+                        ticker.to_ascii_uppercase(),
+                    ]
+                })
+                .map(|ticker| col("underlying").eq(lit(ticker)))
+                .reduce(|a, b| a.or(b))
+                .unwrap();
+            df = df
+                .filter(filter)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            df.collect()
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
+        }
+        .await;
+
+        let _ = self.ctx.deregister_table(&table_name);
+        let batches = result?;
+
+        let mut grouped: HashMap<String, Vec<OptionEodBar>> = HashMap::new();
+        for batch in &batches {
+            for bar in option_eod_batch_to_bars(batch)? {
+                let key = bar.underlying.to_ascii_uppercase();
+                if !requested.contains(&key) {
+                    continue;
+                }
+                grouped.entry(key).or_default().push(bar);
+            }
         }
 
         debug!(
-            "Read {} option EOD bars from {} file(s)",
-            result.len(),
-            paths.len()
+            "Read {} option EOD underlyings ({} rows) from {} (predicate applied)",
+            grouped.len(),
+            grouped.values().map(Vec::len).sum::<usize>(),
+            path.display(),
         );
-        Ok(result)
+        Ok(grouped)
     }
 
     /// Read option universe rows from one or more parquet files.
@@ -1765,6 +1819,61 @@ fn option_universe_batches_to_rows(batches: &[RecordBatch]) -> LeanResult<Vec<Op
     }
 
     Ok(rows)
+}
+
+/// Convert DataFusion-produced option EOD record batches into `OptionEodBar`s,
+/// resolving every column by NAME. DataFusion may hand back columns in a
+/// different physical order or string encoding than the on-disk writer schema,
+/// so positional decoding is not safe here.
+fn option_eod_batch_to_bars(batch: &RecordBatch) -> LeanResult<Vec<OptionEodBar>> {
+    let date_ns = int64_column_named(batch, "date_ns")?;
+    let symbol_value_idx = column_index(batch, "symbol_value")?;
+    let underlying_idx = column_index(batch, "underlying")?;
+    let expiration_ns = int64_column_named(batch, "expiration_ns")?;
+    let strike = int64_column_named(batch, "strike")?;
+    let right_idx = column_index(batch, "right")?;
+    let open = int64_column_named(batch, "open")?;
+    let high = int64_column_named(batch, "high")?;
+    let low = int64_column_named(batch, "low")?;
+    let close = int64_column_named(batch, "close")?;
+    let volume = int64_column_named(batch, "volume")?;
+    let bid = int64_column_named(batch, "bid")?;
+    let ask = int64_column_named(batch, "ask")?;
+    let bid_size = int64_column_named(batch, "bid_size")?;
+    let ask_size = int64_column_named(batch, "ask_size")?;
+
+    let symbol_value_col = batch.column(symbol_value_idx).as_ref();
+    let underlying_col = batch.column(underlying_idx).as_ref();
+    let right_col = batch.column(right_idx).as_ref();
+
+    let mut bars = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let symbol_value = string_cell_as_string(symbol_value_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("symbol_value column missing".into()))?;
+        let underlying = string_cell_as_string(underlying_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("underlying column missing".into()))?;
+        let right = string_cell_as_string(right_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("right column missing".into()))?;
+
+        bars.push(OptionEodBar {
+            date: ns_to_date(date_ns.value(i)),
+            symbol_value,
+            underlying,
+            expiration: ns_to_date(expiration_ns.value(i)),
+            strike: i64_to_price(strike.value(i)),
+            right,
+            open: i64_to_price(open.value(i)),
+            high: i64_to_price(high.value(i)),
+            low: i64_to_price(low.value(i)),
+            close: i64_to_price(close.value(i)),
+            volume: volume.value(i),
+            bid: i64_to_price(bid.value(i)),
+            ask: i64_to_price(ask.value(i)),
+            bid_size: bid_size.value(i),
+            ask_size: ask_size.value(i),
+        });
+    }
+    Ok(bars)
 }
 
 fn record_batches(path: &Path) -> LeanResult<Vec<arrow_array::RecordBatch>> {

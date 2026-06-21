@@ -5,8 +5,8 @@
 /// 2. Path generation matches LEAN's canonical directory layout.
 use chrono::NaiveDate;
 use lean_storage::{
-    factor_file_path, map_file_path, path_resolver::PathResolver, FactorFileEntry, MapFileEntry,
-    ParquetReader, ParquetWriter, WriterConfig,
+    factor_file_path, map_file_path, path_resolver::PathResolver, FactorFileEntry, MapFile,
+    MapFileEntry, MapFileResolver, ParquetReader, ParquetWriter, WriterConfig,
 };
 use tempfile::TempDir;
 
@@ -153,6 +153,67 @@ fn map_file_write_creates_parent_directories() {
     let writer = ParquetWriter::new(WriterConfig::default());
     writer.write_map_file(&entries, &path).unwrap();
     assert!(path.exists());
+}
+
+#[test]
+fn map_file_resolver_resolves_ticker_to_owning_map_file_like_lean() {
+    let resolver = MapFileResolver::new(vec![MapFile::new(
+        "bbby",
+        vec![
+            MapFileEntry {
+                date: date(2002, 5, 30),
+                ticker: "OSTK".to_string(),
+            },
+            MapFileEntry {
+                date: date(2025, 8, 28),
+                ticker: "BYON".to_string(),
+            },
+            MapFileEntry {
+                date: date(2050, 12, 31),
+                ticker: "BBBY".to_string(),
+            },
+        ],
+    )])
+    .unwrap();
+
+    let map_file = resolver.resolve_map_file("BYON", date(2025, 8, 28));
+
+    assert_eq!(map_file.permtick, "BBBY");
+    assert_eq!(
+        map_file.mapped_ticker_at(date(2025, 8, 28), Some("BYON")),
+        Some("BYON")
+    );
+    assert_eq!(
+        map_file.mapped_ticker_at(date(2025, 8, 29), Some("BYON")),
+        Some("BBBY")
+    );
+}
+
+#[test]
+fn map_file_resolver_uses_next_row_then_last_row_like_lean_binary_search() {
+    let resolver = MapFileResolver::new(vec![MapFile::new(
+        "entity",
+        vec![
+            MapFileEntry {
+                date: date(2024, 1, 31),
+                ticker: "AAA".to_string(),
+            },
+            MapFileEntry {
+                date: date(2024, 2, 29),
+                ticker: "BBB".to_string(),
+            },
+        ],
+    )])
+    .unwrap();
+
+    assert_eq!(
+        resolver.resolve_map_file("AAA", date(2024, 1, 15)).permtick,
+        "ENTITY"
+    );
+    assert_eq!(
+        resolver.resolve_map_file("BBB", date(2024, 3, 1)).permtick,
+        "ENTITY"
+    );
 }
 
 // ─── Path generation ────────────────────────────────────────────────────────

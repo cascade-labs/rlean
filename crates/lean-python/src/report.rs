@@ -5,7 +5,7 @@
 ///   - Equity curve chart (Chart.js, CDN)
 ///   - Drawdown chart
 ///   - Monthly returns heatmap
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::Serialize;
@@ -206,6 +206,8 @@ struct BacktestResultJson<'a> {
     total_funding: f64,
     #[serde(rename = "TotalReturn")]
     total_return: f64,
+    #[serde(rename = "AlphaAnalytics")]
+    alpha_analytics: &'a lean_alpha::AlphaAnalytics,
 }
 
 pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Result<()> {
@@ -240,6 +242,7 @@ pub fn write_results_json(result: &BacktestResult, path: &Path) -> std::io::Resu
         total_fees: result.total_fees,
         total_funding: result.total_funding,
         total_return: result.total_return,
+        alpha_analytics: &result.alpha_analytics,
     };
 
     let json = serde_json::to_string_pretty(&json_obj).map_err(std::io::Error::other)?;
@@ -461,6 +464,9 @@ fn generate_html(r: &BacktestResult) -> String {
 <!-- Custom strategy charts -->
 {custom_charts_html}
 
+<!-- Alpha framework diagnostics -->
+{alpha_analytics_html}
+
 <!-- Stat tables -->
 <div class="stats-grid">
   <div class="stats-card">
@@ -561,7 +567,9 @@ new Chart(document.getElementById('equityChart'), {{
     }} }},
     scales: {{
       x: {{ ticks: {{ maxTicksLimit: 6, color: '#666' }}, grid: {{ color: '#1a1d2e' }} }},
-      y: {{ ticks: {{ color: '#666' }}, grid: {{ color: '#1a1d2e' }} }}
+      y: {{ type: 'logarithmic', ticks: {{ color: '#666',
+        callback: function(v) {{ return '$' + Number(v).toLocaleString(); }} }},
+        grid: {{ color: '#1a1d2e' }} }}
     }}
   }}
 }});
@@ -577,6 +585,7 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         kpi_cards = kpi_cards(r),
         monthly_html = monthly_html,
         custom_charts_html = custom_charts_html,
+        alpha_analytics_html = build_alpha_analytics_section(&r.alpha_analytics),
         total_return_pct = pct(r.total_return),
         benchmark_symbol = r.benchmark_symbol,
         benchmark_return_pct = pct(benchmark_return),
@@ -885,6 +894,214 @@ fn build_custom_charts(charts: &ChartCollection) -> String {
     html
 }
 
+// ── Alpha framework diagnostics (IC / correlation / ranking) ──────────────────
+
+/// Colour palette for the rolling-IC lines (one per alpha).
+const ALPHA_PALETTE: &[&str] = &[
+    "#2196F3", "#F44336", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4", "#FFEB3B", "#E91E63",
+    "#8BC34A", "#FF5722", "#3F51B5", "#CDDC39", "#795548", "#607D8B",
+];
+
+/// Build the full alpha-framework diagnostics block (returns "" when no alphas).
+fn build_alpha_analytics_section(a: &lean_alpha::AlphaAnalytics) -> String {
+    if a.ranking.is_empty() && a.ic_series.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from(
+        "<h2 style=\"font-size:1.15rem;color:#fff;margin:28px 0 4px\">Alpha Framework Diagnostics</h2>\n\
+         <div class=\"sub\" style=\"margin-bottom:16px\">Per-alpha Information Coefficient, signal correlation, \
+         and the spanning-set keep/exclude ranking — measured natively during the backtest.</div>\n",
+    );
+    html.push_str(&build_alpha_ic_chart(a));
+    html.push_str(&build_alpha_correlation_heatmap(a));
+    html.push_str(&build_alpha_ranking(a));
+    html
+}
+
+/// Multi-line chart: each alpha's rolling IC over the backtest.
+fn build_alpha_ic_chart(a: &lean_alpha::AlphaAnalytics) -> String {
+    if a.ic_series.is_empty() {
+        return String::new();
+    }
+    // Union of dates across all alphas, sorted, as the shared x-axis.
+    let mut date_set: BTreeSet<&str> = BTreeSet::new();
+    for s in &a.ic_series {
+        for p in &s.points {
+            date_set.insert(p.date.as_str());
+        }
+    }
+    let dates: Vec<&str> = date_set.into_iter().collect();
+    let labels = dates
+        .iter()
+        .map(|d| format!("\"{}\"", d))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut datasets = String::new();
+    for (i, s) in a.ic_series.iter().enumerate() {
+        let color = ALPHA_PALETTE[i % ALPHA_PALETTE.len()];
+        let map: HashMap<&str, f64> = s.points.iter().map(|p| (p.date.as_str(), p.ic)).collect();
+        let data = dates
+            .iter()
+            .map(|d| match map.get(*d) {
+                Some(v) if v.is_finite() => format!("{:.4}", v),
+                _ => "null".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if i > 0 {
+            datasets.push(',');
+        }
+        datasets.push_str(&format!(
+            r#"{{label:"{}",data:[{}],borderColor:"{}",backgroundColor:"transparent",borderWidth:1.3,pointRadius:0,fill:false,spanGaps:true}}"#,
+            escape_js(&s.name),
+            data,
+            color
+        ));
+    }
+
+    format!(
+        r#"<div class="chart-card" style="margin-bottom:20px">
+  <h3>Rolling Information Coefficient (trailing {window}-period mean)</h3>
+  <canvas id="alphaIcChart" style="max-height:340px"></canvas>
+</div>
+<script>
+new Chart(document.getElementById('alphaIcChart'), {{
+  type:'line',
+  data:{{ labels:[{labels}], datasets:[{datasets}] }},
+  options:{{ animation:false, responsive:true, maintainAspectRatio:true,
+    interaction:{{mode:'index',intersect:false}},
+    plugins:{{ legend:{{display:true,labels:{{color:'#aaa',boxWidth:12,font:{{size:10}}}}}},
+      tooltip:{{callbacks:{{label:function(ctx){{return ' '+ctx.dataset.label+': '+(ctx.parsed.y==null?'n/a':ctx.parsed.y.toFixed(4));}}}}}} }},
+    scales:{{ x:{{ticks:{{maxTicksLimit:8,color:'#666'}},grid:{{color:'#1a1d2e'}}}},
+      y:{{ticks:{{color:'#666'}},grid:{{color:'#1a1d2e'}},title:{{display:true,text:'IC',color:'#666'}}}} }} }}
+}});
+</script>
+"#,
+        window = a.rolling_window,
+        labels = labels,
+        datasets = datasets,
+    )
+}
+
+/// NxN heatmap of pairwise alpha signal correlation.
+fn build_alpha_correlation_heatmap(a: &lean_alpha::AlphaAnalytics) -> String {
+    let m = &a.correlation;
+    if m.names.len() < 2 {
+        return String::new();
+    }
+    let mut html = String::from(
+        "<div class=\"heatmap\"><h3>Alpha Signal Correlation</h3>\
+         <div style=\"overflow-x:auto\"><table class=\"hm-table\"><tr><th></th>",
+    );
+    for name in &m.names {
+        html.push_str(&format!("<th>{}</th>", escape_html(name)));
+    }
+    html.push_str("</tr>");
+    for (i, name) in m.names.iter().enumerate() {
+        html.push_str(&format!(
+            "<tr><td style=\"text-align:right;color:#aaa;white-space:nowrap\">{}</td>",
+            escape_html(name)
+        ));
+        for j in 0..m.names.len() {
+            match m.matrix[i][j] {
+                Some(c) => html.push_str(&format!(
+                    "<td style=\"background:{};color:#fff\">{:.2}</td>",
+                    corr_color(c),
+                    c
+                )),
+                None => html.push_str("<td style=\"color:#444\">—</td>"),
+            }
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str(&format!(
+        "</table></div><div style=\"color:#666;font-size:.72rem;margin-top:8px\">\
+         Pearson correlation of emitted signals (red = positively correlated, blue = negatively). \
+         Pairs with |r| ≥ {:.2} are treated as redundant in the ranking below.</div></div>\n",
+        a.max_correlation
+    ));
+    html
+}
+
+/// Keep/exclude ranking table, rows tinted green (keep) / red (exclude).
+fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
+    if a.ranking.is_empty() {
+        return String::new();
+    }
+    let kept = a.ranking.iter().filter(|r| r.keep).count();
+    let fmt = |v: f64| {
+        if v.is_finite() {
+            format!("{:.3}", v)
+        } else {
+            "—".to_string()
+        }
+    };
+    let mut html = format!(
+        "<div class=\"heatmap\"><h3>Alpha Ranking — Keep / Exclude ({kept} of {total} kept)</h3>\
+         <table style=\"font-size:.85rem\"><tr style=\"color:#888\">\
+         <td>Alpha</td><td style=\"text-align:right\">Mean IC</td><td style=\"text-align:right\">IC IR</td>\
+         <td style=\"text-align:right\">t-stat</td><td style=\"text-align:right\">Hit</td>\
+         <td style=\"text-align:right\">Periods</td><td style=\"text-align:center\">Decision</td>\
+         <td style=\"text-align:left;color:#888\">Reason</td></tr>",
+        kept = kept,
+        total = a.ranking.len()
+    );
+    for r in &a.ranking {
+        let (bg, badge, badge_bg) = if r.keep {
+            ("rgba(76,175,80,0.10)", "KEEP", "#4caf50")
+        } else {
+            ("rgba(244,67,54,0.10)", "EXCLUDE", "#f44336")
+        };
+        let hit = if r.hit_rate.is_finite() {
+            format!("{:.0}%", r.hit_rate * 100.0)
+        } else {
+            "—".to_string()
+        };
+        html.push_str(&format!(
+            "<tr style=\"background:{bg}\">\
+             <td style=\"color:#ddd\">{name}</td>\
+             <td style=\"text-align:right\">{mic}</td>\
+             <td style=\"text-align:right\">{ir}</td>\
+             <td style=\"text-align:right\">{t}</td>\
+             <td style=\"text-align:right\">{hit}</td>\
+             <td style=\"text-align:right\">{np}</td>\
+             <td style=\"text-align:center\"><span style=\"background:{bbg};color:#fff;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600\">{badge}</span></td>\
+             <td style=\"text-align:left;color:#999;font-size:.78rem\">{reason}</td></tr>",
+            bg = bg,
+            name = escape_html(&r.name),
+            mic = fmt(r.mean_ic),
+            ir = fmt(r.ic_ir),
+            t = fmt(r.t_stat),
+            hit = hit,
+            np = r.n_periods,
+            bbg = badge_bg,
+            badge = badge,
+            reason = escape_html(&r.reason),
+        ));
+    }
+    html.push_str(&format!(
+        "</table><div style=\"color:#666;font-size:.72rem;margin-top:8px\">\
+         <b>KEEP</b> = predictive <i>and</i> independent: mean IC &gt; 0 with |t-stat| ≥ {tmin:.1}, \
+         and |corr| &lt; {mc:.2} against every higher-IC kept alpha. \
+         Excluded alphas are either not significant or redundant.</div></div>\n",
+        tmin = a.min_t_stat,
+        mc = a.max_correlation,
+    ));
+    html
+}
+
+/// Diverging colour for a correlation value: red positive, blue negative.
+fn corr_color(c: f64) -> String {
+    let x = c.clamp(-1.0, 1.0);
+    let alpha = 0.12 + x.abs() * 0.7;
+    if x >= 0.0 {
+        format!("rgba(244,67,54,{:.2})", alpha)
+    } else {
+        format!("rgba(33,150,243,{:.2})", alpha)
+    }
+}
+
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -962,6 +1179,7 @@ mod tests {
             failed_data_requests: vec!["SPY/2026-01-05".to_string()],
             backtest_id: 1_744_000_000,
             benchmark_symbol: "SPY".to_string(),
+            alpha_analytics: Default::default(),
         }
     }
 

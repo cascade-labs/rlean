@@ -6,6 +6,7 @@
 ///   - MaximumSectorExposureRiskManagementModel (basic exposure cap)
 use lean_core::{Market, Symbol};
 use lean_risk::{
+    max_drawdown::MaximumDrawdownPercentPerSecurity,
     max_drawdown_portfolio::MaximumDrawdownPercentPortfolio,
     max_unrealized_profit::MaximumUnrealizedProfitPercentPerSecurity,
     risk_management::{HoldingSnapshot, PortfolioTarget, RiskContext, RiskManagementModel},
@@ -37,6 +38,49 @@ fn holding(symbol: Symbol, qty: Decimal, avg: Decimal, last: Decimal) -> Holding
         last_price: last,
         unrealized_pnl,
     }
+}
+
+// ─── MaximumDrawdownPercentPerSecurity ───────────────────────────────────────
+
+#[test]
+fn test_security_drawdown_no_trigger_above_threshold() {
+    let mut model = MaximumDrawdownPercentPerSecurity::new(dec!(0.20));
+    let ctx = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(85))],
+    };
+
+    let result = model.manage_risk_with_context(&[], &ctx);
+    assert!(
+        result.is_empty(),
+        "15% drawdown should not trigger 20% limit"
+    );
+}
+
+#[test]
+fn test_security_drawdown_triggers_below_threshold() {
+    let mut model = MaximumDrawdownPercentPerSecurity::new(dec!(0.20));
+    let ctx = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(75))],
+    };
+
+    let result = model.manage_risk_with_context(&[], &ctx);
+    assert_eq!(result.len(), 1, "25% drawdown should trigger 20% limit");
+    assert_eq!(result[0].quantity, Decimal::ZERO);
+    assert_eq!(result[0].symbol.value, "SPY");
+}
+
+#[test]
+fn test_security_drawdown_skips_uninvested() {
+    let mut model = MaximumDrawdownPercentPerSecurity::new(dec!(0.20));
+    let ctx = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(0), dec!(100), dec!(75))],
+    };
+
+    let result = model.manage_risk_with_context(&[], &ctx);
+    assert!(result.is_empty(), "Uninvested holding should be skipped");
 }
 
 // ─── MaximumDrawdownPercentPortfolio ─────────────────────────────────────────

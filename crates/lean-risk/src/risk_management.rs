@@ -59,6 +59,13 @@ pub trait RiskManagementModel: Send + Sync {
     ) -> Vec<PortfolioTarget> {
         self.manage_risk(targets)
     }
+
+    /// Symbols whose active insights should be canceled after the last risk pass.
+    /// Risk models that mirror LEAN models calling `algorithm.Insights.Cancel`
+    /// should return and clear their pending cancellations here.
+    fn canceled_insights(&mut self) -> Vec<Symbol> {
+        Vec::new()
+    }
 }
 
 pub struct NullRiskManagement;

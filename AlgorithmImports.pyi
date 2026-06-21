@@ -103,6 +103,7 @@ class OrderType:
     Limit: OrderType
     StopMarket: OrderType
     StopLimit: OrderType
+    MarketOnOpen: OrderType
     MarketOnClose: OrderType
     OptionExercise: OrderType
     LimitIfTouched: OrderType
