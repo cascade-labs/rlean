@@ -4667,6 +4667,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 let mut daily_universe_seeded = false;
                 let mut daily_custom_data_seeded = false;
                 let mut fill_forward = LiveFillForwardState::default();
+                // Last-known RAW spot per option-underlying SID, carried forward across
+                // intraday timestamps (the underlying may not print on every option tick).
+                let mut last_raw_underlying_spots: HashMap<u64, Decimal> = HashMap::new();
                 while let Some(ts_ns) = all_timestamps.pop_first() {
                     let utc_time = lean_core::NanosecondTimestamp(ts_ns);
                     set_algorithm_time(&adapter, utc_time);
@@ -4675,6 +4678,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     let mut minute_quote_bars: HashMap<u64, QuoteBar> = HashMap::new();
                     let mut minute_ticks: HashMap<u64, Vec<Tick>> = HashMap::new();
                     let mut bars_for_orders: HashMap<u64, TradeBar> = HashMap::new();
+                    // Raw (unadjusted) prices for option underlyings at this timestamp,
+                    // captured before factor adjustment.  Used as the raw spot for option
+                    // chain construction / IV / greeks (strikes are quoted on raw price),
+                    // while the equity security still receives adjusted bars below.
+                    let mut raw_underlying_spots: HashMap<u64, Decimal> = HashMap::new();
 
                     if Some(ts_ns) == first_timestamp {
                         let brokerage_name = adapter.inner.lock().unwrap().brokerage_name;
@@ -4708,12 +4716,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     for sub in &subscriptions {
                         let sid = sub.symbol.id.sid;
                         if let Some(raw_bar) = trade_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
-                            let bar = if !option_underlying_sids.contains(&sid) {
-                                if let Some(rows) = factor_map.get(&sid) {
-                                    apply_factor_row(raw_bar.clone(), rows, current_date)
-                                } else {
-                                    raw_bar.clone()
-                                }
+                            if option_underlying_sids.contains(&sid) {
+                                raw_underlying_spots.insert(sid, raw_bar.close);
+                            }
+                            let bar = if let Some(rows) = factor_map.get(&sid) {
+                                apply_factor_row(raw_bar.clone(), rows, current_date)
                             } else {
                                 raw_bar.clone()
                             };
@@ -4735,6 +4742,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 current_date,
                                 &option_underlying_sids,
                                 &factor_map,
+                                &mut raw_underlying_spots,
                                 &mut bars_for_orders,
                                 &mut minute_quote_bars,
                                 &mut minute_slice,
@@ -4753,16 +4761,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                         if let Some(ticks) = ticks_by_ts.get(&sid).and_then(|m| m.get(&ts_ns)) {
                             if !ticks.is_empty() {
-                                let ticks = if !option_underlying_sids.contains(&sid) {
-                                    if let Some(rows) = factor_map.get(&sid) {
-                                        ticks
-                                            .iter()
-                                            .cloned()
-                                            .map(|tick| apply_factor_tick(tick, rows, current_date))
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        ticks.to_vec()
+                                if option_underlying_sids.contains(&sid) {
+                                    if let Some(tick) = ticks.last() {
+                                        if tick.value > Decimal::ZERO {
+                                            raw_underlying_spots.insert(sid, tick.value);
+                                        }
                                     }
+                                }
+                                let ticks = if let Some(rows) = factor_map.get(&sid) {
+                                    ticks
+                                        .iter()
+                                        .cloned()
+                                        .map(|tick| apply_factor_tick(tick, rows, current_date))
+                                        .collect::<Vec<_>>()
                                 } else {
                                     ticks.to_vec()
                                 };
@@ -4792,6 +4803,13 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                     }
 
+                    // Carry forward this timestamp's raw option-underlying spots so the
+                    // chain reprice below always has the latest RAW underlying price even
+                    // when the underlying did not print on this exact option tick.
+                    for (sid, spot) in &raw_underlying_spots {
+                        last_raw_underlying_spots.insert(*sid, *spot);
+                    }
+
                     let mut option_chains_dirty = false;
                     for runtime in &mut option_runtimes {
                         let stream_ticks = runtime.take_stream_ticks_at(ts_ns);
@@ -4799,16 +4817,24 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             all_timestamps.insert(next_ts);
                         }
                         let underlying_ticker = runtime.permtick.trim_start_matches('?');
+                        // Prefer the RAW underlying spot (strikes are quoted on raw price);
+                        // fall back to the security's current (possibly adjusted) price only
+                        // when no raw print has been seen yet for this underlying.
                         let spot = {
-                            adapter
-                                .inner
-                                .lock()
-                                .unwrap()
+                            let alg = adapter.inner.lock().unwrap();
+                            let sid_and_price = alg
                                 .securities
                                 .all()
                                 .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
-                                .map(|s| s.current_price())
-                                .unwrap_or(Decimal::ZERO)
+                                .map(|s| (s.symbol.id.sid, s.current_price()));
+                            match sid_and_price {
+                                Some((sid, price)) => resolve_option_underlying_spot(
+                                    sid,
+                                    &last_raw_underlying_spots,
+                                    price,
+                                ),
+                                None => Decimal::ZERO,
+                            }
                         };
                         if runtime.apply_timestamp(utc_time, spot, &stream_ticks) {
                             option_chains_dirty = true;
@@ -5166,17 +5192,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                             }
                                             if let Some(raw_bar) = ts_map.get(&utc_time.0).cloned()
                                             {
-                                                let bar = if !option_underlying_sids.contains(&sid)
-                                                {
-                                                    if let Some(rows) = factor_map.get(&sid) {
-                                                        apply_factor_row(
-                                                            raw_bar,
-                                                            rows,
-                                                            current_date,
-                                                        )
-                                                    } else {
-                                                        raw_bar
-                                                    }
+                                                if option_underlying_sids.contains(&sid) {
+                                                    raw_underlying_spots.insert(sid, raw_bar.close);
+                                                }
+                                                let bar = if let Some(rows) = factor_map.get(&sid) {
+                                                    apply_factor_row(raw_bar, rows, current_date)
                                                 } else {
                                                     raw_bar
                                                 };
@@ -5253,6 +5273,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                                     current_date,
                                                     &option_underlying_sids,
                                                     &factor_map,
+                                                    &mut raw_underlying_spots,
                                                     &mut bars_for_orders,
                                                     &mut minute_quote_bars,
                                                     &mut minute_slice,
@@ -5430,7 +5451,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
                 // End-of-day calls.
                 adapter.on_end_of_day(None);
-                process_option_expirations(&mut adapter, current_date, &HashMap::new());
+                process_option_expirations(
+                    &mut adapter,
+                    current_date,
+                    &HashMap::new(),
+                    &last_raw_underlying_spots,
+                );
 
                 let bm_close: Option<Decimal> = if benchmark_in_subs {
                     day_trade_bars
@@ -5747,15 +5773,21 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             for split in &day_split_events {
                 slice.add_split(split.clone());
             }
+            // Raw (unadjusted) closes for option underlyings, captured BEFORE factor
+            // adjustment.  Option strikes/moneyness are quoted on raw price, so the
+            // chain builder and IV/greeks must see the raw spot — but the equity
+            // security itself keeps the user's normalization (Adjusted), so adjusted
+            // bars still flow to the slice / securities / portfolio below.  This is a
+            // deliberate divergence from C# Lean, which forces option underlyings raw.
+            let mut raw_underlying_spots: HashMap<u64, Decimal> = HashMap::new();
             for sub in &subscriptions {
                 let sid = sub.symbol.id.sid;
                 if let Some(day_bar) = bar_map.get(&sid).and_then(|m| m.get(&current_date)) {
-                    let bar = if !option_underlying_sids.contains(&sid) {
-                        if let Some(rows) = factor_map.get(&sid) {
-                            apply_factor_row(day_bar.clone(), rows, current_date)
-                        } else {
-                            day_bar.clone()
-                        }
+                    if option_underlying_sids.contains(&sid) {
+                        raw_underlying_spots.insert(sid, day_bar.close);
+                    }
+                    let bar = if let Some(rows) = factor_map.get(&sid) {
+                        apply_factor_row(day_bar.clone(), rows, current_date)
                     } else {
                         day_bar.clone()
                     };
@@ -5865,16 +5897,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         .as_ref()
                         .map(|u| *u.clone())
                         .unwrap_or_else(|| canonical.clone());
+                    // Use the RAW underlying close (captured pre-factor-adjustment) for
+                    // chain strike/moneyness selection and IV/greeks — strikes are quoted
+                    // on raw price.  Fall back to the (possibly adjusted) security price
+                    // only when no raw close was delivered for the underlying today.
                     let spot = {
-                        adapter
-                            .inner
-                            .lock()
-                            .unwrap()
+                        let alg = adapter.inner.lock().unwrap();
+                        let sid_and_price = alg
                             .securities
                             .all()
                             .find(|s| s.symbol.permtick.eq_ignore_ascii_case(underlying_ticker))
-                            .map(|s| s.current_price())
-                            .unwrap_or(Decimal::ZERO)
+                            .map(|s| (s.symbol.id.sid, s.current_price()));
+                        match sid_and_price {
+                            Some((sid, price)) => {
+                                resolve_option_underlying_spot(sid, &raw_underlying_spots, price)
+                            }
+                            None => Decimal::ZERO,
+                        }
                     };
 
                     let ticker = underlying_ticker.to_uppercase();
@@ -6180,7 +6219,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 
             adapter.on_end_of_day(None);
 
-            process_option_expirations(&mut adapter, current_date, &split_ratios_today);
+            process_option_expirations(
+                &mut adapter,
+                current_date,
+                &split_ratios_today,
+                &raw_underlying_spots,
+            );
 
             let day_equity = portfolio.total_portfolio_value();
             equity_curve.push(day_equity);
@@ -8840,6 +8884,7 @@ fn apply_quote_bar_to_minute<F>(
     current_date: NaiveDate,
     option_underlying_sids: &HashSet<u64>,
     factor_map: &HashMap<u64, Vec<FactorFileEntry>>,
+    raw_underlying_spots: &mut HashMap<u64, Decimal>,
     bars_for_orders: &mut HashMap<u64, TradeBar>,
     minute_quote_bars: &mut HashMap<u64, QuoteBar>,
     minute_slice: &mut Slice,
@@ -8847,12 +8892,17 @@ fn apply_quote_bar_to_minute<F>(
 ) where
     F: FnMut(&Symbol, Decimal, Decimal, Decimal, bool),
 {
-    let qbar = if !option_underlying_sids.contains(&sid) {
-        if let Some(rows) = factor_map.get(&sid) {
-            apply_factor_quote_bar(raw_qbar, rows, current_date)
-        } else {
-            raw_qbar
+    // Capture the raw mid for option underlyings (strikes are quoted on raw price)
+    // before applying factor adjustment, then deliver the adjusted quote bar to the
+    // slice / securities exactly as for any normal equity subscription.
+    if option_underlying_sids.contains(&sid) {
+        let raw_mid = raw_qbar.mid_close();
+        if raw_mid > Decimal::ZERO {
+            raw_underlying_spots.insert(sid, raw_mid);
         }
+    }
+    let qbar = if let Some(rows) = factor_map.get(&sid) {
+        apply_factor_quote_bar(raw_qbar, rows, current_date)
     } else {
         raw_qbar
     };
@@ -8956,6 +9006,7 @@ fn process_option_expirations(
     adapter: &mut PyAlgorithmAdapter,
     current_date: NaiveDate,
     split_ratios: &HashMap<u64, f64>,
+    raw_underlying_spots: &HashMap<u64, Decimal>,
 ) {
     // Collect expiring positions — we need to drop the lock before calling market_order.
     let expiring: Vec<lean_algorithm::qc_algorithm::OpenOptionPosition> = adapter
@@ -8972,7 +9023,9 @@ fn process_option_expirations(
     }
 
     for pos in expiring {
-        // Get the spot price for the underlying.
+        // Get the spot price for the underlying.  Option strikes are quoted on RAW
+        // price, so settlement ITM/OTM must compare against the RAW spot — not the
+        // (now adjusted) security price.  Fall back to the security price, then strike.
         let spot = {
             let alg = adapter.inner.lock().unwrap();
             // Try to find the underlying security by permtick.
@@ -8982,12 +9035,17 @@ fn process_option_expirations(
                 .as_ref()
                 .map(|u| u.permtick.clone())
                 .unwrap_or_default();
-            let found: Option<Decimal> = alg
+            let sid_and_price = alg
                 .securities
                 .all()
                 .find(|s| s.symbol.permtick.eq_ignore_ascii_case(&underlying_ticker))
-                .map(|s| s.current_price());
-            found.unwrap_or(pos.strike) // Conservative fallback: use strike
+                .map(|s| (s.symbol.id.sid, s.current_price()));
+            match sid_and_price {
+                Some((sid, price)) => {
+                    resolve_option_underlying_spot(sid, raw_underlying_spots, price)
+                }
+                None => pos.strike, // Conservative fallback: use strike
+            }
         };
 
         // If the option's underlying had a forward split today, options written in
@@ -9231,6 +9289,26 @@ fn option_eod_bar_to_trade_bar(
         TimeSpan::ONE_DAY,
         TradeBarData::new(open, high, low, close, volume),
     )
+}
+
+/// Resolve the RAW underlying spot to use for option chain construction / IV /
+/// greeks / expiry settlement.
+///
+/// Option strikes and moneyness are quoted on the underlying's RAW (unadjusted)
+/// price.  rlean deliberately keeps the underlying equity on the user's chosen
+/// normalization (e.g. Adjusted) for everything a normal data consumer sees, so
+/// the equity's `current_price()` may be adjusted.  This helper prefers the raw
+/// close captured pre-factor-adjustment (`raw_underlying_spots`, keyed by SID)
+/// and falls back to the security price only when no raw print is available.
+fn resolve_option_underlying_spot(
+    underlying_sid: u64,
+    raw_underlying_spots: &HashMap<u64, Decimal>,
+    security_price: Decimal,
+) -> Decimal {
+    raw_underlying_spots
+        .get(&underlying_sid)
+        .copied()
+        .unwrap_or(security_price)
 }
 
 fn option_eod_bar_to_order_trade_bar(
@@ -12235,6 +12313,7 @@ mod tests {
         let mut minute_quote_bars = HashMap::new();
         let mut minute_slice = Slice::new(frontier);
         let mut updated_mid_price = false;
+        let mut raw_underlying_spots = HashMap::new();
 
         apply_quote_bar_to_minute(
             sid,
@@ -12242,6 +12321,7 @@ mod tests {
             frontier.date_utc(),
             &HashSet::new(),
             &HashMap::new(),
+            &mut raw_underlying_spots,
             &mut bars_for_orders,
             &mut minute_quote_bars,
             &mut minute_slice,
@@ -12825,6 +12905,34 @@ class NoWarmupCallback(QCAlgorithm):
         assert_eq!(subscriptions.len(), 2);
         assert!(loaded_subscription_ids.contains(&spy_trade.unique_id()));
         assert!(loaded_subscription_ids.contains(&aapl_trade.unique_id()));
+    }
+
+    #[test]
+    fn resolve_option_underlying_spot_prefers_raw_over_adjusted_security_price() {
+        // Invariant: subscribing an option must NOT change the underlying equity's
+        // normalization for normal consumers — the security keeps its (adjusted)
+        // price — but the option chain / IV / greeks must see the RAW spot because
+        // strikes are quoted on raw price.
+        let sid = 12345u64;
+        let adjusted_security_price = dec!(95.50); // back-adjusted for dividends
+        let raw_close = dec!(100.00); // raw spot the option strikes are quoted against
+
+        let mut raw_spots: HashMap<u64, Decimal> = HashMap::new();
+        raw_spots.insert(sid, raw_close);
+
+        // When a raw print exists, it is used (NOT the adjusted security price).
+        assert_eq!(
+            resolve_option_underlying_spot(sid, &raw_spots, adjusted_security_price),
+            raw_close,
+        );
+
+        // When no raw print exists for the underlying, fall back to the security
+        // price (best effort) rather than crashing or returning zero.
+        let empty: HashMap<u64, Decimal> = HashMap::new();
+        assert_eq!(
+            resolve_option_underlying_spot(sid, &empty, adjusted_security_price),
+            adjusted_security_price,
+        );
     }
 
     #[test]
