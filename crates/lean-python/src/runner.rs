@@ -4689,7 +4689,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         apply_split_events_to_state(
                             &day_split_events,
                             &subscriptions,
-                            &option_underlying_sids,
                             &portfolio,
                             &order_processor,
                             &mut trade_builder,
@@ -5754,7 +5753,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             apply_split_events_to_state(
                 &day_split_events,
                 &subscriptions,
-                &option_underlying_sids,
                 &portfolio,
                 &order_processor,
                 &mut trade_builder,
@@ -10302,7 +10300,6 @@ fn split_events_for_date(
 fn apply_split_events_to_state(
     splits: &[Split],
     subscriptions: &[Arc<SubscriptionDataConfig>],
-    raw_equity_sids: &HashSet<u64>,
     portfolio: &lean_algorithm::portfolio::SecurityPortfolioManager,
     order_processor: &OrderProcessor,
     trade_builder: &mut TradeBuilder,
@@ -10310,10 +10307,16 @@ fn apply_split_events_to_state(
 ) {
     for split in splits {
         let sid = split.symbol.id.sid;
+        // Corporate-action adjustments to HOLDINGS (split-quantity multiplication)
+        // must only apply when the holding's price feed is genuinely RAW.  In
+        // ADJUSTED (factor-file) mode the factor file already encodes the split in
+        // the back-adjusted price series, so multiplying the share quantity here on
+        // top of an already-adjusted price double-counts the split (phantom gain on
+        // the split date).  Option underlyings, although strikes are quoted on raw
+        // spot, still mark the equity holding at the user's normalization (Adjusted),
+        // so they must NOT receive a holdings split adjustment either.
         let should_apply = subscriptions.iter().any(|sub| {
-            sub.symbol.id.sid == sid
-                && (sub.normalization_mode == DataNormalizationMode::Raw
-                    || raw_equity_sids.contains(&sid))
+            sub.symbol.id.sid == sid && sub.normalization_mode == DataNormalizationMode::Raw
         });
         if !should_apply {
             continue;
@@ -12033,7 +12036,6 @@ mod tests {
         apply_split_events_to_state(
             &[split],
             &subscriptions,
-            &HashSet::new(),
             &portfolio,
             &processor,
             &mut trade_builder,
@@ -12077,7 +12079,6 @@ mod tests {
         apply_split_events_to_state(
             &[split],
             &subscriptions,
-            &HashSet::new(),
             &portfolio,
             &processor,
             &mut trade_builder,
@@ -12088,6 +12089,106 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Submitted);
         assert_eq!(order.quantity, dec!(10));
         assert_eq!(order.limit_price, Some(dec!(1000)));
+    }
+
+    /// A position held through a forward split in ADJUSTED (factor-file)
+    /// normalization mode must NOT receive a holdings split-quantity
+    /// multiplication: the factor file already encodes the split in the
+    /// back-adjusted price series, so multiplying the share count here would
+    /// double-count the split and create a phantom market-value jump on the
+    /// split date (the etf_commodity_blend XLE/XLB/IGV bug).
+    #[test]
+    fn adjusted_mode_split_does_not_multiply_holdings() {
+        let symbol = Symbol::create_equity("XLE", &Market::usa());
+        let split_time = ny_time(2025, 12, 5, 9, 30);
+        let mut subscription =
+            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
+        subscription.normalization_mode = DataNormalizationMode::Adjusted;
+        let subscriptions = vec![Arc::new(subscription)];
+
+        let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
+        // Hold 1260 shares marked at the (back-)adjusted price 50.
+        portfolio.set_holdings(&symbol, dec!(50), dec!(1260), dec!(1));
+        let value_before = portfolio.get_holding(&symbol).market_value();
+        assert_eq!(value_before, dec!(63_000));
+
+        let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
+        let processor = OrderProcessor::new(
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            transactions,
+        );
+        // 2:1 forward split: LEAN price factor 0.5.
+        let split = Split::new(
+            symbol.clone(),
+            split_time,
+            dec!(0.5),
+            dec!(50),
+            SplitType::SplitOccurred,
+        );
+        let mut trade_builder = TradeBuilder::new();
+
+        apply_split_events_to_state(
+            &[split],
+            &subscriptions,
+            &portfolio,
+            &processor,
+            &mut trade_builder,
+            BrokerageName::Default,
+        );
+
+        let after = portfolio.get_holding(&symbol);
+        // Quantity unchanged — the factor file owns the corporate action.
+        assert_eq!(after.quantity, dec!(1260));
+        assert_eq!(after.market_value(), value_before);
+    }
+
+    /// In RAW mode the split must still be applied to holdings: the share
+    /// quantity is multiplied by the split ratio and the price drops by the same
+    /// ratio, leaving market value invariant across the split date.
+    #[test]
+    fn raw_mode_split_applies_quantity_with_invariant_value() {
+        let symbol = Symbol::create_equity("XLE", &Market::usa());
+        let split_time = ny_time(2025, 12, 5, 9, 30);
+        let mut subscription =
+            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
+        subscription.normalization_mode = DataNormalizationMode::Raw;
+        let subscriptions = vec![Arc::new(subscription)];
+
+        let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
+        // Hold 1260 shares marked at the raw price 100.
+        portfolio.set_holdings(&symbol, dec!(100), dec!(1260), dec!(1));
+        let value_before = portfolio.get_holding(&symbol).market_value();
+        assert_eq!(value_before, dec!(126_000));
+
+        let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
+        let processor = OrderProcessor::new(
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            transactions,
+        );
+        // 2:1 forward split: LEAN price factor 0.5.
+        let split = Split::new(
+            symbol.clone(),
+            split_time,
+            dec!(0.5),
+            dec!(100),
+            SplitType::SplitOccurred,
+        );
+        let mut trade_builder = TradeBuilder::new();
+
+        apply_split_events_to_state(
+            &[split],
+            &subscriptions,
+            &portfolio,
+            &processor,
+            &mut trade_builder,
+            BrokerageName::Default,
+        );
+
+        let after = portfolio.get_holding(&symbol);
+        // Quantity doubled, price halved → market value invariant.
+        assert_eq!(after.quantity, dec!(2520));
+        assert_eq!(after.last_price, dec!(50));
+        assert_eq!(after.market_value(), value_before);
     }
 
     #[test]
