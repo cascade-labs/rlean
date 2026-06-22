@@ -1037,11 +1037,20 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
             "—".to_string()
         }
     };
+    let fmt4 = |v: f64| {
+        if v.is_finite() {
+            format!("{:.4}", v)
+        } else {
+            "—".to_string()
+        }
+    };
     let mut html = format!(
-        "<div class=\"heatmap\"><h3>Alpha Ranking — Keep / Exclude ({kept} of {total} kept)</h3>\
+        "<div class=\"heatmap\"><h3>Alpha Ranking — Keep / Dilutive ({kept} of {total} kept)</h3>\
          <table style=\"font-size:.85rem\"><tr style=\"color:#888\">\
          <td>Alpha</td><td style=\"text-align:right\">Mean IC</td><td style=\"text-align:right\">IC IR</td>\
-         <td style=\"text-align:right\">t-stat</td><td style=\"text-align:right\">Hit</td>\
+         <td style=\"text-align:right\">t-stat</td>\
+         <td style=\"text-align:right\">Partial IC</td><td style=\"text-align:right\">Marginal Contribution</td>\
+         <td style=\"text-align:right\">Hit</td>\
          <td style=\"text-align:right\">Periods</td><td style=\"text-align:center\">Decision</td>\
          <td style=\"text-align:left;color:#888\">Reason</td></tr>",
         kept = kept,
@@ -1051,7 +1060,7 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
         let (bg, badge, badge_bg) = if r.keep {
             ("rgba(76,175,80,0.10)", "KEEP", "#4caf50")
         } else {
-            ("rgba(244,67,54,0.10)", "EXCLUDE", "#f44336")
+            ("rgba(244,67,54,0.10)", "DILUTIVE", "#f44336")
         };
         let hit = if r.hit_rate.is_finite() {
             format!("{:.0}%", r.hit_rate * 100.0)
@@ -1064,6 +1073,8 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
              <td style=\"text-align:right\">{mic}</td>\
              <td style=\"text-align:right\">{ir}</td>\
              <td style=\"text-align:right\">{t}</td>\
+             <td style=\"text-align:right\">{pic}</td>\
+             <td style=\"text-align:right\">{mc}</td>\
              <td style=\"text-align:right\">{hit}</td>\
              <td style=\"text-align:right\">{np}</td>\
              <td style=\"text-align:center\"><span style=\"background:{bbg};color:#fff;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600\">{badge}</span></td>\
@@ -1073,6 +1084,8 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
             mic = fmt(r.mean_ic),
             ir = fmt(r.ic_ir),
             t = fmt(r.t_stat),
+            pic = fmt4(r.partial_ic),
+            mc = fmt4(r.marginal_contribution),
             hit = hit,
             np = r.n_periods,
             bbg = badge_bg,
@@ -1082,9 +1095,13 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
     }
     html.push_str(&format!(
         "</table><div style=\"color:#666;font-size:.72rem;margin-top:8px\">\
-         <b>KEEP</b> = predictive <i>and</i> independent: mean IC &gt; 0 with |t-stat| ≥ {tmin:.1}, \
-         and |corr| &lt; {mc:.2} against every higher-IC kept alpha. \
-         Excluded alphas are either not significant or redundant.</div></div>\n",
+         <b>KEEP</b> = clears the floor (mean IC &gt; 0, |t-stat| ≥ {tmin:.1}, |corr| &lt; {mc:.2} \
+         vs every higher-IC kept alpha), <b>Gate 1</b> (partial IC — Grinold-Kahn additive \
+         information vs the kept set), <i>and</i> <b>Gate 2</b> (marginal contribution = \
+         partial IC × turnover factor × long-only transfer factor — the realized, \
+         friction-adjusted increment). <b>DILUTIVE</b> alphas fail one of these: not \
+         significant, redundant, no additive information, or positive partial IC but a \
+         turnover/transfer haircut leaves little realized contribution.</div></div>\n",
         tmin = a.min_t_stat,
         mc = a.max_correlation,
     ));

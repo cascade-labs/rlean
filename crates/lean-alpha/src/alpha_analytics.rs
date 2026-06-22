@@ -40,6 +40,13 @@ const MIN_IC: f64 = 0.01;
 /// (even a modest standalone IC) keeps most of its IC and is kept for breadth. No
 /// portfolio re-runs: computed from the IC vector + correlation matrix in one pass.
 const MIN_PARTIAL_IC: f64 = 0.01;
+/// Gate 2 floor — minimum REALIZED, friction-adjusted marginal contribution. Partial
+/// IC is the frictionless additive-information upper bound (Grinold-Kahn); the marginal
+/// contribution haircuts it by signal turnover (arXiv:2105.10306 — Turnover-Adjusted IR:
+/// IC volatility + turnover lower realized IR) and by the long-only transfer coefficient
+/// (Clarke-de Silva-Thorley — constraints cap how much edge a real book can capture).
+/// Set below MIN_PARTIAL_IC because both factors are ≤ 1 and only shrink partial IC.
+const MIN_MARGINAL_CONTRIB: f64 = 0.005;
 /// Ridge added to the kept-set correlation submatrix diagonal so the SPD solve is
 /// stable when kept signals are themselves correlated (near-singular C_SS).
 const PARTIAL_IC_RIDGE: f64 = 1e-6;
@@ -76,6 +83,12 @@ pub struct AlphaRanking {
     pub t_stat: f64,
     pub hit_rate: f64,
     pub n_periods: usize,
+    /// Gate 1 — Grinold-Kahn partial IC: mean IC orthogonalized against the kept set
+    /// via the signal-correlation matrix (the additive-information upper bound).
+    pub partial_ic: f64,
+    /// Gate 2 — realized friction-adjusted marginal contribution:
+    /// `partial_ic * turnover_factor * transfer_factor`.
+    pub marginal_contribution: f64,
     pub keep: bool,
     pub reason: String,
 }
@@ -247,19 +260,23 @@ impl AlphaPerformanceTracker {
         });
 
         let mut kept: Vec<&String> = Vec::new();
-        let mut decision: HashMap<String, (bool, String)> = HashMap::new();
+        // Per-alpha decision: (keep, partial_ic, marginal_contribution, reason).
+        let mut decision: HashMap<String, (bool, f64, f64, String)> = HashMap::new();
         for name in eligible {
             let s = &stats[name];
 
             // 1. FLOOR — reject noise: must be predictive, economically non-negligible,
             //    and clear a minimum confidence bar. Independence cannot rescue an
-            //    alpha below the floor.
+            //    alpha below the floor. Below-floor alphas have no meaningful partial
+            //    IC / marginal contribution yet (reported as 0.0).
             if s.mean <= 0.0 {
                 decision.insert(
                     name.clone(),
                     (
                         false,
-                        format!("excluded — mean IC {:+.3} ≤ 0 (not predictive)", s.mean),
+                        0.0,
+                        0.0,
+                        format!("dilutive — mean IC {:+.3} ≤ 0 (not predictive)", s.mean),
                     ),
                 );
                 continue;
@@ -269,7 +286,9 @@ impl AlphaPerformanceTracker {
                     name.clone(),
                     (
                         false,
-                        format!("excluded — mean IC {:.3} below floor {:.3}", s.mean, MIN_IC),
+                        0.0,
+                        0.0,
+                        format!("dilutive — mean IC {:.3} below floor {:.3}", s.mean, MIN_IC),
                     ),
                 );
                 continue;
@@ -279,8 +298,10 @@ impl AlphaPerformanceTracker {
                     name.clone(),
                     (
                         false,
+                        0.0,
+                        0.0,
                         format!(
-                            "excluded — below confidence floor (t {:.2}, need |t|≥{:.1})",
+                            "dilutive — below confidence floor (t {:.2}, need |t|≥{:.1})",
                             s.t_stat, IC_T_STAT_FLOOR
                         ),
                     ),
@@ -288,15 +309,18 @@ impl AlphaPerformanceTracker {
                 continue;
             }
 
-            // 2. First floor-passer anchors the set.
+            // 2. First floor-passer anchors the set. Its partial IC and marginal
+            //    contribution are defined as its own mean IC (nothing to project out).
             if kept.is_empty() {
                 kept.push(name);
                 decision.insert(
                     name.clone(),
                     (
                         true,
+                        s.mean,
+                        s.mean,
                         format!(
-                            "kept — anchor (IC {:.3}, t {:.2}), highest |IC|",
+                            "KEEP — anchor (IC {:.3}, t {:.2}), highest |IC|",
                             s.mean, s.t_stat
                         ),
                     ),
@@ -343,33 +367,59 @@ impl AlphaPerformanceTracker {
                 (1.0 - c_ks.iter().zip(&p).map(|(c, pi)| c * pi).sum::<f64>()).max(1e-6);
             let partial_ic = (s.mean - pred_ic) / resid_var.sqrt();
 
+            // 5. MARGINAL CONTRIBUTION (Gate 2) — friction-adjust the frictionless
+            //    partial IC by the alpha's own signal turnover and its long-only
+            //    transfer coefficient, both computed one-pass from this alpha's
+            //    per-period observations.
+            let turnover_factor = turnover_factor(&self.by_model[name]);
+            let transfer_factor = transfer_factor(&self.by_model[name], s.mean);
+            let marginal_contribution = partial_ic * turnover_factor * transfer_factor;
+
             if max_ac >= MAX_CORR {
                 decision.insert(
                     name.clone(),
                     (
                         false,
-                        format!("redundant — |corr| {max_ac:.2} with {other}"),
+                        partial_ic,
+                        marginal_contribution,
+                        format!("dilutive — redundant, |corr| {max_ac:.2} with {other}"),
                     ),
                 );
-            } else if partial_ic >= MIN_PARTIAL_IC {
+            } else if partial_ic < MIN_PARTIAL_IC {
+                decision.insert(
+                    name.clone(),
+                    (
+                        false,
+                        partial_ic,
+                        marginal_contribution,
+                        format!(
+                            "dilutive — partial IC {partial_ic:.3} < {MIN_PARTIAL_IC:.3} (no information beyond kept set; max |corr| {max_ac:.2} vs {other})"
+                        ),
+                    ),
+                );
+            } else if marginal_contribution < MIN_MARGINAL_CONTRIB {
+                decision.insert(
+                    name.clone(),
+                    (
+                        false,
+                        partial_ic,
+                        marginal_contribution,
+                        format!(
+                            "dilutive — partial IC {partial_ic:.3} ok but marginal contribution {marginal_contribution:.3} < {MIN_MARGINAL_CONTRIB:.3} (turnover×{turnover_factor:.2} / transfer×{transfer_factor:.2} haircut)"
+                        ),
+                    ),
+                );
+            } else {
                 kept.push(name);
                 decision.insert(
                     name.clone(),
                     (
                         true,
+                        partial_ic,
+                        marginal_contribution,
                         format!(
-                            "kept — additive: partial IC {partial_ic:.3} (≥{MIN_PARTIAL_IC:.3}) beyond kept set, raises blended IR; IC {:.3}, max |corr| {max_ac:.2} vs {other}",
+                            "KEEP — additive: partial IC {partial_ic:.3} (≥{MIN_PARTIAL_IC:.3}), marginal contribution {marginal_contribution:.3} (≥{MIN_MARGINAL_CONTRIB:.3}; turnover×{turnover_factor:.2}, transfer×{transfer_factor:.2}); IC {:.3}, max |corr| {max_ac:.2} vs {other}",
                             s.mean
-                        ),
-                    ),
-                );
-            } else {
-                decision.insert(
-                    name.clone(),
-                    (
-                        false,
-                        format!(
-                            "excluded — partial IC {partial_ic:.3} < floor {MIN_PARTIAL_IC:.3} (no information beyond kept set; max |corr| {max_ac:.2} vs {other})"
                         ),
                     ),
                 );
@@ -381,12 +431,15 @@ impl AlphaPerformanceTracker {
             .iter()
             .map(|name| {
                 let s = &stats[name];
-                let (keep, reason) = decision.get(name).cloned().unwrap_or_else(|| {
-                    (
-                        false,
-                        format!("insufficient data — {} period(s) (<{MIN_PERIODS})", s.n),
-                    )
-                });
+                let (keep, partial_ic, marginal_contribution, reason) =
+                    decision.get(name).cloned().unwrap_or_else(|| {
+                        (
+                            false,
+                            0.0,
+                            0.0,
+                            format!("insufficient data — {} period(s) (<{MIN_PERIODS})", s.n),
+                        )
+                    });
                 AlphaRanking {
                     name: name.clone(),
                     mean_ic: s.mean,
@@ -394,6 +447,8 @@ impl AlphaPerformanceTracker {
                     t_stat: s.t_stat,
                     hit_rate: s.hit_rate,
                     n_periods: s.n,
+                    partial_ic,
+                    marginal_contribution,
                     keep,
                     reason,
                 }
@@ -462,6 +517,87 @@ fn period_ics(obs: &[Observation]) -> Vec<(String, f64)> {
         }
     }
     out
+}
+
+/// Gate-2 turnover haircut (arXiv:2105.10306, Turnover-Adjusted IR). Turnover is
+/// `1 - mean( spearman(signal_t, signal_{t-1}) )` over consecutive periods, on the
+/// symbols present in BOTH periods (the alpha's own signal autocorrelation). A signal
+/// that reshuffles its cross-section every period (low autocorrelation → high turnover)
+/// is costly to harvest, so the realized contribution is haircut by
+/// `clamp(1 - turnover, 0, 1)`. With <2 usable consecutive periods → 1.0 (no penalty).
+fn turnover_factor(obs: &[Observation]) -> f64 {
+    // Per-period symbol→signal maps, in chronological order.
+    let mut periods: BTreeMap<i64, HashMap<&str, f64>> = BTreeMap::new();
+    for o in obs {
+        periods
+            .entry(o.period)
+            .or_default()
+            .insert(o.symbol.as_str(), o.signal);
+    }
+    let ordered: Vec<&HashMap<&str, f64>> = periods.values().collect();
+    let mut autocorrs = Vec::new();
+    for w in ordered.windows(2) {
+        let (prev, cur) = (w[0], w[1]);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for (sym, &v_cur) in cur {
+            if let Some(&v_prev) = prev.get(sym) {
+                xs.push(v_cur);
+                ys.push(v_prev);
+            }
+        }
+        let ac = spearman(&xs, &ys);
+        if ac.is_finite() {
+            autocorrs.push(ac);
+        }
+    }
+    if autocorrs.is_empty() {
+        return 1.0;
+    }
+    let mean_ac = autocorrs.iter().sum::<f64>() / autocorrs.len() as f64;
+    let turnover = 1.0 - mean_ac;
+    (1.0 - turnover).clamp(0.0, 1.0)
+}
+
+/// Gate-2 long-only transfer coefficient (Clarke-de Silva-Thorley). `long_side_ic` is
+/// the mean over periods of the per-period Spearman(signal, forward_return) computed
+/// ONLY over the names at/above that period's cross-sectional signal median — the names
+/// a long-only book can actually overweight. If an alpha's edge lives on the names it
+/// ranks LOW (which long-only can't short), `long_side_ic << mean_ic` and the factor is
+/// small. `transfer_factor = clamp(long_side_ic / max(|mean_ic|, 1e-6), 0, 1)`. Periods
+/// with <3 top-half names are skipped; no usable periods → 1.0.
+fn transfer_factor(obs: &[Observation], mean_ic: f64) -> f64 {
+    let mut periods: BTreeMap<i64, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for o in obs {
+        let e = periods.entry(o.period).or_default();
+        e.0.push(o.signal);
+        e.1.push(o.forward_return);
+    }
+    let mut top_ics = Vec::new();
+    for (sig, fwd) in periods.values() {
+        let ranks = rank(sig);
+        let n = sig.len() as f64;
+        // 1-based ranks; median line at (n+1)/2, "at/above median" = rank ≥ that.
+        let median_rank = (n + 1.0) / 2.0;
+        let (mut top_sig, mut top_fwd) = (Vec::new(), Vec::new());
+        for i in 0..sig.len() {
+            if ranks[i] >= median_rank {
+                top_sig.push(sig[i]);
+                top_fwd.push(fwd[i]);
+            }
+        }
+        if top_sig.len() < 3 {
+            continue;
+        }
+        let ic = spearman(&top_sig, &top_fwd);
+        if ic.is_finite() {
+            top_ics.push(ic);
+        }
+    }
+    if top_ics.is_empty() {
+        return 1.0;
+    }
+    let long_side_ic = top_ics.iter().sum::<f64>() / top_ics.len() as f64;
+    (long_side_ic / mean_ic.abs().max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn rolling(ics: &[(String, f64)], window: usize) -> Vec<AlphaIcPoint> {
@@ -647,5 +783,101 @@ mod tests {
     fn rank_handles_ties() {
         let r = rank(&[10.0, 10.0, 20.0]);
         assert_eq!(r, vec![1.5, 1.5, 3.0]);
+    }
+
+    fn obs(period: i64, symbol: &str, signal: f64, fwd: f64) -> Observation {
+        Observation {
+            period,
+            date: "2026-01-01".to_string(),
+            symbol: symbol.to_string(),
+            signal,
+            forward_return: fwd,
+        }
+    }
+
+    #[test]
+    fn turnover_factor_stable_signal_no_penalty() {
+        // Same cross-sectional ranking every period → autocorrelation ≈ 1 →
+        // turnover ≈ 0 → factor ≈ 1 (no haircut).
+        let mut o = Vec::new();
+        for p in 0..4 {
+            o.push(obs(p, "A", 3.0, 0.0));
+            o.push(obs(p, "B", 2.0, 0.0));
+            o.push(obs(p, "C", 1.0, 0.0));
+        }
+        assert!((turnover_factor(&o) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn turnover_factor_reshuffling_signal_penalized() {
+        // Ranking flips every period (perfect inverse autocorrelation = -1) →
+        // turnover = 2 → clamp(1 - 2, 0, 1) = 0 (fully penalized).
+        let mut o = Vec::new();
+        for p in 0..4 {
+            let (a, b, c) = if p % 2 == 0 {
+                (3.0, 2.0, 1.0)
+            } else {
+                (1.0, 2.0, 3.0)
+            };
+            o.push(obs(p, "A", a, 0.0));
+            o.push(obs(p, "B", b, 0.0));
+            o.push(obs(p, "C", c, 0.0));
+        }
+        assert!(turnover_factor(&o) < 1e-9);
+    }
+
+    #[test]
+    fn turnover_factor_single_period_no_penalty() {
+        let o = vec![obs(0, "A", 1.0, 0.0), obs(0, "B", 2.0, 0.0)];
+        assert!((turnover_factor(&o) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transfer_factor_long_side_edge_full() {
+        // Edge is monotonic across the whole cross-section, so the top-half names
+        // are also well-ordered → long_side_ic ≈ mean_ic → factor ≈ 1.
+        let mut o = Vec::new();
+        for p in 0..3 {
+            for k in 0..6 {
+                let s = k as f64;
+                o.push(obs(p, &format!("S{k}"), s, s)); // signal predicts return on every name
+            }
+        }
+        let mean_ic = 1.0; // perfect cross-sectional IC
+        let tf = transfer_factor(&o, mean_ic);
+        assert!(tf > 0.95, "expected ~1.0, got {tf}");
+    }
+
+    #[test]
+    fn transfer_factor_short_side_edge_haircut() {
+        // Symmetric V: signal predicts return ONLY on the low-signal (short) names;
+        // among the top-half (long-side) names the relationship is reversed, so
+        // long_side_ic is negative → transfer_factor clamps to ~0.
+        // signal s in {0..5}; forward return = -(s - 2.5) shape on top half.
+        let returns = [5.0, 3.0, 1.0, -1.0, -3.0, -5.0]; // top-half (high signal) does worst
+        let mut o = Vec::new();
+        for p in 0..3 {
+            for (k, &ret) in returns.iter().enumerate() {
+                o.push(obs(p, &format!("S{k}"), k as f64, ret));
+            }
+        }
+        // Whole-book IC is strongly negative; mean_ic.abs() is large. The top-half
+        // (signals 3,4,5) returns are -1,-3,-5: signal up ⇒ return down ⇒ long-side
+        // IC negative ⇒ factor clamps to 0.
+        let mean_ic = 0.5;
+        let tf = transfer_factor(&o, mean_ic);
+        assert!(tf < 1e-9, "expected ~0 (short-side edge), got {tf}");
+    }
+
+    #[test]
+    fn transfer_factor_too_few_top_names_no_data() {
+        // 4 names → top half = 2 names (<3) → period skipped → no usable periods → 1.0.
+        let o = vec![
+            obs(0, "A", 1.0, 1.0),
+            obs(0, "B", 2.0, 2.0),
+            obs(0, "C", 3.0, 3.0),
+            obs(0, "D", 4.0, 4.0),
+        ];
+        assert!((transfer_factor(&o, 1.0) - 1.0).abs() < 1e-9);
     }
 }
