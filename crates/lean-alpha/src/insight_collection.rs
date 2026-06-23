@@ -128,6 +128,42 @@ impl InsightCollection {
         expired
     }
 
+    /// Close (finalize + retain in scored history) and remove ONLY the active insights for
+    /// `symbol` emitted by `source_model`. Used for Flat insights: one alpha's Flat must not
+    /// destroy another alpha's still-active insight on the same symbol, and the closed insight
+    /// must be scored (mirrors `remove_expired`'s finalize+retain) so per-alpha IC is a property
+    /// of that alpha alone — independent of which other alphas (or PCM) are running.
+    pub fn close_source_symbol(
+        &mut self,
+        symbol: &Symbol,
+        source_model: &str,
+        utc_now: DateTime,
+    ) -> Vec<Insight> {
+        let mut closed_out = Vec::new();
+        if let Some(v) = self.insights.get_mut(&symbol.id.sid) {
+            let mut i = 0;
+            while i < v.len() {
+                if v[i].source_model == source_model {
+                    let mut closed = v.remove(i);
+                    if closed.close_time_utc > utc_now {
+                        closed.close_time_utc = utc_now;
+                    }
+                    closed.finalize_score();
+                    self.closed.push(closed.clone());
+                    closed_out.push(closed);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        self.insights.retain(|_, v| !v.is_empty());
+        if self.closed.len() > MAX_CLOSED_HISTORY {
+            let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
+            self.closed.drain(0..overflow);
+        }
+        closed_out
+    }
+
     pub fn has_active(&self, symbol: &Symbol, utc_now: DateTime) -> bool {
         self.insights
             .get(&symbol.id.sid)

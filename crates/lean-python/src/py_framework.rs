@@ -114,10 +114,18 @@ impl FrameworkState {
         // for end-of-backtest IC / correlation / ranking analytics.
         self.alpha_tracker.record_expired(&expired_insights);
 
+        let mut flat_closed: Vec<lean_alpha::Insight> = Vec::new();
         for insight in &alpha_insights {
             if insight.direction == AlphaDir::Flat {
-                self.insights
-                    .clear_symbols(std::slice::from_ref(&insight.symbol));
+                // Close ONLY the emitting model's insight on this symbol (scored + recorded),
+                // not every model's — a Flat from one alpha must not silently destroy another
+                // alpha's live insight before it can be scored, which would make per-alpha IC
+                // depend on the rest of the book. See InsightCollection::close_source_symbol.
+                flat_closed.extend(self.insights.close_source_symbol(
+                    &insight.symbol,
+                    &insight.source_model,
+                    slice.time,
+                ));
                 self.pending_flat_targets.push(insight.clone());
             } else {
                 // Capture the reference price at emission so the insight can be scored.
@@ -127,6 +135,9 @@ impl FrameworkState {
                 }
                 self.insights.add(ins);
             }
+        }
+        if !flat_closed.is_empty() {
+            self.alpha_tracker.record_expired(&flat_closed);
         }
 
         let mut target_insights = if self.pcm.use_all_active_insights() {
