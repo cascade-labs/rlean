@@ -178,7 +178,7 @@ impl SecurityHolding {
 #[derive(Debug)]
 pub struct SecurityPortfolioManager {
     pub cash: RwLock<Price>,
-    pub starting_cash: Price,
+    starting_cash: RwLock<Price>,
     holdings: RwLock<HashMap<u64, SecurityHolding>>,
     margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
@@ -189,12 +189,23 @@ impl SecurityPortfolioManager {
     pub fn new(starting_cash: Price) -> Self {
         SecurityPortfolioManager {
             cash: RwLock::new(starting_cash),
-            starting_cash,
+            starting_cash: RwLock::new(starting_cash),
             holdings: RwLock::new(HashMap::new()),
             margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
             total_funding: RwLock::new(dec!(0)),
         }
+    }
+
+    pub fn starting_cash(&self) -> Price {
+        *self.starting_cash.read()
+    }
+
+    /// Set the performance baseline. In backtests/pure paper this follows
+    /// `SetCash`; in live brokerage runs it is reset to the synced account
+    /// `TotalPortfolioValue`, matching C# LEAN's StartingPortfolioValue.
+    pub fn set_starting_cash(&self, starting_cash: Price) {
+        *self.starting_cash.write() = starting_cash;
     }
 
     pub fn get_holding(&self, symbol: &Symbol) -> SecurityHolding {
@@ -472,9 +483,10 @@ impl SecurityPortfolioManager {
 
     /// Percentage return from starting portfolio value.
     pub fn total_return_pct(&self) -> Price {
-        if self.starting_cash.is_zero() {
+        let starting_cash = self.starting_cash();
+        if starting_cash.is_zero() {
             return dec!(0);
         }
-        (self.total_portfolio_value() - self.starting_cash) / self.starting_cash
+        (self.total_portfolio_value() - starting_cash) / starting_cash
     }
 }

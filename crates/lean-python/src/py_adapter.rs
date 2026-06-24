@@ -367,7 +367,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
     }
 
     fn starting_cash(&self) -> lean_core::Price {
-        self.inner.lock().unwrap().cash()
+        self.inner.lock().unwrap().portfolio.starting_cash()
     }
 }
 

@@ -30,6 +30,36 @@ pub struct GlobalConfig {
     #[serde(default = "default_language")]
     pub default_language: String,
 
+    #[serde(default = "default_datastore")]
+    pub datastore: String,
+
+    #[serde(
+        default,
+        rename = "s3_access_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub s3_access_key: Option<String>,
+
+    #[serde(
+        default,
+        rename = "s3_secret_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub s3_secret_key: Option<String>,
+
+    #[serde(default, rename = "s3_bucket", skip_serializing_if = "Option::is_none")]
+    pub s3_bucket: Option<String>,
+
+    #[serde(
+        default,
+        rename = "s3_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub s3_endpoint: Option<String>,
+
+    #[serde(default, rename = "s3_region", skip_serializing_if = "Option::is_none")]
+    pub s3_region: Option<String>,
+
     /// Global Parquet data root directory
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_folder: Option<String>,
@@ -41,6 +71,10 @@ pub struct GlobalConfig {
 
 fn default_language() -> String {
     "python".to_string()
+}
+
+fn default_datastore() -> String {
+    "file".to_string()
 }
 
 impl GlobalConfig {
@@ -58,7 +92,8 @@ impl GlobalConfig {
         let path = config_path()?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = serde_json::to_string_pretty(self)?;
-        atomic_write(&path, &text)
+        atomic_write(&path, &text)?;
+        secure_owner_read_write(&path)
     }
 }
 
@@ -152,6 +187,21 @@ pub fn configured_data_folder(start: &Path) -> Result<Option<PathBuf>> {
         } else {
             workspace.join(path)
         }));
+    }
+
+    Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))
+}
+
+pub fn configured_data_folder_for_datastore(
+    start: &Path,
+    datastore: &str,
+) -> Result<Option<PathBuf>> {
+    if datastore != "s3" {
+        return configured_data_folder(start);
+    }
+
+    if let Some((_workspace, cfg)) = find_workspace_config(start)? {
+        return Ok(Some(PathBuf::from(cfg.data_folder)));
     }
 
     Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))

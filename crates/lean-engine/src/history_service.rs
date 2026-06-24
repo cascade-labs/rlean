@@ -36,11 +36,26 @@ impl HistoryService {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<TradeBar>> {
+        self.load_trade_bars_between_blocking(
+            symbol,
+            resolution,
+            date_to_datetime(start, 0, 0, 0),
+            date_to_datetime(end, 23, 59, 59),
+        )
+    }
+
+    pub fn load_trade_bars_between_blocking(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<TradeBar>> {
         let request = HistoryRequest {
             symbol: symbol.clone(),
             resolution,
-            start: date_to_datetime(start, 0, 0, 0),
-            end: date_to_datetime(end, 23, 59, 59),
+            start,
+            end,
             data_type: DataType::TradeBar,
         };
 
@@ -188,17 +203,12 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let runtime_handle = tokio::runtime::Handle::try_current().ok();
     let handle = std::thread::spawn(move || {
-        if let Some(runtime_handle) = runtime_handle {
-            runtime_handle.block_on(future)
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow!(e))?
-                .block_on(future)
-        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow!(e))?
+            .block_on(future)
     });
     handle
         .join()

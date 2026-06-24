@@ -64,6 +64,24 @@ my-strategies/
   data/           # Parquet data directory
 ```
 
+Global config lives in `~/.rlean/config`. The `datastore` setting defaults to
+`file`; set it to `s3` only when using an S3-backed data store. With
+`datastore=s3`, `data-folder` is interpreted as the path prefix inside the
+bucket, and rlean keeps a local cache under `~/.rlean/cache/s3/`.
+
+```json
+{
+  "default-language": "python",
+  "datastore": "s3",
+  "data-folder": "lean/data",
+  "s3_access_key": "...",
+  "s3_secret_key": "...",
+  "s3_bucket": "my-bucket",
+  "s3_endpoint": "https://s3-compatible-endpoint.example.com",
+  "s3_region": "us-east-1"
+}
+```
+
 ### 2. Create a project
 
 ```sh

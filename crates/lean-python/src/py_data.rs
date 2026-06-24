@@ -1770,7 +1770,8 @@ impl FrameworkSliceProxy {
         self.quote_bar_cells
             .reserve(quote_bars.len().saturating_sub(self.quote_bar_cells.len()));
         for (&sid, qbar) in quote_bars {
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.quote_bar_cells.entry(sid) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.quote_bar_cells.entry(sid)
+            {
                 match Py::new(py, PyQuoteBar::from(qbar)) {
                     Ok(py_qbar) => {
                         slot.insert(py_qbar);

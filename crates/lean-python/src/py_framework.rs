@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::py_types::PyResolution;
 use lean_alpha::{
     AlphaAnalytics, AlphaPerformanceTracker, IAlphaModel, InsightCollection,
-    InsightDirection as AlphaDir,
+    InsightCollectionSnapshot, InsightDirection as AlphaDir, InsightEvent, InsightEventKind,
 };
 use lean_core::{DateTime, Resolution, Symbol, TickType, TimeSpan};
 use lean_execution::{
@@ -52,7 +52,9 @@ pub struct FrameworkState {
     /// Accumulates closed-insight observations for IC / correlation analytics.
     pub alpha_tracker: AlphaPerformanceTracker,
     pending_flat_targets: Vec<lean_alpha::Insight>,
+    pending_insight_events: Vec<InsightEvent>,
     pending_security_changes: bool,
+    restored_insight_change: bool,
     next_rebalance_time: Option<DateTime>,
     /// Python QCAlgorithm instance; used to expose `algorithm.Insights` with scores.
     pub alg_py: Option<Py<PyAny>>,
@@ -68,7 +70,9 @@ impl FrameworkState {
             insights: InsightCollection::new(),
             alpha_tracker: AlphaPerformanceTracker::new(),
             pending_flat_targets: Vec::new(),
+            pending_insight_events: Vec::new(),
             pending_security_changes: false,
+            restored_insight_change: false,
             next_rebalance_time: None,
             alg_py: None,
         }
@@ -79,26 +83,28 @@ impl FrameworkState {
         !self.alpha_models.is_empty()
     }
 
-    /// Run the full alpha → PCM → risk → execution pipeline.
-    ///
-    /// Returns a list of order requests that the runner should submit.
-    pub fn run_pipeline(
+    fn collect_alpha_insights(
         &mut self,
         slice: &lean_data::Slice,
         securities: &[Symbol],
+    ) -> Vec<lean_alpha::Insight> {
+        self.expose_insights_to_python(slice.time);
+        self.alpha_models
+            .iter_mut()
+            .flat_map(|m| m.update(slice, securities))
+            .map(|i| i.with_generated_time_utc(slice.time))
+            .collect()
+    }
+
+    fn run_pipeline_from_alpha(
+        &mut self,
+        slice: &lean_data::Slice,
+        alpha_insights: Vec<lean_alpha::Insight>,
         portfolio_value: Decimal,
         prices: &HashMap<String, Decimal>,
         risk_context: &RiskContext,
         execution_context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
-        // 1. Alpha: gather insights from all registered models.
-        let alpha_insights: Vec<lean_alpha::Insight> = self
-            .alpha_models
-            .iter_mut()
-            .flat_map(|m| m.update(slice, securities))
-            .map(|i| i.with_generated_time_utc(slice.time))
-            .collect();
-
         // Always update PCM price history so warm-up-requiring models (e.g.
         // Black-Litterman) accumulate data even when alpha is silent.
         self.pcm.update_security_prices(prices);
@@ -109,6 +115,7 @@ impl FrameworkState {
 
         let expired_insights = self.insights.remove_expired(slice.time);
         let expired_insight_count = expired_insights.len();
+        self.push_insight_events(InsightEventKind::Expired, slice.time, &expired_insights);
 
         // Record the now-closed insights (with their realised forward returns)
         // for end-of-backtest IC / correlation / ranking analytics.
@@ -134,11 +141,17 @@ impl FrameworkState {
                     ins.reference_value = prices.get(&ins.symbol.value).copied();
                 }
                 self.insights.add(ins);
+                if let Some(added) = self.insights.latest_for_symbol(&insight.symbol).cloned() {
+                    self.push_insight_event(InsightEventKind::Emitted, slice.time, added);
+                }
             }
         }
         if !flat_closed.is_empty() {
             self.alpha_tracker.record_expired(&flat_closed);
+            self.push_insight_events(InsightEventKind::FlatClosed, slice.time, &flat_closed);
         }
+
+        self.expose_insights_to_python(slice.time);
 
         let mut target_insights = if self.pcm.use_all_active_insights() {
             self.insights.active(slice.time)
@@ -163,8 +176,12 @@ impl FrameworkState {
             return self.exec_model.execute_with_context(&[], execution_context);
         }
 
-        let insight_changes =
-            !alpha_insights.is_empty() || expired_insight_count != 0 || pending_flat_count != 0;
+        let restored_insight_change = self.restored_insight_change;
+        self.restored_insight_change = false;
+        let insight_changes = !alpha_insights.is_empty()
+            || expired_insight_count != 0
+            || pending_flat_count != 0
+            || restored_insight_change;
         if !self.is_rebalance_due(slice.time, insight_changes) {
             return Vec::new();
         }
@@ -185,23 +202,6 @@ impl FrameworkState {
             })
             .collect();
 
-        // Expose the scored insight collection to the Python algorithm as
-        // `algorithm.Insights` so PCMs can call GetInsights()/GetActiveInsights()
-        // and read direction/magnitude scores (mirrors C# Lean).
-        if let Some(alg) = &self.alg_py {
-            let snapshot = self.insights.get_insights();
-            let now = slice.time;
-            Python::attach(|py| {
-                let mgr = PyInsightManager {
-                    insights: snapshot,
-                    utc_now: now,
-                };
-                if let Ok(obj) = Py::new(py, mgr) {
-                    let _ = alg.bind(py).setattr("Insights", obj);
-                }
-            });
-        }
-
         // 3. Portfolio construction: compute target quantities.
         let pcm_targets = self
             .pcm
@@ -217,7 +217,11 @@ impl FrameworkState {
             .manage_risk_with_context(&risk_targets, risk_context);
         let canceled_insights = self.risk_model.canceled_insights();
         if !canceled_insights.is_empty() {
-            self.insights.clear_symbols(&canceled_insights);
+            // Risk-cancelled insights are closed out — record their realized return for analytics.
+            let closed = self.insights.clear_symbols(&canceled_insights);
+            self.alpha_tracker.record_expired(&closed);
+            self.push_insight_events(InsightEventKind::RiskCancelled, slice.time, &closed);
+            self.expose_insights_to_python(slice.time);
         }
         let adjusted_by_symbol: HashMap<String, RiskTarget> =
             risk_targets
@@ -247,10 +251,52 @@ impl FrameworkState {
             .execute_with_context(&exec_targets, execution_context)
     }
 
+    /// Run the full alpha → PCM → risk → execution pipeline.
+    ///
+    /// Returns a list of order requests that the runner should submit.
+    pub fn run_pipeline(
+        &mut self,
+        slice: &lean_data::Slice,
+        securities: &[Symbol],
+        portfolio_value: Decimal,
+        prices: &HashMap<String, Decimal>,
+        risk_context: &RiskContext,
+        execution_context: &ExecutionContext<'_>,
+    ) -> Vec<OrderRequest> {
+        let alpha_insights = self.collect_alpha_insights(slice, securities);
+        self.run_pipeline_from_alpha(
+            slice,
+            alpha_insights,
+            portfolio_value,
+            prices,
+            risk_context,
+            execution_context,
+        )
+    }
+
     /// Reduce the accumulated alpha observations into the analytics bundle
     /// (rolling IC series, signal-correlation matrix, keep/exclude ranking).
     pub fn compute_alpha_analytics(&self) -> AlphaAnalytics {
         self.alpha_tracker.compute()
+    }
+
+    pub fn insight_snapshot(&self) -> InsightCollectionSnapshot {
+        self.insights.snapshot()
+    }
+
+    pub fn take_insight_events(&mut self) -> Vec<InsightEvent> {
+        std::mem::take(&mut self.pending_insight_events)
+    }
+
+    pub fn restore_insights(&mut self, snapshot: InsightCollectionSnapshot, utc_now: DateTime) {
+        self.insights = InsightCollection::from_snapshot(snapshot);
+        let closed = self.insights.closed_insights();
+        self.alpha_tracker = AlphaPerformanceTracker::from_closed_insights(&closed);
+
+        let restored_active = self.insights.snapshot().active;
+        self.push_insight_events(InsightEventKind::Restored, utc_now, &restored_active);
+        self.restored_insight_change = !restored_active.is_empty();
+        self.expose_insights_to_python(utc_now);
     }
 
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
@@ -262,12 +308,57 @@ impl FrameworkState {
         }
         self.pcm.on_securities_changed(added, removed);
         self.exec_model.on_securities_changed(added, removed);
-        self.insights.expire(removed, lean_core::DateTime::MAX);
+        // A removed security's insights are closed out (C# Lean Insights.Expire on universe
+        // removal). Record their realized return for analytics before flattening — clear_symbols
+        // finalizes + retains them, so they are not dropped from per-alpha IC.
         let removed_insights = self.insights.clear_symbols(removed);
+        self.alpha_tracker.record_expired(&removed_insights);
+        self.push_insight_events(
+            InsightEventKind::UniverseRemoved,
+            DateTime::now(),
+            &removed_insights,
+        );
         for mut insight in removed_insights {
             insight.direction = AlphaDir::Flat;
             self.pending_flat_targets.push(insight);
         }
+    }
+
+    fn push_insight_event(
+        &mut self,
+        kind: InsightEventKind,
+        event_time_utc: DateTime,
+        insight: lean_alpha::Insight,
+    ) {
+        self.pending_insight_events
+            .push(InsightEvent::new(kind, event_time_utc, insight));
+    }
+
+    fn push_insight_events(
+        &mut self,
+        kind: InsightEventKind,
+        event_time_utc: DateTime,
+        insights: &[lean_alpha::Insight],
+    ) {
+        for insight in insights {
+            self.push_insight_event(kind, event_time_utc, insight.clone());
+        }
+    }
+
+    fn expose_insights_to_python(&self, utc_now: DateTime) {
+        let Some(alg) = &self.alg_py else {
+            return;
+        };
+        let snapshot = self.insights.get_insights();
+        Python::attach(|py| {
+            let mgr = PyInsightManager {
+                insights: snapshot,
+                utc_now,
+            };
+            if let Ok(obj) = Py::new(py, mgr) {
+                let _ = alg.bind(py).setattr("Insights", obj);
+            }
+        });
     }
 
     fn is_rebalance_due(&mut self, now: DateTime, insight_changes: bool) -> bool {
@@ -328,130 +419,151 @@ pub fn run_framework_pipeline(
         }
     }
 
-    let (securities, prices, portfolio_value, risk_context, security_data, open_order_data) = {
-        let alg = alg_inner.lock().unwrap();
-        let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
-        let portfolio_holdings = alg.portfolio.all_holdings();
-        let mut holdings: HashMap<String, Decimal> =
-            HashMap::with_capacity(portfolio_holdings.len());
-        for holding in &portfolio_holdings {
-            holdings.insert(holding.symbol.value.clone(), holding.quantity);
-        }
-        let mut holding_data: HashMap<String, lean_algorithm::portfolio::SecurityHolding> =
-            HashMap::with_capacity(portfolio_holdings.len());
-        for holding in portfolio_holdings {
-            holding_data.insert(holding.symbol.value.clone(), holding);
-        }
-
-        let open_orders_snapshot = alg.transactions.get_open_orders();
-        let mut open_orders: HashMap<String, Decimal> =
-            HashMap::with_capacity(open_orders_snapshot.len());
-        let mut open_order_data = Vec::with_capacity(open_orders_snapshot.len());
-        for order in open_orders_snapshot {
-            let order_type = match order.order_type {
-                lean_orders::OrderType::Market => ExecutionOrderType::Market,
-                lean_orders::OrderType::Limit => ExecutionOrderType::Limit,
-                lean_orders::OrderType::MarketOnOpen => ExecutionOrderType::MarketOnOpen,
-                lean_orders::OrderType::MarketOnClose => ExecutionOrderType::MarketOnClose,
-                _ => ExecutionOrderType::Market,
-            };
-            let remaining_quantity = order.remaining_quantity();
-            *open_orders
-                .entry(order.symbol.value.clone())
-                .or_insert(Decimal::ZERO) += remaining_quantity;
-            open_order_data.push(ExecutionOpenOrder {
-                id: order.id,
-                symbol: order.symbol.clone(),
-                quantity: order.quantity,
-                filled_quantity: order.filled_quantity,
-                remaining_quantity,
-                order_type,
-                limit_price: order.limit_price,
-                post_only: order.properties.post_only,
-                tag: order.tag.clone(),
-                created_time: order.created_time,
-                last_update_time: order.last_update_time,
-            });
-        }
-        let pv = alg.portfolio.total_portfolio_value();
-        let mut security_data: HashMap<String, SecurityData> =
-            HashMap::with_capacity(securities.len());
-        for security in alg.securities.all() {
-            let symbol = security.symbol.clone();
-            let key = symbol.value.clone();
-            let base_price = security.current_price();
-            let current_qty = holdings.get(&key).copied().unwrap_or(Decimal::ZERO);
-            let open_order_qty = open_orders.get(&key).copied().unwrap_or(Decimal::ZERO);
-            let lot_size = Decimal::from_f64(security.symbol_properties.lot_size)
-                .filter(|lot| *lot > Decimal::ZERO)
-                .unwrap_or(Decimal::ONE);
-            let minimum_price_variation =
-                Decimal::from_f64(security.symbol_properties.minimum_price_variation)
-                    .filter(|tick| *tick > Decimal::ZERO)
-                    .unwrap_or(Decimal::new(1, 2));
-            let data = execution_security_data_from_slice(
-                slice,
-                symbol,
-                base_price,
-                current_qty,
-                open_order_qty,
-                lot_size,
-                minimum_price_variation,
-            );
-            security_data.insert(key, data);
-        }
-        let mut prices: HashMap<String, Decimal> = HashMap::with_capacity(security_data.len());
-        for (key, data) in &security_data {
-            prices.insert(key.clone(), data.price);
-        }
-        let mut risk_holdings = Vec::with_capacity(holding_data.len());
-        for holding in holding_data
-            .values()
-            .filter(|holding| !holding.quantity.is_zero())
-        {
-            let key = holding.symbol.value.clone();
-            let last_price = security_data
-                .get(&key)
-                .map(|data| data.price)
-                .filter(|price| *price > Decimal::ZERO)
-                .unwrap_or(holding.last_price);
-            risk_holdings.push(HoldingSnapshot {
-                symbol: holding.symbol.clone(),
-                quantity: holding.quantity,
-                average_price: holding.average_price,
-                last_price,
-                unrealized_pnl: holding.unrealized_pnl,
-            });
-        }
-        let risk_context = RiskContext {
-            total_portfolio_value: pv,
-            holdings: risk_holdings,
-        };
-        (
-            securities,
-            prices,
-            pv,
-            risk_context,
-            security_data,
-            open_order_data,
-        )
+    let initial_inputs = build_framework_inputs(alg_inner, slice);
+    let alpha_insights = {
+        let mut fw = framework.lock().unwrap();
+        fw.collect_alpha_insights(slice, &initial_inputs.securities)
     };
 
+    // Python alpha models can add securities and seed prices during Update().
+    // Mirror C# LEAN by letting PCM/risk/execution consume the post-alpha
+    // algorithm state instead of the stale pre-alpha subscription snapshot.
+    let inputs = build_framework_inputs(alg_inner, slice);
     let mut fw = framework.lock().unwrap();
     let execution_context = ExecutionContext::new(
         slice.time,
-        &security_data,
-        &open_order_data,
-        portfolio_value,
+        &inputs.security_data,
+        &inputs.open_order_data,
+        inputs.portfolio_value,
     );
-    fw.run_pipeline(
+    fw.run_pipeline_from_alpha(
         slice,
-        &securities,
-        portfolio_value,
-        &prices,
-        &risk_context,
+        alpha_insights,
+        inputs.portfolio_value,
+        &inputs.prices,
+        &inputs.risk_context,
         &execution_context,
     )
+}
+
+struct FrameworkInputs {
+    securities: Vec<Symbol>,
+    prices: HashMap<String, Decimal>,
+    portfolio_value: Decimal,
+    risk_context: RiskContext,
+    security_data: HashMap<String, SecurityData>,
+    open_order_data: Vec<ExecutionOpenOrder>,
+}
+
+fn build_framework_inputs(
+    alg_inner: &Arc<Mutex<lean_algorithm::qc_algorithm::QcAlgorithm>>,
+    slice: &lean_data::Slice,
+) -> FrameworkInputs {
+    let alg = alg_inner.lock().unwrap();
+    let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
+    let portfolio_holdings = alg.portfolio.all_holdings();
+    let mut holdings: HashMap<String, Decimal> = HashMap::with_capacity(portfolio_holdings.len());
+    for holding in &portfolio_holdings {
+        holdings.insert(holding.symbol.value.clone(), holding.quantity);
+    }
+    let mut holding_data: HashMap<String, lean_algorithm::portfolio::SecurityHolding> =
+        HashMap::with_capacity(portfolio_holdings.len());
+    for holding in portfolio_holdings {
+        holding_data.insert(holding.symbol.value.clone(), holding);
+    }
+
+    let open_orders_snapshot = alg.transactions.get_open_orders();
+    let mut open_orders: HashMap<String, Decimal> =
+        HashMap::with_capacity(open_orders_snapshot.len());
+    let mut open_order_data = Vec::with_capacity(open_orders_snapshot.len());
+    for order in open_orders_snapshot {
+        let order_type = match order.order_type {
+            lean_orders::OrderType::Market => ExecutionOrderType::Market,
+            lean_orders::OrderType::Limit => ExecutionOrderType::Limit,
+            lean_orders::OrderType::MarketOnOpen => ExecutionOrderType::MarketOnOpen,
+            lean_orders::OrderType::MarketOnClose => ExecutionOrderType::MarketOnClose,
+            _ => ExecutionOrderType::Market,
+        };
+        let remaining_quantity = order.remaining_quantity();
+        *open_orders
+            .entry(order.symbol.value.clone())
+            .or_insert(Decimal::ZERO) += remaining_quantity;
+        open_order_data.push(ExecutionOpenOrder {
+            id: order.id,
+            symbol: order.symbol.clone(),
+            quantity: order.quantity,
+            filled_quantity: order.filled_quantity,
+            remaining_quantity,
+            order_type,
+            limit_price: order.limit_price,
+            post_only: order.properties.post_only,
+            tag: order.tag.clone(),
+            created_time: order.created_time,
+            last_update_time: order.last_update_time,
+        });
+    }
+    let portfolio_value = alg.portfolio.total_portfolio_value();
+    let mut security_data: HashMap<String, SecurityData> = HashMap::with_capacity(securities.len());
+    for security in alg.securities.all() {
+        let symbol = security.symbol.clone();
+        let key = symbol.value.clone();
+        let base_price = security.current_price();
+        let current_qty = holdings.get(&key).copied().unwrap_or(Decimal::ZERO);
+        let open_order_qty = open_orders.get(&key).copied().unwrap_or(Decimal::ZERO);
+        let lot_size = Decimal::from_f64(security.symbol_properties.lot_size)
+            .filter(|lot| *lot > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE);
+        let minimum_price_variation =
+            Decimal::from_f64(security.symbol_properties.minimum_price_variation)
+                .filter(|tick| *tick > Decimal::ZERO)
+                .unwrap_or(Decimal::new(1, 2));
+        let data = execution_security_data_from_slice(
+            slice,
+            symbol,
+            base_price,
+            current_qty,
+            open_order_qty,
+            lot_size,
+            minimum_price_variation,
+        );
+        security_data.insert(key, data);
+    }
+    let mut prices: HashMap<String, Decimal> = HashMap::with_capacity(security_data.len());
+    for (key, data) in &security_data {
+        prices.insert(key.clone(), data.price);
+    }
+    let mut risk_holdings = Vec::with_capacity(holding_data.len());
+    for holding in holding_data
+        .values()
+        .filter(|holding| !holding.quantity.is_zero())
+    {
+        let key = holding.symbol.value.clone();
+        let last_price = security_data
+            .get(&key)
+            .map(|data| data.price)
+            .filter(|price| *price > Decimal::ZERO)
+            .unwrap_or(holding.last_price);
+        risk_holdings.push(HoldingSnapshot {
+            symbol: holding.symbol.clone(),
+            quantity: holding.quantity,
+            average_price: holding.average_price,
+            last_price,
+            unrealized_pnl: holding.unrealized_pnl,
+        });
+    }
+    let risk_context = RiskContext {
+        total_portfolio_value: portfolio_value,
+        holdings: risk_holdings,
+    };
+
+    FrameworkInputs {
+        securities,
+        prices,
+        portfolio_value,
+        risk_context,
+        security_data,
+        open_order_data,
+    }
 }
 
 fn execution_security_data_from_slice(
@@ -1624,6 +1736,7 @@ impl PyInsightManager {
 /// A single alpha signal.  Mirrors C# `Insight`.
 #[pyclass(name = "Insight")]
 pub struct PyInsight {
+    pub id: u64,
     pub symbol: lean_core::Symbol,
     pub direction: PyInsightDirection,
     /// Insight validity in nanoseconds.
@@ -1636,6 +1749,8 @@ pub struct PyInsight {
     /// Magnitude-accuracy score in [0,1] (None until scored). Mirrors C# Score.Magnitude.
     pub score_magnitude: Option<f64>,
     pub is_final_score: bool,
+    pub generated_time_utc: lean_core::DateTime,
+    pub close_time_utc: lean_core::DateTime,
 }
 
 impl PyInsight {
@@ -1648,6 +1763,7 @@ impl PyInsight {
         };
         use rust_decimal::prelude::ToPrimitive;
         Self {
+            id: i.id,
             symbol: i.symbol.clone(),
             direction,
             period_nanos: i.period.nanos,
@@ -1657,6 +1773,8 @@ impl PyInsight {
             score_direction: i.score_direction,
             score_magnitude: i.score_magnitude,
             is_final_score: i.is_final_score,
+            generated_time_utc: i.generated_time_utc,
+            close_time_utc: i.close_time_utc,
         }
     }
 }
@@ -1692,7 +1810,9 @@ impl PyInsight {
             ((days * 86_400.0 + secs + micros / 1_000_000.0) * 1_000_000_000.0) as i64
         };
 
+        let now = DateTime::now();
         Ok(Self {
+            id: 0,
             symbol: lean_symbol,
             direction,
             period_nanos: nanos,
@@ -1702,6 +1822,8 @@ impl PyInsight {
             score_direction: None,
             score_magnitude: None,
             is_final_score: false,
+            generated_time_utc: now,
+            close_time_utc: now + TimeSpan::from_nanos(nanos),
         })
     }
 
@@ -1753,6 +1875,11 @@ impl PyInsight {
     }
 
     #[getter]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[getter]
     pub fn symbol(&self) -> crate::py_types::PySymbol {
         crate::py_types::PySymbol {
             inner: self.symbol.clone(),
@@ -1800,6 +1927,26 @@ impl PyInsight {
     #[getter]
     pub fn is_final_score(&self) -> bool {
         self.is_final_score
+    }
+
+    #[getter]
+    pub fn generated_time_utc(&self) -> PyResult<Py<PyAny>> {
+        crate::py_qc_algorithm::ns_to_py_datetime(self.generated_time_utc.0)
+    }
+
+    #[getter]
+    pub fn close_time_utc(&self) -> PyResult<Py<PyAny>> {
+        crate::py_qc_algorithm::ns_to_py_datetime(self.close_time_utc.0)
+    }
+
+    #[getter]
+    pub fn generated_time_utc_nanos(&self) -> i64 {
+        self.generated_time_utc.0
+    }
+
+    #[getter]
+    pub fn close_time_utc_nanos(&self) -> i64 {
+        self.close_time_utc.0
     }
 
     /// Forward LEAN PascalCase attribute access to snake_case equivalents.
@@ -2085,6 +2232,7 @@ impl IPortfolioConstructionModel for PyPcmAdapter {
                         PcmDir::Flat => PyInsightDirection::Flat,
                     };
                     let pi = PyInsight {
+                        id: 0,
                         symbol: i.symbol.clone(),
                         direction,
                         period_nanos: 86_400 * 1_000_000_000,
@@ -2094,6 +2242,8 @@ impl IPortfolioConstructionModel for PyPcmAdapter {
                         score_direction: None,
                         score_magnitude: None,
                         is_final_score: false,
+                        generated_time_utc: DateTime::now(),
+                        close_time_utc: DateTime::now() + TimeSpan::ONE_DAY,
                     };
                     Py::new(py, pi)
                         .map(|p| p.into_any())
@@ -2297,6 +2447,18 @@ mod tests {
         }
     }
 
+    struct SilentAlpha;
+
+    impl IAlphaModel for SilentAlpha {
+        fn update(
+            &mut self,
+            _slice: &lean_data::Slice,
+            _securities: &[Symbol],
+        ) -> Vec<lean_alpha::Insight> {
+            Vec::new()
+        }
+    }
+
     struct CountingPcm {
         symbol: Symbol,
         calls: Arc<Mutex<usize>>,
@@ -2343,6 +2505,8 @@ mod tests {
         target_counts: Arc<Mutex<Vec<usize>>>,
     }
 
+    type CapturedExecutionTargets = Arc<Mutex<Vec<(String, Decimal, Option<Decimal>)>>>;
+
     impl IExecutionModel for RecordingExecution {
         fn execute_with_context(
             &mut self,
@@ -2350,6 +2514,62 @@ mod tests {
             _context: &ExecutionContext<'_>,
         ) -> Vec<OrderRequest> {
             self.target_counts.lock().unwrap().push(targets.len());
+            Vec::new()
+        }
+    }
+
+    struct MutatingAlpha {
+        alg_inner: Arc<Mutex<QcAlgorithm>>,
+        symbol: Symbol,
+        emitted: bool,
+    }
+
+    impl IAlphaModel for MutatingAlpha {
+        fn update(
+            &mut self,
+            _slice: &lean_data::Slice,
+            _securities: &[Symbol],
+        ) -> Vec<lean_alpha::Insight> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            {
+                let mut alg = self.alg_inner.lock().unwrap();
+                let symbol = alg.add_equity(&self.symbol.value, Resolution::Minute);
+                alg.securities.update_price(&symbol, dec!(5));
+            }
+            vec![lean_alpha::Insight::new(
+                self.symbol.clone(),
+                AlphaDir::Up,
+                TimeSpan::from_mins(30),
+                None,
+                None,
+                "mutating-alpha",
+            )]
+        }
+    }
+
+    struct CapturingExecution {
+        targets: CapturedExecutionTargets,
+    }
+
+    impl IExecutionModel for CapturingExecution {
+        fn execute_with_context(
+            &mut self,
+            targets: &[ExecutionTarget],
+            context: &ExecutionContext<'_>,
+        ) -> Vec<OrderRequest> {
+            let mut captured = self.targets.lock().unwrap();
+            for target in targets {
+                captured.push((
+                    target.symbol.value.clone(),
+                    target.quantity,
+                    context
+                        .security(&target.symbol)
+                        .map(|security| security.price),
+                ));
+            }
             Vec::new()
         }
     }
@@ -2465,6 +2685,198 @@ mod tests {
 
         assert_eq!(*pcm_calls.lock().unwrap(), 1);
         assert_eq!(execution_target_counts.lock().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn restored_active_insights_drive_first_pcm_rebalance() {
+        let symbol = Symbol::create_equity("RKT", &lean_core::Market::usa());
+        let now = lean_core::DateTime::from_secs(0);
+        let mut insight = lean_alpha::Insight::new(
+            symbol.clone(),
+            AlphaDir::Up,
+            TimeSpan::from_days(1),
+            None,
+            None,
+            "restored-alpha",
+        )
+        .with_generated_time_utc(now);
+        insight.reference_value = Some(dec!(10));
+
+        let pcm_calls = Arc::new(Mutex::new(0usize));
+        let execution_target_counts = Arc::new(Mutex::new(Vec::new()));
+        let mut framework = FrameworkState::new();
+        framework.alpha_models.push(Box::new(SilentAlpha));
+        framework.pcm = Box::new(CountingPcm {
+            symbol: symbol.clone(),
+            calls: pcm_calls.clone(),
+        });
+        framework.exec_model = Box::new(RecordingExecution {
+            target_counts: execution_target_counts.clone(),
+        });
+        framework.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![insight],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            now,
+        );
+
+        let restore_events = framework.take_insight_events();
+        assert_eq!(restore_events.len(), 1);
+        assert_eq!(restore_events[0].kind, InsightEventKind::Restored);
+
+        let securities = vec![symbol.clone()];
+        let prices = HashMap::from([(symbol.value.clone(), dec!(11))]);
+        let security_data =
+            HashMap::from([(symbol.value.clone(), security_data(symbol.clone(), now))]);
+        let open_orders = Vec::new();
+        let slice = lean_data::Slice::new(now);
+        let execution_context =
+            ExecutionContext::new(slice.time, &security_data, &open_orders, dec!(100000));
+
+        framework.run_pipeline(
+            &slice,
+            &securities,
+            dec!(100000),
+            &prices,
+            &empty_risk_context(),
+            &execution_context,
+        );
+
+        assert_eq!(*pcm_calls.lock().unwrap(), 1);
+        assert_eq!(execution_target_counts.lock().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn restored_insights_expire_against_slice_time_not_wall_clock() {
+        let symbol = Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let generated = lean_core::DateTime::from_secs(0);
+        let mut insight = lean_alpha::Insight::new(
+            symbol.clone(),
+            AlphaDir::Up,
+            TimeSpan::from_mins(2),
+            None,
+            None,
+            "restored-alpha",
+        )
+        .with_generated_time_utc(generated);
+        insight.reference_value = Some(dec!(100));
+
+        let pcm_calls = Arc::new(Mutex::new(0usize));
+        let execution_target_counts = Arc::new(Mutex::new(Vec::new()));
+        let mut framework = FrameworkState::new();
+        framework.alpha_models.push(Box::new(SilentAlpha));
+        framework.pcm = Box::new(CountingPcm {
+            symbol: symbol.clone(),
+            calls: pcm_calls.clone(),
+        });
+        framework.exec_model = Box::new(RecordingExecution {
+            target_counts: execution_target_counts.clone(),
+        });
+        framework.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![insight],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            generated + TimeSpan::from_days(1),
+        );
+
+        let restore_events = framework.take_insight_events();
+        assert_eq!(restore_events.len(), 1);
+        assert_eq!(restore_events[0].kind, InsightEventKind::Restored);
+
+        let slice_time = generated + TimeSpan::from_mins(1);
+        let securities = vec![symbol.clone()];
+        let prices = HashMap::from([(symbol.value.clone(), dec!(101))]);
+        let security_data =
+            HashMap::from([(symbol.value.clone(), security_data(symbol, slice_time))]);
+        let open_orders = Vec::new();
+        let slice = lean_data::Slice::new(slice_time);
+        let execution_context =
+            ExecutionContext::new(slice.time, &security_data, &open_orders, dec!(100000));
+
+        framework.run_pipeline(
+            &slice,
+            &securities,
+            dec!(100000),
+            &prices,
+            &empty_risk_context(),
+            &execution_context,
+        );
+
+        assert_eq!(*pcm_calls.lock().unwrap(), 1);
+        assert_eq!(execution_target_counts.lock().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn framework_records_emitted_and_flat_closed_events() {
+        let symbol = Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let mut framework = FrameworkState::new();
+        framework.alpha_models.push(Box::new(OneShotAlpha {
+            symbol: symbol.clone(),
+            emitted: false,
+        }));
+        framework.exec_model = Box::new(RecordingExecution {
+            target_counts: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let securities = vec![symbol.clone()];
+        let prices = HashMap::from([(symbol.value.clone(), dec!(100))]);
+        let security_data = HashMap::from([(
+            symbol.value.clone(),
+            security_data(symbol.clone(), lean_core::DateTime::from_secs(0)),
+        )]);
+        let open_orders = Vec::new();
+        let first_slice = lean_data::Slice::new(lean_core::DateTime::from_secs(0));
+        let first_context =
+            ExecutionContext::new(first_slice.time, &security_data, &open_orders, dec!(100000));
+        framework.run_pipeline(
+            &first_slice,
+            &securities,
+            dec!(100000),
+            &prices,
+            &empty_risk_context(),
+            &first_context,
+        );
+
+        let emitted = framework.take_insight_events();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].kind, InsightEventKind::Emitted);
+
+        let second_slice = lean_data::Slice::new(lean_core::DateTime::from_secs(60));
+        let second_context = ExecutionContext::new(
+            second_slice.time,
+            &security_data,
+            &open_orders,
+            dec!(100000),
+        );
+        let flat = lean_alpha::Insight::new(
+            symbol.clone(),
+            AlphaDir::Flat,
+            TimeSpan::from_mins(1),
+            None,
+            None,
+            "one-shot",
+        )
+        .with_generated_time_utc(second_slice.time);
+        framework.run_pipeline_from_alpha(
+            &second_slice,
+            vec![flat],
+            dec!(100000),
+            &prices,
+            &empty_risk_context(),
+            &second_context,
+        );
+
+        let flat_closed = framework.take_insight_events();
+        assert!(
+            flat_closed
+                .iter()
+                .any(|event| event.kind == InsightEventKind::FlatClosed),
+            "flat insight should close the active source insight"
+        );
     }
 
     #[test]
@@ -2620,6 +3032,32 @@ mod tests {
         run_framework_pipeline(&framework, &algorithm, &slice);
 
         assert_eq!(*seen_price.lock().unwrap(), Some(dec!(50)));
+    }
+
+    #[test]
+    fn framework_pipeline_uses_security_seeded_during_alpha_update() {
+        let symbol = Symbol::create_equity("NIO", &Market::usa());
+        let algorithm = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let captured_targets = Arc::new(Mutex::new(Vec::new()));
+        let mut framework = FrameworkState::new();
+        framework.alpha_models.push(Box::new(MutatingAlpha {
+            alg_inner: algorithm.clone(),
+            symbol: symbol.clone(),
+            emitted: false,
+        }));
+        framework.exec_model = Box::new(CapturingExecution {
+            targets: captured_targets.clone(),
+        });
+        let framework = Arc::new(Mutex::new(framework));
+        let slice = lean_data::Slice::new(lean_core::DateTime::from_secs(0));
+
+        run_framework_pipeline(&framework, &algorithm, &slice);
+
+        let targets = captured_targets.lock().unwrap();
+        assert_eq!(
+            targets.as_slice(),
+            &[("NIO".to_string(), dec!(20000), Some(dec!(5)))]
+        );
     }
 
     #[test]

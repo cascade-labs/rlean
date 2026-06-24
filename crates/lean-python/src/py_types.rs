@@ -1,3 +1,4 @@
+use crate::py_data::PyTradeBar;
 use chrono::{Datelike, NaiveDate, Timelike};
 use lean_algorithm::qc_algorithm::{OptionFilter, QcAlgorithm};
 use lean_core::{
@@ -5,10 +6,61 @@ use lean_core::{
     SymbolOptionsExt,
 };
 use pyo3::prelude::*;
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+fn market_price_from_py(data: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let bar = data.cast::<PyTradeBar>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "Security.SetMarketPrice requires a TradeBar from get_last_known_prices",
+        )
+    })?;
+    Ok(bar.borrow().close)
+}
+
+fn set_algorithm_security_price(
+    algorithm: &Arc<Mutex<QcAlgorithm>>,
+    symbol: &Symbol,
+    price: f64,
+) -> PyResult<bool> {
+    if price <= 0.0 || !price.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Security {} market price must be positive and finite, got {price}",
+            symbol.value
+        )));
+    }
+    let price = Decimal::from_f64(price).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Security {} market price cannot be represented as Decimal: {price}",
+            symbol.value
+        ))
+    })?;
+    let alg = algorithm.lock().unwrap();
+    alg.securities.update_price(symbol, price);
+    alg.portfolio.update_prices(symbol, price);
+    Ok(true)
+}
+
+fn read_algorithm_security_price(
+    algorithm: &Arc<Mutex<QcAlgorithm>>,
+    symbol: &Symbol,
+) -> PyResult<f64> {
+    let alg = algorithm.lock().unwrap();
+    let Some(security) = alg.securities.get(symbol) else {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Security {} is not initialized",
+            symbol.value
+        )));
+    };
+    security.current_price().to_f64().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Security {} price cannot be represented as float",
+            symbol.value
+        ))
+    })
+}
 
 /// Python-visible Resolution enum.
 /// QuantConnect Python uses SCREAMING_SNAKE_CASE; PascalCase remains accepted.
@@ -439,6 +491,16 @@ impl PySecurity {
         self.exchange()
     }
 
+    #[getter]
+    fn price(&self) -> PyResult<f64> {
+        let Some(algorithm) = &self.algorithm else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Security price is only available for initialized algorithm securities",
+            ));
+        };
+        read_algorithm_security_price(algorithm, &self.inner.inner)
+    }
+
     /// LEAN API: ``security.SetDataNormalizationMode(DataNormalizationMode.Adjusted)``
     /// rlean applies Adjusted normalization by default; this is a no-op for API compatibility.
     fn set_data_normalization_mode(&self, _mode: PyDataNormalizationMode) {}
@@ -472,6 +534,22 @@ impl PySecurity {
             .unwrap()
             .register_security_leverage(&self.inner.inner, leverage);
         Ok(())
+    }
+
+    /// LEAN API: ``security.SetMarketPrice(data)``.
+    fn set_market_price(&self, data: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Some(algorithm) = &self.algorithm else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Security.SetMarketPrice requires an initialized algorithm security",
+            ));
+        };
+        let price = market_price_from_py(data)?;
+        set_algorithm_security_price(algorithm, &self.inner.inner, price)
+    }
+
+    #[pyo3(name = "SetMarketPrice")]
+    fn set_market_price_pascal(&self, data: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.set_market_price(data)
     }
 
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
@@ -571,8 +649,6 @@ impl PyOptionSecurity {
 #[pyclass(name = "Security", frozen)]
 #[derive(Clone)]
 pub struct PySecurityEntry {
-    #[pyo3(get)]
-    pub price: f64,
     symbol_inner: PySymbol,
     algorithm: Arc<Mutex<QcAlgorithm>>,
 }
@@ -597,6 +673,11 @@ impl PySecurityEntry {
     }
 
     #[getter]
+    fn price(&self) -> PyResult<f64> {
+        read_algorithm_security_price(&self.algorithm, &self.symbol_inner.inner)
+    }
+
+    #[getter]
     fn leverage(&self) -> PyResult<f64> {
         let alg = self.algorithm.lock().unwrap();
         let Some(security) = alg.securities.get(&self.symbol_inner.inner) else {
@@ -615,6 +696,16 @@ impl PySecurityEntry {
             .register_security_leverage(&self.symbol_inner.inner, leverage);
     }
 
+    fn set_market_price(&self, data: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let price = market_price_from_py(data)?;
+        set_algorithm_security_price(&self.algorithm, &self.symbol_inner.inner, price)
+    }
+
+    #[pyo3(name = "SetMarketPrice")]
+    fn set_market_price_pascal(&self, data: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.set_market_price(data)
+    }
+
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let snake = crate::py_qc_algorithm::pascal_to_snake(name);
         if snake != name {
@@ -628,10 +719,16 @@ impl PySecurityEntry {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "Security('{}', price={:.2})",
-            self.symbol_inner.inner.value, self.price
-        )
+        match self.price() {
+            Ok(price) => format!(
+                "Security('{}', price={:.2})",
+                self.symbol_inner.inner.value, price
+            ),
+            Err(_) => format!(
+                "Security('{}', price=<unavailable>)",
+                self.symbol_inner.inner.value
+            ),
+        }
     }
 }
 
@@ -697,13 +794,8 @@ impl PySecurityManager {
         PySecurityManager { entries }
     }
 
-    pub fn build_entry(
-        symbol: Symbol,
-        price: f64,
-        algorithm: Arc<Mutex<QcAlgorithm>>,
-    ) -> PySecurityEntry {
+    pub fn build_entry(symbol: Symbol, algorithm: Arc<Mutex<QcAlgorithm>>) -> PySecurityEntry {
         PySecurityEntry {
-            price,
             symbol_inner: PySymbol { inner: symbol },
             algorithm,
         }
@@ -823,7 +915,8 @@ pub enum PyMovingAverageType {
 mod tests {
     use super::*;
     use crate::py_qc_algorithm::pascal_to_snake;
-    use lean_core::{Market, Symbol};
+    use lean_core::{Market, Resolution, Symbol};
+    use rust_decimal_macros::dec;
 
     fn make_spy_symbol() -> PySymbol {
         PySymbol {
@@ -909,6 +1002,72 @@ mod tests {
             .unwrap();
             assert_eq!(symbol.value(), "SPX250117P04500000");
             assert_eq!(symbol.inner.security_type(), SecurityType::IndexOption);
+        });
+    }
+
+    #[test]
+    fn security_wrappers_read_live_algorithm_price() {
+        let algorithm = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let symbol = algorithm
+            .lock()
+            .unwrap()
+            .add_equity("JOBY", Resolution::Minute);
+        let py_symbol = PySymbol {
+            inner: symbol.clone(),
+        };
+        let security = PySecurity::from_algorithm_symbol(py_symbol.clone(), algorithm.clone());
+        let manager_entry = PySecurityManager::build_entry(symbol.clone(), algorithm.clone());
+
+        assert_eq!(security.price().unwrap(), 0.0);
+        assert_eq!(manager_entry.price().unwrap(), 0.0);
+
+        algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .update_price(&symbol, dec!(12.5));
+
+        assert_eq!(security.price().unwrap(), 12.5);
+        assert_eq!(manager_entry.price().unwrap(), 12.5);
+
+        algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .update_price(&symbol, dec!(13.75));
+
+        assert_eq!(security.price().unwrap(), 13.75);
+        assert_eq!(manager_entry.price().unwrap(), 13.75);
+    }
+
+    #[test]
+    fn set_algorithm_security_price_rejects_non_positive_price() {
+        let algorithm = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let symbol = algorithm
+            .lock()
+            .unwrap()
+            .add_equity("JOBY", Resolution::Minute);
+
+        assert!(set_algorithm_security_price(&algorithm, &symbol, 0.0).is_err());
+        assert!(set_algorithm_security_price(&algorithm, &symbol, f64::NAN).is_err());
+        assert_eq!(
+            algorithm
+                .lock()
+                .unwrap()
+                .securities
+                .get(&symbol)
+                .unwrap()
+                .current_price(),
+            dec!(0)
+        );
+    }
+
+    #[test]
+    fn market_price_from_py_rejects_numeric_seed() {
+        Python::initialize();
+        Python::attach(|py| {
+            let value = 12.5f64.into_pyobject(py).unwrap().into_any();
+            assert!(market_price_from_py(value.as_any()).is_err());
         });
     }
 }

@@ -1,6 +1,7 @@
 use crate::insight::Insight;
 use lean_core::{DateTime, Symbol};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Max number of closed (scored) insights retained for `get_insights` history.
@@ -18,6 +19,18 @@ pub struct InsightCollection {
     /// Closed insights retained with their final scores (FIFO-pruned history).
     closed: Vec<Insight>,
     total_count: usize,
+}
+
+/// Stable serializable representation of an [`InsightCollection`].
+///
+/// The collection keeps its runtime index private so active-insight ordering
+/// stays deterministic, while live runners can still persist and hydrate the
+/// framework's alpha state across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsightCollectionSnapshot {
+    pub active: Vec<Insight>,
+    pub closed: Vec<Insight>,
+    pub total_count: usize,
 }
 
 impl InsightCollection {
@@ -51,6 +64,38 @@ impl InsightCollection {
         let mut out: Vec<Insight> = self.insights.values().flatten().cloned().collect();
         out.extend(self.closed.iter().cloned());
         out
+    }
+
+    pub fn closed_insights(&self) -> Vec<Insight> {
+        self.closed.clone()
+    }
+
+    pub fn snapshot(&self) -> InsightCollectionSnapshot {
+        InsightCollectionSnapshot {
+            active: self.insights.values().flatten().cloned().collect(),
+            closed: self.closed.clone(),
+            total_count: self.total_count,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: InsightCollectionSnapshot) -> Self {
+        let mut insights: BTreeMap<u64, Vec<Insight>> = BTreeMap::new();
+        for insight in snapshot.active {
+            insights
+                .entry(insight.symbol.id.sid)
+                .or_default()
+                .push(insight);
+        }
+        let mut closed = snapshot.closed;
+        if closed.len() > MAX_CLOSED_HISTORY {
+            let overflow = closed.len() - MAX_CLOSED_HISTORY;
+            closed.drain(0..overflow);
+        }
+        Self {
+            insights,
+            closed,
+            total_count: snapshot.total_count,
+        }
     }
 
     pub fn add(&mut self, insight: Insight) {
@@ -186,12 +231,25 @@ impl InsightCollection {
         expired
     }
 
+    /// Remove all insights for the given symbols (e.g. universe removal, risk cancellation),
+    /// finalizing each and retaining it in the scored-history `closed` set so it is still
+    /// available for analytics — same finalize+retain contract as `remove_expired`, so insights
+    /// cut short by a security leaving the universe are not silently dropped from per-alpha IC.
+    /// The caller is responsible for passing the returned insights to the analytics tracker.
     pub fn clear_symbols(&mut self, symbols: &[Symbol]) -> Vec<Insight> {
         let mut removed = Vec::new();
         for symbol in symbols {
             if let Some(mut insights) = self.insights.remove(&symbol.id.sid) {
+                for insight in insights.iter_mut() {
+                    insight.finalize_score();
+                    self.closed.push(insight.clone());
+                }
                 removed.append(&mut insights);
             }
+        }
+        if self.closed.len() > MAX_CLOSED_HISTORY {
+            let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
+            self.closed.drain(0..overflow);
         }
         removed
     }

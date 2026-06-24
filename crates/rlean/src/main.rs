@@ -35,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 use lean_algorithm::qc_algorithm::BrokerageName;
 use lean_data::IHistoricalDataProvider;
 use lean_data_providers::IHistoryProvider;
+use lean_storage::{DataStore, S3StoreConfig};
 
 mod config;
 mod config_cmd;
@@ -63,6 +64,12 @@ type ProviderPair = (
     Option<Arc<dyn IHistoryProvider>>,
 );
 
+#[derive(Clone)]
+struct ResolvedDataStore {
+    store: DataStore,
+    data_root: PathBuf,
+}
+
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -85,7 +92,7 @@ enum Command {
     #[command(name = "create-project")]
     CreateProject(CreateProjectArgs),
 
-    /// Get, set, or list configuration values (API keys, language, data-folder)
+    /// Get, set, or list configuration values (API keys, language, datastore, data-folder)
     Config(ConfigArgs),
 
     /// Manage rlean plugins (brokerages, data providers, AI skills, custom data)
@@ -422,6 +429,89 @@ fn project_parameter_value_to_string(value: serde_json::Value) -> Result<String>
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
 
+fn resolve_datastore_for_data_root(
+    data_folder: &Path,
+    global_config: &config::GlobalConfig,
+) -> Result<ResolvedDataStore> {
+    match global_config.datastore.as_str() {
+        "file" => Ok(ResolvedDataStore {
+            store: DataStore::local(data_folder),
+            data_root: data_folder.to_path_buf(),
+        }),
+        "s3" => {
+            if data_folder.is_absolute() {
+                bail!(
+                    "S3 datastore requires data-folder to be a relative bucket path, got {}",
+                    data_folder.display()
+                );
+            }
+            let bucket = required_s3_config(global_config.s3_bucket.as_deref(), "s3_bucket")?;
+            let prefix = data_folder.to_string_lossy().trim_matches('/').to_string();
+            let home =
+                std::env::var("HOME").context("HOME is not set; cannot build S3 cache path")?;
+            let mut local_cache_root = PathBuf::from(home)
+                .join(".rlean")
+                .join("cache")
+                .join("s3")
+                .join(sanitize_cache_component(bucket));
+            if !prefix.is_empty() {
+                local_cache_root = local_cache_root.join(sanitize_cache_component(&prefix));
+            }
+
+            let store = DataStore::s3(S3StoreConfig {
+                access_key: required_s3_config(
+                    global_config.s3_access_key.as_deref(),
+                    "s3_access_key",
+                )?
+                .to_string(),
+                secret_key: required_s3_config(
+                    global_config.s3_secret_key.as_deref(),
+                    "s3_secret_key",
+                )?
+                .to_string(),
+                bucket: bucket.to_string(),
+                endpoint: required_s3_config(global_config.s3_endpoint.as_deref(), "s3_endpoint")?
+                    .to_string(),
+                region: required_s3_config(global_config.s3_region.as_deref(), "s3_region")?
+                    .to_string(),
+                prefix,
+                local_cache_root: local_cache_root.clone(),
+            })?;
+
+            Ok(ResolvedDataStore {
+                store,
+                data_root: local_cache_root,
+            })
+        }
+        other => bail!("unsupported datastore '{other}', expected 'file' or 's3'"),
+    }
+}
+
+fn required_s3_config<'a>(value: Option<&'a str>, key: &str) -> Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("datastore=s3 requires `{key}` in ~/.rlean/config"))
+}
+
+fn sanitize_cache_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
 async fn run_backtest(mut args: RunArgs) -> Result<()> {
     // If the user passed a directory, look for main.py inside it.
     if args.strategy.is_dir() {
@@ -442,11 +532,16 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
     // Apply configured data-folder when --data was not explicitly provided.
     // Workspace rlean.json takes precedence over ~/.rlean/config, and relative
     // workspace paths are resolved from the directory containing rlean.json.
+    let global_config = config::GlobalConfig::load()?;
     if args.data == std::path::Path::new("data") {
-        if let Some(folder) = config::configured_data_folder(&args.strategy)? {
+        if let Some(folder) =
+            config::configured_data_folder_for_datastore(&args.strategy, &global_config.datastore)?
+        {
             args.data = folder;
         }
     }
+    let datastore = resolve_datastore_for_data_root(&args.data, &global_config)?;
+    args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
 
     let (historical_provider, history_provider) = build_providers(&args)?;
@@ -458,7 +553,7 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
         .unwrap_or("");
 
     match ext {
-        "py" => run_python_backtest(args, historical_provider, history_provider).await,
+        "py" => run_python_backtest(args, historical_provider, history_provider, datastore).await,
         "so" | "dylib" => run_rust_plugin_backtest(args),
         other => bail!(
             "Unknown strategy extension '.{}'. Expected .py, .so, or .dylib",
@@ -471,6 +566,7 @@ async fn run_python_backtest(
     args: RunArgs,
     historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
     history_provider: Option<Arc<dyn IHistoryProvider>>,
+    datastore: ResolvedDataStore,
 ) -> Result<()> {
     use lean_python::report::{
         write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
@@ -533,7 +629,8 @@ async fn run_python_backtest(
     let custom_data_sources = crate::providers::load_custom_data_plugins(&args.data);
 
     let config = RunConfig {
-        data_root: args.data.clone(),
+        data_root: datastore.data_root.clone(),
+        datastore: datastore.store,
         _compression_level: 3,
         historical_provider,
         history_provider,
@@ -696,11 +793,16 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
+    let global_config = config::GlobalConfig::load()?;
     if args.data == std::path::Path::new("data") {
-        if let Some(folder) = config::configured_data_folder(&args.strategy)? {
+        if let Some(folder) =
+            config::configured_data_folder_for_datastore(&args.strategy, &global_config.datastore)?
+        {
             args.data = folder;
         }
     }
+    let datastore = resolve_datastore_for_data_root(&args.data, &global_config)?;
+    args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
 
     let live_provider_names = args
@@ -775,7 +877,8 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let result = lean_python::runner::run_live_strategy(
         &args.strategy,
         lean_python::runner::LiveRunConfig {
-            data_root: args.data.clone(),
+            data_root: datastore.data_root.clone(),
+            datastore: datastore.store,
             history_provider,
             parameters,
             custom_data_sources,
@@ -854,13 +957,19 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
     }
     validate_strategy_path(&run_args.strategy)?;
 
+    let global_config = config::GlobalConfig::load()?;
     if run_args.data == std::path::Path::new("data") {
-        if let Some(folder) = config::configured_data_folder(&run_args.strategy)? {
+        if let Some(folder) = config::configured_data_folder_for_datastore(
+            &run_args.strategy,
+            &global_config.datastore,
+        )? {
             run_args.data = folder;
         }
     }
-    if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
-        run_args.data = canonical;
+    if global_config.datastore != "s3" {
+        if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
+            run_args.data = canonical;
+        }
     }
     let requested_brokerage = run_args
         .brokerage
@@ -950,15 +1059,14 @@ fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .context("failed to launch detached live deployment")?;
 
     write_pid_file(&deployment_dir, child.id())?;
-    if let Ok(mut metadata) = read_live_deployment_metadata(&deployment_dir) {
-        if !is_terminal_live_status(&metadata.status) {
-            metadata.pid = Some(child.id());
-            metadata.status = "running".to_string();
-            metadata.updated_at = chrono::Utc::now().to_rfc3339();
-            write_live_deployment_metadata(&deployment_dir, &metadata)?;
-        }
-    }
+    mark_live_deployment_running(&deployment_dir, &initial_metadata, child.id())?;
     register_live_deployment(&deployment_dir);
+    confirm_live_deployment_started(
+        &deployment_dir,
+        child.id(),
+        &log_path,
+        Duration::from_secs(2),
+    )?;
 
     println!(
         "Live deployment started: deploy_id={} pid={} dir={} log={}",
@@ -1133,14 +1241,10 @@ fn resume_live_deployment(deploy_id: &str) -> Result<()> {
         .spawn()
         .context("failed to resume live deployment")?;
     write_pid_file(&dir, child.id())?;
-    metadata.pid = Some(child.id());
-    metadata.status = "running".to_string();
-    metadata.stopped = None;
-    metadata.updated_at = chrono::Utc::now().to_rfc3339();
-    metadata.error = None;
-    metadata.exit_code = None;
-    write_live_deployment_metadata(&dir, &metadata)?;
+    mark_live_deployment_running(&dir, &metadata, child.id())?;
     register_live_deployment(&dir);
+    metadata =
+        confirm_live_deployment_started(&dir, child.id(), &log_path, Duration::from_secs(2))?;
 
     println!(
         "Live deployment resumed: deploy_id={} pid={} dir={} log={}",
@@ -1431,6 +1535,78 @@ fn read_live_deployment_metadata(dir: &Path) -> Result<LiveDeploymentMetadata> {
 fn write_pid_file(dir: &Path, pid: u32) -> Result<()> {
     std::fs::write(dir.join("pid"), format!("{pid}\n"))?;
     Ok(())
+}
+
+fn mark_live_deployment_running(
+    dir: &Path,
+    fallback: &LiveDeploymentMetadata,
+    pid: u32,
+) -> Result<LiveDeploymentMetadata> {
+    let mut metadata = read_live_deployment_metadata(dir).unwrap_or_else(|_| fallback.clone());
+    if is_terminal_live_status(&metadata.status) && metadata.pid == Some(pid) {
+        return Ok(metadata);
+    }
+
+    metadata.pid = Some(pid);
+    metadata.status = "running".to_string();
+    metadata.stopped = None;
+    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    metadata.error = None;
+    metadata.exit_code = None;
+    write_live_deployment_metadata(dir, &metadata)?;
+    Ok(metadata)
+}
+
+fn confirm_live_deployment_started(
+    dir: &Path,
+    pid: u32,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<LiveDeploymentMetadata> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let metadata = match read_live_deployment_metadata(dir) {
+            Ok(metadata) => normalize_live_deployment_metadata(dir, metadata),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if running_live_pid(&metadata) == Some(pid) {
+            return Ok(metadata);
+        }
+
+        if is_terminal_live_status(&metadata.status) || !process_is_alive(pid) {
+            bail!(
+                "live deployment {} exited during startup; status={}{}{}; log={}",
+                metadata.deploy_id,
+                metadata.status,
+                metadata
+                    .exit_code
+                    .map(|code| format!(" exit_code={code}"))
+                    .unwrap_or_default(),
+                metadata
+                    .error
+                    .as_ref()
+                    .map(|error| format!(" error={error}"))
+                    .unwrap_or_default(),
+                log_path.display()
+            );
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "live deployment {} did not report running within {}s; pid={pid} log={}",
+                metadata.deploy_id,
+                timeout.as_secs(),
+                log_path.display()
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn update_live_deployment_status(
@@ -2286,6 +2462,61 @@ mod tests {
 
         assert_eq!(command[5], "/tmp/deploy/code/main.py");
         assert_eq!(command[7], "/tmp/data");
+    }
+
+    #[test]
+    fn test_mark_live_deployment_running_preserves_terminal_child_status() {
+        let root = std::env::temp_dir().join(format!(
+            "rlean-live-terminal-status-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let stale = LiveDeploymentMetadata {
+            deploy_id: "deploy-1".to_string(),
+            strategy: PathBuf::from("/tmp/source/main.py"),
+            strategy_name: "source".to_string(),
+            deployment_dir: root.clone(),
+            pid: None,
+            status: "paused".to_string(),
+            launched: "2026-06-22T00:00:00Z".to_string(),
+            stopped: Some("2026-06-22T00:01:00Z".to_string()),
+            updated_at: "2026-06-22T00:01:00Z".to_string(),
+            brokerage: Some("paper".to_string()),
+            data_provider_live: Some("tradier".to_string()),
+            data_provider_historical: None,
+            data: PathBuf::from("/tmp/data"),
+            paper_trading: true,
+            command: vec![
+                "/usr/local/bin/rlean".to_string(),
+                "live".to_string(),
+                "--foreground".to_string(),
+                "--live-deploy-dir".to_string(),
+                root.to_string_lossy().to_string(),
+                "/tmp/source/main.py".to_string(),
+            ],
+            error: None,
+            exit_code: None,
+        };
+        let mut terminal = stale.clone();
+        terminal.pid = Some(42);
+        terminal.status = "runtime-error".to_string();
+        terminal.stopped = Some("2026-06-22T00:02:00Z".to_string());
+        terminal.updated_at = "2026-06-22T00:02:00Z".to_string();
+        terminal.error = Some("boom".to_string());
+        terminal.exit_code = Some(1);
+        write_live_deployment_metadata(&root, &terminal).unwrap();
+
+        let result = mark_live_deployment_running(&root, &stale, 42).unwrap();
+        let persisted = read_live_deployment_metadata(&root).unwrap();
+
+        assert_eq!(result.status, "runtime-error");
+        assert_eq!(persisted.status, "runtime-error");
+        assert_eq!(persisted.pid, Some(42));
+        assert_eq!(persisted.error.as_deref(), Some("boom"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -67,10 +67,22 @@ impl OptionChain {
         )
     }
 
-    /// All contracts sorted by expiry, then strike.
+    /// All contracts in a canonical, deterministic order: expiry, then strike,
+    /// then right (Call before Put).
+    ///
+    /// `contracts` is a `HashMap`, whose `.values()` iteration order is randomized
+    /// per process. Any consumer that exposes contracts in iteration order (e.g.
+    /// the Python chain accessors) MUST go through this so backtests are
+    /// reproducible — otherwise a strategy that stably tie-breaks at the money
+    /// (call vs put at the same strike) picks different contracts each run.
     pub fn sorted(&self) -> Vec<&OptionContract> {
         let mut v: Vec<&OptionContract> = self.contracts.values().collect();
-        v.sort_by(|a, b| a.expiry.cmp(&b.expiry).then(a.strike.cmp(&b.strike)));
+        v.sort_by(|a, b| {
+            a.expiry
+                .cmp(&b.expiry)
+                .then(a.strike.cmp(&b.strike))
+                .then(a.right.cmp(&b.right))
+        });
         v
     }
 }

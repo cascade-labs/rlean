@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod convert;
+pub mod datastore;
 pub mod map_file_resolver;
 pub mod path_resolver;
 pub mod predicate;
@@ -8,6 +9,7 @@ pub mod schema;
 pub mod writer;
 
 pub use cache::DataCache;
+pub use datastore::{DataStore, S3StoreConfig};
 pub use map_file_resolver::{MapFile, MapFileResolver};
 pub use path_resolver::{
     custom_data_history_path, custom_data_path, factor_file_path, map_file_path, PathResolver,

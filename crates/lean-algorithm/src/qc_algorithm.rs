@@ -144,6 +144,7 @@ pub struct QcAlgorithm {
     pub warmup_period: Option<TimeSpan>,
     pub warmup_bar_count: Option<usize>,
     pub warmup_duration: Option<TimeSpan>,
+    pub warmup_resolution: Option<Resolution>,
     pub is_warming_up: bool,
 
     // Order counter
@@ -191,6 +192,7 @@ impl QcAlgorithm {
             warmup_period: None,
             warmup_bar_count: None,
             warmup_duration: None,
+            warmup_resolution: None,
             is_warming_up: false,
             order_id_counter: 0,
             option_subscriptions: Vec::new(),
@@ -296,10 +298,14 @@ impl QcAlgorithm {
 
     pub fn set_cash(&self, amount: Price) {
         *self.portfolio.cash.write() = amount;
+        self.portfolio.set_starting_cash(amount);
     }
 
     pub fn set_warmup(&mut self, period: TimeSpan) {
         self.warmup_period = Some(period);
+        self.warmup_bar_count = None;
+        self.warmup_duration = None;
+        self.warmup_resolution = None;
     }
 
     pub fn set_warmup_periods(&mut self, periods: i64, resolution: Resolution) {
@@ -308,26 +314,53 @@ impl QcAlgorithm {
             .unwrap_or(TimeSpan::ONE_DAY.nanos as u64) as i64
             * periods;
         self.warmup_period = Some(TimeSpan::from_nanos(nanos));
+        self.warmup_bar_count = None;
+        self.warmup_duration = None;
+        self.warmup_resolution = Some(resolution);
     }
 
     /// Set warm-up by number of bars. During warm-up `on_data` is called but
     /// orders are not processed and equity is not recorded.
     pub fn set_warm_up_bars(&mut self, bar_count: usize) {
+        self.set_warm_up_bars_with_resolution(bar_count, None);
+    }
+
+    pub fn set_warm_up_bars_with_resolution(
+        &mut self,
+        bar_count: usize,
+        resolution: Option<Resolution>,
+    ) {
+        self.warmup_period = None;
         self.warmup_bar_count = Some(bar_count);
+        self.warmup_duration = None;
+        self.warmup_resolution = resolution;
         self.is_warming_up = true;
     }
 
     /// Set warm-up by time period.
     pub fn set_warm_up(&mut self, duration: TimeSpan) {
+        self.set_warm_up_with_resolution(duration, None);
+    }
+
+    pub fn set_warm_up_with_resolution(
+        &mut self,
+        duration: TimeSpan,
+        resolution: Option<Resolution>,
+    ) {
+        self.warmup_period = None;
+        self.warmup_bar_count = None;
         self.warmup_duration = Some(duration);
+        self.warmup_resolution = resolution;
         self.is_warming_up = true;
     }
 
     /// Called by the engine when warm-up data has been fully replayed.
     pub fn end_warm_up(&mut self) {
         self.is_warming_up = false;
+        self.warmup_period = None;
         self.warmup_bar_count = None;
         self.warmup_duration = None;
+        self.warmup_resolution = None;
     }
 
     // ─── Universe Management ─────────────────────────────────────────────────
@@ -1765,6 +1798,23 @@ mod tests {
         let fee = alg.order_fee(&order, dec!(42.48));
 
         assert_eq!(fee.amount, dec!(0));
+    }
+
+    #[test]
+    fn warmup_resolution_is_stored_and_cleared_with_warmup_state() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+
+        alg.set_warm_up_bars_with_resolution(200, Some(Resolution::Daily));
+
+        assert_eq!(alg.warmup_bar_count, Some(200));
+        assert_eq!(alg.warmup_resolution, Some(Resolution::Daily));
+        assert!(alg.is_warming_up);
+
+        alg.end_warm_up();
+
+        assert_eq!(alg.warmup_bar_count, None);
+        assert_eq!(alg.warmup_resolution, None);
+        assert!(!alg.is_warming_up);
     }
 
     #[test]

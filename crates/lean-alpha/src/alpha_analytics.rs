@@ -78,10 +78,19 @@ pub struct AlphaCorrelationMatrix {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlphaRanking {
     pub name: String,
+    /// Which skill metric `mean_ic`/`t_stat` represent for THIS alpha:
+    /// "rank_ic" for scored cross-sectional alphas (multi-name periods → Spearman IC),
+    /// "mean_return" for directional/low-breadth alphas (single-name, constant-signal →
+    /// IC is undefined, so the per-period realized forward return is used instead).
+    pub metric: String,
+    /// Mean of the per-period skill series — a Spearman IC ("rank_ic") or the mean realized
+    /// forward return ("mean_return"), per `metric`.
     pub mean_ic: f64,
     pub ic_ir: f64,
     pub t_stat: f64,
     pub hit_rate: f64,
+    /// Skew of the per-period skill series (color; >0 = fat right tail, e.g. lottery payoffs).
+    pub skew: f64,
     pub n_periods: usize,
     /// Gate 1 — Grinold-Kahn partial IC: mean IC orthogonalized against the kept set
     /// via the signal-correlation matrix (the additive-information upper bound).
@@ -131,6 +140,12 @@ pub struct AlphaPerformanceTracker {
 impl AlphaPerformanceTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_closed_insights(insights: &[Insight]) -> Self {
+        let mut tracker = Self::new();
+        tracker.record_expired(insights);
+        tracker
     }
 
     /// Record expired (closed) insights as (signal, forward-return) observations.
@@ -193,16 +208,23 @@ impl AlphaPerformanceTracker {
         let mut names: Vec<String> = self.by_model.keys().cloned().collect();
         names.sort();
 
-        // Per-alpha period ICs → rolling series + summary stats.
+        // Per-alpha skill series → rolling series + summary stats. Each alpha is scored on the
+        // metric appropriate to its breadth: Spearman rank IC for scored cross-sectional alphas,
+        // mean realized return for directional/low-breadth (single-name, constant-signal) alphas
+        // where IC is undefined. Downstream gates are unchanged — they read the per-alpha mean +
+        // t-stat and the cross-alpha signal-correlation matrix, both of which exist either way.
         let mut ic_series = Vec::new();
         let mut stats: HashMap<String, Summary> = HashMap::new();
+        let mut metric: HashMap<String, MetricKind> = HashMap::new();
         for name in &names {
-            let ics = period_ics(&self.by_model[name]);
-            stats.insert(name.clone(), summarize(&ics));
-            if !ics.is_empty() {
+            let kind = classify(&self.by_model[name]);
+            metric.insert(name.clone(), kind);
+            let scores = period_scores(&self.by_model[name], kind);
+            stats.insert(name.clone(), summarize(&scores));
+            if !scores.is_empty() {
                 ic_series.push(AlphaIcSeries {
                     name: name.clone(),
-                    points: rolling(&ics, ROLLING_WINDOW),
+                    points: rolling(&scores, ROLLING_WINDOW),
                 });
             }
         }
@@ -264,6 +286,12 @@ impl AlphaPerformanceTracker {
         let mut decision: HashMap<String, (bool, f64, f64, String)> = HashMap::new();
         for name in eligible {
             let s = &stats[name];
+            // What the alpha's mean/t-stat represent ("rank_ic" or "mean_return"), for messages.
+            let lbl = metric
+                .get(name)
+                .copied()
+                .unwrap_or(MetricKind::RankIc)
+                .label();
 
             // 1. FLOOR — reject noise: must be predictive, economically non-negligible,
             //    and clear a minimum confidence bar. Independence cannot rescue an
@@ -276,7 +304,7 @@ impl AlphaPerformanceTracker {
                         false,
                         0.0,
                         0.0,
-                        format!("dilutive — mean IC {:+.3} ≤ 0 (not predictive)", s.mean),
+                        format!("dilutive — {lbl} {:+.3} ≤ 0 (not predictive)", s.mean),
                     ),
                 );
                 continue;
@@ -288,7 +316,7 @@ impl AlphaPerformanceTracker {
                         false,
                         0.0,
                         0.0,
-                        format!("dilutive — mean IC {:.3} below floor {:.3}", s.mean, MIN_IC),
+                        format!("dilutive — {lbl} {:.3} below floor {:.3}", s.mean, MIN_IC),
                     ),
                 );
                 continue;
@@ -320,7 +348,7 @@ impl AlphaPerformanceTracker {
                         s.mean,
                         s.mean,
                         format!(
-                            "KEEP — anchor (IC {:.3}, t {:.2}), highest |IC|",
+                            "KEEP — anchor ({lbl} {:.3}, t {:.2}), highest |{lbl}|",
                             s.mean, s.t_stat
                         ),
                     ),
@@ -442,10 +470,17 @@ impl AlphaPerformanceTracker {
                     });
                 AlphaRanking {
                     name: name.clone(),
+                    metric: metric
+                        .get(name)
+                        .copied()
+                        .unwrap_or(MetricKind::RankIc)
+                        .label()
+                        .to_string(),
                     mean_ic: s.mean,
                     ic_ir: s.ir,
                     t_stat: s.t_stat,
                     hit_rate: s.hit_rate,
+                    skew: s.skew,
                     n_periods: s.n,
                     partial_ic,
                     marginal_contribution,
@@ -484,11 +519,58 @@ struct Summary {
     ir: f64,
     t_stat: f64,
     hit_rate: f64,
+    skew: f64,
     n: usize,
 }
 
-/// Cross-sectional Spearman rank IC per emission period, sorted chronologically.
-fn period_ics(obs: &[Observation]) -> Vec<(String, f64)> {
+/// Which per-period skill metric an alpha is scored on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MetricKind {
+    /// Scored cross-sectional alpha: Spearman rank IC per multi-name period.
+    RankIc,
+    /// Directional/low-breadth alpha (single-name periods and/or constant signal): IC is
+    /// undefined (no cross-section / no forecast variance), so each period is scored by its
+    /// realized forward return — mean return + t-stat is the correct edge measure.
+    MeanReturn,
+}
+
+impl MetricKind {
+    fn label(self) -> &'static str {
+        match self {
+            MetricKind::RankIc => "rank_ic",
+            MetricKind::MeanReturn => "mean_return",
+        }
+    }
+}
+
+/// Classify an alpha by whether a cross-sectional IC is even computable: it needs at least a
+/// couple of multi-name periods (a cross-section to correlate) AND signal variance (a forecast
+/// that varies across names). A binary long-only selector emitting one name per period with a
+/// constant signal (e.g. the sweep monolith) satisfies neither → score it by realized return.
+fn classify(obs: &[Observation]) -> MetricKind {
+    let mut card: BTreeMap<i64, usize> = BTreeMap::new();
+    for o in obs {
+        *card.entry(o.period).or_default() += 1;
+    }
+    let multi_name_periods = card.values().filter(|&&c| c >= 2).count();
+    let sigs: Vec<f64> = obs.iter().map(|o| o.signal).collect();
+    let sig_mean = sigs.iter().sum::<f64>() / sigs.len().max(1) as f64;
+    let sig_var =
+        sigs.iter().map(|s| (s - sig_mean).powi(2)).sum::<f64>() / sigs.len().max(1) as f64;
+    if multi_name_periods < 2 || sig_var <= 1e-12 {
+        MetricKind::MeanReturn
+    } else {
+        MetricKind::RankIc
+    }
+}
+
+/// Per-period skill series, sorted chronologically. The metric depends on the alpha type:
+/// - `RankIc`: cross-sectional Spearman rank IC over each MULTI-name period (single-name periods
+///   carry no cross-section and are skipped — they cannot contribute to a correlation).
+/// - `MeanReturn`: the realized forward return of each period (mean across names if >1). For a
+///   binary single-name selector this is the per-trade return; its mean + t-stat is the edge,
+///   and IC is intentionally NOT computed (it is undefined for a constant, single-name forecast).
+fn period_scores(obs: &[Observation], kind: MetricKind) -> Vec<(String, f64)> {
     let mut groups: BTreeMap<i64, (String, Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for o in obs {
         let e = groups
@@ -499,21 +581,26 @@ fn period_ics(obs: &[Observation]) -> Vec<(String, f64)> {
     }
     let mut out = Vec::new();
     for (_, (date, sig, fwd)) in groups {
-        // Per-period skill, cardinality-agnostic: a single-name call scores by
-        // directional agreement (±1, "did its long/short go the right way");
-        // multi-name periods score by cross-sectional rank IC. Both aggregate
-        // over all the alpha's periods into its IC + t-stat.
-        let ic = if sig.len() == 1 {
-            let agree = sig[0].signum() * fwd[0].signum();
-            if agree == 0.0 {
-                continue;
+        let score = match kind {
+            MetricKind::RankIc => {
+                if sig.len() < 2 {
+                    continue; // no cross-section this period → not an IC observation
+                }
+                spearman(&sig, &fwd)
             }
-            agree
-        } else {
-            spearman(&sig, &fwd)
+            MetricKind::MeanReturn => {
+                // Realized return of the period's bet: sign-aligned mean forward return so a
+                // short insight's profitable down-move counts positively.
+                let n = fwd.len() as f64;
+                fwd.iter()
+                    .zip(&sig)
+                    .map(|(r, s)| if *s < 0.0 { -r } else { *r })
+                    .sum::<f64>()
+                    / n
+            }
         };
-        if ic.is_finite() {
-            out.push((date, ic));
+        if score.is_finite() {
+            out.push((date, score));
         }
     }
     out
@@ -622,6 +709,7 @@ fn summarize(ics: &[(String, f64)]) -> Summary {
             ir: f64::NAN,
             t_stat: f64::NAN,
             hit_rate: f64::NAN,
+            skew: f64::NAN,
             n: 0,
         };
     }
@@ -640,11 +728,23 @@ fn summarize(ics: &[(String, f64)]) -> Summary {
     } else {
         (f64::NAN, f64::NAN)
     };
+    // Population skew of the per-period series (color: >0 = fat right tail / lottery payoffs).
+    let skew = if n >= 2 {
+        let psd = (vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        if psd > 0.0 {
+            vals.iter().map(|v| ((v - mean) / psd).powi(3)).sum::<f64>() / n as f64
+        } else {
+            0.0
+        }
+    } else {
+        f64::NAN
+    };
     Summary {
         mean,
         ir,
         t_stat,
         hit_rate,
+        skew,
         n,
     }
 }

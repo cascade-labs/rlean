@@ -2,6 +2,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,16 +46,17 @@ use lean_orders::{
 };
 use lean_statistics::{PortfolioStatistics, Statistics, Trade, TradeBuilder};
 use lean_storage::{
-    custom_data_history_path, custom_data_path, DataCache, FactorFileEntry, MapFile, MapFileEntry,
-    MapFileResolver, OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver,
-    QueryParams, WriterConfig,
+    custom_data_history_path, custom_data_path, DataCache, DataStore, FactorFileEntry, MapFile,
+    MapFileEntry, MapFileResolver, OptionEodBar, OptionUniverseRow, ParquetReader, ParquetWriter,
+    PathResolver, QueryParams, WriterConfig,
 };
 
 use crate::charting::ChartCollection;
 use crate::py_adapter::{set_algorithm_time, PyAlgorithmAdapter};
 use crate::py_data::SliceProxy;
-use crate::py_framework::run_framework_pipeline;
+use crate::py_framework::{run_framework_pipeline, FrameworkState};
 use crate::py_qc_algorithm::AlgorithmHistoryContext;
+use lean_alpha::InsightCollectionSnapshot;
 use lean_data_providers::{
     DataType, HistoryBatchRequest, IHistoryProvider as SyncHistoryProvider, TickStream,
 };
@@ -63,6 +65,8 @@ const HIGH_RESOLUTION_PREFETCH_CONCURRENCY: usize = 8;
 const SUBSCRIPTION_PREFETCH_CONCURRENCY: usize = 8;
 const OPTION_RUNTIME_PREFETCH_CONCURRENCY: usize = 8;
 const LIVE_SYNCHRONIZER_HEARTBEAT: Duration = Duration::from_secs(1);
+const LIVE_BROKERAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_INSIGHTS_SCHEMA_VERSION: u32 = 1;
 
 type OptionRuntimeInputs = (
     Vec<Symbol>,
@@ -87,6 +91,54 @@ fn resolve_backtest_end_date(
             strategy_end_date.date_utc()
         }
     })
+}
+
+fn lowest_subscription_resolution(
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+) -> Option<Resolution> {
+    subscriptions.iter().map(|sub| sub.resolution).min()
+}
+
+fn warmup_bar_count_start_date(
+    start_date: NaiveDate,
+    bar_count: usize,
+    resolution: Resolution,
+) -> NaiveDate {
+    let calendar_days = match resolution {
+        Resolution::Daily => {
+            // Approximate trading days with a weekend buffer, matching the
+            // previous rlean daily warm-up behavior.
+            (bar_count as i64 * 7 + 4) / 5 + 10
+        }
+        Resolution::Tick => 1,
+        Resolution::Second | Resolution::Minute | Resolution::Hour => {
+            let nanos_per_day = TimeSpan::ONE_DAY.nanos;
+            let nanos = resolution.to_nanos().unwrap_or(0) as i64 * bar_count as i64;
+            ((nanos + nanos_per_day - 1) / nanos_per_day).max(1) + 1
+        }
+    };
+    start_date - chrono::Duration::days(calendar_days)
+}
+
+fn warmup_replay_subscriptions(
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    warmup_resolution: Option<Resolution>,
+) -> Vec<Arc<SubscriptionDataConfig>> {
+    let Some(resolution) = warmup_resolution else {
+        return subscriptions.to_vec();
+    };
+
+    subscriptions
+        .iter()
+        .filter_map(|sub| {
+            let mut config = (**sub).clone();
+            config.resolution = resolution;
+            if config.resolution == Resolution::Daily && config.tick_type == TickType::Quote {
+                return None;
+            }
+            Some(Arc::new(config))
+        })
+        .collect()
 }
 
 struct SubscriptionReconciliation {
@@ -346,26 +398,40 @@ fn drain_local_order_request_event_batches(
 }
 
 struct LiveBrokerageBridge {
-    brokerage: Box<dyn Brokerage>,
+    brokerage: Arc<Mutex<Box<dyn Brokerage>>>,
     submitted_order_ids: HashSet<i64>,
     paper_fills: bool,
+    reconcile_tx: crossbeam_channel::Sender<Vec<OrderEvent>>,
+    reconcile_rx: crossbeam_channel::Receiver<Vec<OrderEvent>>,
+    reconcile_inflight: Arc<AtomicBool>,
+    last_reconcile_started: Option<Instant>,
 }
 
 impl LiveBrokerageBridge {
     fn connect(mut brokerage: Box<dyn Brokerage>, paper_fills: bool) -> Result<Self> {
+        let brokerage_name = brokerage.name().to_string();
         brokerage
             .connect()
-            .with_context(|| format!("failed to connect brokerage {}", brokerage.name()))?;
+            .with_context(|| format!("failed to connect brokerage {}", brokerage_name))?;
         info!(
             "Connected brokerage {} with {} fills",
-            brokerage.name(),
+            brokerage_name,
             if paper_fills { "paper" } else { "brokerage" }
         );
+        let (reconcile_tx, reconcile_rx) = crossbeam_channel::unbounded();
         Ok(Self {
-            brokerage,
+            brokerage: Arc::new(Mutex::new(brokerage)),
             submitted_order_ids: HashSet::new(),
             paper_fills,
+            reconcile_tx,
+            reconcile_rx,
+            reconcile_inflight: Arc::new(AtomicBool::new(false)),
+            last_reconcile_started: None,
         })
+    }
+
+    fn brokerage_name(&self) -> String {
+        self.brokerage.lock().unwrap().name().to_string()
     }
 
     fn submit_new_orders(
@@ -373,7 +439,7 @@ impl LiveBrokerageBridge {
         order_processor: &OrderProcessor,
         time: DateTime,
     ) -> Result<Vec<OrderEvent>> {
-        let brokerage_name = self.brokerage.name().to_string();
+        let brokerage_name = self.brokerage_name();
         let orders = order_processor.transaction_manager.get_open_orders();
         let mut events = Vec::new();
 
@@ -384,6 +450,8 @@ impl LiveBrokerageBridge {
 
             let brokerage_ids = self
                 .brokerage
+                .lock()
+                .unwrap()
                 .place_order_with_brokerage_ids(order.clone())
                 .with_context(|| {
                     format!(
@@ -429,7 +497,7 @@ impl LiveBrokerageBridge {
         order_processor: &OrderProcessor,
         time: DateTime,
     ) -> Result<Vec<OrderEvent>> {
-        let brokerage_name = self.brokerage.name().to_string();
+        let brokerage_name = self.brokerage_name();
         let requests = order_processor.transaction_manager.get_update_requests();
         let mut events = Vec::new();
 
@@ -452,10 +520,11 @@ impl LiveBrokerageBridge {
 
             let needs_broker_update = self.paper_fills || !order.brokerage_id.is_empty();
             let accepted = if needs_broker_update {
-                if !self.brokerage.can_update_order(&order, &request) {
+                let mut brokerage = self.brokerage.lock().unwrap();
+                if !brokerage.can_update_order(&order, &request) {
                     false
                 } else {
-                    self.brokerage.update_order(&order).with_context(|| {
+                    brokerage.update_order(&order).with_context(|| {
                         format!(
                             "brokerage {} failed to update order {} for {}",
                             brokerage_name, order.id, order.symbol
@@ -504,7 +573,7 @@ impl LiveBrokerageBridge {
         order_processor: &OrderProcessor,
         time: DateTime,
     ) -> Result<Vec<OrderEvent>> {
-        let brokerage_name = self.brokerage.name().to_string();
+        let brokerage_name = self.brokerage_name();
         let requests = order_processor.transaction_manager.get_cancel_requests();
         let mut events = Vec::new();
 
@@ -527,12 +596,16 @@ impl LiveBrokerageBridge {
 
             let needs_broker_cancel = self.paper_fills || !order.brokerage_id.is_empty();
             let accepted = if needs_broker_cancel {
-                self.brokerage.cancel_order(&order).with_context(|| {
-                    format!(
-                        "brokerage {} failed to cancel order {} for {}",
-                        brokerage_name, order.id, order.symbol
-                    )
-                })?
+                self.brokerage
+                    .lock()
+                    .unwrap()
+                    .cancel_order(&order)
+                    .with_context(|| {
+                        format!(
+                            "brokerage {} failed to cancel order {} for {}",
+                            brokerage_name, order.id, order.symbol
+                        )
+                    })?
             } else {
                 true
             };
@@ -569,51 +642,92 @@ impl LiveBrokerageBridge {
 
     fn sync_account_state(&self) -> Result<AccountState> {
         AccountSynchronizer::new(0)
-            .sync_blocking(self.brokerage.as_ref())
+            .sync_blocking(self.brokerage.lock().unwrap().as_ref())
             .context("failed to synchronize live brokerage account state")
     }
 
-    fn reconcile_order_events(
-        &mut self,
-        order_processor: &OrderProcessor,
-        time: DateTime,
-    ) -> Vec<OrderEvent> {
-        if self.paper_fills {
-            return Vec::new();
-        }
-
-        let brokerage_name = self.brokerage.name().to_string();
-        let local_orders = order_processor.transaction_manager.get_all_orders();
-        let mut local_by_brokerage_id = HashMap::new();
-        for order in local_orders {
-            for brokerage_id in &order.brokerage_id {
-                local_by_brokerage_id.insert(brokerage_id.clone(), order.clone());
-            }
-        }
-
+    fn drain_reconciled_order_events(&mut self) -> Vec<OrderEvent> {
         let mut events = Vec::new();
-        for brokerage_order in self.brokerage.get_account_orders() {
-            let Some(local_order) = brokerage_order
-                .brokerage_id
-                .iter()
-                .find_map(|brokerage_id| local_by_brokerage_id.get(brokerage_id))
-            else {
-                continue;
-            };
-            if let Some(event) =
-                brokerage_snapshot_event(local_order, &brokerage_order, time, &brokerage_name)
-            {
-                events.push(event);
-            }
+        while let Ok(mut batch) = self.reconcile_rx.try_recv() {
+            events.append(&mut batch);
         }
         events
+    }
+
+    fn start_order_reconcile_if_idle(&mut self, order_processor: &OrderProcessor, time: DateTime) {
+        if self.paper_fills {
+            return;
+        }
+        if self
+            .last_reconcile_started
+            .map(|started| started.elapsed() < LIVE_BROKERAGE_RECONCILE_INTERVAL)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if self.reconcile_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.last_reconcile_started = Some(Instant::now());
+
+        let local_orders = order_processor.transaction_manager.get_all_orders();
+        let brokerage = Arc::clone(&self.brokerage);
+        let tx = self.reconcile_tx.clone();
+        let inflight = Arc::clone(&self.reconcile_inflight);
+        std::thread::spawn(move || {
+            let (brokerage_name, brokerage_orders) = {
+                let brokerage = brokerage.lock().unwrap();
+                (brokerage.name().to_string(), brokerage.get_account_orders())
+            };
+            let events = reconcile_order_events_from_orders(
+                local_orders,
+                brokerage_orders,
+                time,
+                &brokerage_name,
+            );
+            let _ = tx.send(events);
+            inflight.store(false, Ordering::Release);
+        });
     }
 }
 
 impl Drop for LiveBrokerageBridge {
     fn drop(&mut self) {
-        self.brokerage.disconnect();
+        if let Ok(mut brokerage) = self.brokerage.lock() {
+            brokerage.disconnect();
+        }
     }
+}
+
+fn reconcile_order_events_from_orders(
+    local_orders: Vec<Order>,
+    brokerage_orders: Vec<Order>,
+    time: DateTime,
+    brokerage_name: &str,
+) -> Vec<OrderEvent> {
+    let mut local_by_brokerage_id = HashMap::new();
+    for order in local_orders {
+        for brokerage_id in &order.brokerage_id {
+            local_by_brokerage_id.insert(brokerage_id.clone(), order.clone());
+        }
+    }
+
+    let mut events = Vec::new();
+    for brokerage_order in brokerage_orders {
+        let Some(local_order) = brokerage_order
+            .brokerage_id
+            .iter()
+            .find_map(|brokerage_id| local_by_brokerage_id.get(brokerage_id))
+        else {
+            continue;
+        };
+        if let Some(event) =
+            brokerage_snapshot_event(local_order, &brokerage_order, time, brokerage_name)
+        {
+            events.push(event);
+        }
+    }
+    events
 }
 
 fn brokerage_snapshot_event(
@@ -719,6 +833,14 @@ fn apply_initial_brokerage_account_state(
             holding.quantity,
             multiplier,
         );
+        if holding.market_price > Decimal::ZERO {
+            algorithm
+                .securities
+                .update_price(&holding.symbol, holding.market_price);
+            algorithm
+                .portfolio
+                .update_prices(&holding.symbol, holding.market_price);
+        }
     }
 
     for order in &account_state.open_orders {
@@ -726,11 +848,137 @@ fn apply_initial_brokerage_account_state(
     }
 }
 
+fn set_live_starting_portfolio_value_from_synced_account(
+    portfolio: &SecurityPortfolioManager,
+) -> Decimal {
+    let starting_value = portfolio.total_portfolio_value();
+    portfolio.set_starting_cash(starting_value);
+    starting_value
+}
+
+async fn seed_missing_brokerage_holding_prices_from_history(
+    account_state: &mut AccountState,
+    history_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
+) {
+    let Some(provider) = history_provider else {
+        return;
+    };
+
+    let missing_symbols = account_state
+        .holdings
+        .iter()
+        .filter(|holding| !holding.quantity.is_zero() && holding.market_price <= Decimal::ZERO)
+        .map(|holding| holding.symbol.clone())
+        .collect::<Vec<_>>();
+    if missing_symbols.is_empty() {
+        return;
+    }
+
+    let end = DateTime::now();
+    let start = end - TimeSpan::from_days(10);
+    let mut prices_by_sid: HashMap<u64, (DateTime, Decimal)> = HashMap::new();
+    let mut prices_by_symbol: HashMap<(String, String), (DateTime, Decimal)> = HashMap::new();
+    for data_type in [DataType::QuoteBar, DataType::TradeBar] {
+        let request = HistoryBatchRequest {
+            symbols: missing_symbols.clone(),
+            resolution: Resolution::Minute,
+            start,
+            end,
+            data_type,
+        };
+        let batch = match provider.get_history_batch(&request).await {
+            Ok(batch) => batch,
+            Err(error) => {
+                debug!(
+                    "Live brokerage price seed history request failed for {:?}: {error:#}",
+                    data_type
+                );
+                continue;
+            }
+        };
+
+        for bar in batch.quote_bars {
+            let price = bar.mid_close();
+            if price <= Decimal::ZERO {
+                continue;
+            }
+            record_history_seed_price(
+                &mut prices_by_sid,
+                &mut prices_by_symbol,
+                &bar.symbol,
+                bar.end_time,
+                price,
+            );
+        }
+        for bar in batch.trade_bars {
+            if bar.close <= Decimal::ZERO {
+                continue;
+            }
+            record_history_seed_price(
+                &mut prices_by_sid,
+                &mut prices_by_symbol,
+                &bar.symbol,
+                bar.end_time,
+                bar.close,
+            );
+        }
+    }
+
+    for holding in &mut account_state.holdings {
+        if holding.market_price > Decimal::ZERO {
+            continue;
+        }
+        if let Some((_, price)) = prices_by_sid
+            .get(&holding.symbol.id.sid)
+            .or_else(|| prices_by_symbol.get(&history_seed_symbol_key(&holding.symbol)))
+        {
+            holding.market_price = *price;
+        }
+    }
+}
+
+fn record_history_seed_price(
+    prices_by_sid: &mut HashMap<u64, (DateTime, Decimal)>,
+    prices_by_symbol: &mut HashMap<(String, String), (DateTime, Decimal)>,
+    symbol: &Symbol,
+    end_time: DateTime,
+    price: Decimal,
+) {
+    let entry = prices_by_sid
+        .entry(symbol.id.sid)
+        .or_insert((end_time, price));
+    if end_time >= entry.0 {
+        *entry = (end_time, price);
+    }
+
+    let entry = prices_by_symbol
+        .entry(history_seed_symbol_key(symbol))
+        .or_insert((end_time, price));
+    if end_time >= entry.0 {
+        *entry = (end_time, price);
+    }
+}
+
+fn history_seed_symbol_key(symbol: &Symbol) -> (String, String) {
+    (
+        symbol.id.ticker.to_ascii_uppercase(),
+        symbol.permtick.to_ascii_uppercase(),
+    )
+}
+
 /// Portfolio/order/history snapshot reloaded from a paper deployment directory.
 struct DeployRestore {
     account_state: AccountState,
     order_events: Vec<OrderEvent>,
     trades: Vec<Trade>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LiveInsightSnapshot {
+    schema_version: u32,
+    deployment_id: Option<String>,
+    written_at: String,
+    state: InsightCollectionSnapshot,
 }
 
 /// Restore a paper deployment's holdings, cash, open orders, and cumulative
@@ -759,6 +1007,37 @@ fn load_deploy_restore(dir: &Path) -> Option<DeployRestore> {
         trades: load_json_lines::<Trade>(&dir.join("trades.jsonl")),
         account_state,
     })
+}
+
+fn load_live_insight_snapshot(dir: &Path) -> Option<LiveInsightSnapshot> {
+    let path = dir.join("insights.json");
+    if !path.exists() {
+        return None;
+    }
+    match serde_json::from_str::<LiveInsightSnapshot>(&std::fs::read_to_string(&path).ok()?) {
+        Ok(snapshot) if snapshot.schema_version == LIVE_INSIGHTS_SCHEMA_VERSION => Some(snapshot),
+        Ok(snapshot) => {
+            warn!(
+                "live insight restore: unsupported schema version {} in {}",
+                snapshot.schema_version,
+                path.display()
+            );
+            None
+        }
+        Err(err) => {
+            warn!(
+                "live insight restore: failed to parse {}: {err:#}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn deployment_id_from_dir(dir: &Path) -> Option<String> {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
 /// Build an `AccountState` from a deploy dir's `portfolio.json` + `orders.json`.
@@ -800,6 +1079,7 @@ fn parse_account_snapshot(dir: &Path) -> Result<AccountState> {
                 symbol,
                 quantity,
                 average_price: parse_dec(item, "average_price"),
+                market_price: parse_dec(item, "last_price"),
             });
         }
     }
@@ -962,6 +1242,7 @@ async fn ensure_runner_data_for_new_subscriptions(
 
 pub struct RunConfig {
     pub data_root: PathBuf,
+    pub datastore: DataStore,
     pub _compression_level: i32,
     /// If set, missing price data is fetched from this provider before the backtest loop.
     pub historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
@@ -987,6 +1268,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
             data_root: PathBuf::from("data"),
+            datastore: DataStore::local("data"),
             _compression_level: 3,
             historical_provider: None,
             history_provider: None,
@@ -1001,6 +1283,7 @@ impl Default for RunConfig {
 
 pub struct LiveRunConfig {
     pub data_root: PathBuf,
+    pub datastore: DataStore,
     pub history_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
     pub parameters: HashMap<String, String>,
     pub custom_data_sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>>,
@@ -1235,9 +1518,18 @@ struct LiveDeploymentWriter {
     orders_path: PathBuf,
     order_events_path: PathBuf,
     trades_path: PathBuf,
+    insights_path: PathBuf,
+    insight_events_path: PathBuf,
+    alpha_analytics_path: PathBuf,
     heartbeat_path: PathBuf,
     started_at: chrono::DateTime<chrono::Utc>,
     last_heartbeat: std::sync::Mutex<Instant>,
+}
+
+struct LiveSnapshotCounts {
+    slices_processed: usize,
+    order_events: usize,
+    trades: usize,
 }
 
 impl LiveDeploymentWriter {
@@ -1249,6 +1541,9 @@ impl LiveDeploymentWriter {
             orders_path: dir.join("orders.json"),
             order_events_path: dir.join("order-events.jsonl"),
             trades_path: dir.join("trades.jsonl"),
+            insights_path: dir.join("insights.json"),
+            insight_events_path: dir.join("insight-events.jsonl"),
+            alpha_analytics_path: dir.join("alpha-analytics.json"),
             heartbeat_path: dir.join("heartbeat.log"),
             dir,
             started_at: chrono::Utc::now(),
@@ -1265,6 +1560,7 @@ impl LiveDeploymentWriter {
         };
         ensure_exists(&writer.order_events_path);
         ensure_exists(&writer.trades_path);
+        ensure_exists(&writer.insight_events_path);
         let _ = std::fs::File::create(&writer.heartbeat_path);
         writer
     }
@@ -1282,9 +1578,8 @@ impl LiveDeploymentWriter {
         time: DateTime,
         portfolio: &SecurityPortfolioManager,
         order_processor: &OrderProcessor,
-        slices_processed: usize,
-        order_events: usize,
-        trades: usize,
+        framework: Option<&Arc<Mutex<FrameworkState>>>,
+        counts: LiveSnapshotCounts,
     ) {
         let updated_at = chrono::Utc::now().to_rfc3339();
         let holdings = portfolio
@@ -1320,7 +1615,7 @@ impl LiveDeploymentWriter {
             "updated_at": updated_at,
             "started_at": self.started_at.to_rfc3339(),
             "cash": portfolio.cash.read().to_string(),
-            "starting_cash": portfolio.starting_cash.to_string(),
+            "starting_cash": portfolio.starting_cash().to_string(),
             "total_portfolio_value": portfolio.total_portfolio_value().to_string(),
             "total_holdings_value": portfolio.total_holdings_value().to_string(),
             "unrealized_pnl": portfolio.unrealized_profit().to_string(),
@@ -1346,14 +1641,41 @@ impl LiveDeploymentWriter {
             "time": time.to_string(),
             "updated_at": chrono::Utc::now().to_rfc3339(),
             "started_at": self.started_at.to_rfc3339(),
-            "slices_processed": slices_processed,
+            "slices_processed": counts.slices_processed,
             "portfolio_value": portfolio.total_portfolio_value().to_string(),
-            "order_events": order_events,
-            "trades": trades,
+            "order_events": counts.order_events,
+            "trades": counts.trades,
             "output": self.dir,
         });
         write_json_pretty_atomic(&self.progress_path, &progress_payload);
-        self.append_heartbeat(time, portfolio, slices_processed, order_events, trades);
+        self.record_insight_snapshot(framework);
+        self.append_heartbeat(
+            time,
+            portfolio,
+            counts.slices_processed,
+            counts.order_events,
+            counts.trades,
+        );
+    }
+
+    fn record_insight_snapshot(&self, framework: Option<&Arc<Mutex<FrameworkState>>>) {
+        let Some(framework) = framework else {
+            return;
+        };
+        let Ok(mut fw) = framework.lock() else {
+            return;
+        };
+        let payload = LiveInsightSnapshot {
+            schema_version: LIVE_INSIGHTS_SCHEMA_VERSION,
+            deployment_id: deployment_id_from_dir(&self.dir),
+            written_at: chrono::Utc::now().to_rfc3339(),
+            state: fw.insight_snapshot(),
+        };
+        write_json_pretty_atomic(&self.insights_path, &payload);
+        let analytics = fw.compute_alpha_analytics();
+        write_json_pretty_atomic(&self.alpha_analytics_path, &analytics);
+        let events = fw.take_insight_events();
+        append_json_lines(&self.insight_events_path, &events);
     }
 
     fn append_heartbeat(
@@ -1995,7 +2317,9 @@ fn update_live_prices(
     adapter: &PyAlgorithmAdapter,
     portfolio: &Arc<SecurityPortfolioManager>,
     slice: &Slice,
-) {
+) -> HashSet<u64> {
+    let mut updated_sids = HashSet::new();
+
     for quote_bar in slice.quote_bars.values() {
         let bid = quote_bar
             .bid
@@ -2008,6 +2332,7 @@ fn update_live_prices(
             .map(|bar| bar.close)
             .unwrap_or(Decimal::ZERO);
         if bid > Decimal::ZERO || ask > Decimal::ZERO {
+            updated_sids.insert(quote_bar.symbol.id.sid);
             adapter
                 .inner
                 .lock()
@@ -2018,6 +2343,7 @@ fn update_live_prices(
     }
 
     for (symbol, price) in live_prices_from_slice(slice) {
+        updated_sids.insert(symbol.id.sid);
         adapter
             .inner
             .lock()
@@ -2027,6 +2353,26 @@ fn update_live_prices(
         portfolio.update_prices(&symbol, price);
     }
     portfolio.apply_margin_interest_rates(slice.margin_interest_rates.values());
+
+    updated_sids
+}
+
+fn set_pending_live_starting_portfolio_value_if_priced(
+    portfolio: &SecurityPortfolioManager,
+    updated_sids: &HashSet<u64>,
+    pending_sids: &mut Option<HashSet<u64>>,
+) -> Option<Decimal> {
+    let pending = pending_sids.as_mut()?;
+    for sid in updated_sids {
+        pending.remove(sid);
+    }
+    if !pending.is_empty() {
+        return None;
+    }
+
+    let starting_value = set_live_starting_portfolio_value_from_synced_account(portfolio);
+    *pending_sids = None;
+    Some(starting_value)
 }
 
 #[derive(Default)]
@@ -2280,6 +2626,7 @@ async fn run_live_warmup(adapter: &mut PyAlgorithmAdapter, config: &LiveRunConfi
 
     let run_config = RunConfig {
         data_root: config.data_root.clone(),
+        datastore: config.datastore.clone(),
         history_provider: config.history_provider.clone(),
         parameters: config.parameters.clone(),
         custom_data_sources: config.custom_data_sources.clone(),
@@ -2423,7 +2770,10 @@ fn live_warmup_date_range(
 ) -> Option<(NaiveDate, NaiveDate)> {
     let algorithm = adapter.inner.lock().unwrap();
     let calendar_days = if let Some(bar_count) = algorithm.warmup_bar_count {
-        (bar_count as i64 * 7 + 4) / 5 + 10
+        let resolution = algorithm.warmup_resolution.unwrap_or(Resolution::Daily);
+        (current_time.date_utc()
+            - warmup_bar_count_start_date(current_time.date_utc(), bar_count, resolution))
+        .num_days()
     } else if let Some(duration) = algorithm.warmup_duration {
         (duration.nanos / TimeSpan::ONE_DAY.nanos).max(1)
     } else if let Some(period) = algorithm.warmup_period {
@@ -2495,6 +2845,7 @@ fn process_live_slice(
     live_brokerage: Option<&mut LiveBrokerageBridge>,
     order_processor: &OrderProcessor,
     portfolio: &Arc<SecurityPortfolioManager>,
+    pending_brokerage_starting_value_sids: &mut Option<HashSet<u64>>,
     live_writer: Option<&LiveDeploymentWriter>,
     all_order_events: &mut Vec<OrderEvent>,
     trade_builder: &mut TradeBuilder,
@@ -2503,7 +2854,17 @@ fn process_live_slice(
     set_algorithm_time(adapter, slice.time);
     let live_slice = slice.clone();
 
-    update_live_prices(adapter, portfolio, &live_slice);
+    let updated_sids = update_live_prices(adapter, portfolio, &live_slice);
+    if let Some(starting_value) = set_pending_live_starting_portfolio_value_if_priced(
+        portfolio,
+        &updated_sids,
+        pending_brokerage_starting_value_sids,
+    ) {
+        info!(
+            "Set live starting portfolio value from synchronized brokerage account after live price seed: {}",
+            starting_value
+        );
+    }
 
     Python::attach(|py| {
         slice_proxy.update(py, &live_slice);
@@ -2598,33 +2959,31 @@ fn process_live_slice(
             .process(&mut brokerage_events);
         }
 
-        if !bridge.paper_fills {
-            let mut broker_snapshot_events =
-                bridge.reconcile_order_events(order_processor, live_slice.time);
-            if !broker_snapshot_events.is_empty() {
-                for event in &broker_snapshot_events {
-                    info!(
-                        "Live brokerage snapshot event: order_id={} symbol={} status={:?} fill_qty={} fill_price={} message={}",
-                        event.order_id,
-                        event.symbol.value,
-                        event.status,
-                        event.fill_quantity,
-                        event.fill_price,
-                        event.message
-                    );
-                }
-                OrderEventProcessingContext {
-                    adapter,
-                    portfolio,
-                    order_processor,
-                    all_order_events,
-                    trade_builder,
-                    completed_trades,
-                    live_writer: as_sidecar_writer(live_writer),
-                }
-                .process(&mut broker_snapshot_events);
+        let mut broker_snapshot_events = bridge.drain_reconciled_order_events();
+        if !broker_snapshot_events.is_empty() {
+            for event in &broker_snapshot_events {
+                info!(
+                    "Live brokerage snapshot event: order_id={} symbol={} status={:?} fill_qty={} fill_price={} message={}",
+                    event.order_id,
+                    event.symbol.value,
+                    event.status,
+                    event.fill_quantity,
+                    event.fill_price,
+                    event.message
+                );
             }
+            OrderEventProcessingContext {
+                adapter,
+                portfolio,
+                order_processor,
+                all_order_events,
+                trade_builder,
+                completed_trades,
+                live_writer: as_sidecar_writer(live_writer),
+            }
+            .process(&mut broker_snapshot_events);
         }
+        bridge.start_order_reconcile_if_idle(order_processor, live_slice.time);
     } else {
         let request_events = drain_local_order_request_event_batches(
             order_processor,
@@ -2753,6 +3112,24 @@ pub async fn run_live_strategy(
         .initialize()
         .context("strategy initialize() failed")?;
 
+    if let Some(snapshot) = config
+        .output_dir
+        .as_ref()
+        .and_then(|dir| load_live_insight_snapshot(dir))
+    {
+        let active_count = snapshot.state.active.len();
+        let closed_count = snapshot.state.closed.len();
+        adapter
+            .framework
+            .lock()
+            .unwrap()
+            .restore_insights(snapshot.state, DateTime::now());
+        info!(
+            "Restored live framework insights from deploy dir: active={} closed={}",
+            active_count, closed_count
+        );
+    }
+
     let live_job_brokerage = config
         .brokerage
         .as_ref()
@@ -2787,8 +3164,14 @@ pub async fn run_live_strategy(
     // Reconcile the algorithm portfolio from the source of truth before warmup:
     // a real brokerage's live account, or — for paper, which has no brokerage
     // object and no cloud — the persisted snapshots in the deploy directory.
+    let mut pending_brokerage_starting_value_sids: Option<HashSet<u64>> = None;
     let restored = if let Some(bridge) = live_brokerage.as_ref() {
-        let account_state = bridge.sync_account_state()?;
+        let mut account_state = bridge.sync_account_state()?;
+        seed_missing_brokerage_holding_prices_from_history(
+            &mut account_state,
+            config.history_provider.clone(),
+        )
+        .await;
         info!(
             "Synchronized live brokerage account state: cash={} holdings={} open_orders={}",
             account_state.cash,
@@ -2796,6 +3179,11 @@ pub async fn run_live_strategy(
             account_state.open_orders.len()
         );
         apply_initial_brokerage_account_state(&adapter.inner, &account_state);
+        let starting_value = set_live_starting_portfolio_value_from_synced_account(&portfolio);
+        info!(
+            "Set live starting portfolio value from synchronized brokerage account: {}",
+            starting_value
+        );
         None
     } else if config.paper_trading {
         match config
@@ -2913,15 +3301,20 @@ pub async fn run_live_strategy(
         }
     }
     let runtime_started = Instant::now();
-    if let Some(writer) = &live_writer {
-        writer.record_snapshot(
-            DateTime::now(),
-            &portfolio,
-            &order_processor,
-            slices_processed,
-            all_order_events.len(),
-            completed_trades.len(),
-        );
+    if pending_brokerage_starting_value_sids.is_none() {
+        if let Some(writer) = &live_writer {
+            writer.record_snapshot(
+                DateTime::now(),
+                &portfolio,
+                &order_processor,
+                Some(&adapter.framework),
+                LiveSnapshotCounts {
+                    slices_processed,
+                    order_events: all_order_events.len(),
+                    trades: completed_trades.len(),
+                },
+            );
+        }
     }
 
     loop {
@@ -2943,21 +3336,27 @@ pub async fn run_live_strategy(
                     live_brokerage.as_mut(),
                     &order_processor,
                     &portfolio,
+                    &mut pending_brokerage_starting_value_sids,
                     live_writer.as_ref(),
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
                 )?;
                 slices_processed += 1;
-                if let Some(writer) = &live_writer {
-                    writer.record_snapshot(
-                        slice.time,
-                        &portfolio,
-                        &order_processor,
-                        slices_processed,
-                        all_order_events.len(),
-                        completed_trades.len(),
-                    );
+                if pending_brokerage_starting_value_sids.is_none() {
+                    if let Some(writer) = &live_writer {
+                        writer.record_snapshot(
+                            slice.time,
+                            &portfolio,
+                            &order_processor,
+                            Some(&adapter.framework),
+                            LiveSnapshotCounts {
+                                slices_processed,
+                                order_events: all_order_events.len(),
+                                trades: completed_trades.len(),
+                            },
+                        );
+                    }
                 }
             }
             let stopped_at = chrono::Utc::now();
@@ -2993,21 +3392,27 @@ pub async fn run_live_strategy(
                     live_brokerage.as_mut(),
                     &order_processor,
                     &portfolio,
+                    &mut pending_brokerage_starting_value_sids,
                     live_writer.as_ref(),
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
                 )?;
                 slices_processed += 1;
-                if let Some(writer) = &live_writer {
-                    writer.record_snapshot(
-                        slice.time,
-                        &portfolio,
-                        &order_processor,
-                        slices_processed,
-                        all_order_events.len(),
-                        completed_trades.len(),
-                    );
+                if pending_brokerage_starting_value_sids.is_none() {
+                    if let Some(writer) = &live_writer {
+                        writer.record_snapshot(
+                            slice.time,
+                            &portfolio,
+                            &order_processor,
+                            Some(&adapter.framework),
+                            LiveSnapshotCounts {
+                                slices_processed,
+                                order_events: all_order_events.len(),
+                                trades: completed_trades.len(),
+                            },
+                        );
+                    }
                 }
             }
             break;
@@ -3040,21 +3445,27 @@ pub async fn run_live_strategy(
                     live_brokerage.as_mut(),
                     &order_processor,
                     &portfolio,
+                    &mut pending_brokerage_starting_value_sids,
                     live_writer.as_ref(),
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
                 )?;
                 slices_processed += 1;
-                if let Some(writer) = &live_writer {
-                    writer.record_snapshot(
-                        slice.time,
-                        &portfolio,
-                        &order_processor,
-                        slices_processed,
-                        all_order_events.len(),
-                        completed_trades.len(),
-                    );
+                if pending_brokerage_starting_value_sids.is_none() {
+                    if let Some(writer) = &live_writer {
+                        writer.record_snapshot(
+                            slice.time,
+                            &portfolio,
+                            &order_processor,
+                            Some(&adapter.framework),
+                            LiveSnapshotCounts {
+                                slices_processed,
+                                order_events: all_order_events.len(),
+                                trades: completed_trades.len(),
+                            },
+                        );
+                    }
                 }
                 if config
                     .max_slices
@@ -3113,15 +3524,20 @@ pub async fn run_live_strategy(
                     time,
                     data,
                 )?;
-                if let Some(writer) = &live_writer {
-                    writer.record_snapshot(
-                        time,
-                        &portfolio,
-                        &order_processor,
-                        slices_processed,
-                        all_order_events.len(),
-                        completed_trades.len(),
-                    );
+                if pending_brokerage_starting_value_sids.is_none() {
+                    if let Some(writer) = &live_writer {
+                        writer.record_snapshot(
+                            time,
+                            &portfolio,
+                            &order_processor,
+                            Some(&adapter.framework),
+                            LiveSnapshotCounts {
+                                slices_processed,
+                                order_events: all_order_events.len(),
+                                trades: completed_trades.len(),
+                            },
+                        );
+                    }
                 }
             }
             Ok(Ok(item)) => {
@@ -3138,21 +3554,27 @@ pub async fn run_live_strategy(
                         live_brokerage.as_mut(),
                         &order_processor,
                         &portfolio,
+                        &mut pending_brokerage_starting_value_sids,
                         live_writer.as_ref(),
                         &mut all_order_events,
                         &mut trade_builder,
                         &mut completed_trades,
                     )?;
                     slices_processed += 1;
-                    if let Some(writer) = &live_writer {
-                        writer.record_snapshot(
-                            slice.time,
-                            &portfolio,
-                            &order_processor,
-                            slices_processed,
-                            all_order_events.len(),
-                            completed_trades.len(),
-                        );
+                    if pending_brokerage_starting_value_sids.is_none() {
+                        if let Some(writer) = &live_writer {
+                            writer.record_snapshot(
+                                slice.time,
+                                &portfolio,
+                                &order_processor,
+                                Some(&adapter.framework),
+                                LiveSnapshotCounts {
+                                    slices_processed,
+                                    order_events: all_order_events.len(),
+                                    trades: completed_trades.len(),
+                                },
+                            );
+                        }
                     }
                     if config
                         .max_slices
@@ -3348,18 +3770,18 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     );
 
     // ── determine warm-up window ────────────────────────────────────────────
-    // Compute this before prefetching so data is requested once for the full
-    // range the algorithm can consume. This mirrors LEAN's source-driven data
-    // provider path and keeps the date-partitioned cache complete for warm-up
-    // plus the main backtest period.
-    let warmup_start: Option<NaiveDate> = {
+    // Compute this before prefetching so warm-up can use the configured warm-up
+    // resolution while the main run keeps the strategy's subscription resolution.
+    let (warmup_start, warmup_resolution): (Option<NaiveDate>, Option<Resolution>) = {
         let alg = adapter.inner.lock().unwrap();
-        if let Some(bar_count) = alg.warmup_bar_count {
-            // C# LEAN counts back N trading days using exchange calendar.
-            // For daily data: 5 trading days per 7 calendar days -> multiply by 7/5.
-            // Add a small buffer (+10) to ensure we never undershoot.
-            let calendar_days = (bar_count as i64 * 7 + 4) / 5 + 10;
-            Some(start_date - chrono::Duration::days(calendar_days))
+        let warmup_resolution = alg.warmup_resolution;
+        let start = if let Some(bar_count) = alg.warmup_bar_count {
+            let resolution = warmup_resolution
+                .or_else(|| lowest_subscription_resolution(&subscriptions))
+                .unwrap_or(Resolution::Daily);
+            Some(warmup_bar_count_start_date(
+                start_date, bar_count, resolution,
+            ))
         } else if let Some(dur) = alg.warmup_duration {
             let days = (dur.nanos / TimeSpan::ONE_DAY.nanos).max(1);
             Some(start_date - chrono::Duration::days(days))
@@ -3368,8 +3790,34 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             Some(start_date - chrono::Duration::days(days))
         } else {
             None
-        }
+        };
+        (start, warmup_resolution)
     };
+
+    if let Some(wu_start) = warmup_start {
+        let warmup_end = start_date - chrono::Duration::days(1);
+        if wu_start <= warmup_end {
+            let warmup_subscriptions =
+                warmup_replay_subscriptions(&subscriptions, warmup_resolution);
+            materialize_subscription_range(
+                &config.datastore,
+                &resolver,
+                &warmup_subscriptions,
+                wu_start,
+                warmup_end,
+            )
+            .await?;
+        }
+    }
+
+    materialize_subscription_range(
+        &config.datastore,
+        &resolver,
+        &subscriptions,
+        start_date,
+        end_date,
+    )
+    .await?;
 
     // ── pre-fetch missing low-resolution data ───────────────────────────────
     // C# LEAN resolves date-partitioned high-resolution sources lazily: the
@@ -3383,11 +3831,34 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             .cloned()
             .collect();
 
+        if let Some(wu_start) = warmup_start {
+            let warmup_end = start_date - chrono::Duration::days(1);
+            if wu_start <= warmup_end {
+                let warmup_prefetch_subscriptions: Vec<_> =
+                    warmup_replay_subscriptions(&subscriptions, warmup_resolution)
+                        .into_iter()
+                        .filter(|sub| {
+                            !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote
+                        })
+                        .collect();
+                pre_fetch_all(
+                    provider.clone(),
+                    config.history_provider.clone(),
+                    &warmup_prefetch_subscriptions,
+                    wu_start,
+                    warmup_end,
+                    &resolver,
+                    Some(usa_map_file_resolver.clone()),
+                )
+                .await?;
+            }
+        }
+
         pre_fetch_all(
             provider.clone(),
             config.history_provider.clone(),
             &startup_prefetch_subscriptions,
-            warmup_start.unwrap_or(start_date),
+            start_date,
             end_date,
             &resolver,
             Some(usa_map_file_resolver.clone()),
@@ -3505,7 +3976,9 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             set_algorithm_time(&adapter, utc_time);
 
             let mut slice = Slice::new(utc_time);
-            for sub in &subscriptions {
+            let warmup_day_subscriptions =
+                warmup_replay_subscriptions(&subscriptions, warmup_resolution);
+            for sub in &warmup_day_subscriptions {
                 let sid = sub.symbol.id.sid;
                 let day_key = day_key(wu_date);
                 let path = resolver.market_data_partition(
@@ -6355,6 +6828,29 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
 /// Daily/hourly data is stored in date-partitioned cache files. Higher
 /// resolutions are resolved lazily in the intraday loop, matching LEAN's
 /// source-per-date subscription reader behavior.
+async fn materialize_subscription_range(
+    datastore: &DataStore,
+    resolver: &PathResolver,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<()> {
+    if !datastore.is_s3() {
+        return Ok(());
+    }
+
+    let mut date = start_date;
+    while date <= end_date {
+        for sub in subscriptions {
+            let path =
+                resolver.market_data_partition(&sub.symbol, sub.resolution, sub.tick_type, date);
+            datastore.materialize_path(&path).await?;
+        }
+        date += chrono::Duration::days(1);
+    }
+    Ok(())
+}
+
 async fn pre_fetch_all(
     provider: Arc<dyn IHistoricalDataProvider>,
     factor_provider: Option<Arc<dyn lean_data_providers::IHistoryProvider>>,
@@ -11231,7 +11727,14 @@ mod tests {
         QcAlgorithm::new("test", dec!(100_000))
     }
 
-    fn write_portfolio_snapshot(dir: &Path, cash: &str, symbol: &Symbol, qty: &str, avg: &str) {
+    fn write_portfolio_snapshot(
+        dir: &Path,
+        cash: &str,
+        symbol: &Symbol,
+        qty: &str,
+        avg: &str,
+        last: &str,
+    ) {
         // Mirrors the holdings shape written by LiveDeploymentWriter::record_snapshot,
         // including the lossless `symbol_id` field used for restore.
         let payload = serde_json::json!({
@@ -11242,6 +11745,7 @@ mod tests {
                 "symbol_id": symbol,
                 "quantity": qty,
                 "average_price": avg,
+                "last_price": last,
             }],
         });
         std::fs::write(
@@ -11256,7 +11760,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        write_portfolio_snapshot(dir, "98765.43", &symbol, "10", "411.5");
+        write_portfolio_snapshot(dir, "98765.43", &symbol, "10", "411.5", "455.25");
 
         // One open and one filled order; only the open one should restore.
         let mut open = Order::market(1, symbol.clone(), dec!(10), DateTime::now(), "open");
@@ -11277,6 +11781,7 @@ mod tests {
         assert_eq!(holding.symbol, symbol);
         assert_eq!(holding.quantity, dec!(10));
         assert_eq!(holding.average_price, dec!(411.5));
+        assert_eq!(holding.market_price, dec!(455.25));
         assert_eq!(restore.account_state.open_orders.len(), 1);
         assert_eq!(restore.account_state.open_orders[0].id, 1);
     }
@@ -11310,6 +11815,67 @@ mod tests {
         let restore = load_deploy_restore(tmp.path()).expect("cash still restorable");
         assert_eq!(restore.account_state.cash, dec!(5000));
         assert!(restore.account_state.holdings.is_empty());
+    }
+
+    #[test]
+    fn live_writer_persists_framework_insights_events_and_analytics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = LiveDeploymentWriter::new(tmp.path().to_path_buf());
+        let alg = make_alg();
+        let portfolio = alg.portfolio.clone();
+        let transactions = alg.transactions.clone();
+        let order_processor = OrderProcessor::new(
+            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            transactions,
+        );
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let now = DateTime::from_secs(1_700_000_000);
+        let mut insight = lean_alpha::Insight::new(
+            symbol,
+            lean_alpha::InsightDirection::Up,
+            TimeSpan::from_days(1),
+            None,
+            None,
+            "writer-test",
+        )
+        .with_generated_time_utc(now);
+        insight.reference_value = Some(dec!(100));
+
+        let mut fw = FrameworkState::new();
+        fw.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![insight],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            now,
+        );
+        let framework = Arc::new(Mutex::new(fw));
+
+        writer.record_snapshot(
+            now,
+            &portfolio,
+            &order_processor,
+            Some(&framework),
+            LiveSnapshotCounts {
+                slices_processed: 0,
+                order_events: 0,
+                trades: 0,
+            },
+        );
+
+        let snapshot =
+            load_live_insight_snapshot(tmp.path()).expect("insight snapshot should restore");
+        assert_eq!(snapshot.schema_version, LIVE_INSIGHTS_SCHEMA_VERSION);
+        assert_eq!(snapshot.state.active.len(), 1);
+
+        let events =
+            load_json_lines::<lean_alpha::InsightEvent>(&tmp.path().join("insight-events.jsonl"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, lean_alpha::InsightEventKind::Restored);
+
+        assert!(tmp.path().join("alpha-analytics.json").exists());
     }
 
     fn hyperliquid_future(ticker: &str) -> Symbol {
@@ -11748,7 +12314,12 @@ mod tests {
         broker_order.average_fill_price = dec!(450);
         *account_orders.lock().unwrap() = vec![broker_order];
 
-        let events = bridge.reconcile_order_events(&processor, DateTime::EPOCH);
+        let events = reconcile_order_events_from_orders(
+            processor.transaction_manager.get_all_orders(),
+            account_orders.lock().unwrap().clone(),
+            DateTime::EPOCH,
+            "Recording",
+        );
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].status, OrderStatus::Filled);
@@ -12316,6 +12887,7 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: dec!(10),
                 average_price: dec!(400),
+                market_price: dec!(450),
             }],
             open_orders: vec![open_order],
             last_sync_time: chrono::Utc::now(),
@@ -12328,6 +12900,8 @@ mod tests {
         let holding = algorithm.portfolio.get_holding(&symbol);
         assert_eq!(holding.quantity, dec!(10));
         assert_eq!(holding.average_price, dec!(400));
+        assert_eq!(holding.last_price, dec!(450));
+        assert_eq!(algorithm.portfolio.total_portfolio_value(), dec!(16845));
         assert!(algorithm.securities.contains(&symbol));
         assert_eq!(
             algorithm.transactions.get_order(42).unwrap().quantity,
@@ -12338,6 +12912,116 @@ mod tests {
             .get_all()
             .iter()
             .any(|subscription| subscription.symbol == symbol));
+    }
+
+    #[test]
+    fn live_starting_value_uses_brokerage_market_prices_after_sync() {
+        let algorithm = Arc::new(Mutex::new(QcAlgorithm::new(
+            "live-starting-value",
+            dec!(100000),
+        )));
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let other_symbol = Symbol::create_equity("QQQ", &Market::usa());
+        let account_state = AccountState {
+            cash: dec!(12345),
+            cash_balances: vec![("USD".to_string(), dec!(12345))],
+            positions: HashMap::from([
+                (symbol.id.ticker.clone(), dec!(10)),
+                (other_symbol.id.ticker.clone(), dec!(2)),
+            ]),
+            holdings: vec![
+                lean_brokerages::BrokerageHolding {
+                    symbol: symbol.clone(),
+                    quantity: dec!(10),
+                    average_price: dec!(400),
+                    market_price: dec!(450),
+                },
+                lean_brokerages::BrokerageHolding {
+                    symbol: other_symbol.clone(),
+                    quantity: dec!(2),
+                    average_price: dec!(100),
+                    market_price: dec!(120),
+                },
+            ],
+            open_orders: vec![],
+            last_sync_time: chrono::Utc::now(),
+        };
+
+        apply_initial_brokerage_account_state(&algorithm, &account_state);
+        let algorithm = algorithm.lock().unwrap();
+        assert_eq!(algorithm.portfolio.starting_cash(), dec!(100000));
+        assert_eq!(algorithm.portfolio.total_portfolio_value(), dec!(17085));
+
+        let starting_value =
+            set_live_starting_portfolio_value_from_synced_account(&algorithm.portfolio);
+        assert_eq!(starting_value, dec!(17085));
+        assert_eq!(algorithm.portfolio.starting_cash(), dec!(17085));
+        assert_eq!(algorithm.portfolio.total_return_pct(), dec!(0));
+    }
+
+    #[test]
+    fn live_starting_value_waits_only_for_unpriced_brokerage_holdings() {
+        let algorithm = Arc::new(Mutex::new(QcAlgorithm::new(
+            "live-starting-value-missing-price",
+            dec!(100000),
+        )));
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let other_symbol = Symbol::create_equity("QQQ", &Market::usa());
+        let account_state = AccountState {
+            cash: dec!(12345),
+            cash_balances: vec![("USD".to_string(), dec!(12345))],
+            positions: HashMap::from([
+                (symbol.id.ticker.clone(), dec!(10)),
+                (other_symbol.id.ticker.clone(), dec!(2)),
+            ]),
+            holdings: vec![
+                lean_brokerages::BrokerageHolding {
+                    symbol: symbol.clone(),
+                    quantity: dec!(10),
+                    average_price: dec!(400),
+                    market_price: dec!(450),
+                },
+                lean_brokerages::BrokerageHolding {
+                    symbol: other_symbol.clone(),
+                    quantity: dec!(2),
+                    average_price: dec!(100),
+                    market_price: Decimal::ZERO,
+                },
+            ],
+            open_orders: vec![],
+            last_sync_time: chrono::Utc::now(),
+        };
+
+        apply_initial_brokerage_account_state(&algorithm, &account_state);
+        let algorithm = algorithm.lock().unwrap();
+        assert_eq!(algorithm.portfolio.total_portfolio_value(), dec!(17045));
+
+        let mut pending = Some(HashSet::from([other_symbol.id.sid]));
+
+        algorithm.portfolio.update_prices(&symbol, dec!(450));
+        assert_eq!(
+            set_pending_live_starting_portfolio_value_if_priced(
+                &algorithm.portfolio,
+                &HashSet::from([symbol.id.sid]),
+                &mut pending,
+            ),
+            None
+        );
+        assert!(pending.is_some());
+        assert_eq!(algorithm.portfolio.starting_cash(), dec!(100000));
+
+        algorithm.portfolio.update_prices(&other_symbol, dec!(120));
+        assert_eq!(
+            set_pending_live_starting_portfolio_value_if_priced(
+                &algorithm.portfolio,
+                &HashSet::from([other_symbol.id.sid]),
+                &mut pending,
+            ),
+            Some(dec!(17085))
+        );
+        assert!(pending.is_none());
+        assert_eq!(algorithm.portfolio.starting_cash(), dec!(17085));
+        assert_eq!(algorithm.portfolio.total_return_pct(), dec!(0));
     }
 
     #[test]
@@ -13006,6 +13690,35 @@ class NoWarmupCallback(QCAlgorithm):
         assert_eq!(subscriptions.len(), 2);
         assert!(loaded_subscription_ids.contains(&spy_trade.unique_id()));
         assert!(loaded_subscription_ids.contains(&aapl_trade.unique_id()));
+    }
+
+    #[test]
+    fn warmup_replay_subscriptions_use_requested_resolution_without_mutating_source() {
+        let market = Market::usa();
+        let spy = Symbol::create_equity("SPY", &market);
+        let minute_sub = Arc::new(SubscriptionDataConfig::new_equity(spy, Resolution::Minute));
+        let mut quote_config = (*minute_sub).clone();
+        quote_config.tick_type = TickType::Quote;
+        let quote_sub = Arc::new(quote_config);
+
+        let warmup_subs =
+            warmup_replay_subscriptions(&[minute_sub.clone(), quote_sub], Some(Resolution::Daily));
+
+        assert_eq!(minute_sub.resolution, Resolution::Minute);
+        assert_eq!(warmup_subs.len(), 1);
+        assert_eq!(warmup_subs[0].resolution, Resolution::Daily);
+        assert_eq!(warmup_subs[0].symbol.id.sid, minute_sub.symbol.id.sid);
+    }
+
+    #[test]
+    fn warmup_bar_count_start_date_respects_resolution() {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+
+        let daily_start = warmup_bar_count_start_date(start, 200, Resolution::Daily);
+        let minute_start = warmup_bar_count_start_date(start, 200, Resolution::Minute);
+
+        assert!(daily_start < start - chrono::Duration::days(200));
+        assert_eq!(minute_start, start - chrono::Duration::days(2));
     }
 
     #[test]

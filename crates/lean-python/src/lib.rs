@@ -41,7 +41,7 @@ use py_indicators::{
 };
 use py_orders::{PyOrderEvent, PyOrderTicket};
 use py_portfolio::{PyPortfolio, PySecurityHolding};
-use py_qc_algorithm::PyQcAlgorithm;
+use py_qc_algorithm::{PyBrokerageModelSecurityInitializer, PyFuncSecuritySeeder, PyQcAlgorithm};
 use py_quant_book::PyQuantBook;
 use py_types::{
     PyAlgorithmSettings, PyDataNormalizationMode, PyExchangeHours, PyIndicatorResult,
@@ -351,6 +351,8 @@ pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChartCollection>()?;
 
     // Algorithm base class (LEAN name: QCAlgorithm)
+    m.add_class::<PyFuncSecuritySeeder>()?;
+    m.add_class::<PyBrokerageModelSecurityInitializer>()?;
     m.add_class::<PyQcAlgorithm>()?;
 
     // Research / notebook

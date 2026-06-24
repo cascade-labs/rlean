@@ -2,6 +2,7 @@ pub mod alpha_analytics;
 pub mod alpha_model;
 pub mod insight;
 pub mod insight_collection;
+pub mod insight_event;
 pub mod models;
 
 pub use alpha_analytics::{
@@ -10,7 +11,8 @@ pub use alpha_analytics::{
 };
 pub use alpha_model::{CompositeAlphaModel, ConstantAlphaModel, IAlphaModel, NullAlphaModel};
 pub use insight::{Insight, InsightDirection, InsightType};
-pub use insight_collection::InsightCollection;
+pub use insight_collection::{InsightCollection, InsightCollectionSnapshot};
+pub use insight_event::{InsightEvent, InsightEventKind, INSIGHT_EVENT_SCHEMA_VERSION};
 pub use models::ema_cross::EmaCrossAlphaModel;
 pub use models::historical_returns::HistoricalReturnsAlphaModel;
 pub use models::macd_alpha::MacdAlphaModel;

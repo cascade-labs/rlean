@@ -7,6 +7,7 @@ pub struct BrokerageHolding {
     pub symbol: Symbol,
     pub quantity: lean_core::Quantity,
     pub average_price: Price,
+    pub market_price: Price,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,7 @@ pub trait Brokerage: Send + Sync {
                 symbol,
                 quantity,
                 average_price: Price::ZERO,
+                market_price: Price::ZERO,
             })
             .collect()
     }

@@ -156,7 +156,10 @@ impl Insight {
     }
 
     pub fn is_expired(&self, utc_now: DateTime) -> bool {
-        utc_now >= self.close_time_utc
+        // Match C# Lean Insight.IsExpired (CloseTimeUtc < utcTime): the insight is still ACTIVE
+        // at exactly its close time, so it gets scored on the close bar and its realized return
+        // is measured to the close price — not one bar short (which `>=` caused).
+        utc_now > self.close_time_utc
     }
 
     pub fn is_active(&self, utc_now: DateTime) -> bool {

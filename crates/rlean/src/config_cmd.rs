@@ -5,7 +5,13 @@
 ///
 /// Known keys:
 ///   default-language            python | csharp
+///   datastore                   file | s3
 ///   data-folder                 Parquet data root (relative to rlean.json)
+///   s3_access_key               S3-compatible access key
+///   s3_secret_key               S3-compatible secret key
+///   s3_bucket                   S3 bucket name
+///   s3_endpoint                 S3-compatible endpoint URL
+///   s3_region                   S3 region
 ///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -24,7 +30,7 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Set a configuration value
     Set {
-        /// Config key (e.g. polygon-api-key, thetadata-api-key, default-language)
+        /// Config key (e.g. default-language, datastore, thetadata.api_key)
         key: String,
         /// Value to set
         value: String,
@@ -93,8 +99,24 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
                 println!("Set data-folder = {value} in ~/.rlean/config");
             }
         }
+        "datastore" => {
+            if value != "file" && value != "s3" {
+                bail!("datastore must be file or s3, got '{}'", value);
+            }
+            let mut cfg = GlobalConfig::load()?;
+            cfg.datastore = value.to_string();
+            cfg.save()?;
+            println!("Set datastore = {value} in ~/.rlean/config");
+        }
+        "s3_access_key" | "s3_secret_key" | "s3_bucket" | "s3_endpoint" | "s3_region" => {
+            let mut cfg = GlobalConfig::load()?;
+            set_s3_key(&mut cfg, key, value.to_string())?;
+            cfg.save()?;
+            println!("Set {key} in ~/.rlean/config");
+        }
         _ => bail!(
-            "Unknown key '{}'. Known keys: default-language, data-folder. \
+            "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
+             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -125,8 +147,21 @@ fn cmd_get(key: &str) -> Result<()> {
             let value = effective_data_folder_display(&cwd)?;
             println!("{value}");
         }
+        "datastore" => {
+            let cfg = GlobalConfig::load()?;
+            println!("{}", cfg.datastore);
+        }
+        "s3_access_key" | "s3_secret_key" | "s3_bucket" | "s3_endpoint" | "s3_region" => {
+            let cfg = GlobalConfig::load()?;
+            match get_s3_key(&cfg, key)? {
+                Some(value) if is_secret_key(key) => println!("{}", mask(value)),
+                Some(value) => println!("{value}"),
+                None => println!("(not set)"),
+            }
+        }
         _ => bail!(
-            "Unknown key '{}'. Known keys: default-language, data-folder. \
+            "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
+             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -144,7 +179,24 @@ fn cmd_list() -> Result<()> {
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
+    println!("{:<30} {}", "datastore", global.datastore);
     println!("{:<30} {}", "data-folder", data_folder);
+    for key in [
+        "s3_access_key",
+        "s3_secret_key",
+        "s3_bucket",
+        "s3_endpoint",
+        "s3_region",
+    ] {
+        if let Some(value) = get_s3_key(&global, key)? {
+            let display = if is_secret_key(key) {
+                mask(value)
+            } else {
+                value.to_string()
+            };
+            println!("{:<30} {}", key, display);
+        }
+    }
 
     // Plugin configs
     let mut plugin_names: Vec<&str> = plugin_cfgs.0.keys().map(String::as_str).collect();
@@ -188,4 +240,31 @@ fn effective_data_folder_display(start: &Path) -> Result<String> {
         .unwrap_or_else(|| PathBuf::from("data"))
         .display()
         .to_string())
+}
+
+fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
+    match key {
+        "s3_access_key" => cfg.s3_access_key = Some(value),
+        "s3_secret_key" => cfg.s3_secret_key = Some(value),
+        "s3_bucket" => cfg.s3_bucket = Some(value),
+        "s3_endpoint" => cfg.s3_endpoint = Some(value),
+        "s3_region" => cfg.s3_region = Some(value),
+        _ => bail!("unknown S3 config key '{key}'"),
+    }
+    Ok(())
+}
+
+fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
+    match key {
+        "s3_access_key" => Ok(cfg.s3_access_key.as_deref()),
+        "s3_secret_key" => Ok(cfg.s3_secret_key.as_deref()),
+        "s3_bucket" => Ok(cfg.s3_bucket.as_deref()),
+        "s3_endpoint" => Ok(cfg.s3_endpoint.as_deref()),
+        "s3_region" => Ok(cfg.s3_region.as_deref()),
+        _ => bail!("unknown S3 config key '{key}'"),
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    matches!(key, "s3_access_key" | "s3_secret_key")
 }

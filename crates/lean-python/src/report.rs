@@ -1047,10 +1047,10 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
     let mut html = format!(
         "<div class=\"heatmap\"><h3>Alpha Ranking — Keep / Dilutive ({kept} of {total} kept)</h3>\
          <table style=\"font-size:.85rem\"><tr style=\"color:#888\">\
-         <td>Alpha</td><td style=\"text-align:right\">Mean IC</td><td style=\"text-align:right\">IC IR</td>\
+         <td>Alpha</td><td style=\"text-align:center\">Metric</td><td style=\"text-align:right\">Mean</td><td style=\"text-align:right\">IR</td>\
          <td style=\"text-align:right\">t-stat</td>\
          <td style=\"text-align:right\">Partial IC</td><td style=\"text-align:right\">Marginal Contribution</td>\
-         <td style=\"text-align:right\">Hit</td>\
+         <td style=\"text-align:right\">Hit</td><td style=\"text-align:right\">Skew</td>\
          <td style=\"text-align:right\">Periods</td><td style=\"text-align:center\">Decision</td>\
          <td style=\"text-align:left;color:#888\">Reason</td></tr>",
         kept = kept,
@@ -1067,26 +1067,35 @@ fn build_alpha_ranking(a: &lean_alpha::AlphaAnalytics) -> String {
         } else {
             "—".to_string()
         };
+        let skew = if r.skew.is_finite() {
+            format!("{:+.2}", r.skew)
+        } else {
+            "—".to_string()
+        };
         html.push_str(&format!(
             "<tr style=\"background:{bg}\">\
              <td style=\"color:#ddd\">{name}</td>\
+             <td style=\"text-align:center;color:#999;font-size:.72rem\">{metric}</td>\
              <td style=\"text-align:right\">{mic}</td>\
              <td style=\"text-align:right\">{ir}</td>\
              <td style=\"text-align:right\">{t}</td>\
              <td style=\"text-align:right\">{pic}</td>\
              <td style=\"text-align:right\">{mc}</td>\
              <td style=\"text-align:right\">{hit}</td>\
+             <td style=\"text-align:right\">{skew}</td>\
              <td style=\"text-align:right\">{np}</td>\
              <td style=\"text-align:center\"><span style=\"background:{bbg};color:#fff;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600\">{badge}</span></td>\
              <td style=\"text-align:left;color:#999;font-size:.78rem\">{reason}</td></tr>",
             bg = bg,
             name = escape_html(&r.name),
+            metric = escape_html(&r.metric),
             mic = fmt(r.mean_ic),
             ir = fmt(r.ic_ir),
             t = fmt(r.t_stat),
             pic = fmt4(r.partial_ic),
             mc = fmt4(r.marginal_contribution),
             hit = hit,
+            skew = skew,
             np = r.n_periods,
             bbg = badge_bg,
             badge = badge,
