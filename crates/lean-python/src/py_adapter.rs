@@ -464,7 +464,7 @@ impl PyAlgorithmAdapter {
                 })
                 .collect();
             match self.py_obj.call_method1(py, "OnMarginCall", (payload,)) {
-                Ok(result) => parse_margin_call_python_response(&result.bind(py), requests),
+                Ok(result) => parse_margin_call_python_response(result.bind(py), requests),
                 Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
                     requests.to_vec()
                 }

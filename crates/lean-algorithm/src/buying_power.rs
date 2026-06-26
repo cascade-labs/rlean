@@ -220,6 +220,7 @@ impl BuyingPowerModel {
     }
 
     /// Mirrors C# `GetMaximumOrderQuantityForTargetBuyingPower`.
+    #[allow(clippy::too_many_arguments)]
     pub fn maximum_order_quantity_for_target_buying_power(
         model: Self,
         holding: &SecurityHolding,
@@ -271,8 +272,8 @@ impl BuyingPowerModel {
         }
 
         let mut last_order_quantity = Decimal::ZERO;
-        let mut order_quantity = Decimal::ZERO;
-        let mut signed_target_holdings_margin = Decimal::ZERO;
+        let mut order_quantity;
+        let mut signed_target_holdings_margin;
 
         loop {
             let (qty, holdings_margin) = Self::amount_to_order(
@@ -310,6 +311,7 @@ impl BuyingPowerModel {
     }
 
     /// Mirrors C# `GetMaximumOrderQuantityForDeltaBuyingPower`.
+    #[allow(clippy::too_many_arguments)]
     pub fn maximum_order_quantity_for_delta_buying_power(
         model: Self,
         holding: &SecurityHolding,

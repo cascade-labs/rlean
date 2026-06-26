@@ -122,8 +122,10 @@ impl SubscriptionStream {
         path: &Path,
         params: &QueryParams,
     ) -> LeanResult<Vec<SubscriptionDataPoint>> {
-        let symbols_by_sid =
-            std::collections::HashMap::from([(self.config.symbol.id.sid, self.config.symbol.clone())]);
+        let symbols_by_sid = std::collections::HashMap::from([(
+            self.config.symbol.id.sid,
+            self.config.symbol.clone(),
+        )]);
         let grouped = self
             .reader
             .read_trade_bar_partition_grouped_async(path, &symbols_by_sid, params)
@@ -135,11 +137,7 @@ impl SubscriptionStream {
         let mut out = Vec::with_capacity(bars.len());
         for bar in bars.drain(..) {
             let mut bar = bar;
-            normalize_trade_bar(
-                &mut bar,
-                self.config.normalization_mode,
-                &self.factor_rows,
-            );
+            normalize_trade_bar(&mut bar, self.config.normalization_mode, &self.factor_rows);
             out.push(SubscriptionDataPoint::TradeBar(bar));
         }
         Ok(out)
@@ -150,8 +148,10 @@ impl SubscriptionStream {
         path: &Path,
         params: &QueryParams,
     ) -> LeanResult<Vec<SubscriptionDataPoint>> {
-        let symbols_by_sid =
-            std::collections::HashMap::from([(self.config.symbol.id.sid, self.config.symbol.clone())]);
+        let symbols_by_sid = std::collections::HashMap::from([(
+            self.config.symbol.id.sid,
+            self.config.symbol.clone(),
+        )]);
         let grouped = self
             .reader
             .read_quote_bar_partition_grouped_async(path, &symbols_by_sid, params)
@@ -163,11 +163,7 @@ impl SubscriptionStream {
         let mut out = Vec::with_capacity(bars.len());
         for bar in bars.drain(..) {
             let mut bar = bar;
-            normalize_quote_bar(
-                &mut bar,
-                self.config.normalization_mode,
-                &self.factor_rows,
-            );
+            normalize_quote_bar(&mut bar, self.config.normalization_mode, &self.factor_rows);
             out.push(SubscriptionDataPoint::QuoteBar(bar));
         }
         Ok(out)
@@ -181,10 +177,7 @@ impl SubscriptionStream {
         let ticks = self
             .reader
             .read_tick_partition(path, &self.config.symbol, params)?;
-        Ok(ticks
-            .into_iter()
-            .map(SubscriptionDataPoint::Tick)
-            .collect())
+        Ok(ticks.into_iter().map(SubscriptionDataPoint::Tick).collect())
     }
 }
 

@@ -46,7 +46,10 @@ impl DataManager {
         self.synchronizer = Some(SliceSynchronizer::new(streams, end));
         debug!(
             "Initialized subscription feed with {} stream(s)",
-            self.synchronizer.as_ref().map(|s| s.streams().len()).unwrap_or(0)
+            self.synchronizer
+                .as_ref()
+                .map(|s| s.streams().len())
+                .unwrap_or(0)
         );
         Ok(())
     }
@@ -72,7 +75,9 @@ impl DataManager {
 mod tests {
     use super::DataManager;
     use chrono::{NaiveDate, TimeZone, Utc};
-    use lean_core::{DataNormalizationMode, DateTime, Market, Resolution, Symbol, TimeSpan, TickType};
+    use lean_core::{
+        DataNormalizationMode, DateTime, Market, Resolution, Symbol, TickType, TimeSpan,
+    };
     use lean_data::{SubscriptionDataConfig, Tick, TradeBar, TradeBarData};
     use lean_storage::{FactorFileEntry, ParquetWriter, PathResolver, WriterConfig};
     use rust_decimal_macros::dec;

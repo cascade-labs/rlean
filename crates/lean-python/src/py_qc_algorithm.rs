@@ -656,6 +656,7 @@ impl PyQcAlgorithm {
         data_normalization_mode=None,
         dataNormalizationMode=None
     ))]
+    #[allow(clippy::too_many_arguments)]
     #[allow(non_snake_case)]
     fn add_equity(
         &self,

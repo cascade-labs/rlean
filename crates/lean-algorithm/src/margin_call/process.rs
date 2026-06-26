@@ -51,6 +51,7 @@ fn all_symbols_exchange_open(
 }
 
 /// Run margin call scan for a time slice. Returns `StopBankrupt` when the caller should halt.
+#[allow(clippy::too_many_arguments)]
 pub fn process_margin_call_scan<P: MarginCallFillProcessor>(
     is_backtest: bool,
     is_warming_up: bool,

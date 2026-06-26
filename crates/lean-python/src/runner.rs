@@ -6738,7 +6738,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 &mut completed_trades,
                 as_sidecar_writer(live_writer.as_ref()),
             ) {
-                stop_backtest = true;
                 break;
             }
 

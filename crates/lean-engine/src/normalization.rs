@@ -190,11 +190,7 @@ mod tests {
                 reference_price: 0.0,
             },
         ];
-        normalize_trade_bar(
-            &mut bar,
-            DataNormalizationMode::Adjusted,
-            &rows,
-        );
+        normalize_trade_bar(&mut bar, DataNormalizationMode::Adjusted, &rows);
         assert_eq!(bar.close, dec!(200));
     }
 }

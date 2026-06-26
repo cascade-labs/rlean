@@ -80,7 +80,12 @@ mod tests {
     ) {
         let resolver = PathResolver::new(root);
         let writer = ParquetWriter::new(WriterConfig::default());
-        let path = resolver.market_data_partition(symbol, Resolution::Minute, lean_core::TickType::Trade, date);
+        let path = resolver.market_data_partition(
+            symbol,
+            Resolution::Minute,
+            lean_core::TickType::Trade,
+            date,
+        );
         writer.write_trade_bars(&bars, &path).unwrap();
     }
 
