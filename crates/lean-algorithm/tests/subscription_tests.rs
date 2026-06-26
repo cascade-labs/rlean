@@ -1,5 +1,8 @@
 use lean_algorithm::qc_algorithm::{BrokerageName, QcAlgorithm};
-use lean_core::{Market, OptionRight, OptionStyle, Resolution, SecurityType, Symbol, TickType};
+use lean_core::{
+    DataNormalizationMode, Market, OptionRight, OptionStyle, Resolution, SecurityType, Symbol,
+    TickType,
+};
 use rust_decimal_macros::dec;
 
 #[test]
@@ -90,6 +93,92 @@ fn add_option_contract_minute_adds_trade_and_quote_subscriptions() {
             && sub.resolution == Resolution::Minute
             && sub.tick_type == TickType::Quote
     }));
+}
+
+#[test]
+fn add_equity_defaults_to_adjusted_normalization() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+    for sub in algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&symbol)
+    {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Adjusted);
+    }
+}
+
+#[test]
+fn add_equity_with_normalization_stores_requested_mode() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let symbol = algorithm.add_equity_with_normalization(
+        "SPY",
+        Resolution::Minute,
+        Some(DataNormalizationMode::Raw),
+    );
+    for sub in algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&symbol)
+    {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Raw);
+    }
+}
+
+#[test]
+fn set_data_normalization_mode_flips_trade_and_quote_configs() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+    let updated = algorithm.set_data_normalization_mode(&symbol, DataNormalizationMode::Raw);
+    assert_eq!(updated, 2);
+    for sub in algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&symbol)
+    {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Raw);
+    }
+}
+
+#[test]
+fn add_option_contract_subscriptions_are_raw_and_force_underlying_raw() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    let underlying = Symbol::create_equity("SPY", &Market::usa());
+    let option = Symbol::create_option(
+        underlying.clone(),
+        &Market::usa(),
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+        dec!(450),
+        OptionRight::Call,
+        OptionStyle::American,
+    );
+
+    let symbol = algorithm.add_option_contract(option, Resolution::Minute);
+
+    for sub in algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&symbol)
+    {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Raw);
+    }
+    let underlying_subs = algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&underlying);
+    assert!(!underlying_subs.is_empty());
+    for sub in underlying_subs {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Raw);
+    }
+}
+
+#[test]
+fn add_option_forces_underlying_to_raw() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    algorithm.add_option("SPY", Resolution::Minute);
+    let underlying = Symbol::create_equity("SPY", &Market::usa());
+    let subs = algorithm
+        .subscription_manager
+        .get_configs_for_symbol(&underlying);
+    assert!(!subs.is_empty());
+    for sub in subs {
+        assert_eq!(sub.normalization_mode, DataNormalizationMode::Raw);
+    }
 }
 
 #[test]

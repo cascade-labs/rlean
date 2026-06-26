@@ -1,5 +1,5 @@
 use lean_core::{DateTime, Price, Result as LeanResult};
-use lean_data::Slice;
+use lean_data::{Slice, SubscriptionDataConfig};
 use lean_orders::OrderEvent;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,9 @@ pub trait IAlgorithm: Send + Sync {
     /// Called when margin call occurs.
     fn on_margin_call(&mut self, _requests: &[lean_orders::Order]) {}
 
+    /// Called when margin remaining drops below 5% of portfolio value.
+    fn on_margin_call_warning(&mut self) {}
+
     /// Called when securities change in universe.
     fn on_securities_changed(&mut self, _changes: &SecurityChanges) {}
 
@@ -61,6 +64,12 @@ pub trait IAlgorithm: Send + Sync {
     /// Defaults to 100,000 — implementors backed by QcAlgorithm should override.
     fn starting_cash(&self) -> Price {
         dec!(100_000)
+    }
+
+    /// Active subscription configs after `initialize()`.
+    /// Algorithms backed by `QcAlgorithm` should delegate to `subscription_manager`.
+    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
+        Vec::new()
     }
 }
 

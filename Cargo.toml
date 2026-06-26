@@ -33,6 +33,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Cascade Labs"]
 license = "Apache-2.0"
 
@@ -44,6 +45,7 @@ arrow-schema = "53"
 arrow-cast = "53"
 parquet = { version = "53", features = ["async"] }
 datafusion = "43"
+object_store = { version = "0.11.2", features = ["aws"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }

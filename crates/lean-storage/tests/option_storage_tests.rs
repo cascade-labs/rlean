@@ -99,8 +99,8 @@ fn test_option_universe_partition_path() {
 
 /// Write OptionEodBar rows to a Parquet file and read them back; verify
 /// that all fields survive the round trip (prices, dates, string columns).
-#[test]
-fn test_option_eod_bar_round_trip() {
+#[tokio::test]
+async fn test_option_eod_bar_round_trip() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("option_eod_roundtrip.parquet");
 
@@ -132,7 +132,12 @@ fn test_option_eod_bar_round_trip() {
     assert!(path.exists(), "parquet file should have been created");
 
     let reader = ParquetReader::new();
-    let roundtrip = reader.read_option_eod_bars(&[path]).unwrap();
+    let roundtrip = reader
+        .read_option_eod_partition_grouped(&path, &["SPY".to_string()])
+        .await
+        .unwrap()
+        .remove("SPY")
+        .unwrap_or_default();
 
     assert_eq!(roundtrip.len(), bars.len(), "row count should match");
 
@@ -219,6 +224,34 @@ async fn test_read_option_universe_filtered_by_underlying() {
     assert!(filtered.iter().any(|row| row.underlying == "SPY"));
     assert!(filtered.iter().any(|row| row.underlying == "AAPL"));
     assert!(!filtered.iter().any(|row| row.underlying == "QQQ"));
+}
+
+#[tokio::test]
+async fn test_read_option_eod_partition_grouped_by_underlying() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("option_eod.parquet");
+    let expiry = date(2021, 4, 16);
+    let bars = vec![
+        sample_eod_bar("SPY", "SPY210416P00480000", expiry, "P"),
+        sample_eod_bar("SPY", "SPY210416C00480000", expiry, "C"),
+        sample_eod_bar("QQQ", "QQQ210416P00350000", expiry, "P"),
+        sample_eod_bar("AAPL", "AAPL210416P00150000", expiry, "P"),
+    ];
+
+    let writer = ParquetWriter::new(WriterConfig::default());
+    writer.write_option_eod_bars(&bars, &path).unwrap();
+
+    let reader = ParquetReader::new();
+    let grouped = reader
+        .read_option_eod_partition_grouped(&path, &["spy".to_string(), "AAPL".to_string()])
+        .await
+        .unwrap();
+
+    // Only requested underlyings present, keyed by uppercase ticker.
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped.get("SPY").map(Vec::len), Some(2));
+    assert_eq!(grouped.get("AAPL").map(Vec::len), Some(1));
+    assert!(!grouped.contains_key("QQQ"));
 }
 
 /// Writing an empty slice should be a no-op (no file created).

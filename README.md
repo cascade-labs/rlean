@@ -1,13 +1,16 @@
 # rlean
 
 [![Tests Passing](https://github.com/cascade-labs/rlean/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cascade-labs/rlean/actions/workflows/test.yml)
-[![gitcgr](https://gitcgr.com/badge/cascade-labs/rlean.svg)](https://gitcgr.com/cascade-labs/rlean)
+[![Lint](https://github.com/cascade-labs/rlean/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/cascade-labs/rlean/actions/workflows/lint.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/)
+[![Dependencies](https://deps.rs/repo/github/cascade-labs/rlean/status.svg)](https://deps.rs/repo/github/cascade-labs/rlean)
 
-A Rust rewrite of [QuantConnect LEAN](https://github.com/QuantConnect/Lean), the open-source algorithmic trading engine. rlean targets the same strategy API as LEAN's C# Python bindings — existing `QCAlgorithm`-based strategies run unmodified — while adding a native Rust library for writing high-performance strategies directly. All market data is backed by [Apache Parquet](https://parquet.apache.org/), replacing LEAN's CSV-based data layer.
+A Rust algorithmic trading engine inspired by [QuantConnect LEAN](https://github.com/QuantConnect/Lean). rlean is not a line-for-line port of LEAN; instead it aims for API parity with LEAN's strategy interface — the goal is for existing `QCAlgorithm`-based Python strategies to run with little or no modification — while adding a native Rust library for writing high-performance strategies directly. All market data is backed by [Apache Parquet](https://parquet.apache.org/), in place of LEAN's CSV-based data layer.
 
 ## Features
 
-- **Python strategy compatibility** — `QCAlgorithm` API identical to LEAN C#. Strategies written for LEAN work as-is.
+- **Python strategy compatibility** — targets API parity with LEAN's `QCAlgorithm`, so most strategies written for LEAN run with little or no modification.
 - **Rust strategy library** — implement `IAlgorithm` in Rust for zero-overhead backtests and live execution.
 - **Parquet data layer** — trade bars, factor files, map files, and option chains all stored in Parquet. No CSV.
 - **Plugin system** — brokerages and data providers are runtime plugins, installed and managed via `rlean plugin`.
@@ -62,6 +65,24 @@ This creates:
 my-strategies/
   rlean.json      # workspace config (data root, default language)
   data/           # Parquet data directory
+```
+
+Global config lives in `~/.rlean/config`. The `datastore` setting defaults to
+`file`; set it to `s3` only when using an S3-backed data store. With
+`datastore=s3`, `data-folder` is interpreted as the path prefix inside the
+bucket, and rlean keeps a local cache under `~/.rlean/cache/s3/`.
+
+```json
+{
+  "default-language": "python",
+  "datastore": "s3",
+  "data-folder": "lean/data",
+  "s3_access_key": "...",
+  "s3_secret_key": "...",
+  "s3_bucket": "my-bucket",
+  "s3_endpoint": "https://s3-compatible-endpoint.example.com",
+  "s3_region": "us-east-1"
+}
 ```
 
 ### 2. Create a project

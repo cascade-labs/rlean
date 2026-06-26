@@ -8,14 +8,16 @@ use arrow_array::types::{
 };
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
-    RecordBatch, StringArray, UInt32Array, UInt64Array,
+    RecordBatch, StringArray, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_cast::display::array_value_to_string;
 use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use datafusion::common::config::ConfigOptions;
 use datafusion::prelude::*;
-use lean_core::{DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol};
+use lean_core::{
+    DateTime, NanosecondTimestamp, Result as LeanResult, SecurityType, Symbol, TickType,
+};
 use lean_data::{
     Bar, CustomDataPoint, CustomDataQuery, CustomParquetSource, MarginInterestRate,
     PerpetualContext, QuoteBar, Tick, TradeBar,
@@ -27,12 +29,13 @@ use std::sync::Arc;
 use tracing::debug;
 
 /// Parameters for a data query.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct QueryParams {
     pub predicate: Predicate,
     /// Maximum rows to return. None = unlimited.
     pub limit: Option<usize>,
-    /// Sort ascending by time. Default true.
+    /// Compatibility flag retained for callers that already construct query params.
+    /// Market-data readers normalize output order by time regardless of this value.
     pub order_by_time: bool,
 }
 
@@ -58,6 +61,12 @@ impl QueryParams {
     pub fn with_limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
+    }
+}
+
+impl Default for QueryParams {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -281,12 +290,12 @@ impl ParquetReader {
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
         }
 
-        // Sort by time
-        if params.order_by_time {
-            df = df
-                .sort(vec![col("time_ns").sort(true, true)])
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        }
+        df = df
+            .sort(vec![
+                col("time_ns").sort(true, true),
+                col("symbol_sid").sort(true, true),
+            ])
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
         // Apply limit
         if let Some(limit) = params.limit {
@@ -307,6 +316,7 @@ impl ParquetReader {
         for batch in &batches {
             result.extend(convert::record_batch_to_trade_bars(batch, symbol.clone()));
         }
+        sort_trade_bars_by_time(&mut result);
 
         debug!("Read {} trade bars (predicate applied)", result.len());
         Ok(result)
@@ -414,6 +424,7 @@ impl ParquetReader {
             }
         }
 
+        sort_trade_bars_by_time(&mut result);
         Ok(result)
     }
 
@@ -425,11 +436,13 @@ impl ParquetReader {
         template: &Symbol,
         params: &QueryParams,
     ) -> LeanResult<Vec<TradeBar>> {
-        Ok(self
+        let mut bars: Vec<_> = self
             .read_trade_bar_partition_grouped(path, template, params)?
             .into_values()
             .flatten()
-            .collect())
+            .collect();
+        sort_trade_bars_by_time(&mut bars);
+        Ok(bars)
     }
 
     /// Read every trade bar in an all-symbol partition using DataFusion
@@ -462,6 +475,199 @@ impl ParquetReader {
             )
             .await?;
         trade_batches_to_grouped(&batches, symbols_by_sid, params)
+    }
+
+    /// Read trade bars from multiple all-symbol partitions in one DataFusion scan,
+    /// grouped by stored SID.
+    pub async fn read_trade_bar_partitions_grouped_async(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_sid: &HashMap<u64, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<TradeBar>>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut df = self
+            .read_market_partitions_dataframe(
+                paths,
+                params,
+                &[
+                    "time_ns",
+                    "end_time_ns",
+                    "symbol_sid",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "period_ns",
+                ],
+            )
+            .await?;
+
+        df = df
+            .sort(vec![
+                col("time_ns").sort(true, true),
+                col("symbol_sid").sort(true, true),
+            ])
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        if let Some(limit) = params.limit {
+            df = df
+                .limit(0, Some(limit))
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        trade_batches_to_grouped(&batches, symbols_by_sid, params)
+    }
+
+    async fn read_market_partitions_dataframe(
+        &self,
+        paths: &[PathBuf],
+        params: &QueryParams,
+        columns: &[&str],
+    ) -> LeanResult<datafusion::dataframe::DataFrame> {
+        let path_strings: Vec<String> = paths
+            .iter()
+            .map(|path| {
+                path.to_str().map(str::to_owned).ok_or_else(|| {
+                    lean_core::LeanError::DataError(format!(
+                        "non-utf8 parquet path: {}",
+                        path.display()
+                    ))
+                })
+            })
+            .collect::<LeanResult<_>>()?;
+
+        let mut df = self
+            .ctx
+            .read_parquet(path_strings, ParquetReadOptions::default())
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+            .select_columns(columns)
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        if let Some(filter) = params.predicate.to_datafusion_expr() {
+            df = df
+                .filter(filter)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        Ok(df)
+    }
+
+    /// Read quote bars from multiple all-symbol partitions in one DataFusion scan,
+    /// grouped by stored SID.
+    pub async fn read_quote_bar_partitions_grouped_async(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_sid: &HashMap<u64, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<QuoteBar>>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut df = self
+            .read_market_partitions_dataframe(
+                paths,
+                params,
+                &[
+                    "time_ns",
+                    "end_time_ns",
+                    "symbol_sid",
+                    "bid_open",
+                    "bid_high",
+                    "bid_low",
+                    "bid_close",
+                    "ask_open",
+                    "ask_high",
+                    "ask_low",
+                    "ask_close",
+                    "last_bid_size",
+                    "last_ask_size",
+                    "period_ns",
+                ],
+            )
+            .await?;
+
+        df = df
+            .sort(vec![
+                col("time_ns").sort(true, true),
+                col("symbol_sid").sort(true, true),
+            ])
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        if let Some(limit) = params.limit {
+            df = df
+                .limit(0, Some(limit))
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        quote_batches_to_grouped(&batches, symbols_by_sid, params)
+    }
+
+    /// Read ticks from multiple all-symbol partitions in one DataFusion scan,
+    /// grouped by stored SID.
+    pub async fn read_tick_partitions_grouped_async(
+        &self,
+        paths: &[PathBuf],
+        symbols_by_sid: &HashMap<u64, Symbol>,
+        params: &QueryParams,
+    ) -> LeanResult<HashMap<u64, Vec<Tick>>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut df = self
+            .read_market_partitions_dataframe(
+                paths,
+                params,
+                &[
+                    "time_ns",
+                    "symbol_sid",
+                    "tick_type",
+                    "value",
+                    "quantity",
+                    "bid_price",
+                    "ask_price",
+                    "bid_size",
+                    "ask_size",
+                    "exchange",
+                    "sale_condition",
+                    "suspicious",
+                ],
+            )
+            .await?;
+
+        df = df
+            .sort(vec![
+                col("time_ns").sort(true, true),
+                col("symbol_sid").sort(true, true),
+            ])
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        if let Some(limit) = params.limit {
+            df = df
+                .limit(0, Some(limit))
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        }
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        tick_batches_to_grouped(&batches, symbols_by_sid, params)
     }
 
     /// Read every trade bar in an all-symbol partition, grouped by stored SID.
@@ -518,6 +724,7 @@ impl ParquetReader {
             }
         }
 
+        sort_trade_groups_by_time(&mut grouped);
         Ok(grouped)
     }
 
@@ -577,6 +784,7 @@ impl ParquetReader {
             }
         }
 
+        sort_quote_bars_by_time(&mut result);
         Ok(result)
     }
 
@@ -587,11 +795,13 @@ impl ParquetReader {
         template: &Symbol,
         params: &QueryParams,
     ) -> LeanResult<Vec<QuoteBar>> {
-        Ok(self
+        let mut bars: Vec<_> = self
             .read_quote_bar_partition_grouped(path, template, params)?
             .into_values()
             .flatten()
-            .collect())
+            .collect();
+        sort_quote_bars_by_time(&mut bars);
+        Ok(bars)
     }
 
     /// Read every quote bar in an all-symbol partition using DataFusion
@@ -709,6 +919,7 @@ impl ParquetReader {
             }
         }
 
+        sort_quote_groups_by_time(&mut grouped);
         Ok(grouped)
     }
 
@@ -750,6 +961,13 @@ impl ParquetReader {
                     .filter(filter)
                     .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
             }
+
+            df = df
+                .sort(vec![
+                    col("time_ns").sort(true, true),
+                    col("symbol_sid").sort(true, true),
+                ])
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
 
             if let Some(limit) = params.limit {
                 df = df
@@ -823,6 +1041,7 @@ impl ParquetReader {
             }
         }
 
+        sort_ticks_by_time(&mut result);
         Ok(result)
     }
 
@@ -861,6 +1080,7 @@ impl ParquetReader {
             }
         }
 
+        sort_ticks_by_time(&mut result);
         Ok(result)
     }
 
@@ -899,6 +1119,7 @@ impl ParquetReader {
             }
         }
 
+        sort_margin_interest_rates_by_time(&mut result);
         Ok(result)
     }
 
@@ -937,6 +1158,7 @@ impl ParquetReader {
             }
         }
 
+        sort_perpetual_contexts_by_time(&mut result);
         Ok(result)
     }
 
@@ -961,48 +1183,103 @@ impl ParquetReader {
         Ok(result)
     }
 
-    /// Read option EOD bars from one or more parquet files.
+    /// Read a day's market-wide option EOD partition ONCE, pushing an
+    /// `underlying IN (...)` predicate down to the parquet layer, and return the
+    /// matching rows grouped by uppercase underlying ticker.
     ///
-    /// Each file typically covers all contracts for one underlying.  The rows
-    /// from all provided files are concatenated and returned unsorted.
-    pub fn read_option_eod_bars(&self, paths: &[PathBuf]) -> LeanResult<Vec<OptionEodBar>> {
-        if paths.is_empty() {
-            return Ok(vec![]);
+    /// This is the option analogue of [`read_trade_bar_partition_grouped`]: the
+    /// single all-underlyings file is decoded once and the requested underlyings
+    /// are served from that read. Only the requested underlyings appear as keys;
+    /// underlyings absent from the file simply have no entry.
+    pub async fn read_option_eod_partition_grouped(
+        &self,
+        path: &Path,
+        underlyings: &[String],
+    ) -> LeanResult<HashMap<String, Vec<OptionEodBar>>> {
+        if !path.exists() || underlyings.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        let mut result: Vec<OptionEodBar> = Vec::new();
-
-        for path in paths {
-            let mut rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> LeanResult<Vec<OptionEodBar>> {
-                    let file = std::fs::File::open(path).map_err(|e| {
-                        lean_core::LeanError::DataError(format!("{}: {}", path.display(), e))
-                    })?;
-
-                    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-                        .build()
-                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-                    let mut rows = Vec::new();
-                    for batch_result in reader {
-                        let batch = batch_result
-                            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-                        rows.extend(convert::record_batch_to_option_eod_bars(&batch));
-                    }
-                    Ok(rows)
-                },
-            ))
-            .map_err(|panic| parquet_reader_panic_error(path, panic))??;
-            result.append(&mut rows);
+        let requested: HashSet<String> = underlyings
+            .iter()
+            .map(|ticker| ticker.to_ascii_uppercase())
+            .collect();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
         }
+
+        let table_name = format!(
+            "option_eod_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+
+        self.ctx
+            .register_parquet(
+                &table_name,
+                path.to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+        let result = async {
+            let mut df = self
+                .ctx
+                .table(&table_name)
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            // Predicate pushdown: underlying IN (...). The cached files store the
+            // underlying as-written by the provider (case may vary), so match
+            // against the canonical, lower- and upper-case spellings.
+            let filter = requested
+                .iter()
+                .flat_map(|ticker| {
+                    [
+                        ticker.clone(),
+                        ticker.to_ascii_lowercase(),
+                        ticker.to_ascii_uppercase(),
+                    ]
+                })
+                .map(|ticker| col("underlying").eq(lit(ticker)))
+                .reduce(|a, b| a.or(b))
+                .unwrap();
+            df = df
+                .filter(filter)
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+
+            df.collect()
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))
+        }
+        .await;
+
+        let _ = self.ctx.deregister_table(&table_name);
+        let batches = result?;
+
+        let mut grouped: HashMap<String, Vec<OptionEodBar>> = HashMap::new();
+        for batch in &batches {
+            for bar in option_eod_batch_to_bars(batch)? {
+                let key = bar.underlying.to_ascii_uppercase();
+                if !requested.contains(&key) {
+                    continue;
+                }
+                grouped.entry(key).or_default().push(bar);
+            }
+        }
+        sort_option_eod_groups(&mut grouped);
 
         debug!(
-            "Read {} option EOD bars from {} file(s)",
-            result.len(),
-            paths.len()
+            "Read {} option EOD underlyings ({} rows) from {} (predicate applied)",
+            grouped.len(),
+            grouped.values().map(Vec::len).sum::<usize>(),
+            path.display(),
         );
-        Ok(result)
+        Ok(grouped)
     }
 
     /// Read option universe rows from one or more parquet files.
@@ -1037,6 +1314,7 @@ impl ParquetReader {
             .map_err(|panic| parquet_reader_panic_error(path, panic))??;
             result.append(&mut rows);
         }
+        sort_option_universe_rows(&mut result);
 
         debug!(
             "Read {} option universe rows from {} file(s)",
@@ -1137,6 +1415,7 @@ impl ParquetReader {
 
         let mut result = option_universe_batches_to_rows(&batches)?;
         result.retain(|row| requested_underlyings.contains(&row.underlying.to_ascii_uppercase()));
+        sort_option_universe_rows(&mut result);
 
         debug!(
             "Read {} filtered option universe rows from {} file(s)",
@@ -1205,6 +1484,7 @@ impl ParquetReader {
             }
         }
 
+        result.sort_by_key(|entry| entry.date);
         debug!(
             "Read {} factor file entries from {}",
             result.len(),
@@ -1268,6 +1548,7 @@ impl ParquetReader {
             }
         }
 
+        sort_custom_data_points(&mut result);
         debug!(
             "Read {} custom data points from {}",
             result.len(),
@@ -1316,6 +1597,7 @@ impl ParquetReader {
             }
         }
 
+        result.sort_by_key(|entry| entry.date);
         debug!(
             "Read {} map file entries from {}",
             result.len(),
@@ -1349,6 +1631,7 @@ fn read_custom_parquet_points_from_files(
         out.len(),
         source.paths.len()
     );
+    sort_custom_data_points(&mut out);
     Ok(out)
 }
 
@@ -1375,6 +1658,7 @@ fn read_custom_parquet_points_from_buffers(
         out.len(),
         source.buffers.len()
     );
+    sort_custom_data_points(&mut out);
     Ok(out)
 }
 
@@ -1611,6 +1895,92 @@ fn matches_symbol_filter(symbol_sid: u64, params: &QueryParams) -> bool {
     sids.contains(&symbol_sid)
 }
 
+fn sort_trade_bars_by_time(bars: &mut [TradeBar]) {
+    bars.sort_by_key(|bar| (bar.time, bar.symbol.id.sid, bar.end_time));
+}
+
+fn sort_trade_groups_by_time(grouped: &mut HashMap<u64, Vec<TradeBar>>) {
+    for bars in grouped.values_mut() {
+        sort_trade_bars_by_time(bars);
+    }
+}
+
+fn sort_quote_bars_by_time(bars: &mut [QuoteBar]) {
+    bars.sort_by_key(|bar| (bar.time, bar.symbol.id.sid, bar.end_time));
+}
+
+fn sort_quote_groups_by_time(grouped: &mut HashMap<u64, Vec<QuoteBar>>) {
+    for bars in grouped.values_mut() {
+        sort_quote_bars_by_time(bars);
+    }
+}
+
+fn sort_ticks_by_time(ticks: &mut [Tick]) {
+    ticks.sort_by_key(|tick| (tick.time, tick.symbol.id.sid));
+}
+
+fn sort_tick_groups_by_time(grouped: &mut HashMap<u64, Vec<Tick>>) {
+    for ticks in grouped.values_mut() {
+        sort_ticks_by_time(ticks);
+    }
+}
+
+fn sort_margin_interest_rates_by_time(rows: &mut [MarginInterestRate]) {
+    rows.sort_by_key(|row| (row.time, row.symbol.id.sid));
+}
+
+fn sort_perpetual_contexts_by_time(rows: &mut [PerpetualContext]) {
+    rows.sort_by_key(|row| (row.time, row.symbol.id.sid, row.end_time));
+}
+
+fn sort_option_eod_bars(rows: &mut [OptionEodBar]) {
+    rows.sort_by(|a, b| {
+        (
+            a.date,
+            a.underlying.as_str(),
+            a.symbol_value.as_str(),
+            a.expiration,
+            a.right.as_str(),
+        )
+            .cmp(&(
+                b.date,
+                b.underlying.as_str(),
+                b.symbol_value.as_str(),
+                b.expiration,
+                b.right.as_str(),
+            ))
+    });
+}
+
+fn sort_option_eod_groups(grouped: &mut HashMap<String, Vec<OptionEodBar>>) {
+    for rows in grouped.values_mut() {
+        sort_option_eod_bars(rows);
+    }
+}
+
+fn sort_option_universe_rows(rows: &mut [OptionUniverseRow]) {
+    rows.sort_by(|a, b| {
+        (
+            a.date,
+            a.underlying.as_str(),
+            a.symbol_value.as_str(),
+            a.expiration,
+            a.right.as_str(),
+        )
+            .cmp(&(
+                b.date,
+                b.underlying.as_str(),
+                b.symbol_value.as_str(),
+                b.expiration,
+                b.right.as_str(),
+            ))
+    });
+}
+
+fn sort_custom_data_points(rows: &mut [CustomDataPoint]) {
+    rows.sort_by_key(|row| (row.time, row.end_time));
+}
+
 fn trade_batches_to_grouped(
     batches: &[RecordBatch],
     symbols_by_sid: &HashMap<u64, Symbol>,
@@ -1655,6 +2025,7 @@ fn trade_batches_to_grouped(
         }
     }
 
+    sort_trade_groups_by_time(&mut grouped);
     Ok(grouped)
 }
 
@@ -1726,6 +2097,69 @@ fn quote_batches_to_grouped(
         }
     }
 
+    sort_quote_groups_by_time(&mut grouped);
+    Ok(grouped)
+}
+
+fn tick_batches_to_grouped(
+    batches: &[RecordBatch],
+    symbols_by_sid: &HashMap<u64, Symbol>,
+    params: &QueryParams,
+) -> LeanResult<HashMap<u64, Vec<Tick>>> {
+    let mut grouped: HashMap<u64, Vec<Tick>> = HashMap::new();
+
+    for batch in batches {
+        let symbol_sids = uint64_column_named(batch, "symbol_sid")?;
+        let time_ns = int64_column_named(batch, "time_ns")?;
+        let tick_type_col = uint8_column_named(batch, "tick_type")?;
+        let value_col = int64_column_named(batch, "value")?;
+        let quantity_col = int64_column_named(batch, "quantity")?;
+        let bid_price_col = int64_column_named(batch, "bid_price")?;
+        let ask_price_col = int64_column_named(batch, "ask_price")?;
+        let bid_size_col = int64_column_named(batch, "bid_size")?;
+        let ask_size_col = int64_column_named(batch, "ask_size")?;
+        let exchange_idx = column_index(batch, "exchange")?;
+        let sale_condition_idx = column_index(batch, "sale_condition")?;
+        let suspicious_col = boolean_column_named(batch, "suspicious")?;
+
+        for row_idx in 0..batch.num_rows() {
+            let time = lean_core::NanosecondTimestamp(time_ns.value(row_idx));
+            if !matches_time_filter(time, params) {
+                continue;
+            }
+            let symbol_sid = symbol_sids.value(row_idx);
+            if !matches_symbol_filter(symbol_sid, params) {
+                continue;
+            }
+            let Some(symbol) = symbols_by_sid.get(&symbol_sid).cloned() else {
+                continue;
+            };
+            grouped.entry(symbol_sid).or_default().push(Tick {
+                symbol,
+                time,
+                tick_type: match tick_type_col.value(row_idx) {
+                    0 => TickType::Trade,
+                    1 => TickType::Quote,
+                    2 => TickType::OpenInterest,
+                    _ => TickType::Trade,
+                },
+                value: i64_to_price(value_col.value(row_idx)),
+                quantity: i64_to_price(quantity_col.value(row_idx)),
+                bid_price: i64_to_price(bid_price_col.value(row_idx)),
+                ask_price: i64_to_price(ask_price_col.value(row_idx)),
+                bid_size: i64_to_price(bid_size_col.value(row_idx)),
+                ask_size: i64_to_price(ask_size_col.value(row_idx)),
+                exchange: string_cell_as_string(batch.column(exchange_idx).as_ref(), row_idx),
+                sale_condition: string_cell_as_string(
+                    batch.column(sale_condition_idx).as_ref(),
+                    row_idx,
+                ),
+                suspicious: suspicious_col.value(row_idx),
+            });
+        }
+    }
+
+    sort_tick_groups_by_time(&mut grouped);
     Ok(grouped)
 }
 
@@ -1765,6 +2199,61 @@ fn option_universe_batches_to_rows(batches: &[RecordBatch]) -> LeanResult<Vec<Op
     }
 
     Ok(rows)
+}
+
+/// Convert DataFusion-produced option EOD record batches into `OptionEodBar`s,
+/// resolving every column by NAME. DataFusion may hand back columns in a
+/// different physical order or string encoding than the on-disk writer schema,
+/// so positional decoding is not safe here.
+fn option_eod_batch_to_bars(batch: &RecordBatch) -> LeanResult<Vec<OptionEodBar>> {
+    let date_ns = int64_column_named(batch, "date_ns")?;
+    let symbol_value_idx = column_index(batch, "symbol_value")?;
+    let underlying_idx = column_index(batch, "underlying")?;
+    let expiration_ns = int64_column_named(batch, "expiration_ns")?;
+    let strike = int64_column_named(batch, "strike")?;
+    let right_idx = column_index(batch, "right")?;
+    let open = int64_column_named(batch, "open")?;
+    let high = int64_column_named(batch, "high")?;
+    let low = int64_column_named(batch, "low")?;
+    let close = int64_column_named(batch, "close")?;
+    let volume = int64_column_named(batch, "volume")?;
+    let bid = int64_column_named(batch, "bid")?;
+    let ask = int64_column_named(batch, "ask")?;
+    let bid_size = int64_column_named(batch, "bid_size")?;
+    let ask_size = int64_column_named(batch, "ask_size")?;
+
+    let symbol_value_col = batch.column(symbol_value_idx).as_ref();
+    let underlying_col = batch.column(underlying_idx).as_ref();
+    let right_col = batch.column(right_idx).as_ref();
+
+    let mut bars = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let symbol_value = string_cell_as_string(symbol_value_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("symbol_value column missing".into()))?;
+        let underlying = string_cell_as_string(underlying_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("underlying column missing".into()))?;
+        let right = string_cell_as_string(right_col, i)
+            .ok_or_else(|| lean_core::LeanError::DataError("right column missing".into()))?;
+
+        bars.push(OptionEodBar {
+            date: ns_to_date(date_ns.value(i)),
+            symbol_value,
+            underlying,
+            expiration: ns_to_date(expiration_ns.value(i)),
+            strike: i64_to_price(strike.value(i)),
+            right,
+            open: i64_to_price(open.value(i)),
+            high: i64_to_price(high.value(i)),
+            low: i64_to_price(low.value(i)),
+            close: i64_to_price(close.value(i)),
+            volume: volume.value(i),
+            bid: i64_to_price(bid.value(i)),
+            ask: i64_to_price(ask.value(i)),
+            bid_size: bid_size.value(i),
+            ask_size: ask_size.value(i),
+        });
+    }
+    Ok(bars)
 }
 
 fn record_batches(path: &Path) -> LeanResult<Vec<arrow_array::RecordBatch>> {
@@ -1843,6 +2332,28 @@ fn uint64_column_named<'a>(
     name: &str,
 ) -> LeanResult<&'a UInt64Array> {
     uint64_column(batch, column_index(batch, name)?, name)
+}
+
+fn uint8_column_named<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+) -> LeanResult<&'a UInt8Array> {
+    batch
+        .column(column_index(batch, name)?)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
+}
+
+fn boolean_column_named<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+) -> LeanResult<&'a BooleanArray> {
+    batch
+        .column(column_index(batch, name)?)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| lean_core::LeanError::DataError(format!("{name} column missing")))
 }
 
 fn symbol_like(template: &Symbol, symbol_value: &str) -> Symbol {

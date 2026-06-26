@@ -7,6 +7,8 @@ use strum::{Display, EnumIter, EnumString, FromRepr};
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     Serialize,
     Deserialize,

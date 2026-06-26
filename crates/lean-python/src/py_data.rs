@@ -10,17 +10,31 @@ use lean_options::OptionChain;
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 use rust_decimal::prelude::ToPrimitive;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn ns_to_naive(ns: i64) -> chrono::NaiveDateTime {
+    thread_local! {
+        static NS_TO_NAIVE_CACHE: RefCell<HashMap<i64, chrono::NaiveDateTime>> =
+            RefCell::new(HashMap::new());
+    }
+
+    if let Some(cached) = NS_TO_NAIVE_CACHE.with(|cache| cache.borrow().get(&ns).copied()) {
+        return cached;
+    }
+
     use chrono::{DateTime as ChronoDateTime, Utc};
     use chrono_tz::US::Eastern;
     let secs = ns / 1_000_000_000;
     let nsub = (ns % 1_000_000_000) as u32;
     let dt: ChronoDateTime<Utc> = chrono::DateTime::from_timestamp(secs, nsub).unwrap_or_default();
     // Deliver bar times in Eastern Time (exchange local), matching LEAN's behavior.
-    dt.with_timezone(&Eastern).naive_local()
+    let naive = dt.with_timezone(&Eastern).naive_local();
+    NS_TO_NAIVE_CACHE.with(|cache| {
+        cache.borrow_mut().insert(ns, naive);
+    });
+    naive
 }
 
 /// Python-visible TradeBar.
@@ -1064,8 +1078,9 @@ impl PySlice {
         slice: &Slice,
         custom_data: &HashMap<String, Vec<CustomDataPoint>>,
     ) -> PyResult<Self> {
-        let mut bars: HashMap<u64, Py<PyTradeBar>> = HashMap::new();
-        let mut ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut bars: HashMap<u64, Py<PyTradeBar>> = HashMap::with_capacity(slice.bars.len());
+        let mut ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(slice.bars.len().saturating_mul(2));
         for (&sid, bar) in &slice.bars {
             let py_bar = Py::new(py, PyTradeBar::from(bar))?;
             ticker_to_sid.insert(bar.symbol.value.clone(), sid);
@@ -1080,8 +1095,10 @@ impl PySlice {
             },
         )?;
         let py_chains = Py::new(py, PyOptionChains::empty())?;
-        let mut py_quote_map: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
-        let mut quote_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut py_quote_map: HashMap<u64, Py<PyQuoteBar>> =
+            HashMap::with_capacity(slice.quote_bars.len());
+        let mut quote_ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(slice.quote_bars.len().saturating_mul(2));
         for (&sid, bar) in &slice.quote_bars {
             let py_bar = Py::new(py, PyQuoteBar::from(bar))?;
             quote_ticker_to_sid.insert(bar.symbol.value.clone(), sid);
@@ -1095,8 +1112,10 @@ impl PySlice {
                 ticker_to_sid: quote_ticker_to_sid,
             },
         )?;
-        let mut py_margin_rate_map: HashMap<u64, Py<PyMarginInterestRate>> = HashMap::new();
-        let mut margin_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut py_margin_rate_map: HashMap<u64, Py<PyMarginInterestRate>> =
+            HashMap::with_capacity(slice.margin_interest_rates.len());
+        let mut margin_ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(slice.margin_interest_rates.len().saturating_mul(2));
         for (&sid, rate) in &slice.margin_interest_rates {
             let py_rate = Py::new(py, PyMarginInterestRate::from(rate))?;
             margin_ticker_to_sid.insert(rate.symbol.value.clone(), sid);
@@ -1110,8 +1129,10 @@ impl PySlice {
                 ticker_to_sid: margin_ticker_to_sid,
             },
         )?;
-        let mut py_perpetual_context_map: HashMap<u64, Py<PyPerpetualContext>> = HashMap::new();
-        let mut context_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut py_perpetual_context_map: HashMap<u64, Py<PyPerpetualContext>> =
+            HashMap::with_capacity(slice.perpetual_contexts.len());
+        let mut context_ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(slice.perpetual_contexts.len().saturating_mul(2));
         for (&sid, context) in &slice.perpetual_contexts {
             let py_context = Py::new(py, PyPerpetualContext::from(context))?;
             context_ticker_to_sid.insert(context.symbol.value.clone(), sid);
@@ -1125,19 +1146,20 @@ impl PySlice {
                 ticker_to_sid: context_ticker_to_sid,
             },
         )?;
-        let mut py_ticks_map: HashMap<u64, Vec<Py<PyTick>>> = HashMap::new();
-        let mut tick_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let mut py_ticks_map: HashMap<u64, Vec<Py<PyTick>>> =
+            HashMap::with_capacity(slice.ticks.len());
+        let mut tick_ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(slice.ticks.len().saturating_mul(2));
         for (&sid, ticks) in &slice.ticks {
             let Some(first) = ticks.first() else {
                 continue;
             };
             tick_ticker_to_sid.insert(first.symbol.value.clone(), sid);
             tick_ticker_to_sid.insert(first.symbol.permtick.clone(), sid);
-            let py_ticks = ticks
-                .iter()
-                .map(PyTick::from)
-                .map(|tick| Py::new(py, tick))
-                .collect::<PyResult<Vec<_>>>()?;
+            let mut py_ticks = Vec::with_capacity(ticks.len());
+            for tick in ticks {
+                py_ticks.push(Py::new(py, PyTick::from(tick))?);
+            }
             py_ticks_map.insert(sid, py_ticks);
         }
         let py_ticks = Py::new(
@@ -1149,14 +1171,16 @@ impl PySlice {
         )?;
         let py_custom = Py::new(py, PyCustomData::from_points(py, custom_data)?)?;
         let py_delistings = {
-            let mut events: HashMap<u64, Py<PyDelisting>> = HashMap::new();
+            let mut events: HashMap<u64, Py<PyDelisting>> =
+                HashMap::with_capacity(slice.delistings.len());
             for (&sid, d) in &slice.delistings {
                 events.insert(sid, Py::new(py, PyDelisting::from(d))?);
             }
             Py::new(py, PyDelistings { events })?
         };
         let py_sce = {
-            let mut events: HashMap<u64, Py<PySymbolChangedEvent>> = HashMap::new();
+            let mut events: HashMap<u64, Py<PySymbolChangedEvent>> =
+                HashMap::with_capacity(slice.symbol_changed_events.len());
             for (&sid, ev) in &slice.symbol_changed_events {
                 events.insert(sid, Py::new(py, PySymbolChangedEvent::from(ev))?);
             }
@@ -1430,7 +1454,7 @@ impl PyCustomData {
         py: Python<'_>,
         data: &HashMap<String, Vec<CustomDataPoint>>,
     ) -> PyResult<Self> {
-        let mut points = HashMap::new();
+        let mut points = HashMap::with_capacity(data.len());
         for (ticker, rows) in data {
             let mut py_points = Vec::with_capacity(rows.len());
             for row in rows {
@@ -1525,16 +1549,395 @@ pub struct SliceProxy {
     pub symbol_changed_events_cell: Py<PySymbolChangedEvents>,
 }
 
+/// Reusable Python `Slice` for framework alpha models.
+///
+/// Python alpha `Update()` is called from the framework pipeline and only receives
+/// a raw Rust `Slice`, not the runner's subscription-backed `SliceProxy`. This
+/// cache keeps the same Python Slice surface while updating the backing
+/// containers in place to avoid rebuilding the whole Python object graph on every
+/// framework update.
+pub struct FrameworkSliceProxy {
+    py_slice: Py<PySlice>,
+    bar_cells: HashMap<u64, Py<PyTradeBar>>,
+    quote_bar_cells: HashMap<u64, Py<PyQuoteBar>>,
+    active_bar_sids: Vec<u64>,
+    active_quote_bar_sids: Vec<u64>,
+    bars_cell: Py<PyTradeBars>,
+    quote_bars_cell: Py<PyQuoteBars>,
+    margin_interest_rates_cell: Py<PyMarginInterestRates>,
+    perpetual_contexts_cell: Py<PyPerpetualContexts>,
+    ticks_cell: Py<PyTicks>,
+    custom_data_cell: Py<PyCustomData>,
+    delistings_cell: Py<PyDelistings>,
+    symbol_changed_events_cell: Py<PySymbolChangedEvents>,
+}
+
+impl FrameworkSliceProxy {
+    pub fn new(py: Python<'_>) -> PyResult<Self> {
+        let py_bars = Py::new(
+            py,
+            PyTradeBars {
+                bars: HashMap::new(),
+                ticker_to_sid: HashMap::new(),
+            },
+        )?;
+        let py_quote_bars = Py::new(py, PyQuoteBars::empty())?;
+        let py_margin_interest_rates = Py::new(
+            py,
+            PyMarginInterestRates {
+                rates: HashMap::new(),
+                ticker_to_sid: HashMap::new(),
+            },
+        )?;
+        let py_perpetual_contexts = Py::new(
+            py,
+            PyPerpetualContexts {
+                contexts: HashMap::new(),
+                ticker_to_sid: HashMap::new(),
+            },
+        )?;
+        let py_ticks = Py::new(py, PyTicks::empty())?;
+        let py_custom = Py::new(py, PyCustomData::empty())?;
+        let py_delistings = Py::new(py, PyDelistings::empty())?;
+        let py_sce = Py::new(py, PySymbolChangedEvents::empty())?;
+        let py_chains = Py::new(py, PyOptionChains::empty())?;
+        let py_slice = Py::new(
+            py,
+            PySlice {
+                bars_obj: py_bars.clone_ref(py),
+                quote_bars_obj: py_quote_bars.clone_ref(py),
+                margin_interest_rates_obj: py_margin_interest_rates.clone_ref(py),
+                perpetual_contexts_obj: py_perpetual_contexts.clone_ref(py),
+                ticks_obj: py_ticks.clone_ref(py),
+                option_chains_obj: py_chains,
+                custom_data_obj: py_custom.clone_ref(py),
+                delistings_obj: py_delistings.clone_ref(py),
+                symbol_changed_events_obj: py_sce.clone_ref(py),
+                has_data: false,
+            },
+        )?;
+
+        Ok(Self {
+            py_slice,
+            bar_cells: HashMap::new(),
+            quote_bar_cells: HashMap::new(),
+            active_bar_sids: Vec::new(),
+            active_quote_bar_sids: Vec::new(),
+            bars_cell: py_bars,
+            quote_bars_cell: py_quote_bars,
+            margin_interest_rates_cell: py_margin_interest_rates,
+            perpetual_contexts_cell: py_perpetual_contexts,
+            ticks_cell: py_ticks,
+            custom_data_cell: py_custom,
+            delistings_cell: py_delistings,
+            symbol_changed_events_cell: py_sce,
+        })
+    }
+
+    pub fn update(&mut self, py: Python<'_>, slice: &Slice) -> Py<PyAny> {
+        self.update_bars(py, slice);
+        self.update_quote_bars(py, &slice.quote_bars);
+        self.update_margin_interest_rates(py, slice);
+        self.update_perpetual_contexts(py, slice);
+        self.update_ticks(py, &slice.ticks);
+        self.update_custom_data(py, &slice.custom_data);
+        self.update_delistings(py, slice);
+        self.update_symbol_changed_events(py, slice);
+        self.py_slice.borrow_mut(py).has_data = slice.has_data || !slice.custom_data.is_empty();
+        self.py_slice.clone_ref(py).into_any()
+    }
+
+    fn update_quote_bar_membership(&mut self, py: Python<'_>, quote_bars: &HashMap<u64, QuoteBar>) {
+        let mut qbars_obj = self.quote_bars_cell.borrow_mut(py);
+        let previous_sids = std::mem::take(&mut self.active_quote_bar_sids);
+        for sid in &previous_sids {
+            if !quote_bars.contains_key(sid) {
+                qbars_obj.bars.remove(sid);
+            }
+        }
+        let current_len = qbars_obj.bars.len();
+        qbars_obj
+            .bars
+            .reserve(quote_bars.len().saturating_sub(current_len));
+        self.active_quote_bar_sids.reserve(quote_bars.len());
+        for (&sid, qbar) in quote_bars {
+            if qbars_obj
+                .ticker_to_sid
+                .get(qbar.symbol.value.as_str())
+                .copied()
+                != Some(sid)
+            {
+                qbars_obj
+                    .ticker_to_sid
+                    .insert(qbar.symbol.value.clone(), sid);
+            }
+            if qbars_obj
+                .ticker_to_sid
+                .get(qbar.symbol.permtick.as_str())
+                .copied()
+                != Some(sid)
+            {
+                qbars_obj
+                    .ticker_to_sid
+                    .insert(qbar.symbol.permtick.clone(), sid);
+            }
+            if !previous_sids.contains(&sid) {
+                if let Some(cell) = self.quote_bar_cells.get(&sid) {
+                    qbars_obj.bars.insert(sid, cell.clone_ref(py));
+                }
+            }
+            self.active_quote_bar_sids.push(sid);
+        }
+    }
+
+    fn update_bars_membership(&mut self, py: Python<'_>, bars: &HashMap<u64, TradeBar>) {
+        let mut bars_obj = self.bars_cell.borrow_mut(py);
+        let previous_sids = std::mem::take(&mut self.active_bar_sids);
+        for sid in &previous_sids {
+            if !bars.contains_key(sid) {
+                bars_obj.bars.remove(sid);
+            }
+        }
+        let current_len = bars_obj.bars.len();
+        bars_obj
+            .bars
+            .reserve(bars.len().saturating_sub(current_len));
+        self.active_bar_sids.reserve(bars.len());
+        for (&sid, bar) in bars {
+            if bars_obj
+                .ticker_to_sid
+                .get(bar.symbol.value.as_str())
+                .copied()
+                != Some(sid)
+            {
+                bars_obj.ticker_to_sid.insert(bar.symbol.value.clone(), sid);
+            }
+            if bars_obj
+                .ticker_to_sid
+                .get(bar.symbol.permtick.as_str())
+                .copied()
+                != Some(sid)
+            {
+                bars_obj
+                    .ticker_to_sid
+                    .insert(bar.symbol.permtick.clone(), sid);
+            }
+            if !previous_sids.contains(&sid) {
+                if let Some(cell) = self.bar_cells.get(&sid) {
+                    bars_obj.bars.insert(sid, cell.clone_ref(py));
+                }
+            }
+            self.active_bar_sids.push(sid);
+        }
+    }
+
+    fn update_bars(&mut self, py: Python<'_>, slice: &Slice) {
+        self.bar_cells
+            .reserve(slice.bars.len().saturating_sub(self.bar_cells.len()));
+        for (&sid, bar) in &slice.bars {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.bar_cells.entry(sid) {
+                match Py::new(py, PyTradeBar::from(bar)) {
+                    Ok(py_bar) => {
+                        slot.insert(py_bar);
+                    }
+                    Err(e) => {
+                        tracing::warn!("FrameworkSliceProxy: TradeBar alloc error: {e}");
+                        continue;
+                    }
+                }
+            }
+            if let Some(py_bar) = self.bar_cells.get(&sid) {
+                let mut b = py_bar.borrow_mut(py);
+                if b.symbol.inner.value != bar.symbol.value
+                    || b.symbol.inner.permtick != bar.symbol.permtick
+                {
+                    b.symbol.inner = bar.symbol.clone();
+                }
+                b.open = bar.open.to_f64().unwrap_or(0.0);
+                b.high = bar.high.to_f64().unwrap_or(0.0);
+                b.low = bar.low.to_f64().unwrap_or(0.0);
+                b.close = bar.close.to_f64().unwrap_or(0.0);
+                b.volume = bar.volume.to_f64().unwrap_or(0.0);
+                b.time = ns_to_naive(bar.time.0);
+                b.end_time = ns_to_naive(bar.end_time.0);
+            }
+        }
+        self.update_bars_membership(py, &slice.bars);
+    }
+
+    fn update_quote_bars(&mut self, py: Python<'_>, quote_bars: &HashMap<u64, QuoteBar>) {
+        let to_f = |d: rust_decimal::Decimal| d.to_f64().unwrap_or(0.0);
+        self.quote_bar_cells
+            .reserve(quote_bars.len().saturating_sub(self.quote_bar_cells.len()));
+        for (&sid, qbar) in quote_bars {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.quote_bar_cells.entry(sid)
+            {
+                match Py::new(py, PyQuoteBar::from(qbar)) {
+                    Ok(py_qbar) => {
+                        slot.insert(py_qbar);
+                    }
+                    Err(e) => {
+                        tracing::warn!("FrameworkSliceProxy: QuoteBar alloc error: {e}");
+                        continue;
+                    }
+                }
+            }
+            if let Some(py_qbar) = self.quote_bar_cells.get(&sid) {
+                let mut b = py_qbar.borrow_mut(py);
+                if b.symbol.inner.value != qbar.symbol.value
+                    || b.symbol.inner.permtick != qbar.symbol.permtick
+                {
+                    b.symbol.inner = qbar.symbol.clone();
+                }
+                b.bid_open = qbar.bid.as_ref().map(|b| to_f(b.open)).unwrap_or(0.0);
+                b.bid_high = qbar.bid.as_ref().map(|b| to_f(b.high)).unwrap_or(0.0);
+                b.bid_low = qbar.bid.as_ref().map(|b| to_f(b.low)).unwrap_or(0.0);
+                b.bid_close = qbar.bid.as_ref().map(|b| to_f(b.close)).unwrap_or(0.0);
+                b.ask_open = qbar.ask.as_ref().map(|b| to_f(b.open)).unwrap_or(0.0);
+                b.ask_high = qbar.ask.as_ref().map(|b| to_f(b.high)).unwrap_or(0.0);
+                b.ask_low = qbar.ask.as_ref().map(|b| to_f(b.low)).unwrap_or(0.0);
+                b.ask_close = qbar.ask.as_ref().map(|b| to_f(b.close)).unwrap_or(0.0);
+                b.bid_size = to_f(qbar.last_bid_size);
+                b.ask_size = to_f(qbar.last_ask_size);
+                b.time = ns_to_naive(qbar.time.0);
+                b.end_time = ns_to_naive(qbar.end_time.0);
+            }
+        }
+        self.update_quote_bar_membership(py, quote_bars);
+    }
+
+    fn update_margin_interest_rates(&mut self, py: Python<'_>, slice: &Slice) {
+        let mut rates_obj = self.margin_interest_rates_cell.borrow_mut(py);
+        rates_obj.rates.clear();
+        rates_obj.rates.reserve(slice.margin_interest_rates.len());
+        rates_obj
+            .ticker_to_sid
+            .reserve(slice.margin_interest_rates.len().saturating_mul(2));
+        for (&sid, rate) in &slice.margin_interest_rates {
+            rates_obj
+                .ticker_to_sid
+                .insert(rate.symbol.value.clone(), sid);
+            rates_obj
+                .ticker_to_sid
+                .insert(rate.symbol.permtick.clone(), sid);
+            if let Ok(py_rate) = Py::new(py, PyMarginInterestRate::from(rate)) {
+                rates_obj.rates.insert(sid, py_rate);
+            }
+        }
+    }
+
+    fn update_perpetual_contexts(&mut self, py: Python<'_>, slice: &Slice) {
+        let mut contexts_obj = self.perpetual_contexts_cell.borrow_mut(py);
+        contexts_obj.contexts.clear();
+        contexts_obj
+            .contexts
+            .reserve(slice.perpetual_contexts.len());
+        contexts_obj
+            .ticker_to_sid
+            .reserve(slice.perpetual_contexts.len().saturating_mul(2));
+        for (&sid, context) in &slice.perpetual_contexts {
+            contexts_obj
+                .ticker_to_sid
+                .insert(context.symbol.value.clone(), sid);
+            contexts_obj
+                .ticker_to_sid
+                .insert(context.symbol.permtick.clone(), sid);
+            if let Ok(py_context) = Py::new(py, PyPerpetualContext::from(context)) {
+                contexts_obj.contexts.insert(sid, py_context);
+            }
+        }
+    }
+
+    fn update_ticks(&mut self, py: Python<'_>, ticks: &HashMap<u64, Vec<Tick>>) {
+        let mut ticks_obj = self.ticks_cell.borrow_mut(py);
+        ticks_obj.ticks.clear();
+        ticks_obj.ticker_to_sid.clear();
+        ticks_obj.ticks.reserve(ticks.len());
+        ticks_obj
+            .ticker_to_sid
+            .reserve(ticks.len().saturating_mul(2));
+
+        for (&sid, tick_vec) in ticks {
+            let Some(first) = tick_vec.first() else {
+                continue;
+            };
+            ticks_obj
+                .ticker_to_sid
+                .insert(first.symbol.value.clone(), sid);
+            ticks_obj
+                .ticker_to_sid
+                .insert(first.symbol.permtick.clone(), sid);
+            let mut py_ticks = Vec::with_capacity(tick_vec.len());
+            for tick in tick_vec {
+                if let Ok(py_tick) = Py::new(py, PyTick::from(tick)) {
+                    py_ticks.push(py_tick);
+                }
+            }
+            ticks_obj.ticks.insert(sid, py_ticks);
+        }
+    }
+
+    fn update_custom_data(&mut self, py: Python<'_>, data: &HashMap<String, Vec<CustomDataPoint>>) {
+        let mut custom_obj = self.custom_data_cell.borrow_mut(py);
+        custom_obj.points.clear();
+        custom_obj.points.reserve(data.len());
+
+        for (ticker, points) in data {
+            if points.is_empty() {
+                continue;
+            }
+            let mut py_points = Vec::with_capacity(points.len());
+            for point in points {
+                match Py::new(py, PyCustomDataPoint::from_point(point)) {
+                    Ok(py_point) => py_points.push(py_point),
+                    Err(e) => {
+                        tracing::warn!("FrameworkSliceProxy: custom point alloc error: {e}");
+                    }
+                }
+            }
+            if !py_points.is_empty() {
+                custom_obj.points.insert(ticker.to_uppercase(), py_points);
+            }
+        }
+    }
+
+    fn update_delistings(&mut self, py: Python<'_>, slice: &Slice) {
+        let mut dl = self.delistings_cell.borrow_mut(py);
+        dl.events.clear();
+        dl.events.reserve(slice.delistings.len());
+        for (&sid, d) in &slice.delistings {
+            if let Ok(py_d) = Py::new(py, PyDelisting::from(d)) {
+                dl.events.insert(sid, py_d);
+            }
+        }
+    }
+
+    fn update_symbol_changed_events(&mut self, py: Python<'_>, slice: &Slice) {
+        let mut sce = self.symbol_changed_events_cell.borrow_mut(py);
+        sce.events.clear();
+        sce.events.reserve(slice.symbol_changed_events.len());
+        for (&sid, ev) in &slice.symbol_changed_events {
+            if let Ok(py_ev) = Py::new(py, PySymbolChangedEvent::from(ev)) {
+                sce.events.insert(sid, py_ev);
+            }
+        }
+    }
+}
+
 impl SliceProxy {
     /// Allocate one `PyTradeBar` per subscription.  One-time cost paid before
     /// the main loop; amortised over all trading days.
     pub fn new(py: Python<'_>, subscriptions: &[Arc<SubscriptionDataConfig>]) -> PyResult<Self> {
-        let mut bar_cells: HashMap<u64, Py<PyTradeBar>> = HashMap::new();
-        let mut quote_bar_cells: HashMap<u64, Py<PyQuoteBar>> = HashMap::new();
-        let mut ticker_to_sid: HashMap<String, u64> = HashMap::new();
-        let mut qb_ticker_to_sid: HashMap<String, u64> = HashMap::new();
-        let mut margin_ticker_to_sid: HashMap<String, u64> = HashMap::new();
-        let mut perpetual_context_ticker_to_sid: HashMap<String, u64> = HashMap::new();
+        let alias_capacity = subscriptions.len().saturating_mul(2);
+        let mut bar_cells: HashMap<u64, Py<PyTradeBar>> =
+            HashMap::with_capacity(subscriptions.len());
+        let mut quote_bar_cells: HashMap<u64, Py<PyQuoteBar>> =
+            HashMap::with_capacity(subscriptions.len());
+        let mut ticker_to_sid: HashMap<String, u64> = HashMap::with_capacity(alias_capacity);
+        let mut qb_ticker_to_sid: HashMap<String, u64> = HashMap::with_capacity(alias_capacity);
+        let mut margin_ticker_to_sid: HashMap<String, u64> = HashMap::with_capacity(alias_capacity);
+        let mut perpetual_context_ticker_to_sid: HashMap<String, u64> =
+            HashMap::with_capacity(alias_capacity);
 
         for sub in subscriptions {
             let sid = sub.symbol.id.sid;
@@ -1810,6 +2213,7 @@ impl SliceProxy {
         {
             let mut bars_obj = self.bars_cell.borrow_mut(py);
             bars_obj.bars.clear();
+            bars_obj.bars.reserve(slice.bars.len());
             for sid in active_sids {
                 if let Some(cell) = self.bar_cells.get(&sid) {
                     bars_obj.bars.insert(sid, cell.clone_ref(py));
@@ -1822,6 +2226,7 @@ impl SliceProxy {
         {
             let mut dl = self.delistings_cell.borrow_mut(py);
             dl.events.clear();
+            dl.events.reserve(slice.delistings.len());
             for (&sid, d) in &slice.delistings {
                 if let Ok(py_d) = Py::new(py, PyDelisting::from(d)) {
                     dl.events.insert(sid, py_d);
@@ -1833,6 +2238,7 @@ impl SliceProxy {
         {
             let mut sce = self.symbol_changed_events_cell.borrow_mut(py);
             sce.events.clear();
+            sce.events.reserve(slice.symbol_changed_events.len());
             for (&sid, ev) in &slice.symbol_changed_events {
                 if let Ok(py_ev) = Py::new(py, PySymbolChangedEvent::from(ev)) {
                     sce.events.insert(sid, py_ev);
@@ -1871,6 +2277,7 @@ impl SliceProxy {
         {
             let mut qbars_obj = self.quote_bars_cell.borrow_mut(py);
             qbars_obj.bars.clear();
+            qbars_obj.bars.reserve(quote_bars.len());
             for &sid in quote_bars.keys() {
                 if let Some(cell) = self.quote_bar_cells.get(&sid) {
                     qbars_obj.bars.insert(sid, cell.clone_ref(py));
@@ -1883,6 +2290,7 @@ impl SliceProxy {
     pub fn update_margin_interest_rates(&self, py: Python<'_>, slice: &Slice) {
         let mut rates_obj = self.margin_interest_rates_cell.borrow_mut(py);
         rates_obj.rates.clear();
+        rates_obj.rates.reserve(slice.margin_interest_rates.len());
         for (&sid, rate) in &slice.margin_interest_rates {
             if let Ok(py_rate) = Py::new(py, PyMarginInterestRate::from(rate)) {
                 rates_obj.rates.insert(sid, py_rate);
@@ -1894,6 +2302,9 @@ impl SliceProxy {
     pub fn update_perpetual_contexts(&self, py: Python<'_>, slice: &Slice) {
         let mut contexts_obj = self.perpetual_contexts_cell.borrow_mut(py);
         contexts_obj.contexts.clear();
+        contexts_obj
+            .contexts
+            .reserve(slice.perpetual_contexts.len());
         for (&sid, context) in &slice.perpetual_contexts {
             if let Ok(py_context) = Py::new(py, PyPerpetualContext::from(context)) {
                 contexts_obj.contexts.insert(sid, py_context);
@@ -1906,6 +2317,10 @@ impl SliceProxy {
         let mut ticks_obj = self.ticks_cell.borrow_mut(py);
         ticks_obj.ticks.clear();
         ticks_obj.ticker_to_sid.clear();
+        ticks_obj.ticks.reserve(ticks.len());
+        ticks_obj
+            .ticker_to_sid
+            .reserve(ticks.len().saturating_mul(2));
 
         for (&sid, tick_vec) in ticks {
             if tick_vec.is_empty() {
@@ -1921,10 +2336,12 @@ impl SliceProxy {
                     .insert(first.symbol.permtick.clone(), sid);
             }
 
-            let py_ticks = tick_vec
-                .iter()
-                .filter_map(|tick| Py::new(py, PyTick::from(tick)).ok())
-                .collect::<Vec<_>>();
+            let mut py_ticks = Vec::with_capacity(tick_vec.len());
+            for tick in tick_vec {
+                if let Ok(py_tick) = Py::new(py, PyTick::from(tick)) {
+                    py_ticks.push(py_tick);
+                }
+            }
             if !py_ticks.is_empty() {
                 ticks_obj.ticks.insert(sid, py_ticks);
             }
@@ -1953,6 +2370,7 @@ impl SliceProxy {
     pub fn update_custom_data(&self, py: Python<'_>, data: &HashMap<String, Vec<CustomDataPoint>>) {
         let mut custom_obj = self.custom_data_cell.borrow_mut(py);
         custom_obj.points.clear();
+        custom_obj.points.reserve(data.len());
 
         for (ticker, points) in data {
             if points.is_empty() {
@@ -1977,6 +2395,8 @@ mod tests {
     use super::*;
     use crate::py_qc_algorithm::pascal_to_snake;
     use lean_core::{Market, Resolution, Symbol};
+    use lean_data::TradeBarData;
+    use rust_decimal_macros::dec;
 
     fn make_trade_bar() -> PyTradeBar {
         PyTradeBar {
@@ -2010,8 +2430,16 @@ mod tests {
             let market = Market::usa();
             let spy = Symbol::create_equity("SPY", &market);
             let qqq = Symbol::create_equity("QQQ", &market);
-            let spy_sub = Arc::new(SubscriptionDataConfig::new_equity(spy, Resolution::Minute));
-            let qqq_sub = Arc::new(SubscriptionDataConfig::new_equity(qqq, Resolution::Minute));
+            let spy_sub = Arc::new(SubscriptionDataConfig::new_equity(
+                spy,
+                Resolution::Minute,
+                lean_core::DataNormalizationMode::Adjusted,
+            ));
+            let qqq_sub = Arc::new(SubscriptionDataConfig::new_equity(
+                qqq,
+                Resolution::Minute,
+                lean_core::DataNormalizationMode::Adjusted,
+            ));
             let mut proxy =
                 SliceProxy::new(py, &[spy_sub.clone(), qqq_sub.clone()]).expect("proxy");
 
@@ -2062,6 +2490,73 @@ mod tests {
             assert!(py_slice.has_data);
             assert_eq!(points.len(), 1);
             assert_eq!(point.fields_inner.get("usymbol").unwrap(), "ULCC");
+        });
+    }
+
+    #[test]
+    fn framework_slice_proxy_updates_bars_and_custom_data() {
+        crate::test_python::init();
+        Python::attach(|py| {
+            let market = Market::usa();
+            let spy = Symbol::create_equity("SPY", &market);
+            let qqq = Symbol::create_equity("QQQ", &market);
+            let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 3).unwrap();
+            let time = lean_core::DateTime::from(date.and_hms_opt(13, 46, 0).unwrap());
+            let period = lean_core::TimeSpan::from_secs(60);
+
+            let mut first = Slice::new(time);
+            first.add_bar(TradeBar::new(
+                spy.clone(),
+                time,
+                period,
+                TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100.50), dec!(1000)),
+            ));
+            first.custom_data.insert(
+                "sweeps".to_string(),
+                vec![CustomDataPoint {
+                    time: date,
+                    end_time: Some(time),
+                    value: dec!(1),
+                    fields: HashMap::from([("usymbol".to_string(), serde_json::json!("SPY"))]),
+                }],
+            );
+
+            let mut proxy = FrameworkSliceProxy::new(py).expect("framework proxy");
+            let _ = proxy.update(py, &first);
+            {
+                let bars = proxy.bars_cell.borrow(py);
+                assert_eq!(bars.bars.len(), 1);
+                let bar = bars.bars.get(&spy.id.sid).unwrap().borrow(py);
+                assert_eq!(bar.close, 100.5);
+                assert_eq!(bars.ticker_to_sid.get("SPY"), Some(&spy.id.sid));
+            }
+            {
+                let custom = proxy.custom_data_cell.borrow(py);
+                let points = custom.points.get("SWEEPS").unwrap();
+                assert_eq!(points.len(), 1);
+                assert_eq!(
+                    points[0].borrow(py).fields_inner.get("usymbol").unwrap(),
+                    "SPY"
+                );
+            }
+
+            let mut second = Slice::new(time + period);
+            second.add_bar(TradeBar::new(
+                qqq.clone(),
+                time + period,
+                period,
+                TradeBarData::new(dec!(200), dec!(202), dec!(198), dec!(201), dec!(2000)),
+            ));
+            let _ = proxy.update(py, &second);
+            {
+                let bars = proxy.bars_cell.borrow(py);
+                assert_eq!(bars.bars.len(), 1);
+                assert!(!bars.bars.contains_key(&spy.id.sid));
+                let bar = bars.bars.get(&qqq.id.sid).unwrap().borrow(py);
+                assert_eq!(bar.close, 201.0);
+                assert_eq!(bars.ticker_to_sid.get("QQQ"), Some(&qqq.id.sid));
+            }
+            assert!(proxy.custom_data_cell.borrow(py).points.is_empty());
         });
     }
 

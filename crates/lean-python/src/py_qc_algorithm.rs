@@ -1,4 +1,5 @@
 use crate::charting::ChartCollection;
+use crate::py_data::PyTradeBar;
 use crate::py_framework::{
     try_take_alpha, try_take_exec, try_take_pcm, try_take_risk, FrameworkState,
 };
@@ -6,13 +7,16 @@ use crate::py_indicators::{PyEma, PyMomp, PyRsi, PySma, PyStd};
 use crate::py_orders::PyOrderTicket;
 use crate::py_portfolio::PyPortfolio;
 use crate::py_types::{
-    PyAlgorithmSettings, PyOptionSecurity, PyResolution, PySecurity, PySecurityManager, PySymbol,
+    PyAlgorithmSettings, PyDataNormalizationMode, PyOptionSecurity, PyResolution, PySecurity,
+    PySecurityManager, PySymbol,
 };
 use crate::py_universe::{PyDateRules, PyScheduledUniverse, PyTimeRules, PyUniverseSettings};
 use crate::{PyAccountType, PyBrokerageName, PySecurityType, PyTimeInForce};
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate, TimeZone, Timelike};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{DateTime, Market, Resolution, SecurityType, Symbol};
+use lean_core::{
+    DataNormalizationMode, DateTime, Market, Resolution, SecurityType, Symbol, TickType,
+};
 use lean_data::{CustomDataPoint, CustomDataSubscription, TradeBar};
 use lean_engine::HistoryService;
 use lean_options::{implied_volatility, time_to_expiry_years};
@@ -41,6 +45,88 @@ impl IndicatorRegistry {
             entries: Vec::new(),
         }
     }
+}
+
+/// LEAN API: seed a newly-added security from a Python history function.
+#[pyclass(name = "FuncSecuritySeeder")]
+pub struct PyFuncSecuritySeeder {
+    seed_function: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyFuncSecuritySeeder {
+    #[new]
+    fn new(seed_function: Py<PyAny>) -> Self {
+        Self { seed_function }
+    }
+
+    fn seed_security(&self, py: Python<'_>, security: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let result = self.seed_function.call1(py, (security,))?;
+        seed_security_from_result(py, security, result.bind(py))
+    }
+
+    #[pyo3(name = "SeedSecurity")]
+    fn seed_security_pascal(&self, py: Python<'_>, security: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.seed_security(py, security)
+    }
+}
+
+/// LEAN API: security initializer that delegates price seeding to an ISecuritySeeder.
+#[pyclass(name = "BrokerageModelSecurityInitializer")]
+pub struct PyBrokerageModelSecurityInitializer {
+    security_seeder: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyBrokerageModelSecurityInitializer {
+    #[new]
+    #[pyo3(signature = (brokerage_model=None, security_seeder=None))]
+    fn new(
+        _py: Python<'_>,
+        brokerage_model: Option<Py<PyAny>>,
+        security_seeder: Option<Py<PyAny>>,
+    ) -> Self {
+        let _ = brokerage_model;
+        Self { security_seeder }
+    }
+
+    fn initialize(&self, py: Python<'_>, security: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Some(seeder) = &self.security_seeder {
+            seeder.call_method1(py, "seed_security", (security,))?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(name = "Initialize")]
+    fn initialize_pascal(&self, py: Python<'_>, security: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.initialize(py, security)
+    }
+}
+
+fn seed_security_from_result(
+    _py: Python<'_>,
+    security: &Bound<'_, PyAny>,
+    result: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if result.is_none() {
+        return Ok(false);
+    }
+
+    let iter = result.try_iter().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "security seeder must return None or an iterable of TradeBar values",
+        )
+    })?;
+
+    let mut got_data = false;
+    for item in iter {
+        let item = item?;
+        let seeded = security
+            .call_method1("set_market_price", (&item,))?
+            .extract::<bool>()?;
+        got_data |= seeded;
+    }
+    Ok(got_data)
 }
 
 impl Default for IndicatorRegistry {
@@ -112,7 +198,7 @@ fn py_time_in_force(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<TimeInF
 pub struct PyQcAlgorithm {
     pub inner: Arc<Mutex<QcAlgorithm>>,
     /// ticker → Symbol cache built as subscriptions are added
-    pub symbols: HashMap<String, lean_core::Symbol>,
+    pub symbols: Arc<Mutex<HashMap<String, lean_core::Symbol>>>,
     /// Shared chart collection — plotted from Python via self.plot(...)
     pub charts: Arc<Mutex<ChartCollection>>,
     /// Algorithm Framework models (alpha, PCM, execution, risk).
@@ -129,6 +215,8 @@ pub struct PyQcAlgorithm {
     pub history_context: Arc<Mutex<Option<AlgorithmHistoryContext>>>,
     /// Runtime algorithm parameters supplied by the CLI/config before Initialize().
     pub parameters: Arc<Mutex<HashMap<String, String>>>,
+    /// Optional LEAN-style initializer applied to newly-created securities.
+    pub security_initializer: Arc<Mutex<Option<Py<PyAny>>>>,
 }
 
 impl PyQcAlgorithm {
@@ -152,6 +240,23 @@ impl PyQcAlgorithm {
     }
     pub fn set_history_context(&self, context: AlgorithmHistoryContext) {
         *self.history_context.lock().unwrap() = Some(context);
+    }
+
+    fn initialize_security_from_python(
+        &self,
+        py: Python<'_>,
+        security: &PySecurity,
+    ) -> PyResult<()> {
+        let initializer = self
+            .security_initializer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|initializer| initializer.clone_ref(py));
+        if let Some(initializer) = initializer {
+            initializer.call_method1(py, "initialize", (security.clone(),))?;
+        }
+        Ok(())
     }
 
     fn register_custom_data_subscription(
@@ -392,7 +497,7 @@ impl PyQcAlgorithm {
                 "PythonStrategy",
                 dec!(100_000),
             ))),
-            symbols: HashMap::new(),
+            symbols: Arc::new(Mutex::new(HashMap::new())),
             charts: Arc::new(Mutex::new(ChartCollection::new())),
             framework: Arc::new(Mutex::new(FrameworkState::new())),
             indicators: Arc::new(Mutex::new(IndicatorRegistry::new())),
@@ -400,6 +505,7 @@ impl PyQcAlgorithm {
             universes: Arc::new(Mutex::new(Vec::new())),
             history_context: Arc::new(Mutex::new(None)),
             parameters: Arc::new(Mutex::new(HashMap::new())),
+            security_initializer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -423,6 +529,25 @@ impl PyQcAlgorithm {
             .lock()
             .unwrap()
             .set_brokerage_model(brokerage.into(), account_type.into());
+    }
+
+    #[getter]
+    fn brokerage_model(&self, py: Python<'_>) -> Py<PyAny> {
+        py.None()
+    }
+
+    #[getter(BrokerageModel)]
+    fn brokerage_model_pascal(&self, py: Python<'_>) -> Py<PyAny> {
+        self.brokerage_model(py)
+    }
+
+    fn set_security_initializer(&mut self, initializer: Py<PyAny>) {
+        *self.security_initializer.lock().unwrap() = Some(initializer);
+    }
+
+    #[pyo3(name = "SetSecurityInitializer")]
+    fn set_security_initializer_pascal(&mut self, initializer: Py<PyAny>) {
+        self.set_security_initializer(initializer);
     }
 
     /// Add (or subtract) cash directly — used to credit option premium
@@ -484,13 +609,17 @@ impl PyQcAlgorithm {
         // a TimeSpan of that many calendar days (legacy rlean snake_case behaviour).
         use lean_core::TimeSpan;
 
+        let warmup_resolution = resolution
+            .map(|value| value.extract::<PyResolution>().map(Resolution::from))
+            .transpose()?;
+
         // Check for timedelta first.
         if let Ok(td) = bars_or_days_or_timespan.extract::<chrono::Duration>() {
             let nanos = td.num_nanoseconds().unwrap_or(0);
             self.inner
                 .lock()
                 .unwrap()
-                .set_warm_up(TimeSpan::from_nanos(nanos));
+                .set_warm_up_with_resolution(TimeSpan::from_nanos(nanos), warmup_resolution);
             return Ok(());
         }
 
@@ -498,9 +627,12 @@ impl PyQcAlgorithm {
 
         // With a resolution argument this is always a bar count (C# overload).
         // Without a resolution, > 365 is a bar count; ≤ 365 is calendar days.
-        if resolution.is_some() || n > 365 {
+        if warmup_resolution.is_some() || n > 365 {
             // Bar count: stored as warmup_bar_count; runner converts to calendar days.
-            self.inner.lock().unwrap().set_warm_up_bars(n as usize);
+            self.inner
+                .lock()
+                .unwrap()
+                .set_warm_up_bars_with_resolution(n as usize, warmup_resolution);
         } else {
             // Calendar days (TimeSpan overload without resolution).
             let nanos = n * 86_400 * 1_000_000_000i64;
@@ -514,17 +646,63 @@ impl PyQcAlgorithm {
 
     // ─── Universe ─────────────────────────────────────────────────────────────
 
-    fn add_equity(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
+    #[pyo3(signature = (
+        ticker,
+        resolution,
+        market=None,
+        fill_forward=true,
+        leverage=None,
+        extended_market_hours=false,
+        data_normalization_mode=None,
+        dataNormalizationMode=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(non_snake_case)]
+    fn add_equity(
+        &self,
+        py: Python<'_>,
+        ticker: &str,
+        resolution: PyResolution,
+        market: Option<&Bound<'_, PyAny>>,
+        fill_forward: bool,
+        leverage: Option<f64>,
+        extended_market_hours: bool,
+        data_normalization_mode: Option<PyDataNormalizationMode>,
+        dataNormalizationMode: Option<PyDataNormalizationMode>,
+    ) -> PyResult<PySecurity> {
+        let _ = (market, fill_forward, leverage, extended_market_hours);
         let res: Resolution = resolution.into();
-        let sym = self.inner.lock().unwrap().add_equity(ticker, res);
-        self.symbols.insert(ticker.to_uppercase(), sym.clone());
-        PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
+        let pre_symbol = Symbol::create_equity(ticker, &Market::usa());
+        let existed = self.inner.lock().unwrap().securities.contains(&pre_symbol);
+        // LEAN parity: `normalizationMode ?? UniverseSettings.DataNormalizationMode`.
+        let mode = data_normalization_mode
+            .or(dataNormalizationMode)
+            .map(Into::into)
+            .unwrap_or_else(|| self.universe_settings.snapshot().data_normalization_mode);
+        let sym = self
+            .inner
+            .lock()
+            .unwrap()
+            .add_equity_with_normalization(ticker, res, Some(mode));
+        self.symbols
+            .lock()
+            .unwrap()
+            .insert(ticker.to_uppercase(), sym.clone());
+        let security =
+            PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone());
+        if !existed {
+            self.initialize_security_from_python(py, &security)?;
+        }
+        Ok(security)
     }
 
     fn add_forex(&mut self, ticker: &str, resolution: PyResolution) -> PySecurity {
         let res: Resolution = resolution.into();
         let sym = self.inner.lock().unwrap().add_forex(ticker, res);
-        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        self.symbols
+            .lock()
+            .unwrap()
+            .insert(ticker.to_uppercase(), sym.clone());
         PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
@@ -543,7 +721,10 @@ impl PyQcAlgorithm {
                 .default_market_for_security(SecurityType::Crypto)
         });
         let sym = self.inner.lock().unwrap().add_crypto(ticker, &market, res);
-        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        self.symbols
+            .lock()
+            .unwrap()
+            .insert(ticker.to_uppercase(), sym.clone());
         PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
@@ -574,7 +755,10 @@ impl PyQcAlgorithm {
             .lock()
             .unwrap()
             .add_crypto_future(ticker, &market, res);
-        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        self.symbols
+            .lock()
+            .unwrap()
+            .insert(ticker.to_uppercase(), sym.clone());
         PySecurity::from_algorithm_symbol(PySymbol { inner: sym }, self.inner.clone())
     }
 
@@ -846,6 +1030,38 @@ impl PyQcAlgorithm {
         Ok(PyOrderTicket::new(ticket, self.inner.clone()))
     }
 
+    /// Place a market-on-open order.
+    #[pyo3(signature = (symbol, quantity))]
+    fn market_on_open_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+    ) -> PyResult<PyOrderTicket> {
+        let sym = self.resolve_symbol(symbol)?;
+        let ticket = self
+            .inner
+            .lock()
+            .unwrap()
+            .market_on_open_order(&sym, f2d(quantity));
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
+    }
+
+    /// Place a market-on-close order.
+    #[pyo3(signature = (symbol, quantity))]
+    fn market_on_close_order(
+        &mut self,
+        symbol: &Bound<'_, PyAny>,
+        quantity: f64,
+    ) -> PyResult<PyOrderTicket> {
+        let sym = self.resolve_symbol(symbol)?;
+        let ticket = self
+            .inner
+            .lock()
+            .unwrap()
+            .market_on_close_order(&sym, f2d(quantity));
+        Ok(PyOrderTicket::new(ticket, self.inner.clone()))
+    }
+
     /// Target a portfolio weight (0.0 to 1.0). Automatically computes the delta order.
     fn set_holdings(&mut self, symbol: &Bound<'_, PyAny>, target: f64) -> PyResult<()> {
         let sym = self.resolve_symbol(symbol)?;
@@ -931,7 +1147,10 @@ impl PyQcAlgorithm {
         //   self.unrate = self.add_data("fred", "UNRATE").symbol
         let market = lean_core::Market::usa();
         let sym = lean_core::Symbol::create_equity(ticker, &market);
-        self.symbols.insert(ticker.to_uppercase(), sym.clone());
+        self.symbols
+            .lock()
+            .unwrap()
+            .insert(ticker.to_uppercase(), sym.clone());
         Ok(PySecurity::from_algorithm_symbol(
             PySymbol { inner: sym },
             self.inner.clone(),
@@ -992,9 +1211,18 @@ impl PyQcAlgorithm {
     ///   self.history(symbol, bar_count, resolution)
     ///   self.history(symbol, start, end, resolution)
     ///
+    /// Optional keyword `data_normalization_mode` overrides the subscription
+    /// config's normalization mode, mirroring C# Lean's
+    /// `History(..., dataNormalizationMode: ...)` overloads.
+    ///
     /// Returns a column-oriented dict suitable for pandas.DataFrame(...).
-    #[pyo3(signature = (*args))]
-    fn history(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (*args, data_normalization_mode=None))]
+    fn history(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        data_normalization_mode: Option<PyDataNormalizationMode>,
+    ) -> PyResult<Py<PyAny>> {
         if args.len() != 3 && args.len() != 4 {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "history expects (symbol, bar_count, resolution) or (symbol, start, end, resolution)",
@@ -1037,7 +1265,8 @@ impl PyQcAlgorithm {
         }
 
         let symbol = self.resolve_symbol(&symbol_arg)?;
-        let mut bars = self.load_history_bars(&symbol, resolution, start, end)?;
+        let mode_override = data_normalization_mode.map(Into::into);
+        let mut bars = self.load_history_bars(&symbol, resolution, start, end, mode_override)?;
         bars.sort_by_key(|b| b.time.0);
         if let Some(bar_count) = bar_count {
             if bars.len() > bar_count {
@@ -1045,6 +1274,33 @@ impl PyQcAlgorithm {
             }
         }
         trade_bars_to_pydict(py, &bars)
+    }
+
+    fn get_last_known_prices(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let symbol = self.resolve_symbol(symbol)?;
+        let bars = self.load_last_known_trade_bars(&symbol)?;
+        let list = PyList::empty(py);
+        for bar in bars {
+            list.append(Py::new(py, PyTradeBar::from(&bar))?)?;
+        }
+        Ok(list.into())
+    }
+
+    fn get_last_known_price(
+        &self,
+        py: Python<'_>,
+        symbol: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let symbol = self.resolve_symbol(symbol)?;
+        let bars = self.load_last_known_trade_bars(&symbol)?;
+        if let Some(bar) = bars.last() {
+            return Ok(Py::new(py, PyTradeBar::from(bar))?.into_any());
+        }
+        Ok(py.None())
     }
 
     /// Explicit date-range alias for the smaller rlean API.
@@ -1071,7 +1327,7 @@ impl PyQcAlgorithm {
         }
 
         let symbol = self.resolve_symbol(symbol)?;
-        let mut bars = self.load_history_bars(&symbol, resolution.into(), start, end)?;
+        let mut bars = self.load_history_bars(&symbol, resolution.into(), start, end, None)?;
         bars.sort_by_key(|b| b.time.0);
         trade_bars_to_pydict(py, &bars)
     }
@@ -1183,11 +1439,7 @@ impl PyQcAlgorithm {
             let sid = sec.symbol.id.sid;
             entries.insert(
                 sid,
-                PySecurityManager::build_entry(
-                    sec.symbol.clone(),
-                    sec.current_price().to_f64().unwrap_or(0.0),
-                    self.inner.clone(),
-                ),
+                PySecurityManager::build_entry(sec.symbol.clone(), self.inner.clone()),
             );
         }
         PySecurityManager::from_entries(entries)
@@ -1356,6 +1608,12 @@ impl PyQcAlgorithm {
     fn add_alpha(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
         let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
         let fw = slf.borrow().framework.clone();
+        {
+            let mut g = fw.lock().unwrap();
+            if g.alg_py.is_none() {
+                g.alg_py = Some(slf.clone().into_any().unbind());
+            }
+        }
         if let Some(m) = try_take_alpha(model, alg_py) {
             fw.lock().unwrap().alpha_models.push(m);
         }
@@ -1368,6 +1626,10 @@ impl PyQcAlgorithm {
     fn set_portfolio_construction(slf: Bound<'_, Self>, model: &Bound<'_, PyAny>) {
         let alg_py: Py<PyAny> = slf.clone().into_any().unbind();
         let fw = slf.borrow().framework.clone();
+        {
+            let mut g = fw.lock().unwrap();
+            g.alg_py = Some(slf.clone().into_any().unbind());
+        }
         if let Some(m) = try_take_pcm(model, alg_py) {
             fw.lock().unwrap().pcm = m;
         }
@@ -1569,7 +1831,7 @@ pub(crate) fn pascal_to_snake(name: &str) -> String {
     out
 }
 
-fn ns_to_py_datetime(ns: i64) -> PyResult<Py<PyAny>> {
+pub(crate) fn ns_to_py_datetime(ns: i64) -> PyResult<Py<PyAny>> {
     Python::attach(|py| {
         let secs = ns / 1_000_000_000;
         let micros = (ns % 1_000_000_000) / 1_000;
@@ -1833,10 +2095,105 @@ impl PyQcAlgorithm {
         resolution: Resolution,
         start: NaiveDate,
         end: NaiveDate,
+        normalization_mode_override: Option<DataNormalizationMode>,
     ) -> PyResult<Vec<TradeBar>> {
+        let normalization_mode = normalization_mode_override
+            .unwrap_or_else(|| self.matching_normalization_mode(symbol, Some(resolution)));
         self.history_service()?
-            .load_trade_bars_blocking(symbol, resolution, start, end)
+            .load_trade_bars_blocking_with_normalization(
+                symbol,
+                resolution,
+                start,
+                end,
+                normalization_mode,
+            )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn load_last_known_trade_bars(&self, symbol: &lean_core::Symbol) -> PyResult<Vec<TradeBar>> {
+        let (resolution, end) = {
+            let inner = self.inner.lock().unwrap();
+            let resolution = inner
+                .subscription_manager
+                .get_all()
+                .into_iter()
+                .find(|sub| sub.symbol.id.sid == symbol.id.sid && sub.tick_type == TickType::Trade)
+                .or_else(|| {
+                    inner
+                        .subscription_manager
+                        .get_all()
+                        .into_iter()
+                        .find(|sub| sub.symbol.id.sid == symbol.id.sid)
+                })
+                .map(|sub| sub.resolution)
+                .unwrap_or(Resolution::Minute);
+            let end = if inner.time == DateTime::EPOCH {
+                inner.start_date
+            } else {
+                inner.time
+            };
+            (resolution, end)
+        };
+
+        let lookback_days = match resolution {
+            Resolution::Tick | Resolution::Second | Resolution::Minute => 7,
+            Resolution::Hour => 14,
+            Resolution::Daily => 31,
+        };
+        let end_date = end.date_utc();
+        let start_date = end_date - chrono::Duration::days(lookback_days);
+        let start = DateTime::from(
+            chrono::Utc.from_utc_datetime(&start_date.and_hms_opt(0, 0, 0).unwrap()),
+        );
+        let mut bars = self
+            .history_service()?
+            .load_trade_bars_between_blocking_with_normalization(
+                symbol,
+                resolution,
+                start,
+                end,
+                self.matching_normalization_mode(symbol, Some(resolution)),
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        bars.retain(|bar| bar.close > Decimal::ZERO && bar.end_time.0 <= end.0);
+        bars.sort_by_key(|bar| bar.end_time.0);
+        if bars.len() > 1 {
+            bars = bars[bars.len() - 1..].to_vec();
+        }
+        Ok(bars)
+    }
+
+    /// Mirror of C# Lean's `QCAlgorithm.GetMatchingSubscriptions` for the
+    /// narrow purpose of picking a normalization mode for a history request:
+    /// prefer a trade-tick subscription at the requested resolution, then any
+    /// subscription for the symbol, and finally fall back to the configured
+    /// `UniverseSettings.DataNormalizationMode` (not a security-type default).
+    fn matching_normalization_mode(
+        &self,
+        symbol: &lean_core::Symbol,
+        resolution: Option<Resolution>,
+    ) -> DataNormalizationMode {
+        let inner = self.inner.lock().unwrap();
+        let configs = inner.subscription_manager.get_configs_for_symbol(symbol);
+        if let Some(resolution) = resolution {
+            if let Some(sub) = configs
+                .iter()
+                .find(|sub| sub.resolution == resolution && sub.tick_type == TickType::Trade)
+            {
+                return sub.normalization_mode;
+            }
+            if let Some(sub) = configs.iter().find(|sub| sub.resolution == resolution) {
+                return sub.normalization_mode;
+            }
+        }
+        if let Some(sub) = configs.iter().find(|sub| sub.tick_type == TickType::Trade) {
+            return sub.normalization_mode;
+        }
+        if let Some(sub) = configs.first() {
+            return sub.normalization_mode;
+        }
+        drop(inner);
+        self.universe_settings.snapshot().data_normalization_mode
     }
 
     fn load_custom_history(
@@ -1868,7 +2225,7 @@ impl PyQcAlgorithm {
         }
         if let Ok(ticker) = arg.extract::<String>() {
             let upper = ticker.to_uppercase();
-            if let Some(sym) = self.symbols.get(&upper) {
+            if let Some(sym) = self.symbols.lock().unwrap().get(&upper) {
                 return Ok(sym.clone());
             }
             // Fall back to creating a new US equity symbol
@@ -1886,7 +2243,9 @@ mod tests {
     use lean_core::TickType;
     use lean_data::TradeBarData;
     use lean_data_providers::{LocalHistoryProvider, StackedHistoryProvider};
-    use lean_storage::{custom_data_path, ParquetWriter, PathResolver, WriterConfig};
+    use lean_storage::{
+        custom_data_path, FactorFileEntry, ParquetWriter, PathResolver, WriterConfig,
+    };
     use rust_decimal_macros::dec;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1934,12 +2293,82 @@ mod tests {
     }
 
     #[test]
+    fn add_equity_passes_data_normalization_mode_into_subscription_config() {
+        Python::initialize();
+        Python::attach(|py| {
+            let alg = PyQcAlgorithm::new();
+            let security = alg
+                .add_equity(
+                    py,
+                    "SPY",
+                    PyResolution::Daily,
+                    None,
+                    true,
+                    None,
+                    false,
+                    Some(PyDataNormalizationMode::Raw),
+                    None,
+                )
+                .unwrap();
+            let symbol = security.inner.inner.clone();
+            let inner = alg.inner.lock().unwrap();
+            let configs = inner.subscription_manager.get_configs_for_symbol(&symbol);
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].normalization_mode, DataNormalizationMode::Raw);
+        });
+    }
+
+    #[test]
+    fn add_equity_uses_universe_settings_data_normalization_mode() {
+        Python::initialize();
+        Python::attach(|py| {
+            let alg = PyQcAlgorithm::new();
+            alg.universe_settings
+                .inner
+                .lock()
+                .unwrap()
+                .data_normalization_mode = DataNormalizationMode::Raw;
+            let security = alg
+                .add_equity(
+                    py,
+                    "SPY",
+                    PyResolution::Daily,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let symbol = security.inner.inner.clone();
+            let inner = alg.inner.lock().unwrap();
+            let configs = inner.subscription_manager.get_configs_for_symbol(&symbol);
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].normalization_mode, DataNormalizationMode::Raw);
+        });
+    }
+
+    #[test]
     fn algorithm_history_range_reads_equity_fixture_rows() {
         Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let resolver = PathResolver::new(tmp.path());
-        let mut alg = PyQcAlgorithm::new();
-        let security = alg.add_equity("SPY", PyResolution::Daily);
+        let alg = PyQcAlgorithm::new();
+        let security = Python::attach(|py| {
+            alg.add_equity(
+                py,
+                "SPY",
+                PyResolution::Daily,
+                None,
+                true,
+                None,
+                false,
+                Some(PyDataNormalizationMode::Adjusted),
+                None,
+            )
+            .unwrap()
+        });
         alg.set_history_context(AlgorithmHistoryContext {
             data_root: tmp.path().to_path_buf(),
             history_provider: None,
@@ -1997,8 +2426,21 @@ mod tests {
     fn algorithm_history_range_uses_configured_history_provider() {
         Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
-        let mut alg = PyQcAlgorithm::new();
-        let security = alg.add_equity("SPY", PyResolution::Daily);
+        let alg = PyQcAlgorithm::new();
+        let security = Python::attach(|py| {
+            alg.add_equity(
+                py,
+                "SPY",
+                PyResolution::Daily,
+                None,
+                true,
+                None,
+                false,
+                Some(PyDataNormalizationMode::Adjusted),
+                None,
+            )
+            .unwrap()
+        });
         let symbol = security.inner.inner.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let bars = vec![
@@ -2045,12 +2487,236 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_history_range_applies_adjusted_subscription_normalization() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let alg = PyQcAlgorithm::new();
+        let security = Python::attach(|py| {
+            alg.add_equity(
+                py,
+                "SPY",
+                PyResolution::Daily,
+                None,
+                true,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let symbol = security.inner.inner.clone();
+        let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let writer = ParquetWriter::new(WriterConfig::default());
+
+        let bar = TradeBar::new(
+            symbol.clone(),
+            date_to_datetime(date, 16, 0, 0),
+            lean_core::TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+        );
+        writer
+            .write_trade_bars(
+                std::slice::from_ref(&bar),
+                &resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, date),
+            )
+            .unwrap();
+        writer
+            .write_factor_file(
+                &[FactorFileEntry {
+                    date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+                    price_factor: 0.5,
+                    split_factor: 1.0,
+                    reference_price: 0.0,
+                }],
+                &resolver.factor_file("usa", "SPY"),
+            )
+            .unwrap();
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            history_provider: None,
+            custom_data_sources: Vec::new(),
+        });
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();
+            let start = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![50.0]);
+        });
+    }
+
+    /// Set up SPY daily with a factor file that halves the bar so we can
+    /// distinguish Adjusted (50.0) from Raw (100.0) without re-writing fixtures.
+    fn write_normalization_fixture(tmp: &tempfile::TempDir) -> (PyQcAlgorithm, lean_core::Symbol) {
+        let resolver = PathResolver::new(tmp.path());
+        let alg = PyQcAlgorithm::new();
+        let security = Python::attach(|py| {
+            alg.add_equity(
+                py,
+                "SPY",
+                PyResolution::Daily,
+                None,
+                true,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let symbol = security.inner.inner.clone();
+        let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let writer = ParquetWriter::new(WriterConfig::default());
+        let bar = TradeBar::new(
+            symbol.clone(),
+            date_to_datetime(date, 16, 0, 0),
+            lean_core::TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+        );
+        writer
+            .write_trade_bars(
+                std::slice::from_ref(&bar),
+                &resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, date),
+            )
+            .unwrap();
+        writer
+            .write_factor_file(
+                &[FactorFileEntry {
+                    date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+                    price_factor: 0.5,
+                    split_factor: 1.0,
+                    reference_price: 0.0,
+                }],
+                &resolver.factor_file("usa", "SPY"),
+            )
+            .unwrap();
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            history_provider: None,
+            custom_data_sources: Vec::new(),
+        });
+        (alg, symbol)
+    }
+
+    #[test]
+    fn set_data_normalization_mode_raw_returns_unadjusted_history() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let (alg, symbol) = write_normalization_fixture(&tmp);
+
+        alg.inner
+            .lock()
+            .unwrap()
+            .set_data_normalization_mode(&symbol, DataNormalizationMode::Raw);
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(py, PySymbol { inner: symbol }).unwrap();
+            let start = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let end = PyTuple::new(py, [2024, 1, 2]).unwrap();
+            let result = alg
+                .history_range(
+                    py,
+                    py_symbol.bind(py).as_any(),
+                    start.as_any(),
+                    end.as_any(),
+                    PyResolution::Daily,
+                )
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![100.0]);
+        });
+    }
+
+    #[test]
+    fn history_kwarg_overrides_subscription_normalization_mode() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let (alg, symbol) = write_normalization_fixture(&tmp);
+
+        Python::attach(|py| {
+            let py_symbol = Py::new(
+                py,
+                PySymbol {
+                    inner: symbol.clone(),
+                },
+            )
+            .unwrap();
+            let args = PyTuple::new(
+                py,
+                [
+                    py_symbol.bind(py).as_any(),
+                    PyTuple::new(py, [2024, 1, 2]).unwrap().as_any(),
+                    PyTuple::new(py, [2024, 1, 2]).unwrap().as_any(),
+                    Py::new(py, PyResolution::Daily).unwrap().bind(py).as_any(),
+                ],
+            )
+            .unwrap();
+            // Override Adjusted (subscription default) with Raw.
+            let result = alg
+                .history(py, &args, Some(PyDataNormalizationMode::Raw))
+                .unwrap();
+            let dict = result.bind(py).cast::<PyDict>().unwrap();
+            let closes: Vec<f64> = dict.get_item("close").unwrap().unwrap().extract().unwrap();
+            assert_eq!(closes, vec![100.0]);
+        });
+    }
+
+    #[test]
+    fn matching_normalization_mode_falls_back_to_universe_settings_when_unsubscribed() {
+        Python::initialize();
+        let tmp = tempfile::tempdir().unwrap();
+        let alg = PyQcAlgorithm::new();
+        alg.universe_settings
+            .inner
+            .lock()
+            .unwrap()
+            .data_normalization_mode = DataNormalizationMode::Raw;
+        alg.set_history_context(AlgorithmHistoryContext {
+            data_root: tmp.path().to_path_buf(),
+            history_provider: None,
+            custom_data_sources: Vec::new(),
+        });
+        let unsubscribed = lean_core::Symbol::create_equity("AAPL", &Market::usa());
+        assert_eq!(
+            alg.matching_normalization_mode(&unsubscribed, Some(Resolution::Daily)),
+            DataNormalizationMode::Raw,
+        );
+    }
+
+    #[test]
     fn algorithm_history_range_prefers_local_cache_before_provider() {
         Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let resolver = PathResolver::new(tmp.path());
-        let mut alg = PyQcAlgorithm::new();
-        let security = alg.add_equity("SPY", PyResolution::Daily);
+        let alg = PyQcAlgorithm::new();
+        let security = Python::attach(|py| {
+            alg.add_equity(
+                py,
+                "SPY",
+                PyResolution::Daily,
+                None,
+                true,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        });
         let symbol = security.inner.inner.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let local_bars = vec![
@@ -2118,6 +2784,63 @@ mod tests {
     }
 
     #[test]
+    fn security_initializer_seeds_new_equity_price() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut alg = PyQcAlgorithm::new();
+            let symbol = Symbol::create_equity("JOBY", &Market::usa());
+            let bar = TradeBar::new(
+                symbol,
+                date_to_datetime(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(), 16, 0, 0),
+                lean_core::TimeSpan::ONE_MINUTE,
+                TradeBarData::new(dec!(12), dec!(13), dec!(11), dec!(12.5), dec!(1000)),
+            );
+            let locals = PyDict::new(py);
+            locals
+                .set_item("bar", Py::new(py, PyTradeBar::from(&bar)).unwrap())
+                .unwrap();
+            let seed_function = py
+                .eval(c"lambda security: [bar]", Some(&locals), Some(&locals))
+                .unwrap();
+            let seeder = Py::new(
+                py,
+                PyFuncSecuritySeeder::new(seed_function.unbind().into_any()),
+            )
+            .unwrap();
+            let initializer = Py::new(
+                py,
+                PyBrokerageModelSecurityInitializer::new(py, None, Some(seeder.into_any())),
+            )
+            .unwrap();
+            alg.set_security_initializer(initializer.into_any());
+
+            let security = alg
+                .add_equity(
+                    py,
+                    "JOBY",
+                    PyResolution::Minute,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let price = alg
+                .inner
+                .lock()
+                .unwrap()
+                .securities
+                .get(&security.inner.inner)
+                .unwrap()
+                .current_price();
+
+            assert_eq!(price, Decimal::from_f64(12.5).unwrap());
+        });
+    }
+
+    #[test]
     fn algorithm_history_range_reads_custom_subscription_cache_rows() {
         Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
@@ -2160,7 +2883,7 @@ mod tests {
             let py_symbol = Py::new(
                 py,
                 PySymbol {
-                    inner: alg.symbols.get("ALT").unwrap().clone(),
+                    inner: alg.symbols.lock().unwrap().get("ALT").unwrap().clone(),
                 },
             )
             .unwrap();
@@ -2234,5 +2957,41 @@ mod tests {
             .map(|p| p.value.to_f64().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn market_on_open_order_is_exposed_to_python_algorithm() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut alg = PyQcAlgorithm::new();
+            let security = alg
+                .add_equity(
+                    py,
+                    "SPY",
+                    PyResolution::Daily,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let symbol = Py::new(py, security.inner.clone()).unwrap();
+
+            let ticket = alg
+                .market_on_open_order(symbol.bind(py).as_any(), 10.0)
+                .unwrap();
+
+            let order = alg
+                .inner
+                .lock()
+                .unwrap()
+                .transactions
+                .get_order(ticket.order_id)
+                .unwrap();
+            assert_eq!(order.order_type, lean_orders::OrderType::MarketOnOpen);
+            assert_eq!(order.quantity, dec!(10));
+        });
     }
 }

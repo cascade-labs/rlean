@@ -294,16 +294,16 @@ impl PyOptionChain {
 
     fn contracts(&self) -> Vec<PyOptionContract> {
         self.inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect()
     }
 
     fn calls(&self) -> Vec<PyOptionContract> {
         self.inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .filter(|c| c.right == OptionRight::Call)
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect()
@@ -311,8 +311,8 @@ impl PyOptionChain {
 
     fn puts(&self) -> Vec<PyOptionContract> {
         self.inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .filter(|c| c.right == OptionRight::Put)
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect()
@@ -321,8 +321,8 @@ impl PyOptionChain {
     fn filter(&self, py: Python, filter_fn: Py<PyAny>) -> PyResult<Vec<PyOptionContract>> {
         let all: Vec<Py<PyOptionContract>> = self
             .inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .map(|c| Py::new(py, PyOptionContract { inner: c.clone() }))
             .collect::<PyResult<Vec<_>>>()?;
         let py_list = pyo3::types::PyList::new(py, &all)?;
@@ -335,8 +335,8 @@ impl PyOptionChain {
         use chrono::Local;
         let today = Local::now().date_naive();
         self.inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .filter(|c| {
                 let days = (c.expiry - today).num_days();
                 days >= min_days && days <= max_days
@@ -355,8 +355,8 @@ impl PyOptionChain {
         let lo = spot * Decimal::from_f64(1.0 + min_pct).unwrap_or(Decimal::ONE);
         let hi = spot * Decimal::from_f64(1.0 + max_pct).unwrap_or(Decimal::ONE);
         self.inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .filter(|c| c.strike >= lo && c.strike <= hi)
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect()
@@ -378,8 +378,8 @@ impl PyOptionChain {
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyOptionChainIter>> {
         let contracts: Vec<PyOptionContract> = slf
             .inner
-            .contracts
-            .values()
+            .sorted()
+            .into_iter()
             .map(|c| PyOptionContract { inner: c.clone() })
             .collect();
         let iter = PyOptionChainIter {

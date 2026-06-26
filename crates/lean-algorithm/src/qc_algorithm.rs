@@ -5,16 +5,16 @@ use crate::{
 use chrono::Timelike;
 use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SecurityType,
-    SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
+    DataNormalizationMode, DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution,
+    SecurityType, SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
 };
 use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionManager};
 use lean_options::OptionChain;
 use lean_orders::{
     combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
     fee_model::{
-        BybitFeeModel, FeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel, OrderFee,
-        OrderFeeParameters, TradierFeeModel,
+        BybitFeeModel, FeeModel, FlatFeeModel, HyperliquidFeeModel, InteractiveBrokersFeeModel,
+        OrderFee, OrderFeeParameters, TradierFeeModel,
     },
     order::{Order, OrderStatus, OrderSubmissionData, OrderType, TimeInForce},
     order_event::OrderEvent,
@@ -144,6 +144,7 @@ pub struct QcAlgorithm {
     pub warmup_period: Option<TimeSpan>,
     pub warmup_bar_count: Option<usize>,
     pub warmup_duration: Option<TimeSpan>,
+    pub warmup_resolution: Option<Resolution>,
     pub is_warming_up: bool,
 
     // Order counter
@@ -191,6 +192,7 @@ impl QcAlgorithm {
             warmup_period: None,
             warmup_bar_count: None,
             warmup_duration: None,
+            warmup_resolution: None,
             is_warming_up: false,
             order_id_counter: 0,
             option_subscriptions: Vec::new(),
@@ -296,10 +298,14 @@ impl QcAlgorithm {
 
     pub fn set_cash(&self, amount: Price) {
         *self.portfolio.cash.write() = amount;
+        self.portfolio.set_starting_cash(amount);
     }
 
     pub fn set_warmup(&mut self, period: TimeSpan) {
         self.warmup_period = Some(period);
+        self.warmup_bar_count = None;
+        self.warmup_duration = None;
+        self.warmup_resolution = None;
     }
 
     pub fn set_warmup_periods(&mut self, periods: i64, resolution: Resolution) {
@@ -308,38 +314,91 @@ impl QcAlgorithm {
             .unwrap_or(TimeSpan::ONE_DAY.nanos as u64) as i64
             * periods;
         self.warmup_period = Some(TimeSpan::from_nanos(nanos));
+        self.warmup_bar_count = None;
+        self.warmup_duration = None;
+        self.warmup_resolution = Some(resolution);
     }
 
     /// Set warm-up by number of bars. During warm-up `on_data` is called but
     /// orders are not processed and equity is not recorded.
     pub fn set_warm_up_bars(&mut self, bar_count: usize) {
+        self.set_warm_up_bars_with_resolution(bar_count, None);
+    }
+
+    pub fn set_warm_up_bars_with_resolution(
+        &mut self,
+        bar_count: usize,
+        resolution: Option<Resolution>,
+    ) {
+        self.warmup_period = None;
         self.warmup_bar_count = Some(bar_count);
+        self.warmup_duration = None;
+        self.warmup_resolution = resolution;
         self.is_warming_up = true;
     }
 
     /// Set warm-up by time period.
     pub fn set_warm_up(&mut self, duration: TimeSpan) {
+        self.set_warm_up_with_resolution(duration, None);
+    }
+
+    pub fn set_warm_up_with_resolution(
+        &mut self,
+        duration: TimeSpan,
+        resolution: Option<Resolution>,
+    ) {
+        self.warmup_period = None;
+        self.warmup_bar_count = None;
         self.warmup_duration = Some(duration);
+        self.warmup_resolution = resolution;
         self.is_warming_up = true;
     }
 
     /// Called by the engine when warm-up data has been fully replayed.
     pub fn end_warm_up(&mut self) {
         self.is_warming_up = false;
+        self.warmup_period = None;
         self.warmup_bar_count = None;
         self.warmup_duration = None;
+        self.warmup_resolution = None;
     }
 
     // ─── Universe Management ─────────────────────────────────────────────────
 
     pub fn add_equity(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
-        let market = Market::usa();
-        let symbol = Symbol::create_equity(ticker, &market);
-        self.add_equity_symbol(symbol, resolution)
+        self.add_equity_with_normalization(
+            ticker,
+            resolution,
+            Some(DataNormalizationMode::Adjusted),
+        )
     }
 
-    fn add_equity_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
-        self.add_equity_subscriptions(symbol.clone(), resolution);
+    /// Equivalent to C# Lean's `AddEquity(..., DataNormalizationMode? dataNormalizationMode = null)`.
+    /// When `normalization_mode` is `None`, the default `Adjusted` is used; the
+    /// Python wrapper passes the configured `UniverseSettings.DataNormalizationMode`
+    /// to mirror the LEAN universe-settings fallback.
+    pub fn add_equity_with_normalization(
+        &mut self,
+        ticker: &str,
+        resolution: Resolution,
+        normalization_mode: Option<DataNormalizationMode>,
+    ) -> Symbol {
+        let market = Market::usa();
+        let symbol = Symbol::create_equity(ticker, &market);
+        self.add_equity_symbol(
+            symbol,
+            resolution,
+            normalization_mode.unwrap_or(DataNormalizationMode::Adjusted),
+        )
+    }
+
+    fn add_equity_symbol(
+        &mut self,
+        symbol: Symbol,
+        resolution: Resolution,
+        normalization_mode: DataNormalizationMode,
+    ) -> Symbol {
+        self.add_equity_subscriptions(symbol.clone(), resolution, normalization_mode);
 
         // Idempotent: if the security already exists (e.g. called again during
         // universe rebalancing), keep it as-is so the runner-updated price is
@@ -358,7 +417,9 @@ impl QcAlgorithm {
 
     pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         match symbol.security_type() {
-            SecurityType::Equity => self.add_equity_symbol(symbol, resolution),
+            SecurityType::Equity => {
+                self.add_equity_symbol(symbol, resolution, DataNormalizationMode::Adjusted)
+            }
             SecurityType::Forex => self.add_forex(&symbol.value, resolution),
             SecurityType::Crypto => {
                 let market = symbol.market().clone();
@@ -376,17 +437,35 @@ impl QcAlgorithm {
         }
     }
 
-    fn add_equity_subscriptions(&self, symbol: Symbol, resolution: Resolution) {
+    fn add_equity_subscriptions(
+        &self,
+        symbol: Symbol,
+        resolution: Resolution,
+        normalization_mode: DataNormalizationMode,
+    ) {
         self.subscription_manager
             .add(SubscriptionDataConfig::new_equity(
                 symbol.clone(),
                 resolution,
+                normalization_mode,
             ));
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
-            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            let mut quote_config =
+                SubscriptionDataConfig::new_equity(symbol, resolution, normalization_mode);
             quote_config.tick_type = lean_core::TickType::Quote;
             self.subscription_manager.add(quote_config);
         }
+    }
+
+    /// LEAN parity: `Security.SetDataNormalizationMode(mode)` mutates all
+    /// subscription configs attached to the symbol in place.
+    pub fn set_data_normalization_mode(
+        &self,
+        symbol: &Symbol,
+        normalization_mode: DataNormalizationMode,
+    ) -> usize {
+        self.subscription_manager
+            .set_normalization_mode(symbol, normalization_mode)
     }
 
     pub fn add_forex(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
@@ -513,6 +592,15 @@ impl QcAlgorithm {
                 Box::new(HyperliquidFeeModel::default())
             }
             (_, SecurityType::CryptoFuture, Market::BYBIT) => Box::new(BybitFeeModel::perpetuals()),
+            (
+                BrokerageName::Default,
+                SecurityType::Equity
+                | SecurityType::Option
+                | SecurityType::Future
+                | SecurityType::FutureOption,
+                _,
+            ) => Box::new(InteractiveBrokersFeeModel::default()),
+            (BrokerageName::Default, _, _) => Box::new(FlatFeeModel::new(dec!(0))),
             (BrokerageName::TradierBrokerage, _, _) => Box::new(TradierFeeModel),
             (BrokerageName::InteractiveBrokersBrokerage, _, _) => {
                 Box::new(InteractiveBrokersFeeModel::default())
@@ -601,16 +689,16 @@ impl QcAlgorithm {
     }
 
     pub fn total_margin_used(&self) -> Price {
-        let mut total = Decimal::ZERO;
-        for holding in self.portfolio.all_holdings() {
-            let Some(security) = self.securities.get(&holding.symbol) else {
-                continue;
-            };
-            total += security
-                .buying_power_model()
-                .reserved_buying_power_for_holding(&holding, security.leverage());
-        }
-        total
+        crate::margin_call::PositionGroupCollection::from_holdings(
+            &self.portfolio.all_holdings(),
+            &self.securities,
+        )
+        .total_reserved_buying_power()
+    }
+
+    pub fn margin_remaining(&self) -> Price {
+        self.portfolio
+            .margin_remaining_with_used(self.total_margin_used())
     }
 
     pub fn margin_remaining_for_symbol(&self, symbol: &Symbol) -> Price {
@@ -1375,6 +1463,11 @@ impl QcAlgorithm {
     /// to access the option chain in `on_data()`.
     pub fn add_option(&mut self, underlying_ticker: &str, resolution: Resolution) -> Symbol {
         let underlying = self.add_equity(underlying_ticker, resolution);
+        // C# Lean forces the underlying equity to Raw when an option universe
+        // (or contract) is subscribed — see `OptionChainUniverse` and
+        // `QCAlgorithm.AddOptionContract`.
+        self.subscription_manager
+            .set_normalization_mode(&underlying, DataNormalizationMode::Raw);
         let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
         if !self
             .option_subscriptions
@@ -1402,6 +1495,10 @@ impl QcAlgorithm {
             if !self.securities.contains(u) {
                 self.add_equity(&u.permtick, resolution);
             }
+            // C# Lean's `AddOptionContract` forces the underlying configs to Raw
+            // (see `QCAlgorithm.AddOptionContract`).
+            self.subscription_manager
+                .set_normalization_mode(u, DataNormalizationMode::Raw);
         }
         self.ensure_option_security(&symbol, resolution);
         if !self
@@ -1531,13 +1628,14 @@ impl QcAlgorithm {
             return;
         }
 
+        // Options are always Raw — `new_option` enforces that.
         self.subscription_manager
-            .add(SubscriptionDataConfig::new_equity(
+            .add(SubscriptionDataConfig::new_option(
                 symbol.clone(),
                 resolution,
             ));
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
-            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            let mut quote_config = SubscriptionDataConfig::new_option(symbol, resolution);
             quote_config.tick_type = lean_core::TickType::Quote;
             self.subscription_manager.add(quote_config);
         }
@@ -1706,6 +1804,74 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn default_brokerage_fee_model_matches_lean_security_type_defaults() {
+        let time = DateTime::from_secs(0);
+
+        let alg = QcAlgorithm::new("test", dec!(100_000));
+        let equity = Symbol::create_equity("SPY", &Market::usa());
+        let equity_order = Order::market(1, equity, dec!(471), time, "");
+        let equity_fee = alg.order_fee(&equity_order, dec!(42.48));
+        assert_eq!(equity_fee.amount, dec!(2.355));
+        assert_eq!(equity_fee.currency, "USD");
+
+        let crypto = Symbol::create_crypto("BTCUSD", &Market::coinbase());
+        let crypto_order = Order::market(2, crypto, dec!(1), time, "");
+        let crypto_fee = alg.order_fee(&crypto_order, dec!(50_000));
+        assert_eq!(crypto_fee.amount, dec!(0));
+
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let option = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+            dec!(500),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let option_order = Order::market(3, option, dec!(2), time, "");
+        let option_fee = alg.order_fee(&option_order, dec!(3.25));
+        assert_eq!(option_fee.amount, dec!(1.40));
+
+        let future = Symbol::create_future(
+            "ES",
+            &Market::cme(),
+            NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+        );
+        let future_order = Order::market(4, future, dec!(3), time, "");
+        let future_fee = alg.order_fee(&future_order, dec!(5_000));
+        assert_eq!(future_fee.amount, dec!(2.55));
+    }
+
+    #[test]
+    fn tradier_equity_fee_model_remains_zero_fee() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        alg.set_brokerage_model(BrokerageName::TradierBrokerage, AccountType::Margin);
+
+        let equity = Symbol::create_equity("SPY", &Market::usa());
+        let order = Order::market(1, equity, dec!(471), DateTime::from_secs(0), "");
+        let fee = alg.order_fee(&order, dec!(42.48));
+
+        assert_eq!(fee.amount, dec!(0));
+    }
+
+    #[test]
+    fn warmup_resolution_is_stored_and_cleared_with_warmup_state() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+
+        alg.set_warm_up_bars_with_resolution(200, Some(Resolution::Daily));
+
+        assert_eq!(alg.warmup_bar_count, Some(200));
+        assert_eq!(alg.warmup_resolution, Some(Resolution::Daily));
+        assert!(alg.is_warming_up);
+
+        alg.end_warm_up();
+
+        assert_eq!(alg.warmup_bar_count, None);
+        assert_eq!(alg.warmup_resolution, None);
+        assert!(!alg.is_warming_up);
+    }
 
     #[test]
     fn remove_security_removes_equity_subscription_and_security() {

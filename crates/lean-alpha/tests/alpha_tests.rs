@@ -111,11 +111,16 @@ mod insight_tests {
         let period = TimeSpan::from_days(1);
         let insight = Insight::up(sym, period);
 
-        // At exactly close_time_utc the insight is considered expired (>=).
+        // Match C# LEAN: at exactly close_time_utc the insight is still active,
+        // so it can be scored on its close bar.
         let at_close = insight.close_time_utc;
         assert!(
-            insight.is_expired(at_close),
-            "insight should be expired at close_time_utc"
+            !insight.is_expired(at_close),
+            "insight should remain active at close_time_utc"
+        );
+        assert!(
+            insight.is_active(at_close),
+            "insight should be active at close_time_utc"
         );
     }
 
@@ -367,6 +372,47 @@ mod insight_collection_tests {
         assert_eq!(col.len(), 2);
         assert_eq!(col.for_symbol(&spy_sym).len(), 1);
         assert_eq!(col.for_symbol(&aapl_sym).len(), 1);
+    }
+
+    #[test]
+    fn collection_snapshot_round_trips_active_closed_and_scores() {
+        use std::collections::HashMap;
+
+        let spy_sym = spy();
+        let aapl_sym = aapl();
+        let now = NanosecondTimestamp::from_secs(1_700_000_000);
+        let mut col = InsightCollection::new();
+
+        let mut active =
+            Insight::up(spy_sym.clone(), TimeSpan::from_days(5)).with_generated_time_utc(now);
+        active.source_model = "momentum".to_string();
+        active.reference_value = Some(dec!(100));
+        col.add(active.clone());
+
+        let mut expired =
+            Insight::down(aapl_sym.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now);
+        expired.source_model = "mean_reversion".to_string();
+        expired.reference_value = Some(dec!(200));
+        col.add(expired);
+        col.score_active(&HashMap::from([(aapl_sym.value.clone(), dec!(190))]), now);
+        col.remove_expired(now + TimeSpan::from_days(2));
+
+        let snapshot = col.snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded = serde_json::from_str(&json).unwrap();
+        let restored = InsightCollection::from_snapshot(decoded);
+
+        assert_eq!(restored.len(), 1);
+        assert!(restored.has_active(&spy_sym, now));
+        assert_eq!(restored.closed_insights().len(), 1);
+        assert_eq!(restored.total_count(), 2);
+
+        let closed = &restored.closed_insights()[0];
+        assert_eq!(closed.symbol, aapl_sym);
+        assert_eq!(closed.reference_value, Some(dec!(200)));
+        assert_eq!(closed.reference_value_final, Some(dec!(190)));
+        assert_eq!(closed.score_direction, Some(1.0));
+        assert!(closed.is_final_score);
     }
 }
 

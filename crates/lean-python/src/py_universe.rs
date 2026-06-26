@@ -1,7 +1,7 @@
 use crate::py_data::PyCustomDataPoint;
-use crate::py_types::{PyResolution, PySecurity, PySymbol};
+use crate::py_types::{PyDataNormalizationMode, PyResolution, PySecurity, PySymbol};
 use lean_algorithm::algorithm::SecurityChanges;
-use lean_core::{Market, Resolution, SecurityType, Symbol};
+use lean_core::{DataNormalizationMode, Market, Resolution, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, LiveUniverseSubscriptionConfig};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -15,6 +15,7 @@ pub struct UniverseSettingsState {
     pub fill_forward: bool,
     pub extended_market_hours: bool,
     pub minimum_time_in_universe_secs: f64,
+    pub data_normalization_mode: DataNormalizationMode,
 }
 
 impl Default for UniverseSettingsState {
@@ -25,6 +26,7 @@ impl Default for UniverseSettingsState {
             fill_forward: true,
             extended_market_hours: false,
             minimum_time_in_universe_secs: 0.0,
+            data_normalization_mode: DataNormalizationMode::Adjusted,
         }
     }
 }
@@ -118,6 +120,26 @@ impl PyUniverseSettings {
         };
         self.inner.lock().unwrap().minimum_time_in_universe_secs = seconds.max(0.0);
         Ok(())
+    }
+
+    #[getter]
+    fn data_normalization_mode(&self) -> PyDataNormalizationMode {
+        self.inner.lock().unwrap().data_normalization_mode.into()
+    }
+
+    #[setter]
+    fn set_data_normalization_mode(&self, value: PyDataNormalizationMode) {
+        self.inner.lock().unwrap().data_normalization_mode = value.into();
+    }
+
+    #[getter(DataNormalizationMode)]
+    fn data_normalization_mode_pascal(&self) -> PyDataNormalizationMode {
+        self.data_normalization_mode()
+    }
+
+    #[setter(DataNormalizationMode)]
+    fn set_data_normalization_mode_pascal(&self, value: PyDataNormalizationMode) {
+        self.set_data_normalization_mode(value);
     }
 
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {

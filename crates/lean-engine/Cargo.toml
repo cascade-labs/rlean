@@ -35,3 +35,6 @@ rayon = { workspace = true }
 num_cpus = { workspace = true }
 lean-brokerages = { path = "../lean-brokerages" }
 lean-indicators = { path = "../lean-indicators" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

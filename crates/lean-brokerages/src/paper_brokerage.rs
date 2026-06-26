@@ -205,6 +205,7 @@ impl Brokerage for PaperBrokerage {
                 symbol: h.symbol,
                 quantity: h.quantity,
                 average_price: h.average_price,
+                market_price: h.last_price,
             })
             .collect()
     }

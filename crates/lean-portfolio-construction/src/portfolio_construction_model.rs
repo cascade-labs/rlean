@@ -64,6 +64,14 @@ pub trait IPortfolioConstructionModel: Send + Sync {
         true
     }
 
+    /// Whether this PCM can consume multiple active insights for the same
+    /// symbol. Models such as Black-Litterman use source-model groups as
+    /// distinct investor views, so collapsing to one insight per symbol loses
+    /// the alpha ensemble before optimization.
+    fn use_all_active_insights(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "PortfolioConstructionModel"
     }

@@ -36,6 +36,19 @@ fn tradier_rejects_unsupported_market_on_open_orders() {
 }
 
 #[test]
+fn default_brokerage_accepts_market_on_open_with_ib_minimum_fee() {
+    let mut algorithm = QcAlgorithm::new("default-model-test", dec!(100000));
+    algorithm.set_brokerage_model(BrokerageName::Default, AccountType::Cash);
+    let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+
+    let ticket = algorithm.market_on_open_order(&symbol, dec!(1));
+    let fee = algorithm.order_fee(&ticket.order(), dec!(100));
+
+    assert_eq!(ticket.status(), OrderStatus::New);
+    assert_eq!(fee.amount, dec!(1.00));
+}
+
+#[test]
 fn tradier_rejects_unsupported_security_types() {
     let mut algorithm = tradier_algorithm();
     let symbol = algorithm.add_forex("EURUSD", Resolution::Minute);

@@ -2,7 +2,7 @@ use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
 use lean_data::{Bar, QuoteBar, TradeBar, TradeBarData};
 use lean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
-    Order, TransactionManager,
+    Order, OrderType, TransactionManager,
 };
 use rust_decimal_macros::dec;
 use std::{collections::HashMap, sync::Arc};
@@ -115,6 +115,8 @@ fn process_orders_with_quotes_uses_quote_side_for_limit_trigger() {
     let events = processor.process_orders_with_quotes(&bars, &quotes, ts(60));
 
     assert_eq!(events.len(), 1);
+    // Buy limit @100 triggers off the quote side (ask low 99 <= 100) but fills AT the
+    // limit price — a buy can't fill above its limit, so 100 (not the 101 ask).
     assert_eq!(events[0].fill_price, dec!(100));
     assert_eq!(events[0].fill_quantity, dec!(10));
 }
@@ -187,6 +189,48 @@ fn post_algorithm_scan_defers_new_limit_order_on_current_slice() {
     let events = processor.generate_post_algorithm_order_events_with_quotes(&bars, &quotes, ts(60));
 
     assert!(events.is_empty());
+}
+
+#[test]
+fn post_algorithm_scan_defers_new_market_on_open_order_on_current_slice() {
+    let symbol = spy();
+    let tm = Arc::new(TransactionManager::new());
+    let mut order = Order::market(1, symbol.clone(), dec!(10), ts(60), "");
+    order.order_type = OrderType::MarketOnOpen;
+    tm.add_order(order);
+    let processor = OrderProcessor::new(
+        Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+        tm,
+    );
+
+    let bars = HashMap::from([(symbol.id.sid, trade_bar(symbol.clone()))]);
+    let quotes = HashMap::from([(symbol.id.sid, quote_bar(symbol.clone()))]);
+
+    let events = processor.generate_post_algorithm_order_events_with_quotes(&bars, &quotes, ts(60));
+
+    assert!(events.is_empty());
+}
+
+#[test]
+fn post_algorithm_scan_fills_resting_market_on_open_order_from_prior_slice() {
+    let symbol = spy();
+    let tm = Arc::new(TransactionManager::new());
+    let mut order = Order::market(1, symbol.clone(), dec!(10), ts(0), "");
+    order.order_type = OrderType::MarketOnOpen;
+    tm.add_order(order);
+    let processor = OrderProcessor::new(
+        Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+        tm,
+    );
+
+    let bars = HashMap::from([(symbol.id.sid, trade_bar(symbol.clone()))]);
+    let quotes = HashMap::from([(symbol.id.sid, quote_bar(symbol.clone()))]);
+
+    let events = processor.generate_post_algorithm_order_events_with_quotes(&bars, &quotes, ts(60));
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].fill_price, dec!(101));
+    assert_eq!(events[0].fill_quantity, dec!(10));
 }
 
 #[test]
