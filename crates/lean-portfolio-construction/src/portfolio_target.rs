@@ -14,17 +14,31 @@ pub struct PortfolioTarget {
 
 impl PortfolioTarget {
     pub fn new(symbol: Symbol, quantity: Decimal) -> Self {
+        Self::new_with_tag(symbol, quantity, "")
+    }
+
+    pub fn new_with_tag(symbol: Symbol, quantity: Decimal, tag: impl Into<String>) -> Self {
         Self {
             symbol,
             quantity,
             percent: None,
-            tag: String::new(),
+            tag: tag.into(),
         }
     }
 
     /// Create a target from a target portfolio percentage.
     /// Computes quantity = round(portfolio_value * pct / price).
     pub fn percent(symbol: Symbol, pct: Decimal, portfolio_value: Decimal, price: Decimal) -> Self {
+        Self::percent_with_tag(symbol, pct, portfolio_value, price, "")
+    }
+
+    pub fn percent_with_tag(
+        symbol: Symbol,
+        pct: Decimal,
+        portfolio_value: Decimal,
+        price: Decimal,
+        tag: impl Into<String>,
+    ) -> Self {
         let quantity = if price.is_zero() {
             Decimal::ZERO
         } else {
@@ -34,7 +48,7 @@ impl PortfolioTarget {
             symbol,
             quantity,
             percent: Some(pct),
-            tag: String::new(),
+            tag: tag.into(),
         }
     }
 }

@@ -5,8 +5,8 @@ use crate::{
 use chrono::Timelike;
 use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution, SecurityType,
-    SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
+    DataNormalizationMode, DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution,
+    SecurityType, SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
 };
 use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionManager};
 use lean_options::OptionChain;
@@ -366,13 +366,39 @@ impl QcAlgorithm {
     // ─── Universe Management ─────────────────────────────────────────────────
 
     pub fn add_equity(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
-        let market = Market::usa();
-        let symbol = Symbol::create_equity(ticker, &market);
-        self.add_equity_symbol(symbol, resolution)
+        self.add_equity_with_normalization(
+            ticker,
+            resolution,
+            Some(DataNormalizationMode::Adjusted),
+        )
     }
 
-    fn add_equity_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
-        self.add_equity_subscriptions(symbol.clone(), resolution);
+    /// Equivalent to C# Lean's `AddEquity(..., DataNormalizationMode? dataNormalizationMode = null)`.
+    /// When `normalization_mode` is `None`, the default `Adjusted` is used; the
+    /// Python wrapper passes the configured `UniverseSettings.DataNormalizationMode`
+    /// to mirror the LEAN universe-settings fallback.
+    pub fn add_equity_with_normalization(
+        &mut self,
+        ticker: &str,
+        resolution: Resolution,
+        normalization_mode: Option<DataNormalizationMode>,
+    ) -> Symbol {
+        let market = Market::usa();
+        let symbol = Symbol::create_equity(ticker, &market);
+        self.add_equity_symbol(
+            symbol,
+            resolution,
+            normalization_mode.unwrap_or(DataNormalizationMode::Adjusted),
+        )
+    }
+
+    fn add_equity_symbol(
+        &mut self,
+        symbol: Symbol,
+        resolution: Resolution,
+        normalization_mode: DataNormalizationMode,
+    ) -> Symbol {
+        self.add_equity_subscriptions(symbol.clone(), resolution, normalization_mode);
 
         // Idempotent: if the security already exists (e.g. called again during
         // universe rebalancing), keep it as-is so the runner-updated price is
@@ -391,7 +417,9 @@ impl QcAlgorithm {
 
     pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         match symbol.security_type() {
-            SecurityType::Equity => self.add_equity_symbol(symbol, resolution),
+            SecurityType::Equity => {
+                self.add_equity_symbol(symbol, resolution, DataNormalizationMode::Adjusted)
+            }
             SecurityType::Forex => self.add_forex(&symbol.value, resolution),
             SecurityType::Crypto => {
                 let market = symbol.market().clone();
@@ -409,17 +437,35 @@ impl QcAlgorithm {
         }
     }
 
-    fn add_equity_subscriptions(&self, symbol: Symbol, resolution: Resolution) {
+    fn add_equity_subscriptions(
+        &self,
+        symbol: Symbol,
+        resolution: Resolution,
+        normalization_mode: DataNormalizationMode,
+    ) {
         self.subscription_manager
             .add(SubscriptionDataConfig::new_equity(
                 symbol.clone(),
                 resolution,
+                normalization_mode,
             ));
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
-            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            let mut quote_config =
+                SubscriptionDataConfig::new_equity(symbol, resolution, normalization_mode);
             quote_config.tick_type = lean_core::TickType::Quote;
             self.subscription_manager.add(quote_config);
         }
+    }
+
+    /// LEAN parity: `Security.SetDataNormalizationMode(mode)` mutates all
+    /// subscription configs attached to the symbol in place.
+    pub fn set_data_normalization_mode(
+        &self,
+        symbol: &Symbol,
+        normalization_mode: DataNormalizationMode,
+    ) -> usize {
+        self.subscription_manager
+            .set_normalization_mode(symbol, normalization_mode)
     }
 
     pub fn add_forex(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
@@ -643,16 +689,16 @@ impl QcAlgorithm {
     }
 
     pub fn total_margin_used(&self) -> Price {
-        let mut total = Decimal::ZERO;
-        for holding in self.portfolio.all_holdings() {
-            let Some(security) = self.securities.get(&holding.symbol) else {
-                continue;
-            };
-            total += security
-                .buying_power_model()
-                .reserved_buying_power_for_holding(&holding, security.leverage());
-        }
-        total
+        crate::margin_call::PositionGroupCollection::from_holdings(
+            &self.portfolio.all_holdings(),
+            &self.securities,
+        )
+        .total_reserved_buying_power()
+    }
+
+    pub fn margin_remaining(&self) -> Price {
+        self.portfolio
+            .margin_remaining_with_used(self.total_margin_used())
     }
 
     pub fn margin_remaining_for_symbol(&self, symbol: &Symbol) -> Price {
@@ -1417,6 +1463,11 @@ impl QcAlgorithm {
     /// to access the option chain in `on_data()`.
     pub fn add_option(&mut self, underlying_ticker: &str, resolution: Resolution) -> Symbol {
         let underlying = self.add_equity(underlying_ticker, resolution);
+        // C# Lean forces the underlying equity to Raw when an option universe
+        // (or contract) is subscribed — see `OptionChainUniverse` and
+        // `QCAlgorithm.AddOptionContract`.
+        self.subscription_manager
+            .set_normalization_mode(&underlying, DataNormalizationMode::Raw);
         let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
         if !self
             .option_subscriptions
@@ -1444,6 +1495,10 @@ impl QcAlgorithm {
             if !self.securities.contains(u) {
                 self.add_equity(&u.permtick, resolution);
             }
+            // C# Lean's `AddOptionContract` forces the underlying configs to Raw
+            // (see `QCAlgorithm.AddOptionContract`).
+            self.subscription_manager
+                .set_normalization_mode(u, DataNormalizationMode::Raw);
         }
         self.ensure_option_security(&symbol, resolution);
         if !self
@@ -1573,13 +1628,14 @@ impl QcAlgorithm {
             return;
         }
 
+        // Options are always Raw — `new_option` enforces that.
         self.subscription_manager
-            .add(SubscriptionDataConfig::new_equity(
+            .add(SubscriptionDataConfig::new_option(
                 symbol.clone(),
                 resolution,
             ));
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
-            let mut quote_config = SubscriptionDataConfig::new_equity(symbol, resolution);
+            let mut quote_config = SubscriptionDataConfig::new_option(symbol, resolution);
             quote_config.tick_type = lean_core::TickType::Quote;
             self.subscription_manager.add(quote_config);
         }

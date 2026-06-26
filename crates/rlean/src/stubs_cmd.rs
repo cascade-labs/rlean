@@ -258,6 +258,8 @@ class Security:
     def symbol(self) -> Symbol: ...
     def set_market_price(self, data: Any) -> bool: ...
     def SetMarketPrice(self, data: Any) -> bool: ...
+    def set_data_normalization_mode(self, mode: DataNormalizationMode) -> None: ...
+    def SetDataNormalizationMode(self, mode: DataNormalizationMode) -> None: ...
 
 class FuncSecuritySeeder:
     """Seeds a newly added security from a callable such as ``algorithm.get_last_known_prices``."""
@@ -817,6 +819,39 @@ class Insight:
         """LEAN PascalCase alias for :meth:`price`."""
         ...
 
+class PortfolioTarget:
+    """A target quantity or portfolio-percent allocation for a symbol."""
+
+    symbol: Symbol
+    quantity: Optional[float]
+    tag: str
+    Symbol: Symbol
+    Quantity: Optional[float]
+    Tag: str
+
+    def __init__(
+        self,
+        symbol: Symbol | Security | str,
+        quantity: float,
+        tag: str = "",
+    ) -> None: ...
+
+    @staticmethod
+    def Percent(
+        algorithm: Any,
+        symbol: Symbol | Security | str,
+        percent: float,
+        tag: str = "",
+    ) -> PortfolioTarget: ...
+
+    @staticmethod
+    def percent(
+        algorithm: Any,
+        symbol: Symbol | Security | str,
+        pct: float,
+        tag: str = "",
+    ) -> PortfolioTarget: ...
+
 # ── Algorithm Framework — Base Classes ────────────────────────────────────────
 
 class AlphaModel:
@@ -1033,12 +1068,14 @@ class UniverseSettings:
     fill_forward: bool
     extended_market_hours: bool
     minimum_time_in_universe: float | timedelta
+    data_normalization_mode: DataNormalizationMode
 
     Resolution: Resolution
     Leverage: float
     FillForward: bool
     ExtendedMarketHours: bool
     MinimumTimeInUniverse: float | timedelta
+    DataNormalizationMode: DataNormalizationMode
 
 class DateRule: ...
 
@@ -1159,8 +1196,16 @@ class QCAlgorithm:
 
     # ── History ──────────────────────────────────────────────────────────────
 
-    def history(self, symbol: Symbol | Security | str, bar_count: int, resolution: Resolution) -> Any:
-        """Return history ending at algorithm time as a column-oriented dict."""
+    def history(self, *args: Any, data_normalization_mode: DataNormalizationMode | None = None) -> Any:
+        """Return history as a column-oriented dict.
+
+        Supported call shapes:
+            history(symbol, bar_count, resolution)
+            history(symbol, start, end, resolution)
+
+        The optional ``data_normalization_mode`` keyword overrides the
+        normalization mode resolved from the subscription configuration.
+        """
         ...
     def history_range(self, symbol: Symbol | Security | str, start: Any, end: Any, resolution: Resolution) -> Any:
         """Return history for an explicit date range as a column-oriented dict."""
@@ -1173,7 +1218,7 @@ class QCAlgorithm:
 
     # ── Universe subscription ─────────────────────────────────────────────────
 
-    def add_equity(self, ticker: str, resolution: Resolution = ...) -> Security: ...
+    def add_equity(self, ticker: str, resolution: Resolution = ..., data_normalization_mode: DataNormalizationMode | None = None) -> Security: ...
     def add_forex(self, ticker: str, resolution: Resolution = ...) -> Security: ...
     def add_crypto(self, ticker: str, resolution: Resolution = ..., market: str | None = None) -> Security: ...
     def add_crypto_future(self, ticker: str, resolution: Resolution = ..., market: str | None = None, leverage: float | None = None) -> Security: ...
@@ -1275,6 +1320,18 @@ class QCAlgorithm:
     def initialize(self) -> None: ...
     def on_data(self, data: Slice) -> None: ...
     def on_order_event(self, event: OrderEvent) -> None: ...
+    def on_margin_call(self, orders: List[tuple[str, float]]) -> List[tuple[str, float]]:
+        """Handle generated margin-call liquidation orders. Return the orders to execute."""
+        ...
+    def on_margin_call_warning(self) -> None:
+        """Called when margin remaining drops below 5% of portfolio value."""
+        ...
+    def OnMarginCall(self, orders: List[tuple[str, float]]) -> List[tuple[str, float]]:
+        """LEAN PascalCase alias for ``on_margin_call``."""
+        ...
+    def OnMarginCallWarning(self) -> None:
+        """LEAN PascalCase alias for ``on_margin_call_warning``."""
+        ...
     def on_end_of_algorithm(self) -> None: ...
     def on_warmup_finished(self) -> None: ...
 

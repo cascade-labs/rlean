@@ -132,7 +132,10 @@ impl PyQuantBook {
         // Build a time-range predicate.
         let start_dt = date_to_datetime(start, 0, 0, 0);
         let end_dt = date_to_datetime(end, 23, 59, 59);
-        let params = QueryParams::new().with_time_range(start_dt, end_dt);
+        let sid = symbol.id.sid;
+        let params = QueryParams::new()
+            .with_time_range(start_dt, end_dt)
+            .with_symbols(vec![sid]);
 
         // Run via a one-shot Tokio runtime (QuantBook is used interactively,
         // not inside an existing async context).
@@ -144,17 +147,16 @@ impl PyQuantBook {
             .build()
             .map(|rt| {
                 rt.block_on(async move {
-                    let mut bars = Vec::new();
-                    for path in paths {
-                        bars.extend(
-                            reader
-                                .read_trade_bar_partition(&path, &symbol_clone, &params)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|bar| bar.symbol.id.sid == symbol_clone.id.sid),
-                        );
-                    }
-                    bars
+                    reader
+                        .read_trade_bar_partitions_grouped_async(
+                            &paths,
+                            &HashMap::from([(sid, symbol_clone)]),
+                            &params,
+                        )
+                        .await
+                        .unwrap_or_default()
+                        .remove(&sid)
+                        .unwrap_or_default()
                 })
             })
             .unwrap_or_default()

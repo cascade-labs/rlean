@@ -14,7 +14,7 @@ use rust_decimal_macros::dec;
 pub struct AdaptiveMakerTakerExecutionModel {
     pub accepting_spread_percent: Decimal,
     passive: MakerThenTakerExecutionModel,
-    tight_targets: HashMap<String, (Symbol, Decimal)>,
+    tight_targets: HashMap<String, (Symbol, Decimal, String)>,
 }
 
 impl AdaptiveMakerTakerExecutionModel {
@@ -85,8 +85,10 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
                 .unwrap_or(false)
             {
                 self.passive.remove_target(&target.symbol);
-                self.tight_targets
-                    .insert(key, (target.symbol.clone(), target.quantity));
+                self.tight_targets.insert(
+                    key,
+                    (target.symbol.clone(), target.quantity, target.tag.clone()),
+                );
             } else {
                 self.tight_targets.remove(&key);
                 passive_targets.push(target.clone());
@@ -96,7 +98,9 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
         let mut tight_snapshot: Vec<_> = self
             .tight_targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity, _))| {
+                (key.clone(), symbol.clone(), *target_quantity)
+            })
             .collect();
         context.sort_targets_by_margin_impact(&mut tight_snapshot);
 
@@ -106,10 +110,16 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
             };
             let open_order_quantity = Self::open_order_quantity(context, security);
             if !self.spread_is_tight(security) {
+                let tag = self
+                    .tight_targets
+                    .get(&key)
+                    .map(|(_, _, tag)| tag.clone())
+                    .unwrap_or_default();
                 self.tight_targets.remove(&key);
                 passive_targets.push(ExecutionTarget {
                     symbol,
                     quantity: target_quantity,
+                    tag,
                 });
                 continue;
             }

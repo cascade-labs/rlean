@@ -86,6 +86,7 @@ impl IHistoryProvider for LocalHistoryProvider {
         let end_date = request.end.date_utc();
 
         let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+        let is_daily = request.resolution == Resolution::Daily;
 
         let mut paths = Vec::new();
         for current in &expected_dates {
@@ -106,21 +107,33 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(vec![]);
         }
 
-        let reader = ParquetReader::new();
-        let mut params = QueryParams::new().with_time_range(request.start, request.end);
-        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
         let symbol = request.symbol.clone();
-
-        let mut bars = Vec::new();
-        for path in &paths {
-            bars.extend(
-                reader
-                    .read_trade_bar_partition(path, &symbol, &params)
-                    .unwrap_or_default(),
-            );
+        let sid = symbol.id.sid;
+        let reader = ParquetReader::new();
+        if is_daily && !partition_paths_cover_symbol_sid(&reader, &paths, sid, 2) {
+            return Ok(vec![]);
         }
+        let params = if is_daily {
+            QueryParams::new().with_symbols(vec![sid])
+        } else {
+            QueryParams::new()
+                .with_time_range(request.start, request.end)
+                .with_symbols(vec![sid])
+        };
+        let mut grouped = reader
+            .read_trade_bar_partitions_grouped_async(
+                &paths,
+                &HashMap::from([(sid, symbol)]),
+                &params,
+            )
+            .await?;
+        let bars = grouped.remove(&sid).unwrap_or_default();
 
-        if !local_bars_cover_expected_dates(&bars, &expected_dates) {
+        if is_daily {
+            if bars.len() < expected_dates.len() {
+                return Ok(vec![]);
+            }
+        } else if !local_bars_cover_expected_dates(&bars, &expected_dates) {
             return Ok(vec![]);
         }
 
@@ -132,6 +145,7 @@ impl IHistoryProvider for LocalHistoryProvider {
         let start_date = request.start.date_utc();
         let end_date = request.end.date_utc();
         let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
+        let is_daily = request.resolution == Resolution::Daily;
 
         let mut paths = Vec::new();
         for current in &expected_dates {
@@ -152,14 +166,32 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(vec![]);
         }
 
+        let symbol = request.symbol.clone();
+        let sid = symbol.id.sid;
         let reader = ParquetReader::new();
-        let mut params = QueryParams::new().with_time_range(request.start, request.end);
-        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
-        let mut bars = Vec::new();
-        for path in &paths {
-            bars.extend(reader.read_quote_bar_partition(path, &request.symbol, &params)?);
+        if is_daily && !partition_paths_cover_symbol_sid(&reader, &paths, sid, 2) {
+            return Ok(vec![]);
         }
-        if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
+        let params = if is_daily {
+            QueryParams::new().with_symbols(vec![sid])
+        } else {
+            QueryParams::new()
+                .with_time_range(request.start, request.end)
+                .with_symbols(vec![sid])
+        };
+        let mut grouped = reader
+            .read_quote_bar_partitions_grouped_async(
+                &paths,
+                &HashMap::from([(sid, symbol)]),
+                &params,
+            )
+            .await?;
+        let bars = grouped.remove(&sid).unwrap_or_default();
+        if is_daily {
+            if bars.len() < expected_dates.len() {
+                return Ok(vec![]);
+            }
+        } else if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
             return Ok(vec![]);
         }
         Ok(bars)
@@ -190,13 +222,16 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(vec![]);
         }
 
+        let symbol = request.symbol.clone();
+        let sid = symbol.id.sid;
         let reader = ParquetReader::new();
-        let mut params = QueryParams::new().with_time_range(request.start, request.end);
-        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
-        let mut ticks = Vec::new();
-        for path in &paths {
-            ticks.extend(reader.read_tick_partition(path, &request.symbol, &params)?);
-        }
+        let params = QueryParams::new()
+            .with_time_range(request.start, request.end)
+            .with_symbols(vec![sid]);
+        let mut grouped = reader
+            .read_tick_partitions_grouped_async(&paths, &HashMap::from([(sid, symbol)]), &params)
+            .await?;
+        let ticks = grouped.remove(&sid).unwrap_or_default();
         if !local_ticks_cover_expected_dates(&ticks, &expected_dates) {
             return Ok(vec![]);
         }
@@ -505,6 +540,19 @@ fn local_bars_cover_expected_dates(bars: &[TradeBar], expected_dates: &[NaiveDat
     }
     let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
     expected_dates.iter().all(|date| available.contains(date))
+}
+
+fn partition_paths_cover_symbol_sid(
+    reader: &ParquetReader,
+    paths: &[std::path::PathBuf],
+    sid: u64,
+    symbol_sid_column: usize,
+) -> bool {
+    paths.iter().all(|path| {
+        reader
+            .read_partition_symbol_sids(path, symbol_sid_column)
+            .is_ok_and(|sids| sids.contains(&sid))
+    })
 }
 
 fn local_quote_bars_cover_expected_dates(bars: &[QuoteBar], expected_dates: &[NaiveDate]) -> bool {

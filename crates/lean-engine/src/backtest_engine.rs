@@ -3,7 +3,7 @@ use crate::{
     result_handler::ResultHandler,
 };
 use lean_algorithm::algorithm::IAlgorithm;
-use lean_core::{DateTime, Result as LeanResult};
+use lean_core::Result as LeanResult;
 use lean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
     transaction_manager::TransactionManager,
@@ -24,16 +24,18 @@ impl BacktestEngine {
     pub async fn run(&self, mut algorithm: Box<dyn IAlgorithm>) -> LeanResult<ResultHandler> {
         info!("Starting backtest: {}", algorithm.name());
 
-        // Initialize algorithm
         algorithm.initialize()?;
 
         let start = algorithm.start_date();
         let end = algorithm.end_date();
-        // Read starting cash from the algorithm after initialize() has run (e.g. set_cash was called).
-        // Falls back to the trait default (100,000) if the implementor does not override starting_cash().
         let starting_cash = algorithm.starting_cash();
+        let subscriptions = algorithm.subscriptions();
 
-        let data_manager = DataManager::new(self.config.data_root.clone());
+        let mut data_manager = DataManager::new(self.config.data_root.clone());
+        data_manager
+            .initialize_feed(&subscriptions, start, end)
+            .await?;
+
         let transaction_manager = Arc::new(TransactionManager::new());
 
         let fill_model = ImmediateFillModel::new(Box::new(NullSlippageModel));
@@ -43,48 +45,45 @@ impl BacktestEngine {
         let mut result_handler = ResultHandler::new();
         let mut algo_manager = AlgorithmManager::new(algorithm);
 
-        // Date loop
-        let start_date = start.date_utc();
-        let end_date = end.date_utc();
-        let mut current_date = start_date;
         let mut trading_days = 0i64;
+        let mut last_date = None::<chrono::NaiveDate>;
+        let mut slices_processed = 0i64;
 
-        while current_date <= end_date {
-            let slice = data_manager.get_slice_for_date(current_date).await?;
-
+        while let Some(slice) = data_manager.next_slice().await? {
+            if slice.time > end {
+                break;
+            }
             if !slice.has_data {
-                current_date += chrono::Duration::days(1);
                 continue;
             }
 
-            trading_days += 1;
+            let slice_date = slice.time.date_utc();
+            if last_date.map(|prev| prev != slice_date).unwrap_or(true) {
+                if last_date.is_some() {
+                    algo_manager.on_end_of_day(None);
+                }
+                trading_days += 1;
+            }
+            last_date = Some(slice_date);
+            slices_processed += 1;
 
-            // Update portfolio prices and process orders
             let bars_map: std::collections::HashMap<u64, lean_data::TradeBar> =
                 slice.bars.iter().map(|(k, v)| (*k, v.clone())).collect();
 
-            use chrono::{TimeZone, Utc};
-            let utc_time =
-                DateTime::from(Utc.from_utc_datetime(&current_date.and_hms_opt(16, 0, 0).unwrap()));
+            let order_events = order_processor.process_orders(&bars_map, slice.time);
 
-            let order_events = order_processor.process_orders(&bars_map, utc_time);
-
-            // Notify algorithm of fills
             for event in &order_events {
                 algo_manager.on_order_event(event);
             }
 
-            // Deliver data to algorithm
             algo_manager.on_data(&slice);
 
-            // End of day
-            algo_manager.on_end_of_day(None);
-
-            // Compute real portfolio value (cash + market value of all holdings).
             let portfolio_value = algo_manager.algorithm.portfolio_value();
-            result_handler.record_equity(utc_time, portfolio_value);
+            result_handler.record_equity(slice.time, portfolio_value);
+        }
 
-            current_date += chrono::Duration::days(1);
+        if slices_processed > 0 {
+            algo_manager.on_end_of_day(None);
         }
 
         algo_manager.on_end_of_algorithm();
@@ -93,8 +92,8 @@ impl BacktestEngine {
         result_handler.print_summary();
 
         info!(
-            "Backtest complete. {} trading days processed.",
-            trading_days
+            "Backtest complete. {} trading days, {} slices processed.",
+            trading_days, slices_processed
         );
         Ok(result_handler)
     }

@@ -218,17 +218,18 @@ fn fetch_registry(url: &str) -> Result<Vec<RegistryEntry>> {
 
 /// Fetch plugins from all configured registries (official + user-added).
 /// Returns `(registry_label, entry)` pairs.
-/// Entries from later registries that share a name with an earlier one are skipped
-/// so the official registry takes precedence for name collisions.
+/// Entries from later registries that share a name with an earlier one are skipped.
+/// User registries are loaded first so private overrides can replace built-in
+/// entries without changing the public registry.
 fn fetch_all_registries() -> Vec<(String, RegistryEntry)> {
-    let mut sources: Vec<(String, String)> =
-        vec![("built-in".to_string(), OFFICIAL_REGISTRY_URL.to_string())];
+    let mut sources: Vec<(String, String)> = Vec::new();
     if let Ok(user) = load_user_registries() {
         for url in user.urls {
             let label = registry_label(&url);
             sources.push((label, url));
         }
     }
+    sources.push(("built-in".to_string(), OFFICIAL_REGISTRY_URL.to_string()));
 
     let mut seen = std::collections::HashSet::new();
     let mut all = vec![];

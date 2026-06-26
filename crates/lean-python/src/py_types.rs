@@ -501,9 +501,21 @@ impl PySecurity {
         read_algorithm_security_price(algorithm, &self.inner.inner)
     }
 
-    /// LEAN API: ``security.SetDataNormalizationMode(DataNormalizationMode.Adjusted)``
-    /// rlean applies Adjusted normalization by default; this is a no-op for API compatibility.
-    fn set_data_normalization_mode(&self, _mode: PyDataNormalizationMode) {}
+    /// LEAN API: ``security.SetDataNormalizationMode(DataNormalizationMode.Adjusted)``.
+    /// Mutates every subscription config attached to this symbol in place, matching
+    /// C# Lean's `Security.SetDataNormalizationMode` semantics.
+    fn set_data_normalization_mode(&self, mode: PyDataNormalizationMode) -> PyResult<()> {
+        let Some(algorithm) = &self.algorithm else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Security.SetDataNormalizationMode requires an initialized algorithm security",
+            ));
+        };
+        algorithm
+            .lock()
+            .unwrap()
+            .set_data_normalization_mode(&self.inner.inner, mode.into());
+        Ok(())
+    }
 
     #[getter]
     fn leverage(&self) -> PyResult<f64> {
@@ -876,6 +888,23 @@ impl From<PyDataNormalizationMode> for DataNormalizationMode {
             }
             PyDataNormalizationMode::BackwardPanamaCanal => {
                 DataNormalizationMode::BackwardPanamaCanal
+            }
+        }
+    }
+}
+
+impl From<DataNormalizationMode> for PyDataNormalizationMode {
+    fn from(m: DataNormalizationMode) -> Self {
+        match m {
+            DataNormalizationMode::Raw => PyDataNormalizationMode::Raw,
+            DataNormalizationMode::Adjusted => PyDataNormalizationMode::Adjusted,
+            DataNormalizationMode::SplitAdjusted => PyDataNormalizationMode::SplitAdjusted,
+            DataNormalizationMode::TotalReturn => PyDataNormalizationMode::TotalReturn,
+            DataNormalizationMode::ForwardPanamaCanal => {
+                PyDataNormalizationMode::ForwardPanamaCanal
+            }
+            DataNormalizationMode::BackwardPanamaCanal => {
+                PyDataNormalizationMode::BackwardPanamaCanal
             }
         }
     }

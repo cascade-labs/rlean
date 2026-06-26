@@ -65,6 +65,7 @@ fn make_target(ticker: &str, qty: f64) -> ExecutionTarget {
     ExecutionTarget {
         symbol: make_symbol(ticker),
         quantity: Decimal::try_from(qty).unwrap(),
+        tag: String::new(),
     }
 }
 
@@ -453,6 +454,20 @@ mod immediate_execution_tests {
             "Tag should identify model, got: {}",
             orders[0].tag
         );
+    }
+
+    /// Non-empty PortfolioTarget tags should flow through to immediate orders.
+    #[test]
+    fn order_tag_uses_target_tag_when_provided() {
+        let mut model = ImmediateExecutionModel::new();
+        let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
+        let mut target = make_target("AAPL", 10.0);
+        target.tag = "orthogonal".to_string();
+
+        let orders = model.execute(&[target], &securities);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].tag, "orthogonal");
     }
 
     /// Symbol on the order should match the target symbol.

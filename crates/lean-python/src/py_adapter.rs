@@ -1,10 +1,12 @@
 use crate::charting::ChartCollection;
+use crate::interrupt::{self, Interrupted};
 use crate::py_data::{PySlice, PyTradeBar, SliceProxy};
 use crate::py_framework::{notify_framework_securities_changed, FrameworkState};
 use crate::py_orders::PyOrderEvent;
 use crate::py_qc_algorithm::{AlgorithmHistoryContext, IndicatorRegistry, PyQcAlgorithm};
 use crate::py_universe::{PyScheduledUniverse, PySecurityChanges};
 use lean_algorithm::algorithm::{AlgorithmStatus, IAlgorithm, SecurityChanges};
+use lean_algorithm::margin_call::MarginCallOrderRequest;
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{DateTime, Market, Result as LeanResult, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, Slice};
@@ -46,7 +48,7 @@ impl PyAlgorithmAdapter {
             .py_obj
             .call_method1(py, "OnData", (proxy.py_slice.bind(py),))
         {
-            e.print(py);
+            interrupt::report_py_err_print(py, e);
         }
     }
 
@@ -62,10 +64,12 @@ impl PyAlgorithmAdapter {
             match PySlice::from_slice_with_custom(py, slice, custom_data) {
                 Ok(py_slice) => {
                     if let Err(e) = self.py_obj.call_method1(py, "OnData", (py_slice,)) {
-                        e.print(py);
+                        interrupt::report_py_err_print(py, e);
                     }
                 }
-                Err(e) => e.print(py),
+                Err(e) => {
+                    interrupt::report_py_err_print(py, e);
+                }
             }
         });
     }
@@ -162,7 +166,9 @@ impl PyAlgorithmAdapter {
                         merged.removed.extend(changes.removed);
                     }
                 }
-                Err(e) => e.print(py),
+                Err(e) => {
+                    interrupt::report_py_err_print(py, e);
+                }
             }
         }
         drop(universes);
@@ -210,7 +216,9 @@ impl PyAlgorithmAdapter {
                         merged.removed.extend(changes.removed);
                     }
                 }
-                Err(e) => e.print(py),
+                Err(e) => {
+                    interrupt::report_py_err_print(py, e);
+                }
             }
         }
         drop(universes);
@@ -283,8 +291,12 @@ impl IAlgorithm for PyAlgorithmAdapter {
     fn initialize(&mut self) -> LeanResult<()> {
         Python::attach(|py| {
             self.py_obj.call_method0(py, "Initialize").map_err(|e| {
-                e.print(py);
-                anyhow::anyhow!("Python Initialize() failed")
+                if interrupt::report_py_err(py, &e) {
+                    Interrupted.into()
+                } else {
+                    e.print(py);
+                    anyhow::anyhow!("Python Initialize() failed")
+                }
             })?;
             self.name = self.inner.lock().unwrap().name.clone();
             Ok(())
@@ -297,10 +309,12 @@ impl IAlgorithm for PyAlgorithmAdapter {
             match PySlice::from_slice(py, slice) {
                 Ok(py_slice) => {
                     if let Err(e) = self.py_obj.call_method1(py, "OnData", (py_slice,)) {
-                        e.print(py);
+                        interrupt::report_py_err_print(py, e);
                     }
                 }
-                Err(e) => e.print(py),
+                Err(e) => {
+                    interrupt::report_py_err_print(py, e);
+                }
             }
         });
     }
@@ -309,7 +323,9 @@ impl IAlgorithm for PyAlgorithmAdapter {
         Python::attach(|py| {
             let py_event = PyOrderEvent::from(event);
             if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (py_event,)) {
-                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                    && !interrupt::report_py_err(py, &e)
+                {
                     e.print(py);
                 }
             }
@@ -334,9 +350,19 @@ impl IAlgorithm for PyAlgorithmAdapter {
         });
     }
 
-    fn on_margin_call(&mut self, _requests: &[Order]) {
+    fn on_margin_call(&mut self, requests: &[lean_orders::Order]) {
+        let _ = self.handle_margin_call_orders(requests);
+    }
+
+    fn on_margin_call_warning(&mut self) {
         Python::attach(|py| {
-            lean_call0(py, &self.py_obj, "OnMarginCall");
+            if let Err(e) = self.py_obj.call_method0(py, "OnMarginCallWarning") {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                    && !interrupt::report_py_err(py, &e)
+                {
+                    e.print(py);
+                }
+            }
         });
     }
 
@@ -354,7 +380,7 @@ impl IAlgorithm for PyAlgorithmAdapter {
                         let _ =
                             self.py_obj
                                 .call_method1(py, "on_securities_changed", (changes_obj,));
-                    } else {
+                    } else if !interrupt::report_py_err(py, &e) {
                         e.print(py);
                     }
                 }
@@ -392,7 +418,9 @@ impl PyAlgorithmAdapter {
         );
         Python::attach(|py| {
             if let Err(e) = self.py_obj.call_method1(py, "OnOrderEvent", (event,)) {
-                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                    && !interrupt::report_py_err(py, &e)
+                {
                     tracing::warn!("OnOrderEvent (OTM expiry) error: {e}");
                 }
             }
@@ -405,10 +433,61 @@ impl PyAlgorithmAdapter {
         delistings: pyo3::Py<crate::py_data::PyDelistings>,
     ) {
         if let Err(e) = self.py_obj.call_method1(py, "OnDelistings", (delistings,)) {
-            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                && !interrupt::report_py_err(py, &e)
+            {
                 tracing::warn!("OnDelistings error: {e}");
             }
         }
+    }
+
+    pub fn on_margin_call_warning(&mut self) {
+        IAlgorithm::on_margin_call_warning(self);
+    }
+
+    pub fn handle_margin_call(
+        &mut self,
+        requests: &[MarginCallOrderRequest],
+    ) -> Vec<MarginCallOrderRequest> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        Python::attach(|py| {
+            let payload: Vec<(String, f64)> = requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.symbol.value.clone(),
+                        rust_decimal::prelude::ToPrimitive::to_f64(&request.quantity)
+                            .unwrap_or(0.0),
+                    )
+                })
+                .collect();
+            match self.py_obj.call_method1(py, "OnMarginCall", (payload,)) {
+                Ok(result) => parse_margin_call_python_response(&result.bind(py), requests),
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+                    requests.to_vec()
+                }
+                Err(e) if !interrupt::report_py_err(py, &e) => {
+                    e.print(py);
+                    requests.to_vec()
+                }
+                Err(_) => requests.to_vec(),
+            }
+        })
+    }
+
+    fn handle_margin_call_orders(&mut self, orders: &[Order]) -> Vec<Order> {
+        let requests: Vec<MarginCallOrderRequest> = orders
+            .iter()
+            .map(|order| MarginCallOrderRequest::new(order.symbol.clone(), order.quantity))
+            .collect();
+        let updated = self.handle_margin_call(&requests);
+        let time = self.inner.lock().unwrap().utc_time;
+        updated
+            .into_iter()
+            .map(|request| Order::market(0, request.symbol, request.quantity, time, request.tag))
+            .collect()
     }
 
     pub fn on_symbol_changed_events(
@@ -420,7 +499,9 @@ impl PyAlgorithmAdapter {
             .py_obj
             .call_method1(py, "OnSymbolChangedEvents", (events,))
         {
-            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+            if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                && !interrupt::report_py_err(py, &e)
+            {
                 tracing::warn!("OnSymbolChangedEvents error: {e}");
             }
         }
@@ -444,7 +525,9 @@ impl PyAlgorithmAdapter {
                 .py_obj
                 .call_method1(py, "OnAssignmentOrderEvent", (event,))
             {
-                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                    && !interrupt::report_py_err(py, &e)
+                {
                     tracing::warn!("OnAssignmentOrderEvent error: {e}");
                 }
             }
@@ -454,12 +537,31 @@ impl PyAlgorithmAdapter {
 
 // ─── Lifecycle dispatch helpers ───────────────────────────────────────────────
 
+fn parse_margin_call_python_response(
+    result: &Bound<'_, PyAny>,
+    fallback: &[MarginCallOrderRequest],
+) -> Vec<MarginCallOrderRequest> {
+    if let Ok(items) = result.extract::<Vec<(String, f64)>>() {
+        return items
+            .into_iter()
+            .filter_map(|(symbol, quantity)| {
+                let quantity = rust_decimal::Decimal::from_f64_retain(quantity)?;
+                Some(MarginCallOrderRequest::new(
+                    Symbol::create_equity(&symbol, &Market::usa()),
+                    quantity,
+                ))
+            })
+            .collect();
+    }
+    fallback.to_vec()
+}
+
 /// Call `method` on `obj`.  AttributeError (method not defined — optional hook)
 /// is silently ignored; other errors are printed.
 fn lean_call0(py: Python<'_>, obj: &Py<PyAny>, method: &str) {
     if let Err(e) = obj.call_method0(py, method) {
         if !e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
-            e.print(py);
+            interrupt::report_py_err_print(py, e);
         }
     }
 }

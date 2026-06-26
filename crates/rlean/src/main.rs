@@ -595,9 +595,9 @@ async fn run_python_backtest(
     //
     // Matches C# LEAN format (e.g. "backtests/2026-04-01_sma_crossover/").
     // When --report is set it is treated as the folder path directly.
-    let backtest_dir: PathBuf = if let Some(p) = args.report.clone() {
+    let (backtest_dir, backtests_root) = if let Some(p) = args.report.clone() {
         std::fs::create_dir_all(&p)?;
-        p
+        (p, None)
     } else {
         let backtests_root = args
             .strategy
@@ -606,7 +606,8 @@ async fn run_python_backtest(
             .unwrap_or_else(|| PathBuf::from("backtests"));
         let now = chrono::Utc::now();
         let name = strategy_name_from_path(&args.strategy);
-        reserve_backtest_dir(&backtests_root, now, &name)?
+        let backtest_dir = reserve_backtest_dir(&backtests_root, now, &name)?;
+        (backtest_dir, Some(backtests_root))
     };
 
     // Snapshot the strategy source file into the backtest directory so there is
@@ -641,7 +642,13 @@ async fn run_python_backtest(
         output_dir: Some(backtest_dir.clone()),
     };
 
-    let results = run_strategy(&args.strategy, config).await?;
+    let results = match run_strategy(&args.strategy, config).await {
+        Ok(results) => results,
+        Err(error) if lean_python::interrupt::is_interrupted_error(&error) => {
+            std::process::exit(130);
+        }
+        Err(error) => return Err(error),
+    };
 
     results.print_summary();
 
@@ -683,6 +690,12 @@ async fn run_python_backtest(
     }
     if let Err(e) = write_report(&results, &report_path) {
         eprintln!("Failed to write report: {e}");
+    }
+
+    if let Some(root) = backtests_root {
+        if let Err(e) = update_backtests_latest_symlink(&root, &backtest_dir) {
+            eprintln!("Warning: could not update backtests/latest symlink: {e}");
+        }
     }
 
     println!("Results: {}", backtest_dir.display());
@@ -874,7 +887,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         bail!("Live trading currently supports Python strategies only");
     }
 
-    let result = lean_python::runner::run_live_strategy(
+    let result = match lean_python::runner::run_live_strategy(
         &args.strategy,
         lean_python::runner::LiveRunConfig {
             data_root: datastore.data_root.clone(),
@@ -891,7 +904,14 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             output_dir: deploy_dir,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) if lean_python::interrupt::is_interrupted_error(&error) => {
+            std::process::exit(130);
+        }
+        Err(error) => return Err(error),
+    };
 
     if let Some(brokerage_name) = brokerage_name {
         let mode = if paper_trading {
@@ -2097,6 +2117,36 @@ fn reserve_backtest_dir(
     )
 }
 
+/// Point `<backtests_root>/latest` at the most recently completed backtest directory.
+fn update_backtests_latest_symlink(backtests_root: &Path, backtest_dir: &Path) -> Result<()> {
+    let dir_name = backtest_dir
+        .file_name()
+        .context("backtest directory has no name")?;
+    let latest = backtests_root.join("latest");
+
+    match std::fs::symlink_metadata(&latest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::remove_file(&latest)?;
+        }
+        Ok(_) => {
+            bail!(
+                "{} exists and is not a symlink; remove it manually to enable backtests/latest",
+                latest.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir_name, &latest)?;
+
+    #[cfg(all(windows, not(unix)))]
+    std::os::windows::fs::symlink_dir(dir_name, &latest)?;
+
+    Ok(())
+}
+
 fn validate_strategy_path(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("Strategy file not found: {}", path.display());
@@ -2288,6 +2338,43 @@ mod tests {
         );
         assert!(first.is_dir());
         assert!(second.is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_update_backtests_latest_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("rlean-backtest-latest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = root.join("2026-06-24_120000_strategy");
+        let second = root.join("2026-06-24_120100_strategy");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        update_backtests_latest_symlink(&root, &first).unwrap();
+        let latest = root.join("latest");
+        assert!(latest.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&latest).unwrap(),
+            std::path::PathBuf::from("2026-06-24_120000_strategy")
+        );
+        assert_eq!(
+            latest.canonicalize().unwrap(),
+            first.canonicalize().unwrap()
+        );
+
+        update_backtests_latest_symlink(&root, &second).unwrap();
+        assert_eq!(
+            std::fs::read_link(&latest).unwrap(),
+            std::path::PathBuf::from("2026-06-24_120100_strategy")
+        );
+        assert_eq!(
+            latest.canonicalize().unwrap(),
+            second.canonicalize().unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

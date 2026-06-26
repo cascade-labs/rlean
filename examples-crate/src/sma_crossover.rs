@@ -12,7 +12,7 @@ use lean_algorithm::{
     qc_algorithm::QcAlgorithm,
 };
 use lean_core::{DateTime, Resolution, Symbol};
-use lean_data::Slice;
+use lean_data::{Slice, SubscriptionDataConfig};
 use lean_engine::{BacktestEngine, EngineConfig};
 use lean_indicators::{indicator::Indicator, Sma};
 use lean_orders::OrderEvent;
@@ -119,6 +119,15 @@ impl IAlgorithm for SmaCrossover {
     }
     fn starting_cash(&self) -> lean_core::Price {
         self.algo.cash()
+    }
+
+    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
+        self.algo
+            .subscription_manager
+            .get_all()
+            .into_iter()
+            .map(|config| (*config).clone())
+            .collect()
     }
 }
 

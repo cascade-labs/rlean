@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::interrupt;
 use crate::py_types::PyResolution;
 use lean_alpha::{
     AlphaAnalytics, AlphaPerformanceTracker, IAlphaModel, InsightCollection,
@@ -208,6 +209,10 @@ impl FrameworkState {
             .create_targets(&pcm_insights, portfolio_value, prices);
 
         // 4. Risk management: filter / adjust targets.
+        let target_tags: HashMap<String, String> = pcm_targets
+            .iter()
+            .map(|t| (t.symbol.value.clone(), t.tag.clone()))
+            .collect();
         let risk_targets: Vec<RiskTarget> = pcm_targets
             .iter()
             .map(|t| RiskTarget::new(t.symbol.clone(), t.quantity))
@@ -244,6 +249,10 @@ impl FrameworkState {
             .map(|t| ExecutionTarget {
                 symbol: t.1.symbol.clone(),
                 quantity: t.1.quantity,
+                tag: target_tags
+                    .get(&t.1.symbol.value)
+                    .cloned()
+                    .unwrap_or_default(),
             })
             .collect();
 
@@ -1974,45 +1983,52 @@ pub struct PyPortfolioTarget {
     pub quantity: Option<f64>,
     /// Target percent of portfolio (e.g. 0.10 = 10%).
     pub percent: Option<f64>,
+    pub tag: String,
 }
 
 #[pymethods]
 impl PyPortfolioTarget {
     #[new]
-    pub fn new(symbol: &Bound<'_, PyAny>, quantity: f64) -> PyResult<Self> {
+    #[pyo3(signature = (symbol, quantity, tag=None))]
+    pub fn new(symbol: &Bound<'_, PyAny>, quantity: f64, tag: Option<String>) -> PyResult<Self> {
         let lean_symbol = extract_lean_symbol_from_py(symbol)?;
         Ok(Self {
             symbol: lean_symbol,
             quantity: Some(quantity),
             percent: None,
+            tag: tag.unwrap_or_default(),
         })
     }
 
     /// ``PortfolioTarget.Percent(algorithm, symbol, percent)`` — deferred percent target.
     #[staticmethod]
-    #[pyo3(name = "Percent")]
+    #[pyo3(name = "Percent", signature = (_algorithm, symbol, percent, tag=None))]
     #[allow(non_snake_case)]
     pub fn Percent(
         _algorithm: &Bound<'_, PyAny>,
         symbol: &Bound<'_, PyAny>,
         percent: f64,
+        tag: Option<String>,
     ) -> PyResult<Self> {
         let lean_symbol = extract_lean_symbol_from_py(symbol)?;
         Ok(Self {
             symbol: lean_symbol,
             quantity: None,
             percent: Some(percent),
+            tag: tag.unwrap_or_default(),
         })
     }
 
     /// snake_case alias.
     #[staticmethod]
+    #[pyo3(signature = (algorithm, symbol, pct, tag=None))]
     pub fn percent(
         algorithm: &Bound<'_, PyAny>,
         symbol: &Bound<'_, PyAny>,
         pct: f64,
+        tag: Option<String>,
     ) -> PyResult<Self> {
-        Self::Percent(algorithm, symbol, pct)
+        Self::Percent(algorithm, symbol, pct, tag)
     }
 
     #[getter]
@@ -2020,6 +2036,28 @@ impl PyPortfolioTarget {
         crate::py_types::PySymbol {
             inner: self.symbol.clone(),
         }
+    }
+
+    #[getter]
+    fn quantity(&self) -> Option<f64> {
+        self.quantity
+    }
+
+    #[getter]
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
+        let snake = crate::py_qc_algorithm::pascal_to_snake(name);
+        if snake != name {
+            if let Ok(attr) = slf.getattr(snake.as_str()) {
+                return Ok(attr.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'PortfolioTarget' object has no attribute '{name}'"
+        )))
     }
 
     fn __repr__(&self) -> String {
@@ -2042,6 +2080,9 @@ impl PyPortfolioTarget {
 fn extract_lean_symbol_from_py(symbol: &Bound<'_, PyAny>) -> PyResult<lean_core::Symbol> {
     if let Ok(s) = symbol.cast::<crate::py_types::PySymbol>() {
         return Ok(s.borrow().inner.clone());
+    }
+    if let Ok(security) = symbol.cast::<crate::py_types::PySecurity>() {
+        return Ok(security.borrow().inner.inner.clone());
     }
     let ticker: String = symbol.extract()?;
     Ok(lean_core::Symbol::create_equity(
@@ -2139,6 +2180,11 @@ struct PyAlphaAdapter {
     alg_py: Py<PyAny>,
     /// Reusable Python Slice backing object for framework alpha updates.
     slice_proxy: Option<crate::py_data::FrameworkSliceProxy>,
+    /// Display name of the Python model (`Name`/`name` attr, else class `__name__`).
+    /// Stamped onto emitted insights with a blank `source_model` so per-alpha
+    /// analytics (IC / correlation / ranking) can attribute them — mirrors LEAN,
+    /// which auto-assigns `Insight.SourceModel`, and the native Rust models.
+    name: String,
 }
 
 impl IAlphaModel for PyAlphaAdapter {
@@ -2157,7 +2203,9 @@ impl IAlphaModel for PyAlphaAdapter {
                         slice_py
                     }
                     Err(e) => {
-                        tracing::warn!("PyAlphaAdapter: SliceProxy alloc error: {e}");
+                        if !interrupt::report_py_err(py, &e) {
+                            tracing::warn!("PyAlphaAdapter: SliceProxy alloc error: {e}");
+                        }
                         py.None()
                     }
                 },
@@ -2166,9 +2214,21 @@ impl IAlphaModel for PyAlphaAdapter {
             let alg = self.alg_py.bind(py);
             let result = self.obj.call_method1(py, "Update", (alg, slice_py));
             match result {
-                Ok(list_obj) => extract_py_insights(py, list_obj.bind(py)),
+                Ok(list_obj) => {
+                    let mut insights = extract_py_insights(py, list_obj.bind(py));
+                    // Stamp the emitting model's name on any insight that left
+                    // source_model blank, so per-alpha analytics can attribute it.
+                    for ins in &mut insights {
+                        if ins.source_model.is_empty() {
+                            ins.source_model = self.name.clone();
+                        }
+                    }
+                    insights
+                }
                 Err(e) => {
-                    tracing::warn!("PyAlphaAdapter::Update error: {e}");
+                    if !interrupt::report_py_err(py, &e) {
+                        tracing::warn!("PyAlphaAdapter::Update error: {e}");
+                    }
                     vec![]
                 }
             }
@@ -2189,7 +2249,9 @@ impl IAlphaModel for PyAlphaAdapter {
             let changes_obj = match Py::new(py, py_changes) {
                 Ok(obj) => obj.into_any(),
                 Err(e) => {
-                    tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged alloc error: {e}");
+                    if !interrupt::report_py_err(py, &e) {
+                        tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged alloc error: {e}");
+                    }
                     return;
                 }
             };
@@ -2198,7 +2260,9 @@ impl IAlphaModel for PyAlphaAdapter {
                 .obj
                 .call_method1(py, "OnSecuritiesChanged", (alg, changes_obj))
             {
-                tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged error: {e}");
+                if !interrupt::report_py_err(py, &e) {
+                    tracing::warn!("PyAlphaAdapter::OnSecuritiesChanged error: {e}");
+                }
             }
         });
     }
@@ -2257,7 +2321,9 @@ impl IPortfolioConstructionModel for PyPcmAdapter {
             match self.obj.call_method1(py, "CreateTargets", (alg, list)) {
                 Ok(result) => extract_pcm_targets(py, result.bind(py), portfolio_value, prices),
                 Err(e) => {
-                    tracing::warn!("PyPcmAdapter::CreateTargets error: {e}");
+                    if !interrupt::report_py_err(py, &e) {
+                        tracing::warn!("PyPcmAdapter::CreateTargets error: {e}");
+                    }
                     vec![]
                 }
             }
@@ -2294,17 +2360,21 @@ fn extract_pcm_targets(
             if let Some(pct) = pt.percent {
                 let pct_dec = Decimal::from_f64(pct)?;
                 let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ONE);
-                return Some(lean_portfolio_construction::PortfolioTarget::percent(
-                    sym,
-                    pct_dec,
-                    portfolio_value,
-                    price,
-                ));
+                return Some(
+                    lean_portfolio_construction::PortfolioTarget::percent_with_tag(
+                        sym,
+                        pct_dec,
+                        portfolio_value,
+                        price,
+                        pt.tag.clone(),
+                    ),
+                );
             }
             if let Some(qty) = pt.quantity {
-                return Some(lean_portfolio_construction::PortfolioTarget::new(
+                return Some(lean_portfolio_construction::PortfolioTarget::new_with_tag(
                     sym,
                     Decimal::from_f64(qty)?,
+                    pt.tag.clone(),
                 ));
             }
             return None;
@@ -2322,16 +2392,26 @@ fn extract_pcm_targets(
             lean_core::Symbol::create_equity(&ticker, &lean_core::Market::usa())
         };
 
+        let tag = item
+            .getattr("tag")
+            .or_else(|_| item.getattr("Tag"))
+            .ok()
+            .and_then(|value| value.extract::<String>().ok())
+            .unwrap_or_default();
+
         if let Ok(pct_attr) = item.getattr("percent").or_else(|_| item.getattr("Percent")) {
             if let Ok(pct) = pct_attr.extract::<f64>() {
                 let pct_dec = Decimal::from_f64(pct)?;
                 let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ONE);
-                return Some(lean_portfolio_construction::PortfolioTarget::percent(
-                    sym,
-                    pct_dec,
-                    portfolio_value,
-                    price,
-                ));
+                return Some(
+                    lean_portfolio_construction::PortfolioTarget::percent_with_tag(
+                        sym,
+                        pct_dec,
+                        portfolio_value,
+                        price,
+                        tag,
+                    ),
+                );
             }
         }
         if let Ok(qty_attr) = item
@@ -2339,9 +2419,10 @@ fn extract_pcm_targets(
             .or_else(|_| item.getattr("Quantity"))
         {
             if let Ok(qty) = qty_attr.extract::<f64>() {
-                return Some(lean_portfolio_construction::PortfolioTarget::new(
+                return Some(lean_portfolio_construction::PortfolioTarget::new_with_tag(
                     sym,
                     Decimal::from_f64(qty)?,
+                    tag,
                 ));
             }
         }
@@ -3107,6 +3188,17 @@ all_active = AllActivePcm()
 // ─── Extraction helpers ───────────────────────────────────────────────────────
 
 /// Try to extract an IAlphaModel Box from a Python object.
+/// The Python class name of a framework model (e.g. `Hip3TargetAlphaModel`).
+/// Stamped onto emitted insights as `source_model` so per-alpha analytics can
+/// attribute them — the same identity native Rust models return from `name()`.
+fn py_model_name(model: &Bound<'_, PyAny>) -> String {
+    model
+        .get_type()
+        .name()
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
 /// `alg_py` is the Python QCAlgorithm instance — passed as `algorithm` to `Update()`.
 pub fn try_take_alpha(model: &Bound<'_, PyAny>, alg_py: Py<PyAny>) -> Option<Box<dyn IAlphaModel>> {
     if let Ok(m) = model.cast::<PyEmaCrossAlphaModel>() {
@@ -3133,6 +3225,7 @@ pub fn try_take_alpha(model: &Bound<'_, PyAny>, alg_py: Py<PyAny>) -> Option<Box
             obj: model.clone().unbind(),
             alg_py,
             slice_proxy: None,
+            name: py_model_name(model),
         }));
     }
     tracing::warn!("add_alpha: unrecognized model type — use a built-in AlphaModel class");

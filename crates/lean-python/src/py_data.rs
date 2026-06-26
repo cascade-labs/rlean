@@ -2430,8 +2430,16 @@ mod tests {
             let market = Market::usa();
             let spy = Symbol::create_equity("SPY", &market);
             let qqq = Symbol::create_equity("QQQ", &market);
-            let spy_sub = Arc::new(SubscriptionDataConfig::new_equity(spy, Resolution::Minute));
-            let qqq_sub = Arc::new(SubscriptionDataConfig::new_equity(qqq, Resolution::Minute));
+            let spy_sub = Arc::new(SubscriptionDataConfig::new_equity(
+                spy,
+                Resolution::Minute,
+                lean_core::DataNormalizationMode::Adjusted,
+            ));
+            let qqq_sub = Arc::new(SubscriptionDataConfig::new_equity(
+                qqq,
+                Resolution::Minute,
+                lean_core::DataNormalizationMode::Adjusted,
+            ));
             let mut proxy =
                 SliceProxy::new(py, &[spy_sub.clone(), qqq_sub.clone()]).expect("proxy");
 

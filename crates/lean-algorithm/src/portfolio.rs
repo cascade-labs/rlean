@@ -179,10 +179,13 @@ impl SecurityHolding {
 pub struct SecurityPortfolioManager {
     pub cash: RwLock<Price>,
     starting_cash: RwLock<Price>,
+    /// LEAN `UnsettledCashBook` parity stub — always zero until settlement model exists.
+    unsettled_cash: RwLock<Price>,
     holdings: RwLock<HashMap<u64, SecurityHolding>>,
     margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
     pub total_funding: RwLock<Price>,
+    margin_call_model: RwLock<crate::margin_call::MarginCallModelKind>,
 }
 
 impl SecurityPortfolioManager {
@@ -190,11 +193,47 @@ impl SecurityPortfolioManager {
         SecurityPortfolioManager {
             cash: RwLock::new(starting_cash),
             starting_cash: RwLock::new(starting_cash),
+            unsettled_cash: RwLock::new(dec!(0)),
             holdings: RwLock::new(HashMap::new()),
             margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
             total_funding: RwLock::new(dec!(0)),
+            margin_call_model: RwLock::new(
+                crate::margin_call::MarginCallModelKind::default_backtest(),
+            ),
         }
+    }
+
+    pub fn new_live(starting_cash: Price) -> Self {
+        let portfolio = Self::new(starting_cash);
+        *portfolio.margin_call_model.write() =
+            crate::margin_call::MarginCallModelKind::live_disabled();
+        portfolio
+    }
+
+    pub fn margin_call_model(&self) -> crate::margin_call::MarginCallModelKind {
+        self.margin_call_model.read().clone()
+    }
+
+    pub fn set_margin_call_model(&self, model: crate::margin_call::MarginCallModelKind) {
+        *self.margin_call_model.write() = model;
+    }
+
+    pub fn unsettled_cash(&self) -> Price {
+        *self.unsettled_cash.read()
+    }
+
+    /// Mirrors C# `SecurityPortfolioManager.GetMarginRemaining(totalPortfolioValue)`.
+    pub fn margin_remaining_for_value(
+        &self,
+        total_portfolio_value: Price,
+        total_margin_used: Price,
+    ) -> Price {
+        total_portfolio_value - self.unsettled_cash() - total_margin_used
+    }
+
+    pub fn margin_remaining_with_used(&self, total_margin_used: Price) -> Price {
+        self.margin_remaining_for_value(self.total_portfolio_value(), total_margin_used)
     }
 
     pub fn starting_cash(&self) -> Price {

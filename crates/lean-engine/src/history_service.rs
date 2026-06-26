@@ -1,13 +1,17 @@
 use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, TimeZone, Utc};
-use lean_core::{DateTime, Resolution, Symbol};
+use lean_core::{DataNormalizationMode, DateTime, Resolution, SecurityType, Symbol};
 use lean_data::{
     CustomDataFormat, CustomDataPoint, CustomDataSubscription, CustomDataTransport, TradeBar,
 };
 use lean_data_providers::{
     DataType, HistoryRequest, ICustomDataSource, IHistoryProvider, LocalHistoryProvider,
 };
-use lean_storage::{custom_data_history_path, custom_data_path, ParquetReader};
+use lean_storage::{
+    custom_data_history_path, custom_data_path, factor_file_path, FactorFileEntry, ParquetReader,
+};
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,27 +33,30 @@ impl HistoryService {
         Self { context }
     }
 
-    pub fn load_trade_bars_blocking(
+    pub fn load_trade_bars_blocking_with_normalization(
         &self,
         symbol: &Symbol,
         resolution: Resolution,
         start: NaiveDate,
         end: NaiveDate,
+        normalization_mode: DataNormalizationMode,
     ) -> Result<Vec<TradeBar>> {
-        self.load_trade_bars_between_blocking(
+        self.load_trade_bars_between_blocking_with_normalization(
             symbol,
             resolution,
             date_to_datetime(start, 0, 0, 0),
             date_to_datetime(end, 23, 59, 59),
+            normalization_mode,
         )
     }
 
-    pub fn load_trade_bars_between_blocking(
+    pub fn load_trade_bars_between_blocking_with_normalization(
         &self,
         symbol: &Symbol,
         resolution: Resolution,
         start: DateTime,
         end: DateTime,
+        normalization_mode: DataNormalizationMode,
     ) -> Result<Vec<TradeBar>> {
         let request = HistoryRequest {
             symbol: symbol.clone(),
@@ -59,12 +66,19 @@ impl HistoryService {
             data_type: DataType::TradeBar,
         };
 
-        if let Some(provider) = self.context.history_provider.clone() {
-            return block_on_background(async move { provider.get_history(&request).await });
-        }
-
-        let local = LocalHistoryProvider::new(&self.context.data_root);
-        block_on_background(async move { local.get_history(&request).await })
+        let mut bars = if let Some(provider) = self.context.history_provider.clone() {
+            block_on_background(async move { provider.get_history(&request).await })?
+        } else {
+            let local = LocalHistoryProvider::new(&self.context.data_root);
+            block_on_background(async move { local.get_history(&request).await })?
+        };
+        normalize_trade_bars(
+            &self.context.data_root,
+            symbol,
+            normalization_mode,
+            &mut bars,
+        );
+        Ok(bars)
     }
 
     pub fn load_custom_history_blocking(
@@ -192,6 +206,78 @@ impl HistoryService {
         out.retain(|point| point.time >= start && point.time <= end);
         Ok(out)
     }
+}
+
+fn normalize_trade_bars(
+    data_root: &std::path::Path,
+    symbol: &Symbol,
+    normalization_mode: DataNormalizationMode,
+    bars: &mut [TradeBar],
+) {
+    if bars.is_empty() || !matches!(symbol.security_type(), SecurityType::Equity) {
+        return;
+    }
+    let factor_path = factor_file_path(data_root, symbol.market().as_str(), &symbol.permtick);
+    let rows = ParquetReader::new()
+        .read_factor_file(&factor_path)
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+
+    for bar in bars {
+        apply_normalization_factor(bar, &rows, normalization_mode);
+    }
+}
+
+fn apply_normalization_factor(
+    bar: &mut TradeBar,
+    rows: &[FactorFileEntry],
+    normalization_mode: DataNormalizationMode,
+) {
+    let (price_factor, split_factor) = factor_for_entry(rows, bar.time.date_utc());
+    let scale = match normalization_mode {
+        DataNormalizationMode::Raw => 1.0,
+        DataNormalizationMode::SplitAdjusted => split_factor,
+        DataNormalizationMode::Adjusted
+        | DataNormalizationMode::TotalReturn
+        | DataNormalizationMode::ForwardPanamaCanal
+        | DataNormalizationMode::BackwardPanamaCanal => price_factor * split_factor,
+    };
+    if (scale - 1.0).abs() < 1e-9 {
+        return;
+    }
+
+    let price_scale = Decimal::from_f64(scale).unwrap_or(Decimal::ONE);
+    bar.open *= price_scale;
+    bar.high *= price_scale;
+    bar.low *= price_scale;
+    bar.close *= price_scale;
+
+    if !matches!(normalization_mode, DataNormalizationMode::Raw)
+        && split_factor != 0.0
+        && (split_factor - 1.0).abs() > 1e-9
+    {
+        let volume_scale = Decimal::from_f64(1.0 / split_factor).unwrap_or(Decimal::ONE);
+        bar.volume *= volume_scale;
+    }
+}
+
+fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64) {
+    if rows.is_empty() {
+        return (1.0, 1.0);
+    }
+    if let Some(row) = rows
+        .iter()
+        .filter(|row| row.date < bar_date)
+        .max_by_key(|row| row.date)
+    {
+        return (row.price_factor, row.split_factor);
+    }
+    rows.iter()
+        .min_by_key(|row| row.date)
+        .map(|row| (row.price_factor, row.split_factor))
+        .unwrap_or((1.0, 1.0))
 }
 
 fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime {

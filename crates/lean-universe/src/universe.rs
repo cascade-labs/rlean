@@ -1,4 +1,4 @@
-use lean_core::{DateTime, Resolution, Symbol};
+use lean_core::{DataNormalizationMode, DateTime, Resolution, Symbol};
 
 #[derive(Debug, Clone)]
 pub struct UniverseSettings {
@@ -7,6 +7,9 @@ pub struct UniverseSettings {
     pub extended_market_hours: bool,
     pub minimum_time_in_universe: lean_core::TimeSpan,
     pub leverage: f64,
+    /// Default normalization mode used when a security is added without an
+    /// explicit mode (mirrors C# Lean's `UniverseSettings.DataNormalizationMode`).
+    pub data_normalization_mode: DataNormalizationMode,
 }
 
 impl Default for UniverseSettings {
@@ -17,6 +20,7 @@ impl Default for UniverseSettings {
             extended_market_hours: false,
             minimum_time_in_universe: lean_core::TimeSpan::ONE_DAY,
             leverage: 1.0,
+            data_normalization_mode: DataNormalizationMode::Adjusted,
         }
     }
 }

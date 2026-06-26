@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 /// Mirrors C# ImmediateExecutionModel: targets are retained in a collection and
 /// ordered by margin impact until projected holdings satisfy them.
 pub struct ImmediateExecutionModel {
-    targets: HashMap<String, (Symbol, Decimal)>,
+    targets: HashMap<String, (Symbol, Decimal, String)>,
 }
 
 impl ImmediateExecutionModel {
@@ -30,7 +30,7 @@ impl ImmediateExecutionModel {
         for target in targets {
             self.targets.insert(
                 target.symbol.value.clone(),
-                (target.symbol.clone(), target.quantity),
+                (target.symbol.clone(), target.quantity, target.tag.clone()),
             );
         }
 
@@ -43,7 +43,7 @@ impl ImmediateExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, quantity))| (key.clone(), symbol.clone(), *quantity))
+            .map(|(key, (symbol, quantity, _))| (key.clone(), symbol.clone(), *quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
@@ -62,6 +62,11 @@ impl ImmediateExecutionModel {
                 continue;
             }
 
+            let tag = self
+                .targets
+                .get(&key)
+                .map(|(_, _, tag)| tag.clone())
+                .unwrap_or_default();
             orders.push(OrderRequest {
                 order_id: None,
                 symbol,
@@ -70,7 +75,11 @@ impl ImmediateExecutionModel {
                 limit_price: None,
                 post_only: false,
                 cancel_open_orders: false,
-                tag: "ImmediateExecutionModel".to_string(),
+                tag: if tag.is_empty() {
+                    "ImmediateExecutionModel".to_string()
+                } else {
+                    tag
+                },
             });
         }
 

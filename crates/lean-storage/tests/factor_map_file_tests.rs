@@ -51,9 +51,11 @@ fn factor_file_parquet_round_trip() {
 
     let reader = ParquetReader::new();
     let read_back = reader.read_factor_file(&path).unwrap();
+    let mut expected = entries.clone();
+    expected.sort_by_key(|entry| entry.date);
 
-    assert_eq!(read_back.len(), entries.len());
-    for (orig, got) in entries.iter().zip(read_back.iter()) {
+    assert_eq!(read_back.len(), expected.len());
+    for (orig, got) in expected.iter().zip(read_back.iter()) {
         assert_eq!(orig.date, got.date, "date mismatch");
         assert!(
             (orig.price_factor - got.price_factor).abs() < 1e-9,

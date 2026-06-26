@@ -17,6 +17,9 @@ use serde_json;
 use tracing::{debug, info, warn};
 
 use lean_algorithm::algorithm::IAlgorithm;
+use lean_algorithm::margin_call::{
+    build_margin_call_context, check_backtest_bankruptcy, MarginCallModel,
+};
 use lean_algorithm::{
     portfolio::{SecurityHolding, SecurityPortfolioManager},
     qc_algorithm::{AccountType, BrokerageName, OptionFilter, QcAlgorithm},
@@ -52,6 +55,7 @@ use lean_storage::{
 };
 
 use crate::charting::ChartCollection;
+use crate::interrupt;
 use crate::py_adapter::{set_algorithm_time, PyAlgorithmAdapter};
 use crate::py_data::SliceProxy;
 use crate::py_framework::{run_framework_pipeline, FrameworkState};
@@ -249,6 +253,112 @@ impl OrderEventProcessingContext<'_> {
         }
         self.completed_trades.push(trade);
     }
+}
+
+/// Run bankruptcy guard and periodic margin-call scan for a backtest slice.
+/// Returns `true` when the backtest loop should stop due to bankruptcy.
+#[allow(clippy::too_many_arguments)]
+fn run_backtest_margin_call_scan(
+    adapter: &mut PyAlgorithmAdapter,
+    portfolio: &Arc<SecurityPortfolioManager>,
+    order_processor: &OrderProcessor,
+    next_margin_call_time: &mut DateTime,
+    utc_time: DateTime,
+    trade_bars: &HashMap<u64, TradeBar>,
+    quote_bars: &HashMap<u64, QuoteBar>,
+    all_order_events: &mut Vec<OrderEvent>,
+    trade_builder: &mut TradeBuilder,
+    completed_trades: &mut Vec<Trade>,
+    live_writer: Option<&dyn OrderEventSidecarWriter>,
+) -> bool {
+    if check_backtest_bankruptcy(true, portfolio.total_portfolio_value()) {
+        warn!(
+            "AlgorithmManager.Run(): Portfolio value is less than or equal to zero, stopping algorithm."
+        );
+        return true;
+    }
+
+    let model = portfolio.margin_call_model();
+    let is_warming_up = adapter.inner.lock().unwrap().is_warming_up;
+    if model.is_null() || is_warming_up || utc_time < *next_margin_call_time {
+        return false;
+    }
+    *next_margin_call_time = lean_core::NanosecondTimestamp(utc_time.0 + 300_000_000_000);
+
+    let scan_ctx = {
+        let algorithm = adapter.inner.lock().unwrap();
+        build_margin_call_context(portfolio, &algorithm)
+    };
+    let (mut margin_call_orders, issue_warning) = model.get_margin_call_orders(&scan_ctx);
+    let _total_margin_used = scan_ctx.total_margin_used;
+
+    let mut executed_count = 0usize;
+    if !margin_call_orders.is_empty() {
+        let exchange_open = margin_call_orders.iter().all(|order| {
+            adapter
+                .inner
+                .lock()
+                .unwrap()
+                .securities
+                .get(&order.symbol)
+                .map(|security| security.exchange_hours.is_open_at(utc_time))
+                .unwrap_or(true)
+        });
+        if exchange_open {
+            margin_call_orders = adapter.handle_margin_call(&margin_call_orders);
+            let mut orders_with_pnl: Vec<_> = margin_call_orders
+                .into_iter()
+                .map(|order| {
+                    let unrealized = portfolio.get_holding(&order.symbol).unrealized_pnl;
+                    (order, unrealized)
+                })
+                .collect();
+            orders_with_pnl.sort_by(|a, b| a.1.cmp(&b.1));
+
+            for (request, _) in orders_with_pnl {
+                if portfolio
+                    .margin_remaining_with_used(adapter.inner.lock().unwrap().total_margin_used())
+                    >= Decimal::ZERO
+                {
+                    break;
+                }
+
+                let ticket = {
+                    let mut algorithm = adapter.inner.lock().unwrap();
+                    algorithm.market_order_with_options_and_tag(
+                        &request.symbol,
+                        request.quantity,
+                        None,
+                        false,
+                        request.tag,
+                    )
+                };
+                let order_id = ticket.order_id;
+                let mut events = order_processor
+                    .generate_order_events_with_quotes(trade_bars, quote_bars, utc_time);
+                events.retain(|event| event.order_id == order_id);
+                if !events.is_empty() {
+                    OrderEventProcessingContext {
+                        adapter,
+                        portfolio,
+                        order_processor,
+                        all_order_events,
+                        trade_builder,
+                        completed_trades,
+                        live_writer,
+                    }
+                    .process(&mut events);
+                }
+                executed_count += 1;
+            }
+        }
+    }
+
+    if executed_count == 0 && issue_warning {
+        adapter.on_margin_call_warning();
+    }
+
+    false
 }
 
 fn cancel_event_from_order(order: &Order, time: DateTime, message: String) -> OrderEvent {
@@ -2635,6 +2745,7 @@ async fn run_live_warmup(adapter: &mut PyAlgorithmAdapter, config: &LiveRunConfi
 
     let mut current_date = warmup_start;
     while current_date < warmup_end {
+        interrupt::abort_if_interrupted()?;
         let mut custom_subs: Vec<CustomDataSubscription> = {
             adapter
                 .inner
@@ -2875,8 +2986,10 @@ fn process_live_slice(
         slice_proxy.update_custom_data(py, &live_slice.custom_data);
         adapter.on_data_proxy(py, slice_proxy, &live_slice);
     });
+    interrupt::abort_if_interrupted()?;
 
     submit_framework_order_requests(adapter, &live_slice);
+    interrupt::abort_if_interrupted()?;
 
     let use_paper_fills = live_brokerage
         .as_ref()
@@ -3088,6 +3201,9 @@ pub async fn run_live_strategy(
     strategy_path: &Path,
     mut config: LiveRunConfig,
 ) -> Result<LiveRunResult> {
+    interrupt::reset();
+    interrupt::ensure_ctrl_c_handler();
+
     let started_at = chrono::Utc::now();
     let mut adapter = Python::attach(|py| load_strategy(py, strategy_path))?;
 
@@ -3150,6 +3266,8 @@ pub async fn run_live_strategy(
     config.live_data_queue.set_job(&job)?;
 
     let portfolio = adapter.inner.lock().unwrap().portfolio.clone();
+    portfolio
+        .set_margin_call_model(lean_algorithm::margin_call::MarginCallModelKind::live_disabled());
     let transactions = adapter.inner.lock().unwrap().transactions.clone();
     let order_processor = OrderProcessor::new(
         Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
@@ -3318,6 +3436,7 @@ pub async fn run_live_strategy(
     }
 
     loop {
+        interrupt::abort_if_interrupted()?;
         if config
             .max_runtime
             .map(|max_runtime| runtime_started.elapsed() >= max_runtime)
@@ -3634,6 +3753,9 @@ pub async fn run_live_strategy(
 /// is reused so that tokio primitives (Mutex, Semaphore, reqwest) in the
 /// historical provider work correctly across the same runtime context.
 pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<BacktestResult> {
+    interrupt::reset();
+    interrupt::ensure_ctrl_c_handler();
+
     let mut adapter = Python::attach(|py| load_strategy(py, strategy_path))?;
 
     Python::attach(|py| {
@@ -3737,6 +3859,15 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         resolve_benchmark_symbol(&effective_benchmark_ticker, &subscriptions);
     let benchmark_in_subs =
         benchmark_symbol_in_subscriptions(&benchmark_symbol_obj, &subscriptions);
+    let internal_benchmark_subscription = if benchmark_in_subs {
+        None
+    } else {
+        Some(internal_benchmark_subscription(&benchmark_symbol_obj))
+    };
+    let mut data_subscriptions = subscriptions.clone();
+    if let Some(sub) = &internal_benchmark_subscription {
+        data_subscriptions.push(sub.clone());
+    }
 
     info!(
         "Benchmark: {} ({})",
@@ -3813,7 +3944,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     materialize_subscription_range(
         &config.datastore,
         &resolver,
-        &subscriptions,
+        &data_subscriptions,
         start_date,
         end_date,
     )
@@ -3825,7 +3956,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // data provider reports whether that file exists. Mirror that behavior by
     // leaving hour/minute/second/tick data to the intraday loop below.
     if let Some(ref provider) = config.historical_provider {
-        let startup_prefetch_subscriptions: Vec<_> = subscriptions
+        let startup_prefetch_subscriptions: Vec<_> = data_subscriptions
             .iter()
             .filter(|sub| !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote)
             .cloned()
@@ -3869,7 +4000,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     if let Some(ref provider) = config.history_provider {
         ensure_auxiliary_files_for_subscriptions(
             provider.clone(),
-            &subscriptions,
+            &data_subscriptions,
             start_date,
             end_date,
             &resolver,
@@ -3969,6 +4100,25 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     // ── warm-up loop ────────────────────────────────────────────────────────
     if let Some(wu_start) = warmup_start {
         info!("Warm-up: {} → {} (exclusive)", wu_start, start_date);
+        let warmup_end = start_date - chrono::Duration::days(1);
+        let warmup_full_params = QueryParams::new().with_time_range(
+            date_to_datetime(wu_start, 0, 0, 0),
+            date_to_datetime(warmup_end, 23, 59, 59),
+        );
+        let warmup_trade_subscriptions: Vec<_> =
+            warmup_replay_subscriptions(&subscriptions, warmup_resolution)
+                .into_iter()
+                .filter(|sub| !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote)
+                .collect();
+        let mut warmup_bar_map = load_trade_bar_subscription_map(
+            &reader,
+            &resolver,
+            &warmup_trade_subscriptions,
+            wu_start,
+            warmup_end,
+            &warmup_full_params,
+        )
+        .await?;
 
         let mut wu_date = wu_start;
         while wu_date < start_date {
@@ -3980,43 +4130,52 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 warmup_replay_subscriptions(&subscriptions, warmup_resolution);
             for sub in &warmup_day_subscriptions {
                 let sid = sub.symbol.id.sid;
-                let day_key = day_key(wu_date);
-                let path = resolver.market_data_partition(
-                    &sub.symbol,
-                    sub.resolution,
-                    TickType::Trade,
-                    wu_date,
-                );
-
-                if path.exists() {
-                    let bars = if let Some(cached) = cache.get_bars(sid, day_key) {
-                        cached.as_ref().clone()
-                    } else {
-                        let day_start = date_to_datetime(wu_date, 0, 0, 0);
-                        let day_end = date_to_datetime(wu_date, 23, 59, 59);
-                        let params = QueryParams::new().with_time_range(day_start, day_end);
-                        let loaded = reader
-                            .read_trade_bar_partition(&path, &sub.symbol, &params)
-                            .unwrap_or_default();
-                        cache.insert_bars(sid, day_key, loaded.clone());
-                        loaded
-                    };
-
-                    for bar in bars {
-                        let bar = if let Some(rows) = factor_map.get(&sid) {
-                            apply_factor_row(bar, rows, wu_date)
+                let bars = if !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote {
+                    warmup_bar_map
+                        .get(&sid)
+                        .and_then(|by_date| by_date.get(&wu_date).cloned())
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    let day_key = day_key(wu_date);
+                    let path = resolver.market_data_partition(
+                        &sub.symbol,
+                        sub.resolution,
+                        TickType::Trade,
+                        wu_date,
+                    );
+                    if path.exists() {
+                        if let Some(cached) = cache.get_bars(sid, day_key) {
+                            cached.as_ref().clone()
                         } else {
-                            bar
-                        };
-                        adapter
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .securities
-                            .update_price(&bar.symbol, bar.close);
-                        portfolio.update_prices(&bar.symbol, bar.close);
-                        slice.add_bar(bar);
+                            let day_start = date_to_datetime(wu_date, 0, 0, 0);
+                            let day_end = date_to_datetime(wu_date, 23, 59, 59);
+                            let params = QueryParams::new().with_time_range(day_start, day_end);
+                            let loaded = reader
+                                .read_trade_bar_partition(&path, &sub.symbol, &params)
+                                .unwrap_or_default();
+                            cache.insert_bars(sid, day_key, loaded.clone());
+                            loaded
+                        }
+                    } else {
+                        Vec::new()
                     }
+                };
+
+                for bar in bars {
+                    let bar = if let Some(rows) = factor_map.get(&sid) {
+                        apply_factor_row_with_mode(bar, rows, wu_date, sub.normalization_mode)
+                    } else {
+                        bar
+                    };
+                    adapter
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .securities
+                        .update_price(&bar.symbol, bar.close);
+                    portfolio.update_prices(&bar.symbol, bar.close);
+                    slice.add_bar(bar);
                 }
             }
 
@@ -4068,6 +4227,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     require_factor_files,
                 )
                 .await?;
+                let warmup_new_subscriptions: Vec<_> =
+                    warmup_replay_subscriptions(&reconciliation.new_subs, warmup_resolution)
+                        .into_iter()
+                        .filter(|sub| {
+                            !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote
+                        })
+                        .collect();
+                let loaded = load_trade_bar_subscription_map(
+                    &reader,
+                    &resolver,
+                    &warmup_new_subscriptions,
+                    wu_date,
+                    warmup_end,
+                    &warmup_full_params,
+                )
+                .await?;
+                merge_trade_bar_subscription_maps(&mut warmup_bar_map, loaded);
                 custom_subs = {
                     adapter
                         .inner
@@ -4165,6 +4341,25 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 require_factor_files,
                             )
                             .await?;
+                            let warmup_new_subscriptions: Vec<_> = warmup_replay_subscriptions(
+                                &reconciliation.new_subs,
+                                warmup_resolution,
+                            )
+                            .into_iter()
+                            .filter(|sub| {
+                                !sub.resolution.is_intraday() && sub.tick_type != TickType::Quote
+                            })
+                            .collect();
+                            let loaded = load_trade_bar_subscription_map(
+                                &reader,
+                                &resolver,
+                                &warmup_new_subscriptions,
+                                wu_date,
+                                warmup_end,
+                                &warmup_full_params,
+                            )
+                            .await?;
+                            merge_trade_bar_subscription_maps(&mut warmup_bar_map, loaded);
                             custom_subs = {
                                 adapter
                                     .inner
@@ -4231,26 +4426,31 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     );
     let mut bar_map: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>> = if !is_intraday
     {
-        let mut map = HashMap::new();
+        let map = load_trade_bar_subscription_map(
+            &reader,
+            &resolver,
+            &data_subscriptions,
+            start_date,
+            end_date,
+            &daily_full_params,
+        )
+        .await?;
         for sub in &subscriptions {
-            let sid = sub.symbol.id.sid;
-            let bars = load_trade_bar_partitions(
-                &reader,
-                &resolver,
-                sub,
-                start_date,
-                end_date,
-                &daily_full_params,
-            );
-            if !bars.is_empty() {
-                let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
-                    bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+            if let Some(date_map) = map.get(&sub.symbol.id.sid) {
                 info!(
                     "Pre-loaded {} bars for {}",
                     date_map.len(),
                     sub.symbol.value
                 );
-                map.insert(sid, date_map);
+            }
+        }
+        if let Some(sub) = &internal_benchmark_subscription {
+            if let Some(date_map) = map.get(&sub.symbol.id.sid) {
+                info!(
+                    "Pre-loaded {} benchmark bars for {}",
+                    date_map.len(),
+                    sub.symbol.value
+                );
             }
         }
         map
@@ -4269,16 +4469,28 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut benchmark_dates: Vec<String> = Vec::new();
     let benchmark_price_map: HashMap<NaiveDate, Decimal> = if benchmark_in_subs {
         HashMap::new()
-    } else {
-        load_internal_benchmark_price_map(
-            config.historical_provider.clone(),
-            reader.as_ref(),
+    } else if let Some(date_map) = bar_map.get(&benchmark_sid) {
+        let map = trade_bar_date_map_to_close_map(date_map);
+        log_loaded_benchmark_price_map(&benchmark_symbol_obj, start_date, end_date, &map);
+        map
+    } else if let Some(sub) = &internal_benchmark_subscription {
+        let loaded = load_trade_bar_subscription_map(
+            &reader,
             &resolver,
-            &benchmark_symbol_obj,
+            std::slice::from_ref(sub),
             start_date,
             end_date,
+            &daily_full_params,
         )
-        .await
+        .await?;
+        let map = loaded
+            .get(&benchmark_sid)
+            .map(trade_bar_date_map_to_close_map)
+            .unwrap_or_default();
+        log_loaded_benchmark_price_map(&benchmark_symbol_obj, start_date, end_date, &map);
+        map
+    } else {
+        HashMap::new()
     };
 
     // TradeBuilder assembles completed round-trip trades from fills.
@@ -4476,6 +4688,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
     let mut trading_days = 0i64;
     let mut equity_curve: Vec<Decimal> = Vec::new();
     let mut daily_dates: Vec<String> = Vec::new();
+    let mut next_margin_call_time = DateTime::MIN;
+    let mut stop_backtest = false;
 
     let finest_resolution = subscriptions
         .iter()
@@ -4495,7 +4709,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
         start_date, end_date, resolution_label
     );
 
-    while current_date <= end_date {
+    while current_date <= end_date && !stop_backtest {
+        interrupt::abort_if_interrupted()?;
         if is_intraday {
             // ── INTRADAY LOOP ────────────────────────────────────────────────
             let mut day_trade_bars: HashMap<u64, Vec<TradeBar>> = HashMap::new();
@@ -4777,10 +4992,11 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &mut tick_partition_cache,
                             &reader,
                             tick_path,
-                            &sub.symbol,
+                            &day_symbols_by_sid,
                             sid,
                             &day_read_params,
-                        );
+                        )
+                        .await;
                         if !ticks.is_empty() {
                             ticks.retain(|tick| tick.symbol.id.sid == sid);
                             if let Some(hours) = market_hours_filter.get(&sid) {
@@ -5192,7 +5408,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 raw_underlying_spots.insert(sid, raw_bar.close);
                             }
                             let bar = if let Some(rows) = factor_map.get(&sid) {
-                                apply_factor_row(raw_bar.clone(), rows, current_date)
+                                apply_factor_row_with_mode(
+                                    raw_bar.clone(),
+                                    rows,
+                                    current_date,
+                                    sub.normalization_mode,
+                                )
                             } else {
                                 raw_bar.clone()
                             };
@@ -5214,6 +5435,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 current_date,
                                 &option_underlying_sids,
                                 &factor_map,
+                                sub.normalization_mode,
                                 &mut raw_underlying_spots,
                                 &mut bars_for_orders,
                                 &mut minute_quote_bars,
@@ -5244,7 +5466,14 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                     ticks
                                         .iter()
                                         .cloned()
-                                        .map(|tick| apply_factor_tick(tick, rows, current_date))
+                                        .map(|tick| {
+                                            apply_factor_tick_with_mode(
+                                                tick,
+                                                rows,
+                                                current_date,
+                                                sub.normalization_mode,
+                                            )
+                                        })
                                         .collect::<Vec<_>>()
                                 } else {
                                     ticks.to_vec()
@@ -5575,14 +5804,19 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 .map(|s| s.exchange_hours.clone())
                         };
 
+                        let dynamic_symbols_by_sid = HashMap::from([(sid, sub.symbol.clone())]);
                         if sub.resolution == Resolution::Tick {
                             let tick_path = subscription_data_path(&resolver, sub, current_date);
                             if tick_path.exists() {
-                                match reader.read_tick_partition(
-                                    &tick_path,
-                                    &sub.symbol,
-                                    &day_time_params.clone().with_symbols(vec![sid]),
-                                ) {
+                                match reader
+                                    .read_tick_partitions_grouped_async(
+                                        std::slice::from_ref(&tick_path),
+                                        &dynamic_symbols_by_sid,
+                                        &day_time_params.clone().with_symbols(vec![sid]),
+                                    )
+                                    .await
+                                    .map(|mut grouped| grouped.remove(&sid).unwrap_or_default())
+                                {
                                     Ok(mut ticks) if !ticks.is_empty() => {
                                         ticks.retain(|tick| tick.symbol.id.sid == sid);
                                         if let Some(hours) = &exchange_hours {
@@ -5622,7 +5856,6 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                 }
                             }
                         } else {
-                            let dynamic_symbols_by_sid = HashMap::from([(sid, sub.symbol.clone())]);
                             let trade_path = resolver.market_data_partition(
                                 &sub.symbol,
                                 sub.resolution,
@@ -5668,7 +5901,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                                     raw_underlying_spots.insert(sid, raw_bar.close);
                                                 }
                                                 let bar = if let Some(rows) = factor_map.get(&sid) {
-                                                    apply_factor_row(raw_bar, rows, current_date)
+                                                    apply_factor_row_with_mode(
+                                                        raw_bar,
+                                                        rows,
+                                                        current_date,
+                                                        sub.normalization_mode,
+                                                    )
                                                 } else {
                                                     raw_bar
                                                 };
@@ -5745,6 +5983,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                                                     current_date,
                                                     &option_underlying_sids,
                                                     &factor_map,
+                                                    sub.normalization_mode,
                                                     &mut raw_underlying_spots,
                                                     &mut bars_for_orders,
                                                     &mut minute_quote_bars,
@@ -5831,6 +6070,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                     .process(&mut pre_existing_fill_events);
 
+                    if run_backtest_margin_call_scan(
+                        &mut adapter,
+                        &portfolio,
+                        &order_processor,
+                        &mut next_margin_call_time,
+                        utc_time,
+                        &bars_for_orders,
+                        &minute_quote_bars,
+                        &mut all_order_events,
+                        &mut trade_builder,
+                        &mut completed_trades,
+                        as_sidecar_writer(live_writer.as_ref()),
+                    ) {
+                        stop_backtest = true;
+                        break;
+                    }
+
                     Python::attach(|py| {
                         if let Some(chains_snapshot) = chains_snapshot.as_ref() {
                             slice_proxy.update_option_chains(py, chains_snapshot);
@@ -5844,6 +6100,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         }
                         adapter.on_data_proxy(py, &slice_proxy, &minute_slice);
                     });
+
+                    interrupt::abort_if_interrupted()?;
 
                     // ── Algorithm Framework pipeline (intraday) ───────────
                     {
@@ -5859,6 +6117,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             }
                         }
                     }
+
+                    interrupt::abort_if_interrupted()?;
 
                     let request_events = drain_local_order_request_event_batches(
                         &order_processor,
@@ -6063,17 +6323,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &mut factor_map,
                             require_factor_files,
                         )?;
-                        if path.exists() {
-                            let bars = load_trade_bar_partitions(
-                                &reader,
-                                &resolver,
-                                sub,
-                                start_date,
-                                end_date,
-                                &daily_full_params,
-                            );
-                            let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
-                                bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+                        let mut loaded = load_trade_bar_subscription_map(
+                            &reader,
+                            &resolver,
+                            std::slice::from_ref(sub),
+                            start_date,
+                            end_date,
+                            &daily_full_params,
+                        )
+                        .await?;
+                        if let Some(date_map) = loaded.remove(&sid) {
                             if !date_map.is_empty() {
                                 bar_map.insert(sid, date_map);
                             }
@@ -6195,17 +6454,16 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                             &mut factor_map,
                             require_factor_files,
                         )?;
-                        if path.exists() {
-                            let bars = load_trade_bar_partitions(
-                                &reader,
-                                &resolver,
-                                sub,
-                                start_date,
-                                end_date,
-                                &daily_full_params,
-                            );
-                            let date_map: HashMap<chrono::NaiveDate, lean_data::TradeBar> =
-                                bars.into_iter().map(|b| (b.time.date_utc(), b)).collect();
+                        let mut loaded = load_trade_bar_subscription_map(
+                            &reader,
+                            &resolver,
+                            std::slice::from_ref(sub),
+                            start_date,
+                            end_date,
+                            &daily_full_params,
+                        )
+                        .await?;
+                        if let Some(date_map) = loaded.remove(&sid) {
                             if !date_map.is_empty() {
                                 bar_map.insert(sid, date_map);
                             }
@@ -6258,7 +6516,12 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                         raw_underlying_spots.insert(sid, day_bar.close);
                     }
                     let bar = if let Some(rows) = factor_map.get(&sid) {
-                        apply_factor_row(day_bar.clone(), rows, current_date)
+                        apply_factor_row_with_mode(
+                            day_bar.clone(),
+                            rows,
+                            current_date,
+                            sub.normalization_mode,
+                        )
                     } else {
                         day_bar.clone()
                     };
@@ -6462,6 +6725,23 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
             }
             .process(&mut fill_events);
 
+            if run_backtest_margin_call_scan(
+                &mut adapter,
+                &portfolio,
+                &order_processor,
+                &mut next_margin_call_time,
+                utc_time,
+                &bars_map,
+                &HashMap::new(),
+                &mut all_order_events,
+                &mut trade_builder,
+                &mut completed_trades,
+                as_sidecar_writer(live_writer.as_ref()),
+            ) {
+                stop_backtest = true;
+                break;
+            }
+
             // ── Custom data fetch (daily) ─────────────────────────────────
             let custom_subs: Vec<CustomDataSubscription> = {
                 adapter
@@ -6590,6 +6870,8 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                 }
             });
 
+            interrupt::abort_if_interrupted()?;
+
             // ── Algorithm Framework pipeline ──────────────────────────────
             // Run alpha → PCM → risk → execution after on_data, outside GIL.
             // Only fires when at least one alpha model has been registered.
@@ -6603,6 +6885,7 @@ pub async fn run_strategy(strategy_path: &Path, config: RunConfig) -> Result<Bac
                     }
                 }
             }
+            interrupt::abort_if_interrupted()?;
 
             let request_events = drain_local_order_request_event_batches(
                 &order_processor,
@@ -6841,6 +7124,7 @@ async fn materialize_subscription_range(
 
     let mut date = start_date;
     while date <= end_date {
+        interrupt::abort_if_interrupted()?;
         for sub in subscriptions {
             let path =
                 resolver.market_data_partition(&sub.symbol, sub.resolution, sub.tick_type, date);
@@ -6860,6 +7144,7 @@ async fn pre_fetch_all(
     resolver: &PathResolver,
     map_file_resolver: Option<Arc<MapFileResolver>>,
 ) -> Result<()> {
+    interrupt::abort_if_interrupted()?;
     if subscriptions.is_empty() {
         return Ok(());
     }
@@ -6947,6 +7232,7 @@ async fn pre_fetch_low_resolution_batched(
     }
 
     let reader = ParquetReader::new();
+    let mut partition_sid_cache: HashMap<PathBuf, HashSet<u64>> = HashMap::new();
     let mut items = Vec::new();
     for sub in subscriptions {
         if sub.resolution.is_intraday() || sub.tick_type == TickType::Quote {
@@ -6975,7 +7261,15 @@ async fn pre_fetch_low_resolution_batched(
             continue;
         };
 
-        if local_data_covers_range(sub, mapped_start, mapped_end, resolver).await {
+        let missing_dates = low_resolution_missing_dates(
+            sub,
+            mapped_start,
+            mapped_end,
+            &reader,
+            resolver,
+            &mut partition_sid_cache,
+        );
+        if missing_dates.is_empty() {
             continue;
         }
 
@@ -6990,17 +7284,21 @@ async fn pre_fetch_low_resolution_batched(
             _ => mapped_start,
         };
 
-        for (range_start, range_end, mapped_ticker) in
-            mapped_ticker_ranges(&map_rows, effective_start, mapped_end, &sub.symbol.permtick)
+        for missing_date in missing_dates
+            .into_iter()
+            .filter(|missing_date| *missing_date >= effective_start)
         {
+            let mapped_ticker = ticker_at_date(&map_rows, missing_date)
+                .unwrap_or(&sub.symbol.permtick)
+                .to_uppercase();
             let provider_symbol = symbol_with_mapped_ticker(&sub.symbol, &mapped_ticker);
             items.push(BatchItem {
                 is_mapped_request: provider_symbol.permtick != sub.symbol.permtick,
                 requested_symbol: sub.symbol.clone(),
                 provider_symbol,
                 resolution: sub.resolution,
-                start: range_start,
-                end: range_end,
+                start: missing_date,
+                end: missing_date,
             });
         }
     }
@@ -7888,16 +8186,42 @@ async fn local_data_covers_range(
     }
 
     let reader = ParquetReader::new();
-    for current in &expected_dates {
-        let path = subscription_data_path(resolver, sub, *current);
-        if !path.exists() {
-            return false;
-        }
-        if !cached_partition_has_symbol_data(&reader, resolver, sub, *current) {
-            return false;
-        }
-    }
-    true
+    let mut partition_sid_cache = HashMap::new();
+    low_resolution_local_data_covers_range(
+        sub,
+        start,
+        end,
+        &reader,
+        resolver,
+        &mut partition_sid_cache,
+    )
+}
+
+fn low_resolution_local_data_covers_range(
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    partition_sid_cache: &mut HashMap<PathBuf, HashSet<u64>>,
+) -> bool {
+    low_resolution_missing_dates(sub, start, end, reader, resolver, partition_sid_cache).is_empty()
+}
+
+fn low_resolution_missing_dates(
+    sub: &SubscriptionDataConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+    reader: &ParquetReader,
+    resolver: &PathResolver,
+    partition_sid_cache: &mut HashMap<PathBuf, HashSet<u64>>,
+) -> Vec<NaiveDate> {
+    expected_market_dates(&sub.symbol, start, end)
+        .into_iter()
+        .filter(|date| {
+            !cached_partition_has_symbol_sid(reader, resolver, sub, *date, partition_sid_cache)
+        })
+        .collect()
 }
 
 fn subscription_data_path(
@@ -7976,29 +8300,87 @@ fn cached_partition_has_symbol_sid(
     false
 }
 
-fn load_trade_bar_partitions(
+async fn load_trade_bar_subscription_map(
     reader: &ParquetReader,
     resolver: &PathResolver,
-    sub: &SubscriptionDataConfig,
+    subscriptions: &[Arc<SubscriptionDataConfig>],
     start: NaiveDate,
     end: NaiveDate,
-    params: &QueryParams,
-) -> Vec<lean_data::TradeBar> {
-    let mut bars = Vec::new();
-    for date in expected_market_dates(&sub.symbol, start, end) {
-        let path =
-            resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
-        if path.exists() {
-            bars.extend(
-                reader
-                    .read_trade_bar_partition(&path, &sub.symbol, params)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|bar| bar.symbol.id.sid == sub.symbol.id.sid),
-            );
+    _params: &QueryParams,
+) -> Result<HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>>> {
+    #[derive(Default)]
+    struct ReadGroup {
+        paths: HashSet<PathBuf>,
+        symbols_by_sid: HashMap<u64, Symbol>,
+        dates_by_sid: HashMap<u64, Vec<NaiveDate>>,
+    }
+
+    let mut groups: HashMap<PathBuf, ReadGroup> = HashMap::new();
+    for sub in subscriptions {
+        if sub.resolution.is_intraday() || sub.tick_type == TickType::Quote {
+            continue;
+        }
+
+        for date in expected_market_dates(&sub.symbol, start, end) {
+            let path =
+                resolver.market_data_partition(&sub.symbol, sub.resolution, TickType::Trade, date);
+            if !path.exists() {
+                continue;
+            }
+            let Some(date_dir) = path.parent() else {
+                continue;
+            };
+            let Some(partition_dir) = date_dir.parent() else {
+                continue;
+            };
+            let group = groups.entry(partition_dir.to_path_buf()).or_default();
+            group.paths.insert(path);
+            group
+                .symbols_by_sid
+                .insert(sub.symbol.id.sid, sub.symbol.clone());
+            group
+                .dates_by_sid
+                .entry(sub.symbol.id.sid)
+                .or_default()
+                .push(date);
         }
     }
-    bars
+
+    let mut out: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>> = HashMap::new();
+    for (_partition_dir, group) in groups {
+        if group.paths.is_empty() || group.symbols_by_sid.is_empty() {
+            continue;
+        }
+
+        let mut paths: Vec<PathBuf> = group.paths.into_iter().collect();
+        paths.sort();
+        let mut sids: Vec<u64> = group.symbols_by_sid.keys().copied().collect();
+        sids.sort_unstable();
+        let group_params = QueryParams::new().with_symbols(sids);
+
+        let grouped = reader
+            .read_trade_bar_partitions_grouped_async(&paths, &group.symbols_by_sid, &group_params)
+            .await
+            .with_context(|| format!("failed to bulk-read {} trade-bar partitions", paths.len()))?;
+
+        for (sid, bars) in grouped {
+            let date_map = out.entry(sid).or_default();
+            for bar in bars {
+                date_map.insert(bar.time.date_utc(), bar);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn merge_trade_bar_subscription_maps(
+    target: &mut HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>>,
+    loaded: HashMap<u64, HashMap<chrono::NaiveDate, lean_data::TradeBar>>,
+) {
+    for (sid, date_map) in loaded {
+        target.entry(sid).or_default().extend(date_map);
+    }
 }
 
 fn resolve_benchmark_symbol(ticker: &str, subscriptions: &[Arc<SubscriptionDataConfig>]) -> Symbol {
@@ -8032,38 +8414,42 @@ fn benchmark_symbol_in_subscriptions(
     })
 }
 
-async fn load_internal_benchmark_price_map(
-    provider: Option<Arc<dyn IHistoricalDataProvider>>,
-    reader: &ParquetReader,
-    resolver: &PathResolver,
+fn internal_benchmark_subscription(symbol: &Symbol) -> Arc<SubscriptionDataConfig> {
+    let is_equity = matches!(symbol.security_type(), SecurityType::Equity);
+    let tz = if is_equity { "America/New_York" } else { "UTC" };
+    Arc::new(SubscriptionDataConfig {
+        symbol: symbol.clone(),
+        resolution: Resolution::Daily,
+        tick_type: TickType::Trade,
+        normalization_mode: if is_equity {
+            DataNormalizationMode::Adjusted
+        } else {
+            DataNormalizationMode::Raw
+        },
+        fill_data_forward: true,
+        extended_market_hours: !is_equity,
+        is_internal_feed: true,
+        is_filtered_subscription: false,
+        data_time_zone: tz.into(),
+        exchange_time_zone: tz.into(),
+    })
+}
+
+fn trade_bar_date_map_to_close_map(
+    date_map: &HashMap<NaiveDate, lean_data::TradeBar>,
+) -> HashMap<NaiveDate, Decimal> {
+    date_map
+        .iter()
+        .map(|(date, bar)| (*date, bar.close))
+        .collect()
+}
+
+fn log_loaded_benchmark_price_map(
     symbol: &Symbol,
     start: NaiveDate,
     end: NaiveDate,
-) -> HashMap<NaiveDate, Decimal> {
-    let mut map = load_internal_benchmark_prices_for_resolution(
-        provider.clone(),
-        reader,
-        resolver,
-        symbol,
-        Resolution::Daily,
-        start,
-        end,
-    )
-    .await;
-
-    if map.is_empty() {
-        map = load_internal_benchmark_prices_for_resolution(
-            provider,
-            reader,
-            resolver,
-            symbol,
-            Resolution::Hour,
-            start,
-            end,
-        )
-        .await;
-    }
-
+    map: &HashMap<NaiveDate, Decimal>,
+) {
     if map.is_empty() {
         warn!(
             "Benchmark data not found for {} ({} → {}) — proceeding without benchmark",
@@ -8075,104 +8461,6 @@ async fn load_internal_benchmark_price_map(
             map.len(),
             symbol.value
         );
-    }
-
-    map
-}
-
-async fn load_internal_benchmark_prices_for_resolution(
-    provider: Option<Arc<dyn IHistoricalDataProvider>>,
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    symbol: &Symbol,
-    resolution: Resolution,
-    start: NaiveDate,
-    end: NaiveDate,
-) -> HashMap<NaiveDate, Decimal> {
-    let mut latest_by_date: HashMap<NaiveDate, (DateTime, Decimal)> = HashMap::new();
-
-    if let Some(provider) = provider {
-        let effective_start = match provider.earliest_date() {
-            Some(earliest) if start < earliest => earliest,
-            _ => start,
-        };
-        if effective_start <= end {
-            match provider
-                .get_trade_bars(
-                    symbol.clone(),
-                    resolution,
-                    date_to_datetime(effective_start, 0, 0, 0),
-                    date_to_datetime(end, 23, 59, 59),
-                )
-                .await
-            {
-                Ok(bars) => {
-                    for bar in bars
-                        .into_iter()
-                        .filter(|bar| bar.symbol.id.sid == symbol.id.sid)
-                    {
-                        insert_latest_benchmark_close(&mut latest_by_date, bar.time, bar.close);
-                    }
-                }
-                Err(err) => {
-                    debug!(
-                        "Could not fetch {} benchmark data for {}: {}",
-                        resolution, symbol.value, err
-                    );
-                }
-            }
-        }
-    }
-
-    let params = QueryParams::new()
-        .with_time_range(
-            date_to_datetime(start, 0, 0, 0),
-            date_to_datetime(end, 23, 59, 59),
-        )
-        .with_symbols(vec![symbol.id.sid]);
-    for date in expected_market_dates(symbol, start, end) {
-        let path = resolver.market_data_partition(symbol, resolution, TickType::Trade, date);
-        if !path.exists() {
-            continue;
-        }
-        match reader.read_trade_bar_partition(&path, symbol, &params) {
-            Ok(bars) => {
-                for bar in bars
-                    .into_iter()
-                    .filter(|bar| bar.symbol.id.sid == symbol.id.sid)
-                {
-                    insert_latest_benchmark_close(&mut latest_by_date, bar.time, bar.close);
-                }
-            }
-            Err(err) => {
-                debug!(
-                    "Could not read {} benchmark partition {} for {}: {}",
-                    resolution,
-                    path.display(),
-                    symbol.value,
-                    err
-                );
-            }
-        }
-    }
-
-    latest_by_date
-        .into_iter()
-        .map(|(date, (_, close))| (date, close))
-        .collect()
-}
-
-fn insert_latest_benchmark_close(
-    latest_by_date: &mut HashMap<NaiveDate, (DateTime, Decimal)>,
-    time: DateTime,
-    close: Decimal,
-) {
-    let date = time.date_utc();
-    match latest_by_date.get(&date) {
-        Some((current_time, _)) if *current_time >= time => {}
-        _ => {
-            latest_by_date.insert(date, (time, close));
-        }
     }
 }
 
@@ -8324,27 +8612,30 @@ async fn cached_quote_partition(
         .unwrap_or_default()
 }
 
-fn cached_tick_partition(
+async fn cached_tick_partition(
     cache: &mut HashMap<PathBuf, HashMap<u64, Vec<Tick>>>,
     reader: &ParquetReader,
     path: PathBuf,
-    template: &Symbol,
+    symbols_by_sid: &HashMap<u64, Symbol>,
     sid: u64,
     params: &QueryParams,
 ) -> Vec<Tick> {
-    cache
-        .entry(path.clone())
-        .or_insert_with(|| {
-            let rows = reader
-                .read_tick_partition(&path, template, params)
-                .unwrap_or_default();
-            let mut grouped: HashMap<u64, Vec<Tick>> = HashMap::new();
-            for row in rows {
-                grouped.entry(row.symbol.id.sid).or_default().push(row);
+    if !cache.contains_key(&path) {
+        let grouped = match reader
+            .read_tick_partitions_grouped_async(std::slice::from_ref(&path), symbols_by_sid, params)
+            .await
+        {
+            Ok(grouped) => grouped,
+            Err(err) => {
+                warn!("Failed to read tick partition {}: {}", path.display(), err);
+                HashMap::new()
             }
-            grouped
-        })
-        .get(&sid)
+        };
+        cache.insert(path.clone(), grouped);
+    }
+    cache
+        .get(&path)
+        .and_then(|grouped| grouped.get(&sid))
         .cloned()
         .unwrap_or_default()
 }
@@ -9378,6 +9669,7 @@ fn apply_quote_bar_to_minute<F>(
     current_date: NaiveDate,
     option_underlying_sids: &HashSet<u64>,
     factor_map: &HashMap<u64, Vec<FactorFileEntry>>,
+    normalization_mode: DataNormalizationMode,
     raw_underlying_spots: &mut HashMap<u64, Decimal>,
     bars_for_orders: &mut HashMap<u64, TradeBar>,
     minute_quote_bars: &mut HashMap<u64, QuoteBar>,
@@ -9396,7 +9688,7 @@ fn apply_quote_bar_to_minute<F>(
         }
     }
     let qbar = if let Some(rows) = factor_map.get(&sid) {
-        apply_factor_quote_bar(raw_qbar, rows, current_date)
+        apply_factor_quote_bar_with_mode(raw_qbar, rows, current_date, normalization_mode)
     } else {
         raw_qbar
     };
@@ -10878,33 +11170,56 @@ fn factor_for_entry(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64)
     (1.0, 1.0)
 }
 
-fn factor_price_and_volume_scale(
+fn factor_price_and_volume_scale_with_mode(
     rows: &[FactorFileEntry],
     bar_date: NaiveDate,
+    normalization_mode: DataNormalizationMode,
 ) -> Option<(Decimal, Decimal)> {
+    if matches!(normalization_mode, DataNormalizationMode::Raw) {
+        return None;
+    }
     let (pf, sf) = factor_for_entry(rows, bar_date);
-    let combined = pf * sf;
-    if (combined - 1.0).abs() < 1e-9 {
+    let price_factor = match normalization_mode {
+        DataNormalizationMode::Raw => 1.0,
+        DataNormalizationMode::SplitAdjusted => sf,
+        DataNormalizationMode::Adjusted
+        | DataNormalizationMode::TotalReturn
+        | DataNormalizationMode::ForwardPanamaCanal
+        | DataNormalizationMode::BackwardPanamaCanal => pf * sf,
+    };
+    let volume_factor = if sf != 0.0 { 1.0 / sf } else { 1.0 };
+    if (price_factor - 1.0).abs() < 1e-9 && (volume_factor - 1.0).abs() < 1e-9 {
         return None;
     }
 
-    let price_scale = Decimal::from_f64(combined).unwrap_or(Decimal::ONE);
-    let volume_scale = if combined.abs() > 1e-12 {
-        Decimal::from_f64(1.0 / combined).unwrap_or(Decimal::ONE)
-    } else {
-        Decimal::ONE
-    };
+    let price_scale = Decimal::from_f64(price_factor).unwrap_or(Decimal::ONE);
+    let volume_scale = Decimal::from_f64(volume_factor).unwrap_or(Decimal::ONE);
     Some((price_scale, volume_scale))
 }
 
-fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: NaiveDate) -> TradeBar {
+fn apply_factor_row_with_mode(
+    mut bar: TradeBar,
+    rows: &[FactorFileEntry],
+    bar_date: NaiveDate,
+    normalization_mode: DataNormalizationMode,
+) -> TradeBar {
+    if matches!(normalization_mode, DataNormalizationMode::Raw) {
+        return bar;
+    }
     let (pf, sf) = factor_for_entry(rows, bar_date);
-    let combined = pf * sf;
-    if (combined - 1.0).abs() < 1e-9 {
+    let price_factor = match normalization_mode {
+        DataNormalizationMode::Raw => 1.0,
+        DataNormalizationMode::SplitAdjusted => sf,
+        DataNormalizationMode::Adjusted
+        | DataNormalizationMode::TotalReturn
+        | DataNormalizationMode::ForwardPanamaCanal
+        | DataNormalizationMode::BackwardPanamaCanal => pf * sf,
+    };
+    if (price_factor - 1.0).abs() < 1e-9 && (sf - 1.0).abs() < 1e-9 {
         return bar;
     } // fast-path: no adjustment
 
-    let scale = Decimal::from_f64(combined).unwrap_or(Decimal::ONE);
+    let scale = Decimal::from_f64(price_factor).unwrap_or(Decimal::ONE);
     bar.open *= scale;
     bar.high *= scale;
     bar.low *= scale;
@@ -10917,12 +11232,15 @@ fn apply_factor_row(mut bar: TradeBar, rows: &[FactorFileEntry], bar_date: Naive
     bar
 }
 
-fn apply_factor_quote_bar(
+fn apply_factor_quote_bar_with_mode(
     mut bar: QuoteBar,
     rows: &[FactorFileEntry],
     bar_date: NaiveDate,
+    normalization_mode: DataNormalizationMode,
 ) -> QuoteBar {
-    let Some((price_scale, volume_scale)) = factor_price_and_volume_scale(rows, bar_date) else {
+    let Some((price_scale, volume_scale)) =
+        factor_price_and_volume_scale_with_mode(rows, bar_date, normalization_mode)
+    else {
         return bar;
     };
 
@@ -10943,8 +11261,15 @@ fn apply_factor_quote_bar(
     bar
 }
 
-fn apply_factor_tick(mut tick: Tick, rows: &[FactorFileEntry], bar_date: NaiveDate) -> Tick {
-    let Some((price_scale, volume_scale)) = factor_price_and_volume_scale(rows, bar_date) else {
+fn apply_factor_tick_with_mode(
+    mut tick: Tick,
+    rows: &[FactorFileEntry],
+    bar_date: NaiveDate,
+    normalization_mode: DataNormalizationMode,
+) -> Tick {
+    let Some((price_scale, volume_scale)) =
+        factor_price_and_volume_scale_with_mode(rows, bar_date, normalization_mode)
+    else {
         return tick;
     };
 
@@ -11232,6 +11557,7 @@ mod factor_tests {
         let sub = SubscriptionDataConfig::new_equity(
             Symbol::create_equity("BYON", &Market::usa()),
             Resolution::Minute,
+            DataNormalizationMode::Adjusted,
         );
 
         let map_file = resolve_map_file_for_subscription(
@@ -11643,9 +11969,66 @@ mod factor_tests {
         );
 
         // bar on 2023-12-25 (one day after the row): split factor 0.5 applies.
-        let adjusted = apply_factor_row(bar.clone(), &rows, d(2023, 12, 25));
+        let adjusted = apply_factor_row_with_mode(
+            bar.clone(),
+            &rows,
+            d(2023, 12, 25),
+            DataNormalizationMode::Adjusted,
+        );
         assert_eq!(adjusted.close, dec!(52.5)); // 105 * 0.5
         assert_eq!(adjusted.volume, dec!(2000)); // 1000 / 0.5
+    }
+
+    #[test]
+    fn test_apply_factor_row_respects_raw_mode() {
+        use lean_data::trade_bar::TradeBarData;
+        use rust_decimal_macros::dec;
+
+        let rows = vec![
+            entry_split(2023, 12, 24, 0.8, 0.5),
+            entry_split(2050, 12, 31, 1.0, 1.0),
+        ];
+        let sym = lean_core::Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let bar = TradeBar::new(
+            sym,
+            lean_core::NanosecondTimestamp(0),
+            lean_core::TimeSpan::from_days(1),
+            TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+        );
+
+        let raw =
+            apply_factor_row_with_mode(bar, &rows, d(2023, 12, 25), DataNormalizationMode::Raw);
+
+        assert_eq!(raw.close, dec!(100));
+        assert_eq!(raw.volume, dec!(1000));
+    }
+
+    #[test]
+    fn test_apply_factor_row_split_adjusted_excludes_dividend_factor() {
+        use lean_data::trade_bar::TradeBarData;
+        use rust_decimal_macros::dec;
+
+        let rows = vec![
+            entry_split(2023, 12, 24, 0.8, 0.5),
+            entry_split(2050, 12, 31, 1.0, 1.0),
+        ];
+        let sym = lean_core::Symbol::create_equity("SPY", &lean_core::Market::usa());
+        let bar = TradeBar::new(
+            sym,
+            lean_core::NanosecondTimestamp(0),
+            lean_core::TimeSpan::from_days(1),
+            TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+        );
+
+        let split_adjusted = apply_factor_row_with_mode(
+            bar,
+            &rows,
+            d(2023, 12, 25),
+            DataNormalizationMode::SplitAdjusted,
+        );
+
+        assert_eq!(split_adjusted.close, dec!(50));
+        assert_eq!(split_adjusted.volume, dec!(2000));
     }
 
     #[test]
@@ -11669,7 +12052,12 @@ mod factor_tests {
             dec!(1200),
         );
 
-        let adjusted = apply_factor_quote_bar(qbar, &rows, d(2022, 3, 29));
+        let adjusted = apply_factor_quote_bar_with_mode(
+            qbar,
+            &rows,
+            d(2022, 3, 29),
+            DataNormalizationMode::Adjusted,
+        );
         let synth = synthesize_trade_bar_from_quote_bar(&adjusted).unwrap();
 
         assert_eq!(adjusted.bid.as_ref().unwrap().close, dec!(66.00));
@@ -11696,7 +12084,12 @@ mod factor_tests {
             dec!(1200),
         );
 
-        let adjusted = apply_factor_tick(tick, &rows, d(2022, 3, 29));
+        let adjusted = apply_factor_tick_with_mode(
+            tick,
+            &rows,
+            d(2022, 3, 29),
+            DataNormalizationMode::Adjusted,
+        );
         let synth = synthesize_trade_bar_from_ticks(
             &sym,
             lean_core::NanosecondTimestamp(0),
@@ -12581,9 +12974,11 @@ mod tests {
     fn tradier_reverse_split_cancels_open_orders_instead_of_adjusting_them() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let split_time = ny_time(2026, 1, 16, 9, 30);
-        let mut subscription =
-            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
-        subscription.normalization_mode = DataNormalizationMode::Raw;
+        let subscription = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
         let subscriptions = vec![Arc::new(subscription)];
         let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
         let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
@@ -12624,9 +13019,11 @@ mod tests {
     fn default_reverse_split_adjusts_open_orders() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let split_time = ny_time(2026, 1, 16, 9, 30);
-        let mut subscription =
-            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
-        subscription.normalization_mode = DataNormalizationMode::Raw;
+        let subscription = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
         let subscriptions = vec![Arc::new(subscription)];
         let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
         let transactions = Arc::new(lean_orders::transaction_manager::TransactionManager::new());
@@ -12672,9 +13069,11 @@ mod tests {
     fn adjusted_mode_split_does_not_multiply_holdings() {
         let symbol = Symbol::create_equity("XLE", &Market::usa());
         let split_time = ny_time(2025, 12, 5, 9, 30);
-        let mut subscription =
-            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
-        subscription.normalization_mode = DataNormalizationMode::Adjusted;
+        let subscription = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         let subscriptions = vec![Arc::new(subscription)];
 
         let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
@@ -12720,9 +13119,11 @@ mod tests {
     fn raw_mode_split_applies_quantity_with_invariant_value() {
         let symbol = Symbol::create_equity("XLE", &Market::usa());
         let split_time = ny_time(2025, 12, 5, 9, 30);
-        let mut subscription =
-            SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Minute);
-        subscription.normalization_mode = DataNormalizationMode::Raw;
+        let subscription = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
         let subscriptions = vec![Arc::new(subscription)];
 
         let portfolio = lean_algorithm::portfolio::SecurityPortfolioManager::new(dec!(100_000));
@@ -13106,6 +13507,7 @@ mod tests {
             frontier.date_utc(),
             &HashSet::new(),
             &HashMap::new(),
+            DataNormalizationMode::Adjusted,
             &mut raw_underlying_spots,
             &mut bars_for_orders,
             &mut minute_quote_bars,
@@ -13349,6 +13751,7 @@ class NoWarmupCallback(QCAlgorithm):
         let cfg_spy = Arc::new(SubscriptionDataConfig::new_equity(
             spy.clone(),
             Resolution::Daily,
+            DataNormalizationMode::Adjusted,
         ));
         let subs = [cfg_spy];
 
@@ -13361,45 +13764,211 @@ class NoWarmupCallback(QCAlgorithm):
         assert!(!benchmark_symbol_in_subscriptions(&benchmark2, &subs));
     }
 
-    #[test]
-    fn load_trade_bar_partitions_reads_date_partition_range() {
+    #[tokio::test]
+    async fn load_trade_bar_subscription_map_reads_subscribed_universe_once() {
         let tmp = tempfile::tempdir().unwrap();
         let resolver = PathResolver::new(tmp.path());
         let writer = ParquetWriter::new(WriterConfig::default());
         let market = lean_core::Market::usa();
-        let symbol = Symbol::create_equity("SPY", &market);
-        let sub = SubscriptionDataConfig::new_equity(symbol.clone(), Resolution::Daily);
+        let spy = Symbol::create_equity("SPY", &market);
+        let qqq = Symbol::create_equity("QQQ", &market);
         let day1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let day2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap();
 
-        let make_bar = |date: chrono::NaiveDate, close| {
+        let make_bar = |symbol: Symbol, date: chrono::NaiveDate, close| {
             TradeBar::new(
-                symbol.clone(),
+                symbol,
                 date_to_datetime(date, 16, 0, 0),
                 TimeSpan::ONE_DAY,
                 TradeBarData::new(close, close, close, close, dec!(1000)),
             )
         };
 
-        for (date, close) in [(day1, dec!(100)), (day2, dec!(101))] {
+        for date in [day1, day2] {
             let path =
-                resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, date);
+                resolver.market_data_partition(&spy, Resolution::Daily, TickType::Trade, date);
             writer
-                .write_trade_bars(&[make_bar(date, close)], &path)
+                .write_trade_bars(
+                    &[
+                        make_bar(spy.clone(), date, dec!(100)),
+                        make_bar(qqq.clone(), date, dec!(200)),
+                    ],
+                    &path,
+                )
                 .unwrap();
         }
 
-        let params = QueryParams::new()
-            .with_time_range(
-                date_to_datetime(day1, 0, 0, 0),
-                date_to_datetime(day2, 23, 59, 59),
-            )
-            .with_symbols(vec![symbol.id.sid]);
-        let rows =
-            load_trade_bar_partitions(&ParquetReader::new(), &resolver, &sub, day1, day2, &params);
-        let closes: Vec<_> = rows.iter().map(|bar| bar.close).collect();
+        let subscriptions = vec![
+            Arc::new(SubscriptionDataConfig::new_equity(
+                spy.clone(),
+                Resolution::Daily,
+                DataNormalizationMode::Adjusted,
+            )),
+            Arc::new(SubscriptionDataConfig::new_equity(
+                qqq.clone(),
+                Resolution::Daily,
+                DataNormalizationMode::Adjusted,
+            )),
+        ];
+        let params = QueryParams::new().with_time_range(
+            date_to_datetime(day1, 0, 0, 0),
+            date_to_datetime(day2, 23, 59, 59),
+        );
 
-        assert_eq!(closes, vec![dec!(100), dec!(101)]);
+        let map = load_trade_bar_subscription_map(
+            &ParquetReader::new(),
+            &resolver,
+            &subscriptions,
+            day1,
+            day2,
+            &params,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(map[&spy.id.sid][&day1].close, dec!(100));
+        assert_eq!(map[&spy.id.sid][&day2].close, dec!(100));
+        assert_eq!(map[&qqq.id.sid][&day1].close, dec!(200));
+        assert_eq!(map[&qqq.id.sid][&day2].close, dec!(200));
+    }
+
+    #[tokio::test]
+    async fn load_trade_bar_subscription_map_keys_daily_rows_by_bar_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let writer = ParquetWriter::new(WriterConfig::default());
+        let market = lean_core::Market::usa();
+        let symbol = Symbol::create_equity("SPY", &market);
+        let day1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let day2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 3).unwrap();
+
+        let make_bar = |row_date: chrono::NaiveDate, close| {
+            TradeBar::new(
+                symbol.clone(),
+                date_to_datetime(row_date, 16, 0, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(close, close, close, close, dec!(1000)),
+            )
+        };
+
+        for (partition_date, row_date, close) in [
+            (day1, day1 - chrono::Duration::days(1), dec!(100)),
+            (day2, day2 - chrono::Duration::days(1), dec!(101)),
+        ] {
+            let path = resolver.market_data_partition(
+                &symbol,
+                Resolution::Daily,
+                TickType::Trade,
+                partition_date,
+            );
+            writer
+                .write_trade_bars(&[make_bar(row_date, close)], &path)
+                .unwrap();
+        }
+
+        let subscription = Arc::new(SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Adjusted,
+        ));
+        let params = QueryParams::new().with_time_range(
+            date_to_datetime(day1, 0, 0, 0),
+            date_to_datetime(day2, 23, 59, 59),
+        );
+
+        let map = load_trade_bar_subscription_map(
+            &ParquetReader::new(),
+            &resolver,
+            &[subscription],
+            day1,
+            day2,
+            &params,
+        )
+        .await
+        .unwrap();
+
+        let by_date = &map[&symbol.id.sid];
+        assert_eq!(
+            by_date
+                .get(&(day1 - chrono::Duration::days(1)))
+                .map(|bar| bar.close),
+            Some(dec!(100))
+        );
+        assert_eq!(by_date.get(&day1).map(|bar| bar.close), Some(dec!(101)));
+        assert!(!by_date.contains_key(&day2));
+    }
+
+    #[tokio::test]
+    async fn load_trade_bar_subscription_map_allows_missing_daily_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = PathResolver::new(tmp.path());
+        let writer = ParquetWriter::new(WriterConfig::default());
+        let market = lean_core::Market::usa();
+        let spy = Symbol::create_equity("SPY", &market);
+        let xlc = Symbol::create_equity("XLC", &market);
+        let day1 = chrono::NaiveDate::from_ymd_opt(2018, 6, 18).unwrap();
+        let day2 = chrono::NaiveDate::from_ymd_opt(2018, 6, 19).unwrap();
+
+        let make_bar = |symbol: Symbol, date: chrono::NaiveDate, close| {
+            TradeBar::new(
+                symbol,
+                date_to_datetime(date, 16, 0, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(close, close, close, close, dec!(1000)),
+            )
+        };
+
+        // Day 1 partition exists, but XLC has no row yet (pre-inception).
+        let day1_path =
+            resolver.market_data_partition(&spy, Resolution::Daily, TickType::Trade, day1);
+        writer
+            .write_trade_bars(&[make_bar(spy.clone(), day1, dec!(100))], &day1_path)
+            .unwrap();
+
+        let day2_path =
+            resolver.market_data_partition(&spy, Resolution::Daily, TickType::Trade, day2);
+        writer
+            .write_trade_bars(
+                &[
+                    make_bar(spy.clone(), day2, dec!(101)),
+                    make_bar(xlc.clone(), day2, dec!(50)),
+                ],
+                &day2_path,
+            )
+            .unwrap();
+
+        let subscriptions = vec![
+            Arc::new(SubscriptionDataConfig::new_equity(
+                spy.clone(),
+                Resolution::Daily,
+                DataNormalizationMode::Adjusted,
+            )),
+            Arc::new(SubscriptionDataConfig::new_equity(
+                xlc.clone(),
+                Resolution::Daily,
+                DataNormalizationMode::Adjusted,
+            )),
+        ];
+        let params = QueryParams::new().with_time_range(
+            date_to_datetime(day1, 0, 0, 0),
+            date_to_datetime(day2, 23, 59, 59),
+        );
+
+        let map = load_trade_bar_subscription_map(
+            &ParquetReader::new(),
+            &resolver,
+            &subscriptions,
+            day1,
+            day2,
+            &params,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(map[&spy.id.sid][&day1].close, dec!(100));
+        assert_eq!(map[&spy.id.sid][&day2].close, dec!(101));
+        assert!(!map[&xlc.id.sid].contains_key(&day1));
+        assert_eq!(map[&xlc.id.sid][&day2].close, dec!(50));
     }
 
     fn custom_subscription_for_test(
@@ -13548,7 +14117,7 @@ class NoWarmupCallback(QCAlgorithm):
     }
 
     #[tokio::test]
-    async fn benchmark_loader_reads_full_date_partition_range() {
+    async fn benchmark_loader_reads_grouped_subscription_map() {
         let tmp = tempfile::tempdir().unwrap();
         let resolver = PathResolver::new(tmp.path());
         let writer = ParquetWriter::new(WriterConfig::default());
@@ -13573,16 +14142,25 @@ class NoWarmupCallback(QCAlgorithm):
                 .unwrap();
         }
 
-        let prices = load_internal_benchmark_prices_for_resolution(
-            None,
+        let sub = internal_benchmark_subscription(&symbol);
+        let params = QueryParams::new().with_time_range(
+            date_to_datetime(day1, 0, 0, 0),
+            date_to_datetime(day2, 23, 59, 59),
+        );
+        let loaded = load_trade_bar_subscription_map(
             &ParquetReader::new(),
             &resolver,
-            &symbol,
-            Resolution::Daily,
+            std::slice::from_ref(&sub),
             day1,
             day2,
+            &params,
         )
-        .await;
+        .await
+        .unwrap();
+        let prices = loaded
+            .get(&symbol.id.sid)
+            .map(trade_bar_date_map_to_close_map)
+            .unwrap_or_default();
 
         assert_eq!(prices.get(&day1), Some(&dec!(110)));
         assert_eq!(prices.get(&day2), Some(&dec!(112)));
@@ -13653,12 +14231,25 @@ class NoWarmupCallback(QCAlgorithm):
         let spy_trade = Arc::new(SubscriptionDataConfig::new_equity(
             spy.clone(),
             Resolution::Minute,
+            DataNormalizationMode::Adjusted,
         ));
-        let mut spy_quote_cfg = SubscriptionDataConfig::new_equity(spy, Resolution::Minute);
+        let mut spy_quote_cfg = SubscriptionDataConfig::new_equity(
+            spy,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         spy_quote_cfg.tick_type = TickType::Quote;
         let spy_quote = Arc::new(spy_quote_cfg);
-        let qqq_trade = Arc::new(SubscriptionDataConfig::new_equity(qqq, Resolution::Minute));
-        let aapl_trade = Arc::new(SubscriptionDataConfig::new_equity(aapl, Resolution::Minute));
+        let qqq_trade = Arc::new(SubscriptionDataConfig::new_equity(
+            qqq,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        ));
+        let aapl_trade = Arc::new(SubscriptionDataConfig::new_equity(
+            aapl,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        ));
 
         let mut subscriptions = vec![spy_trade.clone(), spy_quote.clone(), qqq_trade.clone()];
         let mut loaded_subscription_ids: HashSet<u64> =
@@ -13696,7 +14287,11 @@ class NoWarmupCallback(QCAlgorithm):
     fn warmup_replay_subscriptions_use_requested_resolution_without_mutating_source() {
         let market = Market::usa();
         let spy = Symbol::create_equity("SPY", &market);
-        let minute_sub = Arc::new(SubscriptionDataConfig::new_equity(spy, Resolution::Minute));
+        let minute_sub = Arc::new(SubscriptionDataConfig::new_equity(
+            spy,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        ));
         let mut quote_config = (*minute_sub).clone();
         quote_config.tick_type = TickType::Quote;
         let quote_sub = Arc::new(quote_config);

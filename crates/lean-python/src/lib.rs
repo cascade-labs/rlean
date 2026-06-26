@@ -1,4 +1,5 @@
 pub mod charting;
+pub mod interrupt;
 pub mod py_adapter;
 pub mod py_charting;
 pub mod py_data;
@@ -559,7 +560,31 @@ assert algorithm.portfolio.is_invested is False
                 result
             );
 
-            // Test 7: All expected LEAN indicator names are present
+            // Test 7: PortfolioTarget is exposed with LEAN constructor/tag overloads.
+            let result = py.run(
+                c"
+from AlgorithmImports import PortfolioTarget, Symbol
+spy = Symbol.Create('SPY')
+target = PortfolioTarget(spy, 0, 'orthogonal')
+assert target.Symbol == spy
+assert target.Quantity == 0
+assert target.Tag == 'orthogonal'
+pct_target = PortfolioTarget.Percent(None, spy, 0.25, 'orthogonal')
+assert pct_target.Symbol == spy
+assert pct_target.Tag == 'orthogonal'
+snake_target = PortfolioTarget.percent(None, spy, 0.10, 'snake')
+assert snake_target.Tag == 'snake'
+",
+                None,
+                None,
+            );
+            assert!(
+                result.is_ok(),
+                "PortfolioTarget API test failed: {:?}",
+                result
+            );
+
+            // Test 8: All expected LEAN indicator names are present
             let result = py.run(
                 c"
 from AlgorithmImports import (
@@ -582,7 +607,7 @@ assert AverageTrueRange is not None
             );
             assert!(result.is_ok(), "Indicator names test failed: {:?}", result);
 
-            // Test 8: All expected LEAN OrderEvent properties are present
+            // Test 9: All expected LEAN OrderEvent properties are present
             let result = py.run(
                 c"
 from AlgorithmImports import OrderEvent, OrderStatus, OrderDirection
@@ -612,7 +637,7 @@ assert hasattr(OrderDirection, 'Hold')
             );
             assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
 
-            // Test 9: TimeInForce is exposed and accepted by order helpers.
+            // Test 10: TimeInForce is exposed and accepted by order helpers.
             let result = py.run(
                 c"
 from AlgorithmImports import QCAlgorithm, BrokerageName, OrderStatus, OrderTicket, Resolution, TimeInForce
@@ -640,7 +665,7 @@ assert hasattr(TimeInForce, 'GTC')
             );
             assert!(result.is_ok(), "TimeInForce API test failed: {:?}", result);
 
-            // Test 10: security identity and market-hours API surface mirrors LEAN names.
+            // Test 11: security identity and market-hours API surface mirrors LEAN names.
             let result = py.run(
                 c"
 import datetime
@@ -670,7 +695,7 @@ assert security.Exchange.Hours.IsOpen(
             );
             assert!(result.is_ok(), "Security API test failed: {:?}", result);
 
-            // Test 11: universe selection API surface mirrors LEAN names.
+            // Test 12: universe selection API surface mirrors LEAN names.
             let result = py.run(
                 c"
 from AlgorithmImports import *

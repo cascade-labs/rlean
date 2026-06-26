@@ -320,6 +320,22 @@ mod provider_tests {
         }
     }
 
+    fn write_daily_bars_to_partition_dates(root: &std::path::Path, bars: &[(NaiveDate, TradeBar)]) {
+        let resolver = PathResolver::new(root);
+        let writer = ParquetWriter::new(WriterConfig::default());
+        for (partition_date, bar) in bars {
+            let path = resolver.market_data_partition(
+                &bar.symbol,
+                Resolution::Daily,
+                TickType::Trade,
+                *partition_date,
+            );
+            writer
+                .merge_trade_bar_partition(std::slice::from_ref(bar), &path)
+                .unwrap();
+        }
+    }
+
     fn make_option_universe_row(
         date: NaiveDate,
         underlying: &str,
@@ -727,6 +743,36 @@ mod provider_tests {
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
         );
+        let bars = provider.get_history(&request).await.unwrap();
+
+        assert_eq!(bars.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn local_provider_daily_coverage_uses_partition_date_not_bar_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = LocalHistoryProvider::new(dir.path());
+        let symbol = make_symbol();
+        let request_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let request_end = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
+        let partition_dates = [
+            request_start,
+            NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 4).unwrap(),
+            request_end,
+        ];
+        let bars = partition_dates
+            .into_iter()
+            .map(|partition_date| {
+                (
+                    partition_date,
+                    make_bar_for(symbol.clone(), partition_date - chrono::Duration::days(1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_daily_bars_to_partition_dates(dir.path(), &bars);
+
+        let request = make_history_request_for_range(request_start, request_end);
         let bars = provider.get_history(&request).await.unwrap();
 
         assert_eq!(bars.len(), 4);
