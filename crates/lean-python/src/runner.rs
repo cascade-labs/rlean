@@ -313,7 +313,7 @@ fn run_backtest_margin_call_scan(
                     (order, unrealized)
                 })
                 .collect();
-            orders_with_pnl.sort_by(|a, b| a.1.cmp(&b.1));
+            orders_with_pnl.sort_by_key(|(_, pnl)| *pnl);
 
             for (request, _) in orders_with_pnl {
                 if portfolio
