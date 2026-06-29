@@ -1,7 +1,7 @@
 use lean_core::{Market, NanosecondTimestamp, Symbol};
 use lean_orders::{
-    transaction_manager::TransactionManager, Order, OrderDirection, OrderStatus, OrderType,
-    TimeInForce, UpdateOrderFields,
+    transaction_manager::TransactionManager, Order, OrderDirection, OrderEvent, OrderStatus,
+    OrderType, TimeInForce, UpdateOrderFields,
 };
 use rust_decimal_macros::dec;
 
@@ -243,4 +243,25 @@ fn transaction_manager_cancel_open_orders_for_symbol_leaves_other_symbols_open()
     let open = tm.get_open_orders();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].symbol, aapl);
+}
+
+#[test]
+fn transaction_manager_tracks_open_order_index() {
+    let tm = TransactionManager::new();
+    let symbol = spy();
+    assert!(!tm.has_open_orders());
+
+    tm.add_order(Order::market(1, symbol.clone(), dec!(100), ts(0), ""));
+    assert!(tm.has_open_orders());
+    assert_eq!(tm.get_open_orders().len(), 1);
+
+    tm.process_order_event(OrderEvent::filled(
+        1,
+        symbol.clone(),
+        ts(1),
+        dec!(450),
+        dec!(100),
+    ));
+    assert!(!tm.has_open_orders());
+    assert!(tm.get_open_orders().is_empty());
 }

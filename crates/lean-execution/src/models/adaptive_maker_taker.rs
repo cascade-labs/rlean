@@ -77,10 +77,10 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
         let mut market_orders = Vec::new();
 
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             if context
                 .securities
-                .get(&key)
+                .get(key.as_str())
                 .map(|security| self.spread_is_tight(security))
                 .unwrap_or(false)
             {
@@ -90,7 +90,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
                     (target.symbol.clone(), target.quantity, target.tag.clone()),
                 );
             } else {
-                self.tight_targets.remove(&key);
+                self.tight_targets.remove(key.as_str());
                 passive_targets.push(target.clone());
             }
         }
@@ -171,7 +171,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
     fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
         self.passive.on_securities_changed(added, removed);
         for symbol in removed {
-            self.tight_targets.remove(&symbol.value);
+            self.tight_targets.remove(symbol.value.as_ref());
         }
     }
 

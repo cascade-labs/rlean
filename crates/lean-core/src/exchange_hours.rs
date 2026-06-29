@@ -1,8 +1,11 @@
 use crate::time::{NanosecondTimestamp, TimeSpan};
+use crate::{SecurityType, Symbol};
 use chrono::{Datelike, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// A single session: open and close times as offsets from midnight (nanos).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +51,102 @@ pub struct ExchangeHours {
     pub holidays: HashSet<NaiveDate>,
     pub early_closes: std::collections::HashMap<NaiveDate, TimeSpan>,
     pub late_opens: std::collections::HashMap<NaiveDate, TimeSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarketHoursKey {
+    pub market: String,
+    pub symbol: String,
+    pub security_type: SecurityType,
+}
+
+impl MarketHoursKey {
+    pub fn new(
+        market: impl Into<String>,
+        symbol: impl Into<String>,
+        security_type: SecurityType,
+    ) -> Self {
+        Self {
+            market: market.into(),
+            symbol: symbol.into(),
+            security_type,
+        }
+    }
+
+    pub fn from_symbol(symbol: &Symbol) -> Self {
+        Self::new(
+            symbol.market().as_str().to_ascii_lowercase(),
+            Self::database_symbol(symbol),
+            symbol.security_type(),
+        )
+    }
+
+    fn database_symbol(symbol: &Symbol) -> String {
+        if symbol.security_type().is_option_like() {
+            symbol
+                .underlying
+                .as_ref()
+                .map(|underlying| underlying.permtick.to_ascii_uppercase())
+                .unwrap_or_else(|| symbol.permtick.trim_start_matches('?').to_ascii_uppercase())
+        } else {
+            symbol.permtick.to_ascii_uppercase()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketHoursDatabase {
+    entries: HashMap<MarketHoursKey, Arc<ExchangeHours>>,
+    defaults: HashMap<SecurityType, Arc<ExchangeHours>>,
+}
+
+static GLOBAL_MARKET_HOURS_DATABASE: Lazy<Arc<MarketHoursDatabase>> =
+    Lazy::new(|| Arc::new(MarketHoursDatabase::from_builtin_defaults()));
+
+impl MarketHoursDatabase {
+    pub fn global() -> Arc<Self> {
+        GLOBAL_MARKET_HOURS_DATABASE.clone()
+    }
+
+    pub fn from_builtin_defaults() -> Self {
+        let us_equity = Arc::new(ExchangeHours::us_equity());
+        let forex = Arc::new(ExchangeHours::forex_24h());
+        let crypto = Arc::new(ExchangeHours::crypto_24_7());
+
+        let mut defaults = HashMap::new();
+        defaults.insert(SecurityType::Equity, us_equity.clone());
+        defaults.insert(SecurityType::Option, us_equity.clone());
+        defaults.insert(SecurityType::IndexOption, us_equity.clone());
+        defaults.insert(SecurityType::Forex, forex);
+        defaults.insert(SecurityType::Crypto, crypto.clone());
+        defaults.insert(SecurityType::CryptoFuture, crypto.clone());
+        defaults.insert(SecurityType::Base, crypto);
+
+        Self {
+            entries: HashMap::new(),
+            defaults,
+        }
+    }
+
+    pub fn with_entry(mut self, key: MarketHoursKey, exchange_hours: Arc<ExchangeHours>) -> Self {
+        self.entries.insert(key, exchange_hours);
+        self
+    }
+
+    pub fn exchange_hours(&self, symbol: &Symbol) -> Arc<ExchangeHours> {
+        let key = MarketHoursKey::from_symbol(symbol);
+        self.entries
+            .get(&key)
+            .or_else(|| self.defaults.get(&key.security_type))
+            .cloned()
+            .unwrap_or_else(|| Arc::new(ExchangeHours::crypto_24_7()))
+    }
+
+    pub fn is_open_date(&self, symbol: &Symbol, date: NaiveDate) -> bool {
+        date.and_hms_opt(12, 0, 0)
+            .map(|midday| self.exchange_hours(symbol).is_open_at_local_naive(midday))
+            .unwrap_or(false)
+    }
 }
 
 impl ExchangeHours {
@@ -137,6 +236,16 @@ impl ExchangeHours {
             let close = close_override.map(|c| c.nanos).unwrap_or(s.close.nanos);
             day_nanos >= open && day_nanos < close
         })
+    }
+
+    pub fn is_open_at_local_naive(&self, local: chrono::NaiveDateTime) -> bool {
+        let tz: Tz = self.timezone.parse().unwrap_or(chrono_tz::UTC);
+        let local = match tz.from_local_datetime(&local) {
+            chrono::LocalResult::Single(local) => local,
+            chrono::LocalResult::Ambiguous(earliest, _) => earliest,
+            chrono::LocalResult::None => return false,
+        };
+        self.is_open_at(NanosecondTimestamp::from(local.with_timezone(&chrono::Utc)))
     }
 
     pub fn next_open(&self, from: NanosecondTimestamp) -> Option<NanosecondTimestamp> {
@@ -268,5 +377,60 @@ impl ExchangeHours {
         h.insert(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
         h
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Market;
+
+    #[test]
+    fn local_naive_open_check_uses_exchange_definition() {
+        let hours = ExchangeHours::us_equity();
+
+        assert!(hours.is_open_at_local_naive(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap()
+        ));
+        assert!(!hours.is_open_at_local_naive(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 6)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn market_hours_database_reuses_default_exchange_hours() {
+        let db = MarketHoursDatabase::from_builtin_defaults();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+        let aapl = Symbol::create_equity("AAPL", &Market::usa());
+
+        let spy_hours = db.exchange_hours(&spy);
+        let aapl_hours = db.exchange_hours(&aapl);
+
+        assert!(Arc::ptr_eq(&spy_hours, &aapl_hours));
+    }
+
+    #[test]
+    fn market_hours_database_checks_equity_open_dates() {
+        let db = MarketHoursDatabase::from_builtin_defaults();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+
+        assert!(db.is_open_date(
+            &spy,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()
+        ));
+        assert!(!db.is_open_date(
+            &spy,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
+        ));
+        assert!(!db.is_open_date(
+            &spy,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 6).unwrap()
+        ));
     }
 }

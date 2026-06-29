@@ -49,7 +49,7 @@ impl VwapExecutionModel {
             return;
         }
 
-        let key = sec.symbol.value.clone();
+        let key = sec.symbol.value.to_string();
         let state = self.vwap.entry(key).or_insert_with(|| VwapState {
             day: None,
             sum_volume: Decimal::ZERO,
@@ -131,7 +131,7 @@ impl IExecutionModel for VwapExecutionModel {
 
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -220,8 +220,8 @@ impl IExecutionModel for VwapExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
-            self.vwap.remove(&sym.value);
+            self.targets.remove(sym.value.as_ref());
+            self.vwap.remove(sym.value.as_ref());
         }
     }
 

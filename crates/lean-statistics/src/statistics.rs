@@ -40,14 +40,13 @@ impl Statistics {
         Decimal::from_f64_retain(annual).unwrap_or(dec!(0))
     }
 
-    /// Sharpe ratio from returns and risk-free rate.
+    /// Sharpe ratio from daily returns and annual risk-free rate.
     pub fn sharpe_ratio(returns: &[Decimal], risk_free_rate: Decimal) -> Decimal {
         if returns.len() < 2 {
             return dec!(0);
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
-        let excess = mean - risk_free_rate;
         let variance = returns
             .iter()
             .map(|r| (r - mean) * (r - mean))
@@ -59,19 +58,23 @@ impl Statistics {
         if std == 0.0 {
             return dec!(0);
         }
-        let std_dec = Decimal::from_f64_retain(std).unwrap_or(dec!(1));
 
-        (excess / std_dec) * Decimal::from_f64_retain(252_f64.sqrt()).unwrap_or(dec!(1))
+        let annual_performance = Decimal::from_f64_retain(
+            (dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0,
+        )
+        .unwrap_or(dec!(0));
+        let annual_std = Decimal::from_f64_retain(std * 252_f64.sqrt()).unwrap_or(dec!(1));
+
+        (annual_performance - risk_free_rate) / annual_std
     }
 
-    /// Sortino ratio — penalizes only downside deviation.
+    /// Sortino ratio from daily returns and annual risk-free rate.
     pub fn sortino_ratio(returns: &[Decimal], risk_free_rate: Decimal) -> Decimal {
         if returns.len() < 2 {
             return dec!(0);
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
-        let excess = mean - risk_free_rate;
 
         let downside_sq: Decimal = returns
             .iter()
@@ -93,8 +96,14 @@ impl Statistics {
             return dec!(0);
         }
 
-        let std_dec = Decimal::from_f64_retain(downside_std).unwrap_or(dec!(1));
-        (excess / std_dec) * Decimal::from_f64_retain(252_f64.sqrt()).unwrap_or(dec!(1))
+        let annual_performance = Decimal::from_f64_retain(
+            (dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0,
+        )
+        .unwrap_or(dec!(0));
+        let annual_downside_std =
+            Decimal::from_f64_retain(downside_std * 252_f64.sqrt()).unwrap_or(dec!(1));
+
+        (annual_performance - risk_free_rate) / annual_downside_std
     }
 
     /// Maximum drawdown from an equity curve.

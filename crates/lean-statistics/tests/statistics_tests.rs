@@ -80,6 +80,17 @@ fn sharpe_ratio_higher_with_better_returns() {
     assert!(s2 > s1, "Better returns should yield higher Sharpe");
 }
 
+#[test]
+fn sharpe_ratio_uses_annualized_performance_like_lean() {
+    let returns = vec![dec!(0.01), dec!(-0.005), dec!(0.012), dec!(0.003)];
+    let sharpe = Statistics::sharpe_ratio(&returns, dec!(0.04));
+
+    assert!(
+        (sharpe - dec!(20.23555454375385)).abs() < dec!(0.000000000001),
+        "expected LEAN-style annualized Sharpe, got {sharpe}"
+    );
+}
+
 // ─── Sortino ratio ───────────────────────────────────────────────────────────
 
 #[test]

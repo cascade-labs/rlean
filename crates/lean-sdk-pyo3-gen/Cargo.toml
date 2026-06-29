@@ -1,0 +1,10 @@
+[package]
+name = "lean-sdk-pyo3-gen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }

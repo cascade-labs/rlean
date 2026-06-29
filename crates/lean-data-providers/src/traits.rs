@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lean_core::Symbol;
+use lean_core::{Market, OptionRight, OptionStyle, Symbol, SymbolOptionsExt};
 use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
 use std::collections::{HashMap, HashSet};
@@ -12,12 +12,56 @@ use crate::request::{
 
 pub type TickStream = Box<dyn Iterator<Item = anyhow::Result<Tick>> + Send>;
 
+fn option_right_from_row(row: &OptionUniverseRow) -> Option<OptionRight> {
+    match row.right.to_ascii_uppercase().as_str() {
+        "C" | "CALL" => Some(OptionRight::Call),
+        "P" | "PUT" => Some(OptionRight::Put),
+        _ => None,
+    }
+}
+
+fn option_symbol_from_universe_row(ticker: &str, row: &OptionUniverseRow) -> Option<Symbol> {
+    let right = option_right_from_row(row)?;
+    let underlying = Symbol::create_equity(ticker, &Market::usa());
+    Some(Symbol::create_option_osi(
+        underlying,
+        row.strike,
+        row.expiration,
+        right,
+        OptionStyle::American,
+        &Market::usa(),
+    ))
+}
+
+fn option_history_request(
+    ticker: &str,
+    row: &OptionUniverseRow,
+    resolution: lean_core::Resolution,
+    date: chrono::NaiveDate,
+    data_type: DataType,
+) -> Option<HistoryRequest> {
+    let start = lean_core::DateTime::from(date.and_hms_opt(0, 0, 0)?);
+    let end = lean_core::DateTime::from(date.succ_opt()?.and_hms_opt(0, 0, 0)?);
+    Some(HistoryRequest {
+        symbol: option_symbol_from_universe_row(ticker, row)?,
+        resolution,
+        start,
+        end,
+        data_type,
+    })
+}
+
 /// Provides historical market data — Rust equivalent of C# `IHistoryProvider`.
 ///
 /// Implementors are expected to fetch data from a remote source (or local
 /// disk), write it to the Parquet store, and return the raw bars.
 #[async_trait]
 pub trait IHistoryProvider: Send + Sync {
+    /// Human-readable provider name used in verbose diagnostics.
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
     /// Fetch historical trade bars for the symbol described in `request`.
     async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>>;
 
@@ -185,13 +229,14 @@ pub trait IHistoryProvider: Send + Sync {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<TradeBar>> {
-        let allowed = contracts
-            .iter()
-            .map(|row| row.symbol_value.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut bars = self.get_option_trade_bars(ticker, resolution, date).await?;
-        if !allowed.is_empty() {
-            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
+        let mut bars = Vec::new();
+        for contract in contracts {
+            let Some(request) =
+                option_history_request(ticker, contract, resolution, date, DataType::TradeBar)
+            else {
+                continue;
+            };
+            bars.extend(self.get_history(&request).await?);
         }
         Ok(bars)
     }
@@ -216,13 +261,14 @@ pub trait IHistoryProvider: Send + Sync {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let allowed = contracts
-            .iter()
-            .map(|row| row.symbol_value.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut bars = self.get_option_quote_bars(ticker, resolution, date).await?;
-        if !allowed.is_empty() {
-            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
+        let mut bars = Vec::new();
+        for contract in contracts {
+            let Some(request) =
+                option_history_request(ticker, contract, resolution, date, DataType::QuoteBar)
+            else {
+                continue;
+            };
+            bars.extend(self.get_quote_bars(&request).await?);
         }
         Ok(bars)
     }
@@ -243,9 +289,22 @@ pub trait IHistoryProvider: Send + Sync {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-        _contracts: &[OptionUniverseRow],
+        contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<Tick>> {
-        self.get_option_ticks(ticker, date).await
+        let mut ticks = Vec::new();
+        for contract in contracts {
+            let Some(request) = option_history_request(
+                ticker,
+                contract,
+                lean_core::Resolution::Tick,
+                date,
+                DataType::Tick,
+            ) else {
+                continue;
+            };
+            ticks.extend(self.get_ticks(&request).await?);
+        }
+        Ok(ticks)
     }
 
     /// Open a memory-bounded stream of option ticks constrained to an
@@ -293,33 +352,61 @@ pub trait IHistoryProvider: Send + Sync {
                         Err(err) => Err(err),
                     }
                 }
-                OptionDataType::TradeBar => match self
-                    .get_option_trade_bars(ticker, request.resolution, request.date)
-                    .await
-                {
-                    Ok(rows) => {
-                        batch.trade_bars.extend(rows);
-                        Ok(())
+                OptionDataType::TradeBar => {
+                    match self.get_option_universe(ticker, request.date).await {
+                        Ok(contracts) => match self
+                            .get_option_trade_bars_filtered(
+                                ticker,
+                                request.resolution,
+                                request.date,
+                                &contracts,
+                            )
+                            .await
+                        {
+                            Ok(rows) => {
+                                batch.trade_bars.extend(rows);
+                                Ok(())
+                            }
+                            Err(err) => Err(err),
+                        },
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
-                },
-                OptionDataType::QuoteBar => match self
-                    .get_option_quote_bars(ticker, request.resolution, request.date)
-                    .await
-                {
-                    Ok(rows) => {
-                        batch.quote_bars.extend(rows);
-                        Ok(())
+                }
+                OptionDataType::QuoteBar => {
+                    match self.get_option_universe(ticker, request.date).await {
+                        Ok(contracts) => match self
+                            .get_option_quote_bars_filtered(
+                                ticker,
+                                request.resolution,
+                                request.date,
+                                &contracts,
+                            )
+                            .await
+                        {
+                            Ok(rows) => {
+                                batch.quote_bars.extend(rows);
+                                Ok(())
+                            }
+                            Err(err) => Err(err),
+                        },
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
-                },
-                OptionDataType::Tick => match self.get_option_ticks(ticker, request.date).await {
-                    Ok(rows) => {
-                        batch.ticks.extend(rows);
-                        Ok(())
+                }
+                OptionDataType::Tick => {
+                    match self.get_option_universe(ticker, request.date).await {
+                        Ok(contracts) => match self
+                            .get_option_ticks_filtered(ticker, request.date, &contracts)
+                            .await
+                        {
+                            Ok(rows) => {
+                                batch.ticks.extend(rows);
+                                Ok(())
+                            }
+                            Err(err) => Err(err),
+                        },
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
-                },
+                }
             };
             if let Err(err) = result {
                 debug!(

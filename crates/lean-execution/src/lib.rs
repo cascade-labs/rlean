@@ -2,8 +2,8 @@ pub mod execution_model;
 pub mod models;
 
 pub use execution_model::{
-    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
-    OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, ExecutionTargetRef,
+    IExecutionModel, OrderRequest, SecurityData,
 };
 pub use models::adaptive_maker_taker::AdaptiveMakerTakerExecutionModel;
 pub use models::aggressive_post_only::AggressivePostOnlyExecutionModel;

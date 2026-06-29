@@ -1,4 +1,4 @@
-use lean_core::{DateTime, Price};
+use lean_core::{DateTime, NanosecondTimestamp, Price};
 use lean_statistics::PortfolioStatistics;
 use std::collections::BTreeMap;
 
@@ -29,8 +29,8 @@ impl ResultHandler {
         trading_days: i64,
         starting_cash: Price,
     ) {
-        let equity_vec: Vec<Price> = self.equity_curve.values().cloned().collect();
-        let bench_vec: Vec<Price> = self.benchmark_curve.values().cloned().collect();
+        let equity_vec = daily_close_values(&self.equity_curve);
+        let bench_vec = daily_close_values(&self.benchmark_curve);
 
         use rust_decimal_macros::dec;
         self.portfolio_stats = Some(PortfolioStatistics::compute(
@@ -39,7 +39,7 @@ impl ResultHandler {
             trades,
             trading_days,
             starting_cash,
-            dec!(0.04) / dec!(252), // 4% annual risk-free rate, daily
+            dec!(0.04),
         ));
     }
 
@@ -68,5 +68,75 @@ impl ResultHandler {
             println!("  Net Profit:        ${:.2}", stats.total_net_profit);
             println!("═══════════════════════════════════════════════");
         }
+    }
+}
+
+fn daily_close_values(curve: &BTreeMap<i64, Price>) -> Vec<Price> {
+    let mut last_by_date = BTreeMap::new();
+
+    for (&time, &value) in curve {
+        let date = NanosecondTimestamp(time).date_utc();
+        last_by_date.insert(date, value);
+    }
+
+    last_by_date.values().copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{daily_close_values, ResultHandler};
+    use chrono::{TimeZone, Utc};
+    use lean_core::{DateTime, NanosecondTimestamp};
+    use rust_decimal_macros::dec;
+    use std::collections::BTreeMap;
+
+    fn timestamp(year: i32, month: u32, day: u32, hour: u32) -> DateTime {
+        NanosecondTimestamp::from(
+            Utc.with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn daily_close_values_keep_last_sample_per_date() {
+        let mut curve = BTreeMap::new();
+        curve.insert(timestamp(2024, 1, 2, 14).0, dec!(100));
+        curve.insert(timestamp(2024, 1, 2, 21).0, dec!(101));
+        curve.insert(timestamp(2024, 1, 3, 14).0, dec!(102));
+        curve.insert(timestamp(2024, 1, 3, 21).0, dec!(103));
+
+        assert_eq!(daily_close_values(&curve), vec![dec!(101), dec!(103)]);
+    }
+
+    #[test]
+    fn finalize_computes_daily_statistics_from_daily_close_equity() {
+        let mut result_handler = ResultHandler::new();
+        result_handler.record_equity(timestamp(2024, 1, 2, 14), dec!(100000));
+        result_handler.record_equity(timestamp(2024, 1, 2, 21), dec!(101000));
+        result_handler.record_equity(timestamp(2024, 1, 3, 14), dec!(101500));
+        result_handler.record_equity(timestamp(2024, 1, 3, 21), dec!(102000));
+        result_handler.record_equity(timestamp(2024, 1, 4, 14), dec!(102500));
+        result_handler.record_equity(timestamp(2024, 1, 4, 21), dec!(103000));
+        result_handler.record_equity(timestamp(2024, 1, 5, 14), dec!(103500));
+        result_handler.record_equity(timestamp(2024, 1, 5, 21), dec!(104000));
+
+        result_handler.finalize(&[], 4, dec!(100000));
+
+        let stats = result_handler.portfolio_stats.unwrap();
+        let expected = lean_statistics::PortfolioStatistics::compute(
+            &[dec!(101000), dec!(102000), dec!(103000), dec!(104000)],
+            &[],
+            &[],
+            4,
+            dec!(100000),
+            dec!(0.04),
+        );
+
+        assert_eq!(stats.sharpe_ratio, expected.sharpe_ratio);
+        assert_eq!(
+            stats.annual_standard_deviation,
+            expected.annual_standard_deviation
+        );
     }
 }

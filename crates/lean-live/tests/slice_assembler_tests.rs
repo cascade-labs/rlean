@@ -27,7 +27,7 @@ fn bar_symbols(slice: &Slice) -> Vec<String> {
     let mut symbols: Vec<_> = slice
         .bars
         .values()
-        .map(|bar| bar.symbol.value.clone())
+        .map(|bar| bar.symbol.value.to_string())
         .collect();
     symbols.sort();
     symbols

@@ -1,25 +1,58 @@
+use crate::data_feed::DataFeedContext;
 use crate::slice_synchronizer::SliceSynchronizer;
 use crate::subscription_reader::SubscriptionStream;
-use lean_core::{DateTime, Result as LeanResult};
-use lean_data::{Slice, SubscriptionDataConfig};
-use lean_storage::{ParquetReader, PathResolver};
+use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, TickType};
+use lean_data::{Slice, SubscriptionDataConfig, SubscriptionDataKind};
+use lean_data_providers::ICustomDataSource;
+use lean_storage::iceberg_store::{MARKET_QUOTE_BARS, MARKET_TICKS, MARKET_TRADE_BARS};
+use lean_storage::IcebergStore;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
 
 /// Drives backtest data through LEAN-style subscription streams.
 pub struct DataManager {
-    reader: Arc<ParquetReader>,
-    resolver: PathResolver,
+    context: DataFeedContext,
+    active_subscriptions: HashMap<u64, SubscriptionDataConfig>,
     synchronizer: Option<SliceSynchronizer>,
+    end: Option<DateTime>,
 }
 
 impl DataManager {
     pub fn new(data_root: PathBuf) -> Self {
+        Self::from_store(block_connect_store(data_root))
+    }
+
+    pub fn with_custom_data_sources(
+        data_root: PathBuf,
+        custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
+    ) -> Self {
+        Self::with_custom_data_sources_from_store(
+            block_connect_store(data_root),
+            custom_data_sources,
+        )
+    }
+
+    pub fn from_store(store: Arc<IcebergStore>) -> Self {
+        Self::from_context(DataFeedContext::new(store))
+    }
+
+    pub fn with_custom_data_sources_from_store(
+        store: Arc<IcebergStore>,
+        custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
+    ) -> Self {
+        Self::from_context(
+            DataFeedContext::new(store).with_custom_data_sources(custom_data_sources),
+        )
+    }
+
+    pub fn from_context(context: DataFeedContext) -> Self {
         DataManager {
-            reader: Arc::new(ParquetReader::new()),
-            resolver: PathResolver::new(data_root),
+            context,
+            active_subscriptions: HashMap::new(),
             synchronizer: None,
+            end: None,
         }
     }
 
@@ -30,20 +63,21 @@ impl DataManager {
         start: DateTime,
         end: DateTime,
     ) -> LeanResult<()> {
-        let streams = configs
-            .iter()
-            .cloned()
-            .map(|config| {
-                SubscriptionStream::new(
-                    config,
-                    self.reader.clone(),
-                    self.resolver.clone(),
-                    start,
-                    end,
-                )
-            })
-            .collect();
+        self.warm_market_partition_indexes(configs).await?;
+        self.active_subscriptions.clear();
+        let mut streams = Vec::with_capacity(configs.len());
+        for config in configs.iter().cloned() {
+            self.active_subscriptions
+                .insert(config.unique_id(), config.clone());
+            streams.push(SubscriptionStream::new(
+                config,
+                self.context.clone(),
+                start,
+                end,
+            ));
+        }
         self.synchronizer = Some(SliceSynchronizer::new(streams, end));
+        self.end = Some(end);
         debug!(
             "Initialized subscription feed with {} stream(s)",
             self.synchronizer
@@ -54,6 +88,55 @@ impl DataManager {
         Ok(())
     }
 
+    async fn warm_market_partition_indexes(
+        &self,
+        configs: &[SubscriptionDataConfig],
+    ) -> LeanResult<()> {
+        let tables = market_partition_tables(configs);
+        if tables.is_empty() {
+            return Ok(());
+        }
+        self.context
+            .store
+            .warm_market_partition_indexes(tables)
+            .await
+            .map_err(|error| LeanError::DataError(error.to_string()))
+    }
+
+    pub fn add_subscription(&mut self, config: SubscriptionDataConfig, start: DateTime) {
+        let id = config.unique_id();
+        if self.active_subscriptions.contains_key(&id) {
+            return;
+        }
+        let end = self.end.unwrap_or(start);
+        let stream = SubscriptionStream::new(config.clone(), self.context.clone(), start, end);
+        self.active_subscriptions.insert(id, config);
+        match self.synchronizer.as_mut() {
+            Some(sync) => sync.add_stream(stream),
+            None => self.synchronizer = Some(SliceSynchronizer::new(vec![stream], end)),
+        }
+    }
+
+    pub async fn add_subscription_async(
+        &mut self,
+        config: SubscriptionDataConfig,
+        start: DateTime,
+    ) -> LeanResult<()> {
+        self.warm_market_partition_indexes(std::slice::from_ref(&config))
+            .await?;
+        self.add_subscription(config, start);
+        Ok(())
+    }
+
+    pub fn remove_subscription(&mut self, config: &SubscriptionDataConfig) {
+        let id = config.unique_id();
+        if self.active_subscriptions.remove(&id).is_some() {
+            if let Some(sync) = self.synchronizer.as_mut() {
+                sync.remove_stream(id);
+            }
+        }
+    }
+
     /// Advance to the next synchronized slice across all subscriptions.
     pub async fn next_slice(&mut self) -> LeanResult<Option<Slice>> {
         match self.synchronizer.as_mut() {
@@ -62,25 +145,68 @@ impl DataManager {
         }
     }
 
-    pub fn resolver(&self) -> &PathResolver {
-        &self.resolver
+    pub fn store(&self) -> &IcebergStore {
+        &self.context.store
     }
+}
 
-    pub fn reader(&self) -> &ParquetReader {
-        &self.reader
+fn market_partition_tables(configs: &[SubscriptionDataConfig]) -> Vec<&'static str> {
+    let mut tables = HashSet::new();
+    for config in configs {
+        if config.data_kind != SubscriptionDataKind::Market
+            || config.resolution == Resolution::Daily
+        {
+            continue;
+        }
+        let table = if config.resolution.is_tick() {
+            MARKET_TICKS
+        } else if config.tick_type == TickType::Quote {
+            MARKET_QUOTE_BARS
+        } else {
+            MARKET_TRADE_BARS
+        };
+        tables.insert(table);
     }
+    tables.into_iter().collect()
+}
+
+fn block_connect_store(data_root: PathBuf) -> Arc<IcebergStore> {
+    Arc::new(
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("data manager runtime")
+                .block_on(IcebergStore::connect_local(data_root))
+                .expect("failed to connect Iceberg data store")
+        })
+        .join()
+        .expect("data manager store worker panicked"),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::DataManager;
+    use async_trait::async_trait;
     use chrono::{NaiveDate, TimeZone, Utc};
     use lean_core::{
-        DataNormalizationMode, DateTime, Market, Resolution, Symbol, TickType, TimeSpan,
+        DataNormalizationMode, DateTime, Market, OptionRight, OptionStyle, Resolution, Symbol,
+        SymbolOptionsExt, TickType, TimeSpan,
     };
-    use lean_data::{SubscriptionDataConfig, Tick, TradeBar, TradeBarData};
-    use lean_storage::{FactorFileEntry, ParquetWriter, PathResolver, WriterConfig};
+    use lean_data::{
+        CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSource,
+        CustomDataTransport, CustomSubscriptionMetadata, OptionChainFilterMetadata,
+        OptionChainSubscriptionMetadata, SubscriptionDataConfig, SubscriptionDataKind, Tick,
+        TradeBar, TradeBarData,
+    };
+    use lean_data_providers::{
+        CustomDataContext, HistoryRequest, ICustomDataSource, IHistoryProvider,
+        StackedHistoryProvider,
+    };
+    use lean_storage::{FactorFileEntry, OptionEodBar};
     use rust_decimal_macros::dec;
+    use std::sync::{Arc, Mutex};
 
     fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
         DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()))
@@ -89,26 +215,17 @@ mod tests {
     #[tokio::test]
     async fn feed_skips_missing_daily_partitions_without_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = PathResolver::new(tmp.path());
-        let writer = ParquetWriter::new(WriterConfig::default());
-        let symbol = Symbol::create_equity("XLC", &Market::usa());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day1 = NaiveDate::from_ymd_opt(2018, 6, 18).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2018, 6, 19).unwrap();
         let day3 = NaiveDate::from_ymd_opt(2018, 6, 20).unwrap();
 
-        let empty_path =
-            resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, day1);
-        writer.write_trade_bars(&[], &empty_path).unwrap();
-
-        let day2_path =
-            resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, day2);
         let bar = TradeBar::new(
             symbol.clone(),
             dt(day2, 16, 0),
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(50), dec!(50), dec!(50), dec!(50), dec!(1000)),
         );
-        writer.write_trade_bars(&[bar], &day2_path).unwrap();
 
         let config = SubscriptionDataConfig::new_equity(
             symbol.clone(),
@@ -116,6 +233,17 @@ mod tests {
             DataNormalizationMode::Adjusted,
         );
         let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[bar],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
         manager
             .initialize_feed(&[config], dt(day1, 0, 0), dt(day3, 23, 59))
             .await
@@ -132,26 +260,39 @@ mod tests {
     #[tokio::test]
     async fn feed_emits_cross_midnight_daily_bar_on_session_frontier() {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = PathResolver::new(tmp.path());
-        let writer = ParquetWriter::new(WriterConfig::default());
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let day1 = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let day2 = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
-        let day0 = NaiveDate::from_ymd_opt(2024, 1, 14).unwrap();
+        let day1 = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let day0 = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
 
-        let path =
-            resolver.market_data_partition(&symbol, Resolution::Daily, TickType::Trade, day2);
         let bar = TradeBar::new(
             symbol.clone(),
             dt(day1, 20, 0),
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
         );
-        writer.write_trade_bars(&[bar], &path).unwrap();
-
-        let factor_path = resolver.factor_file("usa", "SPY");
-        writer
-            .write_factor_file(
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Adjusted,
+        );
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[bar],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+        manager
+            .store()
+            .append_factor_file(
+                "usa",
+                "SPY",
                 &[
                     FactorFileEntry {
                         date: day0,
@@ -172,16 +313,9 @@ mod tests {
                         reference_price: 0.0,
                     },
                 ],
-                &factor_path,
             )
+            .await
             .unwrap();
-
-        let config = SubscriptionDataConfig::new_equity(
-            symbol.clone(),
-            Resolution::Daily,
-            DataNormalizationMode::Adjusted,
-        );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
         manager
             .initialize_feed(&[config], dt(day2, 0, 0), dt(day2, 23, 59))
             .await
@@ -195,28 +329,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feed_emits_prefetched_daily_option_chain_with_greeks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2024, 2, 16).unwrap();
+
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[TradeBar::new(
+                    underlying.clone(),
+                    dt(day, 16, 0),
+                    TimeSpan::ONE_DAY,
+                    TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
+                )],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+        manager
+            .store()
+            .append_option_eod_bars(&[
+                OptionEodBar {
+                    date: day,
+                    symbol_value: "SPY240216C00100000".to_string(),
+                    underlying: "SPY".to_string(),
+                    expiration: expiry,
+                    strike: dec!(100),
+                    right: "C".to_string(),
+                    open: dec!(5),
+                    high: dec!(6),
+                    low: dec!(4),
+                    close: dec!(5),
+                    volume: 10,
+                    bid: dec!(4.9),
+                    ask: dec!(5.1),
+                    bid_size: 1,
+                    ask_size: 1,
+                },
+                OptionEodBar {
+                    date: day,
+                    symbol_value: "SPY240216P00100000".to_string(),
+                    underlying: "SPY".to_string(),
+                    expiration: expiry,
+                    strike: dec!(100),
+                    right: "P".to_string(),
+                    open: dec!(5),
+                    high: dec!(6),
+                    low: dec!(4),
+                    close: dec!(5),
+                    volume: 10,
+                    bid: dec!(4.9),
+                    ask: dec!(5.1),
+                    bid_size: 1,
+                    ask_size: 1,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let option_config = SubscriptionDataConfig::new_option_chain(
+            canonical.clone(),
+            Resolution::Daily,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: canonical.permtick.to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -1,
+                    max_strike_rank: 1,
+                    min_expiry_days: 0,
+                    max_expiry_days: 60,
+                },
+            },
+        );
+        manager
+            .initialize_feed(&[option_config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("option chain slice");
+        let chain = slice
+            .option_chains
+            .get(canonical.permtick.as_ref())
+            .expect("chain for canonical");
+        assert_eq!(chain.contracts.len(), 2);
+        assert!(chain
+            .contracts
+            .values()
+            .any(|contract| contract.right == OptionRight::Call
+                && contract.style == OptionStyle::American
+                && contract.data.underlying_last_price == dec!(100)
+                && contract.data.implied_volatility > dec!(0)));
+    }
+
+    #[tokio::test]
     async fn feed_emits_all_hourly_bars_in_partition() {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = PathResolver::new(tmp.path());
-        let writer = ParquetWriter::new(WriterConfig::default());
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let day = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let path = resolver.market_data_partition(&symbol, Resolution::Hour, TickType::Trade, day);
+        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let bars = vec![
             TradeBar::new(
                 symbol.clone(),
-                dt(day, 10, 0),
+                dt(day, 15, 0),
                 TimeSpan::ONE_HOUR,
                 TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
             ),
             TradeBar::new(
                 symbol.clone(),
-                dt(day, 11, 0),
+                dt(day, 16, 0),
                 TimeSpan::ONE_HOUR,
                 TradeBarData::new(dec!(2), dec!(2), dec!(2), dec!(2), dec!(100)),
             ),
         ];
-        writer.write_trade_bars(&bars, &path).unwrap();
 
         let config = SubscriptionDataConfig::new_equity(
             symbol.clone(),
@@ -225,7 +455,22 @@ mod tests {
         );
         let mut manager = DataManager::new(tmp.path().to_path_buf());
         manager
-            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .store()
+            .append_trade_bars(
+                &bars,
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Hour,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+        manager
+            .initialize_feed(
+                &[config],
+                dt(day, 0, 0),
+                dt(day + chrono::Duration::days(1), 23, 59),
+            )
             .await
             .unwrap();
 
@@ -241,16 +486,12 @@ mod tests {
     #[tokio::test]
     async fn feed_emits_tick_partition_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = PathResolver::new(tmp.path());
-        let writer = ParquetWriter::new(WriterConfig::default());
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let path = resolver.market_data_partition(&symbol, Resolution::Tick, TickType::Trade, day);
         let ticks = vec![
             Tick::trade(symbol.clone(), dt(day, 9, 31), dec!(1), dec!(100)),
             Tick::trade(symbol.clone(), dt(day, 9, 32), dec!(2), dec!(100)),
         ];
-        writer.write_ticks(&ticks, &path).unwrap();
 
         let config = SubscriptionDataConfig {
             symbol: symbol.clone(),
@@ -263,8 +504,22 @@ mod tests {
             is_filtered_subscription: false,
             data_time_zone: "America/New_York".into(),
             exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         };
         let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_ticks(
+                &ticks,
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Tick,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
         manager
             .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
             .await
@@ -277,5 +532,440 @@ mod tests {
             }
         }
         assert_eq!(values, vec![dec!(1), dec!(2)]);
+    }
+
+    #[tokio::test]
+    async fn feed_emits_custom_data_from_subscription_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_custom_points(
+                "fixture",
+                "ALT",
+                &[CustomDataPoint {
+                    time: day,
+                    end_time: Some(dt(day, 16, 0)),
+                    value: dec!(42),
+                    fields: std::collections::HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let custom_config = CustomDataConfig {
+            ticker: "ALT".to_string(),
+            source_type: "fixture".to_string(),
+            resolution: Resolution::Daily,
+            properties: std::collections::HashMap::new(),
+            query: CustomDataQuery::default(),
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "fixture".to_string(),
+            ticker: "ALT".to_string(),
+            config: custom_config,
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let config =
+            SubscriptionDataConfig::new_custom(symbol.clone(), Resolution::Daily, metadata);
+        manager
+            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("custom slice");
+        let points = slice.get_custom_data(&symbol).expect("custom data");
+        assert_eq!(points[0].value, dec!(42));
+        assert_eq!(slice.custom_data["ALT"][0].value, dec!(42));
+    }
+
+    struct FixtureCustomSource {
+        path: std::path::PathBuf,
+    }
+
+    impl ICustomDataSource for FixtureCustomSource {
+        fn initialize(&mut self, _context: &CustomDataContext) {}
+
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn get_source(
+            &self,
+            _ticker: &str,
+            _date: NaiveDate,
+            _config: &CustomDataConfig,
+        ) -> Option<CustomDataSource> {
+            Some(CustomDataSource {
+                uri: self.path.to_string_lossy().into_owned(),
+                transport: CustomDataTransport::LocalFile,
+                format: CustomDataFormat::Csv,
+            })
+        }
+
+        fn reader(
+            &self,
+            _line: &str,
+            date: NaiveDate,
+            _config: &CustomDataConfig,
+        ) -> Option<CustomDataPoint> {
+            Some(CustomDataPoint {
+                time: date,
+                end_time: Some(dt(date, 16, 0)),
+                value: dec!(7),
+                fields: std::collections::HashMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_fetches_custom_data_on_cache_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let custom_config = CustomDataConfig {
+            ticker: "ALT".to_string(),
+            source_type: "fixture".to_string(),
+            resolution: Resolution::Daily,
+            properties: std::collections::HashMap::new(),
+            query: CustomDataQuery::default(),
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "fixture".to_string(),
+            ticker: "ALT".to_string(),
+            config: custom_config,
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let config =
+            SubscriptionDataConfig::new_custom(symbol.clone(), Resolution::Daily, metadata);
+        let fixture_path = tmp.path().join("fixture.csv");
+        std::fs::write(&fixture_path, "row\n").unwrap();
+        let mut manager = DataManager::with_custom_data_sources(
+            tmp.path().to_path_buf(),
+            vec![Arc::new(FixtureCustomSource { path: fixture_path })],
+        );
+
+        manager
+            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("custom slice");
+        let points = slice.get_custom_data(&symbol).expect("custom data");
+        assert_eq!(points[0].value, dec!(7));
+    }
+
+    struct SourceDatedDailyHistoryProvider;
+
+    #[async_trait]
+    impl IHistoryProvider for SourceDatedDailyHistoryProvider {
+        async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            let day = request.start.date_utc();
+            Ok(vec![TradeBar::new(
+                request.symbol.clone(),
+                dt(day - chrono::Duration::days(1), 20, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(11), dec!(11), dec!(11), dec!(11), dec!(100)),
+            )])
+        }
+    }
+
+    struct RecordingHistoryProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        bars: Vec<TradeBar>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for RecordingHistoryProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            self.calls.lock().unwrap().push(self.name);
+            Ok(self.bars.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_fetches_market_data_on_cache_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let context = crate::data_feed::DataFeedContext::new(Arc::new(
+            lean_storage::IcebergStore::connect_local(tmp.path())
+                .await
+                .unwrap(),
+        ))
+        .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
+        let mut manager = DataManager::from_context(context);
+
+        manager
+            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("market slice");
+        let bar = slice.get_bar(&symbol).expect("fetched bar");
+        assert_eq!(bar.close, dec!(11));
+    }
+
+    #[tokio::test]
+    async fn feed_uses_local_cache_before_stacked_history_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let local_bar = TradeBar::new(
+            symbol.clone(),
+            dt(day - chrono::Duration::days(1), 20, 0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(101), dec!(101), dec!(101), dec!(101), dec!(100)),
+        );
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let store = lean_storage::IcebergStore::connect_local(tmp.path())
+            .await
+            .unwrap();
+        store
+            .append_trade_bars(
+                &[local_bar],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(StackedHistoryProvider::new(vec![
+            Arc::new(RecordingHistoryProvider {
+                name: "first",
+                calls: calls.clone(),
+                bars: Vec::new(),
+            }),
+            Arc::new(RecordingHistoryProvider {
+                name: "second",
+                calls: calls.clone(),
+                bars: Vec::new(),
+            }),
+        ]));
+        let context = crate::data_feed::DataFeedContext::new(Arc::new(store))
+            .with_history_provider(Some(provider));
+        let mut manager = DataManager::from_context(context);
+
+        manager
+            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("market slice");
+        let bar = slice.get_bar(&symbol).expect("local bar");
+        assert_eq!(bar.close, dec!(101));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn feed_falls_through_stacked_history_providers_on_cache_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let remote_bar = TradeBar::new(
+            symbol.clone(),
+            dt(day - chrono::Duration::days(1), 20, 0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(202), dec!(202), dec!(202), dec!(202), dec!(100)),
+        );
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(StackedHistoryProvider::new(vec![
+            Arc::new(RecordingHistoryProvider {
+                name: "first",
+                calls: calls.clone(),
+                bars: Vec::new(),
+            }),
+            Arc::new(RecordingHistoryProvider {
+                name: "second",
+                calls: calls.clone(),
+                bars: vec![remote_bar],
+            }),
+        ]));
+        let context = crate::data_feed::DataFeedContext::new(Arc::new(
+            lean_storage::IcebergStore::connect_local(tmp.path())
+                .await
+                .unwrap(),
+        ))
+        .with_history_provider(Some(provider));
+        let mut manager = DataManager::from_context(context);
+
+        manager
+            .initialize_feed(&[config], dt(day, 0, 0), dt(day, 23, 59))
+            .await
+            .unwrap();
+
+        let slice = manager.next_slice().await.unwrap().expect("market slice");
+        let bar = slice.get_bar(&symbol).expect("fetched bar");
+        assert_eq!(bar.close, dec!(202));
+        assert_eq!(calls.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn feed_fetches_source_dated_daily_market_data_across_multiple_cache_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let start_day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let end_day = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let context = crate::data_feed::DataFeedContext::new(Arc::new(
+            lean_storage::IcebergStore::connect_local(tmp.path())
+                .await
+                .unwrap(),
+        ))
+        .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
+        let mut manager = DataManager::from_context(context);
+
+        manager
+            .initialize_feed(&[config], dt(start_day, 0, 0), dt(end_day, 23, 59))
+            .await
+            .unwrap();
+
+        let mut closes = Vec::new();
+        while let Some(slice) = manager.next_slice().await.unwrap() {
+            if let Some(bar) = slice.get_bar(&symbol) {
+                closes.push(bar.close);
+            }
+        }
+
+        assert_eq!(closes, vec![dec!(11), dec!(11), dec!(11), dec!(11)]);
+    }
+
+    #[tokio::test]
+    async fn add_subscription_emits_only_from_add_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+        let qqq = Symbol::create_equity("QQQ", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let spy_bar = TradeBar::new(
+            spy.clone(),
+            dt(day + chrono::Duration::days(1), 16, 0),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
+        );
+        let qqq_before_add = TradeBar::new(
+            qqq.clone(),
+            dt(day + chrono::Duration::days(1), 16, 0),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(2), dec!(2), dec!(2), dec!(2), dec!(100)),
+        );
+        let qqq_after_add = TradeBar::new(
+            qqq.clone(),
+            dt(day + chrono::Duration::days(2), 16, 0),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(3), dec!(3), dec!(3), dec!(3), dec!(100)),
+        );
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[spy_bar, qqq_before_add, qqq_after_add],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Minute,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+        let spy_config = SubscriptionDataConfig::new_equity(
+            spy.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let qqq_config = SubscriptionDataConfig::new_equity(
+            qqq.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        manager
+            .initialize_feed(
+                &[spy_config],
+                dt(day + chrono::Duration::days(1), 0, 0),
+                dt(day + chrono::Duration::days(2), 23, 59),
+            )
+            .await
+            .unwrap();
+
+        let first = manager.next_slice().await.unwrap().expect("spy slice");
+        assert_eq!(first.get_bar(&spy).expect("spy after start").close, dec!(1));
+        assert!(first.get_bar(&qqq).is_none());
+
+        manager.add_subscription(qqq_config, dt(day + chrono::Duration::days(2), 0, 0));
+        let second = manager.next_slice().await.unwrap().expect("qqq slice");
+        assert_eq!(second.get_bar(&qqq).expect("qqq after add").close, dec!(3));
+    }
+
+    #[tokio::test]
+    async fn remove_subscription_stops_future_emissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let bars = vec![
+            TradeBar::new(
+                spy.clone(),
+                dt(day, 0, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
+            ),
+            TradeBar::new(
+                spy.clone(),
+                dt(day + chrono::Duration::days(1), 0, 0),
+                TimeSpan::ONE_DAY,
+                TradeBarData::new(dec!(2), dec!(2), dec!(2), dec!(2), dec!(100)),
+            ),
+        ];
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &bars,
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            spy.clone(),
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        manager
+            .initialize_feed(
+                std::slice::from_ref(&config),
+                dt(day + chrono::Duration::days(1), 0, 0),
+                dt(day + chrono::Duration::days(2), 23, 59),
+            )
+            .await
+            .unwrap();
+
+        let first = manager.next_slice().await.unwrap().expect("first slice");
+        assert_eq!(first.get_bar(&spy).expect("first bar").close, dec!(2));
+        manager.remove_subscription(&config);
+        assert!(manager.next_slice().await.unwrap().is_none());
     }
 }

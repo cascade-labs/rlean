@@ -1,1 +1,0 @@
-"""Lean Research kernel package."""

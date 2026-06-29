@@ -171,7 +171,10 @@ impl AccumulativeInsightPortfolioConstructionModel {
             }
 
             let pct = pct_per_symbol.unwrap_or(Decimal::ZERO);
-            let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
+            let price = prices
+                .get(sym.value.as_ref())
+                .copied()
+                .unwrap_or(Decimal::ZERO);
             targets.push(PortfolioTarget::percent(
                 sym.clone(),
                 pct,

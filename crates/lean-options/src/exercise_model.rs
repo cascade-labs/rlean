@@ -88,7 +88,7 @@ impl IOptionExerciseModel for DefaultExerciseModel {
                 events.push(OrderEvent {
                     id: 0,
                     order_id: order.order.id,
-                    symbol: *underlying_sym.clone(),
+                    symbol: underlying_sym.as_ref().clone(),
                     utc_time,
                     status: OrderStatus::Filled,
                     direction: underlying_direction,

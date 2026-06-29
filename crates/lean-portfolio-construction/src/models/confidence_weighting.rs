@@ -77,7 +77,7 @@ impl IPortfolioConstructionModel for ConfidenceWeightingPortfolioConstructionMod
                     direction_sign * confidence * weight_factor
                 };
 
-                let ticker = insight.symbol.value.clone();
+                let ticker = insight.symbol.value.to_string();
                 let price = prices.get(&ticker).copied().unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
             })

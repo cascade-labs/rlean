@@ -164,6 +164,19 @@ pub fn covariance_matrix(returns: &[Vec<f64>]) -> Vec<Vec<f64>> {
     cov
 }
 
+/// Column means of a returns matrix (rows = time, cols = asset).
+/// Returns one mean per asset; empty if there are no rows.
+pub fn column_means(returns: &[Vec<f64>]) -> Vec<f64> {
+    let t = returns.len();
+    if t == 0 {
+        return vec![];
+    }
+    let n = returns[0].len();
+    (0..n)
+        .map(|j| returns.iter().map(|row| row[j]).sum::<f64>() / t as f64)
+        .collect()
+}
+
 /// Dot product of two vectors.
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
@@ -182,6 +195,48 @@ pub fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// Scale a vector by scalar.
 pub fn vec_scale(a: &[f64], s: f64) -> Vec<f64> {
     a.iter().map(|x| x * s).collect()
+}
+
+/// Closed-form mean-variance / maximum-Sharpe weights for a given covariance.
+///
+/// Computes the tangency portfolio `w ∝ Σ⁻¹ (μ − rf·1)`, then normalises so the
+/// absolute weights sum to 1 (fully invested). If `Σ` is singular, falls back to
+/// the diagonal approximation `w_i ∝ (μ_i − rf) / σ_i²`. If every weight is
+/// (near) zero, returns equal weights.
+///
+/// This is the analytical solution LEAN's `MaximumSharpeRatioPortfolioOptimizer`
+/// and `MinimumVariancePortfolioOptimizer` approximate with a QP solver; using
+/// the real (annualised) covariance instead of a constant volatility assumption.
+pub fn mean_variance_weights(mu: &[f64], sigma: &[Vec<f64>], rf: f64) -> Vec<f64> {
+    let n = mu.len();
+    if n == 0 {
+        return vec![];
+    }
+    let excess: Vec<f64> = mu.iter().map(|m| m - rf).collect();
+
+    let weights = if let Some(sigma_inv) = mat_inv(sigma) {
+        mat_vec_mul(&sigma_inv, &excess)
+    } else {
+        sigma
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let var = row[i];
+                if var.abs() < 1e-12 {
+                    0.0
+                } else {
+                    excess[i] / var
+                }
+            })
+            .collect()
+    };
+
+    let abs_sum: f64 = weights.iter().map(|w| w.abs()).sum();
+    if abs_sum < 1e-12 {
+        vec![1.0 / n as f64; n]
+    } else {
+        weights.iter().map(|w| w / abs_sum).collect()
+    }
 }
 
 /// Build a diagonal matrix from a vector.

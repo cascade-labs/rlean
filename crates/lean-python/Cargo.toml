@@ -2,6 +2,7 @@
 name = "lean-python"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [lib]
 name = "lean_python"
@@ -11,6 +12,7 @@ crate-type = ["lib"]
 lean-core       = { path = "../lean-core" }
 lean-data       = { path = "../lean-data" }
 lean-engine     = { path = "../lean-engine" }
+lean-sdk        = { path = "../lean-sdk" }
 lean-algorithm  = { path = "../lean-algorithm" }
 lean-brokerages = { path = "../lean-brokerages" }
 lean-indicators = { path = "../lean-indicators" }
@@ -41,3 +43,7 @@ crossbeam-channel = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+
+[build-dependencies]
+lean-sdk-pyo3-gen = { path = "../lean-sdk-pyo3-gen" }
+anyhow = { workspace = true }

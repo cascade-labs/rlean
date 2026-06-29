@@ -54,7 +54,7 @@ impl IExecutionModel for SpreadExecutionModel {
     ) -> Vec<OrderRequest> {
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -122,7 +122,7 @@ impl IExecutionModel for SpreadExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
+            self.targets.remove(sym.value.as_ref());
         }
     }
 

@@ -16,6 +16,6 @@ pub use models::null_pcm::NullPortfolioConstructionModel;
 pub use models::risk_parity::{risk_contributions, RiskParityPortfolioConstructionModel};
 pub use models::sector_weighting::SectorWeightingPortfolioConstructionModel;
 pub use portfolio_construction_model::{
-    IPortfolioConstructionModel, InsightDirection, InsightForPcm,
+    IPortfolioConstructionModel, InsightDirection, InsightForPcm, InsightForPcmRef,
 };
 pub use portfolio_target::PortfolioTarget;

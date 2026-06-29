@@ -8,9 +8,10 @@
 ///   - He, G. and Litterman, R. (1999). The intuition behind Black-Litterman model portfolios.
 ///   - http://www.blacklitterman.org/cookbook.html
 ///   - C# LEAN BlackLittermanOptimizationPortfolioConstructionModel.cs
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
-use lean_core::{Symbol, TimeSpan};
+use lean_core::{DateTime, Symbol, TimeSpan};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::portfolio_construction_model::{
@@ -22,58 +23,7 @@ use super::matrix::{
     covariance_matrix, diag, dot, mat_add, mat_inv, mat_mul, mat_scale, mat_sub, mat_vec_mul,
     transpose, vec_add, vec_scale, vec_sub,
 };
-
-// ─── Rolling returns window ───────────────────────────────────────────────────
-
-/// Maintains a rolling window of daily returns for a single asset.
-struct AssetReturns {
-    prices: VecDeque<f64>,
-    lookback: usize,
-    period: usize,
-}
-
-impl AssetReturns {
-    fn new(lookback: usize, period: usize) -> Self {
-        // We need `lookback + period` prices to compute `period` lookback-step returns.
-        Self {
-            prices: VecDeque::with_capacity(lookback + period + 1),
-            lookback,
-            period,
-        }
-    }
-
-    fn push_price(&mut self, price: f64) {
-        self.prices.push_back(price);
-        let max_len = self.lookback + self.period + 1;
-        while self.prices.len() > max_len {
-            self.prices.pop_front();
-        }
-    }
-
-    /// Returns `period` rate-of-change values spaced `lookback` bars apart,
-    /// or None if not enough data.
-    fn returns(&self) -> Option<Vec<f64>> {
-        if self.prices.len() < self.lookback + 1 {
-            return None;
-        }
-        let prices: Vec<f64> = self.prices.iter().copied().collect();
-        let n = prices.len();
-        // Compute returns: r[i] = (price[i + lookback] / price[i]) - 1
-        // for i from 0 up to n - lookback - 1, then take the last `period` of them.
-        let mut rets: Vec<f64> = Vec::new();
-        for i in 0..=(n.saturating_sub(self.lookback + 1)) {
-            let r = prices[i + self.lookback] / prices[i] - 1.0;
-            rets.push(r);
-        }
-        if rets.len() < self.period {
-            None
-        } else {
-            // Take the last `period` returns
-            let start = rets.len().saturating_sub(self.period);
-            Some(rets[start..].to_vec())
-        }
-    }
-}
+use super::returns_symbol_data::{form_returns_matrix, ReturnsSymbolData};
 
 // ─── Black-Litterman PCM ──────────────────────────────────────────────────────
 
@@ -106,8 +56,8 @@ pub struct BlackLittermanOptimizationPortfolioConstructionModel {
     tau: f64,
     portfolio_bias: PortfolioBias,
     target_gross: f64,
-    /// Per-symbol rolling price history.
-    asset_data: HashMap<String, AssetReturns>,
+    /// Per-symbol rolling returns history (ROC indicator + rolling window).
+    asset_data: HashMap<String, ReturnsSymbolData>,
 }
 
 impl BlackLittermanOptimizationPortfolioConstructionModel {
@@ -162,44 +112,17 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
 
     /// Update rolling prices from the current price map.
     fn update_prices(&mut self, prices: &HashMap<String, Decimal>) {
+        let now = DateTime::now();
         for (ticker, price_dec) in prices {
-            let price: f64 = price_dec.to_string().parse().unwrap_or(0.0);
+            let price = price_dec.to_f64().unwrap_or(0.0);
             if price <= 0.0 {
                 continue;
             }
             self.asset_data
                 .entry(ticker.clone())
-                .or_insert_with(|| AssetReturns::new(self.lookback, self.period))
-                .push_price(price);
+                .or_insert_with(|| ReturnsSymbolData::new(self.lookback, self.period))
+                .update(now, price);
         }
-    }
-
-    /// Build the returns matrix (rows = time, cols = assets) for the ordered
-    /// list of tickers.  Returns None if any asset lacks enough data.
-    fn build_returns_matrix(&self, tickers: &[String]) -> Option<Vec<Vec<f64>>> {
-        let per_asset: Vec<Vec<f64>> = tickers
-            .iter()
-            .map(|t| {
-                self.asset_data
-                    .get(t)
-                    .and_then(|d| d.returns())
-                    .unwrap_or_default()
-            })
-            .collect();
-
-        // All assets must have the same positive number of returns.
-        let n_rows = per_asset.iter().map(|v| v.len()).min().unwrap_or(0);
-        if n_rows == 0 {
-            return None;
-        }
-
-        // Build row-major matrix: rows = time, cols = asset
-        let n_cols = tickers.len();
-        let matrix: Vec<Vec<f64>> = (0..n_rows)
-            .map(|t| (0..n_cols).map(|c| per_asset[c][t]).collect())
-            .collect();
-
-        Some(matrix)
     }
 
     /// Compute equilibrium returns π = δ × Σ × w
@@ -412,7 +335,7 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
             // Build P row: each asset's weighted contribution
             let mut p_row = vec![0.0; n];
             for insight in group.iter() {
-                if let Some(&idx) = ticker_index.get(insight.symbol.value.as_str()) {
+                if let Some(&idx) = ticker_index.get(insight.symbol.value.as_ref()) {
                     let mag: f64 = insight
                         .magnitude
                         .map(|m| m.abs().to_string().parse().unwrap_or(0.0))
@@ -464,14 +387,14 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         let mut seen = std::collections::HashSet::new();
         let tickers: Vec<String> = insights
             .iter()
-            .filter(|i| seen.insert(i.symbol.value.clone()))
-            .map(|i| i.symbol.value.clone())
+            .filter(|i| seen.insert(i.symbol.value.to_string()))
+            .map(|i| i.symbol.value.to_string())
             .collect();
 
         let n = tickers.len();
 
         // Build returns matrix; return empty if not enough history
-        let returns = match self.build_returns_matrix(&tickers) {
+        let returns = match form_returns_matrix(&self.asset_data, &tickers) {
             Some(r) if r.len() >= 2 => r,
             _ => return vec![],
         };
@@ -499,11 +422,13 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         insights
             .iter()
             .filter_map(|insight| {
-                let idx = tickers.iter().position(|t| *t == insight.symbol.value)?;
+                let idx = tickers
+                    .iter()
+                    .position(|t| t.as_str() == insight.symbol.value.as_ref())?;
                 let w = weights[idx];
                 let pct = Decimal::try_from(w).ok()?;
                 let price = prices
-                    .get(&insight.symbol.value)
+                    .get(insight.symbol.value.as_ref())
                     .copied()
                     .unwrap_or(Decimal::ZERO);
                 Some(PortfolioTarget::percent(
@@ -518,7 +443,7 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.asset_data.remove(&sym.value);
+            self.asset_data.remove(sym.value.as_ref());
         }
     }
 

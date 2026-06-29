@@ -71,7 +71,7 @@ fn make_target(ticker: &str, qty: f64) -> ExecutionTarget {
 
 fn securities_map(data: Vec<SecurityData>) -> HashMap<String, SecurityData> {
     data.into_iter()
-        .map(|s| (s.symbol.value.clone(), s))
+        .map(|s| (s.symbol.value.to_string(), s))
         .collect()
 }
 

@@ -1,5 +1,4 @@
 use crate::risk_management::{PortfolioTarget, RiskContext, RiskManagementModel};
-use lean_core::Symbol;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -82,13 +81,4 @@ impl RiskManagementModel for MaximumDrawdownPercentPortfolio {
             Vec::new()
         }
     }
-}
-
-/// Convenience: build liquidation targets for a list of symbols.
-#[allow(dead_code)]
-fn liquidate_symbols(symbols: &[Symbol]) -> Vec<PortfolioTarget> {
-    symbols
-        .iter()
-        .map(|s| PortfolioTarget::new(s.clone(), Decimal::ZERO))
-        .collect()
 }

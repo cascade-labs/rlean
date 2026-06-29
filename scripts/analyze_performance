@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# analyze_performance — one-shot CPU profile of an rlean backtest.
+#
+#   1. builds the dev rlean binary (dev profile carries full debug symbols)
+#   2. runs the given backtest under `samply record`
+#   3. aggregates the samples into a hot-function / bottleneck report
+#
+# Usage:
+#   scripts/analyze_performance <STRATEGY_DIR> [extra rlean backtest args...]
+#
+# Examples:
+#   scripts/analyze_performance ~/trading/etf_commodity_blend \
+#       --data /Volumes/data_cache/lean/data \
+#       --data-provider-historical thetadata,massive
+#
+# Environment overrides:
+#   RLEAN_PROFILE_OUT   profile output path   (default: target/profile/<name>.json.gz)
+#   SAMPLE_RATE         samply sampling Hz    (default: 1000)
+#   ANALYZE_TOP         rows per report table (default: 30)
+#   SKIP_BUILD=1        reuse the existing target/debug/rlean binary
+#
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  sed -n '2,20p' "$0" | sed 's/^#//'
+  exit 1
+fi
+
+# Resolve repo root from this script's location so it works from any CWD.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+STRATEGY_DIR="$1"
+shift
+BACKTEST_ARGS=("$@")
+
+BIN="target/debug/rlean"
+SAMPLE_RATE="${SAMPLE_RATE:-1000}"
+ANALYZE_TOP="${ANALYZE_TOP:-30}"
+PROFILE_NAME="$(basename "$STRATEGY_DIR")"
+OUT="${RLEAN_PROFILE_OUT:-target/profile/${PROFILE_NAME}.json.gz}"
+mkdir -p "$(dirname "$OUT")"
+
+log() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
+
+# --- preflight: samply must be installed -------------------------------------
+if ! command -v samply >/dev/null 2>&1; then
+  log "samply not found — installing via cargo"
+  cargo install samply
+fi
+
+# --- 1. build (dev profile = full debug symbols for symbolication) -----------
+if [[ "${SKIP_BUILD:-0}" == "1" && -x "$BIN" ]]; then
+  log "SKIP_BUILD=1 — reusing existing $BIN"
+else
+  log "Building dev rlean (debug symbols enabled)"
+  cargo build -p rlean
+fi
+
+# --- 2. record the backtest under samply -------------------------------------
+log "Recording profile -> $OUT"
+log "rlean backtest $STRATEGY_DIR ${BACKTEST_ARGS[*]:-}"
+samply record \
+  --save-only --no-open \
+  --rate "$SAMPLE_RATE" \
+  -o "$OUT" \
+  -- "$BIN" backtest "$STRATEGY_DIR" "${BACKTEST_ARGS[@]}"
+
+# --- 3. analyze --------------------------------------------------------------
+log "Analyzing profile"
+python3 "$SCRIPT_DIR/analyze_profile.py" "$OUT" \
+  --binary "$BIN" \
+  --workdir "$REPO_ROOT" \
+  --top "$ANALYZE_TOP"
+
+echo
+log "Done. Open interactively with:  samply load $OUT"

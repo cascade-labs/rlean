@@ -175,10 +175,10 @@ impl SymbolOptionsExt for Symbol {
         );
         let osi = format_option_ticker(&underlying.permtick, strike, expiry, right);
         Symbol {
-            value: osi.clone(),
-            permtick: osi,
-            id,
-            underlying: Some(Box::new(underlying)),
+            value: osi.clone().into(),
+            permtick: osi.into(),
+            id: id.into(),
+            underlying: Some(underlying.into()),
         }
     }
 
@@ -202,10 +202,10 @@ impl SymbolOptionsExt for Symbol {
         );
         let osi = format_option_ticker(&underlying.permtick, strike, expiry, right);
         Symbol {
-            value: osi.clone(),
-            permtick: osi,
-            id,
-            underlying: Some(Box::new(underlying)),
+            value: osi.clone().into(),
+            permtick: osi.into(),
+            id: id.into(),
+            underlying: Some(underlying.into()),
         }
     }
 
@@ -229,10 +229,10 @@ impl SymbolOptionsExt for Symbol {
         // We create the Symbol directly so we can leave underlying = None to signal
         // "canonical" (is_canonical_option checks option_id absence via SecurityIdentifier).
         Symbol {
-            value: canonical_ticker.clone(),
-            permtick: canonical_ticker,
-            id,
-            underlying: Some(Box::new(underlying.clone())),
+            value: canonical_ticker.clone().into(),
+            permtick: canonical_ticker.into(),
+            id: id.into(),
+            underlying: Some(underlying.clone().into()),
         }
     }
 
@@ -254,7 +254,7 @@ impl SymbolOptionsExt for Symbol {
         match (sid.expiry, sid.strike, sid.option_right, sid.option_style) {
             (Some(expiry), Some(strike), Some(right), Some(style)) => {
                 self.underlying.as_ref().map(|u| OptionSymbolId {
-                    underlying: u.clone(),
+                    underlying: Box::new(u.as_ref().clone()),
                     strike,
                     expiry,
                     right,

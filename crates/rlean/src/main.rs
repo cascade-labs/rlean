@@ -16,7 +16,10 @@
 ///   rlean create-project my_strategy
 ///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 ///   rlean research my_strategy
-use std::collections::{BTreeSet, HashMap};
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -28,14 +31,26 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
+use arrow::compute::{cast, concat_batches, filter_record_batch};
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::Array;
 use clap::{Parser, Subcommand, ValueEnum};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing_subscriber::EnvFilter;
 
 use lean_algorithm::qc_algorithm::BrokerageName;
-use lean_data::IHistoricalDataProvider;
+use lean_core::{
+    Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType, TimeSpan,
+};
+use lean_data::{IHistoricalDataProvider, TradeBar};
 use lean_data_providers::IHistoryProvider;
-use lean_storage::{DataStore, S3StoreConfig};
+use lean_storage::iceberg_store::{
+    CUSTOM_POINTS, FACTOR_FILES, MAP_FILES, MARGIN_INTEREST, MARKET_QUOTE_BARS, MARKET_TICKS,
+    MARKET_TRADE_BARS, OPTION_EOD_BARS, OPTION_UNIVERSE, PERPETUAL_CONTEXT,
+};
+use lean_storage::IcebergStore;
 
 mod config;
 mod config_cmd;
@@ -66,7 +81,7 @@ type ProviderPair = (
 
 #[derive(Clone)]
 struct ResolvedDataStore {
-    store: DataStore,
+    store: Arc<IcebergStore>,
     data_root: PathBuf,
 }
 
@@ -115,6 +130,10 @@ enum Command {
 
     /// Version control: push, pull, sync, and configure your strategy remote
     Vcs(VcsArgs),
+
+    /// Hidden: one-time migration from legacy Parquet files into local Iceberg tables
+    #[command(name = "convert-iceberg", hide = true)]
+    ConvertIceberg(ConvertIcebergArgs),
 
     /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
     #[command(name = "__research-daemon", hide = true)]
@@ -259,6 +278,69 @@ struct LiveArgs {
     verbose: bool,
 }
 
+#[derive(clap::Args, Clone)]
+struct ConvertIcebergArgs {
+    /// Legacy Parquet data root to read from.
+    #[arg(long, default_value = "data", env = "RLEAN_DATA")]
+    data: PathBuf,
+
+    /// Iceberg warehouse data root. Defaults to the source data root.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Stop after converting this many source files. Useful for smoke tests.
+    #[arg(long)]
+    limit_files: Option<usize>,
+
+    /// Stop after appending this many rows. Useful for smoke tests.
+    #[arg(long)]
+    limit_rows: Option<usize>,
+
+    /// Only convert legacy paths with this relative prefix. Repeat for multiple prefixes.
+    #[arg(long = "include-prefix")]
+    include_prefixes: Vec<PathBuf>,
+
+    /// Only convert date-partitioned files on or after this date.
+    #[arg(long)]
+    start_date: Option<chrono::NaiveDate>,
+
+    /// Only convert date-partitioned files on or before this date.
+    #[arg(long)]
+    end_date: Option<chrono::NaiveDate>,
+
+    /// Only convert rows for this symbol/underlying. Repeat for multiple symbols.
+    #[arg(long = "symbol")]
+    symbols: Vec<String>,
+
+    /// Bypass append-time dedupe for bulk loads into empty/reset Iceberg tables.
+    #[arg(long)]
+    bulk_append: bool,
+
+    /// Aggregate filtered equity minute trade bars into daily trade bars before appending.
+    #[arg(long)]
+    aggregate_minute_to_daily: bool,
+
+    /// Maximum parquet batches to append per Iceberg commit when --bulk-append is set.
+    #[arg(long, default_value_t = 1)]
+    batch_files: usize,
+
+    /// Reset an Iceberg cache table before conversion. Repeat for multiple tables.
+    #[arg(long = "reset-table")]
+    reset_tables: Vec<String>,
+
+    /// Print each converted source file.
+    #[arg(long, short = 'v')]
+    verbose: bool,
+}
+
+#[derive(Default)]
+struct ConvertIcebergStats {
+    files_seen: usize,
+    files_converted: usize,
+    files_skipped: usize,
+    rows_converted: usize,
+}
+
 #[derive(Subcommand, Clone)]
 enum LiveSubcommand {
     /// List local live deployments
@@ -341,10 +423,12 @@ impl LiveArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    install_immediate_ctrl_c_handler();
 
     let verbose = match &cli.command {
         Command::Backtest(args) => args.verbose,
         Command::Live(args) => args.verbose,
+        Command::ConvertIceberg(args) => args.verbose,
         _ => false,
     };
 
@@ -373,8 +457,27 @@ async fn main() -> Result<()> {
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),
         Command::Vcs(args) => run_vcs(args),
+        Command::ConvertIceberg(args) => run_convert_iceberg(args).await,
         Command::ResearchDaemon(args) => run_daemon(args),
     }
+}
+
+fn install_immediate_ctrl_c_handler() {
+    let _ = ctrlc::set_handler(|| {
+        eprintln!("\nInterrupted.");
+        std::process::exit(130);
+    });
+}
+
+fn backtest_progress_bar() -> indicatif::ProgressBar {
+    let bar = indicatif::ProgressBar::new(100);
+    let style = indicatif::ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>3}% {msg}",
+    )
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=> ");
+    bar.set_style(style);
+    bar
 }
 
 fn parse_algorithm_parameters(raw: &[String]) -> Result<HashMap<String, String>> {
@@ -407,9 +510,19 @@ fn project_config_parameters(strategy: &Path) -> Result<HashMap<String, String>>
         return Ok(HashMap::new());
     }
 
-    let config = config::ProjectConfig::load(project_dir)?;
-    config
-        .parameters
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let Some(parameters) = config.get("parameters") else {
+        return Ok(HashMap::new());
+    };
+    let Some(parameters) = parameters.as_object() else {
+        bail!("project config parameters must be an object");
+    };
+
+    parameters
+        .clone()
         .into_iter()
         .map(|(key, value)| Ok((key, project_parameter_value_to_string(value)?)))
         .collect()
@@ -434,82 +547,1137 @@ fn resolve_datastore_for_data_root(
     global_config: &config::GlobalConfig,
 ) -> Result<ResolvedDataStore> {
     match global_config.datastore.as_str() {
-        "file" => Ok(ResolvedDataStore {
-            store: DataStore::local(data_folder),
-            data_root: data_folder.to_path_buf(),
-        }),
-        "s3" => {
-            if data_folder.is_absolute() {
-                bail!(
-                    "S3 datastore requires data-folder to be a relative bucket path, got {}",
-                    data_folder.display()
-                );
-            }
-            let bucket = required_s3_config(global_config.s3_bucket.as_deref(), "s3_bucket")?;
-            let prefix = data_folder.to_string_lossy().trim_matches('/').to_string();
-            let home =
-                std::env::var("HOME").context("HOME is not set; cannot build S3 cache path")?;
-            let mut local_cache_root = PathBuf::from(home)
-                .join(".rlean")
-                .join("cache")
-                .join("s3")
-                .join(sanitize_cache_component(bucket));
-            if !prefix.is_empty() {
-                local_cache_root = local_cache_root.join(sanitize_cache_component(&prefix));
-            }
-
-            let store = DataStore::s3(S3StoreConfig {
-                access_key: required_s3_config(
-                    global_config.s3_access_key.as_deref(),
-                    "s3_access_key",
-                )?
-                .to_string(),
-                secret_key: required_s3_config(
-                    global_config.s3_secret_key.as_deref(),
-                    "s3_secret_key",
-                )?
-                .to_string(),
-                bucket: bucket.to_string(),
-                endpoint: required_s3_config(global_config.s3_endpoint.as_deref(), "s3_endpoint")?
-                    .to_string(),
-                region: required_s3_config(global_config.s3_region.as_deref(), "s3_region")?
-                    .to_string(),
-                prefix,
-                local_cache_root: local_cache_root.clone(),
-            })?;
-
+        "file" => {
+            let store = block_connect_iceberg_store(data_folder.to_path_buf())?;
             Ok(ResolvedDataStore {
                 store,
-                data_root: local_cache_root,
+                data_root: data_folder.to_path_buf(),
             })
         }
+        "s3" => bail!("datastore=s3 is not supported until Iceberg S3 FileIO is wired"),
         other => bail!("unsupported datastore '{other}', expected 'file' or 's3'"),
     }
 }
 
-fn required_s3_config<'a>(value: Option<&'a str>, key: &str) -> Result<&'a str> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("datastore=s3 requires `{key}` in ~/.rlean/config"))
+fn block_connect_iceberg_store(data_root: PathBuf) -> Result<Arc<IcebergStore>> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build Iceberg store runtime")?
+            .block_on(IcebergStore::connect_local(data_root))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Iceberg store worker panicked"))?
+    .map(Arc::new)
 }
 
-fn sanitize_cache_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
+async fn run_convert_iceberg(args: ConvertIcebergArgs) -> Result<()> {
+    if !args.data.exists() {
+        bail!("source data root '{}' does not exist", args.data.display());
     }
+    let output = args.output.clone().unwrap_or_else(|| args.data.clone());
+    let store = IcebergStore::connect_local(&output).await?;
+    for table in &args.reset_tables {
+        let table = canonical_iceberg_table_name(table)?;
+        store.reset_table(table).await?;
+    }
+    let batch_files = args.batch_files.max(1);
+    let can_batch_appends = args.bulk_append && batch_files > 1 && args.limit_rows.is_none();
+    let symbol_filter = args
+        .symbols
+        .iter()
+        .map(|symbol| symbol.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let mut pending = PendingConvertBatch::default();
+    let mut stats = ConvertIcebergStats::default();
+
+    let files = parquet_files_under(&args.data)?
+        .into_iter()
+        .filter(|path| convert_path_matches_filters(path, &args))
+        .collect::<Vec<_>>();
+    for path in files {
+        if reached_limit(stats.files_converted, args.limit_files)
+            || reached_limit(stats.rows_converted, args.limit_rows)
+        {
+            break;
+        }
+        stats.files_seen += 1;
+        let Some(kind) = classify_legacy_parquet(&args.data, &path) else {
+            stats.files_skipped += 1;
+            continue;
+        };
+        let mut converted_file = false;
+        for batch in read_parquet_batches(&path)? {
+            let batch = filter_legacy_batch_symbols(&kind, batch, &symbol_filter)?;
+            let batch = normalize_legacy_batch(&kind, &path, batch)?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if can_batch_appends {
+                stats.rows_converted += batch.num_rows();
+                pending
+                    .push_or_flush(
+                        &store,
+                        kind.clone(),
+                        batch,
+                        batch_files,
+                        args.bulk_append,
+                        args.aggregate_minute_to_daily,
+                    )
+                    .await?;
+                converted_file = true;
+                continue;
+            }
+            let remaining = args
+                .limit_rows
+                .map(|limit| limit.saturating_sub(stats.rows_converted));
+            let Some(row_limit) = remaining else {
+                let rows = batch.num_rows();
+                append_legacy_batch(
+                    &store,
+                    &kind,
+                    batch,
+                    args.bulk_append,
+                    args.aggregate_minute_to_daily,
+                )
+                .await?;
+                stats.rows_converted += rows;
+                converted_file = true;
+                continue;
+            };
+            if row_limit == 0 {
+                break;
+            }
+            let rows = row_limit.min(batch.num_rows());
+            append_legacy_batch(
+                &store,
+                &kind,
+                batch.slice(0, rows),
+                args.bulk_append,
+                args.aggregate_minute_to_daily,
+            )
+            .await?;
+            stats.rows_converted += rows;
+            converted_file = true;
+            if rows < batch.num_rows() {
+                break;
+            }
+        }
+        if converted_file {
+            stats.files_converted += 1;
+            if args.verbose {
+                println!("converted {}", path.display());
+            }
+        } else {
+            stats.files_skipped += 1;
+        }
+    }
+    pending
+        .flush(&store, args.bulk_append, args.aggregate_minute_to_daily)
+        .await?;
+
+    println!(
+        "Iceberg conversion complete: {} files converted, {} files skipped, {} rows appended into {}",
+        stats.files_converted,
+        stats.files_skipped,
+        stats.rows_converted,
+        store.warehouse_root().display()
+    );
+    Ok(())
+}
+
+fn canonical_iceberg_table_name(name: &str) -> Result<&'static str> {
+    match name {
+        MARKET_TRADE_BARS => Ok(MARKET_TRADE_BARS),
+        MARKET_QUOTE_BARS => Ok(MARKET_QUOTE_BARS),
+        MARKET_TICKS => Ok(MARKET_TICKS),
+        OPTION_EOD_BARS => Ok(OPTION_EOD_BARS),
+        OPTION_UNIVERSE => Ok(OPTION_UNIVERSE),
+        MARGIN_INTEREST => Ok(MARGIN_INTEREST),
+        PERPETUAL_CONTEXT => Ok(PERPETUAL_CONTEXT),
+        CUSTOM_POINTS => Ok(CUSTOM_POINTS),
+        FACTOR_FILES => Ok(FACTOR_FILES),
+        MAP_FILES => Ok(MAP_FILES),
+        _ => bail!("unknown Iceberg table '{name}'"),
+    }
+}
+
+fn parquet_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let pattern = root.join("**").join("*.parquet");
+    let pattern = pattern.to_string_lossy().to_string();
+    let mut files = glob::glob(&pattern)
+        .with_context(|| format!("invalid parquet glob pattern {pattern}"))?
+        .filter_map(|entry| entry.ok())
+        .filter(|path| {
+            !path
+                .components()
+                .any(|component| component.as_os_str() == "iceberg")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+fn convert_path_matches_filters(path: &Path, args: &ConvertIcebergArgs) -> bool {
+    if !args.include_prefixes.is_empty() {
+        let Ok(relative) = path.strip_prefix(&args.data) else {
+            return false;
+        };
+        if !args
+            .include_prefixes
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+        {
+            return false;
+        }
+    }
+
+    if args.start_date.is_some() || args.end_date.is_some() {
+        if let Some(date) = date_from_legacy_path(path) {
+            if args.start_date.is_some_and(|start| date < start) {
+                return false;
+            }
+            if args.end_date.is_some_and(|end| date > end) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn date_from_legacy_path(path: &Path) -> Option<chrono::NaiveDate> {
+    for component in path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if let Some(date) = text.strip_prefix("date=") {
+            return chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
+        }
+    }
+    let stem = path.file_stem()?.to_string_lossy();
+    if stem.len() == 8 && stem.chars().all(|ch| ch.is_ascii_digit()) {
+        return chrono::NaiveDate::parse_from_str(&stem, "%Y%m%d").ok();
+    }
+    None
+}
+
+fn read_parquet_batches(path: &Path) -> Result<Vec<arrow_array::RecordBatch>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("failed to read parquet metadata from {}", path.display()))?
+        .build()
+        .with_context(|| format!("failed to create parquet reader for {}", path.display()))?;
+    reader
+        .map(|batch| batch.with_context(|| format!("failed to read {}", path.display())))
+        .collect()
+}
+
+fn filter_legacy_batch_symbols(
+    kind: &LegacyParquetKind,
+    batch: arrow_array::RecordBatch,
+    symbols: &BTreeSet<String>,
+) -> Result<arrow_array::RecordBatch> {
+    if symbols.is_empty() || !legacy_kind_has_symbols(kind) {
+        return Ok(batch);
+    }
+    let column_name = if matches!(
+        kind,
+        LegacyParquetKind::OptionUniverse | LegacyParquetKind::OptionEod
+    ) && batch.column_by_name("underlying").is_some()
+    {
+        "underlying"
+    } else if matches!(kind, LegacyParquetKind::AlternativeCustom { .. })
+        && batch.column_by_name("usymbol").is_some()
+    {
+        "usymbol"
+    } else {
+        "symbol_value"
+    };
+    let Some(column) = batch.column_by_name(column_name) else {
+        return Ok(batch);
+    };
+    let mut selected = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        selected.push(
+            string_cell_value(column.as_ref(), row)?
+                .map(|value| symbols.contains(&value.to_ascii_uppercase()))
+                .unwrap_or(false),
+        );
+    }
+    let mask = arrow_array::BooleanArray::from(selected);
+    Ok(filter_record_batch(&batch, &mask)?)
+}
+
+fn string_cell_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
+        return Ok(Some(values.value(row).to_string()));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::LargeStringArray>()
+    {
+        return Ok(Some(values.value(row).to_string()));
+    }
+    let casted = cast(array, &ArrowDataType::Utf8)
+        .with_context(|| format!("failed to cast {:?} to utf8", array.data_type()))?;
+    let values = casted
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .with_context(|| format!("casted {:?} column was not utf8", array.data_type()))?;
+    Ok(values.is_valid(row).then(|| values.value(row).to_string()))
+}
+
+fn legacy_kind_has_symbols(kind: &LegacyParquetKind) -> bool {
+    matches!(
+        kind,
+        LegacyParquetKind::Market { .. }
+            | LegacyParquetKind::OptionUniverse
+            | LegacyParquetKind::OptionEod
+            | LegacyParquetKind::AlternativeCustom { .. }
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LegacyParquetKind {
+    Market {
+        table: MarketTable,
+        security_type: SecurityType,
+        market: String,
+        resolution: Resolution,
+        tick_type: TickType,
+    },
+    OptionUniverse,
+    OptionEod,
+    Custom {
+        source_type: String,
+        ticker: String,
+    },
+    AlternativeCustom {
+        source_type: String,
+        ticker: String,
+        value_column: Option<String>,
+    },
+    FactorFile {
+        market: String,
+        ticker: String,
+    },
+    MapFile {
+        market: String,
+        ticker: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarketTable {
+    Trade,
+    Quote,
+    Tick,
+}
+
+#[derive(Default)]
+struct PendingConvertBatch {
+    kind: Option<LegacyParquetKind>,
+    batches: Vec<arrow_array::RecordBatch>,
+}
+
+impl PendingConvertBatch {
+    async fn push_or_flush(
+        &mut self,
+        store: &IcebergStore,
+        kind: LegacyParquetKind,
+        batch: arrow_array::RecordBatch,
+        max_batches: usize,
+        bulk_append: bool,
+        aggregate_minute_to_daily: bool,
+    ) -> Result<()> {
+        if self.should_flush_before(&kind, &batch, max_batches) {
+            self.flush(store, bulk_append, aggregate_minute_to_daily)
+                .await?;
+        }
+        if self.kind.is_none() {
+            self.kind = Some(kind);
+        }
+        self.batches.push(batch);
+        if self.batches.len() >= max_batches {
+            self.flush(store, bulk_append, aggregate_minute_to_daily)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        store: &IcebergStore,
+        bulk_append: bool,
+        aggregate_minute_to_daily: bool,
+    ) -> Result<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+        let kind = self
+            .kind
+            .take()
+            .context("pending conversion batch missing kind")?;
+        let mut batches = std::mem::take(&mut self.batches);
+        let batch = if batches.len() == 1 {
+            batches.pop().expect("single pending batch exists")
+        } else {
+            let schema = batches[0].schema();
+            concat_batches(&schema, batches.iter()).with_context(|| {
+                format!("failed to concatenate {} parquet batches", batches.len())
+            })?
+        };
+        append_legacy_batch(store, &kind, batch, bulk_append, aggregate_minute_to_daily).await
+    }
+
+    fn should_flush_before(
+        &self,
+        kind: &LegacyParquetKind,
+        batch: &arrow_array::RecordBatch,
+        max_batches: usize,
+    ) -> bool {
+        if self.batches.is_empty() {
+            return false;
+        }
+        if self.batches.len() >= max_batches {
+            return true;
+        }
+        if self.kind.as_ref() != Some(kind) {
+            return true;
+        }
+        self.batches[0].schema_ref() != batch.schema_ref()
+    }
+}
+
+fn aggregate_minute_trade_bars_to_daily(mut bars: Vec<TradeBar>) -> Vec<TradeBar> {
+    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+    let mut groups: BTreeMap<(u64, chrono::NaiveDate), DailyTradeAccumulator> = BTreeMap::new();
+    for bar in bars {
+        let date = lean_storage::schema::ns_to_date(bar.time.0);
+        groups
+            .entry((bar.symbol.id.sid, date))
+            .or_insert_with(|| DailyTradeAccumulator::new(bar.symbol.clone(), date))
+            .push(&bar);
+    }
+    groups
+        .into_values()
+        .filter_map(DailyTradeAccumulator::into_trade_bar)
+        .collect()
+}
+
+struct DailyTradeAccumulator {
+    symbol: Symbol,
+    date: chrono::NaiveDate,
+    open: Option<lean_core::Price>,
+    high: Option<lean_core::Price>,
+    low: Option<lean_core::Price>,
+    close: Option<lean_core::Price>,
+    volume: lean_core::Quantity,
+}
+
+impl DailyTradeAccumulator {
+    fn new(symbol: Symbol, date: chrono::NaiveDate) -> Self {
+        Self {
+            symbol,
+            date,
+            open: None,
+            high: None,
+            low: None,
+            close: None,
+            volume: Default::default(),
+        }
+    }
+
+    fn push(&mut self, bar: &TradeBar) {
+        self.volume += bar.volume;
+        let zero = lean_core::Price::default();
+        if bar.open > zero && self.open.is_none() {
+            self.open = Some(bar.open);
+        }
+        if bar.high > zero {
+            self.high = Some(match self.high {
+                Some(high) if high > bar.high => high,
+                _ => bar.high,
+            });
+        }
+        if bar.low > zero {
+            self.low = Some(match self.low {
+                Some(low) if low < bar.low => low,
+                _ => bar.low,
+            });
+        }
+        if bar.close > zero {
+            self.close = Some(bar.close);
+        }
+    }
+
+    fn into_trade_bar(self) -> Option<TradeBar> {
+        let open = self.open?;
+        let close = self.close?;
+        let high = self
+            .high
+            .unwrap_or_else(|| if open > close { open } else { close });
+        let low = self
+            .low
+            .unwrap_or_else(|| if open < close { open } else { close });
+        let period = TimeSpan::from_days(1);
+        let time = NanosecondTimestamp(lean_storage::schema::date_to_ns(self.date));
+        Some(TradeBar {
+            symbol: self.symbol,
+            time,
+            end_time: time + period,
+            open,
+            high,
+            low,
+            close,
+            volume: self.volume,
+            period,
+        })
+    }
+}
+
+async fn append_legacy_batch(
+    store: &IcebergStore,
+    kind: &LegacyParquetKind,
+    batch: arrow_array::RecordBatch,
+    bulk_append: bool,
+    aggregate_minute_to_daily: bool,
+) -> Result<()> {
+    match kind {
+        LegacyParquetKind::Market {
+            table,
+            security_type,
+            market,
+            resolution,
+            tick_type,
+        } if aggregate_minute_to_daily => {
+            if *table != MarketTable::Trade
+                || *security_type != SecurityType::Equity
+                || *resolution != Resolution::Minute
+            {
+                bail!("--aggregate-minute-to-daily only supports equity minute trade bars");
+            }
+            let minute_bars = trade_bars_from_market_batch(&batch, *security_type, market)?;
+            let daily_bars = aggregate_minute_trade_bars_to_daily(minute_bars);
+            store
+                .append_trade_bars_unchecked(
+                    &daily_bars,
+                    *security_type,
+                    market,
+                    Resolution::Daily,
+                    *tick_type,
+                )
+                .await
+        }
+        LegacyParquetKind::Market {
+            table,
+            security_type,
+            market,
+            resolution,
+            tick_type,
+        } => match (table, bulk_append) {
+            (MarketTable::Trade, true) if *security_type == SecurityType::Equity => {
+                let bars = trade_bars_from_market_batch(&batch, *security_type, market)?;
+                store
+                    .append_trade_bars_unchecked(
+                        &bars,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Trade, true) => {
+                store
+                    .append_trade_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Quote, true) if *security_type == SecurityType::Equity => {
+                let bars = quote_bars_from_market_batch(&batch, *security_type, market)?;
+                store
+                    .append_quote_bars_unchecked(
+                        &bars,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Quote, true) => {
+                store
+                    .append_quote_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Tick, true) => {
+                store
+                    .append_tick_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Trade, false) if *security_type == SecurityType::Equity => {
+                let bars = trade_bars_from_market_batch(&batch, *security_type, market)?;
+                store
+                    .append_trade_bars(&bars, *security_type, market, *resolution, *tick_type)
+                    .await
+            }
+            (MarketTable::Trade, false) => {
+                store
+                    .append_trade_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Quote, false) if *security_type == SecurityType::Equity => {
+                let bars = quote_bars_from_market_batch(&batch, *security_type, market)?;
+                store
+                    .append_quote_bars(&bars, *security_type, market, *resolution, *tick_type)
+                    .await
+            }
+            (MarketTable::Quote, false) => {
+                store
+                    .append_quote_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+            (MarketTable::Tick, false) => {
+                store
+                    .append_tick_record_batch(
+                        batch,
+                        *security_type,
+                        market,
+                        *resolution,
+                        *tick_type,
+                    )
+                    .await
+            }
+        },
+        LegacyParquetKind::OptionUniverse if bulk_append => {
+            store
+                .append_option_universe_record_batch_unchecked(batch)
+                .await
+        }
+        LegacyParquetKind::OptionUniverse => store.append_option_universe_record_batch(batch).await,
+        LegacyParquetKind::OptionEod if bulk_append => {
+            store.append_option_eod_record_batch_unchecked(batch).await
+        }
+        LegacyParquetKind::OptionEod => store.append_option_eod_record_batch(batch).await,
+        LegacyParquetKind::Custom {
+            source_type,
+            ticker,
+        }
+        | LegacyParquetKind::AlternativeCustom {
+            source_type,
+            ticker,
+            ..
+        } if bulk_append => {
+            store
+                .append_custom_record_batch_unchecked(source_type, ticker, batch)
+                .await
+        }
+        LegacyParquetKind::Custom {
+            source_type,
+            ticker,
+        }
+        | LegacyParquetKind::AlternativeCustom {
+            source_type,
+            ticker,
+            ..
+        } => {
+            store
+                .append_custom_record_batch(source_type, ticker, batch)
+                .await
+        }
+        LegacyParquetKind::FactorFile { market, ticker } => {
+            store
+                .append_factor_record_batch(market, ticker, batch)
+                .await
+        }
+        LegacyParquetKind::MapFile { market, ticker } => {
+            store.append_map_record_batch(market, ticker, batch).await
+        }
+    }
+}
+
+fn classify_legacy_parquet(root: &Path, path: &Path) -> Option<LegacyParquetKind> {
+    let relative = path.strip_prefix(root).ok()?;
+    let parts = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if parts.len() >= 3 && parts[0] == "custom" {
+        let ticker = path.file_stem()?.to_string_lossy();
+        let ticker = if ticker == "history"
+            || (ticker.len() == 8 && ticker.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            parts.get(2)?.clone()
+        } else {
+            ticker.to_string()
+        };
+        return Some(LegacyParquetKind::Custom {
+            source_type: parts[1].clone(),
+            ticker,
+        });
+    }
+    if parts.len() >= 7 && parts[0] == "alternative" {
+        let source_type = parts[1].clone();
+        let physical_ticker = parts[2].clone();
+        let ticker = alternative_logical_ticker(&source_type, &physical_ticker)?;
+        return Some(LegacyParquetKind::AlternativeCustom {
+            value_column: alternative_value_column(&source_type, &ticker).map(str::to_string),
+            source_type,
+            ticker,
+        });
+    }
+    if parts.len() == 4 && parts[0] == "equity" && parts[2] == "factor_files" {
+        return Some(LegacyParquetKind::FactorFile {
+            market: parts[1].clone(),
+            ticker: path.file_stem()?.to_string_lossy().to_string(),
+        });
+    }
+    if parts.len() == 4 && parts[0] == "equity" && parts[2] == "map_files" {
+        return Some(LegacyParquetKind::MapFile {
+            market: parts[1].clone(),
+            ticker: path.file_stem()?.to_string_lossy().to_string(),
+        });
+    }
+    if parts.len() >= 6 && parts[0] == "option" && parts[3] == "universe" {
+        return Some(LegacyParquetKind::OptionUniverse);
+    }
+    if parts.len() >= 3
+        && parts[0] == "option"
+        && path.file_stem()?.to_string_lossy().ends_with("_eod")
+    {
+        return Some(LegacyParquetKind::OptionEod);
+    }
+    if parts.len() >= 6
+        && parts[0] == "option"
+        && parts[2] == "daily"
+        && parts[3] == "trade"
+        && path.file_name()?.to_string_lossy() == "data.parquet"
+    {
+        return Some(LegacyParquetKind::OptionEod);
+    }
+    if parts.len() < 6 || path.file_name()?.to_string_lossy() != "data.parquet" {
+        return None;
+    }
+    let security_type = parse_security_type(&parts[0])?;
+    let resolution = parse_resolution(&parts[2])?;
+    let tick_type = parse_tick_type(&parts[3])?;
+    let table = match tick_type {
+        TickType::Trade => MarketTable::Trade,
+        TickType::Quote => MarketTable::Quote,
+        TickType::OpenInterest => MarketTable::Tick,
+    };
+    Some(LegacyParquetKind::Market {
+        table,
+        security_type,
+        market: parts[1].clone(),
+        resolution,
+        tick_type,
+    })
+}
+
+fn alternative_logical_ticker(source_type: &str, physical_ticker: &str) -> Option<String> {
+    match (source_type, physical_ticker) {
+        ("tradealert", "underlying_fields_eod") => Some("snapshot".to_string()),
+        ("tradealert", "most_active") => Some("most_active".to_string()),
+        ("tradealert", "sweeps") => Some("sweeps".to_string()),
+        _ => Some(physical_ticker.to_string()),
+    }
+}
+
+fn alternative_value_column(source_type: &str, ticker: &str) -> Option<&'static str> {
+    match (source_type, ticker) {
+        ("atlanta_fed_gdpnow", "gdpnow") => Some("gdp_nowcast"),
+        ("tradealert", "snapshot") => Some("atm_ivol"),
+        ("tradealert", "most_active") => Some("option_volume"),
+        ("tradealert", "sweeps") => Some("size"),
+        _ => None,
+    }
+}
+
+fn normalize_legacy_batch(
+    kind: &LegacyParquetKind,
+    path: &Path,
+    batch: arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch> {
+    let LegacyParquetKind::AlternativeCustom {
+        source_type,
+        ticker,
+        value_column,
+    } = kind
+    else {
+        return Ok(batch);
+    };
+    alternative_custom_batch_to_custom_points(
+        &batch,
+        path,
+        value_column.as_deref(),
+        alternative_field_allowlist(source_type, ticker),
+    )
+}
+
+fn alternative_custom_batch_to_custom_points(
+    batch: &arrow_array::RecordBatch,
+    path: &Path,
+    value_column: Option<&str>,
+    field_allowlist: Option<&[&str]>,
+) -> Result<arrow_array::RecordBatch> {
+    let date_ns = alternative_path_date_ns(path)
+        .with_context(|| format!("failed to parse alternative date from {}", path.display()))?;
+    let selected_value_column = value_column
+        .filter(|name| batch.column_by_name(name).is_some())
+        .map(str::to_string)
+        .or_else(|| first_numeric_column(batch));
+    let mut date_values = Vec::with_capacity(batch.num_rows());
+    let mut values = Vec::with_capacity(batch.num_rows());
+    let mut fields_json = Vec::with_capacity(batch.num_rows());
+
+    for row in 0..batch.num_rows() {
+        date_values.push(date_ns);
+        values.push(
+            selected_value_column
+                .as_deref()
+                .and_then(|name| numeric_cell_as_f64(batch.column_by_name(name)?, row))
+                .unwrap_or_default(),
+        );
+        let mut fields = JsonMap::new();
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
+            if field_allowlist.is_some_and(|allowlist| {
+                !allowlist
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(field.name()))
+            }) {
+                continue;
+            }
+            fields.insert(
+                field.name().clone(),
+                arrow_cell_to_json(batch.column(idx).as_ref(), row)?,
+            );
+        }
+        fields_json.push(JsonValue::Object(fields).to_string());
+    }
+
+    arrow_array::RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("date_ns", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Float64, false),
+            ArrowField::new("fields_json", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            std::sync::Arc::new(arrow_array::Int64Array::from(date_values)),
+            std::sync::Arc::new(arrow_array::Float64Array::from(values)),
+            std::sync::Arc::new(arrow_array::StringArray::from(fields_json)),
+        ],
+    )
+    .context("failed to build normalized alternative custom batch")
+}
+
+fn alternative_field_allowlist(source_type: &str, ticker: &str) -> Option<&'static [&'static str]> {
+    match (source_type, ticker) {
+        ("tradealert", "snapshot") => Some(&[
+            "timestamp",
+            "date",
+            "usymbol",
+            "indicative_borrow",
+            "atm_ivol",
+        ]),
+        _ => None,
+    }
+}
+
+fn alternative_path_date_ns(path: &Path) -> Option<i64> {
+    let parts = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let stem = path.file_stem()?.to_string_lossy();
+    let time_digits = stem.as_ref();
+    for idx in 0..parts.len().saturating_sub(3) {
+        let (Ok(year), Ok(month), Ok(day)) = (
+            parts[idx].parse::<i32>(),
+            parts[idx + 1].parse::<u32>(),
+            parts[idx + 2].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if year < 1900 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            continue;
+        }
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+        let time = if time_digits.len() == 4 && time_digits.chars().all(|ch| ch.is_ascii_digit()) {
+            let hour = time_digits[0..2].parse::<u32>().ok()?;
+            let minute = time_digits[2..4].parse::<u32>().ok()?;
+            chrono::NaiveTime::from_hms_opt(hour, minute, 0)?
+        } else {
+            chrono::NaiveTime::from_hms_opt(0, 0, 0)?
+        };
+        return Some(
+            date.and_time(time)
+                .and_utc()
+                .timestamp_nanos_opt()
+                .unwrap_or_default(),
+        );
+    }
+    None
+}
+
+fn first_numeric_column(batch: &arrow_array::RecordBatch) -> Option<String> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| is_numeric_arrow_type(field.data_type()))
+        .map(|field| field.name().clone())
+}
+
+fn is_numeric_arrow_type(data_type: &ArrowDataType) -> bool {
+    matches!(
+        data_type,
+        ArrowDataType::Float64
+            | ArrowDataType::Float32
+            | ArrowDataType::Int64
+            | ArrowDataType::Int32
+            | ArrowDataType::Int16
+            | ArrowDataType::Int8
+            | ArrowDataType::UInt64
+            | ArrowDataType::UInt32
+            | ArrowDataType::UInt16
+            | ArrowDataType::UInt8
+    )
+}
+
+fn numeric_cell_as_f64(array: &dyn Array, row: usize) -> Option<f64> {
+    if array.is_null(row) {
+        return None;
+    }
+    macro_rules! downcast_value {
+        ($ty:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$ty>()
+                .map(|values| values.value(row) as f64)
+        };
+    }
+    downcast_value!(arrow_array::Float64Array)
+        .or_else(|| downcast_value!(arrow_array::Float32Array))
+        .or_else(|| downcast_value!(arrow_array::Int64Array))
+        .or_else(|| downcast_value!(arrow_array::Int32Array))
+        .or_else(|| downcast_value!(arrow_array::Int16Array))
+        .or_else(|| downcast_value!(arrow_array::Int8Array))
+        .or_else(|| downcast_value!(arrow_array::UInt64Array))
+        .or_else(|| downcast_value!(arrow_array::UInt32Array))
+        .or_else(|| downcast_value!(arrow_array::UInt16Array))
+        .or_else(|| downcast_value!(arrow_array::UInt8Array))
+}
+
+fn arrow_cell_to_json(array: &dyn Array, row: usize) -> Result<JsonValue> {
+    if array.is_null(row) {
+        return Ok(JsonValue::Null);
+    }
+    macro_rules! primitive_json {
+        ($ty:ty) => {
+            if let Some(values) = array.as_any().downcast_ref::<$ty>() {
+                return Ok(JsonValue::from(values.value(row)));
+            }
+        };
+    }
+    primitive_json!(arrow_array::BooleanArray);
+    primitive_json!(arrow_array::Int64Array);
+    primitive_json!(arrow_array::Int32Array);
+    primitive_json!(arrow_array::Int16Array);
+    primitive_json!(arrow_array::Int8Array);
+    primitive_json!(arrow_array::UInt64Array);
+    primitive_json!(arrow_array::UInt32Array);
+    primitive_json!(arrow_array::UInt16Array);
+    primitive_json!(arrow_array::UInt8Array);
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::Float64Array>() {
+        return Ok(serde_json::Number::from_f64(values.value(row))
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::Float32Array>() {
+        return Ok(serde_json::Number::from_f64(values.value(row) as f64)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::StringArray>() {
+        return Ok(JsonValue::String(values.value(row).to_string()));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::LargeStringArray>()
+    {
+        return Ok(JsonValue::String(values.value(row).to_string()));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::Date32Array>() {
+        let date =
+            lean_storage::schema::ns_to_date((values.value(row) as i64) * 86_400_000_000_000);
+        return Ok(JsonValue::String(date.to_string()));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+    {
+        return Ok(JsonValue::String(format_timestamp_ns(values.value(row))));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+    {
+        return Ok(JsonValue::String(format_timestamp_ns(
+            values.value(row) * 1_000,
+        )));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+    {
+        return Ok(JsonValue::String(format_timestamp_ns(
+            values.value(row) * 1_000_000,
+        )));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampSecondArray>()
+    {
+        return Ok(JsonValue::String(format_timestamp_ns(
+            values.value(row) * 1_000_000_000,
+        )));
+    }
+    Ok(JsonValue::String(format!("{:?}", array.data_type())))
+}
+
+fn format_timestamp_ns(ns: i64) -> String {
+    let secs = ns.div_euclid(1_000_000_000);
+    let nanos = ns.rem_euclid(1_000_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+        .map(|timestamp| timestamp.naive_utc().to_string())
+        .unwrap_or_else(|| ns.to_string())
+}
+
+fn trade_bars_from_market_batch(
+    batch: &arrow_array::RecordBatch,
+    security_type: SecurityType,
+    market: &str,
+) -> Result<Vec<lean_data::TradeBar>> {
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let symbol = symbol_from_market_batch_row(batch, row, security_type, market)?;
+        out.extend(lean_storage::convert::record_batch_to_trade_bars(
+            &batch.slice(row, 1),
+            symbol,
+        ));
+    }
+    Ok(out)
+}
+
+fn quote_bars_from_market_batch(
+    batch: &arrow_array::RecordBatch,
+    security_type: SecurityType,
+    market: &str,
+) -> Result<Vec<lean_data::QuoteBar>> {
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let symbol = symbol_from_market_batch_row(batch, row, security_type, market)?;
+        out.extend(lean_storage::convert::record_batch_to_quote_bars(
+            &batch.slice(row, 1),
+            symbol,
+        ));
+    }
+    Ok(out)
+}
+
+fn symbol_from_market_batch_row(
+    batch: &arrow_array::RecordBatch,
+    row: usize,
+    security_type: SecurityType,
+    market: &str,
+) -> Result<Symbol> {
+    let symbol_value = batch
+        .column_by_name("symbol_value")
+        .context("symbol_value column missing")?
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .context("symbol_value must be utf8")?;
+    Ok(Symbol::create_with_security_type(
+        symbol_value.value(row),
+        security_type,
+        Some(Market::new(market)),
+    ))
+}
+
+fn parse_security_type(value: &str) -> Option<SecurityType> {
+    match value.to_ascii_lowercase().as_str() {
+        "base" => Some(SecurityType::Base),
+        "equity" => Some(SecurityType::Equity),
+        "option" => Some(SecurityType::Option),
+        "commodity" => Some(SecurityType::Commodity),
+        "forex" => Some(SecurityType::Forex),
+        "future" => Some(SecurityType::Future),
+        "cfd" => Some(SecurityType::Cfd),
+        "crypto" => Some(SecurityType::Crypto),
+        "futureoption" | "future_option" | "future-option" => Some(SecurityType::FutureOption),
+        "indexoption" | "index_option" | "index-option" => Some(SecurityType::IndexOption),
+        "index" => Some(SecurityType::Index),
+        "cryptofuture" | "crypto_future" | "crypto-future" => Some(SecurityType::CryptoFuture),
+        _ => None,
+    }
+}
+
+fn parse_resolution(value: &str) -> Option<Resolution> {
+    match value.to_ascii_lowercase().as_str() {
+        "tick" => Some(Resolution::Tick),
+        "second" => Some(Resolution::Second),
+        "minute" => Some(Resolution::Minute),
+        "hour" => Some(Resolution::Hour),
+        "daily" | "day" => Some(Resolution::Daily),
+        _ => None,
+    }
+}
+
+fn parse_tick_type(value: &str) -> Option<TickType> {
+    match value.to_ascii_lowercase().as_str() {
+        "trade" | "trades" => Some(TickType::Trade),
+        "quote" | "quotes" => Some(TickType::Quote),
+        "openinterest" | "open_interest" | "open-interest" => Some(TickType::OpenInterest),
+        _ => None,
+    }
+}
+
+fn reached_limit(count: usize, limit: Option<usize>) -> bool {
+    limit.is_some_and(|limit| count >= limit)
 }
 
 async fn run_backtest(mut args: RunArgs) -> Result<()> {
@@ -544,7 +1712,22 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
     args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
 
-    let (historical_provider, history_provider) = build_providers(&args)?;
+    let (historical_provider, history_provider) = build_providers(&args, datastore.store.clone())?;
+
+    run_strategy_backtest(args, historical_provider, history_provider, datastore).await
+}
+
+async fn run_strategy_backtest(
+    args: RunArgs,
+    historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
+    history_provider: Option<Arc<dyn IHistoryProvider>>,
+    datastore: ResolvedDataStore,
+) -> Result<()> {
+    use lean_engine::report::{
+        write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
+        write_report, write_results_json, write_summary_json,
+    };
+    use lean_python::AlgorithmImports;
 
     let ext = args
         .strategy
@@ -552,35 +1735,11 @@ async fn run_backtest(mut args: RunArgs) -> Result<()> {
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
-    match ext {
-        "py" => run_python_backtest(args, historical_provider, history_provider, datastore).await,
-        "so" | "dylib" => run_rust_plugin_backtest(args),
-        other => bail!(
-            "Unknown strategy extension '.{}'. Expected .py, .so, or .dylib",
-            other
-        ),
+    if ext == "py" {
+        ensure_python_baseline_packages()?;
+        pyo3::append_to_inittab!(AlgorithmImports);
+        pyo3::Python::initialize();
     }
-}
-
-async fn run_python_backtest(
-    args: RunArgs,
-    historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
-    history_provider: Option<Arc<dyn IHistoryProvider>>,
-    datastore: ResolvedDataStore,
-) -> Result<()> {
-    use lean_python::report::{
-        write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
-        write_report, write_results_json, write_summary_json,
-    };
-    use lean_python::runner::{run_strategy, RunConfig};
-    use lean_python::AlgorithmImports;
-
-    ensure_python_baseline_packages()?;
-
-    // Register the AlgorithmImports PyO3 module before starting Python.
-    // Must be called before Python::initialize.
-    pyo3::append_to_inittab!(AlgorithmImports);
-    pyo3::Python::initialize();
 
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -590,18 +1749,13 @@ async fn run_python_backtest(
     let end_date_override = args.end_date.as_deref().map(parse_date).transpose()?;
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 
-    // Each backtest creates a LEAN-compatible output directory:
-    //   <project>/backtests/YYYY-MM-DD_<strategy-name>/
-    //
-    // Matches C# LEAN format (e.g. "backtests/2026-04-01_sma_crossover/").
-    // When --report is set it is treated as the folder path directly.
     let (backtest_dir, backtests_root) = if let Some(p) = args.report.clone() {
         std::fs::create_dir_all(&p)?;
         (p, None)
     } else {
         let backtests_root = args
             .strategy
-            .parent() // <project>/
+            .parent()
             .map(|p| p.join("backtests"))
             .unwrap_or_else(|| PathBuf::from("backtests"));
         let now = chrono::Utc::now();
@@ -610,8 +1764,6 @@ async fn run_python_backtest(
         (backtest_dir, Some(backtests_root))
     };
 
-    // Snapshot the strategy source file into the backtest directory so there is
-    // a permanent record of the exact code that produced this backtest.
     let code_dir = backtest_dir.join("code");
     if let Err(e) = std::fs::create_dir_all(&code_dir) {
         eprintln!("Warning: could not create code snapshot dir: {e}");
@@ -626,12 +1778,30 @@ async fn run_python_backtest(
         }
     }
 
-    // Auto-load custom data source plugins from ~/.rlean/plugins/.
     let custom_data_sources = crate::providers::load_custom_data_plugins(&args.data);
-
-    let config = RunConfig {
+    let progress_bar = backtest_progress_bar();
+    let progress = {
+        let progress_bar = progress_bar.clone();
+        Arc::new(move |progress: lean_engine::BacktestProgress| {
+            let total_days = (progress.end_date - progress.start_date).num_days().max(1) as u64;
+            let elapsed_days = (progress.current_date - progress.start_date)
+                .num_days()
+                .clamp(0, total_days as i64) as u64;
+            let pct = elapsed_days.saturating_mul(100).saturating_div(total_days);
+            progress_bar.set_position(pct.min(100));
+            progress_bar.set_message(format!(
+                "{} | value ${:.2} | {} trading days",
+                progress.current_date, progress.portfolio_value, progress.trading_days
+            ));
+        })
+    };
+    let data_feed_options = lean_engine::data_feed::DataFeedOptions {
+        fetch_missing_custom_data: args.data_provider_historical.is_some(),
+        ..Default::default()
+    };
+    let config = lean_engine::BacktestRunConfig {
         data_root: datastore.data_root.clone(),
-        datastore: datastore.store,
+        data_store: datastore.store.clone(),
         _compression_level: 3,
         historical_provider,
         history_provider,
@@ -639,17 +1809,58 @@ async fn run_python_backtest(
         end_date_override,
         parameters,
         custom_data_sources,
+        data_feed_options,
         output_dir: Some(backtest_dir.clone()),
+        progress: Some(progress),
     };
 
-    let results = match run_strategy(&args.strategy, config).await {
+    let mut runtime_context = lean_engine::AlgorithmRuntimeContext::new(
+        config.data_root.clone(),
+        config.data_store.clone(),
+        config.history_provider.clone(),
+        config.custom_data_sources.clone(),
+        config.parameters.clone(),
+    );
+
+    let bridge: Box<dyn lean_sdk::AlgorithmBridge> = match ext {
+        "py" => {
+            let strategy_path = args.strategy.clone();
+            let state = Arc::new(std::sync::Mutex::new(lean_algorithm::qc_algorithm::QcAlgorithm::new(
+                "Algorithm",
+                rust_decimal::Decimal::new(100000, 0),
+            )));
+            runtime_context =
+                lean_python_runtime::bind_compat_framework(state.clone(), runtime_context);
+            let context = lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
+                state,
+                Arc::new(runtime_context.clone()),
+            );
+            let adapter =
+                lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
+            Box::new(adapter)
+        }
+        "so" | "dylib" => load_native_strategy_bridge(&args.strategy)?,
+        other => bail!(
+            "Unknown strategy extension '.{}'. Expected .py, .so, or .dylib",
+            other
+        ),
+    };
+
+    let results = match lean_engine::runner::backtest::run_backtest_with_runtime(
+        bridge,
+        config,
+        runtime_context,
+    )
+    .await
+    {
         Ok(results) => results,
-        Err(error) if lean_python::interrupt::is_interrupted_error(&error) => {
+        Err(error) if lean_sdk::interrupt::is_interrupted_error(&error) => {
             std::process::exit(130);
         }
         Err(error) => return Err(error),
     };
 
+    progress_bar.finish_and_clear();
     results.print_summary();
 
     // The backtest ID (Unix epoch seconds at backtest start) is used as the
@@ -702,43 +1913,24 @@ async fn run_python_backtest(
     Ok(())
 }
 
-fn run_rust_plugin_backtest(args: RunArgs) -> Result<()> {
-    use lean_algorithm::algorithm::IAlgorithm;
-    use lean_engine::{BacktestEngine, EngineConfig};
+fn load_native_strategy_bridge(strategy_path: &Path) -> Result<Box<dyn lean_sdk::AlgorithmBridge>> {
+    use lean_algorithm::algorithm::QcAlgorithmStrategy;
     use libloading::{Library, Symbol};
 
     // Safety: the plugin must export `create_algorithm` with C ABI.
-    let lib = unsafe { Library::new(&args.strategy) }
-        .map_err(|e| anyhow::anyhow!("Failed to load plugin '{}': {e}", args.strategy.display()))?;
+    let lib = unsafe { Library::new(strategy_path) }
+        .map_err(|e| anyhow::anyhow!("Failed to load plugin '{}': {e}", strategy_path.display()))?;
 
-    let create: Symbol<unsafe extern "C" fn() -> Box<dyn IAlgorithm>> =
+    let lib = Box::leak(Box::new(lib));
+    let create: Symbol<unsafe extern "C" fn() -> Box<dyn QcAlgorithmStrategy>> =
         unsafe { lib.get(b"create_algorithm\0") }
             .map_err(|_| anyhow::anyhow!(
                 "Plugin does not export `create_algorithm`. \
-                 Add `#[no_mangle] pub extern \"C\" fn create_algorithm() -> Box<dyn IAlgorithm>` to your strategy crate."
+                 Add `#[no_mangle] pub extern \"C\" fn create_algorithm() -> Box<dyn QcAlgorithmStrategy>` to your strategy crate."
             ))?;
 
-    let algo = unsafe { create() };
-
-    let config = EngineConfig {
-        data_root: args.data,
-        ..Default::default()
-    };
-
-    let engine = BacktestEngine::new(config);
-    // block_in_place lets us call async code from a sync fn inside an async context.
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(engine.run(algo))
-    }) {
-        Ok(results) => results.print_summary(),
-        Err(e) => {
-            eprintln!("Backtest failed: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    drop(lib);
-    Ok(())
+    let strategy = unsafe { create() };
+    Ok(Box::new(lean_sdk::QcAlgorithmNativeBridge::new(strategy)))
 }
 
 // ── Live ──────────────────────────────────────────────────────────────────────
@@ -846,6 +2038,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     let provider_args = providers::ProviderArgs {
         data_root: args.data.clone(),
+        data_store: Some(datastore.store.clone()),
         polygon_rate: args.polygon_rate,
         thetadata_rate: args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
@@ -874,7 +2067,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     };
     let brokerage_model = live_brokerage_model_for_name(requested_brokerage);
 
-    let (_, history_provider) = build_providers(&args)?;
+    let (_, history_provider) = build_providers(&args, datastore.store.clone())?;
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
     let custom_data_sources = crate::providers::load_custom_data_plugins(&args.data);
 
@@ -887,27 +2080,51 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         bail!("Live trading currently supports Python strategies only");
     }
 
-    let result = match lean_python::runner::run_live_strategy(
-        &args.strategy,
-        lean_python::runner::LiveRunConfig {
-            data_root: datastore.data_root.clone(),
-            datastore: datastore.store,
-            history_provider,
-            parameters,
-            custom_data_sources,
-            live_data_queue,
-            brokerage,
-            brokerage_model,
-            paper_trading,
-            max_slices: args.live_max_slices,
-            max_runtime: args.live_max_runtime_seconds.map(Duration::from_secs),
-            output_dir: deploy_dir,
-        },
+    let strategy_path = args.strategy.clone();
+    let live_config = lean_engine::LiveRunConfig {
+        data_root: datastore.data_root.clone(),
+        data_store: datastore.store.clone(),
+        history_provider,
+        parameters,
+        custom_data_sources,
+        live_data_queue,
+        brokerage,
+        brokerage_model,
+        paper_trading,
+        max_slices: args.live_max_slices,
+        max_runtime: args.live_max_runtime_seconds.map(Duration::from_secs),
+        output_dir: deploy_dir,
+    };
+    let state = Arc::new(std::sync::Mutex::new(lean_algorithm::qc_algorithm::QcAlgorithm::new(
+        "Algorithm",
+        rust_decimal::Decimal::new(100000, 0),
+    )));
+    let runtime_context = lean_python_runtime::bind_compat_framework(
+        state.clone(),
+        lean_engine::AlgorithmRuntimeContext::new(
+            live_config.data_root.clone(),
+            live_config.data_store.clone(),
+            live_config.history_provider.clone(),
+            live_config.custom_data_sources.clone(),
+            live_config.parameters.clone(),
+        ),
+    );
+    let context = lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
+        state,
+        Arc::new(runtime_context.clone()),
+    );
+    let adapter =
+        lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
+
+    let result = match lean_engine::runner::live::run_live_with_runtime(
+        adapter,
+        live_config,
+        runtime_context,
     )
     .await
     {
         Ok(result) => result,
-        Err(error) if lean_python::interrupt::is_interrupted_error(&error) => {
+        Err(error) if lean_sdk::interrupt::is_interrupted_error(&error) => {
             std::process::exit(130);
         }
         Err(error) => return Err(error),
@@ -2154,7 +3371,7 @@ fn validate_strategy_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_providers(args: &RunArgs) -> Result<ProviderPair> {
+fn build_providers(args: &RunArgs, data_store: Arc<IcebergStore>) -> Result<ProviderPair> {
     let names = match args.data_provider_historical.as_deref() {
         Some(n) => n,
         None => return Ok((None, None)),
@@ -2162,6 +3379,7 @@ fn build_providers(args: &RunArgs) -> Result<ProviderPair> {
 
     let provider_args = providers::ProviderArgs {
         data_root: args.data.clone(),
+        data_store: Some(data_store),
         polygon_rate: args.polygon_rate,
         thetadata_rate: args.thetadata_rate,
         thetadata_concurrent: args.thetadata_concurrent,
@@ -2285,6 +3503,33 @@ mod tests {
         assert_eq!(parameters.get("enabled").map(String::as_str), Some("true"));
         assert_eq!(parameters.get("threshold").map(String::as_str), Some("2.5"));
         assert_eq!(parameters.get("extra").map(String::as_str), Some("value"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_project_config_parameters_do_not_require_project_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "rlean-project-params-minimal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.py"), "").unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"environment": "backtesting"}"#,
+        )
+        .unwrap();
+
+        let parameters = parse_algorithm_parameters_for_strategy(
+            &root.join("main.py"),
+            &["max_holds=12".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(parameters.get("max_holds").map(String::as_str), Some("12"));
+        assert_eq!(parameters.len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

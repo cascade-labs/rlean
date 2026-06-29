@@ -144,7 +144,7 @@ impl EmaCrossUniverseSelectionModel {
             .filter_map(|cf| {
                 let state = self
                     .averages
-                    .entry(cf.symbol.value.clone())
+                    .entry(cf.symbol.value.to_string())
                     .or_insert_with(|| EmaState::new(self.fast_period, self.slow_period));
 
                 let ready = state.update(cf.price);

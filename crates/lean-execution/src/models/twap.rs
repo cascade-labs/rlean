@@ -53,7 +53,7 @@ impl IExecutionModel for TwapExecutionModel {
     ) -> Vec<OrderRequest> {
         // Register or update targets
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             let current_qty = securities
                 .get(&key)
                 .map(|s| s.current_quantity)
@@ -136,7 +136,7 @@ impl IExecutionModel for TwapExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.state.remove(&sym.value);
+            self.state.remove(sym.value.as_ref());
         }
     }
 

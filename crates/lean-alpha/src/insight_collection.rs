@@ -3,6 +3,7 @@ use lean_core::{DateTime, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Max number of closed (scored) insights retained for `get_insights` history.
 /// Bounds memory while covering well beyond any realistic source-IC lookback.
@@ -33,6 +34,17 @@ pub struct InsightCollectionSnapshot {
     pub total_count: usize,
 }
 
+/// Cheap observer payload for exposing the active insight set on the hot path.
+///
+/// Unlike [`InsightCollectionSnapshot`], this intentionally excludes retained
+/// closed history. Callers that need an owned, serializable full state should use
+/// [`InsightCollection::snapshot`] instead.
+#[derive(Debug, Clone)]
+pub struct ActiveInsightSnapshot {
+    pub active: Arc<[Insight]>,
+    pub total_count: usize,
+}
+
 impl InsightCollection {
     pub fn new() -> Self {
         Self {
@@ -48,7 +60,7 @@ impl InsightCollection {
         for v in self.insights.values_mut() {
             for insight in v.iter_mut() {
                 if insight.is_active(utc_now) {
-                    if let Some(price) = prices.get(&insight.symbol.value) {
+                    if let Some(price) = prices.get(insight.symbol.value.as_ref()) {
                         if insight.reference_value.is_none() {
                             insight.reference_value = Some(*price);
                         }
@@ -74,6 +86,13 @@ impl InsightCollection {
         InsightCollectionSnapshot {
             active: self.insights.values().flatten().cloned().collect(),
             closed: self.closed.clone(),
+            total_count: self.total_count,
+        }
+    }
+
+    pub fn active_snapshot(&self) -> ActiveInsightSnapshot {
+        ActiveInsightSnapshot {
+            active: self.insights.values().flatten().cloned().collect(),
             total_count: self.total_count,
         }
     }
@@ -118,6 +137,17 @@ impl InsightCollection {
             .flatten()
             .filter(|i| i.is_active(utc_now))
             .collect()
+    }
+
+    pub fn iter_active(&self, utc_now: DateTime) -> impl Iterator<Item = &Insight> {
+        self.insights
+            .values()
+            .flatten()
+            .filter(move |i| i.is_active(utc_now))
+    }
+
+    pub fn iter_closed(&self) -> impl Iterator<Item = &Insight> {
+        self.closed.iter()
     }
 
     pub fn active_insights(&self, utc_now: DateTime) -> Vec<Insight> {
@@ -188,7 +218,7 @@ impl InsightCollection {
         if let Some(v) = self.insights.get_mut(&symbol.id.sid) {
             let mut i = 0;
             while i < v.len() {
-                if v[i].source_model == source_model {
+                if v[i].source_model.as_ref() == source_model {
                     let mut closed = v.remove(i);
                     if closed.close_time_utc > utc_now {
                         closed.close_time_utc = utc_now;

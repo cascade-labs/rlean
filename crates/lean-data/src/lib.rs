@@ -8,6 +8,7 @@ pub mod fundamental;
 pub mod history_provider;
 pub mod margin_interest_rate;
 pub mod open_interest;
+pub mod options;
 pub mod order_book;
 pub mod perpetual_context;
 pub mod quote_bar;
@@ -21,7 +22,7 @@ pub mod trade_bar;
 pub use base_data::{BaseData, BaseDataType, DataTimeZoneInfo};
 pub use custom::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSource,
-    CustomDataSubscription, CustomDataSubscriptionRole, CustomDataTransport, CustomParquetSource,
+    CustomDataTransport,
 };
 pub use data_queue::{
     live_data_channel, DataQueueHandler, LiveDataItem, LiveDataSubscription,
@@ -33,12 +34,16 @@ pub use dividend::Dividend;
 pub use history_provider::IHistoricalDataProvider;
 pub use margin_interest_rate::MarginInterestRate;
 pub use open_interest::OpenInterest;
+pub use options::{OptionChain, OptionContract, OptionContractData};
 pub use order_book::{OrderBook, OrderBookLevel};
 pub use perpetual_context::PerpetualContext;
 pub use quote_bar::{Bar, QuoteBar};
 pub use slice::Slice;
 pub use split::Split;
-pub use subscription::{SubscriptionDataConfig, SubscriptionManager};
+pub use subscription::{
+    CustomSubscriptionMetadata, OptionChainFilterMetadata, OptionChainSubscriptionMetadata,
+    SubscriptionDataConfig, SubscriptionDataKind, SubscriptionManager,
+};
 pub use symbol_changed::SymbolChangedEvent;
 pub use tick::Tick;
 pub use trade_bar::{TradeBar, TradeBarData};

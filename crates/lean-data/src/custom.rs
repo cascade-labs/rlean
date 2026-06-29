@@ -82,39 +82,6 @@ impl CustomDataQuery {
     }
 }
 
-/// A parquet-native source returned by custom data providers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomParquetSource {
-    /// Local parquet paths. Historical/backtest providers commonly use these
-    /// so data can be cached and reused.
-    pub paths: Vec<String>,
-    /// In-memory parquet files. Live providers can use these to avoid durable
-    /// local writes when objects are small or ephemeral.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub buffers: Vec<Vec<u8>>,
-    /// Column used as the data timestamp/date. If absent, the runner uses the
-    /// requested date for every row.
-    pub time_column: Option<String>,
-    /// Timestamp encoding for `time_column`.
-    ///
-    /// Native custom parquet supports LEAN-compatible values:
-    /// `timestamp`, an Arrow timestamp column, and `tradealert`, TradeAlert's
-    /// string timestamp format (`YYYY-MM-DD HH:MM:SS:mmm` or `HH:MM:SS:mmm`).
-    /// If `time_zone` is set, the timestamp is interpreted as local wall-clock
-    /// time in that zone and converted to UTC.
-    pub time_format: Option<String>,
-    /// Time zone for provider-local Arrow timestamp columns. Omit for UTC.
-    pub time_zone: Option<String>,
-    /// Optional offset applied to `time_column` to produce the data emission
-    /// time. This mirrors LEAN's `BaseData.EndTime`: providers can preserve
-    /// event time in `time_column` while delaying availability.
-    pub end_time_offset_nanos: Option<i64>,
-    /// Primary symbol column for generic `symbols` filtering.
-    pub symbol_column: Option<String>,
-    /// Primary numeric value column for `CustomDataPoint.value`.
-    pub value_column: Option<String>,
-}
-
 /// Configuration for a custom data subscription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomDataConfig {
@@ -167,31 +134,4 @@ pub struct CustomDataPoint {
     pub value: Decimal,
     /// Additional named fields (e.g. open/high/low/close for VIX).
     pub fields: HashMap<String, serde_json::Value>,
-}
-
-/// How a custom-data subscription is consumed by the engine.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CustomDataSubscriptionRole {
-    /// Ordinary `add_data` subscription delivered to `Slice.custom_data`.
-    #[default]
-    Data,
-    /// Universe-selection input consumed before `OnData`, like C# LEAN
-    /// `FuncUniverse<T>` data.
-    Universe,
-}
-
-/// Active custom data subscription for one ticker + source type.
-#[derive(Debug, Clone)]
-pub struct CustomDataSubscription {
-    pub source_type: String,
-    pub ticker: String,
-    pub config: CustomDataConfig,
-    pub dynamic_query: CustomDataQuery,
-    pub role: CustomDataSubscriptionRole,
-}
-
-impl CustomDataSubscription {
-    pub fn is_universe(&self) -> bool {
-        self.role == CustomDataSubscriptionRole::Universe
-    }
 }

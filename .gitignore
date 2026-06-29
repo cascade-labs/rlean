@@ -4,6 +4,10 @@ Cargo.lock
 examples/backtests/
 examples/data/
 
+# Python caches
+__pycache__/
+*.py[cod]
+
 # Runtime data — never commit
 data/
 logs/

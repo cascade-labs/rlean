@@ -43,7 +43,7 @@ impl EtfConstituentsUniverse {
     pub fn load_constituents(&mut self, constituents: Vec<EtfConstituent>) {
         self.constituents = constituents
             .into_iter()
-            .map(|c| (c.symbol.value.clone(), c))
+            .map(|c| (c.symbol.value.to_string(), c))
             .collect();
     }
 

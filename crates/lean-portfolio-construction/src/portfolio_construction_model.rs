@@ -31,6 +31,20 @@ pub struct InsightForPcm {
     pub source_model: String,
 }
 
+/// Borrowed insight representation for engine hot paths.
+///
+/// The default trait adapter materializes owned [`InsightForPcm`] values for
+/// existing models. Models that care about allocation can override
+/// `create_targets_from_refs` directly.
+#[derive(Debug, Clone, Copy)]
+pub struct InsightForPcmRef<'a> {
+    pub symbol: &'a Symbol,
+    pub direction: InsightDirection,
+    pub magnitude: Option<rust_decimal::Decimal>,
+    pub confidence: Option<rust_decimal::Decimal>,
+    pub source_model: &'a str,
+}
+
 /// Converts alpha insights into portfolio targets.
 /// Mirrors C# IPortfolioConstructionModel.
 pub trait IPortfolioConstructionModel: Send + Sync {
@@ -40,6 +54,25 @@ pub trait IPortfolioConstructionModel: Send + Sync {
         portfolio_value: rust_decimal::Decimal,
         prices: &HashMap<String, rust_decimal::Decimal>,
     ) -> Vec<PortfolioTarget>;
+
+    fn create_targets_from_refs(
+        &mut self,
+        insights: &[InsightForPcmRef<'_>],
+        portfolio_value: rust_decimal::Decimal,
+        prices: &HashMap<String, rust_decimal::Decimal>,
+    ) -> Vec<PortfolioTarget> {
+        let owned: Vec<InsightForPcm> = insights
+            .iter()
+            .map(|insight| InsightForPcm {
+                symbol: insight.symbol.clone(),
+                direction: insight.direction,
+                magnitude: insight.magnitude,
+                confidence: insight.confidence,
+                source_model: insight.source_model.to_string(),
+            })
+            .collect();
+        self.create_targets(&owned, portfolio_value, prices)
+    }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}
 

@@ -19,6 +19,7 @@ fn signum(d: Decimal) -> Decimal {
 }
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const HOUR_NANOS: i64 = 3_600_000_000_000;
 
@@ -26,6 +27,8 @@ const HOUR_NANOS: i64 = 3_600_000_000_000;
 struct MarginInterestState {
     next_application: Option<DateTime>,
 }
+
+pub type SharedHoldings = Arc<RwLock<HashMap<u64, SecurityHolding>>>;
 
 fn next_hourly_funding_time(current_time: DateTime) -> DateTime {
     NanosecondTimestamp(current_time.0.div_euclid(HOUR_NANOS) * HOUR_NANOS + HOUR_NANOS)
@@ -181,7 +184,7 @@ pub struct SecurityPortfolioManager {
     starting_cash: RwLock<Price>,
     /// LEAN `UnsettledCashBook` parity stub — always zero until settlement model exists.
     unsettled_cash: RwLock<Price>,
-    holdings: RwLock<HashMap<u64, SecurityHolding>>,
+    holdings: SharedHoldings,
     margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
     pub total_funding: RwLock<Price>,
@@ -194,7 +197,7 @@ impl SecurityPortfolioManager {
             cash: RwLock::new(starting_cash),
             starting_cash: RwLock::new(starting_cash),
             unsettled_cash: RwLock::new(dec!(0)),
-            holdings: RwLock::new(HashMap::new()),
+            holdings: Arc::new(RwLock::new(HashMap::new())),
             margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
             total_funding: RwLock::new(dec!(0)),
@@ -209,6 +212,10 @@ impl SecurityPortfolioManager {
         *portfolio.margin_call_model.write() =
             crate::margin_call::MarginCallModelKind::live_disabled();
         portfolio
+    }
+
+    pub fn holdings_store(&self) -> SharedHoldings {
+        self.holdings.clone()
     }
 
     pub fn margin_call_model(&self) -> crate::margin_call::MarginCallModelKind {

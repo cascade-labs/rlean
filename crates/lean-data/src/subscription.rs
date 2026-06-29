@@ -1,8 +1,40 @@
+use crate::{CustomDataConfig, CustomDataQuery};
 use lean_core::{DataNormalizationMode, Resolution, Symbol, TickType};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SubscriptionDataKind {
+    Market,
+    Custom,
+    Universe,
+    Option,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomSubscriptionMetadata {
+    pub source_type: String,
+    pub ticker: String,
+    pub config: CustomDataConfig,
+    pub dynamic_query: CustomDataQuery,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptionChainFilterMetadata {
+    pub min_strike_rank: i32,
+    pub max_strike_rank: i32,
+    pub min_expiry_days: i32,
+    pub max_expiry_days: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionChainSubscriptionMetadata {
+    pub canonical_permtick: String,
+    pub underlying_ticker: String,
+    pub filter: OptionChainFilterMetadata,
+}
 
 /// All configuration needed to subscribe to a data stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +49,9 @@ pub struct SubscriptionDataConfig {
     pub is_filtered_subscription: bool,
     pub data_time_zone: String,
     pub exchange_time_zone: String,
+    pub data_kind: SubscriptionDataKind,
+    pub custom: Option<CustomSubscriptionMetadata>,
+    pub option_chain: Option<OptionChainSubscriptionMetadata>,
 }
 
 impl SubscriptionDataConfig {
@@ -36,6 +71,9 @@ impl SubscriptionDataConfig {
             is_filtered_subscription: false,
             data_time_zone: "America/New_York".into(),
             exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         }
     }
 
@@ -53,6 +91,9 @@ impl SubscriptionDataConfig {
             is_filtered_subscription: false,
             data_time_zone: "America/New_York".into(),
             exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         }
     }
 
@@ -68,6 +109,9 @@ impl SubscriptionDataConfig {
             is_filtered_subscription: false,
             data_time_zone: "UTC".into(),
             exchange_time_zone: "UTC".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         }
     }
 
@@ -83,6 +127,9 @@ impl SubscriptionDataConfig {
             is_filtered_subscription: false,
             data_time_zone: "UTC".into(),
             exchange_time_zone: "UTC".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         }
     }
 
@@ -98,7 +145,73 @@ impl SubscriptionDataConfig {
             is_filtered_subscription: false,
             data_time_zone: "UTC".into(),
             exchange_time_zone: "UTC".into(),
+            data_kind: SubscriptionDataKind::Market,
+            custom: None,
+            option_chain: None,
         }
+    }
+
+    pub fn new_custom(
+        symbol: Symbol,
+        resolution: Resolution,
+        metadata: CustomSubscriptionMetadata,
+    ) -> Self {
+        SubscriptionDataConfig {
+            symbol,
+            resolution,
+            tick_type: TickType::Trade,
+            normalization_mode: DataNormalizationMode::Raw,
+            fill_data_forward: false,
+            extended_market_hours: true,
+            is_internal_feed: false,
+            is_filtered_subscription: false,
+            data_time_zone: "America/New_York".into(),
+            exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::Custom,
+            custom: Some(metadata),
+            option_chain: None,
+        }
+    }
+
+    pub fn new_custom_universe(
+        symbol: Symbol,
+        resolution: Resolution,
+        metadata: CustomSubscriptionMetadata,
+    ) -> Self {
+        let mut config = Self::new_custom(symbol, resolution, metadata);
+        config.data_kind = SubscriptionDataKind::Universe;
+        config.is_internal_feed = true;
+        config
+    }
+
+    pub fn new_option_chain(
+        canonical: Symbol,
+        resolution: Resolution,
+        metadata: OptionChainSubscriptionMetadata,
+    ) -> Self {
+        SubscriptionDataConfig {
+            symbol: canonical,
+            resolution,
+            tick_type: TickType::Trade,
+            normalization_mode: DataNormalizationMode::Raw,
+            fill_data_forward: false,
+            extended_market_hours: false,
+            is_internal_feed: true,
+            is_filtered_subscription: true,
+            data_time_zone: "America/New_York".into(),
+            exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::Option,
+            custom: None,
+            option_chain: Some(metadata),
+        }
+    }
+
+    pub fn is_custom_data(&self) -> bool {
+        self.custom.is_some()
+    }
+
+    pub fn is_universe_data(&self) -> bool {
+        self.data_kind == SubscriptionDataKind::Universe
     }
 
     pub fn unique_id(&self) -> u64 {
@@ -108,6 +221,14 @@ impl SubscriptionDataConfig {
         self.symbol.id.sid.hash(&mut h);
         (self.resolution as u8).hash(&mut h);
         (self.tick_type as u8).hash(&mut h);
+        self.data_kind.hash(&mut h);
+        if let Some(custom) = &self.custom {
+            custom.source_type.to_ascii_lowercase().hash(&mut h);
+            custom.ticker.to_ascii_uppercase().hash(&mut h);
+        }
+        if let Some(option_chain) = &self.option_chain {
+            option_chain.canonical_permtick.hash(&mut h);
+        }
         std::hash::Hasher::finish(&h)
     }
 }
@@ -221,6 +342,38 @@ impl SubscriptionManager {
         updated
     }
 
+    pub fn set_custom_dynamic_query(
+        &self,
+        source_type: &str,
+        ticker: &str,
+        query: CustomDataQuery,
+    ) -> bool {
+        let mut state = self.state.write();
+        let Some(id) = state.order.iter().copied().find(|id| {
+            state
+                .subscriptions
+                .get(id)
+                .and_then(|config| config.custom.as_ref())
+                .map(|custom| {
+                    custom.source_type.eq_ignore_ascii_case(source_type)
+                        && custom.ticker.eq_ignore_ascii_case(ticker)
+                })
+                .unwrap_or(false)
+        }) else {
+            return false;
+        };
+
+        if let Some(existing) = state.subscriptions.get(&id) {
+            let mut new_config = (**existing).clone();
+            if let Some(custom) = &mut new_config.custom {
+                custom.dynamic_query = query;
+            }
+            state.subscriptions.insert(id, Arc::new(new_config));
+            return true;
+        }
+        false
+    }
+
     pub fn count(&self) -> usize {
         self.state.read().subscriptions.len()
     }
@@ -254,7 +407,7 @@ mod tests {
         let symbols: Vec<_> = manager
             .get_all()
             .iter()
-            .map(|config| config.symbol.value.clone())
+            .map(|config| config.symbol.value.to_string())
             .collect();
         assert_eq!(symbols, vec!["SPY", "XLK", "XLF"]);
     }
@@ -271,7 +424,7 @@ mod tests {
         let symbols: Vec<_> = manager
             .get_all()
             .iter()
-            .map(|config| config.symbol.value.clone())
+            .map(|config| config.symbol.value.to_string())
             .collect();
         assert_eq!(symbols, vec!["XLK", "XLF"]);
     }
@@ -287,7 +440,7 @@ mod tests {
         let symbols: Vec<_> = manager
             .get_all()
             .iter()
-            .map(|config| config.symbol.value.clone())
+            .map(|config| config.symbol.value.to_string())
             .collect();
         assert_eq!(symbols, vec!["XLK", "SPY"]);
     }

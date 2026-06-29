@@ -66,7 +66,7 @@ impl DataQueueHandler for TestHandler {
             .subscribed
             .lock()
             .unwrap()
-            .push(config.symbol.value.clone());
+            .push(config.symbol.value.to_string());
 
         if !self.accepts_market {
             return Err(LeanError::Unsupported(format!(
@@ -80,7 +80,7 @@ impl DataQueueHandler for TestHandler {
             .send(Ok(LiveDataItem::Heartbeat(lean_core::DateTime::EPOCH)))
             .unwrap();
         Ok(LiveDataSubscription::new(
-            LiveDataSubscriptionConfig::Market(config.clone()),
+            LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
             receiver,
         ))
     }
@@ -90,7 +90,7 @@ impl DataQueueHandler for TestHandler {
             .unsubscribed
             .lock()
             .unwrap()
-            .push(config.symbol.value.clone());
+            .push(config.symbol.value.to_string());
         Ok(())
     }
 

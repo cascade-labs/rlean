@@ -29,7 +29,7 @@ impl ImmediateExecutionModel {
     ) -> Vec<OrderRequest> {
         for target in targets {
             self.targets.insert(
-                target.symbol.value.clone(),
+                target.symbol.value.to_string(),
                 (target.symbol.clone(), target.quantity, target.tag.clone()),
             );
         }

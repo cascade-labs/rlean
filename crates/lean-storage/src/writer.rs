@@ -1,23 +1,21 @@
+use crate::predicate::QueryParams;
+use crate::reader::ParquetReader;
 use crate::schema::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
-use crate::{convert, schema, QueryParams};
+use crate::{convert, schema};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use fs2::FileExt;
-use lean_core::{Result as LeanResult, TickType};
-use lean_data::{CustomDataPoint, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
+use lean_core::{LeanError, Result as LeanResult};
+use lean_data::{QuoteBar, Tick, TradeBar};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
-    file::properties::WriterProperties,
+    file::properties::{EnabledStatistics, WriterProperties},
 };
-use rust_decimal::Decimal;
-use std::{collections::HashSet, fs, path::Path, sync::Arc};
-use tracing::debug;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-/// Compression codec for locally cached Parquet.
-///
-/// Local cache files optimize repeated backtest read speed, not cold-storage
-/// density. Snappy is the default because it is substantially cheaper to decode
-/// than ZSTD for repeatedly scanned market data partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterCompression {
     Snappy,
@@ -25,24 +23,18 @@ pub enum WriterCompression {
     Uncompressed,
 }
 
-/// Configuration for Parquet output.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
-    /// Compression codec. Default Snappy for local-cache scan speed.
     pub compression: WriterCompression,
-    /// Zstandard compression level (1–22). Only used with ZSTD. Default 1.
     pub compression_level: i32,
-    /// Row group size in rows. Default 8k to make SID predicates skip chunks.
     pub row_group_size: usize,
-    /// Write row-group statistics (min/max per column) for predicate pushdown.
     pub write_statistics: bool,
-    /// Write bloom filters for high-cardinality columns.
     pub bloom_filter: bool,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
-        WriterConfig {
+        Self {
             compression: WriterCompression::Snappy,
             compression_level: 1,
             row_group_size: 8_192,
@@ -52,337 +44,180 @@ impl Default for WriterConfig {
     }
 }
 
-/// Writes Parquet files for LEAN market data types.
 pub struct ParquetWriter {
     config: WriterConfig,
 }
 
 impl ParquetWriter {
     pub fn new(config: WriterConfig) -> Self {
-        ParquetWriter { config }
+        Self { config }
     }
 
-    fn writer_props(&self) -> WriterProperties {
-        let compression = match self.config.compression {
-            WriterCompression::Snappy => Compression::SNAPPY,
-            WriterCompression::Zstd => {
-                let zstd = ZstdLevel::try_new(self.config.compression_level)
-                    .unwrap_or(ZstdLevel::try_new(1).unwrap());
-                Compression::ZSTD(zstd)
-            }
-            WriterCompression::Uncompressed => Compression::UNCOMPRESSED,
-        };
-
-        let mut builder = WriterProperties::builder()
-            .set_compression(compression)
-            .set_max_row_group_size(self.config.row_group_size)
-            .set_statistics_enabled(if self.config.write_statistics {
-                parquet::file::properties::EnabledStatistics::Chunk
-            } else {
-                parquet::file::properties::EnabledStatistics::None
-            });
-
-        if self.config.bloom_filter {
-            builder = builder.set_bloom_filter_enabled(true);
-        }
-
-        builder.build()
-    }
-
-    /// Write trade bars to a parquet file at the given path.
     pub fn write_trade_bars(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
         if bars.is_empty() {
             return Ok(());
         }
-        self.ensure_dir(path)?;
-
-        let batch = convert::trade_bars_to_record_batch(bars);
-        let schema = schema::trade_bar_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!("Wrote {} trade bars to {}", bars.len(), path.display());
-        Ok(())
+        self.write_batch(convert::trade_bars_to_record_batch(bars), path)
     }
 
-    /// Write quote bars to a parquet file at the given path.
     pub fn write_quote_bars(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
         if bars.is_empty() {
             return Ok(());
         }
-        self.ensure_dir(path)?;
-
-        let batch = convert::quote_bars_to_record_batch(bars);
-        let schema = schema::quote_bar_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!("Wrote {} quote bars to {}", bars.len(), path.display());
-        Ok(())
+        self.write_batch(convert::quote_bars_to_record_batch(bars), path)
     }
 
-    /// Write ticks to a parquet file at the given path.
     pub fn write_ticks(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
         if ticks.is_empty() {
             return Ok(());
         }
-        self.ensure_dir(path)?;
-
-        let batch = convert::ticks_to_record_batch(ticks);
-        let schema = schema::tick_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!("Wrote {} ticks to {}", ticks.len(), path.display());
-        Ok(())
+        self.write_batch(convert::ticks_to_record_batch(ticks), path)
     }
 
-    /// Write margin interest / funding rate rows to a parquet file.
-    pub fn write_margin_interest_rates(
-        &self,
-        rates: &[MarginInterestRate],
-        path: &Path,
-    ) -> LeanResult<()> {
-        if rates.is_empty() {
+    pub fn write_option_eod_bars(&self, rows: &[OptionEodBar], path: &Path) -> LeanResult<()> {
+        if rows.is_empty() {
             return Ok(());
         }
-        self.ensure_dir(path)?;
-
-        let batch = convert::margin_interest_rates_to_record_batch(rates);
-        let schema = schema::margin_interest_rate_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} margin interest rows to {}",
-            rates.len(),
-            path.display()
-        );
-        Ok(())
+        self.write_batch(convert::option_eod_bars_to_record_batch(rows), path)
     }
 
-    /// Write perpetual context rows to a parquet file.
-    pub fn write_perpetual_contexts(
-        &self,
-        contexts: &[PerpetualContext],
-        path: &Path,
-    ) -> LeanResult<()> {
-        if contexts.is_empty() {
+    pub fn write_option_universe(&self, rows: &[OptionUniverseRow], path: &Path) -> LeanResult<()> {
+        if rows.is_empty() {
             return Ok(());
         }
-        self.ensure_dir(path)?;
-
-        let batch = convert::perpetual_contexts_to_record_batch(contexts);
-        let schema = schema::perpetual_context_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} perpetual context rows to {}",
-            contexts.len(),
-            path.display()
-        );
-        Ok(())
+        self.write_batch(convert::option_universe_rows_to_record_batch(rows), path)
     }
 
-    /// Merge trade bars into a daily all-symbol partition. Existing rows for
-    /// symbols present in `bars` are replaced; all other symbols are preserved.
+    pub fn write_factor_file(&self, rows: &[FactorFileEntry], path: &Path) -> LeanResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch = RecordBatch::try_new(
+            schema::factor_file_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.date_ns()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|row| row.price_factor).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|row| row.split_factor).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter()
+                        .map(|row| row.reference_price)
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| LeanError::DataError(e.to_string()))?;
+        self.write_batch(batch, path)
+    }
+
+    pub fn write_map_file(&self, rows: &[MapFileEntry], path: &Path) -> LeanResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch = RecordBatch::try_new(
+            schema::map_file_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.date_ns()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.ticker.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| LeanError::DataError(e.to_string()))?;
+        self.write_batch(batch, path)
+    }
+
     pub fn merge_trade_bar_partition(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
         if bars.is_empty() {
             return Ok(());
         }
-
         let _lock = self.lock_partition(path)?;
-        let replacement_symbols: HashSet<String> =
-            bars.iter().map(|bar| bar.symbol.value.clone()).collect();
-        if partition_has_all_trade_rows(path, bars)? {
-            return Ok(());
-        }
+        let replacement_sids = bars
+            .iter()
+            .map(|bar| bar.symbol.id.sid)
+            .collect::<HashSet<_>>();
         let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
-                .read_trade_bar_partition(path, &bars[0].symbol, &Default::default())?
+            ParquetReader::new()
+                .read_trade_bar_partition(path, &bars[0].symbol, &QueryParams::default())?
                 .into_iter()
-                .filter(|bar| !replacement_symbols.contains(&bar.symbol.value))
+                .filter(|bar| !replacement_sids.contains(&bar.symbol.id.sid))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-
         merged.extend_from_slice(bars);
-        dedupe_trade_bars(&mut merged);
-        sort_trade_bars_for_predicate_pruning(&mut merged);
+        merged.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+        merged.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
         self.write_trade_bars_atomic(&merged, path)
     }
 
-    /// Merge quote bars into a daily all-symbol partition. Existing rows for
-    /// symbols present in `bars` are replaced; all other symbols are preserved.
     pub fn merge_quote_bar_partition(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
         if bars.is_empty() {
             return Ok(());
         }
-
         let _lock = self.lock_partition(path)?;
-        let replacement_symbols: HashSet<String> =
-            bars.iter().map(|bar| bar.symbol.value.clone()).collect();
-        if partition_has_all_quote_rows(path, bars)? {
-            return Ok(());
-        }
+        let replacement_sids = bars
+            .iter()
+            .map(|bar| bar.symbol.id.sid)
+            .collect::<HashSet<_>>();
         let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
-                .read_quote_bar_partition(path, &bars[0].symbol, &Default::default())?
+            ParquetReader::new()
+                .read_quote_bar_partition(path, &bars[0].symbol, &QueryParams::default())?
                 .into_iter()
-                .filter(|bar| !replacement_symbols.contains(&bar.symbol.value))
+                .filter(|bar| !replacement_sids.contains(&bar.symbol.id.sid))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-
         merged.extend_from_slice(bars);
-        dedupe_quote_bars(&mut merged);
-        sort_quote_bars_for_predicate_pruning(&mut merged);
+        merged.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+        merged.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
         self.write_quote_bars_atomic(&merged, path)
     }
 
-    /// Merge ticks into a daily all-symbol partition. Existing rows for symbols
-    /// present in `ticks` are replaced; all other symbols are preserved.
     pub fn merge_tick_partition(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
         if ticks.is_empty() {
             return Ok(());
         }
-
         let _lock = self.lock_partition(path)?;
-        let replacement_symbols: HashSet<String> =
-            ticks.iter().map(|tick| tick.symbol.value.clone()).collect();
-        if partition_has_all_tick_rows(path, ticks)? {
-            return Ok(());
-        }
+        let replacement_sids = ticks
+            .iter()
+            .map(|tick| tick.symbol.id.sid)
+            .collect::<HashSet<_>>();
         let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
-                .read_tick_partition(path, &ticks[0].symbol, &Default::default())?
+            ParquetReader::new()
+                .read_tick_partition(path, &ticks[0].symbol, &QueryParams::default())?
                 .into_iter()
-                .filter(|tick| !replacement_symbols.contains(&tick.symbol.value))
+                .filter(|tick| !replacement_sids.contains(&tick.symbol.id.sid))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-
         merged.extend_from_slice(ticks);
-        dedupe_ticks(&mut merged);
-        sort_ticks_for_predicate_pruning(&mut merged);
+        merged.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0, tick.tick_type as u8));
+        merged.dedup_by_key(|tick| {
+            (
+                tick.symbol.id.sid,
+                tick.time.0,
+                tick.tick_type as u8,
+                tick.value,
+                tick.quantity,
+                tick.bid_price,
+                tick.ask_price,
+            )
+        });
         self.write_ticks_atomic(&merged, path)
     }
 
-    /// Merge margin-interest rows into a daily all-symbol partition.
-    pub fn merge_margin_interest_rate_partition(
-        &self,
-        rates: &[MarginInterestRate],
-        path: &Path,
-    ) -> LeanResult<()> {
-        if rates.is_empty() {
-            return Ok(());
-        }
-
-        let _lock = self.lock_partition(path)?;
-        let replacement_symbols: HashSet<String> =
-            rates.iter().map(|rate| rate.symbol.value.clone()).collect();
-        let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
-                .read_margin_interest_rate_partition(path, &rates[0].symbol, &Default::default())?
-                .into_iter()
-                .filter(|rate| !replacement_symbols.contains(&rate.symbol.value))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        merged.extend_from_slice(rates);
-        merged.sort_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
-        merged.dedup_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
-        self.write_margin_interest_rates_atomic(&merged, path)
-    }
-
-    /// Merge perpetual context rows into a daily all-symbol partition.
-    pub fn merge_perpetual_context_partition(
-        &self,
-        contexts: &[PerpetualContext],
-        path: &Path,
-    ) -> LeanResult<()> {
-        if contexts.is_empty() {
-            return Ok(());
-        }
-
-        let _lock = self.lock_partition(path)?;
-        let replacement_symbols: HashSet<String> = contexts
-            .iter()
-            .map(|context| context.symbol.value.clone())
-            .collect();
-        if partition_has_all_perpetual_context_rows(path, contexts)? {
-            return Ok(());
-        }
-        let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
-                .read_perpetual_context_partition(path, &contexts[0].symbol, &Default::default())?
-                .into_iter()
-                .filter(|context| !replacement_symbols.contains(&context.symbol.value))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        merged.extend_from_slice(contexts);
-        dedupe_perpetual_contexts(&mut merged);
-        sort_perpetual_contexts_for_predicate_pruning(&mut merged);
-        self.write_perpetual_contexts_atomic(&merged, path)
-    }
-
-    /// Merge option universe rows into a daily all-underlying partition.
-    /// Existing rows for underlyings present in `rows` are replaced; all other
-    /// underlyings are preserved.
     pub fn merge_option_universe_partition(
         &self,
         rows: &[OptionUniverseRow],
@@ -391,14 +226,13 @@ impl ParquetWriter {
         if rows.is_empty() {
             return Ok(());
         }
-
         let _lock = self.lock_partition(path)?;
-        let replacement_underlyings: HashSet<String> = rows
+        let replacement_underlyings = rows
             .iter()
             .map(|row| row.underlying.to_ascii_uppercase())
-            .collect();
+            .collect::<HashSet<_>>();
         let mut merged = if path.exists() {
-            crate::reader::ParquetReader::new()
+            ParquetReader::new()
                 .read_option_universe(&[path.to_path_buf()])?
                 .into_iter()
                 .filter(|row| {
@@ -408,222 +242,76 @@ impl ParquetWriter {
         } else {
             Vec::new()
         };
-
         merged.extend_from_slice(rows);
-        dedupe_option_universe_rows(&mut merged);
-        sort_option_universe_rows(&mut merged);
+        merged.sort_by(|a, b| {
+            (
+                a.underlying.as_str(),
+                a.expiration,
+                a.strike,
+                a.right.as_str(),
+                a.symbol_value.as_str(),
+            )
+                .cmp(&(
+                    b.underlying.as_str(),
+                    b.expiration,
+                    b.strike,
+                    b.right.as_str(),
+                    b.symbol_value.as_str(),
+                ))
+        });
+        merged.dedup_by(|a, b| {
+            a.underlying.eq_ignore_ascii_case(&b.underlying)
+                && a.symbol_value == b.symbol_value
+                && a.expiration == b.expiration
+                && a.strike == b.strike
+                && a.right == b.right
+        });
         self.write_option_universe_atomic(&merged, path)
     }
 
-    /// Write option EOD bars to a parquet file at the given path.
-    pub fn write_option_eod_bars(&self, rows: &[OptionEodBar], path: &Path) -> LeanResult<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
+    fn write_batch(&self, batch: arrow_array::RecordBatch, path: &Path) -> LeanResult<()> {
         self.ensure_dir(path)?;
-
-        let batch = convert::option_eod_bars_to_record_batch(rows);
-        let schema = schema::option_eod_bar_schema();
-
         let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(self.writer_props()))
+            .map_err(|e| LeanError::DataError(e.to_string()))?;
         writer
             .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            .map_err(|e| LeanError::DataError(e.to_string()))?;
         writer
             .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!("Wrote {} option EOD bars to {}", rows.len(), path.display());
+            .map_err(|e| LeanError::DataError(e.to_string()))?;
         Ok(())
     }
 
-    /// Write option universe rows to a parquet file at the given path.
-    pub fn write_option_universe(&self, rows: &[OptionUniverseRow], path: &Path) -> LeanResult<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        self.ensure_dir(path)?;
-
-        let batch = convert::option_universe_rows_to_record_batch(rows);
-        let schema = schema::option_universe_schema();
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} option universe rows to {}",
-            rows.len(),
-            path.display()
-        );
+    fn write_trade_bars_atomic(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_trade_bars(bars, &tmp)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 
-    /// Write factor file entries to a parquet file.
-    ///
-    /// Schema: `date_ns` (Int64 ns UTC), `price_factor` (Float64),
-    ///         `split_factor` (Float64), `reference_price` (Float64).
-    pub fn write_factor_file(&self, entries: &[FactorFileEntry], path: &Path) -> LeanResult<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        self.ensure_dir(path)?;
-
-        let schema = schema::factor_file_schema();
-
-        let dates: Vec<i64> = entries.iter().map(|e| e.date_ns()).collect();
-        let prices: Vec<f64> = entries.iter().map(|e| e.price_factor).collect();
-        let splits: Vec<f64> = entries.iter().map(|e| e.split_factor).collect();
-        let refs: Vec<f64> = entries.iter().map(|e| e.reference_price).collect();
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(dates)),
-                Arc::new(Float64Array::from(prices)),
-                Arc::new(Float64Array::from(splits)),
-                Arc::new(Float64Array::from(refs)),
-            ],
-        )
-        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} factor file entries to {}",
-            entries.len(),
-            path.display()
-        );
+    fn write_quote_bars_atomic(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_quote_bars(bars, &tmp)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 
-    /// Write map file entries to a parquet file.
-    ///
-    /// Schema: `date_ns` (Int64 ns UTC), `ticker` (Utf8).
-    pub fn write_map_file(&self, entries: &[MapFileEntry], path: &Path) -> LeanResult<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        self.ensure_dir(path)?;
-
-        let schema = schema::map_file_schema();
-
-        let dates: Vec<i64> = entries.iter().map(|e| e.date_ns()).collect();
-        let tickers: Vec<&str> = entries.iter().map(|e| e.ticker.as_str()).collect();
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(dates)),
-                Arc::new(StringArray::from(tickers)),
-            ],
-        )
-        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} map file entries to {}",
-            entries.len(),
-            path.display()
-        );
+    fn write_ticks_atomic(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
+        let tmp = temp_path(path);
+        self.write_ticks(ticks, &tmp)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 
-    /// Write custom data points to a parquet cache file.
-    ///
-    /// Schema: `date_ns` (Int64 ns UTC), `value` (Float64), `fields_json` (Utf8).
-    pub fn write_custom_data_points(
+    fn write_option_universe_atomic(
         &self,
-        points: &[CustomDataPoint],
+        rows: &[OptionUniverseRow],
         path: &Path,
     ) -> LeanResult<()> {
-        if points.is_empty() {
-            return Ok(());
-        }
-        self.ensure_dir(path)?;
-
-        let schema = schema::custom_data_schema();
-
-        let dates: Vec<i64> = points
-            .iter()
-            .map(|p| {
-                p.end_time
-                    .map(|t| t.0)
-                    .unwrap_or_else(|| schema::date_to_ns(p.time))
-            })
-            .collect();
-        let values: Vec<f64> = points
-            .iter()
-            .map(|p| {
-                use rust_decimal::prelude::ToPrimitive;
-                p.value.to_f64().unwrap_or(0.0)
-            })
-            .collect();
-        let fields_json: Vec<String> = points
-            .iter()
-            .map(|p| serde_json::to_string(&p.fields).unwrap_or_else(|_| "{}".to_string()))
-            .collect();
-        let fields_json_refs: Vec<&str> = fields_json.iter().map(|s| s.as_str()).collect();
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(dates)),
-                Arc::new(arrow_array::Float64Array::from(values)),
-                Arc::new(StringArray::from(fields_json_refs)),
-            ],
-        )
-        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(self.writer_props()))
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-
-        debug!(
-            "Wrote {} custom data points to {}",
-            points.len(),
-            path.display()
-        );
-        Ok(())
-    }
-
-    fn ensure_dir(&self, path: &Path) -> LeanResult<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let tmp = temp_path(path);
+        self.write_option_universe(rows, &tmp)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 
@@ -635,64 +323,40 @@ impl ParquetWriter {
             .truncate(false)
             .write(true)
             .read(true)
-            .open(&lock_path)?;
+            .open(lock_path)?;
         file.lock_exclusive()
-            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+            .map_err(|e| LeanError::DataError(e.to_string()))?;
         Ok(PartitionLock { file })
     }
 
-    fn write_trade_bars_atomic(&self, bars: &[TradeBar], path: &Path) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_trade_bars(bars, &tmp)?;
-        fs::rename(&tmp, path)?;
+    fn ensure_dir(&self, path: &Path) -> LeanResult<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         Ok(())
     }
 
-    fn write_quote_bars_atomic(&self, bars: &[QuoteBar], path: &Path) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_quote_bars(bars, &tmp)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    fn write_ticks_atomic(&self, ticks: &[Tick], path: &Path) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_ticks(ticks, &tmp)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    fn write_margin_interest_rates_atomic(
-        &self,
-        rates: &[MarginInterestRate],
-        path: &Path,
-    ) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_margin_interest_rates(rates, &tmp)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    fn write_perpetual_contexts_atomic(
-        &self,
-        contexts: &[PerpetualContext],
-        path: &Path,
-    ) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_perpetual_contexts(contexts, &tmp)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    fn write_option_universe_atomic(
-        &self,
-        rows: &[OptionUniverseRow],
-        path: &Path,
-    ) -> LeanResult<()> {
-        let tmp = temp_path(path);
-        self.write_option_universe(rows, &tmp)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+    fn writer_props(&self) -> WriterProperties {
+        let compression = match self.config.compression {
+            WriterCompression::Snappy => Compression::SNAPPY,
+            WriterCompression::Zstd => Compression::ZSTD(
+                ZstdLevel::try_new(self.config.compression_level)
+                    .unwrap_or_else(|_| ZstdLevel::try_new(1).unwrap()),
+            ),
+            WriterCompression::Uncompressed => Compression::UNCOMPRESSED,
+        };
+        let mut builder = WriterProperties::builder()
+            .set_compression(compression)
+            .set_max_row_group_size(self.config.row_group_size)
+            .set_statistics_enabled(if self.config.write_statistics {
+                EnabledStatistics::Chunk
+            } else {
+                EnabledStatistics::None
+            });
+        if self.config.bloom_filter {
+            builder = builder.set_bloom_filter_enabled(true);
+        }
+        builder.build()
     }
 }
 
@@ -706,214 +370,6 @@ impl Drop for PartitionLock {
     }
 }
 
-fn temp_path(path: &Path) -> std::path::PathBuf {
+fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("data.parquet.tmp.{}", uuid::Uuid::new_v4()))
-}
-
-fn dedupe_option_universe_rows(rows: &mut Vec<OptionUniverseRow>) {
-    rows.sort_by(|a, b| {
-        (
-            a.underlying.as_str(),
-            a.symbol_value.as_str(),
-            a.expiration,
-            a.strike,
-            a.right.as_str(),
-        )
-            .cmp(&(
-                b.underlying.as_str(),
-                b.symbol_value.as_str(),
-                b.expiration,
-                b.strike,
-                b.right.as_str(),
-            ))
-    });
-    rows.dedup_by(|a, b| {
-        a.underlying.eq_ignore_ascii_case(&b.underlying)
-            && a.symbol_value == b.symbol_value
-            && a.expiration == b.expiration
-            && a.strike == b.strike
-            && a.right == b.right
-    });
-}
-
-fn sort_option_universe_rows(rows: &mut [OptionUniverseRow]) {
-    rows.sort_by(|a, b| {
-        (
-            a.underlying.as_str(),
-            a.expiration,
-            a.strike,
-            a.right.as_str(),
-            a.symbol_value.as_str(),
-        )
-            .cmp(&(
-                b.underlying.as_str(),
-                b.expiration,
-                b.strike,
-                b.right.as_str(),
-                b.symbol_value.as_str(),
-            ))
-    });
-}
-
-fn partition_has_all_trade_rows(path: &Path, bars: &[TradeBar]) -> LeanResult<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let existing = crate::reader::ParquetReader::new().read_trade_bar_partition(
-        path,
-        &bars[0].symbol,
-        &Default::default(),
-    )?;
-    Ok(bars.iter().all(|bar| {
-        existing.iter().any(|existing| {
-            existing.symbol.id.sid == bar.symbol.id.sid
-                && existing.time.0 == bar.time.0
-                && existing.open == bar.open
-                && existing.high == bar.high
-                && existing.low == bar.low
-                && existing.close == bar.close
-                && existing.volume == bar.volume
-                && existing.period == bar.period
-        })
-    }))
-}
-
-fn partition_has_all_quote_rows(path: &Path, bars: &[QuoteBar]) -> LeanResult<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let existing = crate::reader::ParquetReader::new().read_quote_bar_partition(
-        path,
-        &bars[0].symbol,
-        &Default::default(),
-    )?;
-    Ok(bars.iter().all(|bar| {
-        existing.iter().any(|existing| {
-            existing.symbol.id.sid == bar.symbol.id.sid
-                && existing.time.0 == bar.time.0
-                && existing.bid == bar.bid
-                && existing.ask == bar.ask
-                && existing.last_bid_size == bar.last_bid_size
-                && existing.last_ask_size == bar.last_ask_size
-                && existing.period == bar.period
-        })
-    }))
-}
-
-fn partition_has_all_perpetual_context_rows(
-    path: &Path,
-    contexts: &[PerpetualContext],
-) -> LeanResult<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let existing = crate::reader::ParquetReader::new().read_perpetual_context_partition(
-        path,
-        &contexts[0].symbol,
-        &Default::default(),
-    )?;
-    Ok(contexts.iter().all(|context| {
-        existing.iter().any(|existing| {
-            existing.symbol.id.sid == context.symbol.id.sid
-                && existing.time.0 == context.time.0
-                && existing.funding == context.funding
-                && existing.open_interest == context.open_interest
-                && existing.prev_day_px == context.prev_day_px
-                && existing.day_ntl_vlm == context.day_ntl_vlm
-                && existing.premium == context.premium
-                && existing.oracle_px == context.oracle_px
-                && existing.mark_px == context.mark_px
-                && existing.mid_px == context.mid_px
-                && existing.impact_bid_px == context.impact_bid_px
-                && existing.impact_ask_px == context.impact_ask_px
-                && existing.period == context.period
-        })
-    }))
-}
-
-fn partition_has_all_tick_rows(path: &Path, ticks: &[Tick]) -> LeanResult<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let replacement_sids: Vec<u64> = ticks.iter().map(|tick| tick.symbol.id.sid).collect();
-    let params = QueryParams::new().with_symbols(replacement_sids);
-    let existing =
-        crate::reader::ParquetReader::new().read_tick_partition(path, &ticks[0].symbol, &params)?;
-    let existing_keys: HashSet<TickStorageKey> =
-        existing.iter().map(TickStorageKey::from).collect();
-    Ok(ticks
-        .iter()
-        .map(TickStorageKey::from)
-        .all(|key| existing_keys.contains(&key)))
-}
-
-fn dedupe_trade_bars(bars: &mut Vec<TradeBar>) {
-    let mut seen = HashSet::new();
-    bars.retain(|bar| seen.insert((bar.symbol.id.sid, bar.time.0)));
-}
-
-fn dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
-    let mut seen = HashSet::new();
-    bars.retain(|bar| seen.insert((bar.symbol.id.sid, bar.time.0)));
-}
-
-fn dedupe_perpetual_contexts(contexts: &mut Vec<PerpetualContext>) {
-    let mut seen = HashSet::new();
-    contexts.retain(|context| seen.insert((context.symbol.id.sid, context.time.0)));
-}
-
-fn dedupe_ticks(ticks: &mut Vec<Tick>) {
-    let mut seen = HashSet::new();
-    ticks.retain(|tick| seen.insert(TickStorageKey::from(tick)));
-}
-
-fn sort_trade_bars_for_predicate_pruning(bars: &mut [TradeBar]) {
-    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
-}
-
-fn sort_quote_bars_for_predicate_pruning(bars: &mut [QuoteBar]) {
-    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
-}
-
-fn sort_perpetual_contexts_for_predicate_pruning(contexts: &mut [PerpetualContext]) {
-    contexts.sort_by_key(|context| (context.symbol.id.sid, context.time.0));
-}
-
-fn sort_ticks_for_predicate_pruning(ticks: &mut [Tick]) {
-    ticks.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0, tick.tick_type as u8));
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TickStorageKey {
-    sid: u64,
-    time: i64,
-    tick_type: TickType,
-    value: Decimal,
-    quantity: Decimal,
-    bid_price: Decimal,
-    ask_price: Decimal,
-    bid_size: Decimal,
-    ask_size: Decimal,
-    exchange: Option<String>,
-    sale_condition: Option<String>,
-    suspicious: bool,
-}
-
-impl From<&Tick> for TickStorageKey {
-    fn from(tick: &Tick) -> Self {
-        Self {
-            sid: tick.symbol.id.sid,
-            time: tick.time.0,
-            tick_type: tick.tick_type,
-            value: tick.value,
-            quantity: tick.quantity,
-            bid_price: tick.bid_price,
-            ask_price: tick.ask_price,
-            bid_size: tick.bid_size,
-            ask_size: tick.ask_size,
-            exchange: tick.exchange.clone(),
-            sale_condition: tick.sale_condition.clone(),
-            suspicious: tick.suspicious,
-        }
-    }
 }

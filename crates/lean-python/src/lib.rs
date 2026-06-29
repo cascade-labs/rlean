@@ -1,719 +1,441 @@
-pub mod charting;
-pub mod interrupt;
-pub mod py_adapter;
-pub mod py_charting;
-pub mod py_data;
-pub mod py_framework;
-pub mod py_indicators;
-pub mod py_options;
-pub mod py_orders;
-pub mod py_portfolio;
-pub mod py_qc_algorithm;
-pub mod py_quant_book;
-pub mod py_types;
-pub mod py_universe;
-pub mod report;
-pub mod runner;
-
-use pyo3::prelude::*;
-
-use py_charting::PyChartCollection;
-use py_data::{
-    PyBar, PyCustomData, PyCustomDataPoint, PyDelisting, PyDelistings, PyMarginInterestRate,
-    PyMarginInterestRates, PyPerpetualContext, PyPerpetualContexts, PyQuoteBar, PyQuoteBars,
-    PySlice, PySymbolChangedEvent, PySymbolChangedEvents, PyTick, PyTicks, PyTradeBar, PyTradeBars,
-};
-use py_framework::{
-    PyAccumulativeInsightPcm, PyAdaptiveMakerTakerExecutionModel,
-    PyAggressivePostOnlyExecutionModel, PyAlphaModelBase, PyBlackLittermanPcm,
-    PyConfidenceWeightingPcm, PyConstantAlphaModel, PyEmaCrossAlphaModel, PyEqualWeightingPcm,
-    PyExecutionModelBase, PyHistoricalReturnsAlphaModel, PyImmediateExecutionModel, PyInsight,
-    PyInsightDirection, PyInsightWeightingPcm, PyMacdAlphaModel, PyMakerThenTakerExecutionModel,
-    PyMaxDrawdownPercentPerSecurity, PyMaxDrawdownPercentPortfolio, PyMaxSectorExposureRiskModel,
-    PyMaxSharpeRatioPcm, PyMaxUnrealizedProfitPerSecurity, PyMeanReversionPcm, PyMeanVariancePcm,
-    PyNullExecutionModel, PyNullRiskManagementModel, PyPassiveMakerExecutionModel,
-    PyPearsonCorrelationPairsTradingAlphaModel, PyPortfolioBias, PyPortfolioConstructionModelBase,
-    PyPortfolioTarget, PyRiskManagementModelBase, PyRiskParityPcm, PyRsiAlphaModel,
-    PySpreadExecutionModel, PyStandardDeviationExecutionModel, PyTrailingStopRiskModel,
-    PyVwapExecutionModel,
-};
-use py_indicators::{
-    PyAtr, PyBollingerBands, PyEma, PyIndicatorDataPoint, PyMacd, PyMomp, PyRsi, PySma, PyStd,
-};
-use py_orders::{PyOrderEvent, PyOrderTicket};
-use py_portfolio::{PyPortfolio, PySecurityHolding};
-use py_qc_algorithm::{PyBrokerageModelSecurityInitializer, PyFuncSecuritySeeder, PyQcAlgorithm};
-use py_quant_book::PyQuantBook;
-use py_types::{
-    PyAlgorithmSettings, PyDataNormalizationMode, PyExchangeHours, PyIndicatorResult,
-    PyMovingAverageType, PyOptionSecurity, PyResolution, PySecurity, PySecurityEntry,
-    PySecurityExchange, PySecurityManager, PySymbol,
-};
-use py_universe::{
-    PyDateRule, PyDateRules, PyScheduledUniverse, PySecurityChanges, PyTimeRule, PyTimeRules,
-    PyUniverseSettings,
-};
-
-// ─── Additional enums matching LEAN's Python API ──────────────────────────────
-
-#[pyclass(name = "AccountType", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyAccountType {
-    Margin = 0,
-    Cash = 1,
-}
-
-#[pymethods]
-impl PyAccountType {
-    #[classattr]
-    const MARGIN: Self = Self::Margin;
-    #[classattr]
-    const CASH: Self = Self::Cash;
-}
-
-impl From<PyAccountType> for lean_algorithm::qc_algorithm::AccountType {
-    fn from(value: PyAccountType) -> Self {
-        match value {
-            PyAccountType::Margin => Self::Margin,
-            PyAccountType::Cash => Self::Cash,
-        }
-    }
-}
-
-#[pyclass(name = "BrokerageName", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyBrokerageName {
-    Default = 0,
-    InteractiveBrokersBrokerage = 1,
-    TradierBrokerage = 2,
-    HyperliquidBrokerage = 3,
-}
-
-#[pymethods]
-impl PyBrokerageName {
-    #[classattr]
-    const DEFAULT: Self = Self::Default;
-    #[classattr]
-    const QUANT_CONNECT_BROKERAGE: Self = Self::Default;
-    #[classattr]
-    const INTERACTIVE_BROKERS_BROKERAGE: Self = Self::InteractiveBrokersBrokerage;
-    #[classattr]
-    const TRADIER_BROKERAGE: Self = Self::TradierBrokerage;
-    #[classattr]
-    const HYPERLIQUID_BROKERAGE: Self = Self::HyperliquidBrokerage;
-}
-
-impl From<PyBrokerageName> for lean_algorithm::qc_algorithm::BrokerageName {
-    fn from(value: PyBrokerageName) -> Self {
-        match value {
-            PyBrokerageName::Default => Self::Default,
-            PyBrokerageName::InteractiveBrokersBrokerage => Self::InteractiveBrokersBrokerage,
-            PyBrokerageName::TradierBrokerage => Self::TradierBrokerage,
-            PyBrokerageName::HyperliquidBrokerage => Self::HyperliquidBrokerage,
-        }
-    }
-}
-
-/// LEAN SecurityType enum values.
-#[pyclass(name = "SecurityType", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PySecurityType {
-    Base = 0,
-    Equity = 1,
-    Option = 2,
-    Forex = 3,
-    Future = 4,
-    Cfd = 5,
-    Crypto = 7,
-    Index = 8,
-    IndexOption = 9,
-    CryptoFuture = 11,
-}
-
-#[pymethods]
-impl PySecurityType {
-    #[classattr]
-    const BASE: Self = Self::Base;
-    #[classattr]
-    const EQUITY: Self = Self::Equity;
-    #[classattr]
-    const OPTION: Self = Self::Option;
-    #[classattr]
-    const FOREX: Self = Self::Forex;
-    #[classattr]
-    const FUTURE: Self = Self::Future;
-    #[classattr]
-    const CFD: Self = Self::Cfd;
-    #[classattr]
-    const CRYPTO: Self = Self::Crypto;
-    #[classattr]
-    const INDEX: Self = Self::Index;
-    #[classattr]
-    const INDEX_OPTION: Self = Self::IndexOption;
-    #[classattr]
-    const CRYPTO_FUTURE: Self = Self::CryptoFuture;
-}
-
-/// LEAN TimeInForce enum values.
-#[pyclass(name = "TimeInForce", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyTimeInForce {
-    GoodTilCanceled = 0,
-    Day = 1,
-}
-
-#[pymethods]
-impl PyTimeInForce {
-    #[classattr]
-    const GOOD_TIL_CANCELED: Self = Self::GoodTilCanceled;
-    #[classattr]
-    const GOOD_TIL_CANCELLED: Self = Self::GoodTilCanceled;
-    #[classattr]
-    const GTC: Self = Self::GoodTilCanceled;
-    #[classattr]
-    const DAY: Self = Self::Day;
-}
-
-impl From<PyTimeInForce> for lean_orders::order::TimeInForce {
-    fn from(value: PyTimeInForce) -> Self {
-        match value {
-            PyTimeInForce::GoodTilCanceled => Self::GoodTilCanceled,
-            PyTimeInForce::Day => Self::Day,
-        }
-    }
-}
-
-#[pyclass(name = "Market")]
-pub struct PyMarket;
-
-#[pymethods]
-impl PyMarket {
-    #[classattr]
-    const USA: &'static str = "usa";
-    #[classattr]
-    const BINANCE: &'static str = "binance";
-    #[classattr]
-    const BYBIT: &'static str = "bybit";
-    #[classattr]
-    const COINBASE: &'static str = "coinbase";
-    #[classattr]
-    const KRAKEN: &'static str = "kraken";
-    #[classattr]
-    const HYPERLIQUID: &'static str = "hyperliquid";
-}
-
-#[pyclass(name = "HyperliquidUniverse")]
-pub struct PyHyperliquidUniverse;
-
-#[pymethods]
-impl PyHyperliquidUniverse {
-    #[classattr]
-    const CRYPTO_PERP: &'static str = "CRYPTO_PERP";
-    #[classattr]
-    const CRYPTO_SPOT: &'static str = "CRYPTO_SPOT";
-    #[classattr]
-    const HIP3_XYZ: &'static str = "HIP3_XYZ";
-    #[classattr]
-    const HIP3_TRADING_XYZ: &'static str = "HIP3_XYZ";
-    #[classattr]
-    const HIP3_VNTL: &'static str = "HIP3_VNTL";
-
-    #[staticmethod]
-    fn hip3(dex: &str) -> String {
-        format!(
-            "HIP3_{}",
-            dex.trim()
-                .replace(['-', '.', ':', ' '], "_")
-                .to_ascii_uppercase()
-        )
-    }
-}
-
-/// LEAN OrderType enum values.
-#[pyclass(name = "OrderType", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyOrderType {
-    Market = 0,
-    Limit = 1,
-    StopMarket = 2,
-    StopLimit = 3,
-    MarketOnOpen = 4,
-    MarketOnClose = 5,
-    OptionExercise = 6,
-    LimitIfTouched = 7,
-    ComboMarket = 8,
-    ComboLimit = 9,
-    ComboLegLimit = 10,
-    TrailingStop = 11,
-}
-
-/// LEAN OrderStatus enum values.
-#[pyclass(name = "OrderStatus", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyOrderStatus {
-    New = 0,
-    Submitted = 1,
-    PartiallyFilled = 2,
-    Filled = 3,
-    Canceled = 5,
-    Invalid = 6,
-    CancelPending = 7,
-    UpdateSubmitted = 8,
-}
-
-/// LEAN OrderDirection enum values.
-#[pyclass(name = "OrderDirection", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyOrderDirection {
-    Buy = 0,
-    Sell = 1,
-    Hold = 2,
-}
-
-/// The `AlgorithmImports` Python module — importable as `from AlgorithmImports import *`.
-///
-/// Register before starting the interpreter:
-/// ```rust,ignore
-/// pyo3::append_to_inittab!(AlgorithmImports);
-/// pyo3::Python::initialize();
-/// ```
-///
-/// Then in Python strategies:
-/// ```python
-/// from AlgorithmImports import *
-///
-/// class MyAlgo(QCAlgorithm):
-///     def initialize(self):
-///         self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
-///         self.fast = SimpleMovingAverage(50)
-/// ```
-#[pymodule]
-#[pyo3(name = "AlgorithmImports")]
-pub fn algorithm_imports(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Core types
-    m.add_class::<PyResolution>()?;
-    m.add_class::<PyAlgorithmSettings>()?;
-    m.add_class::<PyUniverseSettings>()?;
-    m.add_class::<PyDateRule>()?;
-    m.add_class::<PyDateRules>()?;
-    m.add_class::<PyTimeRule>()?;
-    m.add_class::<PyTimeRules>()?;
-    m.add_class::<PyScheduledUniverse>()?;
-    m.add_class::<PySecurityChanges>()?;
-    m.add_class::<PyDataNormalizationMode>()?;
-    m.add_class::<PyMovingAverageType>()?;
-    m.add_class::<PySymbol>()?;
-    m.add_class::<PySecurity>()?;
-    m.add_class::<PySecurityEntry>()?;
-    m.add_class::<PySecurityExchange>()?;
-    m.add_class::<PyExchangeHours>()?;
-    m.add_class::<PySecurityManager>()?;
-    m.add_class::<PyIndicatorResult>()?;
-    m.add_class::<PyIndicatorDataPoint>()?;
-
-    // Data
-    m.add_class::<PyTradeBar>()?;
-    m.add_class::<PyTradeBars>()?;
-    m.add_class::<PyBar>()?;
-    m.add_class::<PyQuoteBar>()?;
-    m.add_class::<PyQuoteBars>()?;
-    m.add_class::<PyMarginInterestRate>()?;
-    m.add_class::<PyMarginInterestRates>()?;
-    m.add_class::<PyPerpetualContext>()?;
-    m.add_class::<PyPerpetualContexts>()?;
-    m.add_class::<PyTick>()?;
-    m.add_class::<PyTicks>()?;
-    m.add_class::<PySlice>()?;
-    m.add_class::<PyCustomDataPoint>()?;
-    m.add_class::<PyCustomData>()?;
-    m.add_class::<PyDelisting>()?;
-    m.add_class::<PyDelistings>()?;
-    m.add_class::<PySymbolChangedEvent>()?;
-    m.add_class::<PySymbolChangedEvents>()?;
-
-    // Orders
-    m.add_class::<PyOrderEvent>()?;
-    m.add_class::<PyOrderTicket>()?;
-
-    // Portfolio
-    m.add_class::<PySecurityHolding>()?;
-    m.add_class::<PyPortfolio>()?;
-
-    // Options
-    m.add_class::<py_options::PyOptionRight>()?;
-    m.add_class::<py_options::PyGreeks>()?;
-    m.add_class::<py_options::PyOptionContract>()?;
-    m.add_class::<py_options::PyUnderlying>()?;
-    m.add_class::<py_options::PyOptionChain>()?;
-    m.add_class::<py_options::PyOptionChains>()?;
-    m.add_class::<PyOptionSecurity>()?;
-
-    // Charting
-    m.add_class::<PyChartCollection>()?;
-
-    // Algorithm base class (LEAN name: QCAlgorithm)
-    m.add_class::<PyFuncSecuritySeeder>()?;
-    m.add_class::<PyBrokerageModelSecurityInitializer>()?;
-    m.add_class::<PyQcAlgorithm>()?;
-
-    // Research / notebook
-    m.add_class::<PyQuantBook>()?;
-
-    // Indicators (LEAN names)
-    m.add_class::<PySma>()?;
-    m.add_class::<PyEma>()?;
-    m.add_class::<PyRsi>()?;
-    m.add_class::<PyMacd>()?;
-    m.add_class::<PyBollingerBands>()?;
-    m.add_class::<PyAtr>()?;
-    m.add_class::<PyMomp>()?;
-    m.add_class::<PyStd>()?;
-
-    // Additional enums
-    m.add_class::<PyAccountType>()?;
-    m.add_class::<PyBrokerageName>()?;
-    m.add_class::<PySecurityType>()?;
-    m.add_class::<PyMarket>()?;
-    m.add_class::<PyHyperliquidUniverse>()?;
-    m.add_class::<PyOrderType>()?;
-    m.add_class::<PyOrderStatus>()?;
-    m.add_class::<PyOrderDirection>()?;
-    m.add_class::<PyTimeInForce>()?;
-
-    // ── Insight types ─────────────────────────────────────────────────────────
-    m.add_class::<PyInsightDirection>()?;
-    m.add_class::<PyInsight>()?;
-    m.add_class::<PyPortfolioTarget>()?;
-
-    // ── Algorithm Framework — Base Classes (subclassable) ─────────────────────
-    m.add_class::<PyAlphaModelBase>()?;
-    m.add_class::<PyPortfolioConstructionModelBase>()?;
-    m.add_class::<PyExecutionModelBase>()?;
-    m.add_class::<PyRiskManagementModelBase>()?;
-
-    // ── Algorithm Framework — Alpha Models ────────────────────────────────────
-    m.add_class::<PyConstantAlphaModel>()?;
-    m.add_class::<PyEmaCrossAlphaModel>()?;
-    m.add_class::<PyMacdAlphaModel>()?;
-    m.add_class::<PyRsiAlphaModel>()?;
-    m.add_class::<PyHistoricalReturnsAlphaModel>()?;
-    m.add_class::<PyPearsonCorrelationPairsTradingAlphaModel>()?;
-
-    // ── Algorithm Framework — Portfolio Construction Models ───────────────────
-    m.add_class::<PyPortfolioBias>()?;
-    m.add_class::<PyEqualWeightingPcm>()?;
-    m.add_class::<PyInsightWeightingPcm>()?;
-    m.add_class::<PyMeanVariancePcm>()?;
-    m.add_class::<PyMaxSharpeRatioPcm>()?;
-    m.add_class::<PyBlackLittermanPcm>()?;
-    m.add_class::<PyRiskParityPcm>()?;
-    m.add_class::<PyConfidenceWeightingPcm>()?;
-    m.add_class::<PyAccumulativeInsightPcm>()?;
-    m.add_class::<PyMeanReversionPcm>()?;
-
-    // ── Algorithm Framework — Execution Models ────────────────────────────────
-    m.add_class::<PyImmediateExecutionModel>()?;
-    m.add_class::<PyNullExecutionModel>()?;
-    m.add_class::<PyVwapExecutionModel>()?;
-    m.add_class::<PySpreadExecutionModel>()?;
-    m.add_class::<PyPassiveMakerExecutionModel>()?;
-    m.add_class::<PyAdaptiveMakerTakerExecutionModel>()?;
-    m.add_class::<PyMakerThenTakerExecutionModel>()?;
-    m.add_class::<PyAggressivePostOnlyExecutionModel>()?;
-    m.add_class::<PyStandardDeviationExecutionModel>()?;
-
-    // ── Algorithm Framework — Risk Management Models ──────────────────────────
-    m.add_class::<PyNullRiskManagementModel>()?;
-    m.add_class::<PyMaxDrawdownPercentPerSecurity>()?;
-    m.add_class::<PyTrailingStopRiskModel>()?;
-    m.add_class::<PyMaxSectorExposureRiskModel>()?;
-    m.add_class::<PyMaxDrawdownPercentPortfolio>()?;
-    m.add_class::<PyMaxUnrealizedProfitPerSecurity>()?;
-
-    Ok(())
-}
-
-/// Backward compatibility alias — `lean_rust` was the old module name.
-/// Keep this so existing internal code that calls `pyo3::append_to_inittab!(lean_rust)`
-/// still compiles, though new code should use `AlgorithmImports`.
-pub use algorithm_imports as AlgorithmImports;
-pub use algorithm_imports as lean_rust;
-
-#[cfg(test)]
-pub(crate) mod test_python {
-    use super::AlgorithmImports;
-    use std::sync::Once;
-
-    static INIT: Once = Once::new();
-
-    pub(crate) fn init() {
-        INIT.call_once(|| {
-            pyo3::append_to_inittab!(AlgorithmImports);
-            pyo3::Python::initialize();
-        });
-    }
-}
+include!(concat!(env!("OUT_DIR"), "/python_lib.rs"));
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use pyo3::prelude::*;
 
-    /// Integration test: verify that the AlgorithmImports module exposes the
-    /// correct LEAN-compatible API surface from Python.
-    #[test]
-    fn test_algorithm_imports_api() {
+    fn run_python(code: &str) {
         crate::test_python::init();
-
         Python::attach(|py| {
-            // Test 1: documented Python Resolution aliases are accessible.
-            let result = py.run(
-                c"
-from AlgorithmImports import Resolution
-assert Resolution.DAILY is not None, 'Resolution.DAILY must be accessible'
-assert Resolution.Daily == Resolution.DAILY, 'Resolution.Daily remains a compatibility alias'
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "Resolution API test failed: {:?}", result);
-
-            // Test 2: SimpleMovingAverage(50) creates an indicator
-            let result = py.run(
-                c"
-from AlgorithmImports import SimpleMovingAverage
-sma = SimpleMovingAverage(50)
-assert sma is not None, 'SimpleMovingAverage(50) must not be None'
-assert not sma.is_ready, 'new SMA should not be ready'
-",
-                None,
-                None,
-            );
-            assert!(
-                result.is_ok(),
-                "SimpleMovingAverage creation test failed: {:?}",
-                result
-            );
-
-            // Test 3: .update(datetime, value) works with time arg
-            let result = py.run(
-                c"
-import datetime
-from AlgorithmImports import SimpleMovingAverage
-sma = SimpleMovingAverage(3)
-# Feed 3 values with datetime arg (LEAN API: update(time, value))
-for i in range(1, 4):
-    sma.update(datetime.datetime.now(), float(i * 10))
-assert sma.is_ready, 'SMA with period=3 should be ready after 3 updates'
-",
-                None,
-                None,
-            );
-            assert!(
-                result.is_ok(),
-                "SMA update(time, value) test failed: {:?}",
-                result
-            );
-
-            // Test 4: .current.value returns a float
-            let result = py.run(
-                c"
-import datetime
-from AlgorithmImports import SimpleMovingAverage
-sma = SimpleMovingAverage(3)
-for i in range(1, 4):
-    sma.update(datetime.datetime.now(), float(i * 10))
-val = sma.current.value
-assert isinstance(val, float), 'current.value must be float, got {}'.format(type(val))
-assert val > 0, 'current.value must be positive, got {}'.format(val)
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), ".current.value test failed: {:?}", result);
-
-            // Test 5: QCAlgorithm is exposed (not QcAlgorithm)
-            let result = py.run(
-                c"
-from AlgorithmImports import QCAlgorithm
-assert QCAlgorithm is not None, 'QCAlgorithm must be accessible'
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "QCAlgorithm name test failed: {:?}", result);
-
-            // Test 6: documented LEAN portfolio aliases are present.
-            let result = py.run(
-                c"
-from AlgorithmImports import QCAlgorithm
-algorithm = QCAlgorithm()
-assert algorithm.portfolio.invested is False
-assert algorithm.portfolio.hold_stock is False
-assert algorithm.portfolio.is_invested is False
-",
-                None,
-                None,
-            );
-            assert!(
-                result.is_ok(),
-                "Portfolio API alias test failed: {:?}",
-                result
-            );
-
-            // Test 7: PortfolioTarget is exposed with LEAN constructor/tag overloads.
-            let result = py.run(
-                c"
-from AlgorithmImports import PortfolioTarget, Symbol
-spy = Symbol.Create('SPY')
-target = PortfolioTarget(spy, 0, 'orthogonal')
-assert target.Symbol == spy
-assert target.Quantity == 0
-assert target.Tag == 'orthogonal'
-pct_target = PortfolioTarget.Percent(None, spy, 0.25, 'orthogonal')
-assert pct_target.Symbol == spy
-assert pct_target.Tag == 'orthogonal'
-snake_target = PortfolioTarget.percent(None, spy, 0.10, 'snake')
-assert snake_target.Tag == 'snake'
-",
-                None,
-                None,
-            );
-            assert!(
-                result.is_ok(),
-                "PortfolioTarget API test failed: {:?}",
-                result
-            );
-
-            // Test 8: All expected LEAN indicator names are present
-            let result = py.run(
-                c"
-from AlgorithmImports import (
-    SimpleMovingAverage,
-    ExponentialMovingAverage,
-    RelativeStrengthIndex,
-    MovingAverageConvergenceDivergence,
-    BollingerBands,
-    AverageTrueRange,
-)
-assert SimpleMovingAverage is not None
-assert ExponentialMovingAverage is not None
-assert RelativeStrengthIndex is not None
-assert MovingAverageConvergenceDivergence is not None
-assert BollingerBands is not None
-assert AverageTrueRange is not None
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "Indicator names test failed: {:?}", result);
-
-            // Test 9: All expected LEAN OrderEvent properties are present
-            let result = py.run(
-                c"
-from AlgorithmImports import OrderEvent, OrderStatus, OrderDirection
-
-expected_props = [
-    'order_id', 'id', 'symbol', 'utc_time', 'status', 'direction',
-    'fill_price', 'fill_price_currency', 'fill_quantity',
-    'absolute_fill_quantity', 'quantity', 'is_assignment', 'is_in_the_money',
-    'message', 'is_fill', 'order_fee', 'limit_price', 'stop_price',
-    'trigger_price', 'trailing_amount', 'trailing_as_percentage',
-]
-for prop in expected_props:
-    assert hasattr(OrderEvent, prop), f'OrderEvent missing property: {prop}'
-
-assert hasattr(OrderStatus, 'New')
-assert hasattr(OrderStatus, 'Submitted')
-assert hasattr(OrderStatus, 'PartiallyFilled')
-assert hasattr(OrderStatus, 'Filled')
-assert hasattr(OrderStatus, 'Canceled')
-
-assert hasattr(OrderDirection, 'Buy')
-assert hasattr(OrderDirection, 'Sell')
-assert hasattr(OrderDirection, 'Hold')
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "OrderEvent API test failed: {:?}", result);
-
-            // Test 10: TimeInForce is exposed and accepted by order helpers.
-            let result = py.run(
-                c"
-from AlgorithmImports import QCAlgorithm, BrokerageName, OrderStatus, OrderTicket, Resolution, TimeInForce
-
-algorithm = QCAlgorithm()
-algorithm.set_brokerage_model(BrokerageName.TRADIER_BROKERAGE)
-spy = algorithm.add_equity('SPY', Resolution.DAILY).symbol
-ticket = algorithm.market_order(spy, 1, TimeInForce.DAY)
-limit_ticket = algorithm.limit_order(spy, 1, 500, 'gtc')
-extended_ticket = algorithm.market_order(spy, 1, TimeInForce.DAY, outside_regular_trading_hours=True)
-
-assert isinstance(ticket, OrderTicket)
-assert ticket.status == OrderStatus.New
-assert extended_ticket.status == OrderStatus.Invalid
-assert limit_ticket.update_limit_price(501, 'adjusted') is True
-assert limit_ticket.limit_price == 501.0
-assert limit_ticket.tag == 'adjusted'
-assert ticket.cancel('test cancel') is True
-assert ticket.status == OrderStatus.CancelPending
-assert hasattr(TimeInForce, 'DAY')
-assert hasattr(TimeInForce, 'GTC')
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "TimeInForce API test failed: {:?}", result);
-
-            // Test 11: security identity and market-hours API surface mirrors LEAN names.
-            let result = py.run(
-                c"
-import datetime
-from AlgorithmImports import *
-algorithm = QCAlgorithm()
-spy = Symbol.Create('SPY', SecurityType.EQUITY, Market.USA)
-assert spy.Value == 'SPY'
-assert SecurityType.EQUITY == SecurityType.Equity
-assert SecurityType.INDEX_OPTION == SecurityType.IndexOption
-assert Market.USA == 'usa'
-option = Symbol.CreateOptionOsi('SPY', 450, 20250117, OptionRight.Call)
-assert option.Value == 'SPY250117C00450000'
-spx = Symbol.Create('SPX', SecurityType.INDEX, Market.USA)
-index_option = Symbol.CreateIndexOptionOsi(spx, 4500, '2025-01-17', 'put', 'European')
-assert index_option.Value == 'SPX250117P04500000'
-security = algorithm.AddEquity('SPY', Resolution.Minute)
-assert algorithm.Securities.ContainsKey(spy)
-assert algorithm.AddOptionContract(index_option, Resolution.Minute).Value == index_option.Value
-assert security.Exchange.Hours.IsOpen(
-    datetime.datetime(2022, 1, 3, 10, 0),
-    datetime.datetime(2022, 1, 3, 10, 1),
-    False,
-)
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "Security API test failed: {:?}", result);
-
-            // Test 12: universe selection API surface mirrors LEAN names.
-            let result = py.run(
-                c"
-from AlgorithmImports import *
-algorithm = QCAlgorithm()
-algorithm.universe_settings.resolution = Resolution.HOUR
-assert algorithm.UniverseSettings.Resolution == Resolution.HOUR
-u = ScheduledUniverse(algorithm.DateRules.EveryDay(), algorithm.TimeRules.At(12, 0), lambda time: ['SPY'])
-algorithm.AddUniverse(u)
-algorithm.AddUniverse('hourly', Resolution.HOUR, lambda time: ['AAPL'])
-algorithm.AddUniverse('tradealert', 'snapshot', Resolution.Daily, lambda points: ['SPY'])
-changes = SecurityChanges()
-assert changes.added_securities == []
-assert changes.AddedSecurities == []
-",
-                None,
-                None,
-            );
-            assert!(result.is_ok(), "Universe API test failed: {:?}", result);
+            let code = std::ffi::CString::new(code).unwrap();
+            py.run(code.as_c_str(), None, None).unwrap();
         });
+    }
+
+    #[test]
+    fn algorithm_imports_exposes_expected_sdk_surface() {
+        run_python(
+            r#"
+from AlgorithmImports import (
+    QCAlgorithm,
+    Symbol,
+    Resolution,
+    SecurityType,
+    OrderStatus,
+    OptionRight,
+    UniverseSettings,
+    ChartCollection,
+)
+
+assert QCAlgorithm is not None
+assert Symbol is not None
+assert Resolution.Daily is not None
+assert SecurityType.Equity is not None
+assert OrderStatus.Canceled is not None
+assert OptionRight.Put is not None
+assert UniverseSettings is not None
+assert ChartCollection is not None
+"#,
+        );
+    }
+
+    #[test]
+    fn generated_api_is_snake_case_not_csharp_case() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+algo = QCAlgorithm()
+assert hasattr(algo, "set_cash"), "missing set_cash"
+assert hasattr(algo, "add_equity"), "missing add_equity"
+assert hasattr(algo, "market_order"), "missing market_order"
+assert hasattr(algo, "history"), "missing history"
+
+portfolio = algo.portfolio
+assert hasattr(portfolio, "total_portfolio_value")
+assert hasattr(portfolio, "hold_stock")
+
+spy = algo.add_equity("SPY", Resolution.Daily).symbol
+ticket = algo.market_order(spy, 1.0, None, False)
+assert hasattr(ticket, "average_fill_price")
+assert hasattr(ticket, "stop_price")
+"#,
+        );
+    }
+
+    #[test]
+    fn generated_algorithm_history_binding_is_exposed() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution, Symbol
+
+algo = QCAlgorithm()
+spy = Symbol.create_equity("SPY", None)
+assert hasattr(algo, "history"), "missing history"
+history = algo.history(spy, 1, Resolution.Daily)
+assert isinstance(history, dict)
+"#,
+        );
+    }
+
+    #[test]
+    fn algorithm_parameters_are_available_from_python() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm
+
+algo = QCAlgorithm()
+assert algo.get_parameter("missing", "fallback") == "fallback"
+assert algo.get_parameter("missing", None) is None
+algo.set_parameter("lookback", "63")
+assert algo.get_parameter("lookback", None) == "63"
+"#,
+        );
+    }
+
+    #[test]
+    fn algorithm_cash_security_and_order_helpers_work_from_python() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution, TimeInForce
+
+algo = QCAlgorithm()
+algo.set_cash(12345.67)
+assert abs(algo.cash - 12345.67) < 1e-9
+assert abs(algo.portfolio.cash - 12345.67) < 1e-9
+assert abs(algo.portfolio.total_portfolio_value - 12345.67) < 1e-9
+
+algo.add_cash(54.33)
+assert abs(algo.cash - 12400.0) < 1e-9
+
+security = algo.add_equity("SPY", Resolution.Daily)
+spy = security.symbol
+assert spy.value == "SPY"
+assert spy.ticker == "SPY"
+assert algo.has_security(spy)
+assert algo.portfolio[spy].invested is False
+
+market = algo.market_order(spy, 10.0, TimeInForce.Day, False)
+assert market.symbol.value == "SPY"
+assert abs(market.quantity - 10.0) < 1e-9
+
+limit = algo.limit_order(spy, -5.0, 401.25, None, True, False)
+assert abs(limit.quantity + 5.0) < 1e-9
+assert abs(limit.limit_price - 401.25) < 1e-9
+
+stop = algo.stop_market_order(spy, 3.0, 399.5, None, False)
+assert abs(stop.quantity - 3.0) < 1e-9
+assert abs(stop.stop_price - 399.5) < 1e-9
+"#,
+        );
+    }
+
+    #[test]
+    fn market_order_accepts_lean_default_arguments_from_python() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+algo = QCAlgorithm()
+option = algo.add_option("SPY", Resolution.Daily)
+symbol = option.symbol
+ticket = algo.market_order(symbol, -1.0)
+assert ticket.symbol == symbol
+assert abs(ticket.quantity + 1.0) < 1e-9
+"#,
+        );
+    }
+
+    #[test]
+    fn enum_aliases_and_sdk_objects_match_python_parity() {
+        run_python(
+            r#"
+from AlgorithmImports import (
+    ChartCollection,
+    OptionRight,
+    OrderStatus,
+    Resolution,
+    Symbol,
+    UniverseSettings,
+)
+
+assert Resolution.Daily == Resolution.DAILY
+assert OptionRight.Put == OptionRight.PUT
+assert OrderStatus.Canceled == OrderStatus.CANCELED
+
+settings = UniverseSettings()
+settings.set_resolution(Resolution.Hour)
+assert settings.resolution == Resolution.Hour
+
+spy = Symbol.create_equity("spy", None)
+assert spy.value == "SPY"
+assert spy.ticker == "SPY"
+
+charts = ChartCollection()
+charts.plot("Strategy", "Equity", "2024-01-01", 100.0)
+assert hasattr(charts, "plot")
+assert not hasattr(charts, "Plot")
+"#,
+        );
+    }
+
+    #[test]
+    fn symbols_compare_and_hash_by_lean_identity_from_python() {
+        run_python(
+            r#"
+from AlgorithmImports import Insight, InsightDirection, Symbol
+
+spy_a = Symbol.create_equity("spy", None)
+spy_b = Symbol.create_equity("SPY", None)
+qqq = Symbol.create_equity("QQQ", None)
+
+assert spy_a == spy_b
+assert not (spy_a != spy_b)
+assert spy_a != qqq
+assert hash(spy_a) == hash(spy_b)
+
+states = {spy_a: "state"}
+assert states[spy_b] == "state"
+assert spy_b in {spy_a}
+
+insight = Insight.Price(spy_b, 1, InsightDirection.Up)
+assert insight.symbol == spy_a
+assert insight.symbol in {spy_a}
+"#,
+        );
+    }
+
+    #[test]
+    fn lean_indicator_helper_methods_are_exposed_in_snake_case() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution, MovingAverageType
+
+algo = QCAlgorithm()
+spy = algo.add_equity("SPY", Resolution.Daily).symbol
+vix = algo.add_data("cboe_vix", "VIX", Resolution.Daily).symbol
+assert vix.value == "VIX"
+assert algo.has_security(vix)
+option = algo.add_option("SPY", Resolution.Daily)
+assert option.symbol is not None
+option.set_filter(-10, 10, 20, 45)
+assert hasattr(option, "set_filter")
+
+for name in [
+    "sma",
+    "ema",
+    "rsi",
+    "momp",
+    "std",
+    "bb",
+    "macd",
+    "identity",
+    "register_indicator",
+    "warm_up_indicator",
+]:
+    assert hasattr(algo, name), f"missing QCAlgorithm.{name}"
+
+for csharp_name in ["SMA", "EMA", "RSI", "MOMP", "STD", "BB", "MACD", "RegisterIndicator"]:
+    assert not hasattr(algo, csharp_name), f"unexpected C# casing {csharp_name}"
+
+sma = algo.sma(spy, 14, Resolution.Daily)
+ema = algo.ema(spy, 14, Resolution.Daily)
+rsi = algo.rsi(spy, 14, MovingAverageType.Wilders, Resolution.Daily)
+momp = algo.momp(spy, 14, Resolution.Daily)
+std = algo.std(spy, 14, Resolution.Daily)
+assert sma is not None
+assert ema is not None
+assert rsi is not None
+assert momp is not None
+assert std is not None
+algo.set_warm_up(3, Resolution.Daily)
+"#,
+        );
+    }
+
+    #[test]
+    fn insight_price_accepts_timedelta_and_weight() {
+        run_python(
+            r#"
+from datetime import timedelta
+from AlgorithmImports import Insight, InsightDirection, Resolution, QCAlgorithm
+
+algo = QCAlgorithm()
+sym = algo.add_equity("SPY", Resolution.Daily).symbol
+insight = Insight.price(
+    sym,
+    timedelta(days=21),
+    InsightDirection.Up,
+    0.05,
+    1.0,
+    "test_model",
+    None,
+)
+assert insight.magnitude == 0.05
+assert insight.source_model == "test_model"
+assert insight.direction == InsightDirection.Up
+"#,
+        );
+    }
+
+    #[test]
+    fn framework_registration_helpers_are_snake_case() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm, AlphaModel, EqualWeightingPortfolioConstructionModel, ImmediateExecutionModel, NullRiskManagementModel
+
+class DummyAlpha(AlphaModel):
+    def Update(self, algorithm, data):
+        return []
+
+algo = QCAlgorithm()
+alpha = DummyAlpha()
+algo.add_alpha(alpha)
+algo.set_portfolio_construction(EqualWeightingPortfolioConstructionModel())
+algo.set_execution(ImmediateExecutionModel())
+algo.set_risk_management(NullRiskManagementModel())
+assert hasattr(algo, "insights")
+assert hasattr(algo, "securities")
+assert hasattr(algo, "settings")
+assert not hasattr(algo, "AddAlpha")
+assert not hasattr(algo, "SetPortfolioConstruction")
+"#,
+        );
+    }
+
+    #[test]
+    fn framework_model_factories_are_available_from_python() {
+        run_python(
+            r#"
+from AlgorithmImports import (
+    InsightWeightingPortfolioConstructionModel,
+    EqualWeightingPortfolioConstructionModel,
+    MeanVarianceOptimizationPortfolioConstructionModel,
+    MaximumSharpeRatioPortfolioConstructionModel,
+    ImmediateExecutionModel,
+    NullExecutionModel,
+    VWAPExecutionModel,
+    StandardDeviationExecutionModel,
+    NullRiskManagementModel,
+    MaximumDrawdownPercentPerSecurity,
+    TrailingStopRiskManagementModel,
+    ConstantAlphaModel,
+    EmaCrossAlphaModel,
+    HistoricalReturnsAlphaModel,
+    MacdAlphaModel,
+    RsiAlphaModel,
+)
+
+models = [
+    InsightWeightingPortfolioConstructionModel(),
+    EqualWeightingPortfolioConstructionModel(),
+    MeanVarianceOptimizationPortfolioConstructionModel(),
+    MaximumSharpeRatioPortfolioConstructionModel(),
+    ImmediateExecutionModel(),
+    NullExecutionModel(),
+    VWAPExecutionModel(),
+    StandardDeviationExecutionModel(20, 2.0),
+    NullRiskManagementModel(),
+    MaximumDrawdownPercentPerSecurity(0.05),
+    TrailingStopRiskManagementModel(0.1),
+    ConstantAlphaModel("up", 1, 0.01),
+    EmaCrossAlphaModel(12, 26, 1),
+    HistoricalReturnsAlphaModel(20, 1),
+    MacdAlphaModel(12, 26, 9, 1),
+    RsiAlphaModel(14, 1),
+]
+assert all(model is not None for model in models)
+"#,
+        );
+    }
+
+    #[test]
+    fn framework_and_lifecycle_hooks_are_python_override_points() {
+        run_python(
+            r#"
+from AlgorithmImports import QCAlgorithm
+
+class Strategy(QCAlgorithm):
+    def initialize(self):
+        self.initialized = True
+
+    def on_data(self, slice):
+        self.last_slice = slice
+
+    def on_warmup_finished(self):
+        self.warmup_finished = True
+
+    def on_end_of_day(self, symbol=None):
+        self.eod_symbol = symbol
+
+    def on_end_of_algorithm(self):
+        self.ended = True
+
+    def on_order_event(self, order_event):
+        self.last_order_event = order_event
+
+    def on_securities_changed(self, changes):
+        self.last_changes = changes
+
+    def on_margin_call(self, requests):
+        return requests
+
+    def on_margin_call_warning(self):
+        self.margin_warning = True
+
+    def on_framework_data(self, slice):
+        self.framework_slice = slice
+
+    def on_assignment_order_event(self, assignment_event):
+        self.assignment_event = assignment_event
+
+    def on_otm_expiry(self, expiry_event):
+        self.expiry_event = expiry_event
+
+strategy = Strategy()
+for name in [
+    "initialize",
+    "on_data",
+    "on_warmup_finished",
+    "on_end_of_day",
+    "on_end_of_algorithm",
+    "on_order_event",
+    "on_securities_changed",
+    "on_margin_call",
+    "on_margin_call_warning",
+    "on_framework_data",
+    "on_assignment_order_event",
+    "on_otm_expiry",
+]:
+    assert hasattr(strategy, name), f"missing lifecycle hook {name}"
+"#,
+        );
+    }
+
+    #[test]
+    fn quantbook_research_surface_matches_lean_python_names() {
+        run_python(
+            r#"
+from AlgorithmImports import QuantBook, Resolution
+
+qb = QuantBook()
+for name in [
+    "set_start_date",
+    "set_end_date",
+    "add_equity",
+    "add_option",
+    "history",
+    "history_range",
+    "indicator",
+    "indicator_frame",
+    "option_chain",
+    "get_last_price",
+]:
+    assert hasattr(qb, name), f"missing QuantBook.{name}"
+
+assert not hasattr(qb, "SetStartDate")
+assert not hasattr(qb, "History")
+"#,
+        );
     }
 }

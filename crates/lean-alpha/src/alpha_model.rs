@@ -10,8 +10,7 @@ pub trait IAlphaModel: Send + Sync {
     fn update(&mut self, slice: &Slice, securities: &[Symbol]) -> Vec<Insight>;
 
     /// Called when securities are added to or removed from the universe.
-    #[allow(unused_variables)]
-    fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {}
+    fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}
 
     /// Human-readable name for this model.
     fn name(&self) -> &str {

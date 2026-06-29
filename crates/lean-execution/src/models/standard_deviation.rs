@@ -55,7 +55,7 @@ impl StandardDeviationExecutionModel {
 
         let window = self
             .prices
-            .entry(security.symbol.value.clone())
+            .entry(security.symbol.value.to_string())
             .or_default();
         window.push_back(security.price);
         while window.len() > self.period {
@@ -138,7 +138,7 @@ impl IExecutionModel for StandardDeviationExecutionModel {
 
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -232,8 +232,8 @@ impl IExecutionModel for StandardDeviationExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
-            self.prices.remove(&sym.value);
+            self.targets.remove(sym.value.as_ref());
+            self.prices.remove(sym.value.as_ref());
         }
     }
 

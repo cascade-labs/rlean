@@ -1,6 +1,6 @@
 use lean_core::{DataNormalizationMode, DateTime, SecurityType, Symbol};
 use lean_data::{QuoteBar, TradeBar};
-use lean_storage::{FactorFileEntry, ParquetReader, PathResolver};
+use lean_storage::{FactorFileEntry, IcebergStore};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
@@ -17,17 +17,31 @@ pub fn price_scale_frontier(time: DateTime, end_time: DateTime) -> chrono::Naive
     time_date
 }
 
-pub fn read_factor_rows(
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    symbol: &Symbol,
-) -> Vec<FactorFileEntry> {
+pub fn read_factor_rows(store: &IcebergStore, symbol: &Symbol) -> Vec<FactorFileEntry> {
     if !matches!(symbol.security_type(), SecurityType::Equity) {
         return Vec::new();
     }
-    reader
-        .read_factor_file(&resolver.factor_file(symbol.market().as_str(), &symbol.permtick))
+    let store = store.clone();
+    let market = symbol.market().as_str().to_string();
+    let ticker = symbol.permtick.to_string();
+    block_on_background(async move { store.scan_factor_file(&market, &ticker).await })
         .unwrap_or_default()
+}
+
+fn block_on_background<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!(e))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("factor reader worker panicked"))?
 }
 
 pub fn factor_for_entry(rows: &[FactorFileEntry], date: chrono::NaiveDate) -> (f64, f64) {

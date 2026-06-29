@@ -58,8 +58,8 @@ impl PassiveMakerExecutionModel {
     }
 
     pub fn remove_target(&mut self, symbol: &Symbol) {
-        self.targets.remove(&symbol.value);
-        self.states.remove(&symbol.value);
+        self.targets.remove(symbol.value.as_ref());
+        self.states.remove(symbol.value.as_ref());
     }
 
     fn cap_order_quantity(
@@ -234,7 +234,7 @@ impl IExecutionModel for PassiveMakerExecutionModel {
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.value.to_string();
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -409,8 +409,8 @@ impl IExecutionModel for PassiveMakerExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
-            self.states.remove(&sym.value);
+            self.targets.remove(sym.value.as_ref());
+            self.states.remove(sym.value.as_ref());
         }
     }
 
