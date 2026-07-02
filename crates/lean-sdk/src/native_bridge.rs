@@ -266,8 +266,8 @@ impl LifecycleBridge for QcAlgorithmNativeBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_algorithm::qc_algorithm::OptionFilter;
     use lean_algorithm::lifecycle::NoopAlgorithmServices;
+    use lean_algorithm::qc_algorithm::OptionFilter;
     use rust_decimal_macros::dec;
 
     struct QcBackedTestStrategy {
@@ -285,7 +285,9 @@ mod tests {
     }
 
     impl QcAlgorithmStrategy for QcBackedTestStrategy {
-        fn algorithm_state(&self) -> Arc<std::sync::Mutex<lean_algorithm::qc_algorithm::QcAlgorithm>> {
+        fn algorithm_state(
+            &self,
+        ) -> Arc<std::sync::Mutex<lean_algorithm::qc_algorithm::QcAlgorithm>> {
             self.state.clone()
         }
 
@@ -316,7 +318,7 @@ mod tests {
         assert_eq!(bridge.subscriptions().len(), 1);
         let option_subscriptions = bridge.option_subscriptions();
         assert_eq!(option_subscriptions.len(), 1);
-        assert_eq!(option_subscriptions[0].canonical.permtick, "?SPY");
+        assert_eq!(option_subscriptions[0].canonical.permtick.as_ref(), "?SPY");
         assert_eq!(option_subscriptions[0].filter.min_strike_rank, -1);
         assert_eq!(option_subscriptions[0].filter.max_expiry_days, 30);
     }

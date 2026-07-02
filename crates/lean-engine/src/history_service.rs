@@ -364,6 +364,7 @@ mod tests {
     };
     use lean_data_providers::{CustomDataContext, ICustomDataSource};
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -509,6 +510,7 @@ mod tests {
                 uri: self.path.to_string_lossy().into_owned(),
                 transport: CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
+                headers: HashMap::new(),
             })
         }
 

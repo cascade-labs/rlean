@@ -1,5 +1,4 @@
-/// `rlean stubs create` — generate AlgorithmImports.pyi from the same
-/// lean-sdk annotations used to generate the PyO3 AlgorithmImports module.
+/// `rlean stubs create` — install AlgorithmImports.pyi for the PyO3 runtime module.
 use std::path::PathBuf;
 use std::process::Command as SysCommand;
 
@@ -56,14 +55,14 @@ fn run_create(output_override: Option<PathBuf>) -> Result<()> {
         dests
     };
 
-    let stub_content = lean_sdk_pyo3_gen::generate_algorithm_imports_pyi(repo_root()?)?;
+    let stub_content = algorithm_imports_pyi();
 
     for dest in &destinations {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot create directory '{}'", parent.display()))?;
         }
-        std::fs::write(dest, &stub_content)
+        std::fs::write(dest, stub_content)
             .with_context(|| format!("Cannot write stubs to '{}'", dest.display()))?;
         println!("Stubs written: {}", dest.display());
     }
@@ -80,13 +79,8 @@ fn run_create(output_override: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn repo_root() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .map(PathBuf::from)
-        .context("rlean crate should live below crates/rlean")
+fn algorithm_imports_pyi() -> &'static str {
+    include_str!("../../../crates/lean-sdk/AlgorithmImports.pyi")
 }
 
 /// Query the active Python interpreter for the primary site-packages directory.

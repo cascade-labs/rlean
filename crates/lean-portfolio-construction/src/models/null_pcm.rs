@@ -26,7 +26,7 @@ impl IPortfolioConstructionModel for NullPortfolioConstructionModel {
         &mut self,
         _insights: &[InsightForPcm],
         _portfolio_value: Decimal,
-        _prices: &HashMap<String, Decimal>,
+        _prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         vec![]
     }

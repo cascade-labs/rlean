@@ -91,6 +91,18 @@ impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
             .and_then(|source| source.get_source(ticker, date, config))
     }
 
+    fn get_live_points(
+        &self,
+        ticker: &str,
+        utc_time: DateTime,
+        config: &CustomDataConfig,
+        query: &CustomDataQuery,
+    ) -> Option<Vec<lean_data::CustomDataPoint>> {
+        self.get()
+            .ok()
+            .and_then(|source| source.get_live_points(ticker, utc_time, config, query))
+    }
+
     fn live_poll_delay(
         &self,
         ticker: &str,
@@ -127,6 +139,13 @@ impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
         self.get()
             .ok()
             .map(|source| source.requires_mapping())
+            .unwrap_or(false)
+    }
+
+    fn is_parquet_native(&self) -> bool {
+        self.get()
+            .ok()
+            .map(|source| source.is_parquet_native())
             .unwrap_or(false)
     }
 

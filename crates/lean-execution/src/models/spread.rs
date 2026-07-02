@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use crate::execution_model::{
     ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
-    SecurityData,
 };
-use lean_core::{DateTime, Symbol};
+use lean_core::Symbol;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -18,7 +17,7 @@ pub struct SpreadExecutionModel {
     /// Maximum acceptable spread as a fraction of price (default 0.005 = 0.5%)
     pub accepting_spread_percent: Decimal,
     /// Desired target quantity per symbol (ticker -> target quantity).
-    targets: HashMap<String, (Symbol, Decimal)>,
+    targets: HashMap<u64, (Symbol, Decimal)>,
 }
 
 impl SpreadExecutionModel {
@@ -40,21 +39,11 @@ impl IExecutionModel for SpreadExecutionModel {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest> {
-        let open_orders = Vec::new();
-        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
-        self.execute_with_context(targets, &context)
-    }
-
-    fn execute_with_context(
-        &mut self,
-        targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.to_string();
+            let key = target.symbol.id.sid;
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -65,18 +54,18 @@ impl IExecutionModel for SpreadExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let sec = match context.securities.get(&key) {
+            let sec = match context.security(&symbol) {
                 Some(s) => s,
                 None => continue,
             };
 
             if context.actual_holding_delta(sec, target_quantity) == Decimal::ZERO {
-                fulfilled.push(key.clone());
+                fulfilled.push(key);
                 continue;
             }
 
@@ -122,7 +111,7 @@ impl IExecutionModel for SpreadExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(sym.value.as_ref());
+            self.targets.remove(&sym.id.sid);
         }
     }
 

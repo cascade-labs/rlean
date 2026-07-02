@@ -17,6 +17,13 @@ fn make_equity(ticker: &str) -> Symbol {
     Symbol::create_equity(ticker, &Market::new(Market::USA))
 }
 
+fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
+    pairs
+        .iter()
+        .map(|(ticker, price)| (make_equity(ticker).id.sid, *price))
+        .collect()
+}
+
 fn make_insight(symbol: Symbol, direction: InsightDirection, magnitude: f64) -> InsightForPcm {
     InsightForPcm {
         symbol,
@@ -45,7 +52,7 @@ fn warm_up_model(
     n_bars: usize,
 ) {
     for bar in 0..n_bars {
-        let prices: HashMap<String, Decimal> = tickers
+        let prices: HashMap<u64, Decimal> = tickers
             .iter()
             .enumerate()
             .map(|(i, &ticker)| {
@@ -54,7 +61,10 @@ fn warm_up_model(
                 let drift = 0.001 * (i as f64 + 1.0) * bar as f64;
                 let noise = if bar % 3 == 0 { 0.5 } else { -0.5 };
                 let price = base + drift + noise;
-                (ticker.to_uppercase(), Decimal::try_from(price).unwrap())
+                (
+                    make_equity(ticker).id.sid,
+                    Decimal::try_from(price).unwrap(),
+                )
             })
             .collect();
         // Call create_targets to trigger price update (with empty insights)
@@ -85,7 +95,7 @@ fn returns_empty_when_not_enough_history() {
 
     let spy = make_equity("SPY");
     let insights = vec![make_insight(spy.clone(), InsightDirection::Up, 0.05)];
-    let prices = HashMap::from([("SPY".to_string(), dec!(400))]);
+    let prices = make_prices(&[("SPY", dec!(400))]);
 
     // Only 1 price → not enough data
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
@@ -112,10 +122,7 @@ fn bullish_view_produces_positive_weight() {
 
     warm_up_model(&mut model, &["SPY", "AGG"], 50);
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(415)),
-        ("AGG".to_string(), dec!(100)),
-    ]);
+    let prices = make_prices(&[("SPY", dec!(415)), ("AGG", dec!(100))]);
     let insights = vec![
         make_insight(spy.clone(), InsightDirection::Up, 0.10),
         make_insight(agg.clone(), InsightDirection::Flat, 0.0),
@@ -127,7 +134,7 @@ fn bullish_view_produces_positive_weight() {
         "Should produce targets with sufficient history"
     );
 
-    let spy_target = targets.iter().find(|t| t.symbol.value == "SPY");
+    let spy_target = targets.iter().find(|t| t.symbol.value.as_ref() == "SPY");
     assert!(spy_target.is_some(), "SPY should have a target");
     // Bullish insight + LongShort bias → positive quantity
     if let Some(t) = spy_target {
@@ -153,11 +160,7 @@ fn long_only_bias_produces_non_negative_weights() {
 
     warm_up_model(&mut model, &["SPY", "IEF", "GLD"], 50);
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(415)),
-        ("IEF".to_string(), dec!(95)),
-        ("GLD".to_string(), dec!(175)),
-    ]);
+    let prices = make_prices(&[("SPY", dec!(415)), ("IEF", dec!(95)), ("GLD", dec!(175))]);
 
     let insights = vec![
         make_insight(make_equity("SPY"), InsightDirection::Up, 0.08),
@@ -194,11 +197,7 @@ fn target_gross_scales_portfolio_weights() {
 
     warm_up_model(&mut model, &["SPY", "QQQ", "TLT"], 50);
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(415)),
-        ("QQQ".to_string(), dec!(360)),
-        ("TLT".to_string(), dec!(95)),
-    ]);
+    let prices = make_prices(&[("SPY", dec!(415)), ("QQQ", dec!(360)), ("TLT", dec!(95))]);
     let portfolio_value = dec!(100_000);
     let insights = vec![
         make_insight(make_equity("SPY"), InsightDirection::Up, 0.08),
@@ -213,7 +212,7 @@ fn target_gross_scales_portfolio_weights() {
         .iter()
         .map(|target| {
             let quantity: f64 = target.quantity.to_string().parse().unwrap();
-            let price: f64 = prices[&target.symbol.value].to_string().parse().unwrap();
+            let price: f64 = prices[&target.symbol.id.sid].to_string().parse().unwrap();
             (quantity * price / 100_000.0).abs()
         })
         .sum();
@@ -249,10 +248,7 @@ fn multiple_source_models_produce_targets_for_each() {
 
     warm_up_model(&mut model, &["SPY", "TLT"], 50);
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(415)),
-        ("TLT".to_string(), dec!(100)),
-    ]);
+    let prices = make_prices(&[("SPY", dec!(415)), ("TLT", dec!(100))]);
 
     // Two source models each with one view
     let insights = vec![

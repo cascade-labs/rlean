@@ -1,4 +1,3 @@
-use crate::bridge::bind_compat_framework;
 use anyhow::{Context, Result};
 use lean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
 use pyo3::prelude::*;
@@ -31,7 +30,13 @@ pub fn load_strategy_file_with_parameters(
     let instance = if parameters.is_empty() {
         load_strategy_instance(py, &source, filename.as_ref(), &module_name)?
     } else {
-        load_strategy_instance_with_parameters(py, &source, filename.as_ref(), &module_name, parameters)?
+        load_strategy_instance_with_parameters(
+            py,
+            &source,
+            filename.as_ref(),
+            &module_name,
+            parameters,
+        )?
     };
     Ok(PythonStrategyInstance { instance })
 }
@@ -97,20 +102,17 @@ pub fn load_strategy_instance_with_parameters(
         "Algorithm",
         rust_decimal_macros::dec!(100000),
     )));
-    let runtime_context = bind_compat_framework(
-        state.clone(),
-        lean_engine::AlgorithmRuntimeContext::with_history_service(
-            std::sync::Arc::new(lean_algorithm::lifecycle::NullHistoryService),
-            parameters,
-        ),
+    let runtime_context = lean_engine::AlgorithmRuntimeContext::with_history_service(
+        std::sync::Arc::new(lean_algorithm::lifecycle::NullHistoryService),
+        parameters,
     );
     let context = AlgorithmConstructionContext::new_with_runtime_services(
         state,
         std::sync::Arc::new(runtime_context),
     );
-    Ok(AlgorithmHandle::with_default_context(context, || {
+    AlgorithmHandle::with_default_context(context, || {
         load_strategy_instance_inner(py, source, filename, module_name)
-    })?)
+    })
 }
 
 fn load_strategy_instance_inner(

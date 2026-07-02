@@ -1,12 +1,19 @@
+use crate::custom_universe::{
+    custom_universe_resolution, has_custom_universe_selectors, register_custom_universe_selector,
+    run_custom_universe_selections, CustomUniverseSelectorRegistry,
+};
+use crate::engine_framework_registry::EngineFrameworkRegistry;
 use crate::framework::FrameworkState;
 use crate::history_service::{AlgorithmHistoryContext, HistoryService};
 use lean_algorithm::lifecycle::{
     AlgorithmHistoryService, AlgorithmRuntimeServices, AlgorithmServices,
-    RegisteredIndicatorRegistry,
+    CustomUniverseSelectorRegistrationRequest as RegistrationRequest, RegisteredIndicatorRegistry,
 };
-use lean_core::DateTime;
+use lean_algorithm::FrameworkModelRegistry;
+use lean_core::{DateTime, Resolution};
 use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_storage::IcebergStore;
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,6 +24,8 @@ pub struct AlgorithmRuntimeContext {
     runtime_parameters: Arc<RwLock<HashMap<String, String>>>,
     registered_indicators: RegisteredIndicatorRegistry,
     framework: Arc<Mutex<FrameworkState>>,
+    framework_registry: Arc<EngineFrameworkRegistry>,
+    custom_universe_selectors: CustomUniverseSelectorRegistry,
 }
 
 impl AlgorithmRuntimeContext {
@@ -40,11 +49,14 @@ impl AlgorithmRuntimeContext {
         history_service: Arc<dyn AlgorithmHistoryService>,
         runtime_parameters: HashMap<String, String>,
     ) -> Self {
+        let framework = Arc::new(Mutex::new(FrameworkState::default()));
         Self {
             history_service,
             runtime_parameters: Arc::new(RwLock::new(runtime_parameters)),
             registered_indicators: Arc::new(Mutex::new(HashMap::new())),
-            framework: Arc::new(Mutex::new(FrameworkState::default())),
+            framework: framework.clone(),
+            framework_registry: Arc::new(EngineFrameworkRegistry::new(framework)),
+            custom_universe_selectors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -64,8 +76,17 @@ impl AlgorithmRuntimeContext {
         self.framework.clone()
     }
 
+    pub fn framework_registry(&self) -> Arc<dyn FrameworkModelRegistry> {
+        self.framework_registry.clone()
+    }
+
+    pub fn custom_universe_selectors(&self) -> CustomUniverseSelectorRegistry {
+        self.custom_universe_selectors.clone()
+    }
+
     pub fn with_framework(mut self, framework: Arc<Mutex<FrameworkState>>) -> Self {
-        self.framework = framework;
+        self.framework = framework.clone();
+        self.framework_registry = Arc::new(EngineFrameworkRegistry::new(framework));
         self
     }
 
@@ -150,6 +171,63 @@ impl AlgorithmRuntimeServices for AlgorithmRuntimeContext {
 
     fn registered_indicators(&self) -> RegisteredIndicatorRegistry {
         self.registered_indicators()
+    }
+
+    fn framework_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(self.framework())
+    }
+
+    fn framework_registry(&self) -> Option<Arc<dyn FrameworkModelRegistry>> {
+        Some(self.framework_registry())
+    }
+
+    fn custom_universe_registry(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(self.custom_universe_selectors())
+    }
+
+    fn register_custom_universe_selector(&self, registration: RegistrationRequest) {
+        let settings = lean_sdk::universe::UniverseSettings {
+            resolution: registration.settings_resolution,
+            minimum_time_in_universe_secs: registration.minimum_time_in_universe_secs,
+            ..lean_sdk::universe::UniverseSettings::default()
+        };
+        let descriptor = lean_sdk::universe::ScheduledUniverseDescriptor::custom_data(
+            registration.source_type,
+            registration.ticker.clone(),
+            registration.resolution,
+            settings,
+            lean_core::SecurityType::Equity,
+            lean_core::Market::usa(),
+        );
+        register_custom_universe_selector(
+            &self.custom_universe_selectors,
+            registration.ticker.to_ascii_uppercase(),
+            registration.resolution,
+            descriptor,
+            registration.select,
+        );
+    }
+
+    fn run_custom_universe_selections(
+        &self,
+        utc_ns: i64,
+        resolution: Resolution,
+        custom_data: &HashMap<String, Vec<lean_data::CustomDataPoint>>,
+    ) -> Vec<lean_algorithm::lifecycle::UniverseSelection> {
+        run_custom_universe_selections(
+            &self.custom_universe_selectors,
+            utc_ns,
+            resolution,
+            custom_data,
+        )
+    }
+
+    fn has_custom_universe_selectors(&self) -> bool {
+        has_custom_universe_selectors(&self.custom_universe_selectors)
+    }
+
+    fn custom_universe_selector_resolution(&self) -> Option<Resolution> {
+        custom_universe_resolution(&self.custom_universe_selectors)
     }
 }
 

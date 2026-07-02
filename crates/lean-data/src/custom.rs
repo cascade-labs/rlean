@@ -106,6 +106,7 @@ pub enum CustomDataTransport {
 pub enum CustomDataFormat {
     Csv,
     Json,
+    Parquet,
 }
 
 /// Describes where to fetch custom data for a given ticker + date.
@@ -118,6 +119,28 @@ pub struct CustomDataSource {
     pub uri: String,
     pub transport: CustomDataTransport,
     pub format: CustomDataFormat,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+/// Native Parquet custom-data source returned directly by plugins.
+///
+/// This avoids forcing parquet-native providers to pretend each local file or
+/// fetched object is a text/HTTP source. The engine owns decoding into
+/// `CustomDataPoint`s.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomParquetSource {
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub buffers: Vec<Vec<u8>>,
+    pub time_column: Option<String>,
+    pub time_format: Option<String>,
+    pub time_zone: Option<String>,
+    pub end_time_column: Option<String>,
+    pub end_time_offset_nanos: Option<i64>,
+    pub symbol_column: Option<String>,
+    pub value_column: Option<String>,
+    pub value_columns: Vec<String>,
 }
 
 /// A single data point returned by a custom data source.

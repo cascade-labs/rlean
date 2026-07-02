@@ -420,17 +420,8 @@ mod tests {
         let db = MarketHoursDatabase::from_builtin_defaults();
         let spy = Symbol::create_equity("SPY", &Market::usa());
 
-        assert!(db.is_open_date(
-            &spy,
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()
-        ));
-        assert!(!db.is_open_date(
-            &spy,
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
-        ));
-        assert!(!db.is_open_date(
-            &spy,
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 6).unwrap()
-        ));
+        assert!(db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()));
+        assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()));
+        assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 6).unwrap()));
     }
 }

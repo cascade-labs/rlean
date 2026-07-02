@@ -2,38 +2,73 @@
 
 use chrono::NaiveDate;
 use lean_algorithm::qc_algorithm::{OptionFilter, QcAlgorithm};
-use lean_core::{
-    Market, OptionRight, OptionStyle, Price, Resolution, SecurityType, Symbol, SymbolOptionsExt,
-};
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method, sdk_static};
+use lean_core::{Market, Price, Symbol, SymbolOptionsExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
-#[sdk_bind(py_name = "Security")]
+use crate::types::{OptionRight, OptionStyle, Resolution, SecurityType};
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyAnyMethods;
+
+#[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Security"))]
 pub struct SecurityHandle {
     symbol: Symbol,
+    algorithm: Option<Arc<Mutex<QcAlgorithm>>>,
 }
 
 impl SecurityHandle {
     pub fn new(symbol: Symbol) -> Self {
-        Self { symbol }
+        Self {
+            symbol,
+            algorithm: None,
+        }
+    }
+
+    pub fn with_algorithm(symbol: Symbol, algorithm: Arc<Mutex<QcAlgorithm>>) -> Self {
+        Self {
+            symbol,
+            algorithm: Some(algorithm),
+        }
     }
 
     pub fn symbol_inner(&self) -> &Symbol {
         &self.symbol
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> SymbolHandle {
         SymbolHandle::new(self.symbol.clone())
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SecurityHandle {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> SymbolHandle {
+        self.symbol()
+    }
+
+    #[getter(price)]
+    fn py_price(&self) -> f64 {
+        self.algorithm
+            .as_ref()
+            .and_then(|algorithm| read_algorithm_security_price(algorithm, &self.symbol).ok())
+            .unwrap_or(0.0)
+    }
+
+    #[getter(exchange)]
+    fn py_exchange(&self) -> SecurityExchangeView {
+        let hours = lean_core::MarketHoursDatabase::global().exchange_hours(&self.symbol);
+        SecurityExchangeView { hours }
+    }
+}
+
 #[derive(Clone)]
-#[sdk_bind(py_name = "Option")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Option"))]
 pub struct OptionSecurityHandle {
     symbol: Symbol,
     algorithm: Arc<Mutex<QcAlgorithm>>,
@@ -47,13 +82,10 @@ impl OptionSecurityHandle {
     pub fn symbol_inner(&self) -> &Symbol {
         &self.symbol
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> SymbolHandle {
         SymbolHandle::new(self.symbol.clone())
     }
 
-    #[sdk_method]
     pub fn set_filter(
         &self,
         min_strike_rank: i32,
@@ -73,25 +105,89 @@ impl OptionSecurityHandle {
     }
 }
 
-#[sdk_bind(py_name = "SecurityExchange")]
-pub struct SecurityExchangeHandle;
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OptionSecurityHandle {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> SymbolHandle {
+        self.symbol()
+    }
 
-#[sdk_bind(py_name = "SecurityExchangeHours")]
-pub struct ExchangeHoursHandle;
+    #[pyo3(name = "set_filter")]
+    fn py_set_filter(
+        &self,
+        min_strike_rank: i32,
+        max_strike_rank: i32,
+        min_expiry_days: i32,
+        max_expiry_days: i32,
+    ) {
+        self.set_filter(
+            min_strike_rank,
+            max_strike_rank,
+            min_expiry_days,
+            max_expiry_days,
+        );
+    }
+}
 
-#[sdk_bind(py_name = "SecurityManager")]
-pub struct SecurityManagerHandle;
+#[cfg(feature = "python")]
+#[pyo3::pyclass(name = "SecurityExchangeHours")]
+#[derive(Clone)]
+pub struct ExchangeHoursHandle {
+    hours: std::sync::Arc<lean_core::ExchangeHours>,
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ExchangeHoursHandle {
+    #[pyo3(name = "is_open", signature = (start, end=None, extended=None))]
+    fn py_is_open(
+        &self,
+        start: chrono::NaiveDateTime,
+        end: Option<chrono::NaiveDateTime>,
+        extended: Option<bool>,
+    ) -> bool {
+        let _ = extended.unwrap_or(false);
+        match end {
+            None => self.hours.is_open_at_local_naive(start),
+            Some(end) if start == end => self.hours.is_open_at_local_naive(start),
+            Some(end) => {
+                let mut cursor = start;
+                while cursor < end {
+                    if self.hours.is_open_at_local_naive(cursor) {
+                        return true;
+                    }
+                    cursor += chrono::Duration::minutes(1);
+                    if cursor.date() > end.date() {
+                        break;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyclass(name = "SecurityExchange")]
+#[derive(Clone)]
+pub struct SecurityExchangeView {
+    pub hours: std::sync::Arc<lean_core::ExchangeHours>,
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SecurityExchangeView {
+    #[getter(hours)]
+    fn py_hours(&self) -> ExchangeHoursHandle {
+        ExchangeHoursHandle {
+            hours: self.hours.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
-#[sdk_bind(
-    py_name = "Symbol",
-    wraps = "lean_core::Symbol",
-    wrap_constructor = "new",
-    str = "value",
-    repr = "value",
-    hash = "sid",
-    richcmp = "sid"
-)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Symbol"))]
 pub struct SymbolHandle {
     inner: Symbol,
 }
@@ -108,8 +204,6 @@ impl SymbolHandle {
     pub fn inner(&self) -> &Symbol {
         &self.inner
     }
-
-    #[sdk_static]
     pub fn create(
         ticker: String,
         security_type: Option<SecurityType>,
@@ -118,24 +212,18 @@ impl SymbolHandle {
         let market = market.map(Market::new);
         SymbolHandle::new(Symbol::create_with_security_type(
             &ticker,
-            security_type.unwrap_or(SecurityType::Equity),
+            security_type.unwrap_or(SecurityType::Equity).into(),
             market,
         ))
     }
-
-    #[sdk_static]
     pub fn create_equity(ticker: String, market: Option<String>) -> SymbolHandle {
         let market = market.map(Market::new).unwrap_or_else(Market::usa);
         SymbolHandle::new(Symbol::create_equity(&ticker, &market))
     }
-
-    #[sdk_static]
     pub fn create_index(ticker: String, market: Option<String>) -> SymbolHandle {
         let market = market.map(Market::new).unwrap_or_else(Market::usa);
         SymbolHandle::new(Symbol::create_index(&ticker, &market))
     }
-
-    #[sdk_static]
     pub fn create_option_osi(
         underlying: SymbolHandle,
         strike: f64,
@@ -150,13 +238,11 @@ impl SymbolHandle {
             Symbol::equity_underlying_for_option(underlying.inner(), &market),
             strike,
             expiry,
-            right,
-            style.unwrap_or(OptionStyle::American),
+            right.into(),
+            style.unwrap_or(OptionStyle::American).into(),
             &market,
         ))
     }
-
-    #[sdk_static]
     pub fn create_index_option_osi(
         underlying: SymbolHandle,
         strike: f64,
@@ -171,25 +257,114 @@ impl SymbolHandle {
             Symbol::index_underlying_for_option(underlying.inner(), &market),
             strike,
             expiry,
-            right,
-            style.unwrap_or(OptionStyle::American),
+            right.into(),
+            style.unwrap_or(OptionStyle::American).into(),
             &market,
         ))
     }
-
-    #[sdk_getter]
     pub fn value(&self) -> &str {
         &self.inner.value
     }
 
-    #[sdk_getter]
     pub fn ticker(&self) -> &str {
         &self.inner.permtick
     }
 
-    #[sdk_method]
     pub fn sid(&self) -> u64 {
         self.inner.id.sid
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SymbolHandle {
+    #[staticmethod]
+    #[pyo3(signature = (ticker, security_type=None, market=None))]
+    pub fn py_create(
+        ticker: String,
+        security_type: Option<SecurityType>,
+        market: Option<String>,
+    ) -> SymbolHandle {
+        Self::create(ticker, security_type, market)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "create_equity", signature = (ticker, market=None))]
+    pub fn py_create_equity(ticker: String, market: Option<String>) -> SymbolHandle {
+        Self::create_equity(ticker, market)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "create_index", signature = (ticker, market=None))]
+    pub fn py_create_index(ticker: String, market: Option<String>) -> SymbolHandle {
+        Self::create_index(ticker, market)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "create_option_osi", signature = (underlying, strike, expiry, right, style=None, market=None))]
+    pub fn py_create_option_osi(
+        underlying: SymbolHandle,
+        strike: f64,
+        expiry: NaiveDate,
+        right: OptionRight,
+        style: Option<OptionStyle>,
+        market: Option<String>,
+    ) -> SymbolHandle {
+        Self::create_option_osi(underlying, strike, expiry, right, style, market)
+    }
+
+    #[getter(value)]
+    fn py_value(&self) -> &str {
+        self.value()
+    }
+
+    #[getter(ticker)]
+    fn py_ticker(&self) -> &str {
+        self.ticker()
+    }
+
+    #[getter(sid)]
+    fn py_sid(&self) -> u64 {
+        self.sid()
+    }
+
+    fn __str__(&self) -> &str {
+        self.value()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Symbol({})", self.value())
+    }
+
+    fn __hash__(&self) -> isize {
+        let hash = self.sid() as isize;
+        if hash == -1 {
+            -2
+        } else {
+            hash
+        }
+    }
+
+    fn __richcmp__(
+        &self,
+        other: &pyo3::Bound<'_, pyo3::PyAny>,
+        op: pyo3::pyclass::CompareOp,
+    ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+        let Ok(other) = other.extract::<pyo3::PyRef<'_, SymbolHandle>>() else {
+            return Ok(other.py().NotImplemented());
+        };
+        let result = match op {
+            pyo3::pyclass::CompareOp::Eq => self.sid() == other.sid(),
+            pyo3::pyclass::CompareOp::Ne => self.sid() != other.sid(),
+            pyo3::pyclass::CompareOp::Lt => self.sid() < other.sid(),
+            pyo3::pyclass::CompareOp::Le => self.sid() <= other.sid(),
+            pyo3::pyclass::CompareOp::Gt => self.sid() > other.sid(),
+            pyo3::pyclass::CompareOp::Ge => self.sid() >= other.sid(),
+        };
+        Ok(pyo3::types::PyBool::new(other.py(), result)
+            .to_owned()
+            .into_any()
+            .unbind())
     }
 }
 
@@ -216,8 +391,37 @@ impl SecurityLookup {
     }
 }
 
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "SecurityManager"))]
+#[derive(Clone)]
+pub struct SecurityManagerHandle {
+    algorithm: Arc<Mutex<QcAlgorithm>>,
+}
+
+impl SecurityManagerHandle {
+    pub fn new(algorithm: Arc<Mutex<QcAlgorithm>>) -> Self {
+        Self { algorithm }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SecurityManagerHandle {
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, symbol: SymbolHandle) -> SecurityHandle {
+        SecurityHandle::with_algorithm(symbol.into_inner(), self.algorithm.clone())
+    }
+
+    #[pyo3(name = "contains_key")]
+    fn py_contains_key(&self, symbol: SymbolHandle) -> bool {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .contains(&symbol.into_inner())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "AlgorithmSettings")]
 pub struct AlgorithmSettings {
     values: HashMap<String, AlgorithmSettingValue>,
 }
@@ -233,6 +437,82 @@ impl AlgorithmSettings {
             .cloned()
             .unwrap_or(AlgorithmSettingValue::Integer(0))
     }
+}
+
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "AlgorithmSettings"))]
+#[derive(Clone)]
+pub struct AlgorithmSettingsHandle {
+    inner: Arc<Mutex<AlgorithmSettings>>,
+}
+
+impl AlgorithmSettingsHandle {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AlgorithmSettings::default())),
+        }
+    }
+
+    pub fn from_shared(inner: Arc<Mutex<AlgorithmSettings>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Default for AlgorithmSettingsHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl AlgorithmSettingsHandle {
+    #[pyo3(name = "get")]
+    fn py_get(&self, name: String) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+        let value = self.inner.lock().unwrap().get(&name);
+        Python::attach(|py| algorithm_setting_value_to_py(py, value))
+    }
+
+    #[pyo3(name = "set")]
+    fn py_set(&self, name: String, value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<()> {
+        let parsed = algorithm_setting_value_from_py(&value)?;
+        self.inner.lock().unwrap().set(name, parsed);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+fn algorithm_setting_value_to_py(
+    py: Python<'_>,
+    value: AlgorithmSettingValue,
+) -> PyResult<Py<PyAny>> {
+    use pyo3::types::{PyBool, PyString};
+    Ok(match value {
+        AlgorithmSettingValue::Bool(value) => PyBool::new(py, value).to_owned().into_any().unbind(),
+        AlgorithmSettingValue::Integer(value) => value.into_pyobject(py)?.into_any().unbind(),
+        AlgorithmSettingValue::Float(value) => value.into_pyobject(py)?.into_any().unbind(),
+        AlgorithmSettingValue::String(value) => {
+            PyString::new(py, &value).to_owned().into_any().unbind()
+        }
+    })
+}
+
+#[cfg(feature = "python")]
+fn algorithm_setting_value_from_py(value: &Bound<'_, PyAny>) -> PyResult<AlgorithmSettingValue> {
+    if let Ok(value) = value.extract::<bool>() {
+        return Ok(AlgorithmSettingValue::Bool(value));
+    }
+    if let Ok(value) = value.extract::<i64>() {
+        return Ok(AlgorithmSettingValue::Integer(value));
+    }
+    if let Ok(value) = value.extract::<f64>() {
+        return Ok(AlgorithmSettingValue::Float(value));
+    }
+    if let Ok(value) = value.extract::<String>() {
+        return Ok(AlgorithmSettingValue::String(value));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "setting value must be bool, int, float, or str",
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,8 +595,9 @@ pub fn set_algorithm_security_price_from_float(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{OptionRight, OptionStyle};
     use chrono::NaiveDate;
-    use lean_core::{OptionRight, OptionStyle, Resolution, SecurityType};
+    use lean_core::{Resolution, SecurityType};
     use rust_decimal_macros::dec;
 
     #[test]

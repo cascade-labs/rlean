@@ -3,7 +3,6 @@
 use chrono::NaiveDate;
 use lean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol};
 use lean_data::TradeBar;
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method, sdk_new};
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -190,13 +189,12 @@ pub trait ResearchBackend: Send {
 }
 
 #[derive(Clone)]
-#[sdk_bind(py_name = "QuantBook")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "QuantBook"))]
 pub struct ResearchBook {
     backend: Arc<Mutex<Box<dyn ResearchBackend>>>,
 }
 
 impl ResearchBook {
-    #[sdk_new]
     pub fn default_book() -> Self {
         Self::new(Box::new(EmptyResearchBackend::default()))
     }
@@ -207,7 +205,6 @@ impl ResearchBook {
         }
     }
 
-    #[sdk_method]
     pub fn set_start_date(&self, year: i32, month: u32, day: u32) {
         self.backend
             .lock()
@@ -215,17 +212,14 @@ impl ResearchBook {
             .set_start_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_end_date(&self, year: i32, month: u32, day: u32) {
         self.backend.lock().unwrap().set_end_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_data_folder(&self, path: &str) {
         self.backend.lock().unwrap().set_data_folder(path);
     }
 
-    #[sdk_method]
     pub fn set_thetadata_provider(&self, api_token: &str) {
         self.backend
             .lock()
@@ -233,22 +227,18 @@ impl ResearchBook {
             .set_thetadata_provider(api_token);
     }
 
-    #[sdk_method]
     pub fn set_polygon_provider(&self, api_key: &str) {
         self.backend.lock().unwrap().set_polygon_provider(api_key);
     }
 
-    #[sdk_method]
     pub fn add_equity(&self, ticker: &str) -> Symbol {
         self.backend.lock().unwrap().add_equity(ticker)
     }
 
-    #[sdk_method]
     pub fn add_option(&self, ticker: &str) -> Symbol {
         self.backend.lock().unwrap().add_option(ticker)
     }
 
-    #[sdk_method]
     pub fn add_future(&self, ticker: &str) -> Symbol {
         self.backend.lock().unwrap().add_future(ticker)
     }
@@ -278,7 +268,6 @@ impl ResearchBook {
         HistoryFrameView::from_trade_bars(&self.history_count(symbol, bar_count, resolution))
     }
 
-    #[sdk_method]
     pub fn history(&self, ticker: String, bar_count: usize, resolution: Resolution) -> String {
         let _ = self.history_for_symbol(ResearchSymbol::Ticker(ticker), bar_count, resolution);
         String::new()
@@ -317,7 +306,6 @@ impl ResearchBook {
         HistoryFrameView::from_trade_bars(&self.history_range_bars(symbol, resolution, start, end))
     }
 
-    #[sdk_method]
     pub fn history_range(
         &self,
         ticker: String,
@@ -369,7 +357,6 @@ impl ResearchBook {
         )
     }
 
-    #[sdk_method]
     pub fn indicator(
         &self,
         name: &str,
@@ -383,7 +370,6 @@ impl ResearchBook {
         String::new()
     }
 
-    #[sdk_method]
     pub fn indicator_frame(
         &self,
         name: &str,
@@ -414,7 +400,6 @@ impl ResearchBook {
         self.indicator_view(name, &symbol, period, bar_count, resolution)
     }
 
-    #[sdk_method]
     pub fn option_chain(&self, ticker: &str) -> String {
         let _ = self.option_chain_rows(ticker);
         String::new()
@@ -424,7 +409,6 @@ impl ResearchBook {
         self.backend.lock().unwrap().option_chain(ticker)
     }
 
-    #[sdk_method]
     pub fn get_last_price(&self, ticker: String) -> Option<f64> {
         self.get_last_price_for_symbol(ResearchSymbol::Ticker(ticker))
     }
@@ -437,20 +421,98 @@ impl ResearchBook {
     pub fn last_price(&self, symbol: &Symbol) -> Option<f64> {
         self.backend.lock().unwrap().last_price(symbol)
     }
-
-    #[sdk_getter]
     pub fn start_date(&self) -> chrono::NaiveDate {
         self.backend.lock().unwrap().start_date()
     }
-
-    #[sdk_getter]
     pub fn end_date(&self) -> chrono::NaiveDate {
         self.backend.lock().unwrap().end_date()
     }
-
-    #[sdk_getter]
     pub fn security_keys(&self) -> Vec<String> {
         self.backend.lock().unwrap().security_keys()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ResearchBook {
+    #[new]
+    fn py_new() -> Self {
+        Self::default_book()
+    }
+
+    #[pyo3(name = "set_start_date")]
+    fn py_set_start_date(&self, year: i32, month: u32, day: u32) {
+        self.set_start_date(year, month, day);
+    }
+
+    #[pyo3(name = "set_end_date")]
+    fn py_set_end_date(&self, year: i32, month: u32, day: u32) {
+        self.set_end_date(year, month, day);
+    }
+
+    #[pyo3(name = "add_equity")]
+    fn py_add_equity(&self, ticker: String) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.add_equity(&ticker))
+    }
+
+    #[pyo3(name = "add_option")]
+    fn py_add_option(&self, ticker: String) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.add_option(&ticker))
+    }
+
+    #[pyo3(name = "history")]
+    fn py_history(
+        &self,
+        ticker: String,
+        bar_count: usize,
+        resolution: crate::types::Resolution,
+    ) -> String {
+        self.history(ticker, bar_count, resolution.into())
+    }
+
+    #[pyo3(name = "history_range")]
+    fn py_history_range(
+        &self,
+        ticker: String,
+        start: NaiveDate,
+        end: NaiveDate,
+        resolution: crate::types::Resolution,
+    ) -> String {
+        self.history_range(ticker, start, end, resolution.into())
+    }
+
+    #[pyo3(name = "indicator")]
+    fn py_indicator(
+        &self,
+        name: &str,
+        ticker: String,
+        period: usize,
+        bar_count: usize,
+        resolution: crate::types::Resolution,
+    ) -> String {
+        self.indicator(name, ticker, period, bar_count, resolution.into())
+    }
+
+    #[pyo3(name = "indicator_frame")]
+    fn py_indicator_frame(
+        &self,
+        name: &str,
+        ticker: String,
+        period: usize,
+        bar_count: usize,
+        resolution: crate::types::Resolution,
+    ) -> String {
+        self.indicator_frame(name, ticker, period, bar_count, resolution.into())
+    }
+
+    #[pyo3(name = "option_chain")]
+    fn py_option_chain(&self, ticker: &str) -> String {
+        self.option_chain(ticker)
+    }
+
+    #[pyo3(name = "get_last_price")]
+    fn py_get_last_price(&self, ticker: String) -> Option<f64> {
+        self.get_last_price(ticker)
     }
 }
 
@@ -762,7 +824,7 @@ mod tests {
         assert_eq!(book.end_date(), date(2023, 12, 31));
 
         let symbol = book.add_equity("spy");
-        assert_eq!(symbol.value, "SPY");
+        assert_eq!(symbol.value.as_ref(), "SPY");
         assert_eq!(book.security_keys(), vec!["SPY".to_string()]);
 
         let history = book.history_for_symbol(

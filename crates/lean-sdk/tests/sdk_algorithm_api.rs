@@ -1,6 +1,14 @@
+use lean_algorithm::lifecycle::{
+    AlgorithmHistoryService, AlgorithmRuntimeServices, HistoryColumns, NullHistoryService,
+    RegisteredIndicatorRegistry,
+};
+use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{Resolution, SecurityType};
 use lean_orders::order::TimeInForce;
-use lean_sdk::algorithm::AlgorithmHandle;
+use lean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
+use rust_decimal_macros::dec;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 fn assert_close(actual: f64, expected: f64) {
     assert!(
@@ -9,9 +17,45 @@ fn assert_close(actual: f64, expected: f64) {
     );
 }
 
+struct TestRuntimeServices;
+
+impl AlgorithmHistoryService for TestRuntimeServices {
+    fn history(
+        &self,
+        _algorithm: &QcAlgorithm,
+        _symbol: &lean_core::Symbol,
+        _periods: usize,
+        _resolution: Resolution,
+    ) -> HistoryColumns {
+        HistoryColumns::new()
+    }
+}
+
+impl AlgorithmRuntimeServices for TestRuntimeServices {
+    fn history_service(&self) -> Arc<dyn AlgorithmHistoryService> {
+        Arc::new(NullHistoryService)
+    }
+
+    fn runtime_parameters(&self) -> Arc<RwLock<HashMap<String, String>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn registered_indicators(&self) -> RegisteredIndicatorRegistry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+}
+
+fn test_algorithm() -> AlgorithmHandle {
+    let context = AlgorithmConstructionContext::new_with_runtime_services(
+        Arc::new(Mutex::new(QcAlgorithm::new("Algorithm", dec!(100000)))),
+        Arc::new(TestRuntimeServices),
+    );
+    AlgorithmHandle::with_default_context(context, AlgorithmHandle::default_algorithm)
+}
+
 #[test]
 fn algorithm_handle_projects_cash_and_portfolio_like_qc_algorithm() {
-    let algorithm = AlgorithmHandle::default_algorithm();
+    let algorithm = test_algorithm();
 
     assert_close(algorithm.cash(), 100_000.0);
     assert_close(algorithm.portfolio().cash_f64(), 100_000.0);
@@ -28,7 +72,7 @@ fn algorithm_handle_projects_cash_and_portfolio_like_qc_algorithm() {
 
 #[test]
 fn algorithm_handle_adds_and_removes_common_security_types() {
-    let algorithm = AlgorithmHandle::default_algorithm();
+    let algorithm = test_algorithm();
 
     let equity = algorithm.add_equity("spy".to_string(), Resolution::Daily, None);
     let equity_symbol = equity.symbol();
@@ -56,11 +100,11 @@ fn algorithm_handle_adds_and_removes_common_security_types() {
 
 #[test]
 fn algorithm_handle_order_helpers_return_lean_ticket_projections() {
-    let algorithm = AlgorithmHandle::default_algorithm();
+    let algorithm = test_algorithm();
     let security = algorithm.add_equity("spy".to_string(), Resolution::Minute, None);
     let symbol = security.symbol();
 
-    let market = algorithm.market_order(symbol.clone(), 10.0, Some(TimeInForce::Day), false);
+    let market = algorithm.market_order(symbol.clone(), 10.0, Some(TimeInForce::Day), Some(false));
     assert_eq!(market.symbol(), Some(symbol.inner().clone()));
     assert_close(market.quantity(), 10.0);
     assert!(market.order_id() > 0);

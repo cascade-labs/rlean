@@ -8,13 +8,14 @@ use std::sync::{
 use anyhow::{anyhow, Context, Result};
 use arrow::compute;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray, UInt64Array,
 };
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::*;
 use datafusion::prelude::ParquetReadOptions;
+use datafusion::prelude::*;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{
     DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
@@ -29,11 +30,14 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::PartitioningWriter;
-use iceberg::{Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
+    TableCreation, TableIdent,
+};
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_datafusion::IcebergTableProviderFactory;
 use lean_core::{Resolution, SecurityType, Symbol, TickType};
-use lean_data::{CustomDataPoint, MarginInterestRate, QuoteBar, Tick, TradeBar};
+use lean_data::{CustomDataPoint, CustomDataQuery, MarginInterestRate, QuoteBar, Tick, TradeBar};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
@@ -43,7 +47,10 @@ use sqlx::sqlite::Sqlite;
 static APPEND_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::convert;
-use crate::partition_index::{MarketPartitionFields, MarketPartitionIndex};
+use crate::partition_index::{
+    CustomPartitionFields, CustomPartitionIndex, MarketPartitionDayQuery, MarketPartitionFields,
+    MarketPartitionIndex,
+};
 use crate::schema::{self, FactorFileEntry, MapFileEntry, OptionUniverseRow};
 use crate::QueryParams;
 
@@ -68,12 +75,12 @@ pub struct IcebergStore {
     namespace: NamespaceIdent,
     table_contexts: Arc<Mutex<HashMap<String, Arc<IcebergTableContext>>>>,
     partition_indexes: Arc<Mutex<HashMap<String, Arc<MarketPartitionIndex>>>>,
+    custom_partition_indexes: Arc<Mutex<HashMap<String, Arc<CustomPartitionIndex>>>>,
     table_write_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 struct IcebergTableContext {
     ctx: SessionContext,
-    snapshot_id: Option<i64>,
 }
 
 fn is_catalog_commit_conflict(err: &anyhow::Error) -> bool {
@@ -119,6 +126,7 @@ impl IcebergStore {
             namespace: NamespaceIdent::new(NAMESPACE.into()),
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
             partition_indexes: Arc::new(Mutex::new(HashMap::new())),
+            custom_partition_indexes: Arc::new(Mutex::new(HashMap::new())),
             table_write_locks: Arc::new(Mutex::new(HashMap::new())),
         };
         store.ensure_tables().await?;
@@ -312,40 +320,34 @@ impl IcebergStore {
 
     pub async fn market_partition_days(
         &self,
-        table: &str,
-        security_type: SecurityType,
-        market: &str,
-        resolution: Resolution,
-        symbol_sid: u64,
-        day_start: i32,
-        day_end: i32,
+        query: MarketPartitionDayQuery<'_>,
     ) -> Result<BTreeSet<i32>> {
         let cached_index = {
             let indexes = self
                 .partition_indexes
                 .lock()
                 .expect("iceberg partition index cache poisoned");
-            indexes.get(table).cloned()
+            indexes.get(query.table).cloned()
         };
         if let Some(index) = cached_index {
             return Ok(index.days_for(
-                security_type,
-                market,
-                resolution,
-                symbol_sid,
-                day_start,
-                day_end,
+                query.security_type,
+                query.market,
+                query.resolution,
+                query.symbol_sid,
+                query.day_range.start,
+                query.day_range.end,
             ));
         }
 
-        let index = self.market_partition_index(table).await?;
+        let index = self.market_partition_index(query.table).await?;
         Ok(index.days_for(
-            security_type,
-            market,
-            resolution,
-            symbol_sid,
-            day_start,
-            day_end,
+            query.security_type,
+            query.market,
+            query.resolution,
+            query.symbol_sid,
+            query.day_range.start,
+            query.day_range.end,
         ))
     }
 
@@ -367,6 +369,11 @@ impl IcebergStore {
         Ok(())
     }
 
+    pub async fn warm_custom_partition_index(&self) -> Result<()> {
+        self.custom_partition_index().await?;
+        Ok(())
+    }
+
     async fn scan_market_batches(
         &self,
         table: &str,
@@ -384,39 +391,32 @@ impl IcebergStore {
             .ok_or_else(|| anyhow!("market scan requires at least one symbol"))?;
         let day_start = params.predicate.start_day.or(params.predicate.start_time);
         let day_end = params.predicate.end_day.or(params.predicate.end_time);
-        let pruned_file_paths = match (day_start, day_end) {
-            (Some(start), Some(end)) => {
-                let index = self.market_partition_index(table).await?;
-                let start_day = days_since_epoch(start.0);
-                let end_day = days_since_epoch(end.0);
-                symbols_by_sid
-                    .iter()
-                    .flat_map(|(sid, symbol)| {
-                        index.file_paths_for(
-                            symbol.security_type(),
-                            symbol.market().as_str(),
-                            resolution,
-                            *sid,
-                            start_day,
-                            end_day,
-                        )
-                    })
-                    .collect::<BTreeSet<_>>()
-            }
-            _ => BTreeSet::new(),
-        };
-        if day_start.is_some() && day_end.is_some() && pruned_file_paths.is_empty() {
+        let index = self.market_partition_index(table).await?;
+        let start_day = day_start.map(|start| days_since_epoch(start.0));
+        let end_day = day_end.map(|end| days_since_epoch(end.0));
+        let pruned_file_paths = symbols_by_sid
+            .iter()
+            .flat_map(|(sid, symbol)| {
+                index.file_paths_for_range(
+                    symbol.security_type(),
+                    symbol.market().as_str(),
+                    resolution,
+                    *sid,
+                    start_day,
+                    end_day,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if pruned_file_paths.is_empty() {
             return Ok(Vec::new());
         }
         const MAX_ATTEMPTS: usize = 5;
         for attempt in 0..MAX_ATTEMPTS {
-            let mut df = if pruned_file_paths.is_empty() {
-                self.table_df(table).await?
-            } else {
-                self.market_files_df(pruned_file_paths.iter()).await?
-            };
+            let mut df = self.market_files_df(pruned_file_paths.iter()).await?;
             df = df
-                .filter(col("security_type").eq(lit(first.security_type().to_string().to_lowercase())))?
+                .filter(
+                    col("security_type").eq(lit(first.security_type().to_string().to_lowercase())),
+                )?
                 .filter(col("market").eq(lit(first.market().as_str().to_lowercase())))?
                 .filter(col("resolution").eq(lit(resolution.folder_name())))?;
             if let Some(start) = day_start {
@@ -461,6 +461,8 @@ impl IcebergStore {
         if bars.is_empty() {
             return Ok(());
         }
+        let lock = self.table_write_lock(MARKET_TRADE_BARS).await;
+        let _guard = lock.lock().await;
         let bars = self
             .dedupe_trade_bars_for_append(bars, security_type, market, resolution, tick_type)
             .await?;
@@ -474,7 +476,7 @@ impl IcebergStore {
             resolution,
             tick_type,
         )?;
-        self.insert_batch(MARKET_TRADE_BARS, batch).await
+        self.insert_batch_locked(MARKET_TRADE_BARS, batch).await
     }
 
     pub async fn append_trade_bars_unchecked(
@@ -509,6 +511,8 @@ impl IcebergStore {
         if bars.is_empty() {
             return Ok(());
         }
+        let lock = self.table_write_lock(MARKET_QUOTE_BARS).await;
+        let _guard = lock.lock().await;
         let bars = self
             .dedupe_quote_bars_for_append(bars, security_type, market, resolution, tick_type)
             .await?;
@@ -522,7 +526,7 @@ impl IcebergStore {
             resolution,
             tick_type,
         )?;
-        self.insert_batch(MARKET_QUOTE_BARS, batch).await
+        self.insert_batch_locked(MARKET_QUOTE_BARS, batch).await
     }
 
     pub async fn append_quote_bars_unchecked(
@@ -557,6 +561,8 @@ impl IcebergStore {
         if ticks.is_empty() {
             return Ok(());
         }
+        let lock = self.table_write_lock(MARKET_TICKS).await;
+        let _guard = lock.lock().await;
         let ticks = self
             .dedupe_ticks_for_append(ticks, security_type, market, resolution, tick_type)
             .await?;
@@ -570,7 +576,7 @@ impl IcebergStore {
             resolution,
             tick_type,
         )?;
-        self.insert_batch(MARKET_TICKS, batch).await
+        self.insert_batch_locked(MARKET_TICKS, batch).await
     }
 
     async fn dedupe_trade_bars_for_append(
@@ -716,16 +722,22 @@ impl IcebergStore {
         start: chrono::NaiveDate,
         end: chrono::NaiveDate,
     ) -> Result<Vec<CustomDataPoint>> {
+        self.scan_custom_points_range_with_query(source_type, ticker, start, end, None)
+            .await
+    }
+
+    pub async fn scan_custom_points_range_with_query(
+        &self,
+        source_type: &str,
+        ticker: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        query: Option<&CustomDataQuery>,
+    ) -> Result<Vec<CustomDataPoint>> {
         let start_day = days_since_epoch(schema::date_to_ns(start));
         let end_day = days_since_epoch(schema::date_to_ns(end));
         let batches = self
-            .table_df(CUSTOM_POINTS)
-            .await?
-            .filter(col("source_type").eq(lit(source_type.to_lowercase())))?
-            .filter(col("ticker").eq(lit(ticker.to_lowercase())))?
-            .filter(col("day").gt_eq(lit(start_day)))?
-            .filter(col("day").lt_eq(lit(end_day)))?
-            .collect()
+            .scan_custom_points_batches(source_type, ticker, start_day, end_day, query)
             .await?;
         let mut out = Vec::new();
         for batch in &batches {
@@ -741,15 +753,8 @@ impl IcebergStore {
     }
 
     pub async fn has_custom_points_dataset(&self, source_type: &str, ticker: &str) -> Result<bool> {
-        let batches = self
-            .table_df(CUSTOM_POINTS)
-            .await?
-            .filter(col("source_type").eq(lit(source_type.to_lowercase())))?
-            .filter(col("ticker").eq(lit(ticker.to_lowercase())))?
-            .limit(0, Some(1))?
-            .collect()
-            .await?;
-        Ok(batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 0)
+        let index = self.custom_partition_index().await?;
+        Ok(index.has_dataset(source_type, ticker))
     }
 
     pub async fn append_custom_points(
@@ -1257,16 +1262,21 @@ impl IcebergStore {
         }
         let lock = self.table_write_lock(table).await;
         let _guard = lock.lock().await;
+        self.insert_batch_locked(table, batch).await
+    }
+
+    async fn insert_batch_locked(&self, table: &str, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         const MAX_ATTEMPTS: usize = 8;
         for attempt in 0..MAX_ATTEMPTS {
             match self.insert_batch_once(table, &batch).await {
                 Ok(()) => return Ok(()),
                 Err(error) if is_catalog_commit_conflict(&error) && attempt + 1 < MAX_ATTEMPTS => {
                     self.invalidate_table_context(table);
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        10 * (attempt as u64 + 1),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)))
+                        .await;
                 }
                 Err(error) => return Err(error),
             }
@@ -1346,6 +1356,8 @@ impl IcebergStore {
         tx.commit(self.catalog.as_ref()).await?;
         self.merge_data_files_into_partition_index(table, &data_files_for_index)
             .await?;
+        self.merge_data_files_into_custom_partition_index(table, &data_files_for_index)
+            .await?;
         self.table_contexts
             .lock()
             .expect("iceberg table context cache poisoned")
@@ -1365,13 +1377,6 @@ impl IcebergStore {
     }
 
     async fn table_df(&self, table: &str) -> Result<DataFrame> {
-        let current_snapshot = self
-            .catalog
-            .load_table(&self.ident(table))
-            .await?
-            .metadata()
-            .current_snapshot_id();
-
         let cached_context = {
             let contexts = self
                 .table_contexts
@@ -1380,10 +1385,7 @@ impl IcebergStore {
             contexts.get(table).cloned()
         };
         if let Some(cached) = cached_context {
-            if cached.snapshot_id == current_snapshot {
-                return Ok(cached.ctx.table(table).await?);
-            }
-            self.invalidate_table_context(table);
+            return Ok(cached.ctx.table(table).await?);
         }
 
         let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
@@ -1391,8 +1393,6 @@ impl IcebergStore {
             .metadata_location_result()
             .map_err(|err| anyhow!(err))?
             .to_string();
-        let snapshot_id = catalog_table.metadata().current_snapshot_id();
-
         let mut state = SessionStateBuilder::new().with_default_features().build();
         state.table_factories_mut().insert(
             "ICEBERG".to_string(),
@@ -1406,10 +1406,7 @@ impl IcebergStore {
             metadata_location.replace('\'', "''")
         );
         ctx.sql(&sql).await?.collect().await?;
-        let cached = Arc::new(IcebergTableContext {
-            ctx,
-            snapshot_id,
-        });
+        let cached = Arc::new(IcebergTableContext { ctx });
         self.table_contexts
             .lock()
             .expect("iceberg table context cache poisoned")
@@ -1432,9 +1429,6 @@ impl IcebergStore {
     }
 
     async fn market_partition_index(&self, table: &str) -> Result<Arc<MarketPartitionIndex>> {
-        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
-        let snapshot_id = catalog_table.metadata().current_snapshot_id();
-
         let cached_index = {
             let indexes = self
                 .partition_indexes
@@ -1443,11 +1437,11 @@ impl IcebergStore {
             indexes.get(table).cloned()
         };
         if let Some(cached) = cached_index {
-            if cached.snapshot_id == snapshot_id {
-                return Ok(cached);
-            }
+            return Ok(cached);
         }
 
+        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+        let snapshot_id = catalog_table.metadata().current_snapshot_id();
         let mut index = MarketPartitionIndex::new(snapshot_id);
         let default_spec = catalog_table
             .metadata()
@@ -1465,6 +1459,82 @@ impl IcebergStore {
             .expect("iceberg partition index cache poisoned")
             .insert(table.to_string(), index.clone());
         Ok(index)
+    }
+
+    async fn custom_partition_index(&self) -> Result<Arc<CustomPartitionIndex>> {
+        let cached_index = {
+            let indexes = self
+                .custom_partition_indexes
+                .lock()
+                .expect("iceberg custom partition index cache poisoned");
+            indexes.get(CUSTOM_POINTS).cloned()
+        };
+        if let Some(cached) = cached_index {
+            return Ok(cached);
+        }
+
+        let catalog_table = self.catalog.load_table(&self.ident(CUSTOM_POINTS)).await?;
+        let snapshot_id = catalog_table.metadata().current_snapshot_id();
+        let mut index = CustomPartitionIndex::new(snapshot_id);
+        let default_spec = catalog_table
+            .metadata()
+            .default_partition_spec()
+            .as_ref()
+            .clone();
+        let default_fields = CustomPartitionFields::from_spec(&default_spec)?;
+        let mut tasks = catalog_table.scan().build()?.plan_files().await?;
+        while let Some(task) = futures::TryStreamExt::try_next(&mut tasks).await? {
+            index.insert_file_scan_task_with_fields(&task, &default_fields)?;
+        }
+        let index = Arc::new(index);
+        self.custom_partition_indexes
+            .lock()
+            .expect("iceberg custom partition index cache poisoned")
+            .insert(CUSTOM_POINTS.to_string(), index.clone());
+        Ok(index)
+    }
+
+    async fn scan_custom_points_batches(
+        &self,
+        source_type: &str,
+        ticker: &str,
+        start_day: i32,
+        end_day: i32,
+        query: Option<&CustomDataQuery>,
+    ) -> Result<Vec<RecordBatch>> {
+        let source_type = source_type.to_lowercase();
+        let ticker = ticker.to_lowercase();
+        let index = self.custom_partition_index().await?;
+        let pruned_file_paths =
+            index.file_paths_for_range(&source_type, &ticker, Some(start_day), Some(end_day));
+        if pruned_file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        const MAX_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut df = self.market_files_df(pruned_file_paths.iter()).await?;
+            df = df
+                .filter(col("source_type").eq(lit(source_type.clone())))?
+                .filter(col("ticker").eq(lit(ticker.clone())))?
+                .filter(col("day").gt_eq(lit(start_day)))?
+                .filter(col("day").lt_eq(lit(end_day)))?;
+            if let Some(query) = query {
+                df = apply_custom_query_filters(df, query)?;
+            }
+            match df.collect().await {
+                Ok(batches) => return Ok(batches),
+                Err(error) if attempt + 1 < MAX_ATTEMPTS => {
+                    let message = error.to_string();
+                    if message.contains("No such file") || message.contains("not found") {
+                        self.invalidate_table_context(CUSTOM_POINTS);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(anyhow!(
+            "custom points scan for {source_type}:{ticker} failed after {MAX_ATTEMPTS} attempts"
+        ))
     }
 
     async fn merge_data_files_into_partition_index(
@@ -1494,6 +1564,33 @@ impl IcebergStore {
         Ok(())
     }
 
+    async fn merge_data_files_into_custom_partition_index(
+        &self,
+        table: &str,
+        data_files: &[iceberg::spec::DataFile],
+    ) -> Result<()> {
+        if table != CUSTOM_POINTS || data_files.is_empty() {
+            return Ok(());
+        }
+        let table_ref = self.catalog.load_table(&self.ident(table)).await?;
+        let metadata = table_ref.metadata();
+        let snapshot_id = metadata.current_snapshot_id();
+        let spec = metadata.default_partition_spec().as_ref().clone();
+        let mut indexes = self
+            .custom_partition_indexes
+            .lock()
+            .expect("iceberg custom partition index cache poisoned");
+        if let Some(existing) = indexes.get(table) {
+            let mut updated = existing.as_ref().clone();
+            updated.snapshot_id = snapshot_id;
+            for data_file in data_files {
+                updated.insert_data_file(data_file, &spec)?;
+            }
+            indexes.insert(table.to_string(), Arc::new(updated));
+        }
+        Ok(())
+    }
+
     fn invalidate_table_context(&self, table: &str) {
         self.table_contexts
             .lock()
@@ -1502,6 +1599,10 @@ impl IcebergStore {
         self.partition_indexes
             .lock()
             .expect("iceberg partition index cache poisoned")
+            .remove(table);
+        self.custom_partition_indexes
+            .lock()
+            .expect("iceberg custom partition index cache poisoned")
             .remove(table);
     }
 
@@ -2032,24 +2133,167 @@ fn append_custom_batch_points(batch: &RecordBatch, out: &mut Vec<CustomDataPoint
         .ok_or_else(|| anyhow!("value must be float64"))?;
     let fields_json = batch
         .column_by_name("fields_json")
-        .ok_or_else(|| anyhow!("fields_json column missing"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("fields_json must be utf8"))?;
+        .ok_or_else(|| anyhow!("fields_json column missing"))?;
     for row in 0..batch.num_rows() {
-        let fields = if fields_json.is_null(row) {
-            HashMap::new()
-        } else {
-            serde_json::from_str(fields_json.value(row)).unwrap_or_default()
+        let fields = match optional_string_at(fields_json, row).filter(|raw| !raw.is_empty()) {
+            None => HashMap::new(),
+            Some(raw) => serde_json::from_str(raw).unwrap_or_default(),
         };
+        let date_ns = date_ns.value(row);
+        let end_time = custom_point_end_time(&fields, date_ns).unwrap_or(date_ns);
         out.push(CustomDataPoint {
-            time: schema::ns_to_date(date_ns.value(row)),
-            end_time: Some(lean_core::NanosecondTimestamp(date_ns.value(row))),
+            time: schema::ns_to_date(date_ns),
+            end_time: Some(lean_core::NanosecondTimestamp(end_time)),
             value: rust_decimal::Decimal::from_f64(value.value(row)).unwrap_or_default(),
             fields,
         });
     }
     Ok(())
+}
+
+fn optional_string_at(array: &ArrayRef, row: usize) -> Option<&str> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(values.value(row));
+    }
+    None
+}
+
+fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Result<DataFrame> {
+    if let Some(symbols) = &query.symbols {
+        if !symbols.is_empty() {
+            let mut expr: Option<Expr> = None;
+            for symbol in symbols {
+                let pattern = format!("%\"usymbol\":\"{}\"%", escape_like_value(symbol));
+                let next = col("fields_json").like(lit(pattern));
+                expr = Some(match expr {
+                    Some(existing) => existing.or(next),
+                    None => next,
+                });
+            }
+            if let Some(expr) = expr {
+                df = df.filter(expr)?;
+            }
+        }
+    }
+
+    for (field, expected) in &query.string_equals {
+        let pattern = format!(
+            "%\"{}\":\"{}\"%",
+            escape_like_value(field),
+            escape_like_value(expected)
+        );
+        df = df.filter(col("fields_json").like(lit(pattern)))?;
+    }
+
+    for (field, values) in &query.string_in {
+        if values.is_empty() {
+            continue;
+        }
+        let mut expr: Option<Expr> = None;
+        for value in values {
+            let pattern = format!(
+                "%\"{}\":\"{}\"%",
+                escape_like_value(field),
+                escape_like_value(value)
+            );
+            let next = col("fields_json").like(lit(pattern));
+            expr = Some(match expr {
+                Some(existing) => existing.or(next),
+                None => next,
+            });
+        }
+        if let Some(expr) = expr {
+            df = df.filter(expr)?;
+        }
+    }
+
+    Ok(df)
+}
+
+fn escape_like_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn custom_point_end_time(fields: &HashMap<String, serde_json::Value>, date_ns: i64) -> Option<i64> {
+    for key in ["end_time_ns", "time_ns", "timestamp_ns"] {
+        if let Some(ns) = fields.get(key).and_then(json_i64) {
+            return Some(ns);
+        }
+    }
+    for key in ["end_time", "time", "timestamp", "datetime", "bar_time"] {
+        if let Some(ns) = fields
+            .get(key)
+            .and_then(|value| json_datetime_ns(value, date_ns))
+        {
+            return Some(ns);
+        }
+    }
+    None
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+}
+
+fn json_datetime_ns(value: &serde_json::Value, date_ns: i64) -> Option<i64> {
+    if let Some(raw) = value.as_i64() {
+        return if raw.abs() < 10_000_000_000 {
+            Some(raw * 1_000_000_000)
+        } else if raw.abs() < 10_000_000_000_000 {
+            Some(raw * 1_000_000)
+        } else if raw.abs() < 10_000_000_000_000_000 {
+            Some(raw * 1_000)
+        } else {
+            Some(raw)
+        };
+    }
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(raw) = text.parse::<i64>() {
+        if (0..=2359).contains(&raw) && text.len() <= 4 {
+            let hour = (raw / 100) as u32;
+            let minute = (raw % 100) as u32;
+            return chrono::NaiveTime::from_hms_opt(hour, minute, 0).and_then(|time| {
+                schema::ns_to_date(date_ns)
+                    .and_time(time)
+                    .and_utc()
+                    .timestamp_nanos_opt()
+            });
+        }
+        return json_datetime_ns(&serde_json::Value::from(raw), date_ns);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|dt| dt.timestamp_nanos_opt().unwrap_or_default())
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+        })
+        .or_else(|| {
+            chrono::NaiveTime::parse_from_str(text, "%H:%M:%S")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%H:%M"))
+                .ok()
+                .and_then(|time| {
+                    schema::ns_to_date(date_ns)
+                        .and_time(time)
+                        .and_utc()
+                        .timestamp_nanos_opt()
+                })
+        })
 }
 
 fn market_day_values(batch: &RecordBatch, resolution: Resolution) -> Result<Vec<i32>> {

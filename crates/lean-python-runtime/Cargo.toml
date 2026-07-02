@@ -13,9 +13,10 @@ lean-engine = { path = "../lean-engine" }
 lean-execution = { path = "../lean-execution" }
 lean-orders = { path = "../lean-orders" }
 lean-options = { path = "../lean-options" }
-lean-python = { path = "../lean-python" }
-lean-sdk = { path = "../lean-sdk" }
+lean-sdk = { path = "../lean-sdk", features = ["python"] }
+chrono = { workspace = true }
 pyo3 = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
 

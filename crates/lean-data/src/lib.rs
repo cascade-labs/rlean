@@ -22,7 +22,7 @@ pub mod trade_bar;
 pub use base_data::{BaseData, BaseDataType, DataTimeZoneInfo};
 pub use custom::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSource,
-    CustomDataTransport,
+    CustomDataTransport, CustomParquetSource,
 };
 pub use data_queue::{
     live_data_channel, DataQueueHandler, LiveDataItem, LiveDataSubscription,

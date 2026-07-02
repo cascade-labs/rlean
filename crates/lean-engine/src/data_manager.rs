@@ -64,6 +64,7 @@ impl DataManager {
         end: DateTime,
     ) -> LeanResult<()> {
         self.warm_market_partition_indexes(configs).await?;
+        self.warm_custom_partition_index_if_needed(configs).await?;
         self.active_subscriptions.clear();
         let mut streams = Vec::with_capacity(configs.len());
         for config in configs.iter().cloned() {
@@ -103,6 +104,20 @@ impl DataManager {
             .map_err(|error| LeanError::DataError(error.to_string()))
     }
 
+    async fn warm_custom_partition_index_if_needed(
+        &self,
+        configs: &[SubscriptionDataConfig],
+    ) -> LeanResult<()> {
+        if !configs.iter().any(|config| config.custom.is_some()) {
+            return Ok(());
+        }
+        self.context
+            .store
+            .warm_custom_partition_index()
+            .await
+            .map_err(|error| LeanError::DataError(error.to_string()))
+    }
+
     pub fn add_subscription(&mut self, config: SubscriptionDataConfig, start: DateTime) {
         let id = config.unique_id();
         if self.active_subscriptions.contains_key(&id) {
@@ -125,6 +140,44 @@ impl DataManager {
         self.warm_market_partition_indexes(std::slice::from_ref(&config))
             .await?;
         self.add_subscription(config, start);
+        Ok(())
+    }
+
+    pub async fn add_subscriptions_async(
+        &mut self,
+        configs: Vec<SubscriptionDataConfig>,
+        start: DateTime,
+    ) -> LeanResult<()> {
+        let new_configs = configs
+            .into_iter()
+            .filter(|config| !self.active_subscriptions.contains_key(&config.unique_id()))
+            .collect::<Vec<_>>();
+        if new_configs.is_empty() {
+            return Ok(());
+        }
+        self.warm_market_partition_indexes(&new_configs).await?;
+        self.warm_custom_partition_index_if_needed(&new_configs)
+            .await?;
+        let end = self.end.unwrap_or(start);
+        let mut streams = Vec::with_capacity(new_configs.len());
+        for config in new_configs {
+            let id = config.unique_id();
+            streams.push(SubscriptionStream::new(
+                config.clone(),
+                self.context.clone(),
+                start,
+                end,
+            ));
+            self.active_subscriptions.insert(id, config);
+        }
+        match self.synchronizer.as_mut() {
+            Some(sync) => {
+                for stream in streams {
+                    sync.add_stream(stream);
+                }
+            }
+            None => self.synchronizer = Some(SliceSynchronizer::new(streams, end)),
+        }
         Ok(())
     }
 
@@ -206,6 +259,7 @@ mod tests {
     };
     use lean_storage::{FactorFileEntry, OptionEodBar};
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
@@ -413,7 +467,11 @@ mod tests {
             .await
             .unwrap();
 
-        let slice = manager.next_slice().await.unwrap().expect("option chain slice");
+        let slice = manager
+            .next_slice()
+            .await
+            .unwrap()
+            .expect("option chain slice");
         let chain = slice
             .option_chains
             .get(canonical.permtick.as_ref())
@@ -602,6 +660,7 @@ mod tests {
                 uri: self.path.to_string_lossy().into_owned(),
                 transport: CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
+                headers: HashMap::new(),
             })
         }
 

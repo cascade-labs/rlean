@@ -1,5 +1,5 @@
 use crate::{
-    algorithm_manager::AlgorithmManager,
+    algorithm_manager::{AlgorithmManager, OrderEventProcessing},
     runner::backtest::{
         benchmark_subscription_for_symbol, subscriptions_with_benchmark,
         subscriptions_with_option_chains,
@@ -7,10 +7,13 @@ use crate::{
     LiveRunConfig, LiveRunResult,
 };
 use anyhow::Result;
-use crossbeam_channel::RecvTimeoutError;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
-use lean_core::MarketHoursDatabase;
-use lean_data::{LiveDataItem, LiveDataSubscription, SubscriptionDataConfig};
+use lean_core::{LeanError, MarketHoursDatabase};
+use lean_data::{
+    live_data_channel, CustomDataPoint, LiveDataItem, LiveDataSubscription, SubscriptionDataConfig,
+};
+use lean_data_providers::ICustomDataSource;
 use lean_live::LiveSliceAssembler;
 use lean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
@@ -18,7 +21,10 @@ use lean_orders::{
 };
 use lean_statistics::{Trade, TradeBuilder};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 /// Engine-owned live runner entry point.
@@ -68,6 +74,18 @@ where
     snapshot.recent_order_events = brokerage_sync.order_events.clone();
 
     algorithm_manager.initialize(&mut services)?;
+
+    if let Some(dir) = config.output_dir.as_deref() {
+        if let Some((active, closed)) = crate::live::deployment_writer::restore_live_insights(
+            &algorithm_manager.framework(),
+            dir,
+        ) {
+            tracing::info!(
+                "Restored live framework insights from deploy dir: active={active} closed={closed}"
+            );
+        }
+    }
+
     let benchmark_subscription = benchmark_subscription_for_symbol(
         &algorithm_manager.benchmark_symbol(),
         algorithm_manager.subscriptions(),
@@ -82,6 +100,7 @@ where
     let mut live_subscriptions = LiveSubscriptionSet::subscribe_initial(
         &mut config.live_data_queue,
         &subscriptions,
+        &config.custom_data_sources,
         config
             .brokerage_model
             .as_ref()
@@ -98,11 +117,85 @@ where
             tm.clone(),
         )
     });
-    let mut all_order_events: Vec<OrderEvent> = brokerage_sync.order_events;
+    let live_writer = config
+        .output_dir
+        .as_ref()
+        .map(|dir| crate::live::deployment_writer::LiveDeploymentWriter::new(dir.clone()));
+    let restored = if config.paper_trading {
+        config
+            .output_dir
+            .as_deref()
+            .and_then(crate::live::deployment_writer::load_deploy_restore)
+    } else {
+        None
+    };
+    let mut all_order_events: Vec<OrderEvent> = match &restored {
+        Some(restore) => restore.order_events.clone(),
+        None => brokerage_sync.order_events,
+    };
     let mut trade_builder = TradeBuilder::new();
-    let mut completed_trades = Vec::new();
+    let mut completed_trades = match &restored {
+        Some(restore) => restore.trades.clone(),
+        None => Vec::new(),
+    };
+    if let (Some(restore), Some(algorithm_state)) = (
+        restored.as_ref(),
+        algorithm_manager.algorithm().algorithm_state(),
+    ) {
+        crate::live::deployment_writer::apply_initial_brokerage_account_state(
+            &algorithm_state,
+            &restore.account_state,
+        );
+        if let Some(portfolio) = portfolio.as_ref() {
+            let starting_value = crate::live::deployment_writer::set_live_starting_portfolio_value_from_synced_account(
+                portfolio,
+            );
+            tracing::info!(
+                "Restored paper account from deploy dir: cash={} holdings={} open_orders={} order_events={} trades={} starting_value={starting_value}",
+                restore.account_state.cash,
+                restore.account_state.holdings.len(),
+                restore.account_state.open_orders.len(),
+                restore.order_events.len(),
+                restore.trades.len(),
+            );
+        }
+        let algorithm = algorithm_state.lock().unwrap();
+        for holding in &restore.account_state.holdings {
+            if holding.quantity.is_zero() {
+                continue;
+            }
+            let multiplier = algorithm.contract_multiplier_for_symbol(&holding.symbol);
+            let _ = trade_builder.record_fill(
+                &holding.symbol,
+                lean_core::DateTime::now(),
+                holding.average_price,
+                holding.quantity,
+                multiplier,
+                rust_decimal::Decimal::ZERO,
+            );
+        }
+    }
+    if let (Some(writer), Some(processor), Some(portfolio)) = (
+        live_writer.as_ref(),
+        order_processor.as_ref(),
+        portfolio.as_ref(),
+    ) {
+        writer.record_snapshot(
+            lean_core::DateTime::now(),
+            portfolio,
+            processor,
+            Some(&algorithm_manager.framework()),
+            crate::live::deployment_writer::LiveSnapshotCounts {
+                slices_processed: algorithm_manager.slices_processed() as usize,
+                order_events: all_order_events.len(),
+                trades: completed_trades.len(),
+            },
+        );
+    }
     let run_started = Instant::now();
     let mut assembler = LiveSliceAssembler::new();
+    let mut custom_subscriptions =
+        LiveCustomSubscriptionSet::subscribe_initial(&subscriptions, &config.custom_data_sources);
 
     'live: loop {
         if should_stop(
@@ -114,7 +207,11 @@ where
             break;
         }
 
-        let Some(item) = next_live_item(&mut live_subscriptions, Duration::from_millis(250))?
+        let Some(item) = next_live_item(
+            &mut live_subscriptions,
+            &custom_subscriptions,
+            Duration::from_millis(250),
+        )?
         else {
             continue;
         };
@@ -125,8 +222,10 @@ where
                 &mut services,
                 &mut config,
                 &mut live_subscriptions,
+                &mut custom_subscriptions,
                 &order_processor,
                 portfolio.as_ref(),
+                live_writer.as_ref(),
                 &mut all_order_events,
                 &mut trade_builder,
                 &mut completed_trades,
@@ -165,8 +264,10 @@ where
                     &mut services,
                     &mut config,
                     &mut live_subscriptions,
+                    &mut custom_subscriptions,
                     &order_processor,
                     portfolio.as_ref(),
+                    live_writer.as_ref(),
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
@@ -179,6 +280,7 @@ where
 
     algorithm_manager.finish(&mut services);
     live_subscriptions.unsubscribe_all(&mut config.live_data_queue);
+    custom_subscriptions.unsubscribe_all();
     snapshot.slices_processed = algorithm_manager.slices_processed() as usize;
     snapshot.final_value = algorithm_manager
         .portfolio_value()
@@ -206,8 +308,10 @@ async fn process_live_slice<B: AlgorithmBridge>(
     services: &mut dyn AlgorithmServices,
     config: &mut LiveRunConfig,
     live_subscriptions: &mut LiveSubscriptionSet,
+    custom_subscriptions: &mut LiveCustomSubscriptionSet,
     order_processor: &Option<OrderProcessor>,
     portfolio: Option<&std::sync::Arc<lean_algorithm::portfolio::SecurityPortfolioManager>>,
+    live_writer: Option<&crate::live::deployment_writer::LiveDeploymentWriter>,
     all_order_events: &mut Vec<OrderEvent>,
     trade_builder: &mut TradeBuilder,
     completed_trades: &mut Vec<Trade>,
@@ -226,6 +330,7 @@ async fn process_live_slice<B: AlgorithmBridge>(
             &algorithm_manager.option_subscriptions(),
         );
         live_subscriptions.sync(config, &subscriptions)?;
+        custom_subscriptions.sync(&subscriptions, &config.custom_data_sources);
     }
 
     algorithm_manager.advance_frontier(slice, services);
@@ -234,25 +339,53 @@ async fn process_live_slice<B: AlgorithmBridge>(
         .iter()
         .map(|(key, chain)| (key.as_str(), chain.as_ref()))
         .collect();
-    algorithm_manager.process_order_events(
+    let prev_order_events = all_order_events.len();
+    let prev_trades = completed_trades.len();
+    algorithm_manager.process_order_events(OrderEventProcessing {
         slice,
-        &option_chains,
-        order_processor.as_ref(),
+        option_chains: &option_chains,
+        order_processor: order_processor.as_ref(),
         portfolio,
         services,
         all_order_events,
         trade_builder,
         completed_trades,
-    );
+    });
+    if let Some(writer) = live_writer {
+        writer.append_order_events(&all_order_events[prev_order_events..]);
+        writer.append_trades(&completed_trades[prev_trades..]);
+    }
 
     algorithm_manager.deliver_data(
-        lean_algorithm::algorithm::DataDeliveryPayload {
-            slice: slice_arc,
-        },
+        lean_algorithm::algorithm::DataDeliveryPayload { slice: slice_arc },
         services,
     );
     algorithm_manager.run_framework(slice, services);
     algorithm_manager.end_time_step(services);
+    let custom_points: usize = slice.custom_data.values().map(Vec::len).sum();
+    tracing::debug!(
+        "processed live slice time={:?} custom_keys={} custom_points={} order_events={} completed_trades={}",
+        slice.time,
+        slice.custom_data.len(),
+        custom_points,
+        all_order_events.len(),
+        completed_trades.len()
+    );
+    if let (Some(writer), Some(processor), Some(portfolio)) =
+        (live_writer, order_processor.as_ref(), portfolio)
+    {
+        writer.record_snapshot(
+            slice.time,
+            portfolio,
+            processor,
+            Some(&algorithm_manager.framework()),
+            crate::live::deployment_writer::LiveSnapshotCounts {
+                slices_processed: algorithm_manager.slices_processed() as usize,
+                order_events: all_order_events.len(),
+                trades: completed_trades.len(),
+            },
+        );
+    }
     Ok(())
 }
 
@@ -272,8 +405,14 @@ fn should_stop(
 
 fn next_live_item(
     subscriptions: &mut LiveSubscriptionSet,
+    custom_subscriptions: &LiveCustomSubscriptionSet,
     timeout: Duration,
 ) -> Result<Option<LiveDataItem>> {
+    match custom_subscriptions.receiver.try_recv() {
+        Ok(item) => return Ok(Some(item?)),
+        Err(crossbeam_channel::TryRecvError::Empty) => {}
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+    }
     for subscription in subscriptions.market.values() {
         match subscription.receiver.recv_timeout(Duration::ZERO) {
             Ok(item) => return Ok(Some(item?)),
@@ -283,13 +422,22 @@ fn next_live_item(
     }
 
     if subscriptions.market.is_empty() {
-        return Ok(None);
+        return match custom_subscriptions.receiver.recv_timeout(timeout) {
+            Ok(item) => Ok(Some(item?)),
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => Ok(None),
+        };
     }
 
     for subscription in subscriptions.market.values() {
         match subscription.receiver.recv_timeout(timeout) {
             Ok(item) => return Ok(Some(item?)),
-            Err(RecvTimeoutError::Timeout) => return Ok(None),
+            Err(RecvTimeoutError::Timeout) => {
+                return match custom_subscriptions.receiver.try_recv() {
+                    Ok(item) => Ok(Some(item?)),
+                    Err(crossbeam_channel::TryRecvError::Empty)
+                    | Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(None),
+                };
+            }
             Err(RecvTimeoutError::Disconnected) => {}
         }
     }
@@ -305,6 +453,7 @@ impl LiveSubscriptionSet {
     fn subscribe_initial(
         queue: &mut lean_live::DataQueueHandlerManager,
         subscriptions: &[SubscriptionDataConfig],
+        custom_data_sources: &[Arc<dyn ICustomDataSource>],
         brokerage: Option<String>,
         paper_trading: bool,
         parameters: &HashMap<String, String>,
@@ -323,6 +472,13 @@ impl LiveSubscriptionSet {
             configs: HashMap::new(),
         };
         for config in subscriptions {
+            if is_custom_subscription(config, custom_data_sources) {
+                tracing::info!(
+                    "routing live custom data subscription through custom data source {}",
+                    config.symbol
+                );
+                continue;
+            }
             set.add(queue, config.clone())?;
         }
         Ok(set)
@@ -349,6 +505,13 @@ impl LiveSubscriptionSet {
 
         for subscription_config in current {
             if !self.configs.contains_key(&subscription_config.unique_id()) {
+                if is_custom_subscription(subscription_config, &config.custom_data_sources) {
+                    tracing::info!(
+                        "routing live custom data subscription through custom data source {}",
+                        subscription_config.symbol
+                    );
+                    continue;
+                }
                 self.add(&mut config.live_data_queue, subscription_config.clone())?;
             }
         }
@@ -379,6 +542,213 @@ impl LiveSubscriptionSet {
         }
         self.market.clear();
     }
+}
+
+struct LiveCustomSubscriptionSet {
+    receiver: Receiver<lean_core::Result<LiveDataItem>>,
+    sender: Sender<lean_core::Result<LiveDataItem>>,
+    stop: Arc<AtomicBool>,
+    workers: HashMap<u64, std::thread::JoinHandle<()>>,
+    configs: HashMap<u64, SubscriptionDataConfig>,
+}
+
+impl LiveCustomSubscriptionSet {
+    fn subscribe_initial(
+        subscriptions: &[SubscriptionDataConfig],
+        custom_data_sources: &[Arc<dyn ICustomDataSource>],
+    ) -> Self {
+        let (sender, receiver) = live_data_channel();
+        let mut set = Self {
+            receiver,
+            sender,
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: HashMap::new(),
+            configs: HashMap::new(),
+        };
+        set.sync(subscriptions, custom_data_sources);
+        set
+    }
+
+    fn sync(
+        &mut self,
+        subscriptions: &[SubscriptionDataConfig],
+        custom_data_sources: &[Arc<dyn ICustomDataSource>],
+    ) {
+        let desired = subscriptions
+            .iter()
+            .filter(|config| is_custom_subscription(config, custom_data_sources))
+            .map(SubscriptionDataConfig::unique_id)
+            .collect::<HashSet<_>>();
+        let existing = self.configs.keys().copied().collect::<Vec<_>>();
+        for id in existing {
+            if !desired.contains(&id) {
+                self.configs.remove(&id);
+                // The worker observes the shared stop flag only on global shutdown.
+                // Dynamic custom unsubscription is rare; stale workers are harmless
+                // because they no longer feed subscribed symbols once their sender
+                // is dropped at process end.
+            }
+        }
+
+        for config in subscriptions {
+            let id = config.unique_id();
+            if self.configs.contains_key(&id) {
+                continue;
+            }
+            let Some((source, custom)) = custom_source_for_config(config, custom_data_sources)
+            else {
+                continue;
+            };
+            tracing::info!(
+                "starting live custom data poller for {}:{}",
+                custom.source_type,
+                custom.ticker
+            );
+            let handle = spawn_live_custom_poller(
+                config.clone(),
+                source,
+                self.sender.clone(),
+                self.stop.clone(),
+            );
+            self.configs.insert(id, config.clone());
+            self.workers.insert(id, handle);
+        }
+    }
+
+    fn unsubscribe_all(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for (_, worker) in self.workers.drain() {
+            let _ = worker.join();
+        }
+        self.configs.clear();
+    }
+}
+
+fn is_custom_subscription(
+    config: &SubscriptionDataConfig,
+    custom_data_sources: &[Arc<dyn ICustomDataSource>],
+) -> bool {
+    custom_source_for_config(config, custom_data_sources).is_some()
+}
+
+fn custom_source_for_config(
+    config: &SubscriptionDataConfig,
+    custom_data_sources: &[Arc<dyn ICustomDataSource>],
+) -> Option<(
+    Arc<dyn ICustomDataSource>,
+    lean_data::CustomSubscriptionMetadata,
+)> {
+    let custom = config.custom.as_ref()?;
+    let source = custom_data_sources
+        .iter()
+        .find(|source| source.name().eq_ignore_ascii_case(&custom.source_type))?
+        .clone();
+    Some((source, custom.clone()))
+}
+
+fn spawn_live_custom_poller(
+    config: SubscriptionDataConfig,
+    source: Arc<dyn ICustomDataSource>,
+    sender: Sender<lean_core::Result<LiveDataItem>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!("live-custom-{}", config.symbol.value))
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Err(LeanError::DataError(format!(
+                        "failed to start live custom data poller: {error}"
+                    ))));
+                    return;
+                }
+            };
+            runtime.block_on(run_live_custom_poller(config, source, sender, stop));
+        })
+        .expect("failed to spawn live custom data poller")
+}
+
+async fn run_live_custom_poller(
+    config: SubscriptionDataConfig,
+    source: Arc<dyn ICustomDataSource>,
+    sender: Sender<lean_core::Result<LiveDataItem>>,
+    stop: Arc<AtomicBool>,
+) {
+    let Some(custom) = config.custom.clone() else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    while !stop.load(Ordering::Relaxed) {
+        let utc_now = lean_core::DateTime::now();
+        let mut source_available = false;
+        if let Some(points) = source.get_live_points(
+            &custom.ticker,
+            utc_now,
+            &custom.config,
+            &custom.dynamic_query,
+        ) {
+            source_available = true;
+            tracing::info!(
+                "live custom data {}:{} fetched {} point(s)",
+                custom.source_type,
+                custom.ticker,
+                points.len()
+            );
+            for point in points {
+                let key = custom_point_key(&point);
+                if !seen.insert(key) {
+                    continue;
+                }
+                if sender
+                    .send(Ok(LiveDataItem::CustomData {
+                        symbol: config.symbol.clone(),
+                        source_type: custom.source_type.clone(),
+                        ticker: custom.ticker.clone(),
+                        point,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        } else {
+            tracing::debug!(
+                "live custom data {}:{} no source available at {:?}",
+                custom.source_type,
+                custom.ticker,
+                utc_now
+            );
+        }
+        let delay = source.live_poll_delay(
+            &custom.ticker,
+            utc_now,
+            source_available,
+            &custom.config,
+            &custom.dynamic_query,
+        );
+        sleep_until_stop_or_delay(delay, &stop).await;
+    }
+}
+
+async fn sleep_until_stop_or_delay(delay: Duration, stop: &AtomicBool) {
+    let started = Instant::now();
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < delay {
+        let remaining = delay.saturating_sub(started.elapsed());
+        tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+    }
+}
+
+fn custom_point_key(point: &CustomDataPoint) -> String {
+    let time = point
+        .end_time
+        .map(|time| time.0.to_string())
+        .unwrap_or_else(|| point.time.to_string());
+    let fields = serde_json::to_string(&point.fields).unwrap_or_default();
+    format!("{time}:{fields}")
 }
 
 #[cfg(test)]
@@ -877,6 +1247,7 @@ mod tests {
         let set = LiveSubscriptionSet::subscribe_initial(
             &mut queue,
             &[config],
+            &[],
             Some("paper".to_string()),
             true,
             &HashMap::new(),

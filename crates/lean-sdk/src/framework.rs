@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use lean_alpha::{IAlphaModel, Insight, InsightDirection as AlphaInsightDirection};
 use lean_core::{DateTime, Resolution, Symbol, TimeSpan};
 use lean_execution::{
-    AdaptiveMakerTakerExecutionModel, AggressivePostOnlyExecutionModel, IExecutionModel,
-    ImmediateExecutionModel as LeanImmediateExecutionModel, MakerThenTakerExecutionModel,
+    AdaptiveMakerTakerExecutionModel, AggressivePostOnlyExecutionModel, ExecutionTarget,
+    IExecutionModel, ImmediateExecutionModel as LeanImmediateExecutionModel,
+    MakerThenTakerExecutionModel,
 };
 use lean_portfolio_construction::{
     AccumulativeInsightPortfolioConstructionModel,
@@ -18,13 +19,13 @@ use lean_portfolio_construction::{
     RiskParityPortfolioConstructionModel,
 };
 use lean_risk::risk_management::{
-    NullRiskManagement, RiskManagementModel as RiskManagementModelTrait,
+    NullRiskManagement, PortfolioTarget as RiskPortfolioTarget,
+    RiskManagementModel as RiskManagementModelTrait,
 };
 use lean_risk::{
     MaximumDrawdownPercentPortfolio, MaximumSectorExposureRiskManagementModel,
     MaximumUnrealizedProfitPercentPerSecurity,
 };
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method, sdk_new, sdk_static};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
@@ -106,9 +107,9 @@ fn sdk_direction_from_alpha(direction: AlphaInsightDirection) -> InsightDirectio
     }
 }
 
-#[sdk_bind(
-    py_name = "InsightDirection",
-    rust_type = "lean_sdk::framework::InsightDirection"
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "InsightDirection", eq, eq_int)
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsightDirection {
@@ -117,28 +118,26 @@ pub enum InsightDirection {
     Down = 2,
 }
 
-#[sdk_bind(py_name = "PortfolioBias")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "PortfolioBias", eq, eq_int))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortfolioBiasView {
     LongShort = 0,
     Long = 1,
     Short = 2,
 }
 
-#[sdk_bind(py_name = "AlphaModel", subclass, constructor = "variadic")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "AlphaModel", subclass))]
 pub struct AlphaModel;
 
 impl AlphaModel {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn update(&self) -> Vec<InsightProjection> {
         Vec::new()
     }
 
-    #[sdk_method]
     pub fn on_securities_changed(&self) {}
 }
 
@@ -148,16 +147,14 @@ impl Default for AlphaModel {
     }
 }
 
-#[sdk_bind(py_name = "ExecutionModel", subclass, constructor = "variadic")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "ExecutionModel", subclass))]
 pub struct ExecutionModel;
 
 impl ExecutionModel {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn execute(&self) {}
 }
 
@@ -167,25 +164,21 @@ impl Default for ExecutionModel {
     }
 }
 
-#[sdk_bind(
-    py_name = "PortfolioConstructionModel",
-    subclass,
-    constructor = "variadic"
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "PortfolioConstructionModel", subclass)
 )]
 pub struct PortfolioConstructionModel;
 
 impl PortfolioConstructionModel {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn create_targets(&self) -> Vec<PortfolioTargetProjection> {
         Vec::new()
     }
 
-    #[sdk_method]
     pub fn get_target_insights(&self) -> Vec<InsightProjection> {
         Vec::new()
     }
@@ -197,16 +190,17 @@ impl Default for PortfolioConstructionModel {
     }
 }
 
-#[sdk_bind(py_name = "RiskManagementModel", subclass, constructor = "variadic")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "RiskManagementModel", subclass)
+)]
 pub struct RiskManagementModel;
 
 impl RiskManagementModel {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn manage_risk(&self) -> Vec<PortfolioTargetProjection> {
         Vec::new()
     }
@@ -214,6 +208,58 @@ impl RiskManagementModel {
 
 impl Default for RiskManagementModel {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl AlphaModel {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ExecutionModel {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl PortfolioConstructionModel {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl RiskManagementModel {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
         Self::new()
     }
 }
@@ -562,18 +608,15 @@ pub fn create_max_unrealized_profit_per_security(
     ))
 }
 
-#[sdk_bind(py_name = "InsightWeightingPortfolioConstructionModel")]
-pub struct InsightWeightingPortfolioConstructionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IPortfolioConstructionModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "InsightWeightingPortfolioConstructionModel")
+)]
+pub struct InsightWeightingPortfolioConstructionModel;
 
 impl InsightWeightingPortfolioConstructionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_insight_weighting_pcm(),
-        }
+        Self
     }
 }
 
@@ -583,18 +626,15 @@ impl Default for InsightWeightingPortfolioConstructionModel {
     }
 }
 
-#[sdk_bind(py_name = "EqualWeightingPortfolioConstructionModel")]
-pub struct EqualWeightingPortfolioConstructionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IPortfolioConstructionModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "EqualWeightingPortfolioConstructionModel")
+)]
+pub struct EqualWeightingPortfolioConstructionModel;
 
 impl EqualWeightingPortfolioConstructionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_equal_weighting_pcm(PortfolioBias::LongShort, None, None),
-        }
+        Self
     }
 }
 
@@ -604,18 +644,15 @@ impl Default for EqualWeightingPortfolioConstructionModel {
     }
 }
 
-#[sdk_bind(py_name = "MeanVarianceOptimizationPortfolioConstructionModel")]
-pub struct MeanVarianceOptimizationPortfolioConstructionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IPortfolioConstructionModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "MeanVarianceOptimizationPortfolioConstructionModel")
+)]
+pub struct MeanVarianceOptimizationPortfolioConstructionModel;
 
 impl MeanVarianceOptimizationPortfolioConstructionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_mean_variance_pcm(),
-        }
+        Self
     }
 }
 
@@ -625,18 +662,15 @@ impl Default for MeanVarianceOptimizationPortfolioConstructionModel {
     }
 }
 
-#[sdk_bind(py_name = "MaximumSharpeRatioPortfolioConstructionModel")]
-pub struct MaximumSharpeRatioPortfolioConstructionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IPortfolioConstructionModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "MaximumSharpeRatioPortfolioConstructionModel")
+)]
+pub struct MaximumSharpeRatioPortfolioConstructionModel;
 
 impl MaximumSharpeRatioPortfolioConstructionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_max_sharpe_ratio_pcm(),
-        }
+        Self
     }
 }
 
@@ -646,18 +680,12 @@ impl Default for MaximumSharpeRatioPortfolioConstructionModel {
     }
 }
 
-#[sdk_bind(py_name = "ImmediateExecutionModel")]
-pub struct ImmediateExecutionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IExecutionModel>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "ImmediateExecutionModel"))]
+pub struct ImmediateExecutionModel;
 
 impl ImmediateExecutionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_immediate_execution_model(),
-        }
+        Self
     }
 }
 
@@ -667,18 +695,12 @@ impl Default for ImmediateExecutionModel {
     }
 }
 
-#[sdk_bind(py_name = "NullExecutionModel")]
-pub struct NullExecutionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IExecutionModel>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "NullExecutionModel"))]
+pub struct NullExecutionModel;
 
 impl NullExecutionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_null_execution_model(),
-        }
+        Self
     }
 }
 
@@ -688,18 +710,12 @@ impl Default for NullExecutionModel {
     }
 }
 
-#[sdk_bind(py_name = "VWAPExecutionModel")]
-pub struct VwapExecutionModel {
-    #[allow(dead_code)]
-    inner: (Box<dyn IExecutionModel>, f64),
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "VWAPExecutionModel"))]
+pub struct VwapExecutionModel;
 
 impl VwapExecutionModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_vwap_execution_model(0.1),
-        }
+        Self
     }
 }
 
@@ -709,33 +725,24 @@ impl Default for VwapExecutionModel {
     }
 }
 
-#[sdk_bind(py_name = "StandardDeviationExecutionModel")]
-pub struct StandardDeviationExecutionModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IExecutionModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "StandardDeviationExecutionModel")
+)]
+pub struct StandardDeviationExecutionModel;
 
 impl StandardDeviationExecutionModel {
-    #[sdk_new]
-    pub fn new(period: usize, deviations: f64) -> Self {
-        Self {
-            inner: create_standard_deviation_execution_model(period, deviations, 0.0),
-        }
+    pub fn new(_period: usize, _deviations: f64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "NullRiskManagementModel")]
-pub struct NullRiskManagementModel {
-    #[allow(dead_code)]
-    inner: Box<dyn RiskManagementModelTrait>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "NullRiskManagementModel"))]
+pub struct NullRiskManagementModel;
 
 impl NullRiskManagementModel {
-    #[sdk_new]
     pub fn new() -> Self {
-        Self {
-            inner: create_null_risk_management_model(),
-        }
+        Self
     }
 }
 
@@ -745,113 +752,197 @@ impl Default for NullRiskManagementModel {
     }
 }
 
-#[sdk_bind(py_name = "MaximumDrawdownPercentPerSecurity")]
-pub struct MaximumDrawdownPercentPerSecurity {
-    #[allow(dead_code)]
-    inner: Box<dyn RiskManagementModelTrait>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "MaximumDrawdownPercentPerSecurity")
+)]
+pub struct MaximumDrawdownPercentPerSecurity;
 
 impl MaximumDrawdownPercentPerSecurity {
-    #[sdk_new]
-    pub fn new(maximum_drawdown_percent: f64) -> Self {
-        Self {
-            inner: create_max_drawdown_percent_per_security(maximum_drawdown_percent),
-        }
+    pub fn new(_maximum_drawdown_percent: f64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "TrailingStopRiskManagementModel")]
-pub struct TrailingStopRiskManagementModel {
-    #[allow(dead_code)]
-    inner: Box<dyn RiskManagementModelTrait>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "TrailingStopRiskManagementModel")
+)]
+pub struct TrailingStopRiskManagementModel;
 
 impl TrailingStopRiskManagementModel {
-    #[sdk_new]
-    pub fn new(trailing_amount: f64) -> Self {
-        Self {
-            inner: create_trailing_stop_risk_model(trailing_amount),
-        }
+    pub fn new(_trailing_amount: f64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "ConstantAlphaModel")]
-pub struct ConstantAlphaModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IAlphaModel>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "ConstantAlphaModel"))]
+pub struct ConstantAlphaModel;
 
 impl ConstantAlphaModel {
-    #[sdk_new]
-    pub fn new(direction: String, period_days: i64, magnitude: f64) -> Self {
-        Self {
-            inner: create_constant_alpha_model(&direction, period_days, Some(magnitude)),
-        }
+    pub fn new(_direction: String, _period_days: i64, _magnitude: f64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "EmaCrossAlphaModel")]
-pub struct EmaCrossAlphaModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IAlphaModel>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "EmaCrossAlphaModel"))]
+pub struct EmaCrossAlphaModel;
 
 impl EmaCrossAlphaModel {
-    #[sdk_new]
-    pub fn new(fast_period: usize, slow_period: usize, period_days: i64) -> Self {
-        Self {
-            inner: create_ema_cross_alpha_model(fast_period, slow_period, period_days),
-        }
+    pub fn new(_fast_period: usize, _slow_period: usize, _period_days: i64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "HistoricalReturnsAlphaModel")]
-pub struct HistoricalReturnsAlphaModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IAlphaModel>,
-}
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "HistoricalReturnsAlphaModel")
+)]
+pub struct HistoricalReturnsAlphaModel;
 
 impl HistoricalReturnsAlphaModel {
-    #[sdk_new]
-    pub fn new(period: usize, insight_period_days: i64) -> Self {
-        Self {
-            inner: create_historical_returns_alpha_model(period, Some(insight_period_days)),
-        }
+    pub fn new(_period: usize, _insight_period_days: i64) -> Self {
+        Self
     }
 }
 
-#[sdk_bind(py_name = "MacdAlphaModel")]
-pub struct MacdAlphaModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IAlphaModel>,
-}
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "MacdAlphaModel"))]
+pub struct MacdAlphaModel;
 
 impl MacdAlphaModel {
-    #[sdk_new]
     pub fn new(
+        _fast_period: usize,
+        _slow_period: usize,
+        _signal_period: usize,
+        _period_days: i64,
+    ) -> Self {
+        Self
+    }
+}
+
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "RsiAlphaModel"))]
+pub struct RsiAlphaModel;
+
+impl RsiAlphaModel {
+    pub fn new(_period: usize, _period_days: i64) -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "python")]
+macro_rules! py_model_new_no_args {
+    ($ty:ty) => {
+        #[pyo3::pymethods]
+        impl $ty {
+            #[new]
+            fn py_new() -> Self {
+                Self::new()
+            }
+        }
+    };
+}
+
+#[cfg(feature = "python")]
+py_model_new_no_args!(InsightWeightingPortfolioConstructionModel);
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl EqualWeightingPortfolioConstructionModel {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self::new()
+    }
+}
+#[cfg(feature = "python")]
+py_model_new_no_args!(MeanVarianceOptimizationPortfolioConstructionModel);
+#[cfg(feature = "python")]
+py_model_new_no_args!(MaximumSharpeRatioPortfolioConstructionModel);
+#[cfg(feature = "python")]
+py_model_new_no_args!(ImmediateExecutionModel);
+#[cfg(feature = "python")]
+py_model_new_no_args!(NullExecutionModel);
+#[cfg(feature = "python")]
+py_model_new_no_args!(VwapExecutionModel);
+#[cfg(feature = "python")]
+py_model_new_no_args!(NullRiskManagementModel);
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl StandardDeviationExecutionModel {
+    #[new]
+    fn py_new(period: usize, deviations: f64) -> Self {
+        Self::new(period, deviations)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl MaximumDrawdownPercentPerSecurity {
+    #[new]
+    fn py_new(maximum_drawdown_percent: f64) -> Self {
+        Self::new(maximum_drawdown_percent)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TrailingStopRiskManagementModel {
+    #[new]
+    fn py_new(trailing_amount: f64) -> Self {
+        Self::new(trailing_amount)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ConstantAlphaModel {
+    #[new]
+    fn py_new(direction: String, period_days: i64, magnitude: f64) -> Self {
+        Self::new(direction, period_days, magnitude)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl EmaCrossAlphaModel {
+    #[new]
+    fn py_new(fast_period: usize, slow_period: usize, period_days: i64) -> Self {
+        Self::new(fast_period, slow_period, period_days)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl HistoricalReturnsAlphaModel {
+    #[new]
+    fn py_new(period: usize, insight_period_days: i64) -> Self {
+        Self::new(period, insight_period_days)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl MacdAlphaModel {
+    #[new]
+    fn py_new(
         fast_period: usize,
         slow_period: usize,
         signal_period: usize,
         period_days: i64,
     ) -> Self {
-        Self {
-            inner: create_macd_alpha_model(fast_period, slow_period, signal_period, period_days),
-        }
+        Self::new(fast_period, slow_period, signal_period, period_days)
     }
 }
 
-#[sdk_bind(py_name = "RsiAlphaModel")]
-pub struct RsiAlphaModel {
-    #[allow(dead_code)]
-    inner: Box<dyn IAlphaModel>,
-}
-
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
 impl RsiAlphaModel {
-    #[sdk_new]
-    pub fn new(period: usize, period_days: i64) -> Self {
-        Self {
-            inner: create_rsi_alpha_model(period, period_days),
-        }
+    #[new]
+    fn py_new(period: usize, period_days: i64) -> Self {
+        Self::new(period, period_days)
     }
 }
 
@@ -870,7 +961,7 @@ impl InsightPeriod {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[sdk_bind(py_name = "Insight")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Insight"))]
 pub struct InsightProjection {
     pub id: u64,
     pub symbol: Symbol,
@@ -887,7 +978,6 @@ pub struct InsightProjection {
 }
 
 impl InsightProjection {
-    #[sdk_static(alias = "Price")]
     pub fn price(
         symbol: Symbol,
         period: InsightPeriod,
@@ -907,40 +997,86 @@ impl InsightProjection {
             source_model.as_deref().unwrap_or_default(),
         ))
     }
-
-    #[sdk_getter(py_name = "price")]
     pub fn price_value(&self) -> Option<f64> {
         self.magnitude
     }
 
-    #[sdk_getter(alias = "Symbol")]
     pub fn symbol(&self) -> &Symbol {
         &self.symbol
     }
 
-    #[sdk_getter(alias = "Direction")]
     pub fn direction(&self) -> InsightDirection {
         sdk_direction_from_alpha(self.direction)
     }
-
-    #[sdk_getter]
     pub fn magnitude(&self) -> Option<f64> {
         self.magnitude
     }
-
-    #[sdk_getter]
     pub fn confidence(&self) -> Option<f64> {
         self.confidence
     }
 
-    #[sdk_getter(alias = "SourceModel")]
     pub fn source_model(&self) -> String {
         self.source_model.clone()
     }
-
-    #[sdk_getter]
-    pub fn score_direction(&self) -> Option<f64> {
+    pub fn score_direction_value(&self) -> Option<f64> {
         self.score_direction
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl InsightProjection {
+    #[staticmethod]
+    #[pyo3(name = "price", signature = (symbol, period, direction, magnitude=None, confidence=None, source_model=None, weight=None))]
+    fn py_price(
+        symbol: crate::securities::SymbolHandle,
+        period: &pyo3::Bound<'_, pyo3::PyAny>,
+        direction: InsightDirection,
+        magnitude: Option<f64>,
+        confidence: Option<f64>,
+        source_model: Option<String>,
+        weight: Option<f64>,
+    ) -> pyo3::PyResult<Self> {
+        let period = crate::python_framework::insight_period_from_py(period)?;
+        let _ = weight;
+        Ok(project_alpha_insight(&Insight::new(
+            symbol.into_inner(),
+            alpha_direction_from_sdk(direction),
+            period,
+            magnitude.and_then(Decimal::from_f64),
+            confidence.and_then(Decimal::from_f64),
+            source_model.as_deref().unwrap_or_default(),
+        )))
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "Price", signature = (symbol, period, direction))]
+    fn py_price_pascal(
+        symbol: crate::securities::SymbolHandle,
+        period: &pyo3::Bound<'_, pyo3::PyAny>,
+        direction: InsightDirection,
+    ) -> pyo3::PyResult<Self> {
+        Self::py_price(symbol, period, direction, None, None, None, None)
+    }
+
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol.clone())
+    }
+
+    #[getter(direction)]
+    fn py_direction(&self) -> InsightDirection {
+        self.direction()
+    }
+
+    #[getter(magnitude)]
+    fn py_magnitude(&self) -> Option<f64> {
+        self.magnitude()
+    }
+
+    #[getter(source_model)]
+    fn py_source_model(&self) -> String {
+        self.source_model()
     }
 }
 
@@ -990,7 +1126,7 @@ pub fn insight_from_projection(projection: &InsightProjection) -> Insight {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[sdk_bind(py_name = "PortfolioTarget")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "PortfolioTarget"))]
 pub struct PortfolioTargetProjection {
     pub symbol: Symbol,
     pub quantity: Option<f64>,
@@ -999,7 +1135,6 @@ pub struct PortfolioTargetProjection {
 }
 
 impl PortfolioTargetProjection {
-    #[sdk_new]
     pub fn new(
         symbol: Symbol,
         quantity: Option<f64>,
@@ -1014,7 +1149,6 @@ impl PortfolioTargetProjection {
         }
     }
 
-    #[sdk_static(alias = "Percent")]
     pub fn percent(symbol: Symbol, percent: f64) -> Self {
         Self {
             symbol,
@@ -1028,12 +1162,12 @@ impl PortfolioTargetProjection {
 pub fn portfolio_target_from_projection(
     projection: &PortfolioTargetProjection,
     portfolio_value: Decimal,
-    prices: &HashMap<String, Decimal>,
+    prices: &HashMap<u64, Decimal>,
 ) -> Option<PortfolioTarget> {
     if let Some(percent) = projection.percent {
         let percent = Decimal::from_f64(percent)?;
         let price = prices
-            .get(projection.symbol.value.as_ref())
+            .get(&projection.symbol.id.sid)
             .copied()
             .unwrap_or(Decimal::ONE);
         return Some(PortfolioTarget::percent_with_tag(
@@ -1052,6 +1186,28 @@ pub fn portfolio_target_from_projection(
             projection.tag.clone(),
         ))
     })
+}
+
+pub fn portfolio_target_projection_from_execution_target(
+    target: &ExecutionTarget,
+) -> PortfolioTargetProjection {
+    PortfolioTargetProjection {
+        symbol: target.symbol.clone(),
+        quantity: target.quantity.to_f64(),
+        percent: None,
+        tag: target.tag.clone(),
+    }
+}
+
+pub fn portfolio_target_projection_from_risk_target(
+    target: &RiskPortfolioTarget,
+) -> PortfolioTargetProjection {
+    PortfolioTargetProjection {
+        symbol: target.symbol.clone(),
+        quantity: target.quantity.to_f64(),
+        percent: None,
+        tag: String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1126,7 +1282,7 @@ mod tests {
             percent: Some(0.5),
             tag: "half".to_string(),
         };
-        let prices = HashMap::from([(symbol.value.to_string(), Decimal::from(100))]);
+        let prices = HashMap::from([(symbol.id.sid, Decimal::from(100))]);
 
         let target =
             portfolio_target_from_projection(&projection, Decimal::from(10_000), &prices).unwrap();

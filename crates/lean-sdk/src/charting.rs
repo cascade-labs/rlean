@@ -6,21 +6,19 @@
 use lean_algorithm::charting::{
     new_shared_chart_collection, plot_shared_chart, SharedChartCollection,
 };
-use lean_sdk_annotations::{sdk_bind, sdk_method, sdk_new};
 
 /// SDK-owned handle wrapping a [`SharedChartCollection`] for language bindings.
 ///
 /// All charting behavior (locking, plotting) lives here so the generated Python
 /// layer is pure marshalling. Cloning shares the underlying collection.
 #[derive(Clone)]
-#[sdk_bind(py_name = "ChartCollection")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "ChartCollection"))]
 pub struct ChartCollectionHandle {
     inner: SharedChartCollection,
 }
 
 impl ChartCollectionHandle {
     /// LEAN-compatible constructor exposed to Python as `ChartCollection()`.
-    #[sdk_new]
     pub fn new() -> Self {
         Self {
             inner: new_shared_chart_collection(),
@@ -38,7 +36,6 @@ impl ChartCollectionHandle {
     }
 
     /// Plot a value on a line chart, creating the chart/series on demand.
-    #[sdk_method]
     pub fn plot(&self, chart: &str, series: &str, time: &str, value: f64) {
         plot_shared_chart(&self.inner, chart, series, time, value);
     }
@@ -47,6 +44,20 @@ impl ChartCollectionHandle {
 impl Default for ChartCollectionHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ChartCollectionHandle {
+    #[new]
+    fn py_new() -> Self {
+        Self::new()
+    }
+
+    #[pyo3(name = "plot")]
+    fn py_plot(&self, chart: &str, series: &str, time: &str, value: f64) {
+        self.plot(chart, series, time, value);
     }
 }
 

@@ -15,11 +15,9 @@ lean-data           = { path = "../lean-data" }
 lean-data-providers = { path = "../lean-data-providers" }
 lean-engine         = { path = "../lean-engine" }
 lean-sdk            = { path = "../lean-sdk" }
-lean-sdk-pyo3-gen    = { path = "../lean-sdk-pyo3-gen" }
 lean-algorithm      = { path = "../lean-algorithm" }
 lean-brokerages     = { path = "../lean-brokerages" }
 lean-live           = { path = "../lean-live" }
-lean-python         = { path = "../lean-python" }
 lean-python-runtime = { path = "../lean-python-runtime" }
 lean-storage        = { path = "../lean-storage" }
 

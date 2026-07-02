@@ -19,6 +19,7 @@ pub struct InsightCollection {
     insights: BTreeMap<u64, Vec<Insight>>,
     /// Closed insights retained with their final scores (FIFO-pruned history).
     closed: Vec<Insight>,
+    closed_version: usize,
     total_count: usize,
 }
 
@@ -42,6 +43,8 @@ pub struct InsightCollectionSnapshot {
 #[derive(Debug, Clone)]
 pub struct ActiveInsightSnapshot {
     pub active: Arc<[Insight]>,
+    pub closed: Arc<[Insight]>,
+    pub closed_version: usize,
     pub total_count: usize,
 }
 
@@ -50,17 +53,18 @@ impl InsightCollection {
         Self {
             insights: BTreeMap::new(),
             closed: Vec::new(),
+            closed_version: 0,
             total_count: 0,
         }
     }
 
     /// Update direction/magnitude scores of all active insights from current prices.
-    /// `prices` is keyed by `symbol.value` (ticker), matching the framework pipeline.
-    pub fn score_active(&mut self, prices: &HashMap<String, Decimal>, utc_now: DateTime) {
+    /// `prices` is keyed by `Symbol.sid()` to avoid per-slice ticker allocation.
+    pub fn score_active(&mut self, prices: &HashMap<u64, Decimal>, utc_now: DateTime) {
         for v in self.insights.values_mut() {
             for insight in v.iter_mut() {
                 if insight.is_active(utc_now) {
-                    if let Some(price) = prices.get(insight.symbol.value.as_ref()) {
+                    if let Some(price) = prices.get(&insight.symbol.id.sid) {
                         if insight.reference_value.is_none() {
                             insight.reference_value = Some(*price);
                         }
@@ -93,6 +97,26 @@ impl InsightCollection {
     pub fn active_snapshot(&self) -> ActiveInsightSnapshot {
         ActiveInsightSnapshot {
             active: self.insights.values().flatten().cloned().collect(),
+            closed: self.closed.iter().cloned().collect(),
+            closed_version: self.closed_version,
+            total_count: self.total_count,
+        }
+    }
+
+    pub fn active_snapshot_reusing_closed(
+        &self,
+        cached_closed_version: Option<usize>,
+        cached_closed: Option<Arc<[Insight]>>,
+    ) -> ActiveInsightSnapshot {
+        let closed = if cached_closed_version == Some(self.closed_version) {
+            cached_closed.unwrap_or_else(|| Arc::from([]))
+        } else {
+            self.closed.iter().cloned().collect()
+        };
+        ActiveInsightSnapshot {
+            active: self.insights.values().flatten().cloned().collect(),
+            closed,
+            closed_version: self.closed_version,
             total_count: self.total_count,
         }
     }
@@ -113,6 +137,7 @@ impl InsightCollection {
         Self {
             insights,
             closed,
+            closed_version: 0,
             total_count: snapshot.total_count,
         }
     }
@@ -167,6 +192,25 @@ impl InsightCollection {
             .collect()
     }
 
+    pub fn active_count(&self, utc_now: DateTime) -> usize {
+        self.insights
+            .values()
+            .flatten()
+            .filter(|insight| insight.is_active(utc_now))
+            .count()
+    }
+
+    pub fn latest_active_symbol_count(&self, utc_now: DateTime) -> usize {
+        self.insights
+            .values()
+            .filter(|symbol_insights| {
+                symbol_insights
+                    .iter()
+                    .any(|insight| insight.is_active(utc_now))
+            })
+            .count()
+    }
+
     pub fn active(&self, utc_now: DateTime) -> Vec<Insight> {
         self.insights
             .values()
@@ -199,6 +243,9 @@ impl InsightCollection {
         if self.closed.len() > MAX_CLOSED_HISTORY {
             let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
             self.closed.drain(0..overflow);
+        }
+        if !expired.is_empty() {
+            self.closed_version += 1;
         }
         expired
     }
@@ -235,6 +282,9 @@ impl InsightCollection {
         if self.closed.len() > MAX_CLOSED_HISTORY {
             let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
             self.closed.drain(0..overflow);
+        }
+        if !closed_out.is_empty() {
+            self.closed_version += 1;
         }
         closed_out
     }
@@ -280,6 +330,9 @@ impl InsightCollection {
         if self.closed.len() > MAX_CLOSED_HISTORY {
             let overflow = self.closed.len() - MAX_CLOSED_HISTORY;
             self.closed.drain(0..overflow);
+        }
+        if !removed.is_empty() {
+            self.closed_version += 1;
         }
         removed
     }

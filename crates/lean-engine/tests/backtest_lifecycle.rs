@@ -1,16 +1,22 @@
 use anyhow::Result;
+use chrono::{NaiveDate, TimeZone, Utc};
 use lean_algorithm::algorithm::{DataDeliveryPayload, SecurityChanges};
 use lean_algorithm::lifecycle::{
     AlgorithmBridge, AlgorithmServices, AlgorithmStateAccess, OptionSubscription, UniverseSelection,
 };
 use lean_algorithm::qc_algorithm::QcAlgorithm;
-use lean_core::{DataNormalizationMode, DateTime, Market, Price, Resolution, Symbol};
+use lean_core::{
+    DataNormalizationMode, DateTime, Market, Price, Resolution, SecurityType, Symbol, TickType,
+};
 use lean_data::{
     split::SplitType, CustomDataPoint, Delisting, DelistingType, Dividend, Slice, Split,
     SubscriptionDataConfig, SymbolChangedEvent, TradeBar, TradeBarData,
 };
 use lean_data_providers::{DataType, HistoryRequest, IHistoryProvider};
-use lean_engine::{algorithm_manager::AlgorithmManager, AlgorithmRuntimeContext};
+use lean_engine::{
+    algorithm_manager::{AlgorithmManager, OrderEventProcessing},
+    AlgorithmRuntimeContext,
+};
 use lean_engine::{runner::backtest::run_backtest, BacktestRunConfig};
 use lean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
@@ -27,6 +33,10 @@ fn test_runtime_context() -> AlgorithmRuntimeContext {
         Arc::new(lean_algorithm::lifecycle::NullHistoryService),
         HashMap::new(),
     )
+}
+
+fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
+    DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()))
 }
 
 struct OneBarHistoryProvider {
@@ -46,25 +56,6 @@ impl IHistoryProvider for OneBarHistoryProvider {
     }
 }
 
-struct MultiBarHistoryProvider {
-    bars: Vec<TradeBar>,
-}
-
-#[async_trait::async_trait]
-impl IHistoryProvider for MultiBarHistoryProvider {
-    async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
-        if request.data_type != DataType::TradeBar {
-            return Ok(Vec::new());
-        }
-        Ok(self
-            .bars
-            .iter()
-            .filter(|bar| bar.symbol.id.sid == request.symbol.id.sid)
-            .cloned()
-            .collect())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleEvent {
     Initialize,
@@ -75,7 +66,6 @@ enum LifecycleEvent {
     OnDelistings,
     OnSymbolChangedEvents,
     OnData,
-    OnFrameworkData,
     OnEndOfTimeStep,
     OnOrderEvent,
     OnEndOfDay,
@@ -92,10 +82,6 @@ struct RecordingBacktestAlgorithm {
     securities_changed: Arc<Mutex<Option<SecurityChanges>>>,
     on_data_warmup_states: Arc<Mutex<Vec<bool>>>,
     on_data_times: Arc<Mutex<Vec<DateTime>>>,
-    framework_market_order_symbol: Option<Symbol>,
-    framework_market_order_emitted: bool,
-    framework_slice_times: Arc<Mutex<Vec<DateTime>>>,
-    framework_warmup_states: Arc<Mutex<Vec<bool>>>,
 }
 
 impl RecordingBacktestAlgorithm {
@@ -104,7 +90,7 @@ impl RecordingBacktestAlgorithm {
         algorithm.set_start_date(2024, 1, 2);
         algorithm.set_end_date(2024, 1, 2);
         algorithm.add_equity_with_normalization(
-            &symbol.value,
+            symbol.value.as_ref(),
             Resolution::Daily,
             Some(DataNormalizationMode::Raw),
         );
@@ -116,16 +102,7 @@ impl RecordingBacktestAlgorithm {
             securities_changed: Arc::new(Mutex::new(None)),
             on_data_warmup_states: Arc::new(Mutex::new(Vec::new())),
             on_data_times: Arc::new(Mutex::new(Vec::new())),
-            framework_market_order_symbol: None,
-            framework_market_order_emitted: false,
-            framework_slice_times: Arc::new(Mutex::new(Vec::new())),
-            framework_warmup_states: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    fn set_one_framework_market_order(&mut self, symbol: Symbol) {
-        self.framework_market_order_symbol = Some(symbol);
-        self.framework_market_order_emitted = false;
     }
 
     fn record(&self, event: LifecycleEvent) {
@@ -455,25 +432,32 @@ async fn backtest_runner_replays_warmup_before_warmup_finished() {
     let warmup_date = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
     let warmup_bar = TradeBar::new(
         subscription_symbol.clone(),
-        DateTime::from(warmup_date.and_hms_opt(0, 0, 0).unwrap()),
+        dt(warmup_date, 16, 0),
         lean_core::TimeSpan::ONE_DAY,
         TradeBarData::new(dec!(90), dec!(91), dec!(89), dec!(90), dec!(1_000)),
     );
     let normal_bar = TradeBar::new(
         subscription_symbol,
-        DateTime::from(date.and_hms_opt(0, 0, 0).unwrap()),
+        dt(date, 16, 0),
         lean_core::TimeSpan::ONE_DAY,
         TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1_000)),
     );
+    store
+        .append_trade_bars(
+            &[warmup_bar, normal_bar],
+            SecurityType::Equity,
+            Market::usa().as_str(),
+            Resolution::Daily,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
 
     run_backtest(
         algorithm,
         BacktestRunConfig {
             data_root: tmp.path().to_path_buf(),
             data_store: store,
-            history_provider: Some(Arc::new(MultiBarHistoryProvider {
-                bars: vec![warmup_bar, normal_bar],
-            })),
             start_date_override: Some(date),
             end_date_override: Some(date),
             ..BacktestRunConfig::default()
@@ -632,16 +616,16 @@ fn algorithm_manager_dispatches_order_event_after_fill_settlement() {
     let mut trade_builder = TradeBuilder::new();
     let mut completed_trades = Vec::new();
 
-    manager.process_order_events(
-        &slice,
-        &[],
-        Some(&processor),
-        Some(&portfolio),
-        &mut services,
-        &mut all_order_events,
-        &mut trade_builder,
-        &mut completed_trades,
-    );
+    manager.process_order_events(OrderEventProcessing {
+        slice: &slice,
+        option_chains: &[],
+        order_processor: Some(&processor),
+        portfolio: Some(&portfolio),
+        services: &mut services,
+        all_order_events: &mut all_order_events,
+        trade_builder: &mut trade_builder,
+        completed_trades: &mut completed_trades,
+    });
 
     assert_eq!(all_order_events.len(), 1);
     assert_eq!(all_order_events[0].fill_quantity, dec!(10));

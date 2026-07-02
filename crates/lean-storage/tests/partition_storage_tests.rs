@@ -4,7 +4,7 @@ use lean_data::{TradeBar, TradeBarData};
 use lean_storage::{
     convert,
     iceberg_store::{MARKET_QUOTE_BARS, MARKET_TRADE_BARS},
-    IcebergStore, QueryParams,
+    IcebergStore, MarketPartitionDayQuery, QueryParams,
 };
 use parquet::arrow::arrow_writer::ArrowWriter;
 use rust_decimal_macros::dec;
@@ -21,9 +21,7 @@ fn date_time(date: NaiveDate, h: u32, m: u32, s: u32) -> NanosecondTimestamp {
 }
 
 fn days_since_epoch(value: NaiveDate) -> i32 {
-    value
-        .signed_duration_since(date(1970, 1, 1))
-        .num_days() as i32
+    value.signed_duration_since(date(1970, 1, 1)).num_days() as i32
 }
 
 #[test]
@@ -134,7 +132,7 @@ async fn market_partition_days_tracks_appended_market_partitions() {
         .unwrap();
 
     let first_days = store
-        .market_partition_days(
+        .market_partition_days(MarketPartitionDayQuery::new(
             MARKET_TRADE_BARS,
             lean_core::SecurityType::Equity,
             market.as_str(),
@@ -142,12 +140,14 @@ async fn market_partition_days_tracks_appended_market_partitions() {
             spy.id.sid,
             days_since_epoch(day1),
             days_since_epoch(day3),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(
         first_days,
-        [days_since_epoch(day1), days_since_epoch(day2)].into_iter().collect()
+        [days_since_epoch(day1), days_since_epoch(day2)]
+            .into_iter()
+            .collect()
     );
 
     store
@@ -167,7 +167,7 @@ async fn market_partition_days_tracks_appended_market_partitions() {
         .unwrap();
 
     let updated_days = store
-        .market_partition_days(
+        .market_partition_days(MarketPartitionDayQuery::new(
             MARKET_TRADE_BARS,
             lean_core::SecurityType::Equity,
             market.as_str(),
@@ -175,7 +175,7 @@ async fn market_partition_days_tracks_appended_market_partitions() {
             spy.id.sid,
             days_since_epoch(day1),
             days_since_epoch(day3),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -190,7 +190,7 @@ async fn market_partition_days_tracks_appended_market_partitions() {
     );
 
     let quote_days = store
-        .market_partition_days(
+        .market_partition_days(MarketPartitionDayQuery::new(
             MARKET_QUOTE_BARS,
             lean_core::SecurityType::Equity,
             market.as_str(),
@@ -198,7 +198,7 @@ async fn market_partition_days_tracks_appended_market_partitions() {
             spy.id.sid,
             days_since_epoch(day1),
             days_since_epoch(day3),
-        )
+        ))
         .await
         .unwrap();
     assert!(quote_days.is_empty());
@@ -251,7 +251,7 @@ async fn warmed_market_partition_index_tracks_appends() {
         .unwrap();
 
     let warmed_days = store
-        .market_partition_days(
+        .market_partition_days(MarketPartitionDayQuery::new(
             MARKET_TRADE_BARS,
             lean_core::SecurityType::Equity,
             market.as_str(),
@@ -259,7 +259,7 @@ async fn warmed_market_partition_index_tracks_appends() {
             spy.id.sid,
             days_since_epoch(day1),
             days_since_epoch(day2),
-        )
+        ))
         .await
         .unwrap();
 

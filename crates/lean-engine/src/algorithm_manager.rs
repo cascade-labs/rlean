@@ -10,8 +10,19 @@ use lean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
 use lean_orders::{order_processor::OrderProcessor, OrderEvent};
 use lean_statistics::{Trade, TradeBuilder};
 use rust_decimal_macros::dec;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::info;
+
+pub struct OrderEventProcessing<'a> {
+    pub slice: &'a Slice,
+    pub option_chains: &'a [(&'a str, &'a lean_options::OptionChain)],
+    pub order_processor: Option<&'a OrderProcessor>,
+    pub portfolio: Option<&'a Arc<lean_algorithm::portfolio::SecurityPortfolioManager>>,
+    pub services: &'a mut dyn AlgorithmServices,
+    pub all_order_events: &'a mut Vec<OrderEvent>,
+    pub trade_builder: &'a mut TradeBuilder,
+    pub completed_trades: &'a mut Vec<Trade>,
+}
 
 pub struct AlgorithmManager<B>
 where
@@ -41,6 +52,10 @@ where
     pub fn initialize(&mut self, services: &mut dyn AlgorithmServices) -> anyhow::Result<()> {
         info!("Initializing algorithm: {}", self.algorithm.name());
         self.algorithm.initialize(services)
+    }
+
+    pub fn framework(&self) -> Arc<Mutex<crate::framework::FrameworkState>> {
+        self.runtime_context.framework()
     }
 
     pub fn set_market_hours_database(&mut self, market_hours_database: Arc<MarketHoursDatabase>) {
@@ -145,7 +160,7 @@ where
         new_trading_day: bool,
         services: &mut dyn AlgorithmServices,
     ) -> SecurityChanges {
-        if !new_trading_day || !self.algorithm.has_universes() {
+        if !self.algorithm.has_universes() {
             return SecurityChanges::empty();
         }
 
@@ -154,21 +169,23 @@ where
             .universe_resolution()
             .unwrap_or(lean_core::Resolution::Daily);
         let mut changes = SecurityChanges::empty();
-        for selection in self
-            .algorithm
-            .select_universe_changes(slice.time.0, resolution, services)
-        {
-            if let Some(algorithm_state) = self.algorithm.algorithm_state() {
-                let mut algorithm = algorithm_state.lock().unwrap();
-                crate::algorithm_services::apply_universe_changes(
-                    &mut algorithm,
-                    &mut changes,
-                    selection.changes,
-                    selection.resolution,
-                );
-            } else {
-                changes.added.extend(selection.changes.added);
-                changes.removed.extend(selection.changes.removed);
+        if new_trading_day {
+            for selection in
+                self.algorithm
+                    .select_universe_changes(slice.time.0, resolution, services)
+            {
+                if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                    let mut algorithm = algorithm_state.lock().unwrap();
+                    crate::algorithm_services::apply_universe_changes(
+                        &mut algorithm,
+                        &mut changes,
+                        selection.changes,
+                        selection.resolution,
+                    );
+                } else {
+                    changes.added.extend(selection.changes.added);
+                    changes.removed.extend(selection.changes.removed);
+                }
             }
         }
         if !slice.custom_data.is_empty() {
@@ -208,17 +225,17 @@ where
         self.runtime_context.update_registered_indicators(slice);
     }
 
-    pub fn process_order_events(
-        &mut self,
-        slice: &Slice,
-        option_chains: &[(&str, &lean_options::OptionChain)],
-        order_processor: Option<&OrderProcessor>,
-        portfolio: Option<&Arc<lean_algorithm::portfolio::SecurityPortfolioManager>>,
-        services: &mut dyn AlgorithmServices,
-        all_order_events: &mut Vec<OrderEvent>,
-        trade_builder: &mut TradeBuilder,
-        completed_trades: &mut Vec<Trade>,
-    ) {
+    pub fn process_order_events(&mut self, processing: OrderEventProcessing<'_>) {
+        let OrderEventProcessing {
+            slice,
+            option_chains,
+            order_processor,
+            portfolio,
+            services,
+            all_order_events,
+            trade_builder,
+            completed_trades,
+        } = processing;
         let (Some(processor), Some(portfolio)) = (order_processor, portfolio) else {
             return;
         };
@@ -358,6 +375,11 @@ where
         } else {
             Vec::new()
         };
+        tracing::debug!(
+            "framework pipeline produced {} order request(s) at {:?}",
+            order_requests.len(),
+            slice.time
+        );
         if let Some(algorithm_state) = self.algorithm.algorithm_state() {
             crate::algorithm_services::submit_execution_order_requests(
                 &algorithm_state,
@@ -436,7 +458,7 @@ fn extend_bars_with_option_contracts(
     option_chains: &[(&str, &lean_options::OptionChain)],
 ) {
     for (_, chain) in option_chains {
-        for (_, contract) in &chain.contracts {
+        for contract in chain.contracts.values() {
             let price = contract
                 .mid_price()
                 .max(contract.data.last_price)

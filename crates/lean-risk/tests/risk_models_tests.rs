@@ -69,7 +69,7 @@ fn test_security_drawdown_triggers_below_threshold() {
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "25% drawdown should trigger 20% limit");
     assert_eq!(result[0].quantity, Decimal::ZERO);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn per_security_drawdown_uses_strict_less_than_threshold() {
     let result = model.manage_risk_with_context(&[], &ctx);
 
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0].symbol.value, "AAPL");
+    assert_eq!(result[0].symbol.value.as_ref(), "AAPL");
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
@@ -175,7 +175,7 @@ fn test_drawdown_portfolio_triggers_at_threshold() {
         Decimal::ZERO,
         "Liquidation qty must be 0"
     );
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn test_unrealized_profit_triggers_above_threshold() {
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "7.5% profit should trigger 5% threshold");
     assert_eq!(result[0].quantity, Decimal::ZERO);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -342,7 +342,7 @@ fn test_unrealized_profit_multiple_holdings_mixed() {
     };
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "Only SPY should be liquidated");
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -390,7 +390,7 @@ fn test_trailing_stop_long_updates_high_and_triggers_drawdown() {
     };
     let result = model.manage_risk_with_context(&[], &ctx_drawdown);
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
@@ -420,7 +420,7 @@ fn test_trailing_stop_short_updates_low_and_triggers_drawdown() {
     };
     let result = model.manage_risk_with_context(&[], &ctx_rebound);
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 

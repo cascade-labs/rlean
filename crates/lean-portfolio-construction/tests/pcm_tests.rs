@@ -45,10 +45,10 @@ fn make_insight_with_confidence(
 }
 
 /// Build a price map from (ticker, price) pairs.
-fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
+fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
     pairs
         .iter()
-        .map(|(ticker, price)| (ticker.to_uppercase(), *price))
+        .map(|(ticker, price)| (make_equity(ticker).id.sid, *price))
         .collect()
 }
 
@@ -87,7 +87,7 @@ mod equal_weighting_tests {
         let find = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .expect("target not found")
                 .quantity
         };
@@ -127,7 +127,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -159,7 +159,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -258,7 +258,7 @@ mod equal_weighting_tests {
         let holdings_value: Decimal = targets
             .iter()
             .map(|t| {
-                let price = prices[&t.symbol.value];
+                let price = prices[&t.symbol.id.sid];
                 t.quantity * price
             })
             .sum();
@@ -266,7 +266,7 @@ mod equal_weighting_tests {
         // Each slot should have approximately portfolio_value / 3.
         let expected_per_slot = portfolio_value / dec!(3);
         for target in &targets {
-            let price = prices[&target.symbol.value];
+            let price = prices[&target.symbol.id.sid];
             let slot_value = target.quantity * price;
             let diff = (slot_value - expected_per_slot).abs();
             assert!(
@@ -311,7 +311,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -462,7 +462,7 @@ mod insight_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -565,7 +565,7 @@ mod insight_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };

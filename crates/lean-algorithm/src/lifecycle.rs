@@ -1,7 +1,8 @@
 use crate::algorithm::{AlgorithmStatus, DataDeliveryPayload, SecurityChanges};
 use crate::charting::ChartCollection;
-use lean_alpha::AlphaAnalytics;
+use crate::framework_registry::FrameworkModelRegistry;
 use crate::qc_algorithm::{OptionFilter, QcAlgorithm};
+use lean_alpha::AlphaAnalytics;
 use lean_core::{DateTime, Price, Resolution, Symbol};
 use lean_data::{
     CustomDataPoint, Delisting, Dividend, Split, SubscriptionDataConfig, SymbolChangedEvent,
@@ -9,6 +10,7 @@ use lean_data::{
 use lean_options::OptionContract;
 use lean_orders::{Order, OrderEvent, TransactionManager};
 use rust_decimal::Decimal;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -31,10 +33,51 @@ pub trait RegisteredIndicatorBridge: Send + Sync {
 pub type RegisteredIndicatorRegistry =
     Arc<Mutex<HashMap<u64, Vec<Arc<dyn RegisteredIndicatorBridge>>>>>;
 
+pub type CustomUniverseSelectFn = Arc<dyn Fn(&[CustomDataPoint]) -> Vec<Symbol> + Send + Sync>;
+
+pub struct CustomUniverseSelectorRegistrationRequest {
+    pub source_type: String,
+    pub ticker: String,
+    pub resolution: Resolution,
+    pub settings_resolution: Resolution,
+    pub minimum_time_in_universe_secs: f64,
+    pub select: CustomUniverseSelectFn,
+}
+
 pub trait AlgorithmRuntimeServices: Send + Sync {
     fn history_service(&self) -> Arc<dyn AlgorithmHistoryService>;
     fn runtime_parameters(&self) -> Arc<std::sync::RwLock<HashMap<String, String>>>;
     fn registered_indicators(&self) -> RegisteredIndicatorRegistry;
+    fn framework_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+    fn framework_registry(&self) -> Option<Arc<dyn FrameworkModelRegistry>> {
+        None
+    }
+    fn custom_universe_registry(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+    fn register_custom_universe_selector(
+        &self,
+        registration: CustomUniverseSelectorRegistrationRequest,
+    ) {
+        let _ = registration;
+    }
+    fn run_custom_universe_selections(
+        &self,
+        utc_ns: i64,
+        resolution: Resolution,
+        custom_data: &HashMap<String, Vec<CustomDataPoint>>,
+    ) -> Vec<UniverseSelection> {
+        let _ = (utc_ns, resolution, custom_data);
+        Vec::new()
+    }
+    fn has_custom_universe_selectors(&self) -> bool {
+        false
+    }
+    fn custom_universe_selector_resolution(&self) -> Option<Resolution> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]

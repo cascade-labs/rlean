@@ -2126,9 +2126,9 @@ mod tests {
             .any(|symbol| symbol.id.sid == canonical.id.sid));
         assert!(!alg
             .option_subscription_resolutions
-            .contains_key(&canonical.permtick));
-        assert!(!alg.option_filters.contains_key(&canonical.permtick));
-        assert!(!alg.option_chains.contains_key(&canonical.permtick));
+            .contains_key(canonical.permtick.as_ref()));
+        assert!(!alg.option_filters.contains_key(canonical.permtick.as_ref()));
+        assert!(!alg.option_chains.contains_key(canonical.permtick.as_ref()));
         assert!(!alg.is_option_underlying(&underlying));
         assert!(!alg
             .open_option_contracts

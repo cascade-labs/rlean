@@ -135,7 +135,11 @@ impl TransactionManager {
         }
         self.open_order_ids
             .iter()
-            .filter_map(|order_id| self.orders.get(order_id.key()).map(|entry| entry.read().clone()))
+            .filter_map(|order_id| {
+                self.orders
+                    .get(order_id.key())
+                    .map(|entry| entry.read().clone())
+            })
             .collect()
     }
 

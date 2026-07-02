@@ -1727,7 +1727,7 @@ async fn run_strategy_backtest(
         write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
         write_report, write_results_json, write_summary_json,
     };
-    use lean_python::AlgorithmImports;
+    use lean_python_runtime::AlgorithmImports;
 
     let ext = args
         .strategy
@@ -1814,7 +1814,7 @@ async fn run_strategy_backtest(
         progress: Some(progress),
     };
 
-    let mut runtime_context = lean_engine::AlgorithmRuntimeContext::new(
+    let runtime_context = lean_engine::AlgorithmRuntimeContext::new(
         config.data_root.clone(),
         config.data_store.clone(),
         config.history_provider.clone(),
@@ -1825,16 +1825,17 @@ async fn run_strategy_backtest(
     let bridge: Box<dyn lean_sdk::AlgorithmBridge> = match ext {
         "py" => {
             let strategy_path = args.strategy.clone();
-            let state = Arc::new(std::sync::Mutex::new(lean_algorithm::qc_algorithm::QcAlgorithm::new(
-                "Algorithm",
-                rust_decimal::Decimal::new(100000, 0),
-            )));
-            runtime_context =
-                lean_python_runtime::bind_compat_framework(state.clone(), runtime_context);
-            let context = lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
-                state,
-                Arc::new(runtime_context.clone()),
-            );
+            let state = Arc::new(std::sync::Mutex::new(
+                lean_algorithm::qc_algorithm::QcAlgorithm::new(
+                    "Algorithm",
+                    rust_decimal::Decimal::new(100000, 0),
+                ),
+            ));
+            let context =
+                lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
+                    state,
+                    Arc::new(runtime_context.clone()),
+                );
             let adapter =
                 lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
             Box::new(adapter)
@@ -2032,7 +2033,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
 
     ensure_python_baseline_packages()?;
-    use lean_python::AlgorithmImports;
+    use lean_python_runtime::AlgorithmImports;
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
@@ -2095,26 +2096,24 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         max_runtime: args.live_max_runtime_seconds.map(Duration::from_secs),
         output_dir: deploy_dir,
     };
-    let state = Arc::new(std::sync::Mutex::new(lean_algorithm::qc_algorithm::QcAlgorithm::new(
-        "Algorithm",
-        rust_decimal::Decimal::new(100000, 0),
-    )));
-    let runtime_context = lean_python_runtime::bind_compat_framework(
-        state.clone(),
-        lean_engine::AlgorithmRuntimeContext::new(
-            live_config.data_root.clone(),
-            live_config.data_store.clone(),
-            live_config.history_provider.clone(),
-            live_config.custom_data_sources.clone(),
-            live_config.parameters.clone(),
+    let state = Arc::new(std::sync::Mutex::new(
+        lean_algorithm::qc_algorithm::QcAlgorithm::new(
+            "Algorithm",
+            rust_decimal::Decimal::new(100000, 0),
         ),
+    ));
+    let runtime_context = lean_engine::AlgorithmRuntimeContext::new(
+        live_config.data_root.clone(),
+        live_config.data_store.clone(),
+        live_config.history_provider.clone(),
+        live_config.custom_data_sources.clone(),
+        live_config.parameters.clone(),
     );
     let context = lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
         state,
         Arc::new(runtime_context.clone()),
     );
-    let adapter =
-        lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
+    let adapter = lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
 
     let result = match lean_engine::runner::live::run_live_with_runtime(
         adapter,

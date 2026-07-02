@@ -71,17 +71,17 @@ impl ReturnsSymbolData {
     }
 }
 
-/// Build a returns matrix (rows = time, cols = asset) for the ordered ticker
+/// Build a returns matrix (rows = time, cols = asset) for the ordered symbol id
 /// list from a map of per-symbol returns data.
 ///
 /// Returns `None` if no asset has any returns. Rows are truncated to the
 /// shortest available history so every column is aligned, matching the prior
 /// behaviour of the per-model `build_returns_matrix` helpers.
 pub fn form_returns_matrix(
-    asset_data: &HashMap<String, ReturnsSymbolData>,
-    tickers: &[String],
+    asset_data: &HashMap<u64, ReturnsSymbolData>,
+    symbols: &[u64],
 ) -> Option<Vec<Vec<f64>>> {
-    let per_asset: Vec<Vec<f64>> = tickers
+    let per_asset: Vec<Vec<f64>> = symbols
         .iter()
         .map(|t| asset_data.get(t).map(|d| d.returns()).unwrap_or_default())
         .collect();
@@ -91,7 +91,7 @@ pub fn form_returns_matrix(
         return None;
     }
 
-    let n_cols = tickers.len();
+    let n_cols = symbols.len();
     let matrix: Vec<Vec<f64>> = (0..n_rows)
         .map(|t| (0..n_cols).map(|c| per_asset[c][t]).collect())
         .collect();

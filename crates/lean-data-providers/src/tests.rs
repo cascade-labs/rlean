@@ -38,6 +38,7 @@ mod custom_data_tests {
                 ),
                 transport: CustomDataTransport::Http,
                 format: CustomDataFormat::Csv,
+                headers: HashMap::new(),
             })
         }
 
@@ -216,12 +217,12 @@ mod provider_tests {
     use crate::traits::IHistoryProvider;
 
     fn make_symbol_for(ticker: &str) -> Symbol {
-        Symbol {
-            id: SecurityIdentifier::generate_equity(ticker, &Market::usa()),
-            value: ticker.to_string(),
-            permtick: ticker.to_string(),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            SecurityIdentifier::generate_equity(ticker, &Market::usa()),
+            ticker.to_string(),
+            ticker.to_string(),
+            None,
+        )
     }
 
     fn make_symbol() -> Symbol {
@@ -437,7 +438,7 @@ mod provider_tests {
             &self,
             request: &HistoryRequest,
         ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
-            if request.symbol.value == self.failed_symbol {
+            if request.symbol.value.as_ref() == self.failed_symbol {
                 anyhow::bail!("provider has no data for {}", request.symbol.value);
             }
             Ok(vec![make_bar_for(
@@ -575,7 +576,7 @@ mod provider_tests {
         let batch = provider.get_history_batch(&request).await.unwrap();
 
         assert_eq!(batch.trade_bars.len(), 1);
-        assert_eq!(batch.trade_bars[0].symbol.value, "SPY");
+        assert_eq!(batch.trade_bars[0].symbol.value.as_ref(), "SPY");
     }
 
     #[tokio::test]
@@ -718,10 +719,7 @@ mod provider_tests {
             }
         }
 
-        let provider = StackedHistoryProvider::new(vec![
-            Arc::new(local),
-            Arc::new(RemoteOnly),
-        ]);
+        let provider = StackedHistoryProvider::new(vec![Arc::new(local), Arc::new(RemoteOnly)]);
         let request = make_history_request_for_range(
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
@@ -834,7 +832,7 @@ mod provider_tests {
     #[test]
     fn history_request_fields() {
         let req = make_history_request();
-        assert_eq!(req.symbol.permtick, "SPY");
+        assert_eq!(req.symbol.permtick.as_ref(), "SPY");
         assert_eq!(req.resolution, Resolution::Daily);
         assert_eq!(req.data_type, DataType::TradeBar);
     }

@@ -4,7 +4,7 @@ use crate::execution_model::{
     ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
     SecurityData,
 };
-use lean_core::{DateTime, Symbol};
+use lean_core::Symbol;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -25,8 +25,8 @@ pub struct StandardDeviationExecutionModel {
     /// Mirrors C# StandardDeviationExecutionModel.MaximumOrderValue.
     pub maximum_order_value: Decimal,
     /// Desired target quantity per symbol (ticker -> target quantity).
-    targets: HashMap<String, (Symbol, Decimal)>,
-    prices: HashMap<String, VecDeque<Decimal>>,
+    targets: HashMap<u64, (Symbol, Decimal)>,
+    prices: HashMap<u64, VecDeque<Decimal>>,
 }
 
 impl StandardDeviationExecutionModel {
@@ -53,17 +53,14 @@ impl StandardDeviationExecutionModel {
             return;
         }
 
-        let window = self
-            .prices
-            .entry(security.symbol.value.to_string())
-            .or_default();
+        let window = self.prices.entry(security.symbol.id.sid).or_default();
         window.push_back(security.price);
         while window.len() > self.period {
             window.pop_front();
         }
     }
 
-    fn ready_mean_std_dev(&self, key: &str) -> Option<(Decimal, Decimal)> {
+    fn ready_mean_std_dev(&self, key: &u64) -> Option<(Decimal, Decimal)> {
         let window = self.prices.get(key)?;
         if window.len() < self.period {
             return None;
@@ -120,16 +117,6 @@ impl IExecutionModel for StandardDeviationExecutionModel {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest> {
-        let open_orders = Vec::new();
-        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
-        self.execute_with_context(targets, &context)
-    }
-
-    fn execute_with_context(
-        &mut self,
-        targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for sec in context.securities.values() {
@@ -138,7 +125,7 @@ impl IExecutionModel for StandardDeviationExecutionModel {
 
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.to_string();
+            let key = target.symbol.id.sid;
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -149,18 +136,18 @@ impl IExecutionModel for StandardDeviationExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let sec = match context.securities.get(&key) {
+            let sec = match context.security(&symbol) {
                 Some(s) => s,
                 None => continue,
             };
 
             if context.actual_holding_delta(sec, target_quantity) == Decimal::ZERO {
-                fulfilled.push(key.clone());
+                fulfilled.push(key);
                 continue;
             }
 
@@ -232,8 +219,8 @@ impl IExecutionModel for StandardDeviationExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(sym.value.as_ref());
-            self.prices.remove(sym.value.as_ref());
+            self.targets.remove(&sym.id.sid);
+            self.prices.remove(&sym.id.sid);
         }
     }
 

@@ -1,6 +1,5 @@
 use lean_core::{DataNormalizationMode, Market, Resolution, SecurityType, Symbol};
 use lean_data::LiveUniverseSubscriptionConfig;
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method, sdk_new, sdk_setter};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -33,13 +32,12 @@ impl UniverseSettings {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "UniverseSettings")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "UniverseSettings"))]
 pub struct UniverseSettingsHandle {
     inner: std::sync::Arc<std::sync::Mutex<UniverseSettings>>,
 }
 
 impl UniverseSettingsHandle {
-    #[sdk_new]
     pub fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(UniverseSettings::default())),
@@ -53,65 +51,45 @@ impl UniverseSettingsHandle {
     pub fn snapshot(&self) -> UniverseSettings {
         self.inner.lock().unwrap().clone()
     }
-
-    #[sdk_getter]
     pub fn resolution(&self) -> Resolution {
         self.inner.lock().unwrap().resolution
     }
 
-    #[sdk_method]
-    #[sdk_setter(property = "resolution")]
     pub fn set_resolution(&self, resolution: Resolution) {
         self.inner.lock().unwrap().resolution = resolution;
     }
-
-    #[sdk_getter]
     pub fn leverage(&self) -> f64 {
         self.inner.lock().unwrap().leverage
     }
 
-    #[sdk_method]
-    #[sdk_setter(property = "leverage")]
     pub fn set_leverage(&self, leverage: f64) {
         self.inner.lock().unwrap().leverage = leverage;
     }
-
-    #[sdk_getter]
     pub fn fill_forward(&self) -> bool {
         self.inner.lock().unwrap().fill_forward
     }
 
-    #[sdk_method]
     pub fn set_fill_forward(&self, fill_forward: bool) {
         self.inner.lock().unwrap().fill_forward = fill_forward;
     }
-
-    #[sdk_getter]
     pub fn extended_market_hours(&self) -> bool {
         self.inner.lock().unwrap().extended_market_hours
     }
 
-    #[sdk_method]
     pub fn set_extended_market_hours(&self, extended_market_hours: bool) {
         self.inner.lock().unwrap().extended_market_hours = extended_market_hours;
     }
-
-    #[sdk_getter]
     pub fn minimum_time_in_universe(&self) -> f64 {
         self.inner.lock().unwrap().minimum_time_in_universe_secs
     }
 
-    #[sdk_method]
     pub fn set_minimum_time_in_universe(&self, seconds: f64) {
         self.inner.lock().unwrap().minimum_time_in_universe_secs = seconds.max(0.0);
     }
-
-    #[sdk_getter]
     pub fn data_normalization_mode(&self) -> DataNormalizationMode {
         self.inner.lock().unwrap().data_normalization_mode
     }
 
-    #[sdk_method]
     pub fn set_data_normalization_mode(&self, mode: DataNormalizationMode) {
         self.inner.lock().unwrap().data_normalization_mode = mode;
     }
@@ -120,6 +98,30 @@ impl UniverseSettingsHandle {
 impl Default for UniverseSettingsHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl UniverseSettingsHandle {
+    #[new]
+    fn py_new() -> Self {
+        Self::new()
+    }
+
+    #[getter(resolution)]
+    fn py_resolution(&self) -> crate::types::Resolution {
+        self.resolution().into()
+    }
+
+    #[setter(resolution)]
+    fn py_set_resolution(&self, resolution: crate::types::Resolution) {
+        self.set_resolution(resolution.into());
+    }
+
+    #[pyo3(name = "set_resolution")]
+    fn py_set_resolution_method(&self, resolution: crate::types::Resolution) {
+        self.set_resolution(resolution.into());
     }
 }
 
@@ -136,7 +138,7 @@ pub enum TimeRule {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "DateRule")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "DateRule"))]
 pub struct DateRuleHandle {
     pub kind: DateRule,
 }
@@ -148,23 +150,21 @@ impl DateRuleHandle {
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "DateRules")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "DateRules"))]
 pub struct DateRulesHandle;
 
 impl DateRulesHandle {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn every_day(&self) -> DateRuleHandle {
         DateRuleHandle::new(DateRule::EveryDay)
     }
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "TimeRule")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "TimeRule"))]
 pub struct TimeRuleHandle {
     pub kind: TimeRule,
 }
@@ -176,26 +176,22 @@ impl TimeRuleHandle {
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "TimeRules")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "TimeRules"))]
 pub struct TimeRulesHandle;
 
 impl TimeRulesHandle {
-    #[sdk_new]
     pub fn new() -> Self {
         Self
     }
 
-    #[sdk_method]
     pub fn at(&self, hour: u32, minute: u32, _second: u32) -> TimeRuleHandle {
         TimeRuleHandle::new(TimeRule::At { hour, minute })
     }
 
-    #[sdk_method]
     pub fn after_market_open(&self, minutes_after_open: i64) -> TimeRuleHandle {
         TimeRuleHandle::new(TimeRule::AfterMarketOpen { minutes_after_open })
     }
 
-    #[sdk_method]
     pub fn every(&self, interval_seconds: i64) -> TimeRuleHandle {
         let minutes_after_open = (interval_seconds / 60).max(0);
         TimeRuleHandle::new(TimeRule::AfterMarketOpen { minutes_after_open })
@@ -216,13 +212,12 @@ pub struct ScheduledUniverseDescriptor {
 }
 
 #[derive(Clone)]
-#[sdk_bind(py_name = "ScheduledUniverse")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "ScheduledUniverse"))]
 pub struct ScheduledUniverseHandle {
     descriptor: ScheduledUniverseDescriptor,
 }
 
 impl ScheduledUniverseHandle {
-    #[sdk_new]
     pub fn new(
         date_rule: DateRuleHandle,
         time_rule: TimeRuleHandle,
@@ -244,13 +239,10 @@ impl ScheduledUniverseHandle {
     pub fn descriptor(&self) -> &ScheduledUniverseDescriptor {
         &self.descriptor
     }
-
-    #[sdk_getter]
     pub fn settings(&self) -> UniverseSettings {
         self.descriptor.settings.clone()
     }
 
-    #[sdk_method]
     pub fn with_custom_properties(&self, properties: HashMap<String, String>) -> Self {
         Self {
             descriptor: self.descriptor.clone().with_custom_properties(properties),
@@ -259,14 +251,13 @@ impl ScheduledUniverseHandle {
 }
 
 #[derive(Clone)]
-#[sdk_bind(py_name = "SecurityChanges")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "SecurityChanges"))]
 pub struct SecurityChangesView {
     added: Vec<Symbol>,
     removed: Vec<Symbol>,
 }
 
 impl SecurityChangesView {
-    #[sdk_new]
     pub fn new() -> Self {
         Self {
             added: Vec::new(),
@@ -277,24 +268,41 @@ impl SecurityChangesView {
     pub fn from_symbols(added: Vec<Symbol>, removed: Vec<Symbol>) -> Self {
         Self { added, removed }
     }
-
-    #[sdk_getter]
     pub fn added_symbols(&self) -> Vec<Symbol> {
         self.added.clone()
     }
+    pub fn added_securities(&self) -> Vec<crate::securities::SecurityHandle> {
+        self.added
+            .iter()
+            .cloned()
+            .map(crate::securities::SecurityHandle::new)
+            .collect()
+    }
+    pub fn removed_securities(&self) -> Vec<crate::securities::SecurityHandle> {
+        self.removed
+            .iter()
+            .cloned()
+            .map(crate::securities::SecurityHandle::new)
+            .collect()
+    }
+}
 
-    #[sdk_getter]
-    pub fn added_securities(&self) -> Vec<Symbol> {
-        self.added.clone()
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SecurityChangesView {
+    #[getter(added_securities)]
+    fn py_added_securities(&self) -> Vec<crate::securities::SecurityHandle> {
+        self.added_securities()
     }
 
-    #[sdk_getter]
+    #[getter(removed_securities)]
+    fn py_removed_securities(&self) -> Vec<crate::securities::SecurityHandle> {
+        self.removed_securities()
+    }
+}
+
+impl SecurityChangesView {
     pub fn removed_symbols(&self) -> Vec<Symbol> {
-        self.removed.clone()
-    }
-
-    #[sdk_getter]
-    pub fn removed_securities(&self) -> Vec<Symbol> {
         self.removed.clone()
     }
 }

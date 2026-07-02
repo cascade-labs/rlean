@@ -1,12 +1,11 @@
 use chrono::{Local, NaiveDate, NaiveDateTime};
 use lean_core::{DateTime, Greeks, OptionRight, OptionStyle, Symbol};
 use lean_options::{implied_volatility, time_to_expiry_years, OptionChain, OptionContract};
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[sdk_bind(py_name = "Greeks")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Greeks"))]
 pub struct GreeksView {
     pub delta: f64,
     pub gamma: f64,
@@ -17,22 +16,15 @@ pub struct GreeksView {
 }
 
 impl GreeksView {
-    #[sdk_getter]
     pub fn delta(&self) -> f64 {
         self.delta
     }
-
-    #[sdk_getter]
     pub fn gamma(&self) -> f64 {
         self.gamma
     }
-
-    #[sdk_getter]
     pub fn vega(&self) -> f64 {
         self.vega
     }
-
-    #[sdk_getter]
     pub fn theta(&self) -> f64 {
         self.theta
     }
@@ -92,19 +84,16 @@ impl From<OptionStyle> for OptionStyleView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[sdk_bind(py_name = "OptionUnderlying")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OptionUnderlying"))]
 pub struct UnderlyingView {
     pub price: f64,
     pub close: f64,
 }
 
 impl UnderlyingView {
-    #[sdk_getter]
     pub fn price(&self) -> f64 {
         self.price
     }
-
-    #[sdk_getter]
     pub fn close(&self) -> f64 {
         self.close
     }
@@ -121,7 +110,7 @@ impl From<&OptionChain> for UnderlyingView {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[sdk_bind(py_name = "OptionContract")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OptionContract"))]
 pub struct OptionContractView {
     pub strike: f64,
     pub expiry: NaiveDateTime,
@@ -144,37 +133,24 @@ pub struct OptionContractView {
 }
 
 impl OptionContractView {
-    #[sdk_getter]
     pub fn strike(&self) -> f64 {
         self.strike
     }
-
-    #[sdk_getter]
     pub fn expiry(&self) -> NaiveDateTime {
         self.expiry
     }
-
-    #[sdk_getter]
     pub fn right(&self) -> OptionRight {
         self.right
     }
-
-    #[sdk_getter]
     pub fn greeks(&self) -> GreeksView {
         self.greeks
     }
-
-    #[sdk_getter]
     pub fn bid_price(&self) -> f64 {
         self.bid_price
     }
-
-    #[sdk_getter]
     pub fn ask_price(&self) -> f64 {
         self.ask_price
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> Symbol {
         self.symbol.clone()
     }
@@ -189,7 +165,7 @@ impl OptionContractView {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[sdk_bind(py_name = "OptionChain")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OptionChain"))]
 pub struct OptionChainView {
     contracts: Vec<OptionContractView>,
     underlying: UnderlyingView,
@@ -202,25 +178,47 @@ impl OptionChainView {
             underlying: UnderlyingView::from(chain),
         }
     }
-
-    #[sdk_getter]
     pub fn contracts(&self) -> Vec<OptionContractView> {
         self.contracts.clone()
     }
-
-    #[sdk_getter]
     pub fn underlying(&self) -> UnderlyingView {
         self.underlying
     }
 
-    #[sdk_method]
     pub fn __len__(&self) -> usize {
         self.contracts.len()
     }
 
-    #[sdk_method]
     pub fn __iter__(&self) -> Vec<OptionContractView> {
         self.contracts.clone()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OptionChainView {
+    #[getter(contracts)]
+    fn py_contracts(&self) -> Vec<OptionContractView> {
+        OptionChainView::contracts(self)
+    }
+
+    #[getter(underlying)]
+    fn py_underlying(&self) -> UnderlyingView {
+        OptionChainView::underlying(self)
+    }
+
+    #[pyo3(name = "__len__")]
+    fn py_len(&self) -> usize {
+        OptionChainView::__len__(self)
+    }
+
+    #[pyo3(name = "__iter__")]
+    fn py_iter<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyIterator>> {
+        let list = pyo3::types::PyList::new(py, OptionChainView::contracts(self))?;
+        pyo3::types::PyIterator::from_object(&list)
     }
 }
 
@@ -246,6 +244,15 @@ impl From<&OptionContract> for OptionContractView {
             intrinsic_value: decimal_to_f64(contract.intrinsic_value()),
             time_value: decimal_to_f64(contract.time_value()),
         }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OptionContractView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol())
     }
 }
 

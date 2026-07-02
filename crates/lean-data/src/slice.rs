@@ -1,10 +1,10 @@
 use crate::symbol_changed::SymbolChangedEvent;
+use crate::OptionChain;
 use crate::{
     CustomDataPoint, Delisting, Dividend, MarginInterestRate, OrderBook, PerpetualContext,
     QuoteBar, Split, Tick, TradeBar,
 };
 use lean_core::{DateTime, Symbol};
-use crate::OptionChain;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

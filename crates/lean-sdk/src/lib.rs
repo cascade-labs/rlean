@@ -12,6 +12,8 @@ pub mod native_bridge;
 pub mod options;
 pub mod orders;
 pub mod portfolio;
+#[cfg(feature = "python")]
+pub mod python_framework;
 pub mod research;
 pub mod securities;
 pub mod types;

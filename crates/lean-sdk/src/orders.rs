@@ -9,7 +9,6 @@ use lean_core::{DateTime, NanosecondTimestamp, Price, Symbol};
 use lean_orders::order::{OrderDirection, OrderStatus};
 use lean_orders::transaction_manager::TransactionManager;
 use lean_orders::{Order, OrderEvent, OrderTicket, UpdateOrderFields};
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -221,7 +220,7 @@ impl OrderTicketContext {
 }
 
 #[derive(Clone)]
-#[sdk_bind(py_name = "OrderTicket")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OrderTicket"))]
 pub struct OrderTicketHandle {
     order_id: i64,
     context: OrderTicketContext,
@@ -243,77 +242,51 @@ impl OrderTicketHandle {
     fn with_view<T>(&self, fallback: T, f: impl FnOnce(OrderTicketView) -> T) -> T {
         self.view().map(f).unwrap_or(fallback)
     }
-
-    #[sdk_getter]
     pub fn order_id(&self) -> i64 {
         self.order_id
     }
-
-    #[sdk_getter]
     pub fn id(&self) -> i64 {
         self.order_id
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> Option<Symbol> {
         self.view().map(|view| view.symbol())
     }
-
-    #[sdk_getter(py_name = "status")]
     pub fn status_code(&self) -> i64 {
         self.with_view(order_status_code(OrderStatus::Invalid), |view| {
             view.status_code()
         })
     }
-
-    #[sdk_getter]
     pub fn quantity(&self) -> f64 {
         self.with_view(0.0, |view| view.quantity())
     }
-
-    #[sdk_getter]
     pub fn filled_quantity(&self) -> f64 {
         self.with_view(0.0, |view| view.filled_quantity())
     }
-
-    #[sdk_getter]
     pub fn average_fill_price(&self) -> f64 {
         self.with_view(0.0, |view| view.average_fill_price())
     }
-
-    #[sdk_getter]
     pub fn limit_price(&self) -> Option<f64> {
         self.view().and_then(|view| view.limit_price())
     }
-
-    #[sdk_getter]
     pub fn stop_price(&self) -> Option<f64> {
         self.view().and_then(|view| view.stop_price())
     }
-
-    #[sdk_getter]
     pub fn tag(&self) -> String {
         self.with_view(String::new(), |view| view.tag())
     }
-
-    #[sdk_getter]
     pub fn is_open(&self) -> bool {
         self.with_view(false, |view| view.is_open())
     }
-
-    #[sdk_getter]
     pub fn order_events(&self) -> Vec<OrderEventView> {
         self.with_view(Vec::new(), |view| view.order_events())
     }
 
-    #[sdk_method]
     pub fn cancel(&self, tag: Option<String>) -> bool {
         self.context
             .transactions
             .cancel_order_ticket(self.order_id, self.context.utc_time(), tag)
     }
 
-    #[sdk_method]
     pub fn update(
         &self,
         limit_price: Option<f64>,
@@ -327,19 +300,45 @@ impl OrderTicketHandle {
         )
     }
 
-    #[sdk_method]
     pub fn update_limit_price(&self, limit_price: f64, tag: Option<String>) -> bool {
         self.update(Some(limit_price), None, tag)
     }
 
-    #[sdk_method]
     pub fn update_stop_price(&self, stop_price: f64, tag: Option<String>) -> bool {
         self.update(None, Some(stop_price), tag)
     }
 
-    #[sdk_method]
     pub fn update_tag(&self, tag: String) -> bool {
         self.update(None, None, Some(tag))
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OrderTicketHandle {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> Option<crate::securities::SymbolHandle> {
+        self.symbol().map(crate::securities::SymbolHandle::new)
+    }
+
+    #[getter(quantity)]
+    fn py_quantity(&self) -> f64 {
+        self.quantity()
+    }
+
+    #[getter(average_fill_price)]
+    fn py_average_fill_price(&self) -> f64 {
+        self.average_fill_price()
+    }
+
+    #[getter(limit_price)]
+    fn py_limit_price(&self) -> Option<f64> {
+        self.limit_price()
+    }
+
+    #[getter(stop_price)]
+    fn py_stop_price(&self) -> Option<f64> {
+        self.stop_price()
     }
 }
 
@@ -348,7 +347,7 @@ impl OrderTicketHandle {
 /// Every accessor returns a primitive (or `Symbol`) so a generator can emit a
 /// Python getter per method with no hand-written conversion logic.
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "OrderEvent")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OrderEvent"))]
 pub struct OrderEventView {
     pub event: OrderEvent,
 }
@@ -395,88 +394,66 @@ impl OrderEventView {
         .to_string();
         Self { event }
     }
-
-    #[sdk_getter]
     pub fn order_id(&self) -> i64 {
         self.event.order_id
     }
-    #[sdk_getter]
     pub fn id(&self) -> i64 {
         self.event.id
     }
-    #[sdk_getter]
     pub fn symbol(&self) -> &Symbol {
         &self.event.symbol
     }
-    #[sdk_getter]
     pub fn utc_time_ns(&self) -> i64 {
         self.event.utc_time.0
     }
-    #[sdk_getter(py_name = "status")]
     pub fn status_code(&self) -> i64 {
         order_status_code(self.event.status)
     }
-    #[sdk_getter(py_name = "direction")]
     pub fn direction_code(&self) -> i64 {
         order_direction_code(self.event.direction)
     }
-    #[sdk_getter]
     pub fn fill_price(&self) -> f64 {
         self.event.fill_price.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn fill_price_currency(&self) -> &str {
         &self.event.fill_price_currency
     }
-    #[sdk_getter]
     pub fn fill_quantity(&self) -> f64 {
         self.event.fill_quantity.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn absolute_fill_quantity(&self) -> f64 {
         self.fill_quantity().abs()
     }
-    #[sdk_getter]
     pub fn quantity(&self) -> f64 {
         self.event.quantity.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn is_assignment(&self) -> bool {
         self.event.is_assignment
     }
-    #[sdk_getter]
     pub fn is_in_the_money(&self) -> bool {
         self.event.is_in_the_money
     }
-    #[sdk_getter]
     pub fn message(&self) -> &str {
         &self.event.message
     }
-    #[sdk_getter]
     pub fn is_fill(&self) -> bool {
         self.event.is_fill()
     }
-    #[sdk_getter]
     pub fn order_fee(&self) -> f64 {
         self.event.order_fee.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn limit_price(&self) -> Option<f64> {
         self.event.limit_price.and_then(|p| p.to_f64())
     }
-    #[sdk_getter]
     pub fn stop_price(&self) -> Option<f64> {
         self.event.stop_price.and_then(|p| p.to_f64())
     }
-    #[sdk_getter]
     pub fn trigger_price(&self) -> Option<f64> {
         self.event.trigger_price.and_then(|p| p.to_f64())
     }
-    #[sdk_getter]
     pub fn trailing_amount(&self) -> Option<f64> {
         self.event.trailing_amount.and_then(|p| p.to_f64())
     }
-    #[sdk_getter]
     pub fn trailing_as_percentage(&self) -> bool {
         self.event.trailing_as_percentage
     }

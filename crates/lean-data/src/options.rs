@@ -145,7 +145,10 @@ impl OptionChain {
 
     /// Returns contracts filtered by the given function.
     pub fn filter<F: Fn(&OptionContract) -> bool>(&self, f: F) -> Vec<&OptionContract> {
-        self.contracts.values().filter(|contract| f(contract)).collect()
+        self.contracts
+            .values()
+            .filter(|contract| f(contract))
+            .collect()
     }
 
     /// All contracts in a canonical, deterministic order: expiry, then strike,

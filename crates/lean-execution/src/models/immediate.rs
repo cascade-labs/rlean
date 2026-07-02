@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use crate::execution_model::{
     ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
-    SecurityData,
 };
-use lean_core::{DateTime, Symbol};
+use lean_core::Symbol;
 use rust_decimal::Decimal;
 
 /// Immediately submits market orders to achieve desired portfolio targets.
@@ -12,7 +11,7 @@ use rust_decimal::Decimal;
 /// Mirrors C# ImmediateExecutionModel: targets are retained in a collection and
 /// ordered by margin impact until projected holdings satisfy them.
 pub struct ImmediateExecutionModel {
-    targets: HashMap<String, (Symbol, Decimal, String)>,
+    targets: HashMap<u64, (Symbol, Decimal, String)>,
 }
 
 impl ImmediateExecutionModel {
@@ -29,7 +28,7 @@ impl ImmediateExecutionModel {
     ) -> Vec<OrderRequest> {
         for target in targets {
             self.targets.insert(
-                target.symbol.value.to_string(),
+                target.symbol.id.sid,
                 (target.symbol.clone(), target.quantity, target.tag.clone()),
             );
         }
@@ -43,12 +42,12 @@ impl ImmediateExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, quantity, _))| (key.clone(), symbol.clone(), *quantity))
+            .map(|(key, (symbol, quantity, _))| (*key, symbol.clone(), *quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let Some(security) = context.securities.get(&key) else {
+            let Some(security) = context.security(&symbol) else {
                 continue;
             };
 
@@ -99,16 +98,6 @@ impl Default for ImmediateExecutionModel {
 
 impl IExecutionModel for ImmediateExecutionModel {
     fn execute(
-        &mut self,
-        targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest> {
-        let open_orders = Vec::new();
-        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
-        self.execute_internal(targets, &context)
-    }
-
-    fn execute_with_context(
         &mut self,
         targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,

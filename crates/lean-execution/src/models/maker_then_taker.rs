@@ -19,8 +19,8 @@ pub struct MakerThenTakerExecutionModel {
     pub passive_duration: TimeSpan,
     pub adverse_selection_threshold: Decimal,
     pub maximum_order_value: Decimal,
-    targets: HashMap<String, (Symbol, Decimal)>,
-    states: HashMap<String, MakerState>,
+    targets: HashMap<u64, (Symbol, Decimal)>,
+    states: HashMap<u64, MakerState>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,8 +53,8 @@ impl MakerThenTakerExecutionModel {
     }
 
     pub fn remove_target(&mut self, symbol: &Symbol) {
-        self.targets.remove(symbol.value.as_ref());
-        self.states.remove(symbol.value.as_ref());
+        self.targets.remove(&symbol.id.sid);
+        self.states.remove(&symbol.id.sid);
     }
 
     fn cap_order_quantity(
@@ -72,7 +72,7 @@ impl MakerThenTakerExecutionModel {
 
     fn reset_state_if_needed(
         &mut self,
-        key: &str,
+        key: &u64,
         target_quantity: Decimal,
         direction: Decimal,
         now: DateTime,
@@ -87,7 +87,7 @@ impl MakerThenTakerExecutionModel {
 
         if reset {
             self.states.insert(
-                key.to_string(),
+                *key,
                 MakerState {
                     target_quantity,
                     direction,
@@ -216,13 +216,13 @@ fn single_updateable_passive_order<'a>(
 }
 
 impl IExecutionModel for MakerThenTakerExecutionModel {
-    fn execute_with_context(
+    fn execute(
         &mut self,
         targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for target in targets {
-            let key = target.symbol.value.to_string();
+            let key = target.symbol.id.sid;
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -232,18 +232,18 @@ impl IExecutionModel for MakerThenTakerExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let Some(sec) = context.securities.get(&key) else {
+            let Some(sec) = context.security(&symbol) else {
                 continue;
             };
 
             let target_delta = context.actual_holding_delta(sec, target_quantity);
             if target_delta == Decimal::ZERO {
-                fulfilled.push(key.clone());
+                fulfilled.push(key);
                 self.states.remove(&key);
                 if context.projected_open_order_quantity(&symbol, sec) != Decimal::ZERO {
                     orders.push(cancel_request(
@@ -394,8 +394,8 @@ impl IExecutionModel for MakerThenTakerExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for symbol in removed {
-            self.targets.remove(symbol.value.as_ref());
-            self.states.remove(symbol.value.as_ref());
+            self.targets.remove(&symbol.id.sid);
+            self.states.remove(&symbol.id.sid);
         }
     }
 

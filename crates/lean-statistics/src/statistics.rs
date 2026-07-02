@@ -59,10 +59,9 @@ impl Statistics {
             return dec!(0);
         }
 
-        let annual_performance = Decimal::from_f64_retain(
-            (dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0,
-        )
-        .unwrap_or(dec!(0));
+        let annual_performance =
+            Decimal::from_f64_retain((dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0)
+                .unwrap_or(dec!(0));
         let annual_std = Decimal::from_f64_retain(std * 252_f64.sqrt()).unwrap_or(dec!(1));
 
         (annual_performance - risk_free_rate) / annual_std
@@ -96,10 +95,9 @@ impl Statistics {
             return dec!(0);
         }
 
-        let annual_performance = Decimal::from_f64_retain(
-            (dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0,
-        )
-        .unwrap_or(dec!(0));
+        let annual_performance =
+            Decimal::from_f64_retain((dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0)
+                .unwrap_or(dec!(0));
         let annual_downside_std =
             Decimal::from_f64_retain(downside_std * 252_f64.sqrt()).unwrap_or(dec!(1));
 

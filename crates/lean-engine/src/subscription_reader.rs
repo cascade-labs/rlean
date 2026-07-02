@@ -11,11 +11,12 @@ use lean_core::{
     Symbol, TickType,
 };
 use lean_data::{
-    CustomDataQuery, CustomDataSource, CustomDataTransport, OptionChainSubscriptionMetadata,
-    QuoteBar, SubscriptionDataConfig, SubscriptionDataKind, Tick, TradeBar,
+    custom::{CustomDataConfig, CustomDataSource, CustomDataTransport},
+    CustomDataPoint, CustomDataQuery, OptionChainSubscriptionMetadata, QuoteBar,
+    SubscriptionDataConfig, SubscriptionDataKind, Tick, TradeBar,
 };
 use lean_data_providers::{DataType, HistoryRequest, ICustomDataSource};
-use lean_storage::{FactorFileEntry, OptionEodBar, QueryParams};
+use lean_storage::{FactorFileEntry, MarketPartitionDayQuery, OptionEodBar, QueryParams};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -80,6 +81,7 @@ struct SubscriptionProducerState {
     last_emitted_time: Option<DateTime>,
     last_emitted_point: Option<SubscriptionDataPoint>,
     daily_time_is_source_date: Option<bool>,
+    custom_history_fetched: bool,
     exhausted: bool,
 }
 
@@ -208,6 +210,7 @@ impl SubscriptionProducerState {
             last_emitted_time: None,
             last_emitted_point: None,
             daily_time_is_source_date: None,
+            custom_history_fetched: false,
             exhausted: false,
         }
     }
@@ -507,68 +510,126 @@ impl SubscriptionProducerState {
         let mut cache_filled_until = Some(window_end);
         let points = match data_type {
             DataType::TradeBar => {
-                let rows = provider
-                    .get_history(&request)
-                    .await?
-                    .into_iter()
-                    .filter(|row| self.trade_bar_belongs_to_window(row, window_start, window_end))
-                    .collect::<Vec<_>>();
+                let rows = {
+                    let _fetch_permit = self
+                        .context
+                        .market_fetch_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market fetch throttle closed")?;
+                    provider
+                        .get_history(&request)
+                        .await?
+                        .into_iter()
+                        .filter(|row| {
+                            self.trade_bar_belongs_to_window(row, window_start, window_end)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if self.config.resolution == Resolution::Daily {
                     cache_filled_until =
                         self.daily_fetched_trade_bars_until(&rows, window_start, window_end);
                 }
-                self.context
-                    .store
-                    .append_trade_bars_unchecked(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                {
+                    let _append_permit = self
+                        .context
+                        .market_append_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market append throttle closed")?;
+                    self.context
+                        .store
+                        .append_trade_bars_unchecked(
+                            &rows,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 self.trade_bars_to_points(rows, window_start, window_end)?
             }
             DataType::QuoteBar => {
-                let rows = provider
-                    .get_quote_bars(&request)
-                    .await?
-                    .into_iter()
-                    .filter(|row| self.quote_bar_belongs_to_window(row, window_start, window_end))
-                    .collect::<Vec<_>>();
+                let rows = {
+                    let _fetch_permit = self
+                        .context
+                        .market_fetch_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market fetch throttle closed")?;
+                    provider
+                        .get_quote_bars(&request)
+                        .await?
+                        .into_iter()
+                        .filter(|row| {
+                            self.quote_bar_belongs_to_window(row, window_start, window_end)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if self.config.resolution == Resolution::Daily {
                     cache_filled_until =
                         self.daily_fetched_quote_bars_until(&rows, window_start, window_end);
                 }
-                self.context
-                    .store
-                    .append_quote_bars_unchecked(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                {
+                    let _append_permit = self
+                        .context
+                        .market_append_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market append throttle closed")?;
+                    self.context
+                        .store
+                        .append_quote_bars_unchecked(
+                            &rows,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 self.quote_bars_to_points(rows, window_start, window_end)?
             }
             DataType::Tick => {
-                let rows = provider
-                    .get_ticks(&request)
-                    .await?
-                    .into_iter()
-                    .filter(|row| self.tick_belongs_to_window(row, window_start, window_end))
-                    .collect::<Vec<_>>();
-                self.context
-                    .store
-                    .append_ticks(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                let rows = {
+                    let _fetch_permit = self
+                        .context
+                        .market_fetch_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market fetch throttle closed")?;
+                    provider
+                        .get_ticks(&request)
+                        .await?
+                        .into_iter()
+                        .filter(|row| self.tick_belongs_to_window(row, window_start, window_end))
+                        .collect::<Vec<_>>()
+                };
+                {
+                    let _append_permit = self
+                        .context
+                        .market_append_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("market append throttle closed")?;
+                    self.context
+                        .store
+                        .append_ticks(
+                            &rows,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 rows.into_iter().map(SubscriptionDataPoint::Tick).collect()
             }
             _ => Vec::new(),
@@ -660,7 +721,7 @@ impl SubscriptionProducerState {
             let available = self
                 .context
                 .store
-                .market_partition_days(
+                .market_partition_days(MarketPartitionDayQuery::new(
                     table,
                     self.config.symbol.security_type(),
                     self.config.symbol.market().as_str(),
@@ -668,7 +729,7 @@ impl SubscriptionProducerState {
                     self.config.symbol.id.sid,
                     days_since_epoch(day_start.0),
                     days_since_epoch(day_end.0),
-                )
+                ))
                 .await?
                 .into_iter()
                 .filter_map(date_from_days_since_epoch)
@@ -1084,7 +1145,7 @@ impl SubscriptionProducerState {
             .is_open_at_local_naive(source_midday)
     }
 
-    async fn load_custom_partition(&self) -> LeanResult<LoadedPartition> {
+    async fn load_custom_partition(&mut self) -> LeanResult<LoadedPartition> {
         let Some(custom) = self.config.custom.as_ref() else {
             return Ok(LoadedPartition {
                 points: Vec::new(),
@@ -1093,54 +1154,56 @@ impl SubscriptionProducerState {
         };
         let source_type = custom.source_type.clone();
         let ticker = custom.ticker.clone();
-        let (window_start, window_end) = self.cache_fill_window();
+        let (window_start, window_end) = if self.config.resolution == Resolution::Daily {
+            (self.partition_date, self.partition_date)
+        } else {
+            self.cache_fill_window()
+        };
+        let query = custom.config.query.merge(&custom.dynamic_query);
         let mut points = self
             .context
             .store
-            .scan_custom_points_range(&source_type, &ticker, window_start, window_end)
+            .scan_custom_points_range_with_query(
+                &source_type,
+                &ticker,
+                window_start,
+                window_end,
+                Some(&query),
+            )
             .await
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        let through_date = window_end;
         if points.is_empty() && self.context.options.fetch_missing_custom_data {
-            let dataset_is_cached = self
-                .context
-                .store
-                .has_custom_points_dataset(&source_type, &ticker)
+            let custom_metadata = custom.clone();
+            match self
+                .fetch_custom_window_if_missing(&custom_metadata, window_start, window_end)
                 .await
-                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-            if !dataset_is_cached {
-                if let Err(error) = self.fetch_custom_partition_if_missing().await {
+            {
+                Ok(fetched) if !fetched.is_empty() => {
+                    self.context
+                        .store
+                        .append_custom_points(&source_type, &ticker, &fetched)
+                        .await
+                        .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                    points = fetched;
+                }
+                Ok(_) => {}
+                Err(error) => {
                     tracing::warn!(
-                        "failed to fetch custom data partition {}:{} on {}: {:#}",
+                        "failed to fetch custom data {} {} on {}: {:#}",
                         source_type,
                         ticker,
                         self.partition_date,
                         error
                     );
                 }
-                if points.is_empty() {
-                    if let Err(error) = self.fetch_custom_full_history_if_missing().await {
-                        tracing::warn!(
-                            "failed to fetch custom history {}:{} on {}..{}: {:#}",
-                            source_type,
-                            ticker,
-                            window_start,
-                            window_end,
-                            error
-                        );
-                    }
-                }
-                points = self
-                    .context
-                    .store
-                    .scan_custom_points_range(&source_type, &ticker, window_start, window_end)
-                    .await
-                    .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
             }
         }
-
+        let through_date = window_end;
         let mut out = Vec::new();
         for point in points {
+            if !custom_point_matches_query(&point, &query) {
+                continue;
+            }
             let data_point = SubscriptionDataPoint::CustomData {
                 symbol: self.config.symbol.clone(),
                 ticker: ticker.clone(),
@@ -1156,155 +1219,50 @@ impl SubscriptionProducerState {
         })
     }
 
-    async fn fetch_custom_partition_if_missing(&self) -> anyhow::Result<()> {
-        let Some(custom) = self.config.custom.as_ref() else {
-            return Ok(());
-        };
+    async fn fetch_custom_window_if_missing(
+        &mut self,
+        custom: &lean_data::CustomSubscriptionMetadata,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<CustomDataPoint>> {
         let Some(source) = self
             .context
             .custom_data_sources
             .iter()
-            .find(|source| source.name().eq_ignore_ascii_case(&custom.source_type))
+            .find(|source| source.name() == custom.source_type)
         else {
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let Some(data_source) =
-            source.get_source(&custom.ticker, self.partition_date, &custom.config)
-        else {
-            return Ok(());
-        };
-        if self
-            .context
-            .failed_custom_data_uris
-            .lock()
-            .expect("custom data failure cache poisoned")
-            .contains(&data_source.uri)
-        {
-            return Ok(());
-        }
-        let text = match fetch_custom_data_source(&data_source).await {
-            Ok(text) => text,
-            Err(error) => {
-                self.context
-                    .failed_custom_data_uris
-                    .lock()
-                    .expect("custom data failure cache poisoned")
-                    .insert(data_source.uri.clone());
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to fetch custom data source {}:{} on {}",
-                        custom.source_type, custom.ticker, self.partition_date
-                    )
-                });
-            }
-        };
-        let points = text
-            .lines()
-            .filter_map(|line| source.reader(line, self.partition_date, &custom.config))
-            .collect::<Vec<_>>();
-        self.context
-            .store
-            .append_custom_points(&custom.source_type, &custom.ticker, &points)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to persist custom data rows for {}:{} on {}",
-                    custom.source_type, custom.ticker, self.partition_date
-                )
-            })?;
-        Ok(())
-    }
 
-    async fn fetch_custom_full_history_if_missing(&self) -> anyhow::Result<()> {
-        let Some(custom) = self.config.custom.as_ref() else {
-            return Ok(());
-        };
-        let Some(source) = self
-            .context
-            .custom_data_sources
-            .iter()
-            .find(|source| source.name().eq_ignore_ascii_case(&custom.source_type))
-            .cloned()
-        else {
-            return Ok(());
-        };
-        if !source.is_full_history_source() {
-            return Ok(());
-        }
-        let mut history_config = custom.config.clone();
-        history_config.query = custom.config.query.merge(&CustomDataQuery {
-            start_date: Some(self.start.date_utc()),
-            end_date: Some(self.end.date_utc()),
-            start_time: Some(self.start),
-            end_time: Some(self.end),
-            ..custom.dynamic_query.clone()
-        });
-        let ticker = custom.ticker.clone();
-        let source_for_history = source.clone();
-        let history_result = tokio::task::spawn_blocking(move || {
-            source_for_history.history(&ticker, &history_config)
-        })
-        .await
-        .context("custom history worker join failed")?;
-        let points = if let Some(result) = history_result {
-            result.map_err(|error| anyhow::anyhow!(error))?
-        } else {
-            let Some(fallback_source) = self.custom_data_source(&custom.source_type) else {
-                return Ok(());
-            };
-            let Some(data_source) =
-                fallback_source.get_source(&custom.ticker, self.partition_date, &custom.config)
-            else {
-                return Ok(());
-            };
-            if self
-                .context
-                .failed_custom_data_uris
-                .lock()
-                .expect("custom data failure cache poisoned")
-                .contains(&data_source.uri)
-            {
-                return Ok(());
+        if source.is_full_history_source() {
+            if self.custom_history_fetched {
+                return Ok(Vec::new());
             }
-            let text = match fetch_custom_data_source(&data_source).await {
-                Ok(text) => text,
-                Err(error) => {
-                    self.context
-                        .failed_custom_data_uris
-                        .lock()
-                        .expect("custom data failure cache poisoned")
-                        .insert(data_source.uri.clone());
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to fetch full custom history {}:{}",
-                            custom.source_type, custom.ticker
-                        )
-                    });
-                }
+            self.custom_history_fetched = true;
+            let Some(result) = source.history(&custom.ticker, &custom.config) else {
+                return Ok(Vec::new());
             };
-            text.lines()
-                .filter_map(|line| fallback_source.read_history_line(line, &custom.config))
-                .collect::<Vec<_>>()
-        };
-        self.context
-            .store
-            .append_custom_points(&custom.source_type, &custom.ticker, &points)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to persist custom history rows for {}:{}",
-                    custom.source_type, custom.ticker
-                )
-            })?;
-        Ok(())
-    }
+            let points = result.map_err(|error| anyhow::anyhow!(error))?;
+            return Ok(points
+                .into_iter()
+                .filter(|point| point.time >= window_start && point.time <= window_end)
+                .collect());
+        }
 
-    fn custom_data_source(&self, source_type: &str) -> Option<&dyn ICustomDataSource> {
-        self.context
-            .custom_data_sources
-            .iter()
-            .find(|source| source.name().eq_ignore_ascii_case(source_type))
-            .map(|source| source.as_ref())
+        let mut out = Vec::new();
+        let mut date = window_start;
+        while date <= window_end {
+            if let Some(data_source) = source.get_source(&custom.ticker, date, &custom.config) {
+                out.extend(read_custom_source_points(
+                    source.as_ref(),
+                    data_source,
+                    date,
+                    &custom.config,
+                )?);
+            }
+            date = date.succ_opt().unwrap_or(date);
+        }
+        Ok(out)
     }
 
     fn is_regular_market_bar(&self, end_time: DateTime) -> bool {
@@ -1448,10 +1406,9 @@ impl SubscriptionProducerState {
         window_start: chrono::NaiveDate,
         window_end: chrono::NaiveDate,
     ) -> bool {
-        let coverage_date = if time.date_utc() != end_time.date_utc() {
-            end_time.date_utc()
-        } else if time.to_utc().time() == chrono::NaiveTime::MIN
-            && end_time.to_utc().time() == chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap()
+        let coverage_date = if time.date_utc() != end_time.date_utc()
+            || (time.to_utc().time() == chrono::NaiveTime::MIN
+                && end_time.to_utc().time() == chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap())
         {
             end_time.date_utc()
         } else {
@@ -1520,57 +1477,98 @@ impl SubscriptionProducerState {
     }
 }
 
-async fn fetch_custom_data_source(source: &CustomDataSource) -> anyhow::Result<String> {
-    match source.transport {
-        CustomDataTransport::LocalFile => tokio::fs::read_to_string(&source.uri)
-            .await
-            .with_context(|| format!("failed to read custom data file {}", source.uri)),
-        CustomDataTransport::Http => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .context("failed to build custom data HTTP client")?;
-            let mut last_error = None;
-            for attempt in 1..=3 {
-                let result = async {
-                    client
-                        .get(&source.uri)
-                        .send()
-                        .await
-                        .with_context(|| {
-                            format!("failed to request custom data url {}", source.uri)
-                        })?
-                        .error_for_status()
-                        .with_context(|| {
-                            format!("custom data url returned an error {}", source.uri)
-                        })?
-                        .text()
-                        .await
-                        .with_context(|| {
-                            format!("failed to read custom data response {}", source.uri)
-                        })
-                }
-                .await;
-
-                match result {
-                    Ok(text) => return Ok(text),
-                    Err(error) if attempt < 3 => {
-                        tracing::warn!(
-                            "custom data fetch attempt {} failed for {}: {:#}",
-                            attempt,
-                            source.uri,
-                            error
-                        );
-                        last_error = Some(error);
-                        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
-                            .await;
-                    }
-                    Err(error) => return Err(error),
+fn read_custom_source_points(
+    source: &dyn ICustomDataSource,
+    data_source: CustomDataSource,
+    date: chrono::NaiveDate,
+    config: &CustomDataConfig,
+) -> anyhow::Result<Vec<CustomDataPoint>> {
+    match data_source.transport {
+        CustomDataTransport::LocalFile => {
+            let content = std::fs::read_to_string(&data_source.uri)
+                .with_context(|| format!("read custom data file {}", data_source.uri))?;
+            let mut points = Vec::new();
+            for line in content.lines() {
+                if let Some(point) = source.reader(line, date, config) {
+                    points.push(point);
                 }
             }
-            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("custom data fetch did not run")))
+            Ok(points)
+        }
+        CustomDataTransport::Http => Ok(Vec::new()),
+    }
+}
+
+fn custom_point_matches_query(point: &CustomDataPoint, query: &CustomDataQuery) -> bool {
+    if let Some(symbols) = &query.symbols {
+        let Some(usymbol) = point
+            .fields
+            .get("usymbol")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_uppercase())
+        else {
+            return false;
+        };
+        if !symbols
+            .iter()
+            .any(|symbol| symbol.eq_ignore_ascii_case(&usymbol))
+        {
+            return false;
         }
     }
+
+    for (field, expected) in &query.string_equals {
+        if point
+            .fields
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(|actual| actual == expected)
+            != Some(true)
+        {
+            return false;
+        }
+    }
+
+    for (field, expected_values) in &query.string_in {
+        let Some(actual) = point.fields.get(field).and_then(|value| value.as_str()) else {
+            return false;
+        };
+        if !expected_values.iter().any(|expected| expected == actual) {
+            return false;
+        }
+    }
+
+    for (field, min_value) in &query.numeric_min {
+        if point
+            .fields
+            .get(field)
+            .and_then(json_number)
+            .map(|actual| actual >= *min_value)
+            != Some(true)
+        {
+            return false;
+        }
+    }
+
+    for (field, max_value) in &query.numeric_max {
+        if point
+            .fields
+            .get(field)
+            .and_then(json_number)
+            .map(|actual| actual <= *max_value)
+            != Some(true)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
 }
 
 fn partition_day_start(date: chrono::NaiveDate) -> DateTime {
@@ -1904,7 +1902,9 @@ mod tests {
         CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomSubscriptionMetadata,
         SubscriptionDataConfig, TradeBar, TradeBarData,
     };
-    use lean_data_providers::{CustomDataContext, HistoryRequest, IHistoryProvider};
+    use lean_data_providers::{
+        CustomDataContext, HistoryRequest, ICustomDataSource, IHistoryProvider,
+    };
     use lean_storage::IcebergStore;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1943,6 +1943,7 @@ mod tests {
                 max_prefetch_rows: 16,
             },
             fetch_missing_custom_data: true,
+            ..Default::default()
         })
     }
 

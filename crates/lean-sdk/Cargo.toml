@@ -14,7 +14,6 @@ lean-execution = { path = "../lean-execution" }
 lean-portfolio-construction = { path = "../lean-portfolio-construction" }
 lean-risk = { path = "../lean-risk" }
 lean-indicators = { path = "../lean-indicators" }
-lean-sdk-annotations = { path = "../lean-sdk-annotations" }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -25,3 +24,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+stubs = ["python", "dep:pyo3-stub-gen"]

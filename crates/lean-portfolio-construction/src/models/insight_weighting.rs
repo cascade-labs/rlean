@@ -33,7 +33,7 @@ impl IPortfolioConstructionModel for InsightWeightingPortfolioConstructionModel 
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         // Get the absolute confidence value for each insight (0 if None).
         let get_value = |insight: &InsightForPcm| -> Decimal {
@@ -80,8 +80,10 @@ impl IPortfolioConstructionModel for InsightWeightingPortfolioConstructionModel 
                     direction_sign * get_value(insight) * weight_factor
                 };
 
-                let ticker = insight.symbol.value.to_string();
-                let price = prices.get(&ticker).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.id.sid)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
             })
             .collect()

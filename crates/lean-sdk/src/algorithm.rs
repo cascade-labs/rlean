@@ -10,7 +10,6 @@ use lean_core::{
 use lean_data::{CustomDataQuery, SubscriptionDataConfig, SubscriptionDataKind};
 use lean_orders::order::TimeInForce;
 use lean_orders::OrderTicket;
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method, sdk_new};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::cell::RefCell;
@@ -25,7 +24,10 @@ use crate::indicators::{
 };
 use crate::orders::{OrderTicketContext, OrderTicketHandle};
 use crate::portfolio::PortfolioView;
-use crate::securities::{OptionSecurityHandle, SecurityHandle, SymbolHandle};
+use crate::securities::{
+    read_algorithm_security_price, AlgorithmSettingsHandle, OptionSecurityHandle, SecurityHandle,
+    SecurityManagerHandle, SymbolHandle,
+};
 use crate::types::MovingAverageType;
 use crate::universe::{DateRulesHandle, TimeRulesHandle, UniverseSettings, UniverseSettingsHandle};
 
@@ -41,18 +43,67 @@ thread_local! {
     static DEFAULT_ALGORITHM_CONTEXT: RefCell<Option<AlgorithmConstructionContext>> = const { RefCell::new(None) };
 }
 
-#[sdk_bind(py_name = "QCAlgorithm", subclass)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "QCAlgorithm", subclass))]
 #[derive(Clone)]
 pub struct AlgorithmHandle {
     inner: Arc<Mutex<QcAlgorithm>>,
     universe_settings: Arc<Mutex<UniverseSettings>>,
+    algorithm_settings: Arc<Mutex<crate::securities::AlgorithmSettings>>,
     runtime_services: Arc<dyn AlgorithmRuntimeServices>,
+}
+
+#[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "BrokerageModel"))]
+pub struct BrokerageModelHandle;
+
+#[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "FuncSecuritySeeder"))]
+pub struct FuncSecuritySeederHandle;
+
+#[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "BrokerageModelSecurityInitializer"))]
+pub struct BrokerageModelSecurityInitializerHandle;
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl BrokerageModelHandle {
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl FuncSecuritySeederHandle {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl BrokerageModelSecurityInitializerHandle {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self
+    }
 }
 
 #[derive(Clone)]
 pub struct AlgorithmConstructionContext {
     state: Arc<Mutex<QcAlgorithm>>,
     runtime_services: Arc<dyn AlgorithmRuntimeServices>,
+    algorithm_settings: Arc<Mutex<crate::securities::AlgorithmSettings>>,
 }
 
 impl AlgorithmConstructionContext {
@@ -63,7 +114,14 @@ impl AlgorithmConstructionContext {
         Self {
             state,
             runtime_services,
+            algorithm_settings: Arc::new(Mutex::new(
+                crate::securities::AlgorithmSettings::default(),
+            )),
         }
+    }
+
+    pub fn algorithm_settings(&self) -> Arc<Mutex<crate::securities::AlgorithmSettings>> {
+        self.algorithm_settings.clone()
     }
 
     pub fn registered_indicators(&self) -> RegisteredIndicatorRegistry {
@@ -80,12 +138,12 @@ impl AlgorithmConstructionContext {
 }
 
 impl AlgorithmHandle {
-    #[sdk_new]
     pub fn default_algorithm() -> Self {
         if let Some(context) = DEFAULT_ALGORITHM_CONTEXT.with(|state| state.borrow().clone()) {
             return Self {
                 inner: context.state,
                 universe_settings: Arc::new(Mutex::new(UniverseSettings::default())),
+                algorithm_settings: context.algorithm_settings,
                 runtime_services: context.runtime_services,
             };
         }
@@ -95,6 +153,10 @@ impl AlgorithmHandle {
 
     pub fn inner(&self) -> Arc<Mutex<QcAlgorithm>> {
         self.inner.clone()
+    }
+
+    pub fn runtime_services(&self) -> Arc<dyn AlgorithmRuntimeServices> {
+        self.runtime_services.clone()
     }
 
     fn register_indicator_handle(
@@ -122,23 +184,19 @@ impl AlgorithmHandle {
             result
         })
     }
-
-    #[sdk_getter]
     pub fn portfolio(&self) -> PortfolioView {
         PortfolioView::from_algorithm(self.inner.clone())
     }
-
-    #[sdk_getter]
     pub fn universe_settings(&self) -> UniverseSettingsHandle {
         UniverseSettingsHandle::from_shared(self.universe_settings.clone())
     }
 
-    #[sdk_getter]
+    pub fn algorithm_settings(&self) -> AlgorithmSettingsHandle {
+        AlgorithmSettingsHandle::from_shared(self.algorithm_settings.clone())
+    }
     pub fn date_rules(&self) -> DateRulesHandle {
         DateRulesHandle::new()
     }
-
-    #[sdk_getter]
     pub fn time_rules(&self) -> TimeRulesHandle {
         TimeRulesHandle::new()
     }
@@ -149,17 +207,14 @@ impl AlgorithmHandle {
         OrderTicketContext::new(transactions, move || algorithm.lock().unwrap().utc_time)
     }
 
-    #[sdk_method]
     pub fn set_start_date(&self, year: i32, month: u32, day: u32) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_start_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_end_date(&self, year: i32, month: u32, day: u32) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_end_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_cash(&self, amount: f64) {
         let mut algorithm = self.inner.lock().unwrap();
         AlgorithmApi::new(&mut algorithm).set_cash(amount);
@@ -167,41 +222,42 @@ impl AlgorithmHandle {
         *algorithm.portfolio.cash.write() = cash;
     }
 
-    #[sdk_method]
     pub fn add_cash(&self, amount: f64) {
         let mut algorithm = self.inner.lock().unwrap();
         AlgorithmApi::new(&mut algorithm).add_cash(amount);
         let cash = algorithm.cash();
         *algorithm.portfolio.cash.write() = cash;
     }
-
-    #[sdk_getter]
     pub fn cash(&self) -> f64 {
         decimal_to_f64(AlgorithmApi::new(&mut self.inner.lock().unwrap()).cash())
     }
-
-    #[sdk_getter(py_name = "portfolio_value")]
     pub fn portfolio_value(&self) -> f64 {
         decimal_to_f64(AlgorithmApi::new(&mut self.inner.lock().unwrap()).portfolio_value())
     }
 
-    #[sdk_method]
     pub fn set_name(&self, name: String) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_name(&name);
     }
 
-    #[sdk_method]
     pub fn set_brokerage_model(&self, brokerage: BrokerageName, account_type: AccountType) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .set_brokerage_model(brokerage, account_type);
     }
 
-    #[sdk_method]
+    pub fn brokerage_model(&self) -> BrokerageModelHandle {
+        BrokerageModelHandle
+    }
+
+    pub fn set_security_initializer(&self, _initializer: BrokerageModelSecurityInitializerHandle) {}
+
+    pub fn get_last_known_prices(&self, security: SecurityHandle) -> Option<f64> {
+        read_algorithm_security_price(&self.inner, security.symbol_inner()).ok()
+    }
+
     pub fn set_benchmark(&self, ticker: String) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_benchmark(&ticker);
     }
 
-    #[sdk_method]
     pub fn get_parameter(&self, key: String, default: Option<String>) -> Option<String> {
         self.runtime_services
             .runtime_parameters()
@@ -212,7 +268,6 @@ impl AlgorithmHandle {
             .or(default)
     }
 
-    #[sdk_method]
     pub fn set_parameter(&self, key: String, value: String) {
         self.runtime_services
             .runtime_parameters()
@@ -221,17 +276,13 @@ impl AlgorithmHandle {
             .insert(key, value);
     }
 
-    #[sdk_method]
     pub fn has_security(&self, symbol: SymbolHandle) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).has_security(symbol.inner())
     }
 
-    #[sdk_method]
     pub fn is_invested(&self, symbol: SymbolHandle) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).is_invested(symbol.inner())
     }
-
-    #[sdk_getter(py_name = "time")]
     pub fn current_time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(
             AlgorithmApi::new(&mut self.inner.lock().unwrap())
@@ -239,21 +290,16 @@ impl AlgorithmHandle {
                 .0,
         )
     }
-
-    #[sdk_getter]
     pub fn utc_time(&self) -> chrono::NaiveDateTime {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .utc_time()
             .to_utc()
             .naive_utc()
     }
-
-    #[sdk_getter]
     pub fn is_warming_up(&self) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).is_warming_up()
     }
 
-    #[sdk_method]
     pub fn history(
         &self,
         symbol: Symbol,
@@ -266,17 +312,14 @@ impl AlgorithmHandle {
             .history(&algorithm, &symbol, periods, resolution)
     }
 
-    #[sdk_method]
     pub fn set_warm_up_int(&self, n: i64, resolution: Option<Resolution>) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_warm_up_int(n, resolution);
     }
 
-    #[sdk_method]
     pub fn set_warm_up(&self, n: i64, resolution: Option<Resolution>) {
         self.set_warm_up_int(n, resolution);
     }
 
-    #[sdk_method]
     pub fn add_equity(
         &self,
         ticker: String,
@@ -295,14 +338,12 @@ impl AlgorithmHandle {
         SecurityHandle::new(symbol)
     }
 
-    #[sdk_method]
     pub fn add_forex(&self, ticker: String, resolution: Resolution) -> SymbolHandle {
         SymbolHandle::new(
             AlgorithmApi::new(&mut self.inner.lock().unwrap()).add_forex(&ticker, resolution),
         )
     }
 
-    #[sdk_method]
     pub fn add_crypto(
         &self,
         ticker: String,
@@ -316,7 +357,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn add_crypto_future(
         &self,
         ticker: String,
@@ -331,7 +371,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn add_security(
         &self,
         security_type: SecurityType,
@@ -346,7 +385,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn add_option(
         &self,
         underlying_ticker: String,
@@ -357,7 +395,6 @@ impl AlgorithmHandle {
         OptionSecurityHandle::new(symbol, self.inner.clone())
     }
 
-    #[sdk_method]
     pub fn add_option_contract(
         &self,
         symbol: SymbolHandle,
@@ -369,7 +406,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn add_data(
         &self,
         source_type: String,
@@ -400,34 +436,28 @@ impl AlgorithmHandle {
         ))
     }
 
-    #[sdk_method]
     pub fn log(&self, message: String) {
         self.inner.lock().unwrap().log_message(message);
     }
 
-    #[sdk_method]
     pub fn debug(&self, message: String) {
         self.inner.lock().unwrap().debug(message);
     }
 
-    #[sdk_method]
     pub fn error(&self, message: String) {
         self.inner.lock().unwrap().error(message);
     }
 
-    #[sdk_method]
     pub fn remove_security(&self, symbol: SymbolHandle, tag: Option<String>) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .remove_security(symbol.inner(), tag.as_deref())
     }
 
-    #[sdk_method]
     pub fn remove_option_contract(&self, symbol: SymbolHandle, tag: Option<String>) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .remove_option_contract(symbol.inner(), tag.as_deref())
     }
 
-    #[sdk_method]
     pub fn market_order(
         &self,
         symbol: SymbolHandle,
@@ -444,17 +474,14 @@ impl AlgorithmHandle {
         OrderTicketHandle::from_ticket(ticket, self.order_ticket_context())
     }
 
-    #[sdk_method]
     pub fn buy(&self, symbol: SymbolHandle, quantity: f64) -> OrderTicketHandle {
         self.market_order(symbol, quantity.abs(), None, None)
     }
 
-    #[sdk_method]
     pub fn sell(&self, symbol: SymbolHandle, quantity: f64) -> OrderTicketHandle {
         self.market_order(symbol, -quantity.abs(), None, None)
     }
 
-    #[sdk_method]
     pub fn calculate_order_quantity(&self, symbol: SymbolHandle, target: f64) -> f64 {
         let algorithm = self.inner.lock().unwrap();
         let Some(security) = algorithm.securities.get(symbol.inner()) else {
@@ -471,7 +498,6 @@ impl AlgorithmHandle {
         decimal_to_f64((target_quantity - current_holding.quantity).trunc())
     }
 
-    #[sdk_method]
     pub fn limit_order(
         &self,
         symbol: SymbolHandle,
@@ -492,7 +518,6 @@ impl AlgorithmHandle {
         OrderTicketHandle::from_ticket(ticket, self.order_ticket_context())
     }
 
-    #[sdk_method]
     pub fn stop_market_order(
         &self,
         symbol: SymbolHandle,
@@ -511,32 +536,27 @@ impl AlgorithmHandle {
         OrderTicketHandle::from_ticket(ticket, self.order_ticket_context())
     }
 
-    #[sdk_method]
     pub fn market_on_open_order(&self, symbol: SymbolHandle, quantity: f64) -> OrderTicketHandle {
         let ticket = AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .market_on_open_order(symbol.inner(), quantity);
         OrderTicketHandle::from_ticket(ticket, self.order_ticket_context())
     }
 
-    #[sdk_method]
     pub fn market_on_close_order(&self, symbol: SymbolHandle, quantity: f64) -> OrderTicketHandle {
         let ticket = AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .market_on_close_order(symbol.inner(), quantity);
         OrderTicketHandle::from_ticket(ticket, self.order_ticket_context())
     }
 
-    #[sdk_method]
     pub fn set_holdings(&self, symbol: SymbolHandle, target: f64) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_holdings(symbol.inner(), target);
     }
 
-    #[sdk_method]
     pub fn liquidate(&self, symbol: Option<SymbolHandle>) {
         let symbol = symbol.as_ref().map(SymbolHandle::inner);
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).liquidate(symbol);
     }
 
-    #[sdk_method]
     pub fn sell_to_open(
         &self,
         symbol: SymbolHandle,
@@ -550,7 +570,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn buy_to_open(
         &self,
         symbol: SymbolHandle,
@@ -564,7 +583,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn buy_to_close(
         &self,
         symbol: SymbolHandle,
@@ -578,7 +596,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn sell_to_close(
         &self,
         symbol: SymbolHandle,
@@ -592,7 +609,6 @@ impl AlgorithmHandle {
         )
     }
 
-    #[sdk_method]
     pub fn sma(
         &self,
         symbol: SymbolHandle,
@@ -604,7 +620,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn ema(
         &self,
         symbol: SymbolHandle,
@@ -616,7 +631,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn rsi(
         &self,
         symbol: SymbolHandle,
@@ -629,7 +643,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn momp(
         &self,
         symbol: SymbolHandle,
@@ -641,7 +654,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn std(
         &self,
         symbol: SymbolHandle,
@@ -653,7 +665,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn bb(
         &self,
         symbol: SymbolHandle,
@@ -667,7 +678,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn macd(
         &self,
         symbol: SymbolHandle,
@@ -682,7 +692,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn atr(
         &self,
         symbol: SymbolHandle,
@@ -695,7 +704,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn identity(
         &self,
         symbol: SymbolHandle,
@@ -706,7 +714,6 @@ impl AlgorithmHandle {
         indicator
     }
 
-    #[sdk_method]
     pub fn register_indicator(
         &self,
         _symbol: SymbolHandle,
@@ -715,13 +722,423 @@ impl AlgorithmHandle {
     ) {
     }
 
-    #[sdk_method]
     pub fn warm_up_indicator(
         &self,
         _symbol: SymbolHandle,
         _indicator: IdentityIndicator,
         _resolution: Option<Resolution>,
     ) {
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl AlgorithmHandle {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn py_new(
+        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
+        Self::default_algorithm()
+    }
+
+    #[pyo3(name = "set_start_date")]
+    fn py_set_start_date(&self, year: i32, month: u32, day: u32) {
+        self.set_start_date(year, month, day);
+    }
+
+    #[pyo3(name = "set_end_date")]
+    fn py_set_end_date(&self, year: i32, month: u32, day: u32) {
+        self.set_end_date(year, month, day);
+    }
+
+    #[pyo3(name = "set_cash")]
+    fn py_set_cash(&self, amount: f64) {
+        self.set_cash(amount);
+    }
+
+    #[pyo3(name = "set_brokerage_model")]
+    fn py_set_brokerage_model(
+        &self,
+        brokerage: crate::types::BrokerageName,
+        account_type: crate::types::AccountType,
+    ) {
+        self.set_brokerage_model(brokerage.into(), account_type.into());
+    }
+
+    #[getter(brokerage_model)]
+    fn py_brokerage_model(&self) -> BrokerageModelHandle {
+        self.brokerage_model()
+    }
+
+    #[pyo3(name = "set_security_initializer")]
+    fn py_set_security_initializer(&self, initializer: BrokerageModelSecurityInitializerHandle) {
+        self.set_security_initializer(initializer);
+    }
+
+    #[pyo3(name = "get_last_known_prices")]
+    fn py_get_last_known_prices(&self, security: SecurityHandle) -> Option<f64> {
+        self.get_last_known_prices(security)
+    }
+
+    #[pyo3(name = "set_benchmark")]
+    fn py_set_benchmark(&self, ticker: String) {
+        self.set_benchmark(ticker);
+    }
+
+    #[pyo3(name = "add_cash")]
+    fn py_add_cash(&self, amount: f64) {
+        self.add_cash(amount);
+    }
+
+    #[getter(cash)]
+    fn py_cash(&self) -> f64 {
+        self.cash()
+    }
+
+    #[getter(portfolio_value)]
+    fn py_portfolio_value(&self) -> f64 {
+        self.portfolio_value()
+    }
+
+    #[getter(portfolio)]
+    fn py_portfolio(&self) -> PortfolioView {
+        self.portfolio()
+    }
+
+    #[pyo3(name = "get_parameter", signature = (key, default=None))]
+    fn py_get_parameter(&self, key: String, default: Option<String>) -> Option<String> {
+        self.get_parameter(key, default)
+    }
+
+    #[pyo3(name = "set_parameter")]
+    fn py_set_parameter(&self, key: String, value: String) {
+        self.set_parameter(key, value);
+    }
+
+    #[pyo3(name = "has_security")]
+    fn py_has_security(&self, symbol: SymbolHandle) -> bool {
+        self.has_security(symbol)
+    }
+
+    #[pyo3(name = "history")]
+    fn py_history(
+        &self,
+        symbol: SymbolHandle,
+        periods: usize,
+        resolution: crate::types::Resolution,
+    ) -> HashMap<String, Vec<String>> {
+        self.history(symbol.into_inner(), periods, resolution.into())
+    }
+
+    #[pyo3(name = "add_equity", signature = (ticker, resolution, leverage=None))]
+    fn py_add_equity(
+        &self,
+        ticker: String,
+        resolution: crate::types::Resolution,
+        leverage: Option<f64>,
+    ) -> SecurityHandle {
+        self.add_equity(ticker, resolution.into(), leverage)
+    }
+
+    #[pyo3(name = "add_option")]
+    fn py_add_option(
+        &self,
+        underlying_ticker: String,
+        resolution: crate::types::Resolution,
+    ) -> OptionSecurityHandle {
+        self.add_option(underlying_ticker, resolution.into())
+    }
+
+    #[pyo3(name = "add_data", signature = (source_type, ticker, resolution, properties=None))]
+    fn py_add_data(
+        &self,
+        source_type: String,
+        ticker: String,
+        resolution: crate::types::Resolution,
+        properties: Option<HashMap<String, String>>,
+    ) -> SecurityHandle {
+        self.add_data(source_type, ticker, resolution.into(), properties)
+    }
+
+    #[pyo3(name = "set_warm_up", signature = (n, resolution=None))]
+    fn py_set_warm_up(&self, n: i64, resolution: Option<crate::types::Resolution>) {
+        self.set_warm_up(n, resolution.map(Into::into));
+    }
+
+    #[pyo3(name = "market_order", signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=None))]
+    fn py_market_order(
+        &self,
+        symbol: SymbolHandle,
+        quantity: f64,
+        time_in_force: Option<crate::types::TimeInForce>,
+        outside_regular_trading_hours: Option<bool>,
+    ) -> OrderTicketHandle {
+        self.market_order(
+            symbol,
+            quantity,
+            time_in_force.map(Into::into),
+            outside_regular_trading_hours,
+        )
+    }
+
+    #[pyo3(name = "limit_order", signature = (symbol, quantity, limit_price, time_in_force=None, outside_regular_trading_hours=false, post_only=false))]
+    fn py_limit_order(
+        &self,
+        symbol: SymbolHandle,
+        quantity: f64,
+        limit_price: f64,
+        time_in_force: Option<crate::types::TimeInForce>,
+        outside_regular_trading_hours: bool,
+        post_only: bool,
+    ) -> OrderTicketHandle {
+        self.limit_order(
+            symbol,
+            quantity,
+            limit_price,
+            time_in_force.map(Into::into),
+            outside_regular_trading_hours,
+            post_only,
+        )
+    }
+
+    #[pyo3(name = "stop_market_order", signature = (symbol, quantity, stop_price, time_in_force=None, outside_regular_trading_hours=false))]
+    fn py_stop_market_order(
+        &self,
+        symbol: SymbolHandle,
+        quantity: f64,
+        stop_price: f64,
+        time_in_force: Option<crate::types::TimeInForce>,
+        outside_regular_trading_hours: bool,
+    ) -> OrderTicketHandle {
+        self.stop_market_order(
+            symbol,
+            quantity,
+            stop_price,
+            time_in_force.map(Into::into),
+            outside_regular_trading_hours,
+        )
+    }
+
+    #[pyo3(name = "sma")]
+    fn py_sma(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        resolution: crate::types::Resolution,
+    ) -> SimpleMovingAverage {
+        self.sma(symbol, period, Some(resolution.into()))
+    }
+
+    #[pyo3(name = "ema")]
+    fn py_ema(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        resolution: crate::types::Resolution,
+    ) -> ExponentialMovingAverage {
+        self.ema(symbol, period, Some(resolution.into()))
+    }
+
+    #[pyo3(name = "rsi")]
+    fn py_rsi(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        moving_average_type: MovingAverageType,
+        resolution: crate::types::Resolution,
+    ) -> RelativeStrengthIndex {
+        self.rsi(
+            symbol,
+            period,
+            Some(moving_average_type),
+            Some(resolution.into()),
+        )
+    }
+
+    #[pyo3(name = "momp")]
+    fn py_momp(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        resolution: crate::types::Resolution,
+    ) -> MomentumPercentIndicator {
+        self.momp(symbol, period, Some(resolution.into()))
+    }
+
+    #[pyo3(name = "std")]
+    fn py_std(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        resolution: crate::types::Resolution,
+    ) -> StandardDeviationIndicator {
+        self.std(symbol, period, Some(resolution.into()))
+    }
+
+    #[pyo3(name = "bb")]
+    fn py_bb(
+        &self,
+        symbol: SymbolHandle,
+        period: usize,
+        k: f64,
+        moving_average_type: MovingAverageType,
+        resolution: crate::types::Resolution,
+    ) -> BollingerBandsIndicator {
+        self.bb(
+            symbol,
+            period,
+            Some(k),
+            Some(moving_average_type),
+            Some(resolution.into()),
+        )
+    }
+
+    #[pyo3(name = "macd")]
+    fn py_macd(
+        &self,
+        symbol: SymbolHandle,
+        fast_period: usize,
+        slow_period: usize,
+        signal_period: usize,
+        moving_average_type: MovingAverageType,
+        resolution: crate::types::Resolution,
+    ) -> MacdIndicator {
+        self.macd(
+            symbol,
+            fast_period,
+            slow_period,
+            signal_period,
+            Some(moving_average_type),
+            Some(resolution.into()),
+        )
+    }
+
+    #[pyo3(name = "identity")]
+    fn py_identity(
+        &self,
+        symbol: SymbolHandle,
+        resolution: crate::types::Resolution,
+    ) -> IdentityIndicator {
+        self.identity(symbol, Some(resolution.into()))
+    }
+
+    #[pyo3(name = "register_indicator", signature = (symbol, indicator, resolution=None))]
+    fn py_register_indicator(
+        &self,
+        symbol: SymbolHandle,
+        indicator: IdentityIndicator,
+        resolution: Option<crate::types::Resolution>,
+    ) {
+        self.register_indicator(symbol, indicator, resolution.map(Into::into));
+    }
+
+    #[pyo3(name = "warm_up_indicator", signature = (symbol, indicator, resolution=None))]
+    fn py_warm_up_indicator(
+        &self,
+        symbol: SymbolHandle,
+        indicator: IdentityIndicator,
+        resolution: Option<crate::types::Resolution>,
+    ) {
+        self.warm_up_indicator(symbol, indicator, resolution.map(Into::into));
+    }
+
+    #[pyo3(name = "add_alpha")]
+    fn py_add_alpha(
+        &self,
+        py: pyo3::Python<'_>,
+        model: pyo3::Py<pyo3::PyAny>,
+    ) -> pyo3::PyResult<()> {
+        crate::python_framework::register_alpha(py, self, model)
+    }
+
+    #[pyo3(name = "set_portfolio_construction")]
+    fn py_set_portfolio_construction(
+        &self,
+        py: pyo3::Python<'_>,
+        model: pyo3::Py<pyo3::PyAny>,
+    ) -> pyo3::PyResult<()> {
+        crate::python_framework::register_portfolio_construction(py, self, model)
+    }
+
+    #[pyo3(name = "set_execution")]
+    fn py_set_execution(
+        &self,
+        py: pyo3::Python<'_>,
+        model: pyo3::Py<pyo3::PyAny>,
+    ) -> pyo3::PyResult<()> {
+        crate::python_framework::register_execution(py, self, model)
+    }
+
+    #[pyo3(name = "set_risk_management")]
+    fn py_set_risk_management(
+        &self,
+        py: pyo3::Python<'_>,
+        model: pyo3::Py<pyo3::PyAny>,
+    ) -> pyo3::PyResult<()> {
+        crate::python_framework::register_risk_management(py, self, model)
+    }
+
+    #[getter(insights)]
+    fn py_insights(&self) -> pyo3::PyResult<crate::python_framework::InsightCollectionHandle> {
+        let registry = crate::python_framework::framework_registry(self)?;
+        Ok(crate::python_framework::InsightCollectionHandle::from_registry(&registry))
+    }
+
+    #[getter(securities)]
+    fn py_securities(&self) -> SecurityManagerHandle {
+        SecurityManagerHandle::new(self.inner())
+    }
+
+    #[getter(time)]
+    fn py_time(&self) -> chrono::NaiveDateTime {
+        self.current_time()
+    }
+
+    #[getter(universe_settings)]
+    fn py_universe_settings(&self) -> UniverseSettingsHandle {
+        self.universe_settings()
+    }
+
+    #[pyo3(name = "add_universe")]
+    fn py_add_universe(
+        &self,
+        py: pyo3::Python<'_>,
+        source_type: String,
+        ticker: String,
+        resolution: crate::types::Resolution,
+        selector: pyo3::Py<pyo3::PyAny>,
+    ) -> pyo3::PyResult<()> {
+        tracing::debug!(
+            "QCAlgorithm.add_universe called for {}:{} at {:?}",
+            source_type,
+            ticker,
+            resolution
+        );
+        crate::python_framework::register_custom_universe(
+            py,
+            self,
+            source_type,
+            ticker,
+            resolution.into(),
+            selector,
+        )
+    }
+
+    #[pyo3(name = "set_custom_data_symbols")]
+    fn py_set_custom_data_symbols(
+        &self,
+        source_type: String,
+        ticker: String,
+        symbols: Vec<String>,
+    ) {
+        crate::python_framework::set_custom_data_symbols(self, &source_type, &ticker, symbols);
+    }
+
+    #[getter(settings)]
+    fn py_settings(&self) -> AlgorithmSettingsHandle {
+        self.algorithm_settings()
     }
 }
 
@@ -735,73 +1152,54 @@ impl<'a> AlgorithmApi<'a> {
         Self { algorithm }
     }
 
-    #[sdk_method]
     pub fn set_start_date(&mut self, year: i32, month: u32, day: u32) {
         self.algorithm.set_start_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_end_date(&mut self, year: i32, month: u32, day: u32) {
         self.algorithm.set_end_date(year, month, day);
     }
 
-    #[sdk_method]
     pub fn set_cash(&mut self, amount: f64) {
         self.algorithm.set_cash(f2d(amount));
     }
 
-    #[sdk_method]
     pub fn add_cash(&mut self, amount: f64) {
         let portfolio = self.algorithm.portfolio.clone();
         *portfolio.cash.write() += f2d(amount);
     }
-
-    #[sdk_getter]
     pub fn cash(&self) -> Price {
         self.algorithm.cash()
     }
-
-    #[sdk_getter(py_name = "portfolio_value")]
     pub fn portfolio_value(&self) -> Price {
         self.algorithm.portfolio_value()
     }
 
-    #[sdk_method]
     pub fn set_name(&mut self, name: &str) {
         self.algorithm.name = name.to_string();
     }
 
-    #[sdk_method]
     pub fn set_brokerage_model(&mut self, brokerage: BrokerageName, account_type: AccountType) {
         self.algorithm.set_brokerage_model(brokerage, account_type);
     }
 
-    #[sdk_method]
     pub fn set_benchmark(&mut self, ticker: &str) {
         self.algorithm.set_benchmark(ticker);
     }
 
-    #[sdk_method]
     pub fn has_security(&self, symbol: &Symbol) -> bool {
         self.algorithm.securities.contains(symbol)
     }
 
-    #[sdk_method]
     pub fn is_invested(&self, symbol: &Symbol) -> bool {
         self.algorithm.is_invested(symbol)
     }
-
-    #[sdk_getter(py_name = "time")]
     pub fn current_time(&self) -> DateTime {
         self.algorithm.time
     }
-
-    #[sdk_getter]
     pub fn utc_time(&self) -> DateTime {
         self.algorithm.utc_time
     }
-
-    #[sdk_getter]
     pub fn is_warming_up(&self) -> bool {
         self.algorithm.is_warming_up
     }
@@ -870,12 +1268,10 @@ impl<'a> AlgorithmApi<'a> {
         matching_normalization_mode(&configs, resolution, fallback)
     }
 
-    #[sdk_method]
     pub fn set_warm_up_span(&mut self, span: TimeSpan, resolution: Option<Resolution>) {
         self.algorithm.set_warm_up_with_resolution(span, resolution);
     }
 
-    #[sdk_method]
     pub fn set_warm_up_int(&mut self, n: i64, resolution: Option<Resolution>) {
         if resolution.is_some() || n > 365 {
             self.algorithm
@@ -886,7 +1282,6 @@ impl<'a> AlgorithmApi<'a> {
         }
     }
 
-    #[sdk_method]
     pub fn add_equity_with_normalization(
         &mut self,
         ticker: &str,
@@ -897,7 +1292,6 @@ impl<'a> AlgorithmApi<'a> {
             .add_equity_with_normalization(ticker, resolution, normalization_mode)
     }
 
-    #[sdk_method]
     pub fn add_forex(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
         self.algorithm.add_forex(ticker, resolution)
     }
@@ -906,12 +1300,10 @@ impl<'a> AlgorithmApi<'a> {
         self.algorithm.default_market_for_security(security_type)
     }
 
-    #[sdk_method]
     pub fn add_crypto(&mut self, ticker: &str, market: &Market, resolution: Resolution) -> Symbol {
         self.algorithm.add_crypto(ticker, market, resolution)
     }
 
-    #[sdk_method]
     pub fn add_crypto_future(
         &mut self,
         ticker: &str,
@@ -926,32 +1318,26 @@ impl<'a> AlgorithmApi<'a> {
         self.algorithm.add_crypto_future(ticker, market, resolution)
     }
 
-    #[sdk_method]
     pub fn add_option(&mut self, underlying_ticker: &str, resolution: Resolution) -> Symbol {
         self.algorithm.add_option(underlying_ticker, resolution)
     }
 
-    #[sdk_method]
     pub fn add_option_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         self.algorithm.add_option_contract(symbol, resolution)
     }
 
-    #[sdk_method]
     pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         self.algorithm.add_security_symbol(symbol, resolution)
     }
 
-    #[sdk_method]
     pub fn remove_security(&mut self, symbol: &Symbol, tag: Option<&str>) -> bool {
         self.algorithm.remove_security(symbol, tag)
     }
 
-    #[sdk_method]
     pub fn remove_option_contract(&mut self, symbol: &Symbol, tag: Option<&str>) -> bool {
         self.algorithm.remove_option_contract(symbol, tag)
     }
 
-    #[sdk_method]
     pub fn add_custom_data(
         &mut self,
         source_type: &str,
@@ -963,7 +1349,6 @@ impl<'a> AlgorithmApi<'a> {
             .add_custom_data(source_type, ticker, resolution, properties)
     }
 
-    #[sdk_method]
     pub fn add_custom_universe_data(
         &mut self,
         source_type: &str,
@@ -975,7 +1360,6 @@ impl<'a> AlgorithmApi<'a> {
             .add_custom_universe_data(source_type, ticker, resolution, properties)
     }
 
-    #[sdk_method]
     pub fn add_custom_subscription(
         &mut self,
         source_type: &str,
@@ -997,7 +1381,6 @@ impl<'a> AlgorithmApi<'a> {
         }
     }
 
-    #[sdk_method]
     pub fn set_custom_data_query(
         &mut self,
         source_type: &str,
@@ -1009,7 +1392,6 @@ impl<'a> AlgorithmApi<'a> {
             .set_custom_dynamic_query(source_type, ticker, query)
     }
 
-    #[sdk_method]
     pub fn market_order(
         &mut self,
         symbol: &Symbol,
@@ -1025,7 +1407,6 @@ impl<'a> AlgorithmApi<'a> {
         )
     }
 
-    #[sdk_method]
     pub fn limit_order(
         &mut self,
         symbol: &Symbol,
@@ -1045,7 +1426,6 @@ impl<'a> AlgorithmApi<'a> {
         )
     }
 
-    #[sdk_method]
     pub fn stop_market_order(
         &mut self,
         symbol: &Symbol,
@@ -1063,22 +1443,18 @@ impl<'a> AlgorithmApi<'a> {
         )
     }
 
-    #[sdk_method]
     pub fn market_on_open_order(&mut self, symbol: &Symbol, quantity: f64) -> OrderTicket {
         self.algorithm.market_on_open_order(symbol, f2d(quantity))
     }
 
-    #[sdk_method]
     pub fn market_on_close_order(&mut self, symbol: &Symbol, quantity: f64) -> OrderTicket {
         self.algorithm.market_on_close_order(symbol, f2d(quantity))
     }
 
-    #[sdk_method]
     pub fn set_holdings(&mut self, symbol: &Symbol, target: f64) {
         self.algorithm.set_holdings(symbol, f2d(target));
     }
 
-    #[sdk_method]
     pub fn liquidate(&mut self, symbol: Option<&Symbol>) {
         self.algorithm.liquidate(symbol);
     }
@@ -1164,7 +1540,9 @@ mod tests {
         registry: &RegisteredIndicatorRegistry,
         slice: &lean_data::Slice,
     ) {
-        let registry = registry.lock().expect("registered indicator registry poisoned");
+        let registry = registry
+            .lock()
+            .expect("registered indicator registry poisoned");
         for (sid, indicators) in registry.iter() {
             let Some(bar) = slice.bars.get(sid) else {
                 continue;
@@ -1183,9 +1561,14 @@ mod tests {
             Arc::new(Mutex::new(QcAlgorithm::new("Algorithm", dec!(100000)))),
             runtime_services,
         );
-        let algorithm = AlgorithmHandle::with_default_context(context, AlgorithmHandle::default_algorithm);
+        let algorithm =
+            AlgorithmHandle::with_default_context(context, AlgorithmHandle::default_algorithm);
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let sma = algorithm.sma(SymbolHandle::new(symbol.clone()), 2, Some(Resolution::Minute));
+        let sma = algorithm.sma(
+            SymbolHandle::new(symbol.clone()),
+            2,
+            Some(Resolution::Minute),
+        );
 
         let first_time = DateTime::from(
             chrono::NaiveDate::from_ymd_opt(2024, 1, 2)

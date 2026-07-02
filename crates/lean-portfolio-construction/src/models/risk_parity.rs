@@ -148,7 +148,7 @@ pub struct RiskParityPortfolioConstructionModel {
     period: usize,
     lower_bound: f64,
     upper_bound: f64,
-    asset_data: HashMap<String, ReturnsSymbolData>,
+    asset_data: HashMap<u64, ReturnsSymbolData>,
 }
 
 impl RiskParityPortfolioConstructionModel {
@@ -174,15 +174,15 @@ impl RiskParityPortfolioConstructionModel {
         self
     }
 
-    fn update_prices(&mut self, prices: &HashMap<String, Decimal>) {
+    fn update_prices(&mut self, prices: &HashMap<u64, Decimal>) {
         let now = DateTime::now();
-        for (ticker, price_dec) in prices {
+        for (sid, price_dec) in prices {
             let price = price_dec.to_f64().unwrap_or(0.0);
             if price <= 0.0 {
                 continue;
             }
             self.asset_data
-                .entry(ticker.clone())
+                .entry(*sid)
                 .or_insert_with(|| ReturnsSymbolData::new(self.lookback, self.period))
                 .update(now, price);
         }
@@ -200,7 +200,7 @@ impl IPortfolioConstructionModel for RiskParityPortfolioConstructionModel {
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         if insights.is_empty() {
             return vec![];
@@ -211,16 +211,16 @@ impl IPortfolioConstructionModel for RiskParityPortfolioConstructionModel {
 
         // Deduplicated ordered ticker list
         let mut seen = std::collections::HashSet::new();
-        let tickers: Vec<String> = insights
+        let symbols: Vec<u64> = insights
             .iter()
-            .filter(|i| seen.insert(i.symbol.value.to_string()))
-            .map(|i| i.symbol.value.to_string())
+            .filter(|i| seen.insert(i.symbol.id.sid))
+            .map(|i| i.symbol.id.sid)
             .collect();
 
-        let n = tickers.len();
+        let n = symbols.len();
 
         // Build returns matrix; skip if insufficient history
-        let returns = match form_returns_matrix(&self.asset_data, &tickers) {
+        let returns = match form_returns_matrix(&self.asset_data, &symbols) {
             Some(r) if r.len() >= 2 => r,
             _ => return vec![],
         };
@@ -245,13 +245,13 @@ impl IPortfolioConstructionModel for RiskParityPortfolioConstructionModel {
         insights
             .iter()
             .filter_map(|insight| {
-                let idx = tickers
+                let idx = symbols
                     .iter()
-                    .position(|t| t.as_str() == insight.symbol.value.as_ref())?;
+                    .position(|sid| *sid == insight.symbol.id.sid)?;
                 let w = weights.get(idx).copied().unwrap_or(0.0);
                 let pct = Decimal::try_from(w).ok()?;
                 let price = prices
-                    .get(insight.symbol.value.as_ref())
+                    .get(&insight.symbol.id.sid)
                     .copied()
                     .unwrap_or(Decimal::ZERO);
                 Some(PortfolioTarget::percent(
@@ -266,7 +266,7 @@ impl IPortfolioConstructionModel for RiskParityPortfolioConstructionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.asset_data.remove(sym.value.as_ref());
+            self.asset_data.remove(&sym.id.sid);
         }
     }
 

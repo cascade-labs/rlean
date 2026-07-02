@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use lean_algorithm::algorithm::{AlgorithmStatus, DataDeliveryPayload, SecurityChanges};
 use lean_algorithm::charting::ChartCollection;
 use lean_algorithm::lifecycle::{
-    AlgorithmServices, AlgorithmStateAccess, LifecycleBridge, OptionSubscription, UniverseSelection,
+    AlgorithmRuntimeServices, AlgorithmServices, AlgorithmStateAccess, LifecycleBridge,
+    OptionSubscription, UniverseSelection,
 };
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_alpha::AlphaAnalytics;
@@ -15,8 +16,14 @@ use lean_options::OptionContract;
 use lean_orders::{Order, OrderEvent, TransactionManager};
 use lean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
 use lean_sdk::data::{SharedSliceFrame, SliceView};
-use lean_sdk::orders::{assignment_expiry_event_view, otm_expiry_event_view, OrderEventView};
+use lean_sdk::orders::{
+    assignment_expiry_event_view, margin_call_payload, margin_call_requests_from_orders,
+    otm_expiry_event_view, OrderEventView,
+};
+use lean_sdk::securities::SymbolHandle;
+use lean_sdk::universe::SecurityChangesView;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,6 +33,7 @@ pub struct PythonAlgorithmBridge {
     strategy: Py<PyAny>,
     on_data_callback: Option<Py<PyAny>>,
     state: Arc<Mutex<QcAlgorithm>>,
+    runtime_services: Arc<dyn AlgorithmRuntimeServices>,
     slice_frame: SharedSliceFrame,
     py_slice: Py<PyAny>,
     runtime_error: Option<String>,
@@ -36,13 +44,14 @@ impl PythonAlgorithmBridge {
         py: Python<'_>,
         strategy: Py<PyAny>,
         state: Arc<Mutex<QcAlgorithm>>,
+        runtime_services: Arc<dyn AlgorithmRuntimeServices>,
     ) -> PyResult<Self> {
         let slice_frame = SharedSliceFrame::new();
-        let py_slice = Py::new(
-            py,
-            lean_python::PySlice::from_view(SliceView::new(slice_frame.clone())),
-        )?
-        .into_any();
+        let py_slice = Py::new(py, SliceView::new(slice_frame.clone()))?.into_any();
+        lean_sdk::python_framework::register_python_strategy_object(
+            lean_sdk::python_framework::custom_universe_state_key(&state),
+            strategy.clone_ref(py),
+        );
         let strategy_ref = strategy.bind(py);
         let on_data_callback = strategy_ref
             .getattr("on_data")
@@ -59,6 +68,7 @@ impl PythonAlgorithmBridge {
             strategy,
             on_data_callback,
             state,
+            runtime_services,
             slice_frame,
             py_slice,
             runtime_error: None,
@@ -93,9 +103,7 @@ impl PythonAlgorithmBridge {
         self.slice_frame.set_current(payload.slice);
         Python::attach(|py| {
             if let Some(callback) = &self.on_data_callback {
-                callback
-                    .bind(py)
-                    .call1((self.py_slice.clone_ref(py),))?;
+                callback.bind(py).call1((self.py_slice.clone_ref(py),))?;
             }
             Ok::<(), PyErr>(())
         })
@@ -105,7 +113,7 @@ impl PythonAlgorithmBridge {
     fn call_order_event_callback(&self, methods: &[&str], event: OrderEventView) -> Result<()> {
         Python::attach(|py| {
             let strategy = self.strategy.bind(py);
-            let py_event = Py::new(py, lean_python::PyOrderEvent::from_view(event))?.into_any();
+            let py_event = Py::new(py, event)?.into_any();
             for method in methods {
                 match strategy.getattr(*method) {
                     Ok(callback) => {
@@ -123,21 +131,26 @@ impl PythonAlgorithmBridge {
         .with_context(|| format!("Python strategy callback {} failed", methods.join("/")))
     }
 
+    fn call_method1_if_present(&self, method: &str, arg: Py<PyAny>) -> Result<()> {
+        Python::attach(|py| {
+            let strategy = self.strategy.bind(py);
+            match strategy.getattr(method) {
+                Ok(callback) => {
+                    callback.call1((arg.clone_ref(py),))?;
+                }
+                Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {}
+                Err(err) => return Err(err),
+            }
+            Ok::<(), PyErr>(())
+        })
+        .with_context(|| format!("Python strategy callback {method} failed"))
+    }
+
     fn record_runtime_error(&mut self, error: anyhow::Error) {
         let message = format!("{error:#}");
         self.runtime_error = Some(message);
         self.state.lock().unwrap().status = AlgorithmStatus::RuntimeError;
     }
-}
-
-/// Share the compat-layer framework registry with the engine runtime context so
-/// Python `add_alpha` / `set_portfolio_construction` registrations are visible
-/// to `AlgorithmManager::on_framework_data`.
-pub fn bind_compat_framework(
-    state: Arc<Mutex<QcAlgorithm>>,
-    runtime_context: lean_engine::AlgorithmRuntimeContext,
-) -> lean_engine::AlgorithmRuntimeContext {
-    runtime_context.with_framework(lean_python::compat::framework_for_algorithm(state))
 }
 
 pub fn load_strategy_bridge_with_context(
@@ -146,11 +159,17 @@ pub fn load_strategy_bridge_with_context(
 ) -> Result<PythonAlgorithmBridge> {
     Python::attach(|py| {
         let state = context.state();
+        let runtime_services = context.runtime_services();
         let instance = AlgorithmHandle::with_default_context(context, || {
             strategy_loader::load_strategy_file(py, strategy_path)
         })?
         .instance;
-        Ok(PythonAlgorithmBridge::from_strategy(py, instance, state)?)
+        Ok(PythonAlgorithmBridge::from_strategy(
+            py,
+            instance,
+            state,
+            runtime_services,
+        )?)
     })
 }
 
@@ -223,7 +242,18 @@ impl LifecycleBridge for PythonAlgorithmBridge {
         }
     }
 
-    fn on_end_of_day(&mut self, _symbol: Option<Symbol>, _services: &mut dyn AlgorithmServices) {
+    fn on_end_of_day(&mut self, symbol: Option<Symbol>, _services: &mut dyn AlgorithmServices) {
+        if let Some(symbol) = symbol {
+            let result = Python::attach(|py| {
+                Py::new(py, SymbolHandle::new(symbol)).map(|value| value.into_any())
+            })
+            .context("failed to create end-of-day symbol payload")
+            .and_then(|payload| self.call_method1_if_present("on_end_of_day", payload));
+            if let Err(error) = result {
+                self.record_runtime_error(error);
+            }
+            return;
+        }
         let _ = self.call_method0_if_present("on_end_of_day");
     }
 
@@ -235,8 +265,22 @@ impl LifecycleBridge for PythonAlgorithmBridge {
         let _ = self.call_method0_if_present("on_end_of_algorithm");
     }
 
-    fn on_margin_call(&mut self, _requests: &[Order], _services: &mut dyn AlgorithmServices) {
-        let _ = self.call_method0_if_present("on_margin_call");
+    fn on_margin_call(&mut self, requests: &[Order], _services: &mut dyn AlgorithmServices) {
+        let margin_requests = margin_call_requests_from_orders(requests);
+        let payload = margin_call_payload(&margin_requests);
+        let result = Python::attach(|py| {
+            let py_requests = pyo3::types::PyList::empty(py);
+            for (symbol, quantity) in payload {
+                let item = (symbol, quantity);
+                py_requests.append(item)?;
+            }
+            Ok::<_, PyErr>(py_requests.into_any().unbind())
+        })
+        .context("failed to create margin call callback payload")
+        .and_then(|payload| self.call_method1_if_present("on_margin_call", payload));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
     }
 
     fn on_margin_call_warning(&mut self, _services: &mut dyn AlgorithmServices) {
@@ -245,33 +289,89 @@ impl LifecycleBridge for PythonAlgorithmBridge {
 
     fn on_securities_changed(
         &mut self,
-        _changes: &SecurityChanges,
+        changes: &SecurityChanges,
         _services: &mut dyn AlgorithmServices,
     ) {
-        let _ = self.call_method0_if_present("on_securities_changed");
+        let event =
+            SecurityChangesView::from_symbols(changes.added.clone(), changes.removed.clone());
+        let result = Python::attach(|py| Py::new(py, event).map(|value| value.into_any()))
+            .context("failed to create SecurityChangesView")
+            .and_then(|event| self.call_method1_if_present("on_securities_changed", event));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
     }
 
-    fn on_splits(&mut self, _splits: &HashMap<u64, Split>, _services: &mut dyn AlgorithmServices) {}
+    fn on_splits(&mut self, splits: &HashMap<u64, Split>, _services: &mut dyn AlgorithmServices) {
+        let result = Python::attach(|py| {
+            let event_dict = PyDict::new(py);
+            for sid in splits.keys() {
+                event_dict.set_item(*sid, *sid)?;
+            }
+            Ok::<_, PyErr>(event_dict.into_any().unbind())
+        })
+        .context("failed to create splits callback payload")
+        .and_then(|payload| self.call_method1_if_present("on_splits", payload));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
+    }
 
     fn on_dividends(
         &mut self,
-        _dividends: &HashMap<u64, Dividend>,
+        dividends: &HashMap<u64, Dividend>,
         _services: &mut dyn AlgorithmServices,
     ) {
+        let result = Python::attach(|py| {
+            let event_dict = PyDict::new(py);
+            for sid in dividends.keys() {
+                event_dict.set_item(*sid, *sid)?;
+            }
+            Ok::<_, PyErr>(event_dict.into_any().unbind())
+        })
+        .context("failed to create dividends callback payload")
+        .and_then(|payload| self.call_method1_if_present("on_dividends", payload));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
     }
 
     fn on_delistings(
         &mut self,
-        _delistings: &HashMap<u64, Delisting>,
+        delistings: &HashMap<u64, Delisting>,
         _services: &mut dyn AlgorithmServices,
     ) {
+        let result = Python::attach(|py| {
+            let event_dict = PyDict::new(py);
+            for sid in delistings.keys() {
+                event_dict.set_item(*sid, *sid)?;
+            }
+            Ok::<_, PyErr>(event_dict.into_any().unbind())
+        })
+        .context("failed to create delistings callback payload")
+        .and_then(|payload| self.call_method1_if_present("on_delistings", payload));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
     }
 
     fn on_symbol_changed_events(
         &mut self,
-        _events: &HashMap<u64, SymbolChangedEvent>,
+        events: &HashMap<u64, SymbolChangedEvent>,
         _services: &mut dyn AlgorithmServices,
     ) {
+        let result = Python::attach(|py| {
+            let event_dict = PyDict::new(py);
+            for sid in events.keys() {
+                event_dict.set_item(*sid, *sid)?;
+            }
+            Ok::<_, PyErr>(event_dict.into_any().unbind())
+        })
+        .context("failed to create symbol change callback payload")
+        .and_then(|payload| self.call_method1_if_present("on_symbol_changed_events", payload));
+        if let Err(error) = result {
+            self.record_runtime_error(error);
+        }
     }
 
     fn select_universe_changes(
@@ -285,12 +385,19 @@ impl LifecycleBridge for PythonAlgorithmBridge {
 
     fn select_custom_universe_changes(
         &mut self,
-        _utc_ns: i64,
-        _resolution: Resolution,
-        _custom_data: &HashMap<String, Vec<CustomDataPoint>>,
-        _services: &mut dyn AlgorithmServices,
+        utc_ns: i64,
+        resolution: Resolution,
+        custom_data: &HashMap<String, Vec<CustomDataPoint>>,
+        services: &mut dyn AlgorithmServices,
     ) -> Vec<UniverseSelection> {
-        Vec::new()
+        let Some(runtime) = services.runtime_services() else {
+            return self.runtime_services.run_custom_universe_selections(
+                utc_ns,
+                resolution,
+                custom_data,
+            );
+        };
+        runtime.run_custom_universe_selections(utc_ns, resolution, custom_data)
     }
 
     fn on_end_of_time_step(&mut self, _services: &mut dyn AlgorithmServices) {}
@@ -328,7 +435,7 @@ impl LifecycleBridge for PythonAlgorithmBridge {
     }
 
     fn starting_cash(&self) -> Price {
-        self.state.lock().unwrap().portfolio_value()
+        self.state.lock().unwrap().portfolio.starting_cash()
     }
 
     fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
@@ -408,11 +515,11 @@ impl LifecycleBridge for PythonAlgorithmBridge {
     }
 
     fn has_universes(&self) -> bool {
-        false
+        self.runtime_services.has_custom_universe_selectors()
     }
 
     fn universe_resolution(&self) -> Option<Resolution> {
-        None
+        self.runtime_services.custom_universe_selector_resolution()
     }
 
     fn alpha_analytics(&self) -> AlphaAnalytics {
@@ -427,11 +534,11 @@ impl LifecycleBridge for PythonAlgorithmBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AlgorithmImports;
     use lean_core::TimeSpan;
-    use lean_data::Slice;
     use lean_data::trade_bar::TradeBarData;
+    use lean_data::Slice;
     use lean_data::TradeBar;
-    use lean_python::AlgorithmImports;
     use rust_decimal_macros::dec;
     use std::fs;
     use std::sync::Once;
@@ -446,12 +553,9 @@ mod tests {
 
     fn load_test_strategy_bridge(path: &Path) -> PythonAlgorithmBridge {
         let state = Arc::new(Mutex::new(QcAlgorithm::new("Algorithm", dec!(100000))));
-        let runtime_context = bind_compat_framework(
-            state.clone(),
-            lean_engine::AlgorithmRuntimeContext::with_history_service(
-                Arc::new(lean_algorithm::lifecycle::NullHistoryService),
-                HashMap::new(),
-            ),
+        let runtime_context = lean_engine::AlgorithmRuntimeContext::with_history_service(
+            Arc::new(lean_algorithm::lifecycle::NullHistoryService),
+            HashMap::new(),
         );
         let context = AlgorithmConstructionContext::new_with_runtime_services(
             state,
@@ -529,6 +633,105 @@ class OptionAlgorithm(QCAlgorithm):
         assert_eq!(subscription.filter.max_strike_rank, 15);
         assert_eq!(subscription.filter.min_expiry_days, 0);
         assert_eq!(subscription.filter.max_expiry_days, 90);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn python_add_universe_registers_custom_selector() {
+        init_python();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rlean-python-custom-universe-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.py");
+        fs::write(
+            &path,
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+class UniverseAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.universe_settings.resolution = Resolution.Minute
+        self.add_universe("fixture", "snapshot", Resolution.Daily, self.select)
+
+    def select(self, points):
+        return ["SPY"]
+"#,
+        )
+        .unwrap();
+
+        let mut bridge = load_test_strategy_bridge(&path);
+        let mut services = lean_algorithm::lifecycle::NoopAlgorithmServices::default();
+        bridge.initialize(&mut services).unwrap();
+
+        assert!(bridge.has_universes());
+        assert_eq!(bridge.universe_resolution(), Some(Resolution::Daily));
+        assert_eq!(bridge.subscriptions().len(), 1);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn python_custom_universe_selector_returns_security_changes() {
+        init_python();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rlean-python-custom-universe-select-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.py");
+        fs::write(
+            &path,
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+class UniverseAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.universe_settings.resolution = Resolution.Minute
+        self.add_universe("tradealert", "snapshot", Resolution.Daily, self.select)
+
+    def select(self, points):
+        return [str(point.fields["usymbol"]) for point in points]
+"#,
+        )
+        .unwrap();
+
+        let mut bridge = load_test_strategy_bridge(&path);
+        let mut services = lean_algorithm::lifecycle::NoopAlgorithmServices::default();
+        bridge.initialize(&mut services).unwrap();
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            "usymbol".to_string(),
+            serde_json::Value::String("SPY".to_string()),
+        );
+        let point = CustomDataPoint {
+            time: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            end_time: Some(lean_core::DateTime::from(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(16, 0, 0)
+                    .unwrap(),
+            )),
+            value: dec!(1),
+            fields,
+        };
+        let changes = bridge.select_custom_universe_changes(
+            point.end_time.unwrap().0,
+            Resolution::Daily,
+            &HashMap::from([("SNAPSHOT".to_string(), vec![point])]),
+            &mut services,
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].changes.added.len(), 1);
+        assert_eq!(changes[0].changes.added[0].value.as_ref(), "SPY");
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);

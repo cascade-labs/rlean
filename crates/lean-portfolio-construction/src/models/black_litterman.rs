@@ -57,7 +57,7 @@ pub struct BlackLittermanOptimizationPortfolioConstructionModel {
     portfolio_bias: PortfolioBias,
     target_gross: f64,
     /// Per-symbol rolling returns history (ROC indicator + rolling window).
-    asset_data: HashMap<String, ReturnsSymbolData>,
+    asset_data: HashMap<u64, ReturnsSymbolData>,
 }
 
 impl BlackLittermanOptimizationPortfolioConstructionModel {
@@ -111,15 +111,15 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
     }
 
     /// Update rolling prices from the current price map.
-    fn update_prices(&mut self, prices: &HashMap<String, Decimal>) {
+    fn update_prices(&mut self, prices: &HashMap<u64, Decimal>) {
         let now = DateTime::now();
-        for (ticker, price_dec) in prices {
+        for (sid, price_dec) in prices {
             let price = price_dec.to_f64().unwrap_or(0.0);
             if price <= 0.0 {
                 continue;
             }
             self.asset_data
-                .entry(ticker.clone())
+                .entry(*sid)
                 .or_insert_with(|| ReturnsSymbolData::new(self.lookback, self.period))
                 .update(now, price);
         }
@@ -287,7 +287,7 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
     fn build_views(
         &self,
         insights: &[InsightForPcm],
-        tickers: &[String],
+        symbols: &[u64],
     ) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
         // Group insights by source model
         let mut groups: HashMap<String, Vec<&InsightForPcm>> = HashMap::new();
@@ -298,13 +298,13 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
                 .push(insight);
         }
 
-        let ticker_index: HashMap<&str, usize> = tickers
+        let symbol_index: HashMap<u64, usize> = symbols
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.as_str(), i))
+            .map(|(i, sid)| (*sid, i))
             .collect();
 
-        let n = tickers.len();
+        let n = symbols.len();
         let mut p_rows: Vec<Vec<f64>> = Vec::new();
         let mut q_vec: Vec<f64> = Vec::new();
 
@@ -335,7 +335,7 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
             // Build P row: each asset's weighted contribution
             let mut p_row = vec![0.0; n];
             for insight in group.iter() {
-                if let Some(&idx) = ticker_index.get(insight.symbol.value.as_ref()) {
+                if let Some(&idx) = symbol_index.get(&insight.symbol.id.sid) {
                     let mag: f64 = insight
                         .magnitude
                         .map(|m| m.abs().to_string().parse().unwrap_or(0.0))
@@ -374,7 +374,7 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         if insights.is_empty() {
             return vec![];
@@ -383,18 +383,18 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         // Update rolling price history
         self.update_prices(prices);
 
-        // Collect ordered ticker list from active insights (deduplicated)
+        // Collect ordered symbol ids from active insights (deduplicated)
         let mut seen = std::collections::HashSet::new();
-        let tickers: Vec<String> = insights
+        let symbols: Vec<u64> = insights
             .iter()
-            .filter(|i| seen.insert(i.symbol.value.to_string()))
-            .map(|i| i.symbol.value.to_string())
+            .filter(|i| seen.insert(i.symbol.id.sid))
+            .map(|i| i.symbol.id.sid)
             .collect();
 
-        let n = tickers.len();
+        let n = symbols.len();
 
         // Build returns matrix; return empty if not enough history
-        let returns = match form_returns_matrix(&self.asset_data, &tickers) {
+        let returns = match form_returns_matrix(&self.asset_data, &symbols) {
             Some(r) if r.len() >= 2 => r,
             _ => return vec![],
         };
@@ -403,7 +403,7 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         let (mut pi, mut sigma) = self.equilibrium_returns(&returns);
 
         // Build views from insights
-        if let Some((p, q)) = self.build_views(insights, &tickers) {
+        if let Some((p, q)) = self.build_views(insights, &symbols) {
             // Apply Black-Litterman master formula
             if let Some((pi_post, sigma_post)) = self.apply_master_formula(&pi, &sigma, &p, &q) {
                 pi = pi_post;
@@ -422,13 +422,13 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         insights
             .iter()
             .filter_map(|insight| {
-                let idx = tickers
+                let idx = symbols
                     .iter()
-                    .position(|t| t.as_str() == insight.symbol.value.as_ref())?;
+                    .position(|sid| *sid == insight.symbol.id.sid)?;
                 let w = weights[idx];
                 let pct = Decimal::try_from(w).ok()?;
                 let price = prices
-                    .get(insight.symbol.value.as_ref())
+                    .get(&insight.symbol.id.sid)
                     .copied()
                     .unwrap_or(Decimal::ZERO);
                 Some(PortfolioTarget::percent(
@@ -443,14 +443,11 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.asset_data.remove(sym.value.as_ref());
+            self.asset_data.remove(&sym.id.sid);
         }
     }
 
-    fn update_security_prices(
-        &mut self,
-        prices: &std::collections::HashMap<String, rust_decimal::Decimal>,
-    ) {
+    fn update_security_prices(&mut self, prices: &HashMap<u64, Decimal>) {
         self.update_prices(prices);
     }
 

@@ -7,7 +7,7 @@ fn create_equity_symbol_has_correct_type() {
     let market = Market::usa();
     let sym = Symbol::create_equity("SPY", &market);
     assert_eq!(sym.security_type(), SecurityType::Equity);
-    assert_eq!(sym.value, "SPY");
+    assert_eq!(sym.value.as_ref(), "SPY");
     assert_eq!(sym.market().as_str(), "usa");
 }
 
@@ -15,7 +15,7 @@ fn create_equity_symbol_has_correct_type() {
 fn create_equity_ticker_uppercased() {
     let market = Market::usa();
     let sym = Symbol::create_equity("spy", &market);
-    assert_eq!(sym.value, "SPY");
+    assert_eq!(sym.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn create_crypto_future_symbol_has_correct_type_and_market() {
     let market = Market::hyperliquid();
     let sym = Symbol::create_crypto_future("btc", &market);
     assert_eq!(sym.security_type(), SecurityType::CryptoFuture);
-    assert_eq!(sym.value, "BTC");
+    assert_eq!(sym.value.as_ref(), "BTC");
     assert_eq!(sym.market().as_str(), "hyperliquid");
     assert!(sym.id.expiry.is_none());
 }

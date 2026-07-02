@@ -19,9 +19,9 @@ fn returns_symbol_data_matrix_matches_lean_shape_and_values() {
     let mut aapl = ReturnsSymbolData::new(1, 2);
     update_series(&mut spy, &[100.0, 110.0, 121.0, 133.1]);
     update_series(&mut aapl, &[200.0, 220.0, 242.0]);
-    let data = HashMap::from([("SPY".to_string(), spy), ("AAPL".to_string(), aapl)]);
+    let data = HashMap::from([(1_u64, spy), (2_u64, aapl)]);
 
-    let matrix = form_returns_matrix(&data, &["SPY".to_string(), "AAPL".to_string()]).unwrap();
+    let matrix = form_returns_matrix(&data, &[1_u64, 2_u64]).unwrap();
 
     assert_eq!(matrix.len(), 2);
     assert_eq!(matrix[0].len(), 2);
@@ -35,7 +35,7 @@ fn returns_symbol_data_matrix_matches_lean_shape_and_values() {
 fn returns_symbol_data_matrix_returns_none_when_any_asset_has_no_history() {
     let mut spy = ReturnsSymbolData::new(1, 3);
     update_series(&mut spy, &[100.0, 110.0]);
-    let data = HashMap::from([("SPY".to_string(), spy)]);
+    let data = HashMap::from([(1_u64, spy)]);
 
-    assert!(form_returns_matrix(&data, &["SPY".to_string(), "MISSING".to_string()]).is_none());
+    assert!(form_returns_matrix(&data, &[1_u64, 2_u64]).is_none());
 }

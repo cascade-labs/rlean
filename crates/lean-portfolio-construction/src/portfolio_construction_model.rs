@@ -52,14 +52,14 @@ pub trait IPortfolioConstructionModel: Send + Sync {
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: rust_decimal::Decimal,
-        prices: &HashMap<String, rust_decimal::Decimal>,
+        prices: &HashMap<u64, rust_decimal::Decimal>,
     ) -> Vec<PortfolioTarget>;
 
     fn create_targets_from_refs(
         &mut self,
         insights: &[InsightForPcmRef<'_>],
         portfolio_value: rust_decimal::Decimal,
-        prices: &HashMap<String, rust_decimal::Decimal>,
+        prices: &HashMap<u64, rust_decimal::Decimal>,
     ) -> Vec<PortfolioTarget> {
         let owned: Vec<InsightForPcm> = insights
             .iter()
@@ -80,7 +80,7 @@ pub trait IPortfolioConstructionModel: Send + Sync {
     /// emitted by the alpha model.  Models that require a rolling price history
     /// (e.g. Black-Litterman, Mean-Variance) override this to accumulate data
     /// so their warm-up period runs concurrently with the alpha warm-up.
-    fn update_security_prices(&mut self, _prices: &HashMap<String, rust_decimal::Decimal>) {}
+    fn update_security_prices(&mut self, _prices: &HashMap<u64, rust_decimal::Decimal>) {}
 
     /// Rebalance frequency for models that follow LEAN's scheduled PCM behavior.
     /// `None` preserves the legacy rlean behavior of creating targets whenever

@@ -69,10 +69,12 @@ fn make_target(ticker: &str, qty: f64) -> ExecutionTarget {
     }
 }
 
-fn securities_map(data: Vec<SecurityData>) -> HashMap<String, SecurityData> {
-    data.into_iter()
-        .map(|s| (s.symbol.value.to_string(), s))
-        .collect()
+fn securities_map(data: Vec<SecurityData>) -> HashMap<u64, SecurityData> {
+    data.into_iter().map(|s| (s.symbol.id.sid, s)).collect()
+}
+
+fn context_default(securities: &HashMap<u64, SecurityData>) -> ExecutionContext<'_> {
+    ExecutionContext::new(DateTime::MIN, securities, &[], dec!(100000))
 }
 
 fn make_open_limit_order(
@@ -100,7 +102,7 @@ fn make_open_limit_order(
 
 fn context_orders<'a>(
     time: DateTime,
-    securities: &'a HashMap<String, SecurityData>,
+    securities: &'a HashMap<u64, SecurityData>,
     open_orders: &'a [ExecutionOpenOrder],
 ) -> ExecutionContext<'a> {
     ExecutionContext::new(time, securities, open_orders, dec!(100000))
@@ -120,7 +122,7 @@ mod immediate_execution_tests {
     fn no_targets_no_orders() {
         let mut model = ImmediateExecutionModel::new();
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
-        let orders = model.execute(&[], &securities);
+        let orders = model.execute(&[], &context_default(&securities));
         assert!(orders.is_empty(), "Expected no orders for empty targets");
     }
 
@@ -132,7 +134,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(100));
@@ -151,7 +153,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 60.0)]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(40));
@@ -168,7 +170,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![security]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(30));
@@ -181,8 +183,8 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 10.0)]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let first = model.execute(&targets, &securities);
-        let second = model.execute(&[], &securities);
+        let first = model.execute(&targets, &context_default(&securities));
+        let second = model.execute(&[], &context_default(&securities));
 
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].quantity, dec!(90));
@@ -245,19 +247,27 @@ mod immediate_execution_tests {
         }];
         let context = context_orders(DateTime::from_secs(1), &securities, &open_orders);
         let targets = vec![
-            ("INCREASE".to_string(), make_symbol("INCREASE"), dec!(100)),
-            ("REDUCE".to_string(), make_symbol("REDUCE"), dec!(50)),
+            (
+                make_symbol("INCREASE").id.sid,
+                make_symbol("INCREASE"),
+                dec!(100),
+            ),
+            (
+                make_symbol("REDUCE").id.sid,
+                make_symbol("REDUCE"),
+                dec!(50),
+            ),
         ];
 
         let ordered = context.order_targets_by_margin_impact(&targets);
 
         assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].1.value, "REDUCE");
-        assert_eq!(ordered[1].1.value, "INCREASE");
+        assert_eq!(ordered[0].1.value.as_ref(), "REDUCE");
+        assert_eq!(ordered[1].1.value.as_ref(), "INCREASE");
         assert_eq!(
             context.unordered_quantity(
                 &make_symbol("INCREASE"),
-                context.securities.get("INCREASE").unwrap(),
+                context.security(&make_symbol("INCREASE")).unwrap(),
                 dec!(100),
             ),
             dec!(10)
@@ -273,7 +283,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![security]);
         let targets = vec![make_target("AAPL", -100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(-30));
@@ -287,7 +297,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 100.0)]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -302,7 +312,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", -100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(-100));
@@ -321,7 +331,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 50.0)]);
         let targets = vec![make_target("AAPL", 0.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(-50));
@@ -338,14 +348,20 @@ mod immediate_execution_tests {
         ]);
         let targets = vec![make_target("AAPL", 10.0), make_target("MSFT", 30.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 2);
 
-        let aapl_order = orders.iter().find(|o| o.symbol.value == "AAPL").unwrap();
+        let aapl_order = orders
+            .iter()
+            .find(|o| o.symbol.value.as_ref() == "AAPL")
+            .unwrap();
         assert_eq!(aapl_order.quantity, dec!(10));
 
-        let msft_order = orders.iter().find(|o| o.symbol.value == "MSFT").unwrap();
+        let msft_order = orders
+            .iter()
+            .find(|o| o.symbol.value.as_ref() == "MSFT")
+            .unwrap();
         assert_eq!(msft_order.quantity, dec!(10)); // 30 - 20 = 10
     }
 
@@ -365,14 +381,14 @@ mod immediate_execution_tests {
             make_target("AAPL", 50.0),
         ];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 3);
-        assert_eq!(orders[0].symbol.value, "AAPL");
+        assert_eq!(orders[0].symbol.value.as_ref(), "AAPL");
         assert_eq!(orders[0].quantity, dec!(-50));
-        assert_eq!(orders[1].symbol.value, "GOOG");
+        assert_eq!(orders[1].symbol.value.as_ref(), "GOOG");
         assert_eq!(orders[1].quantity, dec!(50));
-        assert_eq!(orders[2].symbol.value, "MSFT");
+        assert_eq!(orders[2].symbol.value.as_ref(), "MSFT");
         assert_eq!(orders[2].quantity, dec!(1));
     }
 
@@ -381,10 +397,10 @@ mod immediate_execution_tests {
     fn unknown_security_defers_execution() {
         let mut model = ImmediateExecutionModel::new();
         // Provide an empty securities map (security data missing for AAPL)
-        let securities: HashMap<String, SecurityData> = HashMap::new();
+        let securities: HashMap<u64, SecurityData> = HashMap::new();
         let targets = vec![make_target("AAPL", 50.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(orders.is_empty());
     }
@@ -397,7 +413,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 42.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
@@ -414,7 +430,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 70.0)]);
         let targets = vec![make_target("AAPL", 80.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(10)); // 80 - 70 = 10
@@ -428,13 +444,13 @@ mod immediate_execution_tests {
         // First call: target=80, current=0 → order 80
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let first_targets = vec![make_target("AAPL", 80.0)];
-        let first_orders = model.execute(&first_targets, &securities);
+        let first_orders = model.execute(&first_targets, &context_default(&securities));
         assert_eq!(first_orders.len(), 1);
         assert_eq!(first_orders[0].quantity, dec!(80));
 
         // Second call: target=100, current still 0 (order not yet filled) → order 100
         let second_targets = vec![make_target("AAPL", 100.0)];
-        let second_orders = model.execute(&second_targets, &securities);
+        let second_orders = model.execute(&second_targets, &context_default(&securities));
         assert_eq!(second_orders.len(), 1);
         assert_eq!(second_orders[0].quantity, dec!(100)); // 100 - 0 (ImmediateModel is stateless)
     }
@@ -446,7 +462,7 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert!(
@@ -464,7 +480,7 @@ mod immediate_execution_tests {
         let mut target = make_target("AAPL", 10.0);
         target.tag = "orthogonal".to_string();
 
-        let orders = model.execute(&[target], &securities);
+        let orders = model.execute(&[target], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].tag, "orthogonal");
@@ -477,10 +493,10 @@ mod immediate_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].symbol.value, "AAPL");
+        assert_eq!(orders[0].symbol.value.as_ref(), "AAPL");
     }
 
     /// on_securities_changed should not panic (it's a no-op on ImmediateExecutionModel).
@@ -511,8 +527,8 @@ mod null_execution_tests {
     #[test]
     fn null_returns_empty_for_no_targets() {
         let mut model = NullExecutionModel::new();
-        let securities: HashMap<String, SecurityData> = HashMap::new();
-        let orders = model.execute(&[], &securities);
+        let securities: HashMap<u64, SecurityData> = HashMap::new();
+        let orders = model.execute(&[], &context_default(&securities));
         assert!(orders.is_empty());
     }
 
@@ -523,7 +539,7 @@ mod null_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -541,7 +557,7 @@ mod null_execution_tests {
         ]);
         let targets = vec![make_target("AAPL", 100.0), make_target("MSFT", 200.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(orders.is_empty());
     }
@@ -611,7 +627,7 @@ mod vwap_execution_tests {
                 Decimal::ZERO,
                 60 * index as i64,
             )]);
-            let orders = model.execute(&[], &securities);
+            let orders = model.execute(&[], &context_default(&securities));
             assert!(orders.is_empty());
         }
     }
@@ -629,7 +645,7 @@ mod vwap_execution_tests {
             0,
         )]);
 
-        let orders = model.execute(&[], &securities);
+        let orders = model.execute(&[], &context_default(&securities));
 
         assert!(orders.is_empty(), "Expected no orders for empty targets");
     }
@@ -648,7 +664,7 @@ mod vwap_execution_tests {
             600,
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(5));
@@ -669,7 +685,7 @@ mod vwap_execution_tests {
             600,
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(10));
@@ -689,7 +705,7 @@ mod vwap_execution_tests {
             600,
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
 
         assert!(orders.is_empty(), "0.5 shares rounds down to zero lots");
     }
@@ -708,7 +724,7 @@ mod vwap_execution_tests {
             600,
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
 
         assert!(orders.is_empty());
     }
@@ -727,7 +743,7 @@ mod vwap_execution_tests {
             600,
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 0.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 0.0)], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(-10));
@@ -747,7 +763,8 @@ mod vwap_execution_tests {
             Decimal::ZERO,
             600,
         )]);
-        let first_orders = model.execute(&[make_target("AAPL", 10.0)], &unfavorable);
+        let first_orders =
+            model.execute(&[make_target("AAPL", 10.0)], &context_default(&unfavorable));
         assert!(first_orders.is_empty());
 
         let favorable = securities_map(vec![make_security_with_vwap_input(
@@ -759,7 +776,7 @@ mod vwap_execution_tests {
             Decimal::ZERO,
             660,
         )]);
-        let second_orders = model.execute(&[], &favorable);
+        let second_orders = model.execute(&[], &context_default(&favorable));
 
         assert_eq!(second_orders.len(), 1);
         assert_eq!(second_orders[0].quantity, dec!(10));
@@ -779,7 +796,7 @@ mod vwap_execution_tests {
             Decimal::ZERO,
             600,
         )]);
-        model.execute(&[make_target("AAPL", 10.0)], &unfavorable);
+        model.execute(&[make_target("AAPL", 10.0)], &context_default(&unfavorable));
         model.on_securities_changed(&[], &[make_symbol("AAPL")]);
 
         let favorable = securities_map(vec![make_security_with_vwap_input(
@@ -791,7 +808,7 @@ mod vwap_execution_tests {
             Decimal::ZERO,
             660,
         )]);
-        let orders = model.execute(&[], &favorable);
+        let orders = model.execute(&[], &context_default(&favorable));
 
         assert!(orders.is_empty());
     }
@@ -817,7 +834,7 @@ mod order_type_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 50.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
@@ -862,7 +879,7 @@ mod struct_tests {
     #[test]
     fn execution_target_fields() {
         let t = make_target("AAPL", 42.5);
-        assert_eq!(t.symbol.value, "AAPL");
+        assert_eq!(t.symbol.value.as_ref(), "AAPL");
         assert_eq!(t.quantity, Decimal::try_from(42.5).unwrap());
     }
 
@@ -884,7 +901,7 @@ mod struct_tests {
             current_quantity: dec!(50),
             open_order_quantity: dec!(7),
         };
-        assert_eq!(s.symbol.value, "MSFT");
+        assert_eq!(s.symbol.value.as_ref(), "MSFT");
         assert_eq!(s.price, dec!(300));
         assert_eq!(s.bid, Some(dec!(299.5)));
         assert_eq!(s.ask, Some(dec!(300.5)));
@@ -899,7 +916,7 @@ mod struct_tests {
         let mut model = ImmediateExecutionModel::new();
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert!(orders[0].limit_price.is_none());
@@ -951,7 +968,7 @@ mod spread_execution_tests {
         let securities = securities_map(vec![make_security_with_quotes(
             "AAPL", 250.0, 249.0, 251.0, 0.0,
         )]);
-        let orders = model.execute(&[], &securities);
+        let orders = model.execute(&[], &context_default(&securities));
         assert!(orders.is_empty(), "Expected no orders for empty targets");
     }
 
@@ -966,7 +983,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1, "Tight spread should submit order");
         assert_eq!(orders[0].quantity, dec!(10));
@@ -984,7 +1001,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -1003,14 +1020,14 @@ mod spread_execution_tests {
             "AAPL", 250.0, 250.0, 275.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
-        let first_orders = model.execute(&targets, &wide_sec);
+        let first_orders = model.execute(&targets, &context_default(&wide_sec));
         assert!(first_orders.is_empty(), "Should defer on wide spread");
 
         // Second call: tight spread → order submitted for the pending target
         let tight_sec = securities_map(vec![make_security_with_quotes(
             "AAPL", 250.0, 249.75, 250.25, 0.0,
         )]);
-        let second_orders = model.execute(&[], &tight_sec); // no new targets, retry pending
+        let second_orders = model.execute(&[], &context_default(&tight_sec)); // no new targets, retry pending
         assert_eq!(second_orders.len(), 1, "Should submit on tight spread");
         assert_eq!(second_orders[0].quantity, dec!(10));
     }
@@ -1026,7 +1043,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 5.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(
             orders.len(),
@@ -1046,7 +1063,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 5.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -1061,7 +1078,7 @@ mod spread_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(orders.is_empty(), "Missing bid/ask should defer execution");
     }
@@ -1075,7 +1092,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(40));
@@ -1090,13 +1107,13 @@ mod spread_execution_tests {
             "AAPL", 250.0, 250.0, 275.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 100.0)];
-        let first_orders = model.execute(&targets, &wide_sec);
+        let first_orders = model.execute(&targets, &context_default(&wide_sec));
         assert!(first_orders.is_empty(), "Wide spread should defer target");
 
         let mut security = make_security_with_quotes("AAPL", 250.0, 250.0, 250.0, 40.0);
         security.open_order_quantity = dec!(25);
         let tight_sec = securities_map(vec![security]);
-        let second_orders = model.execute(&[], &tight_sec);
+        let second_orders = model.execute(&[], &context_default(&tight_sec));
 
         assert_eq!(second_orders.len(), 1);
         assert_eq!(second_orders[0].quantity, dec!(35));
@@ -1112,7 +1129,7 @@ mod spread_execution_tests {
             "AAPL", 250.0, 250.0, 275.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
-        model.execute(&targets, &wide_sec);
+        model.execute(&targets, &context_default(&wide_sec));
 
         // Remove the security
         let removed = vec![make_symbol("AAPL")];
@@ -1122,7 +1139,7 @@ mod spread_execution_tests {
         let tight_sec = securities_map(vec![make_security_with_quotes(
             "AAPL", 250.0, 250.0, 250.0, 0.0,
         )]);
-        let orders = model.execute(&[], &tight_sec);
+        let orders = model.execute(&[], &context_default(&tight_sec));
         assert!(
             orders.is_empty(),
             "Pending should be cleared after security removed"
@@ -1145,7 +1162,7 @@ mod spread_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 5.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert!(
@@ -1200,7 +1217,7 @@ mod standard_deviation_execution_tests {
             let securities = securities_map(vec![make_security_with_std_dev(
                 ticker, *price, *price, *price, 0.0, 0.0,
             )]);
-            let orders = model.execute(&[], &securities);
+            let orders = model.execute(&[], &context_default(&securities));
             assert!(
                 orders.is_empty(),
                 "Seeding without targets should not submit orders"
@@ -1216,7 +1233,7 @@ mod standard_deviation_execution_tests {
         let securities = securities_map(vec![make_security_with_std_dev(
             "AAPL", 250.0, 245.0, 255.0, 10.0, 0.0,
         )]);
-        let orders = model.execute(&[], &securities);
+        let orders = model.execute(&[], &context_default(&securities));
         assert!(orders.is_empty(), "Expected no orders for empty targets");
     }
 
@@ -1233,7 +1250,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(
             orders.len(),
@@ -1255,7 +1272,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -1274,7 +1291,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 0.0)]; // sell all (liquidate)
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(
             orders.len(),
@@ -1294,7 +1311,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 0.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -1309,7 +1326,7 @@ mod standard_deviation_execution_tests {
         let securities = securities_map(vec![make_security("AAPL", 250.0, 0.0)]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert!(
             orders.is_empty(),
@@ -1327,7 +1344,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 100.0)]; // need 40 more
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(40));
@@ -1344,7 +1361,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 100.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, dec!(20));
@@ -1361,14 +1378,14 @@ mod standard_deviation_execution_tests {
             "AAPL", 250.0, 250.0, 255.0, 0.0, 0.0,
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
-        let first_orders = model.execute(&targets, &within_sec);
+        let first_orders = model.execute(&targets, &context_default(&within_sec));
         assert!(first_orders.is_empty(), "Should defer when within band");
 
         // Second call: [250,250,140] makes the bid favorable.
         let favorable_sec = securities_map(vec![make_security_with_std_dev(
             "AAPL", 140.0, 140.0, 150.0, 0.0, 0.0,
         )]);
-        let second_orders = model.execute(&[], &favorable_sec);
+        let second_orders = model.execute(&[], &context_default(&favorable_sec));
         assert_eq!(
             second_orders.len(),
             1,
@@ -1387,7 +1404,7 @@ mod standard_deviation_execution_tests {
         let within_sec = securities_map(vec![make_security_with_std_dev(
             "AAPL", 250.0, 250.0, 252.0, 0.0, 0.0,
         )]);
-        model.execute(&[make_target("AAPL", 10.0)], &within_sec);
+        model.execute(&[make_target("AAPL", 10.0)], &context_default(&within_sec));
 
         // Remove the security
         model.on_securities_changed(&[], &[make_symbol("AAPL")]);
@@ -1396,7 +1413,7 @@ mod standard_deviation_execution_tests {
         let favorable_sec = securities_map(vec![make_security_with_std_dev(
             "AAPL", 140.0, 140.0, 150.0, 0.0, 0.0,
         )]);
-        let orders = model.execute(&[], &favorable_sec);
+        let orders = model.execute(&[], &context_default(&favorable_sec));
         assert!(
             orders.is_empty(),
             "Pending should be cleared after security removed"
@@ -1420,7 +1437,7 @@ mod standard_deviation_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 5.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert!(
@@ -1451,7 +1468,7 @@ mod passive_maker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
@@ -1474,7 +1491,7 @@ mod passive_maker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", -10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
@@ -1497,12 +1514,15 @@ mod passive_maker_execution_tests {
         );
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let first = model.execute(&targets, &securities_map(vec![security.clone()]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![security.clone()])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
         assert!(first[0].post_only);
 
         security.open_order_quantity = dec!(10);
-        let second = model.execute(&targets, &securities_map(vec![security]));
+        let second = model.execute(&targets, &context_default(&securities_map(vec![security])));
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Market);
@@ -1525,13 +1545,19 @@ mod passive_maker_execution_tests {
         );
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let first = model.execute(&targets, &securities_map(vec![security.clone()]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![security.clone()])),
+        );
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
 
         security.open_order_quantity = dec!(10);
-        let second = model.execute(&targets, &securities_map(vec![security.clone()]));
-        let third = model.execute(&targets, &securities_map(vec![security]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![security.clone()])),
+        );
+        let third = model.execute(&targets, &context_default(&securities_map(vec![security])));
 
         assert!(second.is_empty());
         assert!(third.is_empty());
@@ -1605,11 +1631,17 @@ mod passive_maker_execution_tests {
             dec!(10),
         );
 
-        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![first_security])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
         assert_eq!(first[0].limit_price, Some(dec!(99.90)));
 
-        let second = model.execute(&targets, &securities_map(vec![second_security.clone()]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![second_security.clone()])),
+        );
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
@@ -1619,7 +1651,10 @@ mod passive_maker_execution_tests {
         assert!(second[0].cancel_open_orders);
 
         second_security.open_order_quantity = dec!(10);
-        let third = model.execute(&targets, &securities_map(vec![second_security]));
+        let third = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![second_security])),
+        );
         assert!(third.is_empty());
     }
 
@@ -1740,11 +1775,17 @@ mod passive_maker_execution_tests {
             dec!(10),
         );
 
-        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![first_security])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
         assert_eq!(first[0].limit_price, Some(dec!(99.90)));
 
-        let second = model.execute(&targets, &securities_map(vec![second_security]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![second_security])),
+        );
 
         assert!(second.is_empty());
     }
@@ -1770,11 +1811,17 @@ mod passive_maker_execution_tests {
             dec!(-10),
         );
 
-        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![first_security])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
         assert_eq!(first[0].limit_price, Some(dec!(100.10)));
 
-        let second = model.execute(&targets, &securities_map(vec![second_security]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![second_security])),
+        );
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Limit);
@@ -1805,10 +1852,16 @@ mod passive_maker_execution_tests {
             dec!(10),
         );
 
-        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![first_security])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
 
-        let second = model.execute(&targets, &securities_map(vec![second_security]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![second_security])),
+        );
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Market);
@@ -1837,10 +1890,16 @@ mod passive_maker_execution_tests {
             dec!(10),
         );
 
-        let first = model.execute(&targets, &securities_map(vec![first_security]));
+        let first = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![first_security])),
+        );
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
 
-        let second = model.execute(&targets, &securities_map(vec![fulfilled_security]));
+        let second = model.execute(
+            &targets,
+            &context_default(&securities_map(vec![fulfilled_security])),
+        );
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Cancel);
@@ -1867,7 +1926,7 @@ mod aggressive_post_only_execution_tests {
             dec!(0),
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", 10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
@@ -1889,7 +1948,7 @@ mod aggressive_post_only_execution_tests {
             dec!(0),
         )]);
 
-        let orders = model.execute(&[make_target("AAPL", -10.0)], &securities);
+        let orders = model.execute(&[make_target("AAPL", -10.0)], &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
@@ -1911,9 +1970,9 @@ mod aggressive_post_only_execution_tests {
         )]);
 
         let buy_orders = AggressivePostOnlyExecutionModel::default()
-            .execute(&[make_target("AAPL", 10.0)], &securities);
+            .execute(&[make_target("AAPL", 10.0)], &context_default(&securities));
         let sell_orders = AggressivePostOnlyExecutionModel::default()
-            .execute(&[make_target("AAPL", -10.0)], &securities);
+            .execute(&[make_target("AAPL", -10.0)], &context_default(&securities));
 
         assert_eq!(buy_orders[0].limit_price, Some(dec!(100.00)));
         assert_eq!(sell_orders[0].limit_price, Some(dec!(100.01)));
@@ -1991,7 +2050,7 @@ mod adaptive_maker_taker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
@@ -2013,7 +2072,7 @@ mod adaptive_maker_taker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Market);
@@ -2032,7 +2091,7 @@ mod adaptive_maker_taker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let first = model.execute(&targets, &securities);
+        let first = model.execute(&targets, &context_default(&securities));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
 
@@ -2044,7 +2103,7 @@ mod adaptive_maker_taker_execution_tests {
             dec!(4),
             dec!(6),
         )]);
-        let second = model.execute(&targets, &tightened);
+        let second = model.execute(&targets, &context_default(&tightened));
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Market);
@@ -2095,7 +2154,7 @@ mod adaptive_maker_taker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let first = model.execute(&targets, &securities);
+        let first = model.execute(&targets, &context_default(&securities));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].order_type, ExecutionOrderType::Limit);
 
@@ -2107,7 +2166,7 @@ mod adaptive_maker_taker_execution_tests {
             dec!(10),
             dec!(10),
         )]);
-        let second = model.execute(&targets, &filled_with_stale_open_order);
+        let second = model.execute(&targets, &context_default(&filled_with_stale_open_order));
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].order_type, ExecutionOrderType::Cancel);
@@ -2158,7 +2217,7 @@ mod adaptive_maker_taker_execution_tests {
         )]);
         let targets = vec![make_target("AAPL", 10.0)];
 
-        let orders = model.execute(&targets, &securities);
+        let orders = model.execute(&targets, &context_default(&securities));
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order_type, ExecutionOrderType::Limit);
@@ -2248,7 +2307,7 @@ mod maker_then_taker_execution_tests {
 
     fn context_orders<'a>(
         time: DateTime,
-        securities: &'a HashMap<String, SecurityData>,
+        securities: &'a HashMap<u64, SecurityData>,
         open_orders: &'a [ExecutionOpenOrder],
     ) -> ExecutionContext<'a> {
         ExecutionContext::new(time, securities, open_orders, dec!(100000))

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """One-time rlean Parquet-to-Iceberg migration.
 
-This script is intentionally destructive: after each source Parquet file is
-successfully appended to Iceberg, that source file is deleted immediately.
+This script is intentionally destructive: after source Parquet files are
+successfully appended to Iceberg, those source files are deleted immediately.
 Restart safety comes from the remaining files on disk.
 """
 
@@ -56,6 +56,16 @@ class MigrationItem:
     transform: Callable[[pa.Table, Path], pa.Table]
 
 
+@dataclass
+class MigrationBatch:
+    table: str
+    items: list[MigrationItem]
+
+    @property
+    def row_count(self) -> int:
+        return len(self.items)
+
+
 def main() -> None:
     args = parse_args()
     source_root = args.source_root.resolve()
@@ -72,13 +82,24 @@ def main() -> None:
 
     include_top_level = set(args.include_top_level or [])
     total = 0
-    for item in iter_items(source_root, include_top_level):
-        total += 1
-        migrate_item(catalog, item, args.dry_run)
-        prune_empty_parents(item.path.parent, source_root, args.dry_run)
+    if args.dry_run:
+        for item in iter_items(source_root, include_top_level):
+            total += 1
+            migrate_item(catalog, item, args.dry_run)
+            prune_empty_parents(item.path.parent, source_root, args.dry_run)
+    else:
+        for batch in iter_batches(
+            iter_items(source_root, include_top_level),
+            max_files=args.batch_files,
+            max_rows=args.batch_rows,
+        ):
+            total += batch.row_count
+            migrate_batch(catalog, batch)
+            for item in batch.items:
+                prune_empty_parents(item.path.parent, source_root, args.dry_run)
 
     prune_top_level_dirs(source_root, args.dry_run)
-    print(f"processed {total} source parquet files")
+    print(f"processed {total} source parquet files", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +126,18 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help="Only migrate selected top-level source directories. Repeat for multiple values.",
+    )
+    parser.add_argument(
+        "--batch-files",
+        type=int,
+        default=500,
+        help="Maximum source files per Iceberg append commit.",
+    )
+    parser.add_argument(
+        "--batch-rows",
+        type=int,
+        default=500_000,
+        help="Approximate maximum rows per Iceberg append commit.",
     )
     return parser.parse_args()
 
@@ -288,7 +321,21 @@ def classify_path(root: Path, path: Path) -> MigrationItem | None:
 
     if parts[0] in {"custom", "alternative"}:
         source_type, ticker = infer_custom_identity(parts, path)
-        return MigrationItem(path, "custom_points", lambda table, _: add_custom_partitions(table, source_type, ticker))
+        return MigrationItem(
+            path,
+            "custom_points",
+            lambda table, source_path: add_custom_partitions(table, source_type, ticker, source_path),
+        )
+
+    # When scanning directly under `data/alternative/{provider}/`, rel paths omit the
+    # `alternative/` prefix (e.g. tradealert/sweeps/_ALL/5min/...).
+    if len(parts) >= 3 and root.name == "alternative":
+        source_type, ticker = parts[0], parts[1]
+        return MigrationItem(
+            path,
+            "custom_points",
+            lambda table, source_path: add_custom_partitions(table, source_type, ticker, source_path),
+        )
 
     if len(parts) >= 6:
         security_type, market, resolution, data_kind = parts[0], parts[1], parts[2], parts[3]
@@ -340,7 +387,7 @@ def classify_path(root: Path, path: Path) -> MigrationItem | None:
 
 
 def migrate_item(catalog: SqlCatalog, item: MigrationItem, dry_run: bool) -> None:
-    print(f"{item.path} -> {NAMESPACE}.{item.table}")
+    print(f"{item.path} -> {NAMESPACE}.{item.table}", flush=True)
     if dry_run:
         return
 
@@ -349,6 +396,68 @@ def migrate_item(catalog: SqlCatalog, item: MigrationItem, dry_run: bool) -> Non
     arrow_table = align_arrow_table(item.transform(source_table, item.path), targets()[item.table].arrow_schema)
     iceberg_table.append(arrow_table)
     item.path.unlink()
+
+
+def iter_batches(
+    items: Iterable[MigrationItem],
+    *,
+    max_files: int,
+    max_rows: int,
+) -> Iterable[MigrationBatch]:
+    if max_files <= 0:
+        raise ValueError("--batch-files must be greater than zero")
+    if max_rows <= 0:
+        raise ValueError("--batch-rows must be greater than zero")
+
+    batch: MigrationBatch | None = None
+    batch_rows = 0
+    for item in items:
+        item_rows = parquet_row_count(item.path)
+        if (
+            batch is not None
+            and (
+                batch.table != item.table
+                or len(batch.items) >= max_files
+                or (batch_rows > 0 and batch_rows + item_rows > max_rows)
+            )
+        ):
+            yield batch
+            batch = None
+            batch_rows = 0
+
+        if batch is None:
+            batch = MigrationBatch(table=item.table, items=[])
+
+        batch.items.append(item)
+        batch_rows += item_rows
+
+    if batch is not None and batch.items:
+        yield batch
+
+
+def parquet_row_count(path: Path) -> int:
+    return pq.read_metadata(path).num_rows
+
+
+def migrate_batch(catalog: SqlCatalog, batch: MigrationBatch) -> None:
+    first = batch.items[0].path
+    last = batch.items[-1].path
+    print(
+        f"{len(batch.items)} files {first} .. {last} -> {NAMESPACE}.{batch.table}",
+        flush=True,
+    )
+
+    arrow_tables = []
+    target_schema = targets()[batch.table].arrow_schema
+    for item in batch.items:
+        source_table = pq.read_table(item.path)
+        arrow_tables.append(align_arrow_table(item.transform(source_table, item.path), target_schema))
+
+    iceberg_table = catalog.load_table(f"{NAMESPACE}.{batch.table}")
+    iceberg_table.append(pa.concat_tables(arrow_tables, promote_options="default"))
+
+    for item in batch.items:
+        item.path.unlink()
 
 
 def align_arrow_table(table: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -399,8 +508,8 @@ def add_option_partitions(table: pa.Table, underlying: str) -> pa.Table:
     return table.append_column("day", day_from_ns(table["date_ns"]))
 
 
-def add_custom_partitions(table: pa.Table, source_type: str, ticker: str) -> pa.Table:
-    table = normalize_custom_table(table, source_type, ticker)
+def add_custom_partitions(table: pa.Table, source_type: str, ticker: str, path: Path) -> pa.Table:
+    table = normalize_custom_table(table, source_type, ticker, path)
     return table.append_column("source_type", string_array(source_type.lower(), table.num_rows)).append_column(
         "ticker", string_array(ticker.lower(), table.num_rows)
     ).append_column(
@@ -408,11 +517,11 @@ def add_custom_partitions(table: pa.Table, source_type: str, ticker: str) -> pa.
     )
 
 
-def normalize_custom_table(table: pa.Table, source_type: str, ticker: str) -> pa.Table:
+def normalize_custom_table(table: pa.Table, source_type: str, ticker: str, path: Path) -> pa.Table:
     if {"date_ns", "value", "fields_json"}.issubset(set(table.column_names)):
         return table
 
-    date_ns = custom_date_ns(table)
+    date_ns = custom_date_ns(table, path)
     value_name = custom_value_column(table, source_type, ticker)
     fields = table.to_pylist()
     fields_json = [json.dumps({k: v for k, v in row.items() if v is not None}, default=str) for row in fields]
@@ -427,7 +536,7 @@ def normalize_custom_table(table: pa.Table, source_type: str, ticker: str) -> pa
     )
 
 
-def custom_date_ns(table: pa.Table) -> list[int]:
+def custom_date_ns(table: pa.Table, path: Path) -> list[int]:
     for name in ("date_ns", "time_ns", "end_time_ns"):
         if name in table.column_names:
             values = table[name].to_pylist()
@@ -435,7 +544,48 @@ def custom_date_ns(table: pa.Table) -> list[int]:
     for name in ("release_date", "date", "time", "end_time"):
         if name in table.column_names:
             return [parse_date_ns(v) for v in table[name].to_pylist()]
-    raise ValueError("custom parquet table has no date/time column")
+    if inferred := custom_date_ns_from_path(path):
+        return [inferred] * table.num_rows
+    raise ValueError(f"custom parquet table has no date/time column and path date could not be inferred: {path}")
+
+
+def custom_date_ns_from_path(path: Path) -> int | None:
+    parts = path.parts
+    for idx in range(len(parts) - 2):
+        year, month, day = parts[idx : idx + 3]
+        if not (year.isdigit() and month.isdigit() and day.isdigit()):
+            continue
+        if len(year) != 4:
+            continue
+        try:
+            parsed_date = dt.date(int(year), int(month), int(day))
+        except ValueError:
+            continue
+        hour = minute = 0
+        stem = path.stem
+        if re.fullmatch(r"\d{4}", stem):
+            hour = int(stem[:2])
+            minute = int(stem[2:])
+        elif re.fullmatch(r"\d{6}", stem):
+            hour = int(stem[:2])
+            minute = int(stem[2:4])
+        elif path_has_intraday_frequency(parts):
+            hour = 16
+            minute = 0
+        timestamp = dt.datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            hour,
+            minute,
+            tzinfo=dt.timezone.utc,
+        )
+        return int(timestamp.timestamp() * 1_000_000_000)
+    return None
+
+
+def path_has_intraday_frequency(parts: tuple[str, ...]) -> bool:
+    return any(re.fullmatch(r"\d+(mi|min|m|sec|s|hour|h)", part.lower()) for part in parts)
 
 
 def parse_date_ns(value) -> int:
@@ -455,23 +605,39 @@ def parse_date_ns(value) -> int:
 
 
 def custom_value_column(table: pa.Table, source_type: str, ticker: str) -> str | None:
-    preferred = (
+    preferred = custom_value_columns(source_type, ticker)
+    for name in preferred:
+        if name in table.column_names and is_numeric_type(table.schema.field(name).type):
+            return name
+    for field in table.schema:
+        if is_numeric_type(field.type):
+            return field.name
+    return None
+
+
+def custom_value_columns(source_type: str, ticker: str) -> tuple[str, ...]:
+    source = source_type.lower()
+    data_ticker = ticker.lower()
+    if source == "tradealert" and data_ticker == "sweeps":
+        return ("norm_edge", "size", "value", "price")
+    if source == "tradealert" and data_ticker in {"snapshot", "most_active"}:
+        return ("option_volume", "atm_ivol", "close", "value", "price")
+    if source == "unusual_whales" and data_ticker == "flow_alerts":
+        return ("total_premium", "premium", "size", "volume", "value", "price")
+    return (
         "value",
         "close",
         "gdp_nowcast",
         "vix_close",
         "price",
-        ticker.lower(),
+        data_ticker,
         ticker.upper(),
-        source_type.lower(),
+        source,
     )
-    for name in preferred:
-        if name in table.column_names and pa.types.is_floating(table.schema.field(name).type):
-            return name
-    for field in table.schema:
-        if pa.types.is_floating(field.type) or pa.types.is_integer(field.type):
-            return field.name
-    return None
+
+
+def is_numeric_type(dtype: pa.DataType) -> bool:
+    return pa.types.is_floating(dtype) or pa.types.is_integer(dtype)
 
 
 def add_static_partitions(table: pa.Table, *, market: str, ticker: str) -> pa.Table:
@@ -499,10 +665,16 @@ def infer_underlying_from_option_path(path: Path) -> str:
 
 def infer_custom_identity(parts: tuple[str, ...], path: Path) -> tuple[str, str]:
     if len(parts) >= 3:
-        return parts[1], parts[2]
+        return parts[1], canonical_custom_ticker(parts[1], parts[2])
     if len(parts) == 2:
-        return parts[0], path.stem
+        return parts[0], canonical_custom_ticker(parts[0], path.stem)
     raise ValueError(f"cannot infer custom source/ticker from {path}")
+
+
+def canonical_custom_ticker(source_type: str, ticker: str) -> str:
+    if source_type.lower() == "tradealert" and ticker.lower() == "underlying_fields_eod":
+        return "snapshot"
+    return ticker
 
 
 def data_kind_to_tick_type(data_kind: str) -> str | None:
@@ -516,6 +688,9 @@ def data_kind_to_tick_type(data_kind: str) -> str | None:
 def prune_empty_parents(start: Path, stop: Path, dry_run: bool) -> None:
     current = start
     while current != stop and stop in current.parents:
+        if not current.exists():
+            current = current.parent
+            continue
         try:
             next(current.iterdir())
             return

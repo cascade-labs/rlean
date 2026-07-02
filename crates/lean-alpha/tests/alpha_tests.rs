@@ -160,7 +160,7 @@ mod insight_tests {
             None,
             "MyAlphaModel",
         );
-        assert_eq!(insight.source_model, "MyAlphaModel");
+        assert_eq!(insight.source_model.as_ref(), "MyAlphaModel");
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod insight_collection_tests {
         expired.source_model = "mean_reversion".into();
         expired.reference_value = Some(dec!(200));
         col.add(expired);
-        col.score_active(&HashMap::from([(aapl_sym.value.to_string(), dec!(190))]), now);
+        col.score_active(&HashMap::from([(aapl_sym.id.sid, dec!(190))]), now);
         col.remove_expired(now + TimeSpan::from_days(2));
 
         let snapshot = col.snapshot();
@@ -548,7 +548,7 @@ mod alpha_model_tests {
         };
         let slice = empty_slice(0);
         let insights = model.update(&slice, &[spy()]);
-        assert_eq!(insights[0].source_model, "ConstantAlphaModel");
+        assert_eq!(insights[0].source_model.as_ref(), "ConstantAlphaModel");
     }
 
     #[test]

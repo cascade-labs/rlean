@@ -14,16 +14,16 @@ use lean_alpha::{
     InsightEventKind,
 };
 use lean_core::{DateTime, Symbol, TickType};
+use lean_execution::execution_model::ExecutionTargetRef;
 use lean_execution::{
     ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, IExecutionModel,
     ImmediateExecutionModel, OrderRequest, SecurityData,
 };
-use lean_execution::execution_model::ExecutionTargetRef;
+use lean_portfolio_construction::portfolio_construction_model::InsightForPcmRef;
 use lean_portfolio_construction::{
     EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel,
     InsightDirection as PcmDir,
 };
-use lean_portfolio_construction::portfolio_construction_model::InsightForPcmRef;
 use lean_risk::risk_management::{
     HoldingSnapshot, NullRiskManagement, PortfolioTarget as RiskTarget, RiskContext,
     RiskManagementModel,
@@ -37,6 +37,10 @@ use rust_decimal::Decimal;
 /// The engine owns all pipeline logic; this is the only seam a language binding
 /// hooks into for insight exposure.
 pub trait InsightObserver: Send + Sync {
+    fn closed_snapshot_cache(&self) -> (Option<usize>, Option<Arc<[Insight]>>) {
+        (None, None)
+    }
+
     fn on_insights(&self, snapshot: ActiveInsightSnapshot, utc_now: DateTime);
 }
 
@@ -94,7 +98,12 @@ impl FrameworkState {
         let Some(observer) = &self.observer else {
             return;
         };
-        observer.on_insights(self.insights.active_snapshot(), utc_now);
+        let (closed_version, closed) = observer.closed_snapshot_cache();
+        observer.on_insights(
+            self.insights
+                .active_snapshot_reusing_closed(closed_version, closed),
+            utc_now,
+        );
     }
 
     fn collect_alpha_insights(
@@ -114,7 +123,7 @@ impl FrameworkState {
         slice: &lean_data::Slice,
         alpha_insights: Vec<Insight>,
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
         risk_context: &RiskContext,
         execution_context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
@@ -146,7 +155,7 @@ impl FrameworkState {
             } else {
                 let mut ins = insight.clone();
                 if ins.reference_value.is_none() {
-                    ins.reference_value = prices.get(ins.symbol.value.as_ref()).copied();
+                    ins.reference_value = prices.get(&ins.symbol.id.sid).copied();
                 }
                 self.insights.add(ins);
                 if let Some(added) = self.insights.latest_for_symbol(&insight.symbol).cloned() {
@@ -157,6 +166,33 @@ impl FrameworkState {
         if !flat_closed.is_empty() {
             self.alpha_tracker.record_expired(&flat_closed);
             self.push_insight_events(InsightEventKind::FlatClosed, slice.time, &flat_closed);
+        }
+
+        let pending_flat_count = self.pending_flat_targets.len();
+        let active_target_count = if self.pcm.use_all_active_insights() {
+            self.insights.active_count(slice.time)
+        } else {
+            self.insights.latest_active_symbol_count(slice.time)
+        };
+        let expired_flat_count = expired_insights
+            .iter()
+            .filter(|insight| !self.insights.has_active(&insight.symbol, slice.time))
+            .count();
+        if active_target_count == 0 && expired_flat_count == 0 && pending_flat_count == 0 {
+            let orders = self.exec_model.execute_with_context(&[], execution_context);
+            self.expose_insights(slice.time);
+            return orders;
+        }
+
+        let restored_insight_change = self.restored_insight_change;
+        self.restored_insight_change = false;
+        let insight_changes = !alpha_insights.is_empty()
+            || expired_insight_count != 0
+            || pending_flat_count != 0
+            || restored_insight_change;
+        if !self.is_rebalance_due(slice.time, insight_changes) {
+            self.expose_insights(slice.time);
+            return Vec::new();
         }
 
         let mut target_insights = if self.pcm.use_all_active_insights() {
@@ -174,26 +210,9 @@ impl FrameworkState {
                 target_insights.push(flat);
             }
         }
-
-        let pending_flat_count = self.pending_flat_targets.len();
         target_insights.append(&mut self.pending_flat_targets);
 
-        if target_insights.is_empty() {
-            let orders = self.exec_model.execute_with_context(&[], execution_context);
-            self.expose_insights(slice.time);
-            return orders;
-        }
-
-        let restored_insight_change = self.restored_insight_change;
-        self.restored_insight_change = false;
-        let insight_changes = !alpha_insights.is_empty()
-            || expired_insight_count != 0
-            || pending_flat_count != 0
-            || restored_insight_change;
-        if !self.is_rebalance_due(slice.time, insight_changes) {
-            self.expose_insights(slice.time);
-            return Vec::new();
-        }
+        self.expose_insights(slice.time);
 
         let pcm_insights: Vec<InsightForPcmRef<'_>> = target_insights
             .iter()
@@ -258,11 +277,8 @@ impl FrameworkState {
             })
             .collect();
 
-        let orders = self
-            .exec_model
-            .execute_refs_with_context(&exec_targets, execution_context);
-        self.expose_insights(slice.time);
-        orders
+        self.exec_model
+            .execute_refs_with_context(&exec_targets, execution_context)
     }
 
     /// Run the full alpha → PCM → risk → execution pipeline.
@@ -271,7 +287,7 @@ impl FrameworkState {
         slice: &lean_data::Slice,
         securities: &[Symbol],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
         risk_context: &RiskContext,
         execution_context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
@@ -451,10 +467,10 @@ pub fn notify_framework_securities_changed(
 
 struct FrameworkInputs {
     securities: Vec<Symbol>,
-    prices: HashMap<String, Decimal>,
+    prices: HashMap<u64, Decimal>,
     portfolio_value: Decimal,
     risk_context: RiskContext,
-    security_data: HashMap<String, SecurityData>,
+    security_data: HashMap<u64, SecurityData>,
     open_order_data: Vec<ExecutionOpenOrder>,
 }
 
@@ -505,10 +521,9 @@ fn build_framework_inputs(
         });
     }
     let portfolio_value = alg.portfolio_value();
-    let mut security_data: HashMap<String, SecurityData> = HashMap::with_capacity(securities.len());
+    let mut security_data: HashMap<u64, SecurityData> = HashMap::with_capacity(securities.len());
     for security in alg.securities.all() {
         let symbol = security.symbol.clone();
-        let key = symbol.value.to_string();
         let sid = symbol.id.sid;
         let base_price = security.current_price();
         let current_qty = holdings.get(&sid).copied().unwrap_or(Decimal::ZERO);
@@ -529,20 +544,19 @@ fn build_framework_inputs(
             lot_size,
             minimum_price_variation,
         );
-        security_data.insert(key, data);
+        security_data.insert(sid, data);
     }
-    let mut prices: HashMap<String, Decimal> = HashMap::with_capacity(security_data.len());
-    for (key, data) in &security_data {
-        prices.insert(key.clone(), data.price);
+    let mut prices: HashMap<u64, Decimal> = HashMap::with_capacity(security_data.len());
+    for (sid, data) in &security_data {
+        prices.insert(*sid, data.price);
     }
     let mut risk_holdings = Vec::with_capacity(holding_data.len());
     for holding in holding_data
         .values()
         .filter(|holding| !holding.quantity.is_zero())
     {
-        let key = holding.symbol.value.to_string();
         let last_price = security_data
-            .get(&key)
+            .get(&holding.symbol.id.sid)
             .map(|data| data.price)
             .filter(|price| *price > Decimal::ZERO)
             .unwrap_or(holding.last_price);

@@ -85,7 +85,7 @@ pub struct SecurityData {
 /// are passed together instead of as a reduced security snapshot.
 pub struct ExecutionContext<'a> {
     pub time: DateTime,
-    pub securities: &'a HashMap<String, SecurityData>,
+    pub securities: &'a HashMap<u64, SecurityData>,
     pub open_orders: &'a [ExecutionOpenOrder],
     pub portfolio_value: Decimal,
 }
@@ -94,8 +94,8 @@ pub struct ExecutionContext<'a> {
 /// `PortfolioTargetCollection.OrderByMarginImpact`: position-reducing orders
 /// first, then the largest remaining order value.
 pub fn sort_targets_by_margin_impact(
-    targets: &mut [(String, Symbol, Decimal)],
-    securities: &HashMap<String, SecurityData>,
+    targets: &mut [(u64, Symbol, Decimal)],
+    securities: &HashMap<u64, SecurityData>,
 ) {
     let open_orders = Vec::new();
     let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
@@ -108,11 +108,8 @@ struct MarginImpact {
     order_value: Decimal,
 }
 
-fn margin_impact(
-    target: &(String, Symbol, Decimal),
-    context: &ExecutionContext<'_>,
-) -> MarginImpact {
-    let Some(security) = context.securities.get(&target.0) else {
+fn margin_impact(target: &(u64, Symbol, Decimal), context: &ExecutionContext<'_>) -> MarginImpact {
+    let Some(security) = context.security(&target.1) else {
         return MarginImpact {
             is_reducing_position: false,
             order_value: Decimal::ZERO,
@@ -159,7 +156,7 @@ pub fn adjust_by_lot_size(lot_size: Decimal, quantity: Decimal) -> Decimal {
 impl<'a> ExecutionContext<'a> {
     pub fn new(
         time: DateTime,
-        securities: &'a HashMap<String, SecurityData>,
+        securities: &'a HashMap<u64, SecurityData>,
         open_orders: &'a [ExecutionOpenOrder],
         portfolio_value: Decimal,
     ) -> Self {
@@ -172,7 +169,7 @@ impl<'a> ExecutionContext<'a> {
     }
 
     pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {
-        self.securities.get(symbol.value.as_ref())
+        self.securities.get(&symbol.id.sid)
     }
 
     pub fn open_orders_for_symbol<'b>(
@@ -232,12 +229,12 @@ impl<'a> ExecutionContext<'a> {
 
     pub fn order_targets_by_margin_impact(
         &self,
-        targets: &[(String, Symbol, Decimal)],
-    ) -> Vec<(String, Symbol, Decimal)> {
+        targets: &[(u64, Symbol, Decimal)],
+    ) -> Vec<(u64, Symbol, Decimal)> {
         let mut filtered = targets
             .iter()
             .filter_map(|target| {
-                let security = self.securities.get(&target.0)?;
+                let security = self.security(&target.1)?;
                 let unordered = self.unordered_quantity(&target.1, security, target.2);
                 if unordered.abs() < security.lot_size {
                     None
@@ -251,7 +248,7 @@ impl<'a> ExecutionContext<'a> {
         filtered
     }
 
-    pub fn sort_targets_by_margin_impact(&self, targets: &mut [(String, Symbol, Decimal)]) {
+    pub fn sort_targets_by_margin_impact(&self, targets: &mut [(u64, Symbol, Decimal)]) {
         targets.sort_by(|left, right| {
             let left_impact = margin_impact(left, self);
             let right_impact = margin_impact(right, self);
@@ -275,19 +272,15 @@ pub trait IExecutionModel: Send + Sync {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest> {
-        let open_orders = Vec::new();
-        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
-        self.execute_with_context(targets, &context)
-    }
+        context: &ExecutionContext<'_>,
+    ) -> Vec<OrderRequest>;
 
     fn execute_with_context(
         &mut self,
         targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
-        self.execute(targets, context.securities)
+        self.execute(targets, context)
     }
 
     fn execute_refs_with_context(

@@ -8,7 +8,6 @@ use crate::options::OptionChainView;
 use lean_core::{Symbol, TickType};
 use lean_data::{CustomDataPoint, QuoteBar, Slice};
 use lean_options::OptionChain;
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method};
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -126,7 +125,7 @@ impl SharedSliceFrame {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "Slice")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Slice"))]
 pub struct SliceView {
     frame: SharedSliceFrame,
 }
@@ -139,43 +138,147 @@ impl SliceView {
     pub fn frame(&self) -> &SharedSliceFrame {
         &self.frame
     }
-
-    #[sdk_getter]
     pub fn has_data(&self) -> bool {
         self.frame
             .current()
             .map(|slice| slice.has_data || !slice.custom_data.is_empty())
             .unwrap_or(false)
     }
-
-    #[sdk_getter]
     pub fn bars(&self) -> TradeBarsView {
         TradeBarsView::new(self.frame.clone())
     }
-
-    #[sdk_getter]
     pub fn quote_bars(&self) -> QuoteBarsView {
         QuoteBarsView::new(self.frame.clone())
     }
-
-    #[sdk_getter]
     pub fn ticks(&self) -> TicksView {
         TicksView::new(self.frame.clone())
     }
-
-    #[sdk_getter]
     pub fn custom(&self) -> CustomDataView {
         CustomDataView::new(self.frame.clone())
     }
-
-    #[sdk_getter]
     pub fn option_chains(&self) -> OptionChainsView {
         OptionChainsView::new(self.frame.clone())
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SliceView {
+    #[getter(has_data)]
+    fn py_has_data(&self) -> bool {
+        self.has_data()
+    }
+
+    #[getter(bars)]
+    fn py_bars(&self) -> TradeBarsView {
+        self.bars()
+    }
+
+    #[getter(option_chains)]
+    fn py_option_chains(&self) -> OptionChainsView {
+        self.option_chains()
+    }
+
+    #[getter(custom)]
+    fn py_custom(&self) -> CustomDataView {
+        self.custom()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OptionChainsView {
+    #[pyo3(name = "get")]
+    fn py_get(&self, canonical: crate::securities::SymbolHandle) -> Option<OptionChainView> {
+        self.get(canonical.inner())
+    }
+
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, canonical: crate::securities::SymbolHandle) -> bool {
+        OptionChainsView::__contains__(self, canonical.inner())
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, canonical: crate::securities::SymbolHandle) -> Option<OptionChainView> {
+        OptionChainsView::__getitem__(self, canonical.inner())
+    }
+
+    #[getter(count)]
+    fn py_count(&self) -> usize {
+        OptionChainsView::count(self)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TradeBarsView {
+    #[pyo3(name = "get")]
+    fn py_get(&self, symbol: crate::securities::SymbolHandle) -> Option<TradeBarView> {
+        self.get(symbol.inner())
+    }
+
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, symbol: crate::securities::SymbolHandle) -> bool {
+        TradeBarsView::__contains__(self, symbol.inner())
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, symbol: crate::securities::SymbolHandle) -> Option<TradeBarView> {
+        TradeBarsView::__getitem__(self, symbol.inner())
+    }
+
+    #[getter(count)]
+    fn py_count(&self) -> usize {
+        TradeBarsView::count(self)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TradeBarView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(open)]
+    fn py_open(&self) -> f64 {
+        self.open()
+    }
+
+    #[getter(high)]
+    fn py_high(&self) -> f64 {
+        self.high()
+    }
+
+    #[getter(low)]
+    fn py_low(&self) -> f64 {
+        self.low()
+    }
+
+    #[getter(close)]
+    fn py_close(&self) -> f64 {
+        self.close()
+    }
+
+    #[getter(volume)]
+    fn py_volume(&self) -> f64 {
+        self.volume()
+    }
+
+    #[getter(time)]
+    fn py_time(&self) -> chrono::NaiveDateTime {
+        self.time()
+    }
+
+    #[getter(end_time)]
+    fn py_end_time(&self) -> chrono::NaiveDateTime {
+        self.end_time()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "OptionChains")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "OptionChains"))]
 pub struct OptionChainsView {
     frame: SharedSliceFrame,
 }
@@ -185,31 +288,26 @@ impl OptionChainsView {
         Self { frame }
     }
 
-    #[sdk_method]
     pub fn get(&self, canonical: &Symbol) -> Option<OptionChainView> {
         self.frame
             .option_chain(&canonical.permtick)
             .map(|chain| OptionChainView::from_chain(&chain))
     }
 
-    #[sdk_method]
     pub fn __contains__(&self, canonical: &Symbol) -> bool {
         self.frame.option_chain(&canonical.permtick).is_some()
     }
 
-    #[sdk_method]
     pub fn __getitem__(&self, canonical: &Symbol) -> Option<OptionChainView> {
         self.get(canonical)
     }
-
-    #[sdk_getter]
     pub fn count(&self) -> usize {
         self.frame.option_chain_count()
     }
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "TradeBars")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "TradeBars"))]
 pub struct TradeBarsView {
     frame: SharedSliceFrame,
 }
@@ -219,7 +317,6 @@ impl TradeBarsView {
         Self { frame }
     }
 
-    #[sdk_method]
     pub fn get(&self, symbol: &Symbol) -> Option<TradeBarView> {
         let slice = self.frame.current()?;
         slice
@@ -228,7 +325,6 @@ impl TradeBarsView {
             .then(|| TradeBarView::new(slice, symbol.id.sid))
     }
 
-    #[sdk_method]
     pub fn __contains__(&self, symbol: &Symbol) -> bool {
         self.frame
             .current()
@@ -236,12 +332,9 @@ impl TradeBarsView {
             .unwrap_or(false)
     }
 
-    #[sdk_method]
     pub fn __getitem__(&self, symbol: &Symbol) -> Option<TradeBarView> {
         self.get(symbol)
     }
-
-    #[sdk_getter]
     pub fn count(&self) -> usize {
         self.frame
             .current()
@@ -251,7 +344,7 @@ impl TradeBarsView {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "TradeBar")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "TradeBar"))]
 pub struct TradeBarView {
     slice: Arc<Slice>,
     sid: u64,
@@ -268,47 +361,37 @@ impl TradeBarView {
             .get(&self.sid)
             .expect("TradeBarView sid missing from slice")
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> &Symbol {
         &self.bar().symbol
     }
-    #[sdk_getter(alias = "Open")]
     pub fn open(&self) -> f64 {
         decimal_to_f64(self.bar().open)
     }
-    #[sdk_getter(alias = "High")]
     pub fn high(&self) -> f64 {
         decimal_to_f64(self.bar().high)
     }
-    #[sdk_getter(alias = "Low")]
     pub fn low(&self) -> f64 {
         decimal_to_f64(self.bar().low)
     }
-    #[sdk_getter(alias = "Close")]
     pub fn close(&self) -> f64 {
         decimal_to_f64(self.bar().close)
     }
-    #[sdk_getter]
     pub fn volume(&self) -> f64 {
         decimal_to_f64(self.bar().volume)
     }
-    #[sdk_getter]
     pub fn value(&self) -> f64 {
         self.close()
     }
-    #[sdk_getter(alias = "Time")]
     pub fn time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.bar().time.0)
     }
-    #[sdk_getter(alias = "EndTime")]
     pub fn end_time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.bar().end_time.0)
     }
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "Bar")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Bar"))]
 pub struct BarView {
     pub open: f64,
     pub high: f64,
@@ -317,26 +400,22 @@ pub struct BarView {
 }
 
 impl BarView {
-    #[sdk_getter(alias = "Open")]
     pub fn open(&self) -> f64 {
         self.open
     }
-    #[sdk_getter(alias = "High")]
     pub fn high(&self) -> f64 {
         self.high
     }
-    #[sdk_getter(alias = "Low")]
     pub fn low(&self) -> f64 {
         self.low
     }
-    #[sdk_getter(alias = "Close")]
     pub fn close(&self) -> f64 {
         self.close
     }
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "QuoteBars")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "QuoteBars"))]
 pub struct QuoteBarsView {
     frame: SharedSliceFrame,
 }
@@ -346,7 +425,6 @@ impl QuoteBarsView {
         Self { frame }
     }
 
-    #[sdk_method]
     pub fn get(&self, symbol: &Symbol) -> Option<QuoteBarView> {
         let slice = self.frame.current()?;
         slice
@@ -355,7 +433,6 @@ impl QuoteBarsView {
             .then(|| QuoteBarView::new(slice, symbol.id.sid))
     }
 
-    #[sdk_method]
     pub fn __contains__(&self, symbol: &Symbol) -> bool {
         self.frame
             .current()
@@ -363,12 +440,9 @@ impl QuoteBarsView {
             .unwrap_or(false)
     }
 
-    #[sdk_method]
     pub fn __getitem__(&self, symbol: &Symbol) -> Option<QuoteBarView> {
         self.get(symbol)
     }
-
-    #[sdk_getter]
     pub fn count(&self) -> usize {
         self.frame
             .current()
@@ -378,7 +452,7 @@ impl QuoteBarsView {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "QuoteBar")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "QuoteBar"))]
 pub struct QuoteBarView {
     slice: Arc<Slice>,
     sid: u64,
@@ -413,47 +487,37 @@ impl QuoteBarView {
             close: decimal_to_f64(b.close),
         })
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> &Symbol {
         &self.bar().symbol
     }
-    #[sdk_getter]
     pub fn bid(&self) -> Option<BarView> {
         self.bid_bar()
     }
-    #[sdk_getter]
     pub fn ask(&self) -> Option<BarView> {
         self.ask_bar()
     }
-    #[sdk_getter]
     pub fn open(&self) -> f64 {
         decimal_to_f64(self.bar().mid_open())
     }
-    #[sdk_getter(alias = "Close")]
     pub fn close(&self) -> f64 {
         decimal_to_f64(self.bar().mid_close())
     }
-    #[sdk_getter]
     pub fn bid_size(&self) -> f64 {
         decimal_to_f64(self.bar().last_bid_size)
     }
-    #[sdk_getter]
     pub fn ask_size(&self) -> f64 {
         decimal_to_f64(self.bar().last_ask_size)
     }
-    #[sdk_getter]
     pub fn time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.bar().time.0)
     }
-    #[sdk_getter]
     pub fn end_time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.bar().end_time.0)
     }
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "Ticks")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Ticks"))]
 pub struct TicksView {
     frame: SharedSliceFrame,
 }
@@ -463,7 +527,6 @@ impl TicksView {
         Self { frame }
     }
 
-    #[sdk_method]
     pub fn get(&self, symbol: &Symbol) -> Vec<TickView> {
         let Some(slice) = self.frame.current() else {
             return Vec::new();
@@ -474,8 +537,6 @@ impl TicksView {
             .map(|index| TickView::new(slice.clone(), sid, index))
             .collect()
     }
-
-    #[sdk_getter]
     pub fn count(&self) -> usize {
         self.frame
             .current()
@@ -485,7 +546,7 @@ impl TicksView {
 }
 
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "Tick")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Tick"))]
 pub struct TickView {
     slice: Arc<Slice>,
     sid: u64,
@@ -504,32 +565,24 @@ impl TickView {
             .and_then(|ticks| ticks.get(self.index))
             .expect("TickView index missing from slice")
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> &Symbol {
         &self.tick().symbol
     }
-    #[sdk_getter]
     pub fn time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.tick().time.0)
     }
-    #[sdk_getter]
     pub fn value(&self) -> f64 {
         decimal_to_f64(self.tick().value)
     }
-    #[sdk_getter]
     pub fn quantity(&self) -> f64 {
         decimal_to_f64(self.tick().quantity)
     }
-    #[sdk_getter]
     pub fn bid_price(&self) -> f64 {
         decimal_to_f64(self.tick().bid_price)
     }
-    #[sdk_getter]
     pub fn ask_price(&self) -> f64 {
         decimal_to_f64(self.tick().ask_price)
     }
-    #[sdk_getter]
     pub fn tick_type(&self) -> String {
         match self.tick().tick_type {
             TickType::Trade => "Trade",
@@ -538,18 +591,16 @@ impl TickView {
         }
         .to_string()
     }
-    #[sdk_method]
     pub fn is_trade(&self) -> bool {
         self.tick().tick_type == TickType::Trade
     }
-    #[sdk_method]
     pub fn is_quote(&self) -> bool {
         self.tick().tick_type == TickType::Quote
     }
 }
 
 #[derive(Debug, Clone, Default)]
-#[sdk_bind(py_name = "CustomData")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "CustomData"))]
 pub struct CustomDataView {
     frame: SharedSliceFrame,
 }
@@ -572,12 +623,10 @@ impl CustomDataView {
             .cloned()
     }
 
-    #[sdk_method]
     pub fn get(&self, key: &str) -> Option<CustomDataPointView> {
         self.latest_point(key).map(CustomDataPointView::new)
     }
 
-    #[sdk_method]
     pub fn get_all(&self, key: &str) -> Vec<CustomDataPointView> {
         self.frame
             .current()
@@ -588,20 +637,16 @@ impl CustomDataView {
             .collect()
     }
 
-    #[sdk_method]
     pub fn __getitem__(&self, key: &str) -> Option<CustomDataPointView> {
         self.get(key)
     }
 
-    #[sdk_method]
     pub fn __contains__(&self, key: &str) -> bool {
         self.frame
             .current()
             .map(|slice| slice.custom_data.contains_key(&Self::normalize_key(key)))
             .unwrap_or(false)
     }
-
-    #[sdk_getter]
     pub fn count(&self) -> usize {
         self.frame
             .current()
@@ -610,8 +655,27 @@ impl CustomDataView {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl CustomDataView {
+    #[pyo3(name = "get_all")]
+    fn py_get_all(&self, key: &str) -> Vec<CustomDataPointView> {
+        self.get_all(key)
+    }
+
+    #[pyo3(name = "get")]
+    fn py_get(&self, key: &str) -> Option<CustomDataPointView> {
+        self.get(key)
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, key: &str) -> Option<CustomDataPointView> {
+        self.__getitem__(key)
+    }
+}
+
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "CustomDataPoint")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "CustomDataPoint"))]
 pub struct CustomDataPointView {
     point: CustomDataPoint,
 }
@@ -620,41 +684,27 @@ impl CustomDataPointView {
     pub fn new(point: CustomDataPoint) -> Self {
         Self { point }
     }
-
-    #[sdk_getter]
     pub fn value(&self) -> f64 {
         decimal_to_f64(self.point.value)
     }
-
-    #[sdk_getter(py_name = "Value")]
     pub fn value_pascal(&self) -> f64 {
         self.value()
     }
-
-    #[sdk_getter]
     pub fn time(&self) -> chrono::NaiveDate {
         self.point.time
     }
-
-    #[sdk_getter(py_name = "Time")]
     pub fn time_pascal(&self) -> chrono::NaiveDate {
         self.time()
     }
-
-    #[sdk_getter]
     pub fn end_time(&self) -> chrono::NaiveDateTime {
         self.point
             .end_time
             .map(|time| ns_to_exchange_naive(time.0))
             .unwrap_or_else(|| self.point.time.and_hms_opt(0, 0, 0).unwrap_or_default())
     }
-
-    #[sdk_getter(py_name = "EndTime")]
     pub fn end_time_pascal(&self) -> chrono::NaiveDateTime {
         self.end_time()
     }
-
-    #[sdk_getter]
     pub fn fields(&self) -> HashMap<String, String> {
         self.point
             .fields
@@ -662,10 +712,32 @@ impl CustomDataPointView {
             .map(|(key, value)| (key.clone(), json_value_to_field_string(value)))
             .collect()
     }
-
-    #[sdk_getter(py_name = "Fields")]
     pub fn fields_pascal(&self) -> HashMap<String, String> {
         self.fields()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl CustomDataPointView {
+    #[getter(fields)]
+    fn py_fields(&self) -> HashMap<String, String> {
+        self.fields()
+    }
+
+    #[getter(value)]
+    fn py_value(&self) -> f64 {
+        self.value()
+    }
+
+    #[getter(time)]
+    fn py_time(&self) -> chrono::NaiveDate {
+        self.time()
+    }
+
+    #[getter(end_time)]
+    fn py_end_time(&self) -> chrono::NaiveDateTime {
+        self.end_time()
     }
 }
 

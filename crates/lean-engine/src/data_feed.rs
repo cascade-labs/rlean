@@ -3,6 +3,7 @@ use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_storage::IcebergStore;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionCachePolicy {
@@ -26,6 +27,8 @@ impl Default for SubscriptionCachePolicy {
 pub struct DataFeedOptions {
     pub cache_policy: SubscriptionCachePolicy,
     pub fetch_missing_custom_data: bool,
+    pub max_concurrent_market_fetches: usize,
+    pub max_concurrent_market_appends: usize,
 }
 
 impl Default for DataFeedOptions {
@@ -33,6 +36,8 @@ impl Default for DataFeedOptions {
         Self {
             cache_policy: SubscriptionCachePolicy::default(),
             fetch_missing_custom_data: true,
+            max_concurrent_market_fetches: 8,
+            max_concurrent_market_appends: 2,
         }
     }
 }
@@ -50,6 +55,8 @@ pub struct DataFeedContext {
     pub failed_custom_data_uris: Arc<Mutex<HashSet<String>>>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
+    pub market_fetch_permits: Arc<Semaphore>,
+    pub market_append_permits: Arc<Semaphore>,
 }
 
 impl DataFeedContext {
@@ -61,6 +68,12 @@ impl DataFeedContext {
             failed_custom_data_uris: Arc::new(Mutex::new(HashSet::new())),
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
+            market_fetch_permits: Arc::new(Semaphore::new(
+                DataFeedOptions::default().max_concurrent_market_fetches,
+            )),
+            market_append_permits: Arc::new(Semaphore::new(
+                DataFeedOptions::default().max_concurrent_market_appends,
+            )),
         }
     }
 
@@ -82,6 +95,9 @@ impl DataFeedContext {
 
     pub fn with_options(mut self, options: DataFeedOptions) -> Self {
         self.options = options;
+        self.market_fetch_permits = Arc::new(Semaphore::new(options.max_concurrent_market_fetches));
+        self.market_append_permits =
+            Arc::new(Semaphore::new(options.max_concurrent_market_appends));
         self
     }
 

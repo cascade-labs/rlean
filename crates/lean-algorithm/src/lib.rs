@@ -2,6 +2,7 @@ pub mod algorithm;
 pub mod benchmark;
 pub mod buying_power;
 pub mod charting;
+pub mod framework_registry;
 pub mod history;
 pub mod lifecycle;
 pub mod logging;
@@ -18,6 +19,7 @@ pub use charting::{
     ensure_shared_chart, new_shared_chart_collection, plot_shared_chart, Chart, ChartCollection,
     ChartPoint, Series, SeriesType, SharedChartCollection,
 };
+pub use framework_registry::FrameworkModelRegistry;
 pub use history::HistoryRequest;
 pub use lifecycle::{
     AlgorithmBridge, AlgorithmServices, AlgorithmStateAccess, LifecycleBridge,

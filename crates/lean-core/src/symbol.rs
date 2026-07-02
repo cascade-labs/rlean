@@ -1,8 +1,9 @@
 use crate::{Market, OptionRight, OptionStyle, Price, SecurityType};
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// Immutable, globally unique identifier for any tradeable instrument.
@@ -244,8 +245,11 @@ impl fmt::Display for SecurityIdentifier {
 
 /// High-level handle for a tradeable instrument.
 /// Cheap to clone — arc'd inner data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Symbol {
+#[derive(Debug, Clone)]
+pub struct Symbol(Arc<SymbolInner>);
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SymbolInner {
     pub id: Arc<SecurityIdentifier>,
     /// Current market ticker (may differ from id.ticker for mapped symbols).
     pub value: Arc<str>,
@@ -255,7 +259,47 @@ pub struct Symbol {
     pub underlying: Option<Arc<Symbol>>,
 }
 
+impl Deref for Symbol {
+    type Target = SymbolInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for Symbol {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self(Arc::new(SymbolInner::deserialize(deserializer)?)))
+    }
+}
+
 impl Symbol {
+    pub fn from_parts(
+        id: SecurityIdentifier,
+        value: impl Into<Arc<str>>,
+        permtick: impl Into<Arc<str>>,
+        underlying: Option<Symbol>,
+    ) -> Self {
+        Self(Arc::new(SymbolInner {
+            id: Arc::new(id),
+            value: value.into(),
+            permtick: permtick.into(),
+            underlying: underlying.map(Arc::new),
+        }))
+    }
+
     pub fn default_market_for_security_type(security_type: SecurityType) -> Market {
         match security_type {
             SecurityType::Crypto | SecurityType::CryptoFuture => Market::binance(),
@@ -299,12 +343,12 @@ impl Symbol {
     pub fn create_base(data_type: &str, ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_base(ticker, market, data_type);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_base_with_underlying(
@@ -314,67 +358,67 @@ impl Symbol {
     ) -> Self {
         let id = SecurityIdentifier::generate_base(underlying.value.as_ref(), market, data_type);
         let value = underlying.value.to_string();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: Some(Arc::new(underlying)),
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            Some(underlying),
+        )
     }
 
     pub fn create_equity(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_equity(ticker, market);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_forex(ticker: &str) -> Self {
         let id = SecurityIdentifier::generate_forex(ticker);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_crypto(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_crypto(ticker, market);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_crypto_future(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_crypto_future(ticker, market);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_index(ticker: &str, market: &Market) -> Self {
         let id = SecurityIdentifier::generate_index(ticker, market);
         let value = ticker.to_uppercase();
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn create_option(
@@ -401,23 +445,23 @@ impl Symbol {
             strike,
             style,
         );
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: Some(Arc::new(underlying)),
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            Some(underlying),
+        )
     }
 
     pub fn create_future(ticker: &str, market: &Market, expiry: NaiveDate) -> Self {
         let id = SecurityIdentifier::generate_future(ticker, market, expiry);
         let value = format!("{} {}", ticker.to_uppercase(), expiry.format("%Y%m%d"));
-        Symbol {
-            value: Arc::from(value.as_str()),
-            permtick: Arc::from(value),
-            id: Arc::new(id),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            id,
+            Arc::<str>::from(value.as_str()),
+            Arc::<str>::from(value),
+            None,
+        )
     }
 
     pub fn security_type(&self) -> SecurityType {
@@ -450,21 +494,21 @@ impl Symbol {
         }
         let mut id = self.id.as_ref().clone();
         id.sid = sid;
-        Self {
+        Self(Arc::new(SymbolInner {
             id: Arc::new(id),
             value: self.value.clone(),
             permtick: self.permtick.clone(),
             underlying: self.underlying.clone(),
-        }
+        }))
     }
 
     pub fn with_value(&self, value: &str) -> Self {
-        Self {
+        Self(Arc::new(SymbolInner {
             id: self.id.clone(),
             value: Arc::from(value),
             permtick: Arc::from(value),
             underlying: self.underlying.clone(),
-        }
+        }))
     }
 
     pub fn has_underlying(&self) -> bool {
@@ -570,13 +614,7 @@ mod tests {
         );
         let clone = option.clone();
 
-        assert!(Arc::ptr_eq(&option.id, &clone.id));
-        assert!(Arc::ptr_eq(&option.value, &clone.value));
-        assert!(Arc::ptr_eq(&option.permtick, &clone.permtick));
-        assert!(Arc::ptr_eq(
-            option.underlying.as_ref().unwrap(),
-            clone.underlying.as_ref().unwrap()
-        ));
+        assert!(Arc::ptr_eq(&option.0, &clone.0));
     }
 
     #[test]

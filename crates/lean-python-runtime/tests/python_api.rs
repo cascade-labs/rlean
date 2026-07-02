@@ -1,14 +1,37 @@
-include!(concat!(env!("OUT_DIR"), "/python_lib.rs"));
-
 #[cfg(test)]
 mod tests {
+    use lean_algorithm::lifecycle::NullHistoryService;
+    use lean_algorithm::qc_algorithm::QcAlgorithm;
+    use lean_python_runtime::AlgorithmImports;
+    use lean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
     use pyo3::prelude::*;
+    use rust_decimal_macros::dec;
+    use std::sync::{Arc, Mutex};
+
+    fn init_python() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            pyo3::append_to_inittab!(AlgorithmImports);
+            pyo3::Python::initialize();
+        });
+    }
 
     fn run_python(code: &str) {
-        crate::test_python::init();
-        Python::attach(|py| {
-            let code = std::ffi::CString::new(code).unwrap();
-            py.run(code.as_c_str(), None, None).unwrap();
+        init_python();
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("Algorithm", dec!(100000))));
+        let runtime_context = lean_engine::AlgorithmRuntimeContext::with_history_service(
+            Arc::new(NullHistoryService),
+            std::collections::HashMap::new(),
+        );
+        let context = AlgorithmConstructionContext::new_with_runtime_services(
+            state,
+            Arc::new(runtime_context),
+        );
+        AlgorithmHandle::with_default_context(context, || {
+            Python::attach(|py| {
+                let code = std::ffi::CString::new(code).unwrap();
+                py.run(code.as_c_str(), None, None).unwrap();
+            });
         });
     }
 

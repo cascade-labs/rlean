@@ -15,10 +15,10 @@ fn add_equity_minute_adds_trade_and_quote_subscriptions() {
     assert_eq!(subscriptions.len(), 2);
     assert!(subscriptions
         .iter()
-        .any(|sub| sub.symbol.value == "SPY" && sub.tick_type == TickType::Trade));
+        .any(|sub| sub.symbol.value.as_ref() == "SPY" && sub.tick_type == TickType::Trade));
     assert!(subscriptions
         .iter()
-        .any(|sub| sub.symbol.value == "SPY" && sub.tick_type == TickType::Quote));
+        .any(|sub| sub.symbol.value.as_ref() == "SPY" && sub.tick_type == TickType::Quote));
 }
 
 #[test]
@@ -31,14 +31,14 @@ fn add_equity_existing_security_still_adds_later_minute_quote_subscription() {
     let subscriptions = algorithm.subscription_manager.get_all();
     assert!(subscriptions
         .iter()
-        .any(|sub| sub.symbol.value == "SPY" && sub.resolution == Resolution::Daily));
+        .any(|sub| sub.symbol.value.as_ref() == "SPY" && sub.resolution == Resolution::Daily));
     assert!(subscriptions.iter().any(|sub| {
-        sub.symbol.value == "SPY"
+        sub.symbol.value.as_ref() == "SPY"
             && sub.resolution == Resolution::Minute
             && sub.tick_type == TickType::Trade
     }));
     assert!(subscriptions.iter().any(|sub| {
-        sub.symbol.value == "SPY"
+        sub.symbol.value.as_ref() == "SPY"
             && sub.resolution == Resolution::Minute
             && sub.tick_type == TickType::Quote
     }));

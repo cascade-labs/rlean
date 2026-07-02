@@ -174,12 +174,7 @@ impl SymbolOptionsExt for Symbol {
             style,
         );
         let osi = format_option_ticker(&underlying.permtick, strike, expiry, right);
-        Symbol {
-            value: osi.clone().into(),
-            permtick: osi.into(),
-            id: id.into(),
-            underlying: Some(underlying.into()),
-        }
+        Symbol::from_parts(id, osi.clone(), osi, Some(underlying))
     }
 
     fn create_index_option_osi(
@@ -201,12 +196,7 @@ impl SymbolOptionsExt for Symbol {
             style,
         );
         let osi = format_option_ticker(&underlying.permtick, strike, expiry, right);
-        Symbol {
-            value: osi.clone().into(),
-            permtick: osi.into(),
-            id: id.into(),
-            underlying: Some(underlying.into()),
-        }
+        Symbol::from_parts(id, osi.clone(), osi, Some(underlying))
     }
 
     fn create_canonical_option(underlying: &Symbol, market: &Market) -> Symbol {
@@ -228,12 +218,12 @@ impl SymbolOptionsExt for Symbol {
         // Override security_type — generate_option already sets it to Option.
         // We create the Symbol directly so we can leave underlying = None to signal
         // "canonical" (is_canonical_option checks option_id absence via SecurityIdentifier).
-        Symbol {
-            value: canonical_ticker.clone().into(),
-            permtick: canonical_ticker.into(),
-            id: id.into(),
-            underlying: Some(underlying.clone().into()),
-        }
+        Symbol::from_parts(
+            id,
+            canonical_ticker.clone(),
+            canonical_ticker,
+            Some(underlying.clone()),
+        )
     }
 
     fn is_option(&self) -> bool {

@@ -6,14 +6,13 @@
 use lean_algorithm::portfolio::{SecurityHolding, SecurityPortfolioManager};
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{Market, Price, Symbol};
-use lean_sdk_annotations::{sdk_bind, sdk_getter, sdk_method};
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 /// SDK-owned projection of a single `SecurityHolding`.
 #[derive(Debug, Clone)]
-#[sdk_bind(py_name = "SecurityHolding")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "SecurityHolding"))]
 pub struct SecurityHoldingView {
     holding: SecurityHolding,
 }
@@ -22,72 +21,55 @@ impl SecurityHoldingView {
     pub fn new(holding: SecurityHolding) -> Self {
         Self { holding }
     }
-
-    #[sdk_getter]
     pub fn symbol(&self) -> &Symbol {
         &self.holding.symbol
     }
-    #[sdk_getter]
     pub fn quantity(&self) -> f64 {
         self.holding.quantity.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn average_price(&self) -> f64 {
         self.holding.average_price.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn unrealized_pnl(&self) -> f64 {
         self.holding.unrealized_pnl.to_f64().unwrap_or(0.0)
     }
     /// LEAN alias for `unrealized_pnl`.
-    #[sdk_getter]
     pub fn unrealized_profit(&self) -> f64 {
         self.unrealized_pnl()
     }
-    #[sdk_getter]
     pub fn realized_pnl(&self) -> f64 {
         self.holding.realized_pnl.to_f64().unwrap_or(0.0)
     }
     /// realized + unrealized P&L — mirrors LEAN `holding.profit`.
-    #[sdk_getter]
     pub fn profit(&self) -> f64 {
         self.unrealized_pnl() + self.realized_pnl()
     }
-    #[sdk_getter]
     pub fn total_fees(&self) -> f64 {
         self.holding.total_fees.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn total_funding(&self) -> f64 {
         self.holding.total_funding.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn last_price(&self) -> f64 {
         self.holding.last_price.to_f64().unwrap_or(0.0)
     }
-    #[sdk_getter]
     pub fn is_long(&self) -> bool {
         self.holding.is_long()
     }
-    #[sdk_getter]
     pub fn is_short(&self) -> bool {
         self.holding.is_short()
     }
-    #[sdk_getter]
     pub fn is_invested(&self) -> bool {
         self.holding.is_invested()
     }
     /// LEAN alias for `is_invested`.
-    #[sdk_getter]
     pub fn invested(&self) -> bool {
         self.is_invested()
     }
-    #[sdk_getter]
     pub fn market_value(&self) -> f64 {
         self.holding.market_value().to_f64().unwrap_or(0.0)
     }
 
-    #[sdk_method]
     pub fn display(&self) -> String {
         format!(
             "Holding({} qty={:.0} avg={:.2} pnl={:.2})",
@@ -99,8 +81,17 @@ impl SecurityHoldingView {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl SecurityHoldingView {
+    #[getter(invested)]
+    fn py_invested(&self) -> bool {
+        self.invested()
+    }
+}
+
 #[derive(Clone)]
-#[sdk_bind(py_name = "Portfolio")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Portfolio"))]
 pub struct PortfolioView {
     manager: Arc<SecurityPortfolioManager>,
     algorithm: Option<Arc<Mutex<QcAlgorithm>>>,
@@ -125,13 +116,9 @@ impl PortfolioView {
     pub fn cash_decimal(&self) -> Price {
         *self.manager.cash.read()
     }
-
-    #[sdk_getter(py_name = "cash")]
     pub fn cash_f64(&self) -> f64 {
         self.cash_decimal().to_f64().unwrap_or(0.0)
     }
-
-    #[sdk_getter]
     pub fn total_portfolio_value(&self) -> f64 {
         self.algorithm
             .as_ref()
@@ -140,13 +127,9 @@ impl PortfolioView {
             .to_f64()
             .unwrap_or(0.0)
     }
-
-    #[sdk_getter]
     pub fn total_value(&self) -> f64 {
         self.total_portfolio_value()
     }
-
-    #[sdk_getter]
     pub fn unrealized_pnl(&self) -> f64 {
         self.algorithm
             .as_ref()
@@ -155,8 +138,6 @@ impl PortfolioView {
             .to_f64()
             .unwrap_or(0.0)
     }
-
-    #[sdk_getter]
     pub fn total_holdings_value(&self) -> f64 {
         self.algorithm
             .as_ref()
@@ -165,36 +146,28 @@ impl PortfolioView {
             .to_f64()
             .unwrap_or(0.0)
     }
-
-    #[sdk_getter]
     pub fn total_fees(&self) -> f64 {
         self.manager.total_fees.read().to_f64().unwrap_or(0.0)
     }
-
-    #[sdk_getter]
     pub fn total_funding(&self) -> f64 {
         self.manager.total_funding.read().to_f64().unwrap_or(0.0)
     }
 
     /// True when any symbol is invested.
-    #[sdk_getter(py_name = "is_invested")]
     pub fn is_invested_any(&self) -> bool {
         !self.manager.invested_symbols().is_empty()
     }
 
     /// LEAN alias for whole-portfolio investment state.
-    #[sdk_getter]
     pub fn invested(&self) -> bool {
         self.is_invested_any()
     }
 
     /// LEAN alias for whole-portfolio investment state.
-    #[sdk_getter]
     pub fn hold_stock(&self) -> bool {
         self.is_invested_any()
     }
 
-    #[sdk_method]
     pub fn is_invested_in(&self, symbol: &Symbol) -> bool {
         self.manager.is_invested(symbol)
     }
@@ -203,22 +176,18 @@ impl PortfolioView {
         Symbol::create_equity(ticker, &Market::usa())
     }
 
-    #[sdk_method]
     pub fn holding_for_ticker(&self, ticker: &str) -> SecurityHoldingView {
         self.holding(&Self::default_equity_symbol(ticker))
     }
 
-    #[sdk_method]
     pub fn holding(&self, symbol: &Symbol) -> SecurityHoldingView {
         SecurityHoldingView::new(self.manager.get_holding(symbol))
     }
 
-    #[sdk_method]
     pub fn __getitem__(&self, symbol: &Symbol) -> SecurityHoldingView {
         self.holding(symbol)
     }
 
-    #[sdk_method]
     pub fn holdings(&self) -> Vec<SecurityHoldingView> {
         self.manager
             .all_holdings()
@@ -227,7 +196,6 @@ impl PortfolioView {
             .collect()
     }
 
-    #[sdk_method]
     pub fn display(&self) -> String {
         format!(
             "Portfolio(value={:.2}, cash={:.2}, invested={})",
@@ -235,6 +203,30 @@ impl PortfolioView {
             self.cash_f64(),
             self.is_invested_any()
         )
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl PortfolioView {
+    #[getter(cash)]
+    fn py_cash(&self) -> f64 {
+        self.cash_f64()
+    }
+
+    #[getter(total_portfolio_value)]
+    fn py_total_portfolio_value(&self) -> f64 {
+        self.total_portfolio_value()
+    }
+
+    #[getter(hold_stock)]
+    fn py_hold_stock(&self) -> bool {
+        self.hold_stock()
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, symbol: crate::securities::SymbolHandle) -> SecurityHoldingView {
+        self.holding(symbol.inner())
     }
 }
 
@@ -295,7 +287,7 @@ mod tests {
         assert!(!view.hold_stock());
 
         let symbol = PortfolioView::default_equity_symbol("spy");
-        assert_eq!(symbol.value, "SPY");
+        assert_eq!(symbol.value.as_ref(), "SPY");
         assert_eq!(
             view.holding_for_ticker("spy").symbol(),
             view.holding(&symbol).symbol()

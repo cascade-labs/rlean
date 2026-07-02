@@ -1,7 +1,10 @@
 use crate::{
-    algorithm_manager::AlgorithmManager, data_feed::DataFeedContext, data_manager::DataManager,
+    algorithm_manager::{AlgorithmManager, OrderEventProcessing},
+    data_feed::DataFeedContext,
+    data_manager::DataManager,
     options_service::option_underlying_ticker,
-    result_handler::ResultHandler, BacktestProgress, BacktestRunConfig, BacktestRunResult,
+    result_handler::ResultHandler,
+    BacktestProgress, BacktestRunConfig, BacktestRunResult,
 };
 use anyhow::Result;
 use lean_algorithm::lifecycle::{AlgorithmBridge, OptionSubscription};
@@ -145,11 +148,12 @@ where
         if !slice.has_data {
             continue;
         }
-        let has_market_data = slice_has_market_data(&slice);
-        if has_market_data {
+        let has_data_for_algorithm = slice_has_algorithm_data(&slice);
+        let has_fill_data = slice_has_fill_data(&slice);
+        if has_data_for_algorithm {
             market_slices_after_warmup += 1;
         }
-        if has_market_data {
+        if has_data_for_algorithm {
             let new_trading_day = algorithm_manager.handle_new_trading_day(&slice, &mut services);
             let changes =
                 algorithm_manager.apply_universe_selection(&slice, new_trading_day, &mut services);
@@ -171,19 +175,19 @@ where
             .iter()
             .map(|(key, chain)| (key.as_str(), chain.as_ref()))
             .collect();
-        if has_market_data {
+        if has_fill_data {
             // Settle resting orders against this slice before delivering data, so
             // fills from prior bars are reflected when the strategy sees new data.
-            algorithm_manager.process_order_events(
-                slice.as_ref(),
-                &option_chains,
-                order_processor.as_ref(),
-                portfolio.as_ref(),
-                &mut services,
-                &mut all_order_events,
-                &mut trade_builder,
-                &mut completed_trades,
-            );
+            algorithm_manager.process_order_events(OrderEventProcessing {
+                slice: slice.as_ref(),
+                option_chains: &option_chains,
+                order_processor: order_processor.as_ref(),
+                portfolio: portfolio.as_ref(),
+                services: &mut services,
+                all_order_events: &mut all_order_events,
+                trade_builder: &mut trade_builder,
+                completed_trades: &mut completed_trades,
+            });
         }
 
         algorithm_manager.deliver_data(
@@ -195,38 +199,38 @@ where
         if let Some(error) = algorithm_manager.algorithm().runtime_error() {
             anyhow::bail!("Algorithm runtime error: {error}");
         }
-        if has_market_data {
-            algorithm_manager.process_order_events(
-                slice.as_ref(),
-                &option_chains,
-                order_processor.as_ref(),
-                portfolio.as_ref(),
-                &mut services,
-                &mut all_order_events,
-                &mut trade_builder,
-                &mut completed_trades,
-            );
+        if has_fill_data {
+            algorithm_manager.process_order_events(OrderEventProcessing {
+                slice: slice.as_ref(),
+                option_chains: &option_chains,
+                order_processor: order_processor.as_ref(),
+                portfolio: portfolio.as_ref(),
+                services: &mut services,
+                all_order_events: &mut all_order_events,
+                trade_builder: &mut trade_builder,
+                completed_trades: &mut completed_trades,
+            });
             algorithm_manager.process_option_expirations(slice.as_ref(), &mut services);
         }
         let run_framework_this_slice =
-            has_market_data && !(had_warmup && market_slices_after_warmup == 1);
+            has_data_for_algorithm && !(had_warmup && market_slices_after_warmup == 1);
         if run_framework_this_slice {
             algorithm_manager.run_framework(slice.as_ref(), &mut services);
-            algorithm_manager.process_order_events(
-                slice.as_ref(),
-                &option_chains,
-                order_processor.as_ref(),
-                portfolio.as_ref(),
-                &mut services,
-                &mut all_order_events,
-                &mut trade_builder,
-                &mut completed_trades,
-            );
+            algorithm_manager.process_order_events(OrderEventProcessing {
+                slice: slice.as_ref(),
+                option_chains: &option_chains,
+                order_processor: order_processor.as_ref(),
+                portfolio: portfolio.as_ref(),
+                services: &mut services,
+                all_order_events: &mut all_order_events,
+                trade_builder: &mut trade_builder,
+                completed_trades: &mut completed_trades,
+            });
             algorithm_manager.process_option_expirations(slice.as_ref(), &mut services);
         }
         algorithm_manager.end_time_step(&mut services);
 
-        if has_market_data {
+        if has_data_for_algorithm {
             let portfolio_value = algorithm_manager.portfolio_value();
             result_handler.record_equity(slice.time, portfolio_value);
             if let Some(progress) = &config.progress {
@@ -274,11 +278,19 @@ where
     ))
 }
 
-fn slice_has_market_data(slice: &lean_data::Slice) -> bool {
+fn slice_has_algorithm_data(slice: &lean_data::Slice) -> bool {
     !slice.bars.is_empty()
         || !slice.quote_bars.is_empty()
         || !slice.ticks.is_empty()
         || !slice.custom_data.is_empty()
+        || !slice.order_books.is_empty()
+        || !slice.perpetual_contexts.is_empty()
+}
+
+fn slice_has_fill_data(slice: &lean_data::Slice) -> bool {
+    !slice.bars.is_empty()
+        || !slice.quote_bars.is_empty()
+        || !slice.ticks.is_empty()
         || !slice.order_books.is_empty()
         || !slice.perpetual_contexts.is_empty()
 }
@@ -321,13 +333,45 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         .map(|config| config.unique_id())
         .collect::<std::collections::HashSet<_>>();
 
-    for config in &current_subscriptions {
-        if !previous.contains(&config.unique_id()) {
-            data_manager
-                .add_subscription_async(config.clone(), start)
-                .await?;
+    let replaced = current_subscriptions
+        .iter()
+        .filter(|config| {
+            active_subscriptions
+                .iter()
+                .find(|existing| existing.unique_id() == config.unique_id())
+                .map(|existing| subscription_requires_stream_replacement(existing, config))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for config in &replaced {
+        if let Some(custom) = &config.custom {
+            tracing::debug!(
+                "replacing custom subscription {}:{} with dynamic symbols={}",
+                custom.source_type,
+                custom.ticker,
+                custom
+                    .dynamic_query
+                    .symbols
+                    .as_ref()
+                    .map(|symbols| symbols.len())
+                    .unwrap_or(0)
+            );
         }
+        data_manager.remove_subscription(config);
     }
+
+    let added = current_subscriptions
+        .iter()
+        .filter(|config| {
+            !previous.contains(&config.unique_id())
+                || replaced
+                    .iter()
+                    .any(|replacement| replacement.unique_id() == config.unique_id())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    data_manager.add_subscriptions_async(added, start).await?;
     for config in active_subscriptions.iter() {
         if !current.contains(&config.unique_id()) {
             data_manager.remove_subscription(config);
@@ -335,6 +379,20 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     }
     *active_subscriptions = current_subscriptions;
     Ok(())
+}
+
+fn subscription_requires_stream_replacement(
+    previous: &lean_data::SubscriptionDataConfig,
+    current: &lean_data::SubscriptionDataConfig,
+) -> bool {
+    match (previous.custom.as_ref(), current.custom.as_ref()) {
+        (Some(previous_custom), Some(current_custom)) => {
+            previous_custom.dynamic_query != current_custom.dynamic_query
+                || previous_custom.config.query != current_custom.config.query
+                || previous_custom.config.properties != current_custom.config.properties
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn benchmark_subscription_for_symbol(

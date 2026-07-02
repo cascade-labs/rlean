@@ -14,7 +14,7 @@ use rust_decimal_macros::dec;
 pub struct AdaptiveMakerTakerExecutionModel {
     pub accepting_spread_percent: Decimal,
     passive: MakerThenTakerExecutionModel,
-    tight_targets: HashMap<String, (Symbol, Decimal, String)>,
+    tight_targets: HashMap<u64, (Symbol, Decimal, String)>,
 }
 
 impl AdaptiveMakerTakerExecutionModel {
@@ -68,7 +68,7 @@ impl Default for AdaptiveMakerTakerExecutionModel {
 }
 
 impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
-    fn execute_with_context(
+    fn execute(
         &mut self,
         targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
@@ -77,10 +77,9 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
         let mut market_orders = Vec::new();
 
         for target in targets {
-            let key = target.symbol.value.to_string();
+            let key = target.symbol.id.sid;
             if context
-                .securities
-                .get(key.as_str())
+                .security(&target.symbol)
                 .map(|security| self.spread_is_tight(security))
                 .unwrap_or(false)
             {
@@ -90,7 +89,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
                     (target.symbol.clone(), target.quantity, target.tag.clone()),
                 );
             } else {
-                self.tight_targets.remove(key.as_str());
+                self.tight_targets.remove(&key);
                 passive_targets.push(target.clone());
             }
         }
@@ -98,14 +97,12 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
         let mut tight_snapshot: Vec<_> = self
             .tight_targets
             .iter()
-            .map(|(key, (symbol, target_quantity, _))| {
-                (key.clone(), symbol.clone(), *target_quantity)
-            })
+            .map(|(key, (symbol, target_quantity, _))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut tight_snapshot);
 
         for (key, symbol, target_quantity) in tight_snapshot {
-            let Some(security) = context.securities.get(&key) else {
+            let Some(security) = context.security(&symbol) else {
                 continue;
             };
             let open_order_quantity = Self::open_order_quantity(context, security);
@@ -171,7 +168,7 @@ impl IExecutionModel for AdaptiveMakerTakerExecutionModel {
     fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
         self.passive.on_securities_changed(added, removed);
         for symbol in removed {
-            self.tight_targets.remove(symbol.value.as_ref());
+            self.tight_targets.remove(&symbol.id.sid);
         }
     }
 
