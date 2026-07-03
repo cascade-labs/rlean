@@ -17,6 +17,12 @@ pub struct LocalHistoryProvider {
     store: Arc<IcebergStore>,
     daily_trade_cache: Mutex<HashMap<u64, Arc<Vec<TradeBar>>>>,
     option_universe_cache: Mutex<Option<OptionUniverseCacheEntry>>,
+    /// When true, a daily request that the local store cannot fully satisfy
+    /// returns empty (a "miss") instead of best-effort partial rows, so a
+    /// stacked remote provider is given a chance to backfill the gap. Enabled
+    /// when local sits in front of remote providers; disabled for local-only
+    /// runs where partial cached data is better than nothing.
+    strict_coverage: bool,
 }
 
 struct OptionUniverseCacheEntry {
@@ -42,6 +48,7 @@ impl LocalHistoryProvider {
             store: Arc::new(store),
             daily_trade_cache: Mutex::new(HashMap::new()),
             option_universe_cache: Mutex::new(None),
+            strict_coverage: false,
         }
     }
 
@@ -50,7 +57,15 @@ impl LocalHistoryProvider {
             store,
             daily_trade_cache: Mutex::new(HashMap::new()),
             option_universe_cache: Mutex::new(None),
+            strict_coverage: false,
         }
+    }
+
+    /// Enable strict coverage: incomplete daily windows are reported as a miss
+    /// (empty result) so remote providers in the stack can backfill the gap.
+    pub fn with_strict_coverage(mut self, strict: bool) -> Self {
+        self.strict_coverage = strict;
+        self
     }
 
     async fn cached_daily_trade_rows(&self, symbol: &Symbol) -> anyhow::Result<Arc<Vec<TradeBar>>> {
@@ -228,6 +243,16 @@ impl IHistoryProvider for LocalHistoryProvider {
                 return Ok(Vec::new());
             }
             if !has_complete_daily_coverage(&request.symbol, &rows, request.start, request.end) {
+                if self.strict_coverage {
+                    tracing::debug!(
+                        symbol = %request.symbol.value,
+                        start = %request.start,
+                        end = %request.end,
+                        rows = rows.len(),
+                        "local daily coverage incomplete; reporting miss so remote can backfill"
+                    );
+                    return Ok(Vec::new());
+                }
                 tracing::debug!(
                     symbol = %request.symbol.value,
                     start = %request.start,
@@ -281,6 +306,18 @@ impl IHistoryProvider for LocalHistoryProvider {
         Ok(self
             .store
             .scan_margin_interest_rates(&request.symbol, &params)
+            .await?)
+    }
+
+    async fn get_perpetual_contexts(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::PerpetualContext>> {
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        Ok(self
+            .store
+            .scan_perpetual_contexts(&request.symbol, &params)
             .await?)
     }
 

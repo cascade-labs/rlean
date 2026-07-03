@@ -1,5 +1,8 @@
 use crate::data_feed::DataFeedContext;
-use crate::normalization::{normalize_quote_bar, normalize_trade_bar, read_factor_rows};
+use crate::normalization::{
+    ensure_corporate_actions_cached, normalize_quote_bar, normalize_trade_bar, read_factor_rows,
+    read_map_first_date,
+};
 use crate::options_service::{
     build_daily_eod_chain, option_underlying_ticker, underlying_price_from_bars,
 };
@@ -11,14 +14,14 @@ use lean_core::{
     Symbol, TickType,
 };
 use lean_data::{
-    custom::{CustomDataConfig, CustomDataSource, CustomDataTransport},
+    custom::{CustomDataConfig, CustomDataFormat, CustomDataSource, CustomDataTransport},
     CustomDataPoint, CustomDataQuery, OptionChainSubscriptionMetadata, QuoteBar,
     SubscriptionDataConfig, SubscriptionDataKind, Tick, TradeBar,
 };
-use lean_data_providers::{DataType, HistoryRequest, ICustomDataSource};
+use lean_data_providers::{DataType, HistoryRequest, ICustomDataSource, IHistoryProvider};
 use lean_storage::{FactorFileEntry, MarketPartitionDayQuery, OptionEodBar, QueryParams};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -37,6 +40,11 @@ struct BufferedSubscriptionPoint {
 struct LoadedPartition {
     points: Vec<SubscriptionDataPoint>,
     through_date: chrono::NaiveDate,
+}
+
+enum SubscriptionStreamMessage {
+    Point(SubscriptionDataPoint),
+    Watermark(DateTime),
 }
 
 impl BufferedSubscriptionPoint {
@@ -60,9 +68,10 @@ impl BufferedSubscriptionPoint {
 /// ordered, normalized data points for one subscription config.
 pub struct SubscriptionStream {
     config: SubscriptionDataConfig,
-    receiver: mpsc::Receiver<LeanResult<SubscriptionDataPoint>>,
+    receiver: mpsc::Receiver<LeanResult<SubscriptionStreamMessage>>,
     producer: JoinHandle<()>,
     pending: VecDeque<SubscriptionDataPoint>,
+    watermark: Option<DateTime>,
     exhausted: bool,
     producer_error: Option<lean_core::LeanError>,
 }
@@ -75,6 +84,11 @@ struct SubscriptionProducerState {
     end: DateTime,
     partition_date: chrono::NaiveDate,
     end_partition_date: chrono::NaiveDate,
+    /// Earliest date the history provider can supply (its subscription lower
+    /// bound). Market dates before this can never be cached, so the coverage
+    /// check must not treat them as missing — otherwise every run re-fetches a
+    /// window whose head predates available data.
+    provider_earliest_date: Option<chrono::NaiveDate>,
     cache_filled_until: Option<chrono::NaiveDate>,
     pending: VecDeque<BufferedSubscriptionPoint>,
     prefetched: BTreeMap<DateTime, VecDeque<BufferedSubscriptionPoint>>,
@@ -82,6 +96,9 @@ struct SubscriptionProducerState {
     last_emitted_point: Option<SubscriptionDataPoint>,
     daily_time_is_source_date: Option<bool>,
     custom_history_fetched: bool,
+    /// Per-day TradeAlert/S3 lookups that returned no rows — avoids hammering
+    /// object storage on every partition once a date is known empty.
+    custom_empty_dates: std::collections::BTreeSet<chrono::NaiveDate>,
     exhausted: bool,
 }
 
@@ -108,6 +125,7 @@ impl SubscriptionStream {
             receiver,
             producer,
             pending: VecDeque::new(),
+            watermark: None,
             exhausted: false,
             producer_error: None,
         }
@@ -125,6 +143,39 @@ impl SubscriptionStream {
         self.exhausted && self.pending.is_empty()
     }
 
+    pub fn is_ready_for(&self, frontier: DateTime) -> bool {
+        self.exhausted
+            || !self.pending.is_empty()
+            || self
+                .watermark
+                .map(|watermark| watermark > frontier)
+                .unwrap_or(false)
+    }
+
+    pub async fn advance_until_progress(&mut self) -> LeanResult<()> {
+        if let Some(error) = self.producer_error.take() {
+            return Err(error);
+        }
+        self.drain_available_messages()?;
+        if !self.pending.is_empty() || self.exhausted {
+            return Ok(());
+        }
+        match self.receiver.recv().await {
+            Some(Ok(message)) => self.handle_message(message),
+            Some(Err(error)) => {
+                self.exhausted = true;
+                return Err(error);
+            }
+            None => self.exhausted = true,
+        }
+        self.drain_available_messages()?;
+        Ok(())
+    }
+
+    pub fn pop_pending(&mut self) -> Option<SubscriptionDataPoint> {
+        self.pending.pop_front()
+    }
+
     pub async fn fill_pending(&mut self) -> LeanResult<()> {
         if let Some(error) = self.producer_error.take() {
             return Err(error);
@@ -137,7 +188,7 @@ impl SubscriptionStream {
             return Ok(());
         }
         match self.receiver.recv().await {
-            Some(Ok(point)) => self.pending.push_back(point),
+            Some(Ok(message)) => self.handle_message(message),
             Some(Err(error)) => {
                 self.exhausted = true;
                 return Err(error);
@@ -157,10 +208,10 @@ impl SubscriptionStream {
         Ok(next)
     }
 
-    fn drain_available_messages(&mut self) -> LeanResult<()> {
+    pub fn drain_available_messages(&mut self) -> LeanResult<()> {
         loop {
             match self.receiver.try_recv() {
-                Ok(Ok(point)) => self.pending.push_back(point),
+                Ok(Ok(message)) => self.handle_message(message),
                 Ok(Err(error)) => {
                     self.exhausted = true;
                     return Err(error);
@@ -173,6 +224,21 @@ impl SubscriptionStream {
             }
         }
         Ok(())
+    }
+
+    fn handle_message(&mut self, message: SubscriptionStreamMessage) {
+        match message {
+            SubscriptionStreamMessage::Point(point) => self.pending.push_back(point),
+            SubscriptionStreamMessage::Watermark(watermark) => {
+                if self
+                    .watermark
+                    .map(|current| watermark > current)
+                    .unwrap_or(true)
+                {
+                    self.watermark = Some(watermark);
+                }
+            }
+        }
     }
 }
 
@@ -189,6 +255,15 @@ impl SubscriptionProducerState {
         start: DateTime,
         end: DateTime,
     ) -> Self {
+        // Populate the Iceberg factor/map tables from the history provider if
+        // they're empty for this symbol. Providers supply the rows; the
+        // framework owns persistence. This must run before we read factor rows
+        // or the map-file inception date below.
+        ensure_corporate_actions_cached(
+            &context.store,
+            context.history_provider.as_ref(),
+            &config.symbol,
+        );
         let factor_rows = if config.normalization_mode != lean_core::DataNormalizationMode::Raw {
             read_factor_rows(&context.store, &config.symbol)
         } else {
@@ -196,6 +271,20 @@ impl SubscriptionProducerState {
         };
         let partition_date = start.date_utc();
         let end_partition_date = end.date_utc();
+        // The earliest date any provider can supply, combined with the symbol's
+        // own inception (map-file first date). Market dates before this are
+        // uncacheable; take the later of the two bounds.
+        let provider_earliest_date = {
+            let provider_floor = context
+                .history_provider
+                .as_ref()
+                .and_then(|provider| provider.earliest_date());
+            let symbol_inception = read_map_first_date(&context.store, &config.symbol);
+            match (provider_floor, symbol_inception) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            }
+        };
         Self {
             config,
             context,
@@ -204,6 +293,7 @@ impl SubscriptionProducerState {
             end,
             partition_date,
             end_partition_date,
+            provider_earliest_date,
             cache_filled_until: None,
             pending: VecDeque::new(),
             prefetched: BTreeMap::new(),
@@ -211,11 +301,12 @@ impl SubscriptionProducerState {
             last_emitted_point: None,
             daily_time_is_source_date: None,
             custom_history_fetched: false,
+            custom_empty_dates: std::collections::BTreeSet::new(),
             exhausted: false,
         }
     }
 
-    async fn run(mut self, sender: mpsc::Sender<LeanResult<SubscriptionDataPoint>>) {
+    async fn run(mut self, sender: mpsc::Sender<LeanResult<SubscriptionStreamMessage>>) {
         if let Err(error) = self.run_inner(&sender).await {
             let _ = sender.send(Err(error)).await;
         }
@@ -223,7 +314,7 @@ impl SubscriptionProducerState {
 
     async fn run_inner(
         &mut self,
-        sender: &mpsc::Sender<LeanResult<SubscriptionDataPoint>>,
+        sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     ) -> LeanResult<()> {
         while !self.exhausted {
             if self.promote_next_frontier() {
@@ -247,7 +338,19 @@ impl SubscriptionProducerState {
             {
                 self.maybe_stage_fill_forward(next_frontier);
             }
+            let loaded_points = loaded.points.len();
             self.stage_loaded_points(loaded.points);
+            if loaded_points == 0 && self.pending.is_empty() && self.prefetched.is_empty() {
+                let watermark = partition_day_end(loaded.through_date);
+                if sender
+                    .send(Ok(SubscriptionStreamMessage::Watermark(watermark)))
+                    .await
+                    .is_err()
+                {
+                    self.exhausted = true;
+                    break;
+                }
+            }
             self.advance_partition_past(loaded.through_date);
         }
         Ok(())
@@ -255,14 +358,18 @@ impl SubscriptionProducerState {
 
     async fn send_pending(
         &mut self,
-        sender: &mpsc::Sender<LeanResult<SubscriptionDataPoint>>,
+        sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     ) -> LeanResult<()> {
         while let Some(buffered) = self.pending.pop_front() {
             let frontier_time = buffered.frontier_time();
             let point = buffered.point;
             self.last_emitted_time = Some(frontier_time);
             self.last_emitted_point = Some(point.clone());
-            if sender.send(Ok(point)).await.is_err() {
+            if sender
+                .send(Ok(SubscriptionStreamMessage::Point(point)))
+                .await
+                .is_err()
+            {
                 self.exhausted = true;
                 break;
             }
@@ -287,6 +394,23 @@ impl SubscriptionProducerState {
             return self.load_custom_partition().await;
         }
         let (window_start, window_end) = self.cache_fill_window();
+        // #region agent log
+        if self.partition_date == self.start.date_utc() {
+            debug_hang_probe(
+                "subscription_reader.rs:market_load_window",
+                "market partition load window selected",
+                "H6,H7",
+                json!({
+                    "symbol": self.config.symbol.value,
+                    "resolution": format!("{:?}", self.config.resolution),
+                    "tick_type": format!("{:?}", self.config.tick_type),
+                    "window_start": window_start.to_string(),
+                    "window_end": window_end.to_string(),
+                    "fetch_missing_custom_data": self.context.options.fetch_missing_custom_data,
+                }),
+            );
+        }
+        // #endregion
         let fetched_points = match self.fetch_market_window_if_missing().await {
             Ok(points) => points,
             Err(error) => {
@@ -550,6 +674,10 @@ impl SubscriptionProducerState {
                         )
                         .await?;
                 }
+                if self.config.symbol.security_type() == SecurityType::CryptoFuture {
+                    self.persist_crypto_future_derived_data(provider.as_ref(), &request)
+                        .await?;
+                }
                 self.trade_bars_to_points(rows, window_start, window_end)?
             }
             DataType::QuoteBar => {
@@ -593,6 +721,10 @@ impl SubscriptionProducerState {
                         )
                         .await?;
                 }
+                if self.config.symbol.security_type() == SecurityType::CryptoFuture {
+                    self.persist_crypto_future_derived_data(provider.as_ref(), &request)
+                        .await?;
+                }
                 self.quote_bars_to_points(rows, window_start, window_end)?
             }
             DataType::Tick => {
@@ -630,6 +762,10 @@ impl SubscriptionProducerState {
                         )
                         .await?;
                 }
+                if self.config.symbol.security_type() == SecurityType::CryptoFuture {
+                    self.persist_crypto_future_derived_data(provider.as_ref(), &request)
+                        .await?;
+                }
                 rows.into_iter().map(SubscriptionDataPoint::Tick).collect()
             }
             _ => Vec::new(),
@@ -638,19 +774,98 @@ impl SubscriptionProducerState {
         Ok(points)
     }
 
-    fn daily_fetched_trade_bars_until(
+    async fn persist_crypto_future_derived_data(
         &self,
-        rows: &[TradeBar],
+        provider: &dyn IHistoryProvider,
+        base_request: &HistoryRequest,
+    ) -> anyhow::Result<()> {
+        let context_request = HistoryRequest {
+            data_type: DataType::PerpetualContext,
+            resolution: Resolution::Minute,
+            ..base_request.clone()
+        };
+        let margin_request = HistoryRequest {
+            data_type: DataType::MarginInterestRate,
+            resolution: Resolution::Hour,
+            ..base_request.clone()
+        };
+        let open_interest_request = HistoryRequest {
+            data_type: DataType::OpenInterest,
+            resolution: Resolution::Minute,
+            ..base_request.clone()
+        };
+
+        let contexts = provider.get_perpetual_contexts(&context_request).await?;
+        let margin_rates = provider.get_margin_interest_rates(&margin_request).await?;
+        let open_interest_ticks = provider.get_ticks(&open_interest_request).await?;
+
+        let _append_permit = self
+            .context
+            .market_append_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("market append throttle closed")?;
+
+        self.context
+            .store
+            .append_perpetual_contexts_unchecked(
+                &contexts,
+                self.config.symbol.security_type(),
+                self.config.symbol.market().as_str(),
+            )
+            .await?;
+        self.context
+            .store
+            .append_margin_interest_rates_unchecked(
+                &margin_rates,
+                self.config.symbol.security_type(),
+                self.config.symbol.market().as_str(),
+            )
+            .await?;
+        self.context
+            .store
+            .append_ticks(
+                &open_interest_ticks,
+                self.config.symbol.security_type(),
+                self.config.symbol.market().as_str(),
+                Resolution::Tick,
+                TickType::OpenInterest,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Market dates the cache is expected to hold for `[window_start, window_end]`,
+    /// with dates before the provider's earliest available date removed. Those
+    /// pre-history dates can never be fetched or cached, so treating them as
+    /// "expected" would keep the coverage check permanently unsatisfied and
+    /// force a full re-fetch on every run.
+    fn expected_cacheable_dates(
+        &self,
         window_start: chrono::NaiveDate,
         window_end: chrono::NaiveDate,
-    ) -> Option<chrono::NaiveDate> {
-        let expected = expected_market_dates(
+    ) -> HashSet<chrono::NaiveDate> {
+        let mut expected = expected_market_dates(
             window_start,
             window_end,
             self.end_partition_date,
             self.exchange_hours().as_deref(),
             self.config.symbol.security_type(),
         );
+        if let Some(earliest) = self.provider_earliest_date {
+            expected.retain(|date| *date >= earliest);
+        }
+        expected
+    }
+
+    fn daily_fetched_trade_bars_until(
+        &self,
+        rows: &[TradeBar],
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> Option<chrono::NaiveDate> {
+        let expected = self.expected_cacheable_dates(window_start, window_end);
         let exchange_hours = self
             .context
             .market_hours_database
@@ -671,13 +886,7 @@ impl SubscriptionProducerState {
         window_start: chrono::NaiveDate,
         window_end: chrono::NaiveDate,
     ) -> Option<chrono::NaiveDate> {
-        let expected = expected_market_dates(
-            window_start,
-            window_end,
-            self.end_partition_date,
-            self.exchange_hours().as_deref(),
-            self.config.symbol.security_type(),
-        );
+        let expected = self.expected_cacheable_dates(window_start, window_end);
         let exchange_hours = self
             .context
             .market_hours_database
@@ -699,13 +908,7 @@ impl SubscriptionProducerState {
     ) -> anyhow::Result<bool> {
         let day_start = partition_day_start(window_start);
         let day_end = partition_day_end(window_end);
-        let expected = expected_market_dates(
-            window_start,
-            window_end,
-            self.end_partition_date,
-            self.exchange_hours().as_deref(),
-            self.config.symbol.security_type(),
-        );
+        let expected = self.expected_cacheable_dates(window_start, window_end);
         if expected.is_empty() {
             return Ok(true);
         }
@@ -808,9 +1011,27 @@ impl SubscriptionProducerState {
             if expected.is_subset(&available) {
                 return Ok(true);
             }
-            Ok(rows.iter().any(|row| {
-                row.time.date_utc() <= window_end && row.end_time.date_utc() >= window_start
-            }))
+            // `daily_trade_bar_dates` clears its set when the cached row count is
+            // short of `expected`, which also fires for interior holidays we
+            // don't have in the calendar. To tolerate those without masking a
+            // genuinely missing head/tail, require the cached rows to *bracket*
+            // the expected window: a covered date on/before the first expected
+            // day and on/after the last. A truncated head (e.g. warmup asking
+            // for data older than the cache) then correctly reports missing so
+            // the provider backfills it.
+            let (Some(expected_first), Some(expected_last)) = (
+                expected.iter().min().copied(),
+                expected.iter().max().copied(),
+            ) else {
+                return Ok(true);
+            };
+            let covered_dates: HashSet<chrono::NaiveDate> = rows
+                .iter()
+                .map(|row| daily_row_coverage_date(&exchange_hours, row.time, row.end_time))
+                .collect();
+            let brackets_head = covered_dates.iter().any(|date| *date <= expected_first);
+            let brackets_tail = covered_dates.iter().any(|date| *date >= expected_last);
+            Ok(brackets_head && brackets_tail)
         }
     }
 
@@ -1172,7 +1393,36 @@ impl SubscriptionProducerState {
             )
             .await
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        if points.is_empty() && self.context.options.fetch_missing_custom_data {
+        let custom_source = self
+            .context
+            .custom_data_sources
+            .iter()
+            .find(|source| source.name() == source_type);
+        let is_full_history = custom_source
+            .map(|source| source.is_full_history_source())
+            .unwrap_or(false);
+        let mut window_dates_empty = true;
+        let mut probe_date = window_start;
+        loop {
+            if !self.custom_empty_dates.contains(&probe_date) {
+                window_dates_empty = false;
+                break;
+            }
+            if probe_date >= window_end {
+                break;
+            }
+            probe_date = probe_date.succ_opt().unwrap_or(probe_date);
+        }
+        // Full-history custom sources (FRED, GDPNow) download the entire series once
+        // per subscription. Incremental per-day sources (TradeAlert snapshot/sweeps)
+        // must refetch any date missing from Iceberg even when another date exists.
+        let should_fetch = self.context.options.fetch_missing_custom_data
+            && if is_full_history {
+                !self.custom_history_fetched
+            } else {
+                points.is_empty() && !window_dates_empty
+            };
+        if should_fetch {
             let custom_metadata = custom.clone();
             match self
                 .fetch_custom_window_if_missing(&custom_metadata, window_start, window_end)
@@ -1184,7 +1434,32 @@ impl SubscriptionProducerState {
                         .append_custom_points(&source_type, &ticker, &fetched)
                         .await
                         .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-                    points = fetched;
+                    if is_full_history {
+                        points = self
+                            .context
+                            .store
+                            .scan_custom_points_range_with_query(
+                                &source_type,
+                                &ticker,
+                                window_start,
+                                window_end,
+                                Some(&query),
+                            )
+                            .await
+                            .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+                    } else {
+                        points = fetched;
+                    }
+                }
+                Ok(_) if !is_full_history => {
+                    let mut date = window_start;
+                    loop {
+                        self.custom_empty_dates.insert(date);
+                        if date >= window_end {
+                            break;
+                        }
+                        date = date.succ_opt().unwrap_or(date);
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -1238,27 +1513,76 @@ impl SubscriptionProducerState {
             if self.custom_history_fetched {
                 return Ok(Vec::new());
             }
-            self.custom_history_fetched = true;
-            let Some(result) = source.history(&custom.ticker, &custom.config) else {
-                return Ok(Vec::new());
+
+            let mut config = custom.config.clone();
+            config.query = custom.config.query.merge(&custom.dynamic_query);
+            if config.query.start_date.is_none() {
+                config.query.start_date = Some(self.start.date_utc());
             };
-            let points = result.map_err(|error| anyhow::anyhow!(error))?;
+            if config.query.end_date.is_none() {
+                config.query.end_date = Some(self.end.date_utc());
+            }
+
+            let points = if let Some(result) = source.history(&custom.ticker, &config) {
+                result.map_err(|error| anyhow::anyhow!(error))?
+            } else if let Some(result) = source.history_sources(&custom.ticker, &config) {
+                let mut out = Vec::new();
+                for (source_date, data_source) in result.map_err(|error| anyhow::anyhow!(error))? {
+                    out.extend(
+                        read_custom_source_points(
+                            source.as_ref(),
+                            data_source,
+                            source_date,
+                            &config,
+                            true,
+                        )
+                        .await?,
+                    );
+                }
+                out
+            } else if let Some(data_source) =
+                source.get_source(&custom.ticker, window_start, &config)
+            {
+                read_custom_source_points(source.as_ref(), data_source, window_start, &config, true)
+                    .await?
+            } else {
+                Vec::new()
+            };
+
+            // Only mark full-history sources fetched after we actually persisted rows.
+            // TradeAlert-style per-day S3 listings legitimately return empty for dates
+            // before dataset inception; marking fetched on empty would skip 2021+ data.
+            if !points.is_empty() {
+                self.custom_history_fetched = true;
+            }
+
+            // Return the whole fetched series/window so the caller persists it to
+            // Iceberg. `load_custom_partition` filters emitted rows to the current
+            // frontier after the append.
             return Ok(points
                 .into_iter()
-                .filter(|point| point.time >= window_start && point.time <= window_end)
+                .filter(|point| {
+                    point.time >= self.start.date_utc() && point.time <= self.end.date_utc()
+                })
                 .collect());
         }
 
         let mut out = Vec::new();
         let mut date = window_start;
+        let mut fetch_config = custom.config.clone();
+        fetch_config.query = fetch_config.query.merge(&custom.dynamic_query);
         while date <= window_end {
-            if let Some(data_source) = source.get_source(&custom.ticker, date, &custom.config) {
-                out.extend(read_custom_source_points(
-                    source.as_ref(),
-                    data_source,
-                    date,
-                    &custom.config,
-                )?);
+            if let Some(data_source) = source.get_source(&custom.ticker, date, &fetch_config) {
+                out.extend(
+                    read_custom_source_points(
+                        source.as_ref(),
+                        data_source,
+                        date,
+                        &fetch_config,
+                        false,
+                    )
+                    .await?,
+                );
             }
             date = date.succ_opt().unwrap_or(date);
         }
@@ -1433,7 +1757,7 @@ impl SubscriptionProducerState {
 
     fn cache_fill_window(&self) -> (chrono::NaiveDate, chrono::NaiveDate) {
         let intervals = self.context.options.cache_policy.prefetch_intervals.max(1);
-        let start = self.partition_date;
+        let mut start = self.partition_date;
         let mut end = match self.config.resolution {
             Resolution::Daily => add_years_saturating(start, intervals as i32),
             Resolution::Hour => add_months_saturating(start, intervals as i32),
@@ -1443,6 +1767,18 @@ impl SubscriptionProducerState {
         };
         if end > self.end_partition_date {
             end = self.end_partition_date;
+        }
+        // Respect the provider's data start: never probe or request a window
+        // that begins before the earliest date any provider can supply. LEAN's
+        // HistoryProviderManager asserts each request against data availability
+        // rather than issuing reads before a security's first tradable date.
+        // Clamping here means the coverage check and the outgoing fetch both
+        // stop below `earliest`, so we don't re-request an un-fillable head on
+        // every run (and don't emit per-symbol provider clip warnings).
+        if let Some(earliest) = self.provider_earliest_date {
+            if start < earliest {
+                start = earliest.min(end);
+            }
         }
         (start, end)
     }
@@ -1477,26 +1813,106 @@ impl SubscriptionProducerState {
     }
 }
 
-fn read_custom_source_points(
+async fn read_custom_source_points(
     source: &dyn ICustomDataSource,
     data_source: CustomDataSource,
     date: chrono::NaiveDate,
     config: &CustomDataConfig,
+    full_history: bool,
 ) -> anyhow::Result<Vec<CustomDataPoint>> {
-    match data_source.transport {
-        CustomDataTransport::LocalFile => {
-            let content = std::fs::read_to_string(&data_source.uri)
-                .with_context(|| format!("read custom data file {}", data_source.uri))?;
+    let bytes = match data_source.transport {
+        CustomDataTransport::LocalFile => std::fs::read(&data_source.uri)
+            .with_context(|| format!("read custom data file {}", data_source.uri))?,
+        CustomDataTransport::Http => {
+            let client = custom_data_http_client();
+            let mut request = client.get(&data_source.uri);
+            for (key, value) in &data_source.headers {
+                request = request.header(key, value);
+            }
+            request
+                .send()
+                .await
+                .with_context(|| format!("fetch custom data {}", data_source.uri))?
+                .error_for_status()
+                .with_context(|| format!("fetch custom data {}", data_source.uri))?
+                .bytes()
+                .await
+                .with_context(|| format!("read custom data response {}", data_source.uri))?
+                .to_vec()
+        }
+    };
+
+    match data_source.format {
+        CustomDataFormat::Csv | CustomDataFormat::Json => {
+            let content = String::from_utf8(bytes)
+                .with_context(|| format!("decode custom data text {}", data_source.uri))?;
             let mut points = Vec::new();
             for line in content.lines() {
-                if let Some(point) = source.reader(line, date, config) {
+                let point = if full_history {
+                    source.read_history_line(line, config)
+                } else {
+                    source.reader(line, date, config)
+                };
+                if let Some(point) = point {
                     points.push(point);
                 }
             }
             Ok(points)
         }
-        CustomDataTransport::Http => Ok(Vec::new()),
+        CustomDataFormat::Parquet => {
+            let value_columns = custom_value_columns(config);
+            let value_column_refs = value_columns.iter().map(String::as_str).collect::<Vec<_>>();
+            lean_storage::provider_parquet_bytes_to_custom_points(
+                &bytes,
+                date,
+                &data_source.uri,
+                &value_column_refs,
+            )
+        }
     }
+}
+
+fn custom_value_columns(config: &CustomDataConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(value_column) = config.properties.get("value_column") {
+        out.push(value_column.clone());
+    }
+    if let Some(value_columns) = config.properties.get("value_columns") {
+        out.extend(
+            value_columns
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if out.is_empty() {
+        out.extend(
+            [
+                "value",
+                "close",
+                "gdp_nowcast",
+                "atm_ivol",
+                "option_volume",
+                "size",
+            ]
+            .map(str::to_string),
+        );
+    }
+    out
+}
+
+fn custom_data_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("rlean/0.1 (+https://github.com/rlean)")
+                .http1_only()
+                .build()
+                .expect("custom data HTTP client")
+        })
+        .clone()
 }
 
 fn custom_point_matches_query(point: &CustomDataPoint, query: &CustomDataQuery) -> bool {
@@ -2059,6 +2475,92 @@ mod tests {
         assert!(!dates.contains(&NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()));
         assert!(!dates.contains(&NaiveDate::from_ymd_opt(2022, 1, 2).unwrap()));
         assert!(dates.contains(&NaiveDate::from_ymd_opt(2022, 1, 3).unwrap()));
+    }
+
+    struct EarliestDateProvider(NaiveDate);
+
+    #[async_trait]
+    impl IHistoryProvider for EarliestDateProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        fn earliest_date(&self) -> Option<NaiveDate> {
+            Some(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_cacheable_dates_excludes_dates_before_provider_start() {
+        // Window reaches before the provider's earliest available data. The
+        // pre-history dates can never be fetched or cached, so they must be
+        // excluded from `expected` — otherwise coverage stays permanently
+        // unsatisfied and the window is re-fetched on every run.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let provider_start = NaiveDate::from_ymd_opt(2018, 1, 2).unwrap();
+        let context = context(store)
+            .with_history_provider(Some(Arc::new(EarliestDateProvider(provider_start))));
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let window_start = NaiveDate::from_ymd_opt(2017, 5, 23).unwrap();
+        let window_end = NaiveDate::from_ymd_opt(2018, 5, 22).unwrap();
+        let state = SubscriptionProducerState::new(
+            config,
+            context,
+            dt(window_start, 0, 0),
+            dt(window_end, 23, 59),
+        );
+
+        let expected = state.expected_cacheable_dates(window_start, window_end);
+        assert!(!expected.is_empty());
+        assert!(
+            expected.iter().all(|date| *date >= provider_start),
+            "expected set must not contain dates before the provider start"
+        );
+        // A known open day before the provider start must be excluded...
+        assert!(!expected.contains(&NaiveDate::from_ymd_opt(2017, 6, 1).unwrap()));
+        // ...while a day after it is kept.
+        assert!(expected.contains(&NaiveDate::from_ymd_opt(2018, 1, 3).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cache_fill_window_start_respects_provider_earliest_date() {
+        // The fetch window (used for both the coverage check and the outgoing
+        // history request) must not begin before the provider's data start, so
+        // we never issue a read for dates the provider will only clip away.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let provider_start = NaiveDate::from_ymd_opt(2018, 1, 1).unwrap();
+        let context = context(store)
+            .with_history_provider(Some(Arc::new(EarliestDateProvider(provider_start))));
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let requested_start = NaiveDate::from_ymd_opt(2017, 5, 23).unwrap();
+        let requested_end = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+        let state = SubscriptionProducerState::new(
+            config,
+            context,
+            dt(requested_start, 0, 0),
+            dt(requested_end, 23, 59),
+        );
+
+        let (window_start, window_end) = state.cache_fill_window();
+        assert_eq!(
+            window_start, provider_start,
+            "window start must be clamped up to the provider earliest date"
+        );
+        assert!(window_end >= window_start);
     }
 
     #[tokio::test]

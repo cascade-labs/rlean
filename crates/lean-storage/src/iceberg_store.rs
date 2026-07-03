@@ -12,6 +12,7 @@ use arrow_array::{
     StringArray, UInt64Array,
 };
 use arrow_cast::cast;
+use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::ParquetReadOptions;
@@ -37,7 +38,10 @@ use iceberg::{
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_datafusion::IcebergTableProviderFactory;
 use lean_core::{Resolution, SecurityType, Symbol, TickType};
-use lean_data::{CustomDataPoint, CustomDataQuery, MarginInterestRate, QuoteBar, Tick, TradeBar};
+use lean_data::{
+    CustomDataPoint, CustomDataQuery, MarginInterestRate, PerpetualContext, QuoteBar, Tick,
+    TradeBar,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
@@ -579,6 +583,44 @@ impl IcebergStore {
         self.insert_batch_locked(MARKET_TICKS, batch).await
     }
 
+    pub async fn append_margin_interest_rates_unchecked(
+        &self,
+        rates: &[MarginInterestRate],
+        security_type: SecurityType,
+        market: &str,
+    ) -> Result<()> {
+        if rates.is_empty() {
+            return Ok(());
+        }
+        let batch = with_market_partitions(
+            convert::margin_interest_rates_to_record_batch(rates),
+            security_type,
+            market,
+            Resolution::Hour,
+            TickType::Trade,
+        )?;
+        self.insert_batch(MARGIN_INTEREST, batch).await
+    }
+
+    pub async fn append_perpetual_contexts_unchecked(
+        &self,
+        contexts: &[PerpetualContext],
+        security_type: SecurityType,
+        market: &str,
+    ) -> Result<()> {
+        if contexts.is_empty() {
+            return Ok(());
+        }
+        let batch = with_market_partitions(
+            convert::perpetual_contexts_to_record_batch(contexts),
+            security_type,
+            market,
+            Resolution::Minute,
+            TickType::Trade,
+        )?;
+        self.insert_batch(PERPETUAL_CONTEXT, batch).await
+    }
+
     async fn dedupe_trade_bars_for_append(
         &self,
         bars: &[TradeBar],
@@ -705,6 +747,34 @@ impl IcebergStore {
         Ok(out)
     }
 
+    pub async fn scan_perpetual_contexts(
+        &self,
+        symbol: &Symbol,
+        params: &QueryParams,
+    ) -> Result<Vec<PerpetualContext>> {
+        let mut df = self
+            .table_df(PERPETUAL_CONTEXT)
+            .await?
+            .filter(
+                col("security_type").eq(lit(symbol.security_type().to_string().to_lowercase())),
+            )?
+            .filter(col("market").eq(lit(symbol.market().as_str().to_lowercase())))?
+            .filter(col("symbol_sid").eq(lit(symbol.id.sid as i64)))?;
+        if let Some(filter) = params.predicate.to_datafusion_expr() {
+            df = df.filter(filter)?;
+        }
+        let batches = df.collect().await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            out.extend(convert::record_batch_to_perpetual_contexts(
+                batch,
+                symbol.clone(),
+            ));
+        }
+        out.sort_by_key(|context| context.time.0);
+        Ok(out)
+    }
+
     pub async fn scan_custom_points(
         &self,
         source_type: &str,
@@ -750,6 +820,20 @@ impl IcebergStore {
                 .unwrap_or_else(|| schema::date_to_ns(point.time))
         });
         Ok(out)
+    }
+
+    pub async fn scan_custom_points_raw_batches(
+        &self,
+        source_type: &str,
+        ticker: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        query: Option<&CustomDataQuery>,
+    ) -> Result<Vec<RecordBatch>> {
+        let start_day = days_since_epoch(schema::date_to_ns(start));
+        let end_day = days_since_epoch(schema::date_to_ns(end));
+        self.scan_custom_points_batches(source_type, ticker, start_day, end_day, query)
+            .await
     }
 
     pub async fn has_custom_points_dataset(&self, source_type: &str, ticker: &str) -> Result<bool> {
@@ -2137,7 +2221,7 @@ fn append_custom_batch_points(batch: &RecordBatch, out: &mut Vec<CustomDataPoint
     for row in 0..batch.num_rows() {
         let fields = match optional_string_at(fields_json, row).filter(|raw| !raw.is_empty()) {
             None => HashMap::new(),
-            Some(raw) => serde_json::from_str(raw).unwrap_or_default(),
+            Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
         };
         let date_ns = date_ns.value(row);
         let end_time = custom_point_end_time(&fields, date_ns).unwrap_or(date_ns);
@@ -2151,17 +2235,39 @@ fn append_custom_batch_points(batch: &RecordBatch, out: &mut Vec<CustomDataPoint
     Ok(())
 }
 
-fn optional_string_at(array: &ArrayRef, row: usize) -> Option<&str> {
+fn optional_string_at(array: &ArrayRef, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
     }
     if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-        return Some(values.value(row));
+        return Some(values.value(row).to_string());
     }
     if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Some(values.value(row));
+        return Some(values.value(row).to_string());
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<arrow_array::StringViewArray>()
+    {
+        return string_view_value(values, row);
     }
     None
+}
+
+fn string_view_value(values: &arrow_array::StringViewArray, row: usize) -> Option<String> {
+    let view = *values.views().get(row)?;
+    let len = (view as u32) as usize;
+    let bytes = if len <= MAX_INLINE_VIEW_LEN as usize {
+        // SAFETY: Arrow stores <=12 byte Utf8View values inline in the view word.
+        unsafe { arrow_array::StringViewArray::inline_value(&view, len) }
+    } else {
+        let view = ByteView::from(view);
+        let buffer = values.data_buffers().get(view.buffer_index as usize)?;
+        let start = view.offset as usize;
+        let end = start.checked_add(view.length as usize)?;
+        buffer.get(start..end)?
+    };
+    std::str::from_utf8(bytes).ok().map(str::to_string)
 }
 
 fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Result<DataFrame> {
@@ -2169,8 +2275,7 @@ fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Res
         if !symbols.is_empty() {
             let mut expr: Option<Expr> = None;
             for symbol in symbols {
-                let pattern = format!("%\"usymbol\":\"{}\"%", escape_like_value(symbol));
-                let next = col("fields_json").like(lit(pattern));
+                let next = json_string_field_expr("usymbol", symbol);
                 expr = Some(match expr {
                     Some(existing) => existing.or(next),
                     None => next,
@@ -2183,12 +2288,7 @@ fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Res
     }
 
     for (field, expected) in &query.string_equals {
-        let pattern = format!(
-            "%\"{}\":\"{}\"%",
-            escape_like_value(field),
-            escape_like_value(expected)
-        );
-        df = df.filter(col("fields_json").like(lit(pattern)))?;
+        df = df.filter(json_string_field_expr(field, expected))?;
     }
 
     for (field, values) in &query.string_in {
@@ -2197,12 +2297,7 @@ fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Res
         }
         let mut expr: Option<Expr> = None;
         for value in values {
-            let pattern = format!(
-                "%\"{}\":\"{}\"%",
-                escape_like_value(field),
-                escape_like_value(value)
-            );
-            let next = col("fields_json").like(lit(pattern));
+            let next = json_string_field_expr(field, value);
             expr = Some(match expr {
                 Some(existing) => existing.or(next),
                 None => next,
@@ -2214,6 +2309,14 @@ fn apply_custom_query_filters(mut df: DataFrame, query: &CustomDataQuery) -> Res
     }
 
     Ok(df)
+}
+
+fn json_string_field_expr(field: &str, value: &str) -> Expr {
+    let field = escape_like_value(field);
+    let value = escape_like_value(value);
+    col("fields_json")
+        .like(lit(format!("%\"{field}\":\"{value}\"%")))
+        .or(col("fields_json").like(lit(format!("%\"{field}\": \"{value}\"%"))))
 }
 
 fn escape_like_value(value: &str) -> String {
@@ -2229,12 +2332,21 @@ fn custom_point_end_time(fields: &HashMap<String, serde_json::Value>, date_ns: i
             return Some(ns);
         }
     }
-    for key in ["end_time", "time", "timestamp", "datetime", "bar_time"] {
-        if let Some(ns) = fields
-            .get(key)
-            .and_then(|value| json_datetime_ns(value, date_ns))
-        {
-            return Some(ns);
+    let fallback_date = schema::ns_to_date(date_ns);
+    for key in [
+        "current_time",
+        "time",
+        "bar_time",
+        "datetime",
+        "end_time",
+        "timestamp",
+    ] {
+        if let Some(text) = fields.get(key).and_then(|value| value.as_str()) {
+            if let Some(end_time) =
+                crate::custom_ingest::parse_tradealert_timestamp(text, fallback_date)
+            {
+                return Some(end_time.0);
+            }
         }
     }
     None
@@ -2244,56 +2356,6 @@ fn json_i64(value: &serde_json::Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
-}
-
-fn json_datetime_ns(value: &serde_json::Value, date_ns: i64) -> Option<i64> {
-    if let Some(raw) = value.as_i64() {
-        return if raw.abs() < 10_000_000_000 {
-            Some(raw * 1_000_000_000)
-        } else if raw.abs() < 10_000_000_000_000 {
-            Some(raw * 1_000_000)
-        } else if raw.abs() < 10_000_000_000_000_000 {
-            Some(raw * 1_000)
-        } else {
-            Some(raw)
-        };
-    }
-    let text = value.as_str()?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Ok(raw) = text.parse::<i64>() {
-        if (0..=2359).contains(&raw) && text.len() <= 4 {
-            let hour = (raw / 100) as u32;
-            let minute = (raw % 100) as u32;
-            return chrono::NaiveTime::from_hms_opt(hour, minute, 0).and_then(|time| {
-                schema::ns_to_date(date_ns)
-                    .and_time(time)
-                    .and_utc()
-                    .timestamp_nanos_opt()
-            });
-        }
-        return json_datetime_ns(&serde_json::Value::from(raw), date_ns);
-    }
-    chrono::DateTime::parse_from_rfc3339(text)
-        .map(|dt| dt.timestamp_nanos_opt().unwrap_or_default())
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
-        })
-        .or_else(|| {
-            chrono::NaiveTime::parse_from_str(text, "%H:%M:%S")
-                .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%H:%M"))
-                .ok()
-                .and_then(|time| {
-                    schema::ns_to_date(date_ns)
-                        .and_time(time)
-                        .and_utc()
-                        .timestamp_nanos_opt()
-                })
-        })
 }
 
 fn market_day_values(batch: &RecordBatch, resolution: Resolution) -> Result<Vec<i32>> {

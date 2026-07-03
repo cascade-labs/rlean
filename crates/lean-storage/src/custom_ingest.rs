@@ -5,7 +5,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::DataType;
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use lean_core::{DateTime, TimeSpan};
 use lean_data::CustomDataPoint;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -123,25 +123,67 @@ fn point_end_time(
     source_uri: &str,
     fields: &HashMap<String, serde_json::Value>,
 ) -> DateTime {
+    for key in ["current_time", "time", "bar_time", "datetime"] {
+        let Some(text) = fields.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Some(end_time) = parse_tradealert_timestamp(text, source_date) {
+            return end_time;
+        }
+    }
+
     if let Some(time) = fields
         .get("time")
         .and_then(serde_json::Value::as_str)
         .and_then(parse_hhmm)
     {
-        return DateTime::from(Utc.from_utc_datetime(&source_date.and_time(time))) + TimeSpan::ZERO;
+        return eastern_market_time(source_date, time);
     }
 
     if let Some(time) = file_hhmm(source_uri).and_then(parse_hhmm) {
-        return DateTime::from(Utc.from_utc_datetime(&source_date.and_time(time))) + TimeSpan::ZERO;
+        return eastern_market_time(source_date, time);
     }
 
-    DateTime::from(
-        Utc.from_utc_datetime(
-            &source_date
-                .and_hms_opt(16, 0, 0)
-                .expect("valid custom data timestamp"),
-        ),
-    ) + TimeSpan::ZERO
+    eastern_market_time(
+        source_date,
+        chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("valid custom data timestamp"),
+    )
+}
+
+fn eastern_market_time(date: NaiveDate, time: chrono::NaiveTime) -> DateTime {
+    use chrono::TimeZone as _;
+    use chrono_tz::America::New_York;
+    let local = New_York
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .unwrap_or_else(|| New_York.from_utc_datetime(&date.and_time(time)));
+    DateTime::from(local.with_timezone(&Utc)) + TimeSpan::ZERO
+}
+
+/// Parse TradeAlert sweep/snapshot timestamps. Values are exchange-local (US/Eastern).
+pub fn parse_tradealert_timestamp(text: &str, source_date: NaiveDate) -> Option<DateTime> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(time) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
+        return Some(eastern_market_time(time.date(), time.time()));
+    }
+    if let Ok(time) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(eastern_market_time(time.date(), time.time()));
+    }
+    // TradeAlert occasionally uses "YYYY-MM-DD HH:MM:SS:mmm" (colon before millis).
+    if let Some((base, _millis)) = text.rsplit_once(':') {
+        if base.len() >= 19 {
+            if let Ok(time) = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S") {
+                return Some(eastern_market_time(time.date(), time.time()));
+            }
+        }
+    }
+    if let Some(time) = parse_hhmm(text) {
+        return Some(eastern_market_time(source_date, time));
+    }
+    None
 }
 
 fn parse_hhmm(value: &str) -> Option<chrono::NaiveTime> {
