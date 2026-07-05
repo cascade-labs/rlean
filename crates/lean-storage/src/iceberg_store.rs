@@ -72,6 +72,59 @@ pub const CUSTOM_POINTS: &str = "custom_points";
 pub const FACTOR_FILES: &str = "factor_files";
 pub const MAP_FILES: &str = "map_files";
 
+/// Every table the local cache manages, in a stable order. Used by maintenance
+/// tooling and the end-of-backtest compaction pass.
+pub const CACHE_TABLES: &[&str] = &[
+    MARKET_TRADE_BARS,
+    MARKET_QUOTE_BARS,
+    MARKET_TICKS,
+    OPTION_EOD_BARS,
+    OPTION_UNIVERSE,
+    MARGIN_INTEREST,
+    PERPETUAL_CONTEXT,
+    CUSTOM_POINTS,
+    FACTOR_FILES,
+    MAP_FILES,
+];
+
+/// Byte budget for a single staged compaction chunk (and therefore for any
+/// batch read back from it). Kept well under Arrow's 2GB 32-bit string offset
+/// limit so re-reading a chunk cannot overflow.
+const COMPACT_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+/// Row ceiling for a single staged compaction chunk.
+const COMPACT_CHUNK_ROWS: usize = 4_000_000;
+/// Byte budget for one re-insert append commit. Bounds peak memory and keeps
+/// the concatenated batch's string columns under the 2GB offset limit.
+const COMPACT_APPEND_BYTES: usize = 512 * 1024 * 1024;
+/// Row ceiling for one re-insert append commit.
+const COMPACT_APPEND_ROWS: usize = 4_000_000;
+/// Cap on distinct partitions per re-insert append. The fanout writer keeps one
+/// open file per partition until the commit closes, so this bounds open files.
+const COMPACT_APPEND_PARTITIONS: usize = 2_048;
+
+/// Approximate in-memory footprint of a record batch (sum of column buffer
+/// sizes). For sliced batches this over-counts shared buffers, which only makes
+/// the compaction budgets more conservative.
+fn record_batch_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size())
+        .sum()
+}
+
+/// Result of compacting one Iceberg table via [`IcebergStore::compact_table`].
+#[derive(Debug, Clone)]
+pub struct CompactionStats {
+    pub table: String,
+    /// Number of live data files referenced by the snapshot before compaction.
+    pub files_before: usize,
+    /// Number of rows preserved.
+    pub rows: usize,
+    /// Number of append commits (snapshots + manifests) written afterward.
+    pub appends: usize,
+}
+
 #[derive(Clone)]
 pub struct IcebergStore {
     warehouse_root: PathBuf,
@@ -139,6 +192,411 @@ impl IcebergStore {
 
     pub fn warehouse_root(&self) -> &Path {
         &self.warehouse_root
+    }
+
+    /// Number of persisted table-metadata versions (`*.metadata.json`) for
+    /// `table`. iceberg-rust keeps every version and writes a new one on every
+    /// commit, so this count grows by one per append and is a direct measure of
+    /// the snapshot/manifest bloat that slows query planning. A freshly
+    /// compacted (or absent) table reports a small handful.
+    pub fn metadata_version_count(&self, table: &str) -> usize {
+        let dir = self
+            .warehouse_root
+            .join(NAMESPACE)
+            .join(table)
+            .join("metadata");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".metadata.json")
+            })
+            .count()
+    }
+
+    /// Compact every managed cache table whose metadata bloat
+    /// ([`IcebergStore::metadata_version_count`]) is at or above `min_versions`.
+    ///
+    /// Intended for the end of a backtest, once results are safely written:
+    /// each append-heavy run leaves the touched tables with hundreds of tiny
+    /// snapshots, and rewriting them keeps the next run's query planning fast.
+    /// The threshold skips tables that were not (meaningfully) appended to so a
+    /// large table like `custom_points` is not rewritten on every run.
+    ///
+    /// Best-effort: a per-table failure is logged and skipped so the remaining
+    /// tables are still compacted. Returns the stats of the tables actually
+    /// rewritten.
+    pub async fn compact_bloated(&self, min_versions: usize) -> Vec<CompactionStats> {
+        let mut compacted = Vec::new();
+        for table in CACHE_TABLES {
+            let versions = self.metadata_version_count(table);
+            if versions < min_versions {
+                continue;
+            }
+            match self.compact_table(table).await {
+                Ok(stats) if stats.files_before > 0 => {
+                    tracing::info!(
+                        "compacted {} ({} metadata versions): {} rows, {} live files -> {} appends",
+                        stats.table,
+                        versions,
+                        stats.rows,
+                        stats.files_before,
+                        stats.appends,
+                    );
+                    compacted.push(stats);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("skipped compaction of {table}: {error:#}");
+                }
+            }
+        }
+        compacted
+    }
+
+    /// Rewrite every live row of `table` into a small number of append commits,
+    /// collapsing the accumulated snapshot/manifest chain.
+    ///
+    /// iceberg-rust 0.9.1 has no snapshot expiration or manifest rewrite, so the
+    /// append-only ingest path writes a new snapshot + manifest set on every
+    /// commit. After tens of thousands of incremental appends a table ends up
+    /// with tens of GB of manifests for a few hundred MB of data, and every
+    /// query plan pays to read and predicate-prune across that manifest set —
+    /// which manifests as a backtest that appears to hang.
+    ///
+    /// The rewrite streams the current rows (clustered by partition via a
+    /// path-sorted single scan) into temporary parquet chunks, drops and
+    /// recreates the table, then re-inserts the rows in append commits bounded
+    /// by distinct partition count (to cap the fanout writer's simultaneously
+    /// open files), a row budget and a byte budget (to cap memory and to keep
+    /// any single string column well under Arrow's 2GB 32-bit offset limit).
+    /// Row content is preserved exactly; only the physical layout and snapshot
+    /// history change.
+    ///
+    /// If the re-insert half fails, the staged chunks are left in place under
+    /// `.compact_tmp_<table>` so the data can be recovered with
+    /// [`IcebergStore::restore_from_staging`].
+    pub async fn compact_table(&self, table: &str) -> Result<CompactionStats> {
+        use futures::StreamExt;
+        use parquet::arrow::ArrowWriter;
+
+        let lock = self.table_write_lock(table).await;
+        let _guard = lock.lock().await;
+
+        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+        // With identity-transform partitions the spec field name equals the
+        // source column name, so these double as the physical sort columns.
+        let partition_columns: Vec<String> = catalog_table
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+
+        let mut file_paths: Vec<String> = Vec::new();
+        let mut tasks = catalog_table.scan().build()?.plan_files().await?;
+        while let Some(task) = futures::TryStreamExt::try_next(&mut tasks).await? {
+            file_paths.push(task.data_file_path().to_string());
+        }
+        let files_before = file_paths.len();
+        if files_before == 0 {
+            return Ok(CompactionStats {
+                table: table.to_string(),
+                files_before: 0,
+                rows: 0,
+                appends: 0,
+            });
+        }
+        let mut local_paths = file_paths
+            .iter()
+            .map(|path| local_path_from_iceberg_file_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        drop(catalog_table);
+        // Iceberg writes each identity partition's data files under a distinct
+        // `data/<partition-path>/` directory, so sorting paths clusters rows by
+        // partition. Reading them in that order with a single scan partition
+        // then yields a partition-contiguous stream — everything the re-insert
+        // packer needs — without a costly (and memory-hungry) global sort.
+        local_paths.sort();
+
+        // --- Stage: stream the live rows into temporary parquet chunks so the
+        // reset below cannot lose data and the re-insert sees ordered input.
+        let staging = self.staging_dir(table);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging).ok();
+        }
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("failed to create staging dir {}", staging.display()))?;
+
+        let mut staged: Vec<PathBuf> = Vec::new();
+        let mut rows = 0usize;
+        {
+            // A single scan partition preserves the supplied (path-sorted) file
+            // order and reads sequentially, keeping memory to one batch.
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            let mut stream = ctx
+                .read_parquet(local_paths, ParquetReadOptions::default())
+                .await?
+                .execute_stream()
+                .await?;
+            let mut writer: Option<ArrowWriter<std::fs::File>> = None;
+            let mut writer_rows = 0usize;
+            let mut writer_bytes = 0usize;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                rows += batch.num_rows();
+                if writer.is_none() {
+                    let path = staging.join(format!("part-{:06}.parquet", staged.len()));
+                    let file = std::fs::File::create(&path)
+                        .with_context(|| format!("failed to create {}", path.display()))?;
+                    writer = Some(ArrowWriter::try_new(file, batch.schema(), None)?);
+                    staged.push(path);
+                    writer_rows = 0;
+                    writer_bytes = 0;
+                }
+                let active = writer.as_mut().expect("staging writer present");
+                active.write(&batch)?;
+                writer_rows += batch.num_rows();
+                writer_bytes += record_batch_bytes(&batch);
+                // Roll chunks by byte size (with a row ceiling) so no chunk — and
+                // hence no re-read batch — can hold a >2GB string column.
+                if writer_bytes >= COMPACT_CHUNK_BYTES || writer_rows >= COMPACT_CHUNK_ROWS {
+                    writer.take().expect("staging writer present").close()?;
+                }
+            }
+            if let Some(active) = writer.take() {
+                active.close()?;
+            }
+        }
+
+        // --- Reset: drop + recreate the table, discarding every old snapshot,
+        // manifest and tiny data file.
+        self.reset_table(table).await?;
+
+        if rows == 0 {
+            std::fs::remove_dir_all(&staging).ok();
+            self.invalidate_table_context(table);
+            return Ok(CompactionStats {
+                table: table.to_string(),
+                files_before,
+                rows: 0,
+                appends: 0,
+            });
+        }
+
+        // --- Re-insert the staged rows, then discard the staging area.
+        staged.sort();
+        let appends = self
+            .reinsert_staged_chunks(table, &staged, &partition_columns)
+            .await?;
+        std::fs::remove_dir_all(&staging).ok();
+        self.invalidate_table_context(table);
+        Ok(CompactionStats {
+            table: table.to_string(),
+            files_before,
+            rows,
+            appends,
+        })
+    }
+
+    /// Recover a table from staged chunks left behind by a
+    /// [`IcebergStore::compact_table`] run whose re-insert half failed.
+    ///
+    /// The table must already exist (recreated empty by the interrupted
+    /// compaction) and be empty; the staged chunks under `.compact_tmp_<table>`
+    /// are re-inserted and then removed.
+    pub async fn restore_from_staging(&self, table: &str) -> Result<CompactionStats> {
+        let lock = self.table_write_lock(table).await;
+        let _guard = lock.lock().await;
+
+        let staging = self.staging_dir(table);
+        if !staging.exists() {
+            anyhow::bail!("no staging directory at {}", staging.display());
+        }
+        let mut staged: Vec<PathBuf> = std::fs::read_dir(&staging)
+            .with_context(|| format!("failed to read {}", staging.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .collect();
+        staged.sort();
+        if staged.is_empty() {
+            anyhow::bail!("no staged parquet chunks in {}", staging.display());
+        }
+
+        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+        let partition_columns: Vec<String> = catalog_table
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        drop(catalog_table);
+
+        let appends = self
+            .reinsert_staged_chunks(table, &staged, &partition_columns)
+            .await?;
+        std::fs::remove_dir_all(&staging).ok();
+        self.invalidate_table_context(table);
+        Ok(CompactionStats {
+            table: table.to_string(),
+            files_before: staged.len(),
+            rows: 0,
+            appends,
+        })
+    }
+
+    fn staging_dir(&self, table: &str) -> PathBuf {
+        self.warehouse_root.join(format!(".compact_tmp_{table}"))
+    }
+
+    /// Total number of live rows visible through the current snapshot of
+    /// `table`. Used by maintenance tooling to verify a compaction preserved
+    /// every row.
+    pub async fn count_rows(&self, table: &str) -> Result<usize> {
+        Ok(self.table_df(table).await?.count().await?)
+    }
+
+    /// Run an arbitrary SQL query against `table` (registered under its own
+    /// name) and return the resulting batches. Intended for maintenance and
+    /// debugging tooling only.
+    pub async fn query_table(&self, table: &str, sql: &str) -> Result<Vec<RecordBatch>> {
+        // Ensure the table is registered in its cached DataFusion context.
+        let _ = self.table_df(table).await?;
+        let ctx = {
+            let contexts = self
+                .table_contexts
+                .lock()
+                .expect("iceberg table context cache poisoned");
+            contexts.get(table).map(|context| context.ctx.clone())
+        }
+        .ok_or_else(|| anyhow!("table context for {table} missing"))?;
+        Ok(ctx.sql(sql).await?.collect().await?)
+    }
+
+    /// Read the (partition-clustered) staged chunks in order and re-insert them
+    /// as append commits bounded by distinct partition count, row count and
+    /// byte size. Returns the number of append commits written.
+    async fn reinsert_staged_chunks(
+        &self,
+        table: &str,
+        staged: &[PathBuf],
+        partition_columns: &[String],
+    ) -> Result<usize> {
+        use arrow::row::{OwnedRow, RowConverter, SortField};
+        use futures::StreamExt;
+
+        let mut appends = 0usize;
+        let mut group: Vec<RecordBatch> = Vec::new();
+        let mut group_rows = 0usize;
+        let mut group_bytes = 0usize;
+        let mut group_partitions = 0usize;
+        let mut last_key: Option<OwnedRow> = None;
+        let mut converter: Option<RowConverter> = None;
+
+        for path in staged {
+            // Stream (not collect) each chunk so an oversized staged file cannot
+            // pull gigabytes into memory at once.
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            let mut stream = ctx
+                .read_parquet(
+                    vec![path.to_string_lossy().to_string()],
+                    ParquetReadOptions::default(),
+                )
+                .await?
+                .execute_stream()
+                .await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let partition_arrays = partition_columns
+                    .iter()
+                    .map(|name| {
+                        let idx = batch
+                            .schema()
+                            .index_of(name)
+                            .with_context(|| format!("partition column {name} missing"))?;
+                        Ok(batch.column(idx).clone())
+                    })
+                    .collect::<Result<Vec<ArrayRef>>>()?;
+                if converter.is_none() {
+                    let fields = partition_arrays
+                        .iter()
+                        .map(|array| SortField::new(array.data_type().clone()))
+                        .collect::<Vec<_>>();
+                    converter = Some(RowConverter::new(fields)?);
+                }
+                let keys = converter
+                    .as_ref()
+                    .expect("row converter present")
+                    .convert_columns(&partition_arrays)?;
+
+                let rows_in_batch = batch.num_rows();
+                let mut run_start = 0usize;
+                for row in 1..=rows_in_batch {
+                    let boundary = row == rows_in_batch || keys.row(row) != keys.row(row - 1);
+                    if !boundary {
+                        continue;
+                    }
+                    let slice = batch.slice(run_start, row - run_start);
+                    let slice_rows = slice.num_rows();
+                    let slice_bytes = record_batch_bytes(&slice);
+                    let run_key = keys.row(run_start).owned();
+                    let is_new_partition = last_key
+                        .as_ref()
+                        .is_none_or(|key| key.row() != run_key.row());
+                    // Flush before the slice would overflow any budget. The byte
+                    // budget also keeps the concatenated batch's string columns
+                    // under Arrow's 2GB 32-bit offset limit.
+                    let would_exceed = !group.is_empty()
+                        && (group_bytes + slice_bytes > COMPACT_APPEND_BYTES
+                            || group_rows + slice_rows > COMPACT_APPEND_ROWS
+                            || (is_new_partition && group_partitions >= COMPACT_APPEND_PARTITIONS));
+                    if would_exceed {
+                        let schema = group[0].schema();
+                        let combined = compute::concat_batches(&schema, &group)?;
+                        self.insert_batch_locked(table, combined).await?;
+                        appends += 1;
+                        group.clear();
+                        group_rows = 0;
+                        group_bytes = 0;
+                        group_partitions = 0;
+                    }
+                    if is_new_partition || group.is_empty() {
+                        group_partitions += 1;
+                    }
+                    group_rows += slice_rows;
+                    group_bytes += slice_bytes;
+                    group.push(slice);
+                    last_key = Some(run_key);
+                    run_start = row;
+                }
+            }
+        }
+        if !group.is_empty() {
+            let schema = group[0].schema();
+            let combined = compute::concat_batches(&schema, &group)?;
+            self.insert_batch_locked(table, combined).await?;
+            appends += 1;
+        }
+        Ok(appends)
     }
 
     pub async fn reset_table(&self, name: &str) -> Result<()> {

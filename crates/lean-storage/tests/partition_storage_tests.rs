@@ -2,14 +2,11 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use lean_core::{Market, NanosecondTimestamp, Resolution, Symbol, TickType, TimeSpan};
 use lean_data::{TradeBar, TradeBarData};
 use lean_storage::{
-    convert,
     iceberg_store::{MARKET_QUOTE_BARS, MARKET_TRADE_BARS},
     IcebergStore, MarketPartitionDayQuery, QueryParams,
 };
-use parquet::arrow::arrow_writer::ArrowWriter;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use std::fs::File;
 use tempfile::TempDir;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -366,66 +363,4 @@ async fn appending_same_trade_bar_twice_does_not_duplicate_key() {
         .unwrap();
 
     assert_eq!(grouped.get(&spy.id.sid).unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn iceberg_raw_trade_batch_append_rewrites_legacy_parquet_rows() {
-    let tmp = TempDir::new().unwrap();
-    let legacy_partition = tmp
-        .path()
-        .join("equity")
-        .join("usa")
-        .join("daily")
-        .join("trade")
-        .join("date=2022-05-03");
-    std::fs::create_dir_all(&legacy_partition).unwrap();
-    let legacy_path = legacy_partition.join("data.parquet");
-
-    let market = Market::usa();
-    let spy = Symbol::create_equity("SPY", &market);
-    let day = date(2022, 5, 3);
-    let bars = vec![TradeBar::new(
-        spy.clone(),
-        date_time(day, 16, 0, 0),
-        TimeSpan::ONE_DAY,
-        TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100.5), dec!(12345)),
-    )];
-    let batch = convert::trade_bars_to_record_batch(&bars);
-    let file = File::create(&legacy_path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
-    store
-        .append_trade_record_batch(
-            batch,
-            lean_core::SecurityType::Equity,
-            market.as_str(),
-            Resolution::Daily,
-            TickType::Trade,
-        )
-        .await
-        .unwrap();
-
-    let params = QueryParams::new().with_symbols(vec![spy.id.sid]);
-    let grouped = store
-        .scan_trade_bar_partitions_grouped(
-            &HashMap::from([(spy.id.sid, spy.clone())]),
-            Resolution::Daily,
-            TickType::Trade,
-            &params,
-        )
-        .await
-        .unwrap();
-
-    let converted = grouped.get(&spy.id.sid).unwrap();
-    assert_eq!(converted.len(), 1);
-    assert_eq!(converted[0].symbol.id.sid, spy.id.sid);
-    assert_eq!(converted[0].close, dec!(100.5));
-    assert!(store
-        .warehouse_root()
-        .join("lean")
-        .join("market_trade_bars")
-        .exists());
 }

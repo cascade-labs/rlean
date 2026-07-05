@@ -147,6 +147,40 @@ impl MarketHoursDatabase {
             .map(|midday| self.exchange_hours(symbol).is_open_at_local_naive(midday))
             .unwrap_or(false)
     }
+
+    /// Walk back `bar_count` regular trading days from `end_date` (exclusive)
+    /// using the symbol's exchange calendar, returning the resulting start date.
+    ///
+    /// Mirrors LEAN's `HistoryRequestFactory.GetStartTimeAlgoTz` bar-count path:
+    /// warmup should replay N *trading* bars, not N calendar days. Used to size
+    /// indicator warmup windows so a 200-bar SMA sees 200 open sessions.
+    pub fn warmup_start_date(
+        &self,
+        symbol: &Symbol,
+        bar_count: usize,
+        end_date: NaiveDate,
+    ) -> NaiveDate {
+        let exchange_hours = self.exchange_hours(symbol);
+        let mut remaining = bar_count;
+        let mut date = end_date;
+        // Cap the search so a pathological calendar can't loop forever.
+        let max_lookback_days = bar_count.saturating_mul(4).saturating_add(16) as i64;
+        for _ in 0..max_lookback_days {
+            if remaining == 0 {
+                break;
+            }
+            date = match date.pred_opt() {
+                Some(previous) => previous,
+                None => break,
+            };
+            if let Some(midday) = date.and_hms_opt(12, 0, 0) {
+                if exchange_hours.is_open_at_local_naive(midday) {
+                    remaining -= 1;
+                }
+            }
+        }
+        date
+    }
 }
 
 impl ExchangeHours {

@@ -117,7 +117,23 @@ impl SubscriptionStream {
         let (sender, receiver) = mpsc::channel(capacity);
         let producer_config = config.clone();
         let producer = tokio::spawn(async move {
-            let state = SubscriptionProducerState::new(producer_config, context, start, end);
+            // `SubscriptionProducerState::new` performs *blocking* work: a
+            // plugin `dlopen` (via `provider.earliest_date()`) plus synchronous
+            // Iceberg reads for factor/map/corporate-action caching. Running it
+            // on an async worker thread blocks that worker for the duration —
+            // and when universe selection spawns hundreds of producers at once
+            // they saturate the fixed worker pool (all parked on the plugin
+            // `OnceLock` and on `.join()`ed background readers), starving and
+            // deadlocking the runtime. Build the state on the elastic blocking
+            // pool so async workers stay free to make progress.
+            let state = match tokio::task::spawn_blocking(move || {
+                SubscriptionProducerState::new(producer_config, context, start, end)
+            })
+            .await
+            {
+                Ok(state) => state,
+                Err(_) => return,
+            };
             state.run(sender).await;
         });
         Self {
@@ -394,23 +410,6 @@ impl SubscriptionProducerState {
             return self.load_custom_partition().await;
         }
         let (window_start, window_end) = self.cache_fill_window();
-        // #region agent log
-        if self.partition_date == self.start.date_utc() {
-            debug_hang_probe(
-                "subscription_reader.rs:market_load_window",
-                "market partition load window selected",
-                "H6,H7",
-                json!({
-                    "symbol": self.config.symbol.value,
-                    "resolution": format!("{:?}", self.config.resolution),
-                    "tick_type": format!("{:?}", self.config.tick_type),
-                    "window_start": window_start.to_string(),
-                    "window_end": window_end.to_string(),
-                    "fetch_missing_custom_data": self.context.options.fetch_missing_custom_data,
-                }),
-            );
-        }
-        // #endregion
         let fetched_points = match self.fetch_market_window_if_missing().await {
             Ok(points) => points,
             Err(error) => {
@@ -1380,7 +1379,37 @@ impl SubscriptionProducerState {
         } else {
             self.cache_fill_window()
         };
+        let us_equity_hours = ExchangeHours::us_equity();
+        let mut date = window_start;
+        let mut has_open_date = false;
+        while date <= window_end {
+            if is_open_equity_date(&us_equity_hours, date) {
+                has_open_date = true;
+                break;
+            }
+            if date >= window_end {
+                break;
+            }
+            date = date.succ_opt().unwrap_or(date);
+        }
+        if !has_open_date {
+            return Ok(LoadedPartition {
+                points: Vec::new(),
+                through_date: window_end,
+            });
+        }
         let query = custom.config.query.merge(&custom.dynamic_query);
+        if query
+            .symbols
+            .as_ref()
+            .map(|symbols| symbols.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(LoadedPartition {
+                points: Vec::new(),
+                through_date: window_end,
+            });
+        }
         let mut points = self
             .context
             .store
@@ -1393,6 +1422,21 @@ impl SubscriptionProducerState {
             )
             .await
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
+        // Cache coverage is about source/ticker/window existence, not whether
+        // the current dynamic query happens to match rows. A query can
+        // legitimately select zero rows from a populated Iceberg window; that is
+        // still a cache hit and must not fall through to the provider.
+        let cache_has_window_data = if points.is_empty() {
+            !self
+                .context
+                .store
+                .scan_custom_points_range(&source_type, &ticker, window_start, window_end)
+                .await
+                .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
+                .is_empty()
+        } else {
+            true
+        };
         let custom_source = self
             .context
             .custom_data_sources
@@ -1413,14 +1457,15 @@ impl SubscriptionProducerState {
             }
             probe_date = probe_date.succ_opt().unwrap_or(probe_date);
         }
-        // Full-history custom sources (FRED, GDPNow) download the entire series once
-        // per subscription. Incremental per-day sources (TradeAlert snapshot/sweeps)
-        // must refetch any date missing from Iceberg even when another date exists.
+        // Full-history custom sources (FRED, GDPNow, TradeAlert history_sources)
+        // download a whole series/window once only when the Iceberg query missed.
+        // Incremental per-day sources must refetch any date missing from Iceberg
+        // even when another date exists.
         let should_fetch = self.context.options.fetch_missing_custom_data
             && if is_full_history {
-                !self.custom_history_fetched
+                !cache_has_window_data && !self.custom_history_fetched && !window_dates_empty
             } else {
-                points.is_empty() && !window_dates_empty
+                !cache_has_window_data && !window_dates_empty
             };
         if should_fetch {
             let custom_metadata = custom.clone();
@@ -2391,6 +2436,31 @@ mod tests {
         }
     }
 
+    struct CountingFixtureHistorySource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ICustomDataSource for CountingFixtureHistorySource {
+        fn initialize(&mut self, _context: &CustomDataContext) {}
+
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn is_full_history_source(&self) -> bool {
+            true
+        }
+
+        fn history(
+            &self,
+            _ticker: &str,
+            _config: &CustomDataConfig,
+        ) -> Option<Result<Vec<CustomDataPoint>, String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(Vec::new()))
+        }
+    }
+
     struct ErrorHistoryProvider;
 
     #[async_trait]
@@ -2561,6 +2631,72 @@ mod tests {
             "window start must be clamped up to the provider earliest date"
         );
         assert!(window_end >= window_start);
+    }
+
+    /// Blocks the *constructing* thread inside `earliest_date()` until an async
+    /// task releases it. In production this stands in for the plugin `dlopen`
+    /// that `LazyPluginProvider::earliest_date()` triggers on first use.
+    struct RuntimeGatedProvider {
+        gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for RuntimeGatedProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        fn earliest_date(&self) -> Option<NaiveDate> {
+            if let Some(rx) = self.gate.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn producer_construction_does_not_starve_async_workers() {
+        // Regression for the backtest hang: `SubscriptionProducerState::new`
+        // performs *blocking* work — a plugin `dlopen` behind
+        // `earliest_date()` plus synchronous Iceberg reads. When that runs on
+        // an async worker thread, a single-worker runtime is wedged: the task
+        // that would unblock construction can never be polled. Building the
+        // state on the blocking pool keeps the async worker free to drive it to
+        // completion. This test deadlocks (times out) if the fix regresses.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let provider = Arc::new(RuntimeGatedProvider {
+            gate: std::sync::Mutex::new(Some(rx)),
+        });
+        let context = context(store).with_history_provider(Some(provider));
+
+        // Only an async task can release the blocked construction. It can only
+        // run if the single worker is not wedged by that construction.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send(());
+        });
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let mut stream = SubscriptionStream::new(config, context, dt(day, 0, 0), dt(day, 23, 59));
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !stream.is_exhausted() {
+                stream.advance_until_progress().await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "producer construction blocked the async runtime (worker-starvation deadlock)"
+        );
     }
 
     #[tokio::test]
@@ -2910,6 +3046,129 @@ mod tests {
             .expect("second custom point");
         assert_eq!(second.frontier_time(), dt(second_day, 16, 0));
         assert!(stream.pop_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_stream_uses_cached_iceberg_rows_before_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        store
+            .append_custom_points(
+                "fixture",
+                "ALT",
+                &[CustomDataPoint {
+                    time: day,
+                    end_time: Some(dt(day, 16, 0)),
+                    value: dec!(10),
+                    fields: std::collections::HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let custom_config = CustomDataConfig {
+            ticker: "ALT".to_string(),
+            source_type: "fixture".to_string(),
+            resolution: Resolution::Daily,
+            properties: std::collections::HashMap::new(),
+            query: CustomDataQuery::default(),
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "fixture".to_string(),
+            ticker: "ALT".to_string(),
+            config: custom_config,
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context =
+            context(store).with_custom_data_sources(vec![Arc::new(CountingFixtureHistorySource {
+                calls: calls.clone(),
+            })]);
+        let mut stream = SubscriptionStream::new(
+            SubscriptionDataConfig::new_custom(symbol, Resolution::Daily, metadata),
+            context,
+            dt(day, 0, 0),
+            dt(day, 23, 59),
+        );
+
+        let point = stream
+            .pop_next()
+            .await
+            .unwrap()
+            .expect("cached custom point");
+        assert_eq!(point.frontier_time(), dt(day, 16, 0));
+        assert!(stream.pop_next().await.unwrap().is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "Iceberg cache hit must not call the custom data provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_stream_zero_query_matches_still_count_as_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "usymbol".to_string(),
+            serde_json::Value::String("AAPL".to_string()),
+        );
+        store
+            .append_custom_points(
+                "fixture",
+                "ALT",
+                &[CustomDataPoint {
+                    time: day,
+                    end_time: Some(dt(day, 16, 0)),
+                    value: dec!(10),
+                    fields,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let custom_config = CustomDataConfig {
+            ticker: "ALT".to_string(),
+            source_type: "fixture".to_string(),
+            resolution: Resolution::Daily,
+            properties: std::collections::HashMap::new(),
+            query: CustomDataQuery::default(),
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "fixture".to_string(),
+            ticker: "ALT".to_string(),
+            config: custom_config,
+            dynamic_query: CustomDataQuery {
+                symbols: Some(vec!["MSFT".to_string()]),
+                ..Default::default()
+            },
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context =
+            context(store).with_custom_data_sources(vec![Arc::new(CountingFixtureHistorySource {
+                calls: calls.clone(),
+            })]);
+        let mut stream = SubscriptionStream::new(
+            SubscriptionDataConfig::new_custom(symbol, Resolution::Daily, metadata),
+            context,
+            dt(day, 0, 0),
+            dt(day, 23, 59),
+        );
+
+        assert!(
+            stream.pop_next().await.unwrap().is_none(),
+            "query selecting zero cached rows should produce no data"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "raw Iceberg window coverage must prevent provider fetch even when the query matches no rows"
+        );
     }
 
     #[tokio::test]

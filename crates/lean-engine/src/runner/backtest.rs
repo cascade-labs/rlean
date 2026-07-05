@@ -10,7 +10,8 @@ use anyhow::Result;
 use lean_algorithm::lifecycle::{AlgorithmBridge, OptionSubscription};
 use lean_core::{DataNormalizationMode, Market, MarketHoursDatabase, Resolution, Symbol};
 use lean_data::{
-    OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig, TradeBar,
+    OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
+    SubscriptionDataKind, TradeBar,
 };
 use lean_options::OptionChain;
 use lean_orders::{
@@ -71,14 +72,26 @@ where
     );
     let option_subscriptions = algorithm_manager.option_subscriptions();
     let subscriptions = subscriptions_with_option_chains(subscriptions, &option_subscriptions);
-    let mut active_subscriptions = subscriptions.clone();
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
+    let feed_subscriptions = lean_style_active_subscriptions(&subscriptions);
+    let mut active_subscriptions = feed_subscriptions.clone();
 
     let feed_context = DataFeedContext::new(config.data_store.clone())
         .with_history_provider(config.history_provider.clone())
         .with_custom_data_sources(config.custom_data_sources.clone())
         .with_options(config.data_feed_options)
-        .with_market_hours_database(market_hours_database);
+        .with_market_hours_database(market_hours_database.clone());
+
+    // Warm the history-provider plugin's lazy `OnceLock` exactly once, up front
+    // and on the blocking pool. The first `earliest_date()`/`get_history()`
+    // triggers a plugin `dlopen` (which pulls in Python and other heavy
+    // libraries); if that first load happens concurrently across the hundreds
+    // of subscription producers spawned by universe selection, they all
+    // serialize on the plugin `OnceLock` while occupying worker threads and
+    // deadlock the runtime. Warming it here makes that load single and cheap.
+    if let Some(provider) = config.history_provider.clone() {
+        let _ = tokio::task::spawn_blocking(move || provider.earliest_date()).await;
+    }
 
     let normal_start = lean_core::NanosecondTimestamp::from(
         start.and_hms_opt(0, 0, 0).expect("valid start of day"),
@@ -89,13 +102,33 @@ where
 
     let had_warmup = algorithm_manager.is_warming_up();
     if had_warmup {
-        if let Some(warmup_duration) = algorithm_manager.warmup_duration() {
-            let warmup_start = normal_start - warmup_duration;
+        // Bar-count warmups (SetWarmUp(barCount, resolution)) must be sized
+        // against each security's exchange calendar so that N trading sessions
+        // are replayed — mirrors LEAN's HistoryRequestFactory.GetStartTimeAlgoTz.
+        // Fall back to the calendar-span warmup_duration otherwise.
+        let warmup_start = if let Some(bar_count) = algorithm_manager.warmup_bar_count() {
+            warmup_start_from_bar_count(&market_hours_database, &subscriptions, bar_count, start)
+                .map(|date| {
+                    lean_core::NanosecondTimestamp::from(
+                        date.and_hms_opt(0, 0, 0).expect("valid warmup start"),
+                    )
+                })
+        } else {
+            algorithm_manager
+                .warmup_duration()
+                .map(|duration| normal_start - duration)
+        };
+        tracing::debug!(
+            warmup_bar_count = ?algorithm_manager.warmup_bar_count(),
+            warmup_start = ?warmup_start.map(|ts| ts.to_string()),
+            "computed warmup window"
+        );
+        if let Some(warmup_start) = warmup_start {
             let warmup_end = normal_start - lean_core::TimeSpan::from_nanos(1);
             if warmup_start <= warmup_end {
                 let mut warmup_data_manager = DataManager::from_context(feed_context.clone());
                 warmup_data_manager
-                    .initialize_feed(&subscriptions, warmup_start, warmup_end)
+                    .initialize_feed(&feed_subscriptions, warmup_start, warmup_end)
                     .await?;
                 while let Some(slice) = warmup_data_manager.next_slice().await? {
                     if !slice.has_data {
@@ -124,7 +157,7 @@ where
 
     let mut data_manager = DataManager::from_context(feed_context);
     data_manager
-        .initialize_feed(&subscriptions, normal_start, normal_end)
+        .initialize_feed(&feed_subscriptions, normal_start, normal_end)
         .await?;
 
     let mut result_handler = ResultHandler::new();
@@ -143,6 +176,15 @@ where
     let mut market_slices_after_warmup = 0usize;
     let mut trade_builder = TradeBuilder::new();
     let mut completed_trades = Vec::new();
+
+    // Optional incremental result streamer. When an output directory is set the
+    // runner appends order events / trades and rewrites progress.json while the
+    // backtest is still running, matching the live path's streaming sidecars.
+    let mut stream_writer = config.output_dir.as_ref().map(|dir| {
+        crate::runner::stream_writer::BacktestStreamWriter::new(dir.clone(), start, end)
+    });
+    let mut streamed_order_events = 0usize;
+    let mut streamed_trades = 0usize;
 
     while let Some(slice) = data_manager.next_slice().await? {
         if !slice.has_data {
@@ -242,6 +284,23 @@ where
                     portfolio_value: portfolio_value.to_string().parse::<f64>().unwrap_or(0.0),
                 });
             }
+            if let Some(writer) = stream_writer.as_mut() {
+                if all_order_events.len() > streamed_order_events {
+                    writer.append_order_events(&all_order_events[streamed_order_events..]);
+                    streamed_order_events = all_order_events.len();
+                }
+                if completed_trades.len() > streamed_trades {
+                    writer.append_trades(&completed_trades[streamed_trades..]);
+                    streamed_trades = completed_trades.len();
+                }
+                writer.record_progress(
+                    slice.time.date_utc(),
+                    algorithm_manager.trading_days(),
+                    portfolio_value,
+                    all_order_events.len(),
+                    completed_trades.len(),
+                );
+            }
             if let Some(benchmark_bar) = benchmark_subscription
                 .as_ref()
                 .and_then(|config| benchmark_bar(&slice, config))
@@ -263,6 +322,25 @@ where
         .unwrap_or_default();
 
     let trading_days = algorithm_manager.trading_days();
+
+    // Flush any trailing order events / trades and finalize the streaming
+    // progress file before the batch report writers run.
+    if let Some(writer) = stream_writer.as_mut() {
+        if all_order_events.len() > streamed_order_events {
+            writer.append_order_events(&all_order_events[streamed_order_events..]);
+        }
+        if completed_trades.len() > streamed_trades {
+            writer.append_trades(&completed_trades[streamed_trades..]);
+        }
+        let final_value = algorithm_manager.portfolio_value();
+        writer.mark_completed(
+            trading_days,
+            final_value,
+            all_order_events.len(),
+            completed_trades.len(),
+        );
+    }
+
     result_handler.finalize(&completed_trades, trading_days, starting_cash);
     Ok(build_backtest_result(
         result_handler,
@@ -293,6 +371,66 @@ fn slice_has_fill_data(slice: &lean_data::Slice) -> bool {
         || !slice.ticks.is_empty()
         || !slice.order_books.is_empty()
         || !slice.perpetual_contexts.is_empty()
+}
+
+/// Backtests run the same subscription-shaped custom data flow as live mode:
+/// custom data streams are active subscriptions from feed initialization, and
+/// `set_custom_data_symbols` narrows their dynamic query as universe selection
+/// changes. For custom streams fed by a custom universe, an unset dynamic
+/// symbol filter means "universe not selected yet", so start with an explicit
+/// empty filter instead of scanning the full custom dataset.
+fn lean_style_active_subscriptions(
+    subscriptions: &[SubscriptionDataConfig],
+) -> Vec<SubscriptionDataConfig> {
+    let custom_universe_sources = subscriptions
+        .iter()
+        .filter(|config| config.data_kind == SubscriptionDataKind::Universe)
+        .filter_map(|config| {
+            config
+                .custom
+                .as_ref()
+                .map(|custom| custom.source_type.to_ascii_lowercase())
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    subscriptions
+        .iter()
+        .cloned()
+        .map(|mut config| {
+            let Some(custom) = config.custom.as_mut() else {
+                return config;
+            };
+            if config.data_kind == SubscriptionDataKind::Universe {
+                return config;
+            }
+            if custom_universe_sources.contains(&custom.source_type.to_ascii_lowercase())
+                && custom.dynamic_query.symbols.is_none()
+            {
+                custom.dynamic_query.symbols = Some(Vec::new());
+            }
+            config
+        })
+        .collect()
+}
+
+/// Compute the warmup start date for a bar-count warmup by walking back the
+/// requested number of trading sessions on each subscribed security's exchange
+/// calendar and taking the earliest (min) start — matching LEAN, which selects
+/// the minimum start across warmup history requests. Internal/benchmark feeds
+/// are ignored so they don't skew the window.
+fn warmup_start_from_bar_count(
+    market_hours_database: &MarketHoursDatabase,
+    subscriptions: &[lean_data::SubscriptionDataConfig],
+    bar_count: usize,
+    normal_start_date: chrono::NaiveDate,
+) -> Option<chrono::NaiveDate> {
+    subscriptions
+        .iter()
+        .filter(|config| !config.is_internal_feed)
+        .map(|config| {
+            market_hours_database.warmup_start_date(&config.symbol, bar_count, normal_start_date)
+        })
+        .min()
 }
 
 fn resolve_backtest_dates(
@@ -326,8 +464,10 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         .iter()
         .map(|config| config.unique_id())
         .collect::<std::collections::HashSet<_>>();
-    let current_subscriptions =
-        subscriptions_with_option_chains(bridge.subscriptions(), &bridge.option_subscriptions());
+    let current_subscriptions = lean_style_active_subscriptions(&subscriptions_with_option_chains(
+        bridge.subscriptions(),
+        &bridge.option_subscriptions(),
+    ));
     let current = current_subscriptions
         .iter()
         .map(|config| config.unique_id())
@@ -551,9 +691,16 @@ fn build_backtest_result(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_backtest_dates;
+    use super::{
+        lean_style_active_subscriptions, resolve_backtest_dates,
+        subscription_requires_stream_replacement,
+    };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use lean_core::DateTime;
+    use lean_core::{DateTime, Market, Resolution, Symbol};
+    use lean_data::{
+        CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, SubscriptionDataConfig,
+    };
+    use std::collections::HashMap;
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
@@ -561,6 +708,93 @@ mod tests {
 
     fn dt(year: i32, month: u32, day: u32) -> DateTime {
         DateTime::from(Utc.from_utc_datetime(&date(year, month, day).and_hms_opt(0, 0, 0).unwrap()))
+    }
+
+    fn custom_config(ticker: &str, resolution: Resolution) -> SubscriptionDataConfig {
+        let symbol = Symbol::create_base("tradealert", ticker, &Market::usa());
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "tradealert".to_string(),
+            ticker: ticker.to_string(),
+            config: CustomDataConfig {
+                ticker: ticker.to_string(),
+                source_type: "tradealert".to_string(),
+                resolution,
+                properties: HashMap::new(),
+                query: CustomDataQuery::default(),
+            },
+            dynamic_query: CustomDataQuery::default(),
+        };
+        SubscriptionDataConfig::new_custom(symbol, resolution, metadata)
+    }
+
+    #[test]
+    fn active_subscriptions_keep_empty_dynamic_custom_streams() {
+        let snapshot_symbol = Symbol::create_base("tradealert", "snapshot", &Market::usa());
+        let snapshot_metadata = CustomSubscriptionMetadata {
+            source_type: "tradealert".to_string(),
+            ticker: "snapshot".to_string(),
+            config: CustomDataConfig {
+                ticker: "snapshot".to_string(),
+                source_type: "tradealert".to_string(),
+                resolution: Resolution::Daily,
+                properties: HashMap::new(),
+                query: CustomDataQuery::default(),
+            },
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let snapshot = SubscriptionDataConfig::new_custom_universe(
+            snapshot_symbol,
+            Resolution::Daily,
+            snapshot_metadata,
+        );
+        let sweeps = custom_config("sweeps", Resolution::Minute);
+
+        let active = lean_style_active_subscriptions(&[snapshot.clone(), sweeps.clone()]);
+
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|config| {
+            config
+                .custom
+                .as_ref()
+                .map(|custom| custom.ticker == "sweeps")
+                .unwrap_or(false)
+                && config.resolution == Resolution::Minute
+        }));
+        let active_sweeps = active
+            .iter()
+            .find(|config| {
+                config
+                    .custom
+                    .as_ref()
+                    .map(|custom| custom.ticker == "sweeps")
+                    .unwrap_or(false)
+            })
+            .expect("sweeps subscription");
+        assert_eq!(
+            active_sweeps
+                .custom
+                .as_ref()
+                .expect("custom metadata")
+                .dynamic_query
+                .symbols,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn dynamic_custom_query_change_requires_stream_replacement() {
+        let previous = custom_config("sweeps", Resolution::Minute);
+        let mut current = previous.clone();
+        current
+            .custom
+            .as_mut()
+            .expect("custom metadata")
+            .dynamic_query
+            .symbols = Some(vec!["NRG".to_string(), "FXI".to_string()]);
+
+        assert!(subscription_requires_stream_replacement(
+            &previous, &current
+        ));
     }
 
     #[test]

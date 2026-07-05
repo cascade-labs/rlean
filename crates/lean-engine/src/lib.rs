@@ -1,7 +1,6 @@
 pub mod algorithm_manager;
 pub mod algorithm_services;
 pub mod custom_universe;
-pub mod data;
 pub mod data_feed;
 pub mod data_manager;
 pub mod engine_config;

@@ -10,6 +10,34 @@ use lean_orders::order::TimeInForce as CoreTimeInForce;
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "Market"))]
 pub struct MarketConstants;
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl MarketConstants {
+    #[classattr]
+    #[pyo3(name = "USA")]
+    const USA: &'static str = "usa";
+
+    #[classattr]
+    #[pyo3(name = "GDAX")]
+    const GDAX: &'static str = "gdax";
+
+    #[classattr]
+    #[pyo3(name = "Oanda")]
+    const OANDA: &'static str = "oanda";
+
+    #[classattr]
+    #[pyo3(name = "FXCM")]
+    const FXCM: &'static str = "fxcm";
+
+    #[classattr]
+    #[pyo3(name = "Binance")]
+    const BINANCE: &'static str = "binance";
+
+    #[classattr]
+    #[pyo3(name = "Coinbase")]
+    const COINBASE: &'static str = "coinbase";
+}
+
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "HyperliquidUniverse"))]
 pub struct HyperliquidUniverseConstants;
 
@@ -342,6 +370,23 @@ impl From<DataNormalizationMode> for CoreDataNormalizationMode {
             }
             DataNormalizationMode::BackwardPanamaCanal => {
                 CoreDataNormalizationMode::BackwardPanamaCanal
+            }
+        }
+    }
+}
+
+impl From<CoreDataNormalizationMode> for DataNormalizationMode {
+    fn from(value: CoreDataNormalizationMode) -> Self {
+        match value {
+            CoreDataNormalizationMode::Raw => DataNormalizationMode::Raw,
+            CoreDataNormalizationMode::Adjusted => DataNormalizationMode::Adjusted,
+            CoreDataNormalizationMode::SplitAdjusted => DataNormalizationMode::SplitAdjusted,
+            CoreDataNormalizationMode::TotalReturn => DataNormalizationMode::TotalReturn,
+            CoreDataNormalizationMode::ForwardPanamaCanal => {
+                DataNormalizationMode::ForwardPanamaCanal
+            }
+            CoreDataNormalizationMode::BackwardPanamaCanal => {
+                DataNormalizationMode::BackwardPanamaCanal
             }
         }
     }

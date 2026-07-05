@@ -26,8 +26,66 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+fn debug_log(run_id: &str, hypothesis_id: &str, location: &str, data: serde_json::Value) {
+    // #region agent log
+    let payload = serde_json::json!({
+        "sessionId": "3a8e9a",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": "ctrl-c backtest debug probe",
+        "data": data,
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/jfbrown/code/rlean/.cursor/debug-3a8e9a.log")
+    {
+        let _ = writeln!(file, "{payload}");
+    }
+    // #endregion
+}
+
+#[cfg(unix)]
+fn debug_log_sigint_state(run_id: &str, hypothesis_id: &str, location: &str) {
+    // #region agent log
+    unsafe {
+        let current = libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, current);
+        let mut blocked = false;
+        let mut set = std::mem::zeroed();
+        if libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut set) == 0 {
+            blocked = libc::sigismember(&set, libc::SIGINT) == 1;
+        }
+        debug_log(
+            run_id,
+            hypothesis_id,
+            location,
+            serde_json::json!({
+                "sigint_handler": current as usize,
+                "sig_dfl": libc::SIG_DFL,
+                "sig_ign": libc::SIG_IGN,
+                "sigint_blocked": blocked
+            }),
+        );
+    }
+    // #endregion
+}
+
+#[cfg(not(unix))]
+fn debug_log_sigint_state(run_id: &str, hypothesis_id: &str, location: &str) {
+    debug_log(
+        run_id,
+        hypothesis_id,
+        location,
+        serde_json::json!({ "sigint_state": "unavailable" }),
+    );
+}
 
 pub struct PythonAlgorithmBridge {
     strategy: Py<PyAny>,
@@ -181,7 +239,18 @@ impl AlgorithmStateAccess for PythonAlgorithmBridge {
 
 impl LifecycleBridge for PythonAlgorithmBridge {
     fn initialize(&mut self, _services: &mut dyn AlgorithmServices) -> Result<()> {
-        self.call_method0_if_present_any(&["initialize", "Initialize"])
+        debug_log_sigint_state(
+            "pre-fix",
+            "H5",
+            "crates/lean-python-runtime/src/bridge.rs:before_strategy_initialize",
+        );
+        let result = self.call_method0_if_present_any(&["initialize", "Initialize"]);
+        debug_log_sigint_state(
+            "pre-fix",
+            "H5",
+            "crates/lean-python-runtime/src/bridge.rs:after_strategy_initialize",
+        );
+        result
     }
 
     fn on_data(&mut self, payload: DataDeliveryPayload, _services: &mut dyn AlgorithmServices) {

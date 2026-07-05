@@ -95,7 +95,23 @@ where
     }
 
     pub fn alpha_analytics(&self) -> AlphaAnalytics {
-        self.algorithm.alpha_analytics()
+        // The framework state (owned by the runtime context, shared with the pipeline)
+        // accumulates every closed insight's realised forward return across the backtest.
+        // Reduce that into the IC / correlation / ranking bundle here — the algorithm
+        // bridges (Python + native) intentionally return an empty default, so reading it
+        // from them drops all diagnostics. Fall back to the bridge only when the framework
+        // tracked nothing (e.g. a non-framework algorithm).
+        let framework_analytics = self
+            .runtime_context
+            .framework()
+            .lock()
+            .unwrap()
+            .compute_alpha_analytics();
+        if framework_analytics.ranking.is_empty() && framework_analytics.ic_series.is_empty() {
+            self.algorithm.alpha_analytics()
+        } else {
+            framework_analytics
+        }
     }
 
     pub fn charts(&self) -> ChartCollection {
@@ -437,6 +453,30 @@ where
                     })
                 })
         })
+    }
+
+    /// Number of bars requested via `SetWarmUp(barCount, ...)`, if any.
+    ///
+    /// A bar-count warmup must be sized against the exchange calendar (N
+    /// trading sessions), not a naive calendar-day span, so the runner handles
+    /// it separately from `warmup_duration`.
+    pub fn warmup_bar_count(&self) -> Option<usize> {
+        self.algorithm.algorithm_state().and_then(|state| {
+            let algorithm = state.lock().unwrap();
+            // Only bar-count warmups need calendar-aware sizing; explicit
+            // durations/periods are already calendar spans.
+            if algorithm.warmup_duration.is_some() || algorithm.warmup_period.is_some() {
+                None
+            } else {
+                algorithm.warmup_bar_count
+            }
+        })
+    }
+
+    pub fn warmup_resolution(&self) -> Option<Resolution> {
+        self.algorithm
+            .algorithm_state()
+            .and_then(|state| state.lock().unwrap().warmup_resolution)
     }
 
     pub fn finish(&mut self, services: &mut dyn AlgorithmServices) {

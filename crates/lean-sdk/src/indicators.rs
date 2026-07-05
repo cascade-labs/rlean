@@ -303,6 +303,35 @@ impl Clone for ExponentialMovingAverage {
 
 impl_registered_price_indicator!(ExponentialMovingAverage);
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl ExponentialMovingAverage {
+    #[new]
+    fn py_new(period: usize) -> Self {
+        Self::new(period)
+    }
+
+    #[pyo3(name = "update")]
+    fn py_update(&mut self, time: chrono::NaiveDateTime, value: f64) -> bool {
+        ExponentialMovingAverage::update(self, time, value)
+    }
+
+    #[getter(is_ready)]
+    fn py_is_ready(&self) -> bool {
+        self.is_ready()
+    }
+
+    #[getter(current)]
+    fn py_current(&self) -> IndicatorDataPointView {
+        self.current()
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(&mut self) {
+        ExponentialMovingAverage::reset(self)
+    }
+}
+
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "RelativeStrengthIndex"))]
 pub struct RelativeStrengthIndex {
     inner: Arc<Mutex<lean_indicators::Rsi>>,
@@ -366,6 +395,35 @@ impl Clone for RelativeStrengthIndex {
 }
 
 impl_registered_price_indicator!(RelativeStrengthIndex);
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl RelativeStrengthIndex {
+    #[new]
+    fn py_new(period: usize) -> Self {
+        Self::new(period)
+    }
+
+    #[pyo3(name = "update")]
+    fn py_update(&mut self, time: chrono::NaiveDateTime, value: f64) -> bool {
+        RelativeStrengthIndex::update(self, time, value)
+    }
+
+    #[getter(is_ready)]
+    fn py_is_ready(&self) -> bool {
+        self.is_ready()
+    }
+
+    #[getter(current)]
+    fn py_current(&self) -> IndicatorDataPointView {
+        self.current()
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(&mut self) {
+        RelativeStrengthIndex::reset(self)
+    }
+}
 
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "MomentumPercent"))]
 pub struct MomentumPercentIndicator {
@@ -460,6 +518,35 @@ impl Clone for MomentumPercentIndicator {
         Self {
             inner: self.inner.clone(),
         }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl MomentumPercentIndicator {
+    #[new]
+    fn py_new(period: usize) -> Self {
+        Self::new(period)
+    }
+
+    #[pyo3(name = "update")]
+    fn py_update(&mut self, time: chrono::NaiveDateTime, value: f64) -> bool {
+        MomentumPercentIndicator::update(self, time, value)
+    }
+
+    #[getter(is_ready)]
+    fn py_is_ready(&self) -> bool {
+        self.is_ready()
+    }
+
+    #[getter(current)]
+    fn py_current(&self) -> IndicatorDataPointView {
+        self.current()
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(&mut self) {
+        MomentumPercentIndicator::reset(self)
     }
 }
 
@@ -571,6 +658,35 @@ impl Clone for StandardDeviationIndicator {
         Self {
             inner: self.inner.clone(),
         }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl StandardDeviationIndicator {
+    #[new]
+    fn py_new(period: usize) -> Self {
+        Self::new(period)
+    }
+
+    #[pyo3(name = "update")]
+    fn py_update(&mut self, time: chrono::NaiveDateTime, value: f64) -> bool {
+        StandardDeviationIndicator::update(self, time, value)
+    }
+
+    #[getter(is_ready)]
+    fn py_is_ready(&self) -> bool {
+        self.is_ready()
+    }
+
+    #[getter(current)]
+    fn py_current(&self) -> IndicatorDataPointView {
+        self.current()
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(&mut self) {
+        StandardDeviationIndicator::reset(self)
     }
 }
 

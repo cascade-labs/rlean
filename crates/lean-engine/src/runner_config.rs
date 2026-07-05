@@ -3,7 +3,6 @@ use lean_algorithm::charting::ChartCollection;
 use lean_algorithm::qc_algorithm::BrokerageName;
 use lean_alpha::AlphaAnalytics;
 use lean_brokerages::Brokerage;
-use lean_data::IHistoricalDataProvider;
 use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_live::DataQueueHandlerManager;
 use lean_orders::{Order, OrderEvent};
@@ -27,8 +26,6 @@ pub struct BacktestRunConfig {
     pub data_root: PathBuf,
     pub data_store: Arc<IcebergStore>,
     pub _compression_level: i32,
-    /// If set, missing price data is fetched from this provider before the backtest loop.
-    pub historical_provider: Option<Arc<dyn IHistoricalDataProvider>>,
     /// Raw stacked provider for DataType-specific requests (e.g. FactorFile).
     /// Providers that don't support a DataType return NotImplemented and the
     /// next provider in the stack is tried.
@@ -55,7 +52,6 @@ impl Default for BacktestRunConfig {
             data_root: PathBuf::from("data"),
             data_store: Arc::new(block_connect_store(PathBuf::from("data"))),
             _compression_level: 3,
-            historical_provider: None,
             history_provider: None,
             start_date_override: None,
             end_date_override: None,

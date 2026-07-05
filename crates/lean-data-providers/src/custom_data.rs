@@ -135,6 +135,14 @@ pub trait ICustomDataSource: Send + Sync {
         lean_core::Resolution::Daily
     }
 
+    /// Default resolution for a specific data ticker handled by this source.
+    ///
+    /// Multi-dataset providers can override this when one plugin serves both
+    /// daily and intraday datasets.
+    fn default_resolution_for_ticker(&self, _ticker: &str) -> lean_core::Resolution {
+        self.default_resolution()
+    }
+
     /// Whether the data ticker requires symbol mapping (ticker rename history).
     ///
     /// Almost always `false` for alternative data; set to `true` only for

@@ -978,6 +978,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_minute_custom_subscription_does_not_block_market_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let bar = TradeBar::new(
+            spy.clone(),
+            dt(day, 14, 35),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
+        );
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[bar],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Minute,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+
+        let custom_symbol = Symbol::create_base("tradealert", "sweeps", &Market::usa());
+        let custom_metadata = CustomSubscriptionMetadata {
+            source_type: "tradealert".to_string(),
+            ticker: "sweeps".to_string(),
+            config: CustomDataConfig {
+                ticker: "sweeps".to_string(),
+                source_type: "tradealert".to_string(),
+                resolution: Resolution::Minute,
+                properties: HashMap::new(),
+                query: CustomDataQuery::default(),
+            },
+            dynamic_query: CustomDataQuery {
+                symbols: Some(Vec::new()),
+                ..CustomDataQuery::default()
+            },
+        };
+        let market_config = SubscriptionDataConfig::new_equity(
+            spy.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let custom_config =
+            SubscriptionDataConfig::new_custom(custom_symbol, Resolution::Minute, custom_metadata);
+
+        manager
+            .initialize_feed(
+                &[market_config, custom_config],
+                dt(day, 0, 0),
+                dt(day, 23, 59),
+            )
+            .await
+            .unwrap();
+
+        let slice = tokio::time::timeout(std::time::Duration::from_secs(2), manager.next_slice())
+            .await
+            .expect("empty custom stream should not block synchronizer")
+            .unwrap()
+            .expect("market slice");
+        assert_eq!(slice.get_bar(&spy).expect("spy bar").close, dec!(1));
+    }
+
+    #[tokio::test]
+    async fn unset_minute_custom_subscription_does_not_block_market_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let bar = TradeBar::new(
+            spy.clone(),
+            dt(day, 14, 35),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
+        );
+        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        manager
+            .store()
+            .append_trade_bars(
+                &[bar],
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Minute,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+
+        let custom_symbol = Symbol::create_base("standalone", "custom", &Market::usa());
+        let custom_metadata = CustomSubscriptionMetadata {
+            source_type: "standalone".to_string(),
+            ticker: "custom".to_string(),
+            config: CustomDataConfig {
+                ticker: "custom".to_string(),
+                source_type: "standalone".to_string(),
+                resolution: Resolution::Minute,
+                properties: HashMap::new(),
+                query: CustomDataQuery::default(),
+            },
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let market_config = SubscriptionDataConfig::new_equity(
+            spy.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let custom_config =
+            SubscriptionDataConfig::new_custom(custom_symbol, Resolution::Minute, custom_metadata);
+
+        manager
+            .initialize_feed(
+                &[market_config, custom_config],
+                dt(day, 0, 0),
+                dt(day, 23, 59),
+            )
+            .await
+            .unwrap();
+
+        let slice = tokio::time::timeout(std::time::Duration::from_secs(2), manager.next_slice())
+            .await
+            .expect("unset empty custom stream should not block synchronizer")
+            .unwrap()
+            .expect("market slice");
+        assert_eq!(slice.get_bar(&spy).expect("spy bar").close, dec!(1));
+    }
+
+    #[tokio::test]
     async fn remove_subscription_stops_future_emissions() {
         let tmp = tempfile::tempdir().unwrap();
         let spy = Symbol::create_equity("SPY", &Market::usa());

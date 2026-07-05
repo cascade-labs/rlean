@@ -73,6 +73,12 @@ assert hasattr(algo, "set_cash"), "missing set_cash"
 assert hasattr(algo, "add_equity"), "missing add_equity"
 assert hasattr(algo, "market_order"), "missing market_order"
 assert hasattr(algo, "history"), "missing history"
+assert hasattr(algo, "log"), "missing log"
+assert hasattr(algo, "debug"), "missing debug"
+assert hasattr(algo, "error"), "missing error"
+algo.log("hello")
+algo.debug("hello")
+algo.error("hello")
 
 portfolio = algo.portfolio
 assert hasattr(portfolio, "total_portfolio_value")

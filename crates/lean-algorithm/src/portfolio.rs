@@ -509,9 +509,18 @@ impl SecurityPortfolioManager {
     }
 
     pub fn update_prices(&self, symbol: &Symbol, price: Price) {
-        if let Some(h) = self.holdings.write().get_mut(&symbol.id.sid) {
-            h.update_price(price);
+        if price <= dec!(0) {
+            return;
         }
+        // Track the latest market price for every security that produces data —
+        // not just invested ones — so `portfolio[symbol].last_price` mirrors the
+        // security price (matches LEAN, where SecurityHolding.Price follows the
+        // market). Framework alphas read this for cross-sectional vol scaling.
+        self.holdings
+            .write()
+            .entry(symbol.id.sid)
+            .or_insert_with(|| SecurityHolding::new(symbol.clone()))
+            .update_price(price);
     }
 
     pub fn all_holdings(&self) -> Vec<SecurityHolding> {

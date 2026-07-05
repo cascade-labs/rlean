@@ -2,11 +2,11 @@
 // Mirrors the C# EqualWeightingPortfolioConstructionModelTests and
 // InsightWeightingPortfolioConstructionModelTests from LEAN.
 
-use lean_core::{Market, Symbol};
+use lean_core::{Market, Symbol, TimeSpan};
 use lean_portfolio_construction::{
     EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel, InsightDirection,
     InsightForPcm, InsightWeightingPortfolioConstructionModel, NullPortfolioConstructionModel,
-    PortfolioBias, PortfolioTarget,
+    PortfolioBias, PortfolioTarget, RebalanceCadence, RebalancePolicy,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -58,6 +58,75 @@ fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
 
 mod equal_weighting_tests {
     use super::*;
+
+    #[test]
+    fn equal_weighting_default_rebalance_policy_is_daily() {
+        let model = EqualWeightingPortfolioConstructionModel::new();
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(
+            policy.cadence(),
+            RebalanceCadence::Period(period) if *period == TimeSpan::ONE_DAY
+        ));
+        assert!(policy.rebalance_on_security_changes());
+        assert!(policy.rebalance_on_insight_changes());
+    }
+
+    #[test]
+    fn equal_weighting_none_period_uses_every_slice_policy() {
+        let model = EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance(
+            PortfolioBias::LongShort,
+            None,
+            None,
+        );
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(policy.cadence(), RebalanceCadence::EverySlice));
+    }
+
+    #[test]
+    fn equal_weighting_accepts_explicit_rebalance_policy() {
+        let model =
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::period(TimeSpan::from_nanos(30_000_000_000)),
+            );
+        let policy = model.rebalance_policy();
+
+        assert_eq!(
+            policy.period_value(),
+            Some(TimeSpan::from_nanos(30_000_000_000))
+        );
+    }
+
+    /// A custom PCM that never sets a rebalancing function must rebalance on
+    /// every slice, mirroring C# LEAN's base `PortfolioConstructionModel`
+    /// (default `rebalancingFunc == null` -> `IsRebalanceDue` returns true every
+    /// bar). This is the default a Python subclass of
+    /// `PortfolioConstructionModel` inherits; returning `daily()` here silently
+    /// throttled custom PCMs to one rebalance per day.
+    #[test]
+    fn custom_pcm_trait_default_rebalance_policy_is_every_slice() {
+        struct BareCustomPcm;
+        impl IPortfolioConstructionModel for BareCustomPcm {
+            fn create_targets(
+                &mut self,
+                _insights: &[InsightForPcm],
+                _portfolio_value: rust_decimal::Decimal,
+                _prices: &std::collections::HashMap<u64, rust_decimal::Decimal>,
+            ) -> Vec<PortfolioTarget> {
+                Vec::new()
+            }
+        }
+
+        let model = BareCustomPcm;
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(policy.cadence(), RebalanceCadence::EverySlice));
+        assert!(policy.rebalance_on_security_changes());
+        assert!(policy.rebalance_on_insight_changes());
+    }
 
     /// Two Up insights: each should get 50 % of portfolio → equal long shares.
     /// Mirrors C# InsightsReturnsTargetsConsistentWithDirection (Up, N=2).

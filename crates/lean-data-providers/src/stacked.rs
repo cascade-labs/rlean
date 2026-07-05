@@ -231,10 +231,42 @@ impl IHistoryProvider for StackedHistoryProvider {
     async fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
         for (idx, provider) in self.providers.iter().enumerate() {
             let provider_label = provider_label(idx, provider);
+            debug!(
+                "History provider {} requesting QuoteBar rows for {} ({} -> {})",
+                provider_label,
+                request.symbol.value,
+                request.start.date_utc(),
+                request.end.date_utc()
+            );
             match provider.get_quote_bars(request).await {
-                Ok(data) if !data.is_empty() => return Ok(data),
-                Ok(_) => continue,
-                Err(ref e) if is_not_implemented(e) => continue,
+                Ok(data) if !data.is_empty() => {
+                    debug!(
+                        "History provider {} returned {} QuoteBar rows for {} ({} -> {})",
+                        provider_label,
+                        data.len(),
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    return Ok(data);
+                }
+                Ok(_) => {
+                    debug!(
+                        "History provider {} returned 0 QuoteBar rows for {} ({} -> {})",
+                        provider_label,
+                        request.symbol.value,
+                        request.start.date_utc(),
+                        request.end.date_utc()
+                    );
+                    continue;
+                }
+                Err(ref e) if is_not_implemented(e) => {
+                    debug!(
+                        "History provider {} does not implement QuoteBar for {}",
+                        provider_label, request.symbol.value
+                    );
+                    continue;
+                }
                 Err(ref e) if is_recoverable_cache_error(e) => {
                     debug!(
                         "History provider {} hit recoverable quote cache error for {}: {}",
@@ -314,6 +346,68 @@ impl IHistoryProvider for StackedHistoryProvider {
                 Ok(data) if !data.is_empty() => return Ok(data),
                 Ok(_) => continue,
                 Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_factor_file(
+        &self,
+        symbol: &Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::FactorFileEntry>> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            let provider_label = provider_label(idx, provider);
+            match provider.get_factor_file(symbol).await {
+                Ok(rows) if !rows.is_empty() => {
+                    debug!(
+                        "History provider {} returned {} factor rows for {}",
+                        provider_label,
+                        rows.len(),
+                        symbol.value
+                    );
+                    return Ok(rows);
+                }
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider {} failed for factor file {}; trying next provider: {}",
+                        provider_label, symbol.value, e
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn get_map_file(
+        &self,
+        symbol: &Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::MapFileEntry>> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            let provider_label = provider_label(idx, provider);
+            match provider.get_map_file(symbol).await {
+                Ok(rows) if !rows.is_empty() => {
+                    debug!(
+                        "History provider {} returned {} map rows for {}",
+                        provider_label,
+                        rows.len(),
+                        symbol.value
+                    );
+                    return Ok(rows);
+                }
+                Ok(_) => continue,
+                Err(ref e) if is_not_implemented(e) => continue,
+                Err(e) if should_fall_through_provider_error(self.providers.len()) => {
+                    debug!(
+                        "History provider {} failed for map file {}; trying next provider: {}",
+                        provider_label, symbol.value, e
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }

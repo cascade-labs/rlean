@@ -15,7 +15,7 @@ use lean_portfolio_construction::{
     ConfidenceWeightingPortfolioConstructionModel,
     EqualWeightingPortfolioConstructionModel as LeanEqualWeightingPortfolioConstructionModel,
     IPortfolioConstructionModel, InsightDirection as PcmInsightDirection, InsightForPcm,
-    MeanReversionPortfolioConstructionModel, PortfolioBias, PortfolioTarget,
+    MeanReversionPortfolioConstructionModel, PortfolioBias, PortfolioTarget, RebalancePolicy,
     RiskParityPortfolioConstructionModel,
 };
 use lean_risk::risk_management::{
@@ -47,6 +47,22 @@ pub fn seconds_rebalance_period(seconds: f64) -> Option<TimeSpan> {
 
 pub fn default_rebalance_period() -> Option<TimeSpan> {
     Some(TimeSpan::ONE_DAY)
+}
+
+pub fn default_rebalance_policy() -> RebalancePolicy {
+    RebalancePolicy::default()
+}
+
+pub fn period_rebalance_policy(period: TimeSpan) -> RebalancePolicy {
+    RebalancePolicy::period(period)
+}
+
+pub fn every_slice_rebalance_policy() -> RebalancePolicy {
+    RebalancePolicy::every_slice()
+}
+
+pub fn rebalance_policy_from_period(period: Option<TimeSpan>) -> RebalancePolicy {
+    RebalancePolicy::from_period(period)
 }
 
 pub fn sanitize_positive_f64_decimal(value: Option<f64>) -> Option<Decimal> {
@@ -1078,6 +1094,26 @@ impl InsightProjection {
     fn py_source_model(&self) -> String {
         self.source_model()
     }
+
+    #[getter(confidence)]
+    fn py_confidence(&self) -> Option<f64> {
+        self.confidence()
+    }
+
+    #[getter(score_direction)]
+    fn py_score_direction(&self) -> Option<f64> {
+        self.score_direction
+    }
+
+    #[getter(score_magnitude)]
+    fn py_score_magnitude(&self) -> Option<f64> {
+        self.score_magnitude
+    }
+
+    #[getter(is_final_score)]
+    fn py_is_final_score(&self) -> bool {
+        self.is_final_score
+    }
 }
 
 pub fn project_alpha_insight(insight: &Insight) -> InsightProjection {
@@ -1156,6 +1192,66 @@ impl PortfolioTargetProjection {
             percent: Some(percent),
             tag: String::new(),
         }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl PortfolioTargetProjection {
+    #[staticmethod]
+    #[pyo3(name = "percent", signature = (symbol, percent, tag=None))]
+    fn py_percent(
+        symbol: crate::securities::SymbolHandle,
+        percent: f64,
+        tag: Option<String>,
+    ) -> Self {
+        Self {
+            symbol: symbol.into_inner(),
+            quantity: None,
+            percent: Some(percent),
+            tag: tag.unwrap_or_default(),
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "Percent", signature = (symbol, percent, tag=None))]
+    fn py_percent_pascal(
+        symbol: crate::securities::SymbolHandle,
+        percent: f64,
+        tag: Option<String>,
+    ) -> Self {
+        Self::py_percent(symbol, percent, tag)
+    }
+
+    #[new]
+    #[pyo3(signature = (symbol, quantity, tag=None))]
+    fn py_new(symbol: crate::securities::SymbolHandle, quantity: f64, tag: Option<String>) -> Self {
+        Self {
+            symbol: symbol.into_inner(),
+            quantity: Some(quantity),
+            percent: None,
+            tag: tag.unwrap_or_default(),
+        }
+    }
+
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol.clone())
+    }
+
+    #[getter(quantity)]
+    fn py_quantity(&self) -> Option<f64> {
+        self.quantity
+    }
+
+    #[getter(percent)]
+    fn py_percent_getter(&self) -> Option<f64> {
+        self.percent
+    }
+
+    #[getter(tag)]
+    fn py_tag(&self) -> String {
+        self.tag.clone()
     }
 }
 

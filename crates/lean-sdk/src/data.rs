@@ -174,6 +174,16 @@ impl SliceView {
         self.bars()
     }
 
+    #[getter(quote_bars)]
+    fn py_quote_bars(&self) -> QuoteBarsView {
+        self.quote_bars()
+    }
+
+    #[getter(ticks)]
+    fn py_ticks(&self) -> TicksView {
+        self.ticks()
+    }
+
     #[getter(option_chains)]
     fn py_option_chains(&self) -> OptionChainsView {
         self.option_chains()
@@ -451,6 +461,30 @@ impl QuoteBarsView {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl QuoteBarsView {
+    #[pyo3(name = "get")]
+    fn py_get(&self, symbol: crate::securities::SymbolHandle) -> Option<QuoteBarView> {
+        self.get(symbol.inner())
+    }
+
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, symbol: crate::securities::SymbolHandle) -> bool {
+        QuoteBarsView::__contains__(self, symbol.inner())
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, symbol: crate::securities::SymbolHandle) -> Option<QuoteBarView> {
+        QuoteBarsView::__getitem__(self, symbol.inner())
+    }
+
+    #[getter(count)]
+    fn py_count(&self) -> usize {
+        QuoteBarsView::count(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "QuoteBar"))]
 pub struct QuoteBarView {
@@ -516,6 +550,79 @@ impl QuoteBarView {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl QuoteBarView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(bid)]
+    fn py_bid(&self) -> Option<BarView> {
+        self.bid()
+    }
+
+    #[getter(ask)]
+    fn py_ask(&self) -> Option<BarView> {
+        self.ask()
+    }
+
+    #[getter(open)]
+    fn py_open(&self) -> f64 {
+        self.open()
+    }
+
+    #[getter(close)]
+    fn py_close(&self) -> f64 {
+        self.close()
+    }
+
+    #[getter(bid_size)]
+    fn py_bid_size(&self) -> f64 {
+        self.bid_size()
+    }
+
+    #[getter(ask_size)]
+    fn py_ask_size(&self) -> f64 {
+        self.ask_size()
+    }
+
+    #[getter(time)]
+    fn py_time(&self) -> chrono::NaiveDateTime {
+        self.time()
+    }
+
+    #[getter(end_time)]
+    fn py_end_time(&self) -> chrono::NaiveDateTime {
+        self.end_time()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl BarView {
+    #[getter(open)]
+    fn py_open(&self) -> f64 {
+        self.open()
+    }
+
+    #[getter(high)]
+    fn py_high(&self) -> f64 {
+        self.high()
+    }
+
+    #[getter(low)]
+    fn py_low(&self) -> f64 {
+        self.low()
+    }
+
+    #[getter(close)]
+    fn py_close(&self) -> f64 {
+        self.close()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "Ticks"))]
 pub struct TicksView {
@@ -542,6 +649,30 @@ impl TicksView {
             .current()
             .map(|slice| slice.ticks.len())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TicksView {
+    #[pyo3(name = "get")]
+    fn py_get(&self, symbol: crate::securities::SymbolHandle) -> Vec<TickView> {
+        self.get(symbol.inner())
+    }
+
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, symbol: crate::securities::SymbolHandle) -> bool {
+        !self.get(symbol.inner()).is_empty()
+    }
+
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, symbol: crate::securities::SymbolHandle) -> Vec<TickView> {
+        self.get(symbol.inner())
+    }
+
+    #[getter(count)]
+    fn py_count(&self) -> usize {
+        TicksView::count(self)
     }
 }
 
@@ -596,6 +727,55 @@ impl TickView {
     }
     pub fn is_quote(&self) -> bool {
         self.tick().tick_type == TickType::Quote
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TickView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(time)]
+    fn py_time(&self) -> chrono::NaiveDateTime {
+        self.time()
+    }
+
+    #[getter(value)]
+    fn py_value(&self) -> f64 {
+        self.value()
+    }
+
+    #[getter(quantity)]
+    fn py_quantity(&self) -> f64 {
+        self.quantity()
+    }
+
+    #[getter(bid_price)]
+    fn py_bid_price(&self) -> f64 {
+        self.bid_price()
+    }
+
+    #[getter(ask_price)]
+    fn py_ask_price(&self) -> f64 {
+        self.ask_price()
+    }
+
+    #[getter(tick_type)]
+    fn py_tick_type(&self) -> String {
+        self.tick_type()
+    }
+
+    #[getter(is_trade)]
+    fn py_is_trade(&self) -> bool {
+        self.is_trade()
+    }
+
+    #[getter(is_quote)]
+    fn py_is_quote(&self) -> bool {
+        self.is_quote()
     }
 }
 
@@ -671,6 +851,20 @@ impl CustomDataView {
     #[pyo3(name = "__getitem__")]
     fn py_getitem(&self, key: &str) -> Option<CustomDataPointView> {
         self.__getitem__(key)
+    }
+
+    // Without an explicit __contains__, Python's `key in custom` falls back to
+    // iterating via __getitem__(0), __getitem__(1), ... which passes integer
+    // indices into a &str-typed getter and raises a TypeError. Expose membership
+    // (and length) directly so `name in data.custom` works.
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, key: &str) -> bool {
+        self.__contains__(key)
+    }
+
+    #[pyo3(name = "__len__")]
+    fn py_len(&self) -> usize {
+        self.count()
     }
 }
 

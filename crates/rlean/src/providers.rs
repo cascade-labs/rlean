@@ -135,6 +135,13 @@ impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
             .unwrap_or(Resolution::Daily)
     }
 
+    fn default_resolution_for_ticker(&self, ticker: &str) -> Resolution {
+        self.get()
+            .ok()
+            .map(|source| source.default_resolution_for_ticker(ticker))
+            .unwrap_or(Resolution::Daily)
+    }
+
     fn requires_mapping(&self) -> bool {
         self.get()
             .ok()
@@ -170,6 +177,16 @@ impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
         self.get()
             .ok()
             .and_then(|source| source.history(ticker, config))
+    }
+
+    fn history_sources(
+        &self,
+        ticker: &str,
+        config: &CustomDataConfig,
+    ) -> Option<Result<Vec<(chrono::NaiveDate, CustomDataSource)>, String>> {
+        self.get()
+            .ok()
+            .and_then(|source| source.history_sources(ticker, config))
     }
 }
 
@@ -226,6 +243,22 @@ impl IHistoryProvider for LazyPluginProvider {
     ) -> anyhow::Result<Vec<lean_data::MarginInterestRate>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_margin_interest_rates(request).await
+    }
+
+    async fn get_factor_file(
+        &self,
+        symbol: &lean_core::Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::FactorFileEntry>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_factor_file(symbol).await
+    }
+
+    async fn get_map_file(
+        &self,
+        symbol: &lean_core::Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::MapFileEntry>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_map_file(symbol).await
     }
 
     async fn get_history_batch(
@@ -410,8 +443,14 @@ pub fn build_history_provider(
     let provider_names: Vec<&str> = names.split(',').map(str::trim).collect();
 
     let has_local_first = matches!(provider_names.first(), Some(&"local") | Some(&""));
+    // When we auto-prepend local in front of remote providers, it must report a
+    // miss for windows it cannot fully cover so the remotes backfill the gap
+    // (e.g. indicator warmup reaching before the cached history). A local-only
+    // stack keeps best-effort behavior.
     let mut providers: Vec<Arc<dyn IHistoryProvider>> = if !has_local_first {
-        vec![build_local_history_provider(&args)]
+        vec![build_local_history_provider_with_strict_coverage(
+            &args, true,
+        )]
     } else {
         vec![]
     };
@@ -431,9 +470,18 @@ pub fn build_history_provider(
 }
 
 fn build_local_history_provider(args: &ProviderArgs) -> Arc<dyn IHistoryProvider> {
+    build_local_history_provider_with_strict_coverage(args, false)
+}
+
+fn build_local_history_provider_with_strict_coverage(
+    args: &ProviderArgs,
+    strict: bool,
+) -> Arc<dyn IHistoryProvider> {
     match &args.data_store {
-        Some(store) => Arc::new(LocalHistoryProvider::from_store(store.clone())),
-        None => Arc::new(LocalHistoryProvider::new(&args.data_root)),
+        Some(store) => {
+            Arc::new(LocalHistoryProvider::from_store(store.clone()).with_strict_coverage(strict))
+        }
+        None => Arc::new(LocalHistoryProvider::new(&args.data_root).with_strict_coverage(strict)),
     }
 }
 

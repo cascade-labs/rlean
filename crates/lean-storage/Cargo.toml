@@ -9,6 +9,7 @@ lean-data = { path = "../lean-data" }
 
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-cast = { workspace = true }
 parquet = { workspace = true }
@@ -43,18 +44,6 @@ fs2 = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
 
-[[bin]]
-name = "convert-iceberg"
-path = "src/bin/convert_iceberg.rs"
-
-[[bin]]
-name = "iceberg-maintenance"
-path = "src/bin/iceberg_maintenance.rs"
-
-[[bin]]
-name = "make-legacy-parquet-fixture"
-path = "src/bin/make_legacy_parquet_fixture.rs"
-required-features = ["fixture-bin"]
 
 [features]
 fixture-bin = []

@@ -84,9 +84,69 @@ impl SecurityHoldingView {
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl SecurityHoldingView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(quantity)]
+    fn py_quantity(&self) -> f64 {
+        self.quantity()
+    }
+
+    #[getter(average_price)]
+    fn py_average_price(&self) -> f64 {
+        self.average_price()
+    }
+
+    #[getter(last_price)]
+    fn py_last_price(&self) -> f64 {
+        self.last_price()
+    }
+
+    #[getter(market_value)]
+    fn py_market_value(&self) -> f64 {
+        self.market_value()
+    }
+
+    #[getter(unrealized_pnl)]
+    fn py_unrealized_pnl(&self) -> f64 {
+        self.unrealized_pnl()
+    }
+
+    #[getter(unrealized_profit)]
+    fn py_unrealized_profit(&self) -> f64 {
+        self.unrealized_profit()
+    }
+
+    #[getter(realized_pnl)]
+    fn py_realized_pnl(&self) -> f64 {
+        self.realized_pnl()
+    }
+
+    #[getter(profit)]
+    fn py_profit(&self) -> f64 {
+        self.profit()
+    }
+
+    #[getter(total_fees)]
+    fn py_total_fees(&self) -> f64 {
+        self.total_fees()
+    }
+
     #[getter(invested)]
     fn py_invested(&self) -> bool {
         self.invested()
+    }
+
+    #[getter(is_long)]
+    fn py_is_long(&self) -> bool {
+        self.is_long()
+    }
+
+    #[getter(is_short)]
+    fn py_is_short(&self) -> bool {
+        self.is_short()
     }
 }
 

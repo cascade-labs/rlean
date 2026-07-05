@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lean_core::{Market, OptionRight, OptionStyle, Symbol, SymbolOptionsExt};
 use lean_data::{MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
-use lean_storage::{FactorFileEntry, OptionEodBar, OptionUniverseRow};
+use lean_storage::{FactorFileEntry, MapFileEntry, OptionEodBar, OptionUniverseRow};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -88,6 +88,30 @@ pub trait IHistoryProvider: Send + Sync {
         &self,
         _request: &HistoryRequest,
     ) -> anyhow::Result<Vec<PerpetualContext>> {
+        Ok(vec![])
+    }
+
+    /// Fetch the corporate-action factor file (split/dividend adjustments) for
+    /// `symbol`, returning the rows for the framework to persist.
+    ///
+    /// Providers are pure data sources: they fetch/compute the rows and return
+    /// them. The framework owns all persistence — it writes the returned rows
+    /// into the Iceberg `factor_files` table exactly as it does trade/quote
+    /// bars. Providers MUST NOT write files themselves.
+    ///
+    /// Returns `Ok(vec![])` (default) when the provider has no corporate-action
+    /// source for the symbol; the framework treats that as "nothing to persist".
+    async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+        Ok(vec![])
+    }
+
+    /// Fetch the map file (ticker rename / listing history) for `symbol`,
+    /// returning the rows for the framework to persist into the Iceberg
+    /// `map_files` table. Providers MUST NOT write files themselves.
+    ///
+    /// Returns `Ok(vec![])` (default) when the provider has no ticker-detail
+    /// source for the symbol.
+    async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
         Ok(vec![])
     }
 
@@ -420,9 +444,8 @@ pub trait IHistoryProvider: Send + Sync {
 
     /// The earliest date this provider can supply data for, if limited.
     ///
-    /// The async adapter (`HistoryProviderAdapter`) forwards this to
-    /// `IHistoricalDataProvider::earliest_date` so the runner can clip
-    /// requested date ranges before making network calls.
+    /// The data feed uses this to clip requested date ranges before making
+    /// network calls.
     /// Returns `None` (default) when the provider has no known lower bound.
     fn earliest_date(&self) -> Option<chrono::NaiveDate> {
         None

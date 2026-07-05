@@ -15,7 +15,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::portfolio_construction_model::{
-    IPortfolioConstructionModel, InsightDirection, InsightForPcm,
+    IPortfolioConstructionModel, InsightDirection, InsightForPcm, RebalancePolicy,
 };
 use crate::portfolio_target::PortfolioTarget;
 
@@ -50,7 +50,7 @@ pub enum PortfolioBias {
 pub struct BlackLittermanOptimizationPortfolioConstructionModel {
     lookback: usize,
     period: usize,
-    rebalance_period: Option<TimeSpan>,
+    rebalance_policy: RebalancePolicy,
     risk_free_rate: f64,
     delta: f64,
     tau: f64,
@@ -97,10 +97,33 @@ impl BlackLittermanOptimizationPortfolioConstructionModel {
         rebalance_period: Option<TimeSpan>,
         target_gross: f64,
     ) -> Self {
+        Self::with_params_and_rebalance_policy(
+            lookback,
+            period,
+            risk_free_rate,
+            delta,
+            tau,
+            portfolio_bias,
+            RebalancePolicy::from_period(rebalance_period),
+            target_gross,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_params_and_rebalance_policy(
+        lookback: usize,
+        period: usize,
+        risk_free_rate: f64,
+        delta: f64,
+        tau: f64,
+        portfolio_bias: PortfolioBias,
+        rebalance_policy: RebalancePolicy,
+        target_gross: f64,
+    ) -> Self {
         Self {
             lookback,
             period,
-            rebalance_period,
+            rebalance_policy,
             risk_free_rate,
             delta,
             tau,
@@ -451,8 +474,8 @@ impl IPortfolioConstructionModel for BlackLittermanOptimizationPortfolioConstruc
         self.update_prices(prices);
     }
 
-    fn rebalance_period(&self) -> Option<TimeSpan> {
-        self.rebalance_period
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.rebalance_policy.clone()
     }
 
     fn use_all_active_insights(&self) -> bool {

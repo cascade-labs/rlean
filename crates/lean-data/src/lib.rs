@@ -5,7 +5,6 @@ pub mod data_queue;
 pub mod delisting;
 pub mod dividend;
 pub mod fundamental;
-pub mod history_provider;
 pub mod margin_interest_rate;
 pub mod open_interest;
 pub mod options;
@@ -31,7 +30,6 @@ pub use data_queue::{
 };
 pub use delisting::{Delisting, DelistingType};
 pub use dividend::Dividend;
-pub use history_provider::IHistoricalDataProvider;
 pub use margin_interest_rate::MarginInterestRate;
 pub use open_interest::OpenInterest;
 pub use options::{OptionChain, OptionContract, OptionContractData};

@@ -15,36 +15,62 @@ impl SliceSynchronizer {
     }
 
     pub async fn next_slice(&mut self) -> LeanResult<Option<Slice>> {
-        let mut frontier: Option<DateTime> = None;
+        loop {
+            let mut frontier: Option<DateTime> = None;
 
-        for stream in &mut self.streams {
-            stream.fill_pending().await?;
-            if let Some(point) = stream.peek() {
-                let time = point.frontier_time();
-                frontier = Some(match frontier {
-                    Some(current) => current.min(time),
-                    None => time,
-                });
-            }
-        }
-
-        let frontier = match frontier {
-            Some(time) if time <= self.end => time,
-            _ => return Ok(None),
-        };
-
-        let mut slice = Slice::new(frontier);
-        for stream in &mut self.streams {
-            while let Some(point) = stream.peek() {
-                if point.frontier_time() != frontier {
-                    break;
+            for stream in &mut self.streams {
+                stream.drain_available_messages()?;
+                if let Some(point) = stream.peek() {
+                    let time = point.frontier_time();
+                    frontier = Some(match frontier {
+                        Some(current) => current.min(time),
+                        None => time,
+                    });
                 }
-                let point = stream.pop_next().await?.expect("peek implied pending data");
-                point.add_to_slice(&mut slice);
             }
-        }
 
-        Ok(Some(slice))
+            let Some(candidate) = frontier else {
+                let mut advanced_any = false;
+                for stream in self
+                    .streams
+                    .iter_mut()
+                    .filter(|stream| !stream.is_exhausted())
+                {
+                    stream.advance_until_progress().await?;
+                    advanced_any = true;
+                    if stream.peek().is_some() {
+                        break;
+                    }
+                }
+                if advanced_any {
+                    continue;
+                }
+                return Ok(None);
+            };
+            if candidate > self.end {
+                return Ok(None);
+            }
+            if let Some(stream) = self
+                .streams
+                .iter_mut()
+                .find(|stream| !stream.is_ready_for(candidate))
+            {
+                stream.advance_until_progress().await?;
+                continue;
+            }
+
+            let mut slice = Slice::new(candidate);
+            for stream in &mut self.streams {
+                while let Some(point) = stream.peek() {
+                    if point.frontier_time() != candidate {
+                        break;
+                    }
+                    let point = stream.pop_pending().expect("peek implied pending data");
+                    point.add_to_slice(&mut slice);
+                }
+            }
+            return Ok(Some(slice));
+        }
     }
 
     pub fn streams(&self) -> &[SubscriptionStream] {

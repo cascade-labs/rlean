@@ -61,7 +61,10 @@ pub struct BrokerageModelHandle;
 pub struct FuncSecuritySeederHandle;
 
 #[derive(Clone)]
-#[cfg_attr(feature = "python", pyo3::pyclass(name = "BrokerageModelSecurityInitializer"))]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "BrokerageModelSecurityInitializer")
+)]
 pub struct BrokerageModelSecurityInitializerHandle;
 
 #[cfg(feature = "python")]
@@ -807,6 +810,11 @@ impl AlgorithmHandle {
         self.portfolio()
     }
 
+    #[getter(is_warming_up)]
+    fn py_is_warming_up(&self) -> bool {
+        self.is_warming_up()
+    }
+
     #[pyo3(name = "get_parameter", signature = (key, default=None))]
     fn py_get_parameter(&self, key: String, default: Option<String>) -> Option<String> {
         self.get_parameter(key, default)
@@ -815,6 +823,21 @@ impl AlgorithmHandle {
     #[pyo3(name = "set_parameter")]
     fn py_set_parameter(&self, key: String, value: String) {
         self.set_parameter(key, value);
+    }
+
+    #[pyo3(name = "log")]
+    fn py_log(&self, message: String) {
+        self.log(message);
+    }
+
+    #[pyo3(name = "debug")]
+    fn py_debug(&self, message: String) {
+        self.debug(message);
+    }
+
+    #[pyo3(name = "error")]
+    fn py_error(&self, message: String) {
+        self.error(message);
     }
 
     #[pyo3(name = "has_security")]
@@ -919,6 +942,24 @@ impl AlgorithmHandle {
             time_in_force.map(Into::into),
             outside_regular_trading_hours,
         )
+    }
+
+    #[pyo3(name = "set_holdings", signature = (symbol, target, liquidate_existing_holdings=false, tag=None))]
+    fn py_set_holdings(
+        &self,
+        symbol: SymbolHandle,
+        target: f64,
+        liquidate_existing_holdings: bool,
+        tag: Option<String>,
+    ) {
+        let _ = (liquidate_existing_holdings, tag);
+        self.set_holdings(symbol, target);
+    }
+
+    #[pyo3(name = "liquidate", signature = (symbol=None, tag=None))]
+    fn py_liquidate(&self, symbol: Option<SymbolHandle>, tag: Option<String>) {
+        let _ = tag;
+        self.liquidate(symbol);
     }
 
     #[pyo3(name = "sma")]
@@ -1094,6 +1135,11 @@ impl AlgorithmHandle {
     #[getter(time)]
     fn py_time(&self) -> chrono::NaiveDateTime {
         self.current_time()
+    }
+
+    #[getter(utc_time)]
+    fn py_utc_time(&self) -> chrono::NaiveDateTime {
+        self.utc_time()
     }
 
     #[getter(universe_settings)]

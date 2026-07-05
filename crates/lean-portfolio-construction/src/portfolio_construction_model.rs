@@ -1,6 +1,105 @@
 use crate::portfolio_target::PortfolioTarget;
-use lean_core::{Symbol, TimeSpan};
+use lean_core::{DateTime, Symbol, TimeSpan};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Portfolio rebalance cadence and change-trigger settings.
+///
+/// This is the Rust-owned equivalent of LEAN's `PortfolioConstructionModel`
+/// rebalancing function plus `RebalanceOn*Changes` switches. The engine owns the
+/// runtime next-rebalance state; portfolio construction models only declare the
+/// policy they want.
+#[derive(Clone)]
+pub struct RebalancePolicy {
+    cadence: RebalanceCadence,
+    rebalance_on_security_changes: bool,
+    rebalance_on_insight_changes: bool,
+}
+
+/// Scheduled rebalance cadence.
+#[derive(Clone)]
+pub enum RebalanceCadence {
+    /// No scheduled next time. Rebalance whenever the framework has targets to
+    /// process, matching C# LEAN's null rebalancing function behavior.
+    EverySlice,
+    /// Rebalance after a fixed elapsed period from the last refresh.
+    Period(TimeSpan),
+    /// For a given UTC time, return the next expected rebalance time. Returning
+    /// `None` means the next time is unknown and should be requested again on
+    /// the next framework loop, matching C# LEAN's nullable rebalancing func.
+    NextTime(Arc<dyn Fn(DateTime) -> Option<DateTime> + Send + Sync>),
+}
+
+impl RebalancePolicy {
+    pub fn every_slice() -> Self {
+        Self {
+            cadence: RebalanceCadence::EverySlice,
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
+        }
+    }
+
+    pub fn period(period: TimeSpan) -> Self {
+        Self {
+            cadence: RebalanceCadence::Period(period),
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
+        }
+    }
+
+    pub fn daily() -> Self {
+        Self::period(TimeSpan::ONE_DAY)
+    }
+
+    pub fn next_time(
+        next_time: impl Fn(DateTime) -> Option<DateTime> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cadence: RebalanceCadence::NextTime(Arc::new(next_time)),
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
+        }
+    }
+
+    pub fn from_period(period: Option<TimeSpan>) -> Self {
+        period.map(Self::period).unwrap_or_else(Self::every_slice)
+    }
+
+    pub fn cadence(&self) -> &RebalanceCadence {
+        &self.cadence
+    }
+
+    pub fn rebalance_on_security_changes(&self) -> bool {
+        self.rebalance_on_security_changes
+    }
+
+    pub fn rebalance_on_insight_changes(&self) -> bool {
+        self.rebalance_on_insight_changes
+    }
+
+    pub fn with_security_changes(mut self, enabled: bool) -> Self {
+        self.rebalance_on_security_changes = enabled;
+        self
+    }
+
+    pub fn with_insight_changes(mut self, enabled: bool) -> Self {
+        self.rebalance_on_insight_changes = enabled;
+        self
+    }
+
+    pub fn period_value(&self) -> Option<TimeSpan> {
+        match self.cadence {
+            RebalanceCadence::Period(period) => Some(period),
+            RebalanceCadence::EverySlice | RebalanceCadence::NextTime(_) => None,
+        }
+    }
+}
+
+impl Default for RebalancePolicy {
+    fn default() -> Self {
+        Self::daily()
+    }
+}
 
 /// Direction of an alpha insight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,19 +181,19 @@ pub trait IPortfolioConstructionModel: Send + Sync {
     /// so their warm-up period runs concurrently with the alpha warm-up.
     fn update_security_prices(&mut self, _prices: &HashMap<u64, rust_decimal::Decimal>) {}
 
-    /// Rebalance frequency for models that follow LEAN's scheduled PCM behavior.
-    /// `None` preserves the legacy rlean behavior of creating targets whenever
-    /// active insights are present.
-    fn rebalance_period(&self) -> Option<TimeSpan> {
-        None
-    }
-
-    fn rebalance_on_security_changes(&self) -> bool {
-        true
-    }
-
-    fn rebalance_on_insight_changes(&self) -> bool {
-        true
+    /// Default rebalance cadence for a portfolio construction model.
+    ///
+    /// Mirrors C# LEAN's base `PortfolioConstructionModel`, whose default
+    /// `rebalancingFunc` is `null`. In `IsRebalanceDue` a null func returns
+    /// `true` every call, i.e. the model rebalances on **every slice**. Built-in
+    /// models (e.g. `EqualWeightingPortfolioConstructionModel`, which defaults to
+    /// `Resolution.Daily`) override this with their own cadence, but a bare
+    /// custom PCM — including Python subclasses of `PortfolioConstructionModel`
+    /// that never set a rebalancing function — must rebalance every bar to match
+    /// LEAN. Returning `daily()` here silently throttled custom PCMs to one
+    /// rebalance per day.
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::every_slice()
     }
 
     /// Whether this PCM can consume multiple active insights for the same

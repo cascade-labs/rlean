@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{
-    IPortfolioConstructionModel, InsightDirection, InsightForPcm,
+    IPortfolioConstructionModel, InsightDirection, InsightForPcm, RebalancePolicy,
 };
 use crate::portfolio_target::PortfolioTarget;
 use crate::PortfolioBias;
@@ -20,7 +20,7 @@ use crate::PortfolioBias;
 pub struct EqualWeightingPortfolioConstructionModel {
     portfolio_bias: PortfolioBias,
     max_weight: Option<Decimal>,
-    rebalance_period: Option<TimeSpan>,
+    rebalance_policy: RebalancePolicy,
 }
 
 impl EqualWeightingPortfolioConstructionModel {
@@ -28,7 +28,7 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias: PortfolioBias::LongShort,
             max_weight: None,
-            rebalance_period: Some(TimeSpan::ONE_DAY),
+            rebalance_policy: RebalancePolicy::daily(),
         }
     }
 
@@ -36,7 +36,7 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias,
             max_weight: None,
-            rebalance_period: Some(TimeSpan::ONE_DAY),
+            rebalance_policy: RebalancePolicy::daily(),
         }
     }
 
@@ -47,7 +47,7 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias,
             max_weight,
-            rebalance_period: Some(TimeSpan::ONE_DAY),
+            rebalance_policy: RebalancePolicy::daily(),
         }
     }
 
@@ -56,10 +56,22 @@ impl EqualWeightingPortfolioConstructionModel {
         max_weight: Option<Decimal>,
         rebalance_period: Option<TimeSpan>,
     ) -> Self {
+        Self::with_bias_max_weight_and_rebalance_policy(
+            portfolio_bias,
+            max_weight,
+            RebalancePolicy::from_period(rebalance_period),
+        )
+    }
+
+    pub fn with_bias_max_weight_and_rebalance_policy(
+        portfolio_bias: PortfolioBias,
+        max_weight: Option<Decimal>,
+        rebalance_policy: RebalancePolicy,
+    ) -> Self {
         Self {
             portfolio_bias,
             max_weight,
-            rebalance_period,
+            rebalance_policy,
         }
     }
 
@@ -128,8 +140,8 @@ impl IPortfolioConstructionModel for EqualWeightingPortfolioConstructionModel {
         "EqualWeightingPortfolioConstructionModel"
     }
 
-    fn rebalance_period(&self) -> Option<TimeSpan> {
-        self.rebalance_period
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.rebalance_policy.clone()
     }
 
     fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}

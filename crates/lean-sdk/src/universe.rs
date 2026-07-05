@@ -123,6 +123,56 @@ impl UniverseSettingsHandle {
     fn py_set_resolution_method(&self, resolution: crate::types::Resolution) {
         self.set_resolution(resolution.into());
     }
+
+    #[getter(leverage)]
+    fn py_leverage(&self) -> f64 {
+        self.leverage()
+    }
+
+    #[setter(leverage)]
+    fn py_set_leverage(&self, leverage: f64) {
+        self.set_leverage(leverage);
+    }
+
+    #[getter(fill_forward)]
+    fn py_fill_forward(&self) -> bool {
+        self.fill_forward()
+    }
+
+    #[setter(fill_forward)]
+    fn py_set_fill_forward(&self, fill_forward: bool) {
+        self.set_fill_forward(fill_forward);
+    }
+
+    #[getter(extended_market_hours)]
+    fn py_extended_market_hours(&self) -> bool {
+        self.extended_market_hours()
+    }
+
+    #[setter(extended_market_hours)]
+    fn py_set_extended_market_hours(&self, extended_market_hours: bool) {
+        self.set_extended_market_hours(extended_market_hours);
+    }
+
+    #[getter(minimum_time_in_universe)]
+    fn py_minimum_time_in_universe(&self) -> f64 {
+        self.minimum_time_in_universe()
+    }
+
+    #[setter(minimum_time_in_universe)]
+    fn py_set_minimum_time_in_universe(&self, seconds: f64) {
+        self.set_minimum_time_in_universe(seconds);
+    }
+
+    #[getter(data_normalization_mode)]
+    fn py_data_normalization_mode(&self) -> crate::types::DataNormalizationMode {
+        self.data_normalization_mode().into()
+    }
+
+    #[setter(data_normalization_mode)]
+    fn py_set_data_normalization_mode(&self, mode: crate::types::DataNormalizationMode) {
+        self.set_data_normalization_mode(mode.into());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

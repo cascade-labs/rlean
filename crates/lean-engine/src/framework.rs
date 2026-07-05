@@ -19,7 +19,9 @@ use lean_execution::{
     ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, IExecutionModel,
     ImmediateExecutionModel, OrderRequest, SecurityData,
 };
-use lean_portfolio_construction::portfolio_construction_model::InsightForPcmRef;
+use lean_portfolio_construction::portfolio_construction_model::{
+    InsightForPcmRef, RebalanceCadence, RebalancePolicy,
+};
 use lean_portfolio_construction::{
     EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel,
     InsightDirection as PcmDir,
@@ -179,6 +181,12 @@ impl FrameworkState {
             .filter(|insight| !self.insights.has_active(&insight.symbol, slice.time))
             .count();
         if active_target_count == 0 && expired_flat_count == 0 && pending_flat_count == 0 {
+            tracing::debug!(
+                time = %slice.time,
+                alpha_insights = alpha_insights.len(),
+                active_target_count,
+                "FWDBG no active targets; skipping rebalance"
+            );
             let orders = self.exec_model.execute_with_context(&[], execution_context);
             self.expose_insights(slice.time);
             return orders;
@@ -233,6 +241,15 @@ impl FrameworkState {
             .pcm
             .create_targets_from_refs(&pcm_insights, portfolio_value, prices);
 
+        tracing::debug!(
+            time = %slice.time,
+            alpha_insights = pcm_insights.len(),
+            target_insights = target_insights.len(),
+            pcm_targets = pcm_targets.len(),
+            portfolio_value = %portfolio_value,
+            "FWDBG rebalance produced pcm targets"
+        );
+
         let target_tags: HashMap<u64, String> = pcm_targets
             .iter()
             .map(|t| (t.symbol.id.sid, t.tag.clone()))
@@ -277,8 +294,16 @@ impl FrameworkState {
             })
             .collect();
 
-        self.exec_model
-            .execute_refs_with_context(&exec_targets, execution_context)
+        let orders = self
+            .exec_model
+            .execute_refs_with_context(&exec_targets, execution_context);
+        tracing::debug!(
+            time = %slice.time,
+            exec_targets = exec_targets.len(),
+            orders = orders.len(),
+            "FWDBG execution produced orders"
+        );
+        orders
     }
 
     /// Run the full alpha → PCM → risk → execution pipeline.
@@ -375,21 +400,23 @@ impl FrameworkState {
     }
 
     fn is_rebalance_due(&mut self, now: DateTime, insight_changes: bool) -> bool {
-        let Some(period) = self.pcm.rebalance_period() else {
-            return true;
-        };
+        let policy = self.pcm.rebalance_policy();
 
         if self.next_rebalance_time.is_none() {
-            self.next_rebalance_time = Some(now + period);
+            self.next_rebalance_time = next_rebalance_time(&policy, now);
+            if matches!(policy.cadence(), RebalanceCadence::EverySlice) {
+                self.refresh_rebalance(now, &policy);
+                return true;
+            }
         }
 
-        if self.pcm.rebalance_on_security_changes() && self.pending_security_changes {
-            self.refresh_rebalance(now);
+        if policy.rebalance_on_security_changes() && self.pending_security_changes {
+            self.refresh_rebalance(now, &policy);
             return true;
         }
 
-        if self.pcm.rebalance_on_insight_changes() && insight_changes {
-            self.refresh_rebalance(now);
+        if policy.rebalance_on_insight_changes() && insight_changes {
+            self.refresh_rebalance(now, &policy);
             return true;
         }
 
@@ -397,16 +424,24 @@ impl FrameworkState {
             .next_rebalance_time
             .is_some_and(|rebalance_time| rebalance_time <= now)
         {
-            self.refresh_rebalance(now);
+            self.refresh_rebalance(now, &policy);
             return true;
         }
 
         false
     }
 
-    fn refresh_rebalance(&mut self, now: DateTime) {
-        self.next_rebalance_time = self.pcm.rebalance_period().map(|period| now + period);
+    fn refresh_rebalance(&mut self, now: DateTime, policy: &RebalancePolicy) {
+        self.next_rebalance_time = next_rebalance_time(policy, now);
         self.pending_security_changes = false;
+    }
+}
+
+fn next_rebalance_time(policy: &RebalancePolicy, now: DateTime) -> Option<DateTime> {
+    match policy.cadence() {
+        RebalanceCadence::EverySlice => None,
+        RebalanceCadence::Period(period) => Some(now + *period),
+        RebalanceCadence::NextTime(next_time) => next_time(now),
     }
 }
 
@@ -701,5 +736,46 @@ fn execution_security_data_from_slice(
         minimum_price_variation,
         current_quantity,
         open_order_quantity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use lean_core::TimeSpan;
+
+    fn dt(year: i32, month: u32, day: u32) -> DateTime {
+        let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()))
+    }
+
+    #[test]
+    fn period_policy_sets_next_rebalance_time() {
+        let now = dt(2026, 1, 1);
+        let policy = RebalancePolicy::period(TimeSpan::ONE_DAY);
+
+        assert_eq!(
+            next_rebalance_time(&policy, now),
+            Some(now + TimeSpan::ONE_DAY)
+        );
+    }
+
+    #[test]
+    fn every_slice_policy_has_no_scheduled_next_time() {
+        let policy = RebalancePolicy::every_slice();
+
+        assert_eq!(next_rebalance_time(&policy, dt(2026, 1, 1)), None);
+    }
+
+    #[test]
+    fn next_time_policy_uses_callback_result() {
+        let policy = RebalancePolicy::next_time(|now| Some(now + TimeSpan::ONE_HOUR));
+        let now = dt(2026, 1, 1);
+
+        assert_eq!(
+            next_rebalance_time(&policy, now),
+            Some(now + TimeSpan::ONE_HOUR)
+        );
     }
 }

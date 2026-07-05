@@ -279,6 +279,7 @@ impl SymbolHandle {
 #[pyo3::pymethods]
 impl SymbolHandle {
     #[staticmethod]
+    #[pyo3(name = "create")]
     #[pyo3(signature = (ticker, security_type=None, market=None))]
     pub fn py_create(
         ticker: String,
@@ -474,6 +475,20 @@ impl AlgorithmSettingsHandle {
 
     #[pyo3(name = "set")]
     fn py_set(&self, name: String, value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<()> {
+        let parsed = algorithm_setting_value_from_py(&value)?;
+        self.inner.lock().unwrap().set(name, parsed);
+        Ok(())
+    }
+
+    // LEAN exposes settings as named attributes (e.g. `settings.minimum_order_margin_portfolio_percentage`).
+    // Back them with the generic key/value store so any LEAN setting name reads/writes
+    // without a dedicated field per property.
+    fn __getattr__(&self, name: String) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+        let value = self.inner.lock().unwrap().get(&name);
+        Python::attach(|py| algorithm_setting_value_to_py(py, value))
+    }
+
+    fn __setattr__(&self, name: String, value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<()> {
         let parsed = algorithm_setting_value_from_py(&value)?;
         self.inner.lock().unwrap().set(name, parsed);
         Ok(())

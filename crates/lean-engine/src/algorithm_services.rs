@@ -109,11 +109,23 @@ pub fn register_custom_universe_leverage_metadata(
 pub fn apply_slice_security_prices(alg: &mut QcAlgorithm, slice: &Slice) {
     for bar in slice.bars.values() {
         alg.securities.update_price(&bar.symbol, bar.close);
+        alg.portfolio.update_prices(&bar.symbol, bar.close);
     }
     for quote in slice.quote_bars.values() {
         let bid = quote.bid.as_ref().map(|bar| bar.close).unwrap_or_default();
         let ask = quote.ask.as_ref().map(|bar| bar.close).unwrap_or_default();
         alg.securities.update_quote(&quote.symbol, bid, ask);
+        let mid = match (bid, ask) {
+            (b, a) if b > rust_decimal::Decimal::ZERO && a > rust_decimal::Decimal::ZERO => {
+                (b + a) / rust_decimal::Decimal::from(2u8)
+            }
+            (b, _) if b > rust_decimal::Decimal::ZERO => b,
+            (_, a) if a > rust_decimal::Decimal::ZERO => a,
+            _ => rust_decimal::Decimal::ZERO,
+        };
+        if mid > rust_decimal::Decimal::ZERO {
+            alg.portfolio.update_prices(&quote.symbol, mid);
+        }
     }
 }
 

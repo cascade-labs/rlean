@@ -17,5 +17,6 @@ pub use models::risk_parity::{risk_contributions, RiskParityPortfolioConstructio
 pub use models::sector_weighting::SectorWeightingPortfolioConstructionModel;
 pub use portfolio_construction_model::{
     IPortfolioConstructionModel, InsightDirection, InsightForPcm, InsightForPcmRef,
+    RebalanceCadence, RebalancePolicy,
 };
 pub use portfolio_target::PortfolioTarget;
