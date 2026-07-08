@@ -2064,12 +2064,23 @@ impl SubscriptionProducerState {
             // Return the whole fetched series/window so the caller persists it to
             // Iceberg. `load_custom_partition` filters emitted rows to the current
             // frontier after the append.
-            return Ok(points
+            let fetched_total = points.len();
+            let kept: Vec<CustomDataPoint> = points
                 .into_iter()
                 .filter(|point| {
                     point.time >= self.start.date_utc() && point.time <= self.end.date_utc()
                 })
-                .collect());
+                .collect();
+            tracing::info!(
+                "full custom history fetch {}/{} decoded {} points, {} within {} -> {}",
+                custom.source_type,
+                custom.ticker,
+                fetched_total,
+                kept.len(),
+                self.start.date_utc(),
+                self.end.date_utc(),
+            );
+            return Ok(kept);
         }
 
         let mut fetch_config = custom.config.clone();

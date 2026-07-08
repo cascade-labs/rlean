@@ -1316,9 +1316,19 @@ impl IcebergStore {
         if points.is_empty() {
             return Ok(());
         }
+        let incoming = points.len();
         let points = self
             .dedupe_custom_points_for_append(source_type, ticker, points)
             .await?;
+        if incoming >= 10_000 || points.len() < incoming {
+            tracing::info!(
+                "append_custom_points {}/{}: {} incoming, {} after dedupe",
+                source_type,
+                ticker,
+                incoming,
+                points.len(),
+            );
+        }
         if points.is_empty() {
             return Ok(());
         }
