@@ -284,12 +284,8 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn point_with_symbol(symbol: Option<&str>) -> CustomDataPoint {
-        CustomDataPoint::empty(
-            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
-            None,
-            dec!(1),
-        )
-        .with_symbol(symbol.map(str::to_string))
+        CustomDataPoint::empty(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(), None, dec!(1))
+            .with_symbol(symbol.map(str::to_string))
     }
 
     #[test]
