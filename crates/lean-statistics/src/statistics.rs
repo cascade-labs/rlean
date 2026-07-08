@@ -47,6 +47,7 @@ impl Statistics {
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
+        let daily_rf = risk_free_rate / dec!(252);
         let variance = returns
             .iter()
             .map(|r| (r - mean) * (r - mean))
@@ -59,12 +60,8 @@ impl Statistics {
             return dec!(0);
         }
 
-        let annual_performance =
-            Decimal::from_f64_retain((dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0)
-                .unwrap_or(dec!(0));
-        let annual_std = Decimal::from_f64_retain(std * 252_f64.sqrt()).unwrap_or(dec!(1));
-
-        (annual_performance - risk_free_rate) / annual_std
+        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
+        Decimal::from_f64_retain(daily_excess / std * 252_f64.sqrt()).unwrap_or(dec!(0))
     }
 
     /// Sortino ratio from daily returns and annual risk-free rate.
@@ -74,6 +71,7 @@ impl Statistics {
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
+        let daily_rf = risk_free_rate / dec!(252);
 
         let downside_sq: Decimal = returns
             .iter()
@@ -95,13 +93,8 @@ impl Statistics {
             return dec!(0);
         }
 
-        let annual_performance =
-            Decimal::from_f64_retain((dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0)
-                .unwrap_or(dec!(0));
-        let annual_downside_std =
-            Decimal::from_f64_retain(downside_std * 252_f64.sqrt()).unwrap_or(dec!(1));
-
-        (annual_performance - risk_free_rate) / annual_downside_std
+        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
+        Decimal::from_f64_retain(daily_excess / downside_std * 252_f64.sqrt()).unwrap_or(dec!(0))
     }
 
     /// Maximum drawdown from an equity curve.

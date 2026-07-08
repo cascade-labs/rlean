@@ -652,6 +652,7 @@ mod tests {
     use lean_data::trade_bar::TradeBarData;
     use lean_data::{CustomDataPoint, QuoteBar, TradeBar};
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     #[test]
     fn tradebar_view_value_equals_close() {
@@ -713,13 +714,15 @@ mod tests {
             time: date,
             end_time: None,
             value: dec!(1),
-            fields: HashMap::new(),
+            symbol: None,
+            fields: Arc::new(HashMap::new()),
         };
         let second = CustomDataPoint {
             time: date,
             end_time: None,
             value: dec!(2),
-            fields: HashMap::new(),
+            symbol: None,
+            fields: Arc::new(HashMap::new()),
         };
         let view =
             CustomDataView::new(HashMap::from([("sweeps".to_string(), vec![first, second])]));
@@ -796,7 +799,8 @@ mod tests {
             time: date,
             end_time: None,
             value: dec!(1),
-            fields: HashMap::new(),
+            symbol: None,
+            fields: Arc::new(HashMap::new()),
         };
         let view = CustomDataPointView::new(point);
         assert_eq!(view.end_time(), date.and_hms_opt(0, 0, 0).unwrap());
@@ -812,7 +816,8 @@ mod tests {
                 time: date,
                 end_time: None,
                 value: dec!(1),
-                fields: HashMap::new(),
+                symbol: None,
+                fields: Arc::new(HashMap::new()),
             }],
         );
 

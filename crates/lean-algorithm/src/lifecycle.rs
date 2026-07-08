@@ -24,6 +24,21 @@ pub trait AlgorithmHistoryService: Send + Sync {
         periods: usize,
         resolution: Resolution,
     ) -> HistoryColumns;
+
+    fn last_known_close_price(
+        &self,
+        algorithm: &QcAlgorithm,
+        symbol: &Symbol,
+        resolution: Resolution,
+    ) -> Option<f64> {
+        let history = self.history(algorithm, symbol, 1, resolution);
+        ["close", "price", "ask_close", "bid_close"]
+            .iter()
+            .filter_map(|column| history.get(*column))
+            .flat_map(|values| values.iter().rev())
+            .filter_map(|value| value.parse::<f64>().ok())
+            .find(|value| *value > 0.0 && value.is_finite())
+    }
 }
 
 pub trait RegisteredIndicatorBridge: Send + Sync {

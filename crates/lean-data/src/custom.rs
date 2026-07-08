@@ -3,6 +3,7 @@ use lean_core::{DateTime, Resolution};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Generic query hints for custom data providers.
 ///
@@ -10,8 +11,11 @@ use std::collections::HashMap;
 /// storage layer. The runner also uses them for parquet-capable providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CustomDataQuery {
-    /// Provider-neutral symbol filter. Providers define which column this maps
-    /// to, but `usymbol` is the common convention for TradeAlert-style data.
+    /// Provider-neutral symbol filter. Matched against the canonical
+    /// [`CustomDataPoint::symbol`], which providers populate by declaring a
+    /// `symbol_column` on their [`CustomDataSource`] (the engine copies that
+    /// column's value, uppercased, into the point). Matching is
+    /// case-insensitive.
     pub symbols: Option<Vec<String>>,
     /// Provider field projection. Providers should include any required time,
     /// value, and symbol columns even if omitted here.
@@ -121,6 +125,12 @@ pub struct CustomDataSource {
     pub format: CustomDataFormat,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Name of the decoded column carrying the underlying symbol. When set, the
+    /// engine copies that column's value (uppercased) into
+    /// [`CustomDataPoint::symbol`] so `CustomDataQuery::symbols` can filter on
+    /// it. `None` leaves the point's symbol unset.
+    #[serde(default)]
+    pub symbol_column: Option<String>,
 }
 
 /// Native Parquet custom-data source returned directly by plugins.
@@ -155,6 +165,40 @@ pub struct CustomDataPoint {
     pub end_time: Option<DateTime>,
     /// Primary scalar value (equivalent to LEAN's `BaseData.Value`).
     pub value: Decimal,
+    /// Canonical UPPERCASE underlying ticker this point pertains to, if any.
+    ///
+    /// Providers declare which decoded column carries it via
+    /// [`CustomDataSource::symbol_column`]; the engine uppercases and stores it
+    /// here. `CustomDataQuery::symbols` filtering matches against this field.
+    #[serde(default)]
+    pub symbol: Option<String>,
     /// Additional named fields (e.g. open/high/low/close for VIX).
-    pub fields: HashMap<String, serde_json::Value>,
+    pub fields: Arc<HashMap<String, serde_json::Value>>,
+}
+
+impl CustomDataPoint {
+    pub fn new(
+        time: NaiveDate,
+        end_time: Option<DateTime>,
+        value: Decimal,
+        fields: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            time,
+            end_time,
+            value,
+            symbol: None,
+            fields: Arc::new(fields),
+        }
+    }
+
+    /// Builder that sets the canonical underlying symbol (uppercased).
+    pub fn with_symbol(mut self, symbol: Option<String>) -> Self {
+        self.symbol = symbol.map(|value| value.trim().to_ascii_uppercase());
+        self
+    }
+
+    pub fn empty(time: NaiveDate, end_time: Option<DateTime>, value: Decimal) -> Self {
+        Self::new(time, end_time, value, HashMap::new())
+    }
 }

@@ -1,14 +1,11 @@
 /// Stacked (priority-ordered) history provider.
 ///
-/// Tries each provider in order.  The first provider that returns a non-empty
-/// `Ok` result wins.  For side-effect requests (factor/map files), every
-/// provider that does not return `NotImplemented:` is given a chance to write
-/// its file because success is represented by a filesystem side effect, not
-/// returned rows.  A provider that returns `Ok(vec![])` for market data or an
-/// `anyhow::Error` whose message starts with "NotImplemented:" is treated as
-/// "I don't have this data — try the next one".  With a single provider,
-/// unexpected provider errors are returned. With multiple providers, a provider
-/// error is treated as a miss so fallback providers can satisfy the request.
+/// Tries each provider in order. The first provider that returns a non-empty
+/// `Ok` result wins. `Ok(vec![])` or an `anyhow::Error` whose message starts
+/// with "NotImplemented:" is treated as "I don't have this data — try the next
+/// one". With a single provider, unexpected provider errors are returned. With
+/// multiple providers, a provider error is treated as a miss so fallback
+/// providers can satisfy the request.
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -54,10 +51,6 @@ fn market_data_batch_is_empty(batch: &MarketDataBatch, data_type: DataType) -> b
         DataType::MarginInterestRate => batch.margin_interest_rates.is_empty(),
         DataType::PerpetualContext => batch.perpetual_contexts.is_empty(),
     }
-}
-
-fn is_side_effect_data_type(data_type: DataType) -> bool {
-    matches!(data_type, DataType::FactorFile | DataType::MapFile)
 }
 
 fn option_market_data_batch_is_empty(
@@ -168,17 +161,6 @@ impl IHistoryProvider for StackedHistoryProvider {
                         request.end.date_utc()
                     );
                     return Ok(data);
-                }
-                Ok(_data) if is_side_effect_data_type(request.data_type) => {
-                    debug!(
-                        "History provider {} accepted {:?} for {} as a side-effect ({} → {}); trying remaining providers too",
-                        provider_label,
-                        request.data_type,
-                        request.symbol.value,
-                        request.start.date_utc(),
-                        request.end.date_utc()
-                    );
-                    continue;
                 }
                 Ok(_) => {
                     debug!(
@@ -431,17 +413,6 @@ impl IHistoryProvider for StackedHistoryProvider {
                         request.end.date_utc()
                     );
                     return Ok(data);
-                }
-                Ok(_data) if is_side_effect_data_type(request.data_type) => {
-                    debug!(
-                        "History provider {} accepted batched {:?} for {} symbols as a side-effect ({} → {}); trying remaining providers too",
-                        provider_label,
-                        request.data_type,
-                        request.symbols.len(),
-                        request.start.date_utc(),
-                        request.end.date_utc()
-                    );
-                    continue;
                 }
                 Ok(_) => {
                     debug!(

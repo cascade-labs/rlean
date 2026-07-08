@@ -361,6 +361,20 @@ fn generate_html(r: &BacktestResult) -> String {
     let pct = |v: f64| format!("{:.2}%", v * 100.0);
     let dollar = |v: f64| format!("${:.2}", v);
     let ratio = |v: f64| format!("{:.3}", v);
+    let stable_ratio = |v: f64| {
+        if r.trading_days < 30 {
+            "n/a".to_string()
+        } else {
+            ratio(v)
+        }
+    };
+    let stable_pct = |v: f64| {
+        if r.trading_days < 30 {
+            "n/a".to_string()
+        } else {
+            pct(v)
+        }
+    };
 
     let cagr = s.compounding_annual_return.to_f64().unwrap_or(0.0);
     let sharpe = s.sharpe_ratio.to_f64().unwrap_or(0.0);
@@ -594,15 +608,15 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         cagr = pct(cagr),
         ann_std = pct(ann_std),
         drawdown = pct(drawdown),
-        sharpe = ratio(sharpe),
-        sortino = ratio(sortino),
-        calmar = ratio(calmar),
+        sharpe = stable_ratio(sharpe),
+        sortino = stable_ratio(sortino),
+        calmar = stable_ratio(calmar),
         omega = ratio(omega),
-        psr = pct(psr),
+        psr = stable_pct(psr),
         recovery = ratio(recovery),
-        alpha = pct(alpha),
+        alpha = stable_pct(alpha),
         beta = ratio(beta),
-        treynor = ratio(treynor),
+        treynor = stable_ratio(treynor),
         total_trades = s.total_trades,
         win_rate = pct(win_rate),
         pl_ratio = ratio(pl_ratio),
@@ -667,7 +681,7 @@ fn kpi_cards(r: &BacktestResult) -> String {
     let s = &r.statistics;
     let cagr = s.compounding_annual_return.to_f64().unwrap_or(0.0);
     let sharpe = s.sharpe_ratio.to_f64().unwrap_or(0.0);
-    let dd = s.drawdown.to_f64().unwrap_or(0.0);
+    let dd = s.drawdown.to_f64().unwrap_or(0.0).max(0.0);
     let wr = s.win_rate.to_f64().unwrap_or(0.0);
 
     let card = |label: &str, value: &str, class: &str| -> String {
@@ -686,8 +700,16 @@ fn kpi_cards(r: &BacktestResult) -> String {
             color(r.total_return),
         ),
         card("CAGR", &format!("{:+.2}%", cagr * 100.0), color(cagr)),
-        card("Sharpe", &format!("{:.3}", sharpe), color(sharpe)),
-        card("Max Drawdown", &format!("-{:.2}%", dd * 100.0), "neg"),
+        card(
+            "Sharpe",
+            &if r.trading_days < 30 {
+                "n/a".to_string()
+            } else {
+                format!("{:.3}", sharpe)
+            },
+            color(sharpe),
+        ),
+        card("Max Drawdown", &format!("{:.2}%", dd * 100.0), "neg"),
         card("Win Rate", &format!("{:.1}%", wr * 100.0), "neu"),
         card("Equity Legs", &s.total_trades.to_string(), "neu"),
     ]

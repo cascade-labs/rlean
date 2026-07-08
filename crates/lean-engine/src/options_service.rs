@@ -109,7 +109,7 @@ fn filter_option_rows(
             dte >= filter.min_expiry_days && dte <= filter.max_expiry_days
         })
         .collect();
-    rows.sort_by(|a, b| a.strike.cmp(&b.strike));
+    rows.sort_by_key(|row| row.strike);
 
     let atm_index = rows
         .iter()

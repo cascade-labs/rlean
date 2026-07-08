@@ -1,6 +1,7 @@
 use crate::data_feed::DataFeedContext;
 use crate::slice_synchronizer::SliceSynchronizer;
 use crate::subscription_reader::SubscriptionStream;
+use chrono::NaiveDate;
 use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, TickType};
 use lean_data::{Slice, SubscriptionDataConfig, SubscriptionDataKind};
 use lean_data_providers::ICustomDataSource;
@@ -8,6 +9,7 @@ use lean_storage::iceberg_store::{MARKET_QUOTE_BARS, MARKET_TICKS, MARKET_TRADE_
 use lean_storage::IcebergStore;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -17,6 +19,7 @@ pub struct DataManager {
     active_subscriptions: HashMap<u64, SubscriptionDataConfig>,
     synchronizer: Option<SliceSynchronizer>,
     end: Option<DateTime>,
+    last_market_cache_flush_date: Option<NaiveDate>,
 }
 
 impl DataManager {
@@ -53,7 +56,12 @@ impl DataManager {
             active_subscriptions: HashMap::new(),
             synchronizer: None,
             end: None,
+            last_market_cache_flush_date: None,
         }
+    }
+
+    pub fn context(&self) -> &DataFeedContext {
+        &self.context
     }
 
     /// Initialize subscription streams for the backtest period.
@@ -66,6 +74,8 @@ impl DataManager {
         self.warm_market_partition_indexes(configs).await?;
         self.warm_custom_partition_index_if_needed(configs).await?;
         self.active_subscriptions.clear();
+        self.last_market_cache_flush_date = None;
+        self.context.seed_consumer_frontier(start.date_utc());
         let mut streams = Vec::with_capacity(configs.len());
         for config in configs.iter().cloned() {
             self.active_subscriptions
@@ -77,8 +87,9 @@ impl DataManager {
                 end,
             ));
         }
-        self.synchronizer = Some(SliceSynchronizer::new(streams, end));
+        self.synchronizer = Some(SliceSynchronizer::new(streams, end, self.context.clone()));
         self.end = Some(end);
+        self.sync_subscription_cache_policy();
         debug!(
             "Initialized subscription feed with {} stream(s)",
             self.synchronizer
@@ -87,6 +98,12 @@ impl DataManager {
                 .unwrap_or(0)
         );
         Ok(())
+    }
+
+    fn sync_subscription_cache_policy(&mut self) {
+        self.context
+            .active_subscription_count
+            .store(self.active_subscriptions.len(), Ordering::Relaxed);
     }
 
     async fn warm_market_partition_indexes(
@@ -126,9 +143,16 @@ impl DataManager {
         let end = self.end.unwrap_or(start);
         let stream = SubscriptionStream::new(config.clone(), self.context.clone(), start, end);
         self.active_subscriptions.insert(id, config);
+        self.sync_subscription_cache_policy();
         match self.synchronizer.as_mut() {
             Some(sync) => sync.add_stream(stream),
-            None => self.synchronizer = Some(SliceSynchronizer::new(vec![stream], end)),
+            None => {
+                self.synchronizer = Some(SliceSynchronizer::new(
+                    vec![stream],
+                    end,
+                    self.context.clone(),
+                ))
+            }
         }
     }
 
@@ -176,8 +200,11 @@ impl DataManager {
                     sync.add_stream(stream);
                 }
             }
-            None => self.synchronizer = Some(SliceSynchronizer::new(streams, end)),
+            None => {
+                self.synchronizer = Some(SliceSynchronizer::new(streams, end, self.context.clone()))
+            }
         }
+        self.sync_subscription_cache_policy();
         Ok(())
     }
 
@@ -187,15 +214,31 @@ impl DataManager {
             if let Some(sync) = self.synchronizer.as_mut() {
                 sync.remove_stream(id);
             }
+            self.sync_subscription_cache_policy();
         }
     }
 
     /// Advance to the next synchronized slice across all subscriptions.
     pub async fn next_slice(&mut self) -> LeanResult<Option<Slice>> {
-        match self.synchronizer.as_mut() {
-            Some(sync) => sync.next_slice().await,
-            None => Ok(None),
+        let slice = match self.synchronizer.as_mut() {
+            Some(sync) => sync.next_slice().await?,
+            None => None,
+        };
+        // Publish the consumer frontier so producers can gate how far ahead they
+        // load/fetch. Without this, every producer races to the backtest end,
+        // fetching months of not-yet-needed data on large universes.
+        if let Some(slice) = slice.as_ref() {
+            let date = slice.time.date_utc();
+            self.context.observe_consumer_frontier(date);
+            if self.last_market_cache_flush_date != Some(date) {
+                self.context
+                    .flush_market_cache_writes_through(date)
+                    .await
+                    .map_err(|error| LeanError::DataError(error.to_string()))?;
+                self.last_market_cache_flush_date = Some(date);
+            }
         }
+        Ok(slice)
     }
 
     pub fn store(&self) -> &IcebergStore {
@@ -603,12 +646,7 @@ mod tests {
             .append_custom_points(
                 "fixture",
                 "ALT",
-                &[CustomDataPoint {
-                    time: day,
-                    end_time: Some(dt(day, 16, 0)),
-                    value: dec!(42),
-                    fields: std::collections::HashMap::new(),
-                }],
+                &[CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(42))],
             )
             .await
             .unwrap();
@@ -661,6 +699,7 @@ mod tests {
                 transport: CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
                 headers: HashMap::new(),
+                symbol_column: None,
             })
         }
 
@@ -670,12 +709,7 @@ mod tests {
             date: NaiveDate,
             _config: &CustomDataConfig,
         ) -> Option<CustomDataPoint> {
-            Some(CustomDataPoint {
-                time: date,
-                end_time: Some(dt(date, 16, 0)),
-                value: dec!(7),
-                fields: std::collections::HashMap::new(),
-            })
+            Some(CustomDataPoint::empty(date, Some(dt(date, 16, 0)), dec!(7)))
         }
     }
 

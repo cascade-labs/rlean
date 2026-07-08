@@ -8,6 +8,7 @@ use lean_core::{DataNormalizationMode, DateTime, NanosecondTimestamp, Resolution
 use lean_data::{CustomDataPoint, SubscriptionDataConfig, TradeBar};
 use lean_data_providers::{DataType, HistoryRequest, ICustomDataSource, IHistoryProvider};
 use lean_storage::IcebergStore;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::future::Future;
 use std::path::PathBuf;
@@ -143,6 +144,36 @@ impl AlgorithmHistoryService for HistoryService {
     ) -> HistoryColumns {
         self.history_count_columns(algorithm, symbol, periods, resolution)
             .unwrap_or_default()
+    }
+
+    fn last_known_close_price(
+        &self,
+        algorithm: &QcAlgorithm,
+        symbol: &Symbol,
+        resolution: Resolution,
+    ) -> Option<f64> {
+        let as_of = if algorithm.utc_time == DateTime::EPOCH {
+            algorithm.start_date
+        } else {
+            algorithm.utc_time
+        };
+        let configs = algorithm
+            .subscription_manager
+            .get_configs_for_symbol(symbol);
+        let normalization = matching_normalization_mode(
+            &configs
+                .iter()
+                .map(|config| (**config).clone())
+                .collect::<Vec<_>>(),
+            Some(resolution),
+            DataNormalizationMode::Adjusted,
+        );
+        let bars = self
+            .load_last_known_trade_bar(symbol, resolution, as_of, normalization)
+            .ok()?;
+        bars.last()
+            .and_then(|bar| bar.close.to_f64())
+            .filter(|price| *price > 0.0 && price.is_finite())
     }
 }
 
@@ -511,6 +542,7 @@ mod tests {
                 transport: CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
                 headers: HashMap::new(),
+                symbol_column: None,
             })
         }
 
@@ -520,12 +552,7 @@ mod tests {
             date: NaiveDate,
             _config: &CustomDataConfig,
         ) -> Option<CustomDataPoint> {
-            Some(CustomDataPoint {
-                time: date,
-                end_time: Some(dt(date, 16, 0)),
-                value: dec!(7),
-                fields: std::collections::HashMap::new(),
-            })
+            Some(CustomDataPoint::empty(date, Some(dt(date, 16, 0)), dec!(7)))
         }
     }
 
@@ -675,24 +702,12 @@ mod tests {
 
     #[test]
     fn custom_history_count_is_sorted_by_end_time_like_lean() {
-        let first = CustomDataPoint {
-            time: day(2024, 9, 27),
-            end_time: Some(dt(day(2024, 9, 27), 10, 0)),
-            value: dec!(1),
-            fields: std::collections::HashMap::new(),
-        };
-        let second = CustomDataPoint {
-            time: day(2024, 9, 30),
-            end_time: Some(dt(day(2024, 9, 30), 11, 0)),
-            value: dec!(2),
-            fields: std::collections::HashMap::new(),
-        };
-        let third = CustomDataPoint {
-            time: day(2024, 10, 1),
-            end_time: Some(dt(day(2024, 10, 1), 17, 0)),
-            value: dec!(3),
-            fields: std::collections::HashMap::new(),
-        };
+        let first =
+            CustomDataPoint::empty(day(2024, 9, 27), Some(dt(day(2024, 9, 27), 10, 0)), dec!(1));
+        let second =
+            CustomDataPoint::empty(day(2024, 9, 30), Some(dt(day(2024, 9, 30), 11, 0)), dec!(2));
+        let third =
+            CustomDataPoint::empty(day(2024, 10, 1), Some(dt(day(2024, 10, 1), 17, 0)), dec!(3));
         let columns = custom_points_to_columns(&[first, second, third]);
 
         assert_eq!(

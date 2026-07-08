@@ -909,14 +909,105 @@ impl CustomDataPointView {
     pub fn fields_pascal(&self) -> HashMap<String, String> {
         self.fields()
     }
+    /// Canonical UPPERCASE underlying symbol, if the provider declared one.
+    pub fn symbol(&self) -> Option<String> {
+        self.point.symbol.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "CustomDataFields"))]
+pub struct CustomDataFieldsView {
+    fields: Arc<HashMap<String, serde_json::Value>>,
+}
+
+impl CustomDataFieldsView {
+    pub fn new(fields: Arc<HashMap<String, serde_json::Value>>) -> Self {
+        Self { fields }
+    }
+
+    fn get_field(&self, key: &str) -> Option<String> {
+        self.fields.get(key).map(json_value_to_field_string)
+    }
+
+    fn keys_vec(&self) -> Vec<String> {
+        self.fields.keys().cloned().collect()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl CustomDataFieldsView {
+    #[pyo3(name = "__getitem__")]
+    fn py_getitem(&self, key: &str) -> pyo3::PyResult<String> {
+        self.get_field(key).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("custom data field not found: {key}"))
+        })
+    }
+
+    #[pyo3(name = "get", signature = (key, default=None))]
+    fn py_get(
+        &self,
+        py: pyo3::Python<'_>,
+        key: &str,
+        default: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> pyo3::Py<pyo3::PyAny> {
+        // Mirror a plain Python dict: return the field's string value when
+        // present, otherwise the caller-supplied default (of any type) or None.
+        match self.get_field(key) {
+            Some(value) => pyo3::types::PyString::new(py, &value).into_any().unbind(),
+            None => default.unwrap_or_else(|| py.None()),
+        }
+    }
+
+    #[pyo3(name = "__contains__")]
+    fn py_contains(&self, key: &str) -> bool {
+        self.fields.contains_key(key)
+    }
+
+    #[pyo3(name = "__len__")]
+    fn py_len(&self) -> usize {
+        self.fields.len()
+    }
+
+    #[pyo3(name = "keys")]
+    fn py_keys(&self) -> Vec<String> {
+        self.keys_vec()
+    }
+
+    #[pyo3(name = "items")]
+    fn py_items(&self) -> Vec<(String, String)> {
+        self.fields
+            .iter()
+            .map(|(key, value)| (key.clone(), json_value_to_field_string(value)))
+            .collect()
+    }
+
+    #[pyo3(name = "values")]
+    fn py_values(&self) -> Vec<String> {
+        self.fields
+            .values()
+            .map(json_value_to_field_string)
+            .collect()
+    }
+
+    #[pyo3(name = "__iter__")]
+    fn py_iter(&self) -> Vec<String> {
+        self.keys_vec()
+    }
 }
 
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl CustomDataPointView {
     #[getter(fields)]
-    fn py_fields(&self) -> HashMap<String, String> {
-        self.fields()
+    fn py_fields(&self) -> CustomDataFieldsView {
+        CustomDataFieldsView::new(self.point.fields.clone())
+    }
+
+    #[getter(symbol)]
+    fn py_symbol(&self) -> Option<String> {
+        self.symbol()
     }
 
     #[getter(value)]
@@ -1002,17 +1093,19 @@ mod tests {
                     time: day,
                     end_time: None,
                     value: dec!(13.5),
-                    fields: HashMap::new(),
+                    symbol: None,
+                    fields: Arc::new(HashMap::new()),
                 },
                 CustomDataPoint {
                     time: day,
                     end_time: None,
                     value: dec!(14.25),
-                    fields: HashMap::from([
+                    symbol: Some("SPY".to_string()),
+                    fields: Arc::new(HashMap::from([
                         ("usymbol".to_string(), serde_json::json!("SPY")),
                         ("indicative_borrow".to_string(), serde_json::json!(1.25)),
                         ("missing".to_string(), serde_json::Value::Null),
-                    ]),
+                    ])),
                 },
             ],
         );

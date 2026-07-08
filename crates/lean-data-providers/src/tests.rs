@@ -10,6 +10,7 @@ mod custom_data_tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// A minimal mock custom data source for testing.
     struct MockVixSource;
@@ -39,6 +40,7 @@ mod custom_data_tests {
                 transport: CustomDataTransport::Http,
                 format: CustomDataFormat::Csv,
                 headers: HashMap::new(),
+                symbol_column: None,
             })
         }
 
@@ -70,7 +72,8 @@ mod custom_data_tests {
                 time: date,
                 end_time: None,
                 value: close,
-                fields,
+                symbol: None,
+                fields: Arc::new(fields),
             })
         }
 
@@ -363,12 +366,12 @@ mod provider_tests {
     }
 
     #[derive(Clone)]
-    struct MockSideEffectProvider {
+    struct MockFactorRowsProvider {
         implemented: bool,
     }
 
     #[async_trait::async_trait]
-    impl IHistoryProvider for MockSideEffectProvider {
+    impl IHistoryProvider for MockFactorRowsProvider {
         async fn get_history(
             &self,
             request: &HistoryRequest,
@@ -381,12 +384,12 @@ mod provider_tests {
     }
 
     #[derive(Clone)]
-    struct RecordingSideEffectProvider {
+    struct RecordingEmptyRowsProvider {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
-    impl IHistoryProvider for RecordingSideEffectProvider {
+    impl IHistoryProvider for RecordingEmptyRowsProvider {
         async fn get_history(
             &self,
             _request: &HistoryRequest,
@@ -514,10 +517,10 @@ mod provider_tests {
     }
 
     #[tokio::test]
-    async fn stacked_provider_falls_back_for_side_effect_not_implemented() {
+    async fn stacked_provider_falls_back_for_factor_rows_not_implemented() {
         let provider = StackedHistoryProvider::new(vec![
-            Arc::new(MockSideEffectProvider { implemented: false }),
-            Arc::new(MockSideEffectProvider { implemented: true }),
+            Arc::new(MockFactorRowsProvider { implemented: false }),
+            Arc::new(MockFactorRowsProvider { implemented: true }),
         ]);
         let mut request = make_history_request();
         request.data_type = DataType::FactorFile;
@@ -528,14 +531,14 @@ mod provider_tests {
     }
 
     #[tokio::test]
-    async fn stacked_provider_tries_all_side_effect_providers_after_empty_ok() {
+    async fn stacked_provider_tries_next_factor_provider_after_empty_ok() {
         let first_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = StackedHistoryProvider::new(vec![
-            Arc::new(RecordingSideEffectProvider {
+            Arc::new(RecordingEmptyRowsProvider {
                 calls: Arc::clone(&first_calls),
             }),
-            Arc::new(RecordingSideEffectProvider {
+            Arc::new(RecordingEmptyRowsProvider {
                 calls: Arc::clone(&second_calls),
             }),
         ]);

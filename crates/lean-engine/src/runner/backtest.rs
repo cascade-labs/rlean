@@ -148,6 +148,8 @@ where
                     algorithm_manager.advance_framework_warmup(slice.as_ref(), &mut services);
                     algorithm_manager.end_time_step(&mut services);
                 }
+                feed_context.flush_market_cache_writes().await?;
+                feed_context.flush_corporate_action_cache_writes().await?;
             }
         }
         algorithm_manager.warmup_finished(&mut services);
@@ -241,6 +243,13 @@ where
         if let Some(error) = algorithm_manager.algorithm().runtime_error() {
             anyhow::bail!("Algorithm runtime error: {error}");
         }
+        sync_data_manager_subscriptions(
+            &mut data_manager,
+            &mut active_subscriptions,
+            algorithm_manager.algorithm(),
+            slice.time,
+        )
+        .await?;
         if has_fill_data {
             algorithm_manager.process_order_events(OrderEventProcessing {
                 slice: slice.as_ref(),
@@ -258,6 +267,13 @@ where
             has_data_for_algorithm && !(had_warmup && market_slices_after_warmup == 1);
         if run_framework_this_slice {
             algorithm_manager.run_framework(slice.as_ref(), &mut services);
+            sync_data_manager_subscriptions(
+                &mut data_manager,
+                &mut active_subscriptions,
+                algorithm_manager.algorithm(),
+                slice.time,
+            )
+            .await?;
             algorithm_manager.process_order_events(OrderEventProcessing {
                 slice: slice.as_ref(),
                 option_chains: &option_chains,
@@ -309,6 +325,11 @@ where
             }
         }
     }
+    data_manager.context().flush_market_cache_writes().await?;
+    data_manager
+        .context()
+        .flush_corporate_action_cache_writes()
+        .await?;
 
     algorithm_manager.finish(&mut services);
 

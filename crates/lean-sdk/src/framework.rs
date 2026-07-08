@@ -65,6 +65,47 @@ pub fn rebalance_policy_from_period(period: Option<TimeSpan>) -> RebalancePolicy
     RebalancePolicy::from_period(period)
 }
 
+pub fn portfolio_bias_from_view(bias: PortfolioBiasView) -> PortfolioBias {
+    match bias {
+        PortfolioBiasView::LongShort => PortfolioBias::LongShort,
+        PortfolioBiasView::Long => PortfolioBias::Long,
+        PortfolioBiasView::Short => PortfolioBias::Short,
+    }
+}
+
+/// Parses a Python-side `rebalance` argument, which LEAN allows to be a
+/// `Resolution`, a `datetime.timedelta`, a duration expressed in seconds, or
+/// `None` (meaning: use the model's own default cadence).
+#[cfg(feature = "python")]
+pub fn parse_rebalance_arg(value: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<TimeSpan> {
+    use pyo3::types::{PyAnyMethods, PyTypeMethods};
+    if let Ok(resolution) = value.extract::<crate::types::Resolution>() {
+        return resolution_rebalance_period(resolution.into());
+    }
+    // `timedelta` must be tried before `f64`: pyo3 will not accidentally
+    // extract a `timedelta` as a float, but checking it first keeps the
+    // common `EqualWeightingPortfolioConstructionModel(timedelta(days=1))`
+    // call from silently falling through to the default cadence.
+    if let Ok(duration) = value.extract::<chrono::Duration>() {
+        return duration
+            .num_nanoseconds()
+            .filter(|nanos| *nanos > 0)
+            .map(TimeSpan::from_nanos);
+    }
+    if let Ok(seconds) = value.extract::<f64>() {
+        return seconds_rebalance_period(seconds);
+    }
+    let type_name = value
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    tracing::warn!(
+        "unsupported rebalance argument type {type_name}; using model's default cadence"
+    );
+    None
+}
+
 pub fn sanitize_positive_f64_decimal(value: Option<f64>) -> Option<Decimal> {
     value
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -646,11 +687,24 @@ impl Default for InsightWeightingPortfolioConstructionModel {
     feature = "python",
     pyo3::pyclass(name = "EqualWeightingPortfolioConstructionModel")
 )]
-pub struct EqualWeightingPortfolioConstructionModel;
+#[derive(Clone)]
+pub struct EqualWeightingPortfolioConstructionModel {
+    pub portfolio_bias: PortfolioBias,
+    pub max_weight: Option<f64>,
+    pub rebalance_period: Option<TimeSpan>,
+}
 
 impl EqualWeightingPortfolioConstructionModel {
     pub fn new() -> Self {
-        Self
+        Self {
+            portfolio_bias: PortfolioBias::LongShort,
+            max_weight: None,
+            rebalance_period: default_rebalance_period(),
+        }
+    }
+
+    pub fn into_pcm(self) -> Box<dyn IPortfolioConstructionModel> {
+        create_equal_weighting_pcm(self.portfolio_bias, self.max_weight, self.rebalance_period)
     }
 }
 
@@ -864,12 +918,24 @@ py_model_new_no_args!(InsightWeightingPortfolioConstructionModel);
 #[pyo3::pymethods]
 impl EqualWeightingPortfolioConstructionModel {
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs))]
+    #[pyo3(signature = (rebalance=None, portfolio_bias=None, max_weight=None))]
     fn py_new(
-        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
-        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+        rebalance: Option<pyo3::Bound<'_, pyo3::PyAny>>,
+        portfolio_bias: Option<PortfolioBiasView>,
+        max_weight: Option<f64>,
     ) -> Self {
-        Self::new()
+        let rebalance_period = rebalance
+            .as_ref()
+            .and_then(parse_rebalance_arg)
+            .or_else(default_rebalance_period);
+        let portfolio_bias = portfolio_bias
+            .map(portfolio_bias_from_view)
+            .unwrap_or(PortfolioBias::LongShort);
+        Self {
+            portfolio_bias,
+            max_weight,
+            rebalance_period,
+        }
     }
 }
 #[cfg(feature = "python")]
@@ -1367,6 +1433,33 @@ mod tests {
             absolute_decimal_or_zero(-3.5),
             Decimal::from_f64_retain(3.5).unwrap()
         );
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn parse_rebalance_arg_accepts_timedelta_and_warns_on_unsupported_types() {
+        use pyo3::types::{IntoPyDict, PyAnyMethods};
+        use pyo3::Python;
+
+        Python::attach(|py| {
+            let timedelta_type = py.import("datetime").unwrap().getattr("timedelta").unwrap();
+            let one_day = timedelta_type.call1((1,)).unwrap();
+            assert_eq!(parse_rebalance_arg(&one_day), Some(TimeSpan::ONE_DAY));
+
+            let kwargs = [("hours", 12)].into_py_dict(py).unwrap();
+            let half_day = timedelta_type.call((), Some(&kwargs)).unwrap();
+            assert_eq!(
+                parse_rebalance_arg(&half_day),
+                Some(TimeSpan::from_nanos(12 * 60 * 60 * 1_000_000_000))
+            );
+
+            // A type LEAN never accepts here (e.g. a list) must not silently
+            // resolve to the model's default cadence via a bogus extraction —
+            // it should fall through to `None` so the caller applies its own
+            // documented default.
+            let unsupported = pyo3::types::PyList::empty(py);
+            assert_eq!(parse_rebalance_arg(unsupported.as_any()), None);
+        });
     }
 
     #[test]

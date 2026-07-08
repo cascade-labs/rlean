@@ -44,6 +44,7 @@ fn register_data(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lean_sdk::data::TicksView>()?;
     m.add_class::<lean_sdk::data::TickView>()?;
     m.add_class::<lean_sdk::data::CustomDataView>()?;
+    m.add_class::<lean_sdk::data::CustomDataFieldsView>()?;
     m.add_class::<lean_sdk::data::CustomDataPointView>()?;
     Ok(())
 }

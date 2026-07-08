@@ -247,11 +247,13 @@ pub struct OptionUniverseRow {
 /// - `date_ns`    — nanoseconds since Unix epoch (midnight UTC) for the data point date
 /// - `value`      — primary scalar value (Float64)
 /// - `fields_json`— JSON-encoded extra fields map (Utf8)
+/// - `symbol`     — canonical UPPERCASE underlying ticker (Utf8, nullable)
 pub fn custom_data_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("date_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("fields_json", DataType::Utf8, false),
+        Field::new("symbol", DataType::Utf8, true),
     ]))
 }
 

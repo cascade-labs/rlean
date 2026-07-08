@@ -789,7 +789,82 @@ class UniverseAlgorithm(QCAlgorithm):
                     .unwrap(),
             )),
             value: dec!(1),
-            fields,
+            symbol: None,
+            fields: Arc::new(fields),
+        };
+        let changes = bridge.select_custom_universe_changes(
+            point.end_time.unwrap().0,
+            Resolution::Daily,
+            &HashMap::from([("SNAPSHOT".to_string(), vec![point])]),
+            &mut services,
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].changes.added.len(), 1);
+        assert_eq!(changes[0].changes.added[0].value.as_ref(), "SPY");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn python_custom_fields_view_is_dict_compatible() {
+        init_python();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rlean-python-custom-fields-view-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.py");
+        fs::write(
+            &path,
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+class UniverseAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.add_universe("tradealert", "snapshot", Resolution.Daily, self.select)
+
+    def select(self, points):
+        out = []
+        for point in points:
+            # get() with a non-string default returns that object (dict-compat).
+            assert point.fields.get("missing", 0) == 0
+            assert point.fields.get("missing") is None
+            assert point.fields.get("usymbol") == "SPY"
+            # values() returns every field's string value.
+            values = sorted(point.fields.values())
+            assert "SPY" in values
+            # Canonical symbol is exposed on the point itself.
+            assert point.symbol == "SPY"
+            out.append(point.symbol)
+        return out
+"#,
+        )
+        .unwrap();
+
+        let mut bridge = load_test_strategy_bridge(&path);
+        let mut services = lean_algorithm::lifecycle::NoopAlgorithmServices::default();
+        bridge.initialize(&mut services).unwrap();
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            "usymbol".to_string(),
+            serde_json::Value::String("SPY".to_string()),
+        );
+        fields.insert("score".to_string(), serde_json::json!(1.25));
+        let point = CustomDataPoint {
+            time: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            end_time: Some(lean_core::DateTime::from(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(16, 0, 0)
+                    .unwrap(),
+            )),
+            value: dec!(1),
+            symbol: Some("SPY".to_string()),
+            fields: Arc::new(fields),
         };
         let changes = bridge.select_custom_universe_changes(
             point.end_time.unwrap().0,

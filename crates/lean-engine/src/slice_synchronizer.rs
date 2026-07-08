@@ -1,3 +1,4 @@
+use crate::data_feed::DataFeedContext;
 use crate::subscription_reader::SubscriptionStream;
 use lean_core::{DateTime, Result as LeanResult};
 use lean_data::Slice;
@@ -7,11 +8,16 @@ use lean_data::Slice;
 pub struct SliceSynchronizer {
     streams: Vec<SubscriptionStream>,
     end: DateTime,
+    context: DataFeedContext,
 }
 
 impl SliceSynchronizer {
-    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime) -> Self {
-        SliceSynchronizer { streams, end }
+    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime, context: DataFeedContext) -> Self {
+        SliceSynchronizer {
+            streams,
+            end,
+            context,
+        }
     }
 
     pub async fn next_slice(&mut self) -> LeanResult<Option<Slice>> {
@@ -30,6 +36,19 @@ impl SliceSynchronizer {
             }
 
             let Some(candidate) = frontier else {
+                // No stream has a current point. Ratchet the frontier to the
+                // minimum watermark so producers gated on the prefetch horizon
+                // wake up and load the next partitions; otherwise a data gap
+                // longer than the horizon deadlocks producer<->consumer.
+                let min_watermark = self
+                    .streams
+                    .iter()
+                    .filter(|stream| !stream.is_exhausted())
+                    .filter_map(|stream| stream.watermark())
+                    .min();
+                if let Some(watermark) = min_watermark {
+                    self.context.observe_consumer_frontier(watermark.date_utc());
+                }
                 let mut advanced_any = false;
                 for stream in self
                     .streams
@@ -50,6 +69,13 @@ impl SliceSynchronizer {
             if candidate > self.end {
                 return Ok(None);
             }
+            // LEAN's frontier is the candidate being synchronized (the minimum
+            // current emit time), not the last emitted slice. Publish it before
+            // waiting on any stream so a producer whose next partition is needed
+            // for this candidate is never gated behind the prefetch horizon —
+            // gating on the previous slice date deadlocks across market-closed
+            // gaps (weekend + holiday) longer than the horizon.
+            self.context.observe_consumer_frontier(candidate.date_utc());
             if let Some(stream) = self
                 .streams
                 .iter_mut()
@@ -155,8 +181,9 @@ mod tests {
         );
         let start = dt(day, 0, 0);
         let end = dt(day, 23, 59);
-        let stream = SubscriptionStream::new(config, DataFeedContext::new(store), start, end);
-        let mut sync = SliceSynchronizer::new(vec![stream], end);
+        let context = DataFeedContext::new(store);
+        let stream = SubscriptionStream::new(config, context.clone(), start, end);
+        let mut sync = SliceSynchronizer::new(vec![stream], end, context);
 
         let mut closes = Vec::new();
         while let Some(slice) = sync.next_slice().await.unwrap() {

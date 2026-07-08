@@ -81,13 +81,13 @@ fn sharpe_ratio_higher_with_better_returns() {
 }
 
 #[test]
-fn sharpe_ratio_uses_annualized_performance_like_lean() {
+fn sharpe_ratio_uses_annualized_daily_excess_return() {
     let returns = vec![dec!(0.01), dec!(-0.005), dec!(0.012), dec!(0.003)];
     let sharpe = Statistics::sharpe_ratio(&returns, dec!(0.04));
 
     assert!(
-        (sharpe - dec!(20.23555454375385)).abs() < dec!(0.000000000001),
-        "expected LEAN-style annualized Sharpe, got {sharpe}"
+        (sharpe - dec!(9.977234654099509)).abs() < dec!(0.000000000001),
+        "expected annualized daily excess-return Sharpe, got {sharpe}"
     );
 }
 

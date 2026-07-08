@@ -6,7 +6,9 @@ use lean_alpha::{IAlphaModel, Insight};
 use lean_core::{DateTime, Market, Resolution, SecurityType, Symbol};
 use lean_data::{CustomDataPoint, CustomDataQuery, Slice};
 use lean_execution::{ExecutionContext, ExecutionTarget, IExecutionModel, OrderRequest};
-use lean_portfolio_construction::{IPortfolioConstructionModel, InsightForPcm, PortfolioTarget};
+use lean_portfolio_construction::{
+    IPortfolioConstructionModel, InsightForPcm, PortfolioTarget, RebalancePolicy,
+};
 use lean_risk::risk_management::{PortfolioTarget as RiskPortfolioTarget, RiskManagementModel};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -19,10 +21,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::algorithm::{AlgorithmApi, AlgorithmHandle};
 use crate::data::{CustomDataPointView, SharedSliceFrame, SliceView};
 use crate::framework::{
-    create_immediate_execution_model, create_null_risk_management_model, insight_from_projection,
+    create_immediate_execution_model, create_insight_weighting_pcm, create_max_sharpe_ratio_pcm,
+    create_mean_variance_pcm, create_null_risk_management_model, insight_from_projection,
     portfolio_target_from_projection, portfolio_target_projection_from_execution_target,
     portfolio_target_projection_from_risk_target, project_alpha_insight, project_pcm_insight,
-    ImmediateExecutionModel, InsightProjection, NullRiskManagementModel, PortfolioTargetProjection,
+    EqualWeightingPortfolioConstructionModel, ImmediateExecutionModel, InsightProjection,
+    InsightWeightingPortfolioConstructionModel, MaximumSharpeRatioPortfolioConstructionModel,
+    MeanVarianceOptimizationPortfolioConstructionModel, NullRiskManagementModel,
+    PortfolioTargetProjection,
 };
 use crate::securities::SymbolHandle;
 use crate::universe::ScheduledUniverseDescriptor;
@@ -130,7 +136,7 @@ impl PythonAlphaModelAdapter {
 
 impl IAlphaModel for PythonAlphaModelAdapter {
     fn update(&mut self, slice: &Slice, _securities: &[Symbol]) -> Vec<Insight> {
-        self.slice_frame.set_current(Arc::new(slice.clone()));
+        self.slice_frame.set_current(Arc::new(slice.to_owned()));
         Python::attach(|py| -> PyResult<Vec<Insight>> {
             let model = self.model.bind(py);
             let Some(callback) = first_attr(model, &["Update", "update"])? else {
@@ -207,8 +213,76 @@ impl IPortfolioConstructionModel for PythonPortfolioConstructionModelAdapter {
         true
     }
 
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        Python::attach(|py| -> PyResult<Option<RebalancePolicy>> {
+            let model = self.model.bind(py);
+            let Some(value) = first_attr(
+                model,
+                &[
+                    "RebalancePolicy",
+                    "rebalance_policy",
+                    "Rebalance",
+                    "rebalance",
+                ],
+            )?
+            else {
+                return Ok(None);
+            };
+            if value.is_callable() {
+                // LEAN's Python PCM constructors accept a rebalancing function of
+                // signature `Callable[[datetime], Optional[datetime]]`: given the
+                // current UTC time, it returns the next rebalance time (or `None`
+                // if unknown). It must be invoked with that argument each time the
+                // engine actually needs the next scheduled time — never eagerly
+                // with zero arguments here, which would raise on every LEAN-style
+                // model and mask a working callable behind a bogus fallback.
+                let callable = value.clone().unbind();
+                let name = self.name.clone();
+                return Ok(Some(RebalancePolicy::next_time(move |now| {
+                    call_python_rebalance_func(&callable, &name, now)
+                })));
+            }
+            if let Ok(policy) = value.extract::<String>() {
+                return Ok(rebalance_policy_from_py_str(&policy));
+            }
+            Ok(None)
+        })
+        .unwrap_or_else(|error| {
+            tracing::error!("Python PCM {} rebalance policy failed: {error}", self.name);
+            None
+        })
+        .unwrap_or_else(RebalancePolicy::every_slice)
+    }
+
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Invokes a Python-side `Callable[[datetime], Optional[datetime]]` rebalancing
+/// function with the current UTC time, matching LEAN's calling convention.
+fn call_python_rebalance_func(callable: &Py<PyAny>, name: &str, now: DateTime) -> Option<DateTime> {
+    Python::attach(|py| -> PyResult<Option<DateTime>> {
+        let naive_utc = now.to_utc().naive_utc();
+        let result = callable.bind(py).call1((naive_utc,))?;
+        if result.is_none() {
+            return Ok(None);
+        }
+        let next: chrono::NaiveDateTime = result.extract()?;
+        Ok(Some(DateTime::from(next)))
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!("Python PCM {name} rebalance function failed: {error}");
+        None
+    })
+}
+
+fn rebalance_policy_from_py_str(value: &str) -> Option<RebalancePolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "daily" | "day" | "1d" => Some(RebalancePolicy::daily()),
+        "every_slice" | "everyslice" | "every-slice" | "slice" | "tick" | "every_tick"
+        | "everytick" => Some(RebalancePolicy::every_slice()),
+        _ => None,
     }
 }
 
@@ -338,6 +412,32 @@ pub fn register_portfolio_construction(
     handle: &AlgorithmHandle,
     model: Py<PyAny>,
 ) -> PyResult<()> {
+    // Built-in Rust portfolio construction models are exposed to Python as
+    // thin marker pyclasses (matching LEAN's constructor surface), not as
+    // subclasses of `PortfolioConstructionModel` with a real `create_targets`
+    // method. Without this fast path, the generic adapter below would look
+    // for a Python-level `create_targets`/`CreateTargets` attribute, find
+    // none, and silently produce zero targets forever — insights would be
+    // generated but never converted into orders.
+    let bound = model.bind(py);
+    if let Ok(builtin) = bound.extract::<EqualWeightingPortfolioConstructionModel>() {
+        framework_registry(handle)?.set_portfolio_construction_model(builtin.into_pcm());
+        return Ok(());
+    }
+    if bound.is_instance_of::<InsightWeightingPortfolioConstructionModel>() {
+        framework_registry(handle)?
+            .set_portfolio_construction_model(create_insight_weighting_pcm());
+        return Ok(());
+    }
+    if bound.is_instance_of::<MeanVarianceOptimizationPortfolioConstructionModel>() {
+        framework_registry(handle)?.set_portfolio_construction_model(create_mean_variance_pcm());
+        return Ok(());
+    }
+    if bound.is_instance_of::<MaximumSharpeRatioPortfolioConstructionModel>() {
+        framework_registry(handle)?.set_portfolio_construction_model(create_max_sharpe_ratio_pcm());
+        return Ok(());
+    }
+
     let algorithm = algorithm_py_object(py, handle)?.unbind();
     let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, algorithm);
     framework_registry(handle)?.set_portfolio_construction_model(Box::new(adapter));
@@ -583,5 +683,88 @@ impl InsightCollectionHandle {
             .filter(|insight| insight.is_active(utc))
             .map(project_alpha_insight)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lean_portfolio_construction::RebalanceCadence;
+    use std::ffi::CString;
+
+    fn build_model(py: Python<'_>, source: &str) -> Py<PyAny> {
+        let code = CString::new(source).unwrap();
+        let filename = CString::new("test_model.py").unwrap();
+        let modname = CString::new("test_model").unwrap();
+        let module = PyModule::from_code(py, &code, &filename, &modname).unwrap();
+        module.getattr("model").unwrap().unbind()
+    }
+
+    #[test]
+    fn rebalance_policy_wraps_lean_style_callable_without_calling_it_eagerly() {
+        Python::attach(|py| {
+            let model = build_model(
+                py,
+                "import datetime\n\
+                 class Model:\n\
+                 \x20\x20\x20\x20def rebalance(self, time):\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20return time + datetime.timedelta(days=3)\n\
+                 model = Model()\n",
+            );
+            let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, py.None());
+            let policy = adapter.rebalance_policy();
+            let RebalanceCadence::NextTime(next_time) = policy.cadence() else {
+                panic!(
+                    "a callable `rebalance` attribute must become a NextTime cadence, not be \
+                     invoked eagerly with zero arguments"
+                );
+            };
+
+            let now = DateTime::from(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            );
+            let next = next_time(now).expect("callable should return the next rebalance time");
+            assert_eq!(next.date_utc(), now.date_utc() + chrono::Duration::days(3));
+        });
+    }
+
+    #[test]
+    fn rebalance_policy_returns_none_when_callable_signature_mismatches() {
+        Python::attach(|py| {
+            let model = build_model(
+                py,
+                "class Model:\n\
+                 \x20\x20\x20\x20def rebalance(self):\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20return None\n\
+                 model = Model()\n",
+            );
+            let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, py.None());
+            let policy = adapter.rebalance_policy();
+            let RebalanceCadence::NextTime(next_time) = policy.cadence() else {
+                panic!("expected NextTime cadence wrapping the callable");
+            };
+            // The callable takes zero args; calling it with `now` mismatches its
+            // signature and must be reported as `None` (ask again later), not
+            // panic or silently succeed.
+            assert_eq!(next_time(DateTime::now()), None);
+        });
+    }
+
+    #[test]
+    fn rebalance_policy_parses_string_cadence() {
+        Python::attach(|py| {
+            let model = build_model(
+                py,
+                "class Model:\n\
+                 \x20\x20\x20\x20rebalance = \"daily\"\n\
+                 model = Model()\n",
+            );
+            let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, py.None());
+            let policy = adapter.rebalance_policy();
+            assert!(matches!(policy.cadence(), RebalanceCadence::Period(_)));
+        });
     }
 }

@@ -247,6 +247,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
@@ -268,7 +269,8 @@ mod tests {
             time: date(2024, 1, day),
             end_time: Some(date_to_datetime(date(2024, 1, day), 16, 0, 0)),
             value: Decimal::from(value),
-            fields,
+            symbol: None,
+            fields: Arc::new(fields),
         }
     }
 

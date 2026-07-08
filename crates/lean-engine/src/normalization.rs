@@ -1,6 +1,6 @@
+use crate::data_feed::DataFeedContext;
 use lean_core::{DataNormalizationMode, DateTime, SecurityType, Symbol};
 use lean_data::{QuoteBar, TradeBar};
-use lean_data_providers::IHistoryProvider;
 use lean_storage::{FactorFileEntry, IcebergStore};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -41,15 +41,11 @@ pub fn read_factor_rows(store: &IcebergStore, symbol: &Symbol) -> Vec<FactorFile
 ///
 /// Cache-first and idempotent: if the tables already have rows for the symbol,
 /// no provider call is made. Only equities carry corporate actions.
-pub fn ensure_corporate_actions_cached(
-    store: &IcebergStore,
-    provider: Option<&Arc<dyn IHistoryProvider>>,
-    symbol: &Symbol,
-) {
+pub fn ensure_corporate_actions_cached(context: &DataFeedContext, symbol: &Symbol) {
     if !matches!(symbol.security_type(), SecurityType::Equity) {
         return;
     }
-    let Some(provider) = provider else {
+    let Some(provider) = context.history_provider.as_ref() else {
         return;
     };
 
@@ -57,23 +53,28 @@ pub fn ensure_corporate_actions_cached(
     let ticker = symbol.permtick.to_string();
     let symbol_value = symbol.value.to_string();
     let provider = Arc::clone(provider);
-    let store_for_task = store.clone();
+    let context_for_task = context.clone();
     let symbol = symbol.clone();
 
     // Run the fetch+persist on a dedicated current-thread runtime so it works
     // regardless of the caller's async context, mirroring `read_factor_rows`.
     let outcome = block_on_background(async move {
         // Factor file: fetch + persist only when absent for this symbol.
-        let have_factors = store_for_task
+        let have_factors = context_for_task
+            .store
             .scan_factor_file(&market, &ticker)
             .await
             .map(|rows| !rows.is_empty())
             .unwrap_or(false);
         if !have_factors {
-            match provider.get_factor_file(&symbol).await {
+            match context_for_task
+                .fetch_factor_file(provider.as_ref(), &symbol)
+                .await
+            {
                 Ok(rows) if !rows.is_empty() => {
-                    if let Err(err) = store_for_task
-                        .append_factor_file(&market, &ticker, &rows)
+                    let rows_len = rows.len();
+                    if let Err(err) = context_for_task
+                        .buffer_factor_file_cache_write(market.clone(), ticker.clone(), rows)
                         .await
                     {
                         tracing::warn!(
@@ -82,9 +83,9 @@ pub fn ensure_corporate_actions_cached(
                             err
                         );
                     } else {
-                        tracing::info!(
-                            "Persisted {} factor rows for {} into Iceberg",
-                            rows.len(),
+                        tracing::debug!(
+                            "Buffered {} factor rows for {} into Iceberg",
+                            rows_len,
                             symbol.value
                         );
                     }
@@ -97,23 +98,28 @@ pub fn ensure_corporate_actions_cached(
         }
 
         // Map file: fetch + persist only when absent for this symbol.
-        let have_map = store_for_task
+        let have_map = context_for_task
+            .store
             .scan_map_file(&market, &ticker)
             .await
             .map(|rows| !rows.is_empty())
             .unwrap_or(false);
         if !have_map {
-            match provider.get_map_file(&symbol).await {
+            match context_for_task
+                .fetch_map_file(provider.as_ref(), &symbol)
+                .await
+            {
                 Ok(rows) if !rows.is_empty() => {
-                    if let Err(err) = store_for_task
-                        .append_map_file(&market, &ticker, &rows)
+                    let rows_len = rows.len();
+                    if let Err(err) = context_for_task
+                        .buffer_map_file_cache_write(market.clone(), ticker.clone(), rows)
                         .await
                     {
                         tracing::warn!("Failed to persist map file for {}: {}", symbol.value, err);
                     } else {
-                        tracing::info!(
-                            "Persisted {} map rows for {} into Iceberg",
-                            rows.len(),
+                        tracing::debug!(
+                            "Buffered {} map rows for {} into Iceberg",
+                            rows_len,
                             symbol.value
                         );
                     }

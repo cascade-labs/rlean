@@ -9,6 +9,7 @@ use crate::options_service::{
 use crate::subscription_data::SubscriptionDataPoint;
 use anyhow::Context;
 use chrono::Datelike;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use lean_core::{
     exchange_hours::ExchangeHours, DateTime, Resolution, Result as LeanResult, SecurityType,
     Symbol, TickType,
@@ -21,6 +22,7 @@ use lean_data::{
 use lean_data_providers::{DataType, HistoryRequest, ICustomDataSource, IHistoryProvider};
 use lean_storage::{FactorFileEntry, MarketPartitionDayQuery, OptionEodBar, QueryParams};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -40,6 +42,76 @@ struct BufferedSubscriptionPoint {
 struct LoadedPartition {
     points: Vec<SubscriptionDataPoint>,
     through_date: chrono::NaiveDate,
+}
+
+const CUSTOM_PARTITION_STAGE_CHUNK_ROWS: usize = 10_000;
+
+fn agent_debug_log(
+    run_id: &str,
+    hypothesis_id: &str,
+    location: &str,
+    message: &str,
+    data: serde_json::Value,
+) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "sessionId": "15c1d5",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": timestamp,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/jfbrown/code/rlean/.cursor/debug-15c1d5.log")
+    {
+        let _ = writeln!(file, "{payload}");
+    }
+}
+
+fn drain_subscription_points_chunk(
+    points: &mut VecDeque<SubscriptionDataPoint>,
+    max_rows: usize,
+) -> Vec<SubscriptionDataPoint> {
+    let take = points.len().min(max_rows);
+    points.drain(..take).collect()
+}
+
+fn history_request_for_window(
+    request: &HistoryRequest,
+    window_start: chrono::NaiveDate,
+    window_end: chrono::NaiveDate,
+) -> HistoryRequest {
+    HistoryRequest {
+        start: partition_day_start(window_start),
+        end: partition_day_end(window_end),
+        ..request.clone()
+    }
+}
+
+fn push_split_windows(
+    pending: &mut Vec<(chrono::NaiveDate, chrono::NaiveDate)>,
+    window_start: chrono::NaiveDate,
+    window_end: chrono::NaiveDate,
+) {
+    let days = window_end.signed_duration_since(window_start).num_days();
+    if days <= 0 {
+        return;
+    }
+    let left_end = window_start + chrono::Duration::days(days / 2);
+    let Some(right_start) = left_end.succ_opt() else {
+        return;
+    };
+    if right_start <= window_end {
+        pending.push((right_start, window_end));
+    }
+    pending.push((window_start, left_end));
 }
 
 enum SubscriptionStreamMessage {
@@ -96,6 +168,7 @@ struct SubscriptionProducerState {
     last_emitted_point: Option<SubscriptionDataPoint>,
     daily_time_is_source_date: Option<bool>,
     custom_history_fetched: bool,
+    custom_overflow: VecDeque<SubscriptionDataPoint>,
     /// Per-day TradeAlert/S3 lookups that returned no rows — avoids hammering
     /// object storage on every partition once a date is known empty.
     custom_empty_dates: std::collections::BTreeSet<chrono::NaiveDate>,
@@ -109,11 +182,7 @@ impl SubscriptionStream {
         start: DateTime,
         end: DateTime,
     ) -> Self {
-        let capacity = context
-            .options
-            .cache_policy
-            .max_prefetch_rows
-            .clamp(1, 100_000);
+        let capacity = context.effective_cache_policy().channel_capacity();
         let (sender, receiver) = mpsc::channel(capacity);
         let producer_config = config.clone();
         let producer = tokio::spawn(async move {
@@ -157,6 +226,13 @@ impl SubscriptionStream {
 
     pub fn is_exhausted(&self) -> bool {
         self.exhausted && self.pending.is_empty()
+    }
+
+    /// Latest producer watermark: all data up to this time has been delivered
+    /// (or proven absent). Used by the synchronizer to advance the consumer
+    /// frontier across data gaps so horizon-gated producers wake up.
+    pub fn watermark(&self) -> Option<DateTime> {
+        self.watermark
     }
 
     pub fn is_ready_for(&self, frontier: DateTime) -> bool {
@@ -275,11 +351,7 @@ impl SubscriptionProducerState {
         // they're empty for this symbol. Providers supply the rows; the
         // framework owns persistence. This must run before we read factor rows
         // or the map-file inception date below.
-        ensure_corporate_actions_cached(
-            &context.store,
-            context.history_provider.as_ref(),
-            &config.symbol,
-        );
+        ensure_corporate_actions_cached(&context, &config.symbol);
         let factor_rows = if config.normalization_mode != lean_core::DataNormalizationMode::Raw {
             read_factor_rows(&context.store, &config.symbol)
         } else {
@@ -317,6 +389,7 @@ impl SubscriptionProducerState {
             last_emitted_point: None,
             daily_time_is_source_date: None,
             custom_history_fetched: false,
+            custom_overflow: VecDeque::new(),
             custom_empty_dates: std::collections::BTreeSet::new(),
             exhausted: false,
         }
@@ -345,6 +418,7 @@ impl SubscriptionProducerState {
                 self.partition_date += chrono::Duration::days(1);
                 continue;
             }
+            self.wait_for_prefetch_horizon().await;
             let loaded = self.load_partition().await?;
             if let Some(next_frontier) = loaded
                 .points
@@ -367,9 +441,91 @@ impl SubscriptionProducerState {
                     break;
                 }
             }
-            self.advance_partition_past(loaded.through_date);
+            if self.custom_overflow.is_empty() {
+                // #region agent log
+                if self.config.data_kind != SubscriptionDataKind::Market {
+                    let next_partition_date = loaded
+                        .through_date
+                        .succ_opt()
+                        .unwrap_or(loaded.through_date);
+                    agent_debug_log(
+                        "initial",
+                        "H1,H2,H5",
+                        "crates/lean-engine/src/subscription_reader.rs:384",
+                        "advancing custom partition after load",
+                        serde_json::json!({
+                            "symbol": self.config.symbol.value,
+                            "resolution": format!("{:?}", self.config.resolution),
+                            "partition_date_before": self.partition_date.to_string(),
+                            "loaded_through_date": loaded.through_date.to_string(),
+                            "next_partition_date": next_partition_date.to_string(),
+                            "loaded_points": loaded_points,
+                            "overflow_remaining": self.custom_overflow.len(),
+                            "prefetch_ceiling": self.context.prefetch_ceiling_date().map(|date| date.to_string()),
+                        }),
+                    );
+                }
+                // #endregion
+                self.advance_partition_past(loaded.through_date);
+            } else {
+                // #region agent log
+                if self.config.data_kind != SubscriptionDataKind::Market {
+                    agent_debug_log(
+                        "initial",
+                        "H1,H2",
+                        "crates/lean-engine/src/subscription_reader.rs:386",
+                        "skipping partition advance while custom overflow remains",
+                        serde_json::json!({
+                            "symbol": self.config.symbol.value,
+                            "resolution": format!("{:?}", self.config.resolution),
+                            "partition_date": self.partition_date.to_string(),
+                            "loaded_through_date": loaded.through_date.to_string(),
+                            "loaded_points": loaded_points,
+                            "overflow_remaining": self.custom_overflow.len(),
+                        }),
+                    );
+                }
+                // #endregion
+            }
         }
         Ok(())
+    }
+
+    /// True when the next partition to load is beyond `consumer_frontier +
+    /// max_prefetch_ahead_days`. Used for cooperative backpressure only — remote
+    /// provider fetches are clamped separately in `clamp_fetch_window`.
+    fn partition_beyond_prefetch_horizon(&self) -> bool {
+        self.context
+            .prefetch_ceiling_date()
+            .map(|ceiling| self.partition_date > ceiling)
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_prefetch_horizon(&self) {
+        while self.partition_beyond_prefetch_horizon() {
+            let notified = self.context.frontier_advanced();
+            if !self.partition_beyond_prefetch_horizon() {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    /// Clamp a fetch window to the prefetch horizon. Returns `None` when the
+    /// entire window is beyond the horizon (skip the provider call). Local
+    /// Iceberg reads use the unclamped window so warm cache stays fast.
+    fn clamp_fetch_window(
+        &self,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
+        let Some(ceiling) = self.context.prefetch_ceiling_date() else {
+            return Some((window_start, window_end));
+        };
+        if window_start > ceiling {
+            return None;
+        }
+        Some((window_start, window_end.min(ceiling)))
     }
 
     async fn send_pending(
@@ -484,12 +640,46 @@ impl SubscriptionProducerState {
     }
 
     fn stage_loaded_points(&mut self, points: Vec<SubscriptionDataPoint>) {
-        let max_rows = self.context.options.cache_policy.max_prefetch_rows;
+        // `max_prefetch_rows` is a pathological safety valve only. It is sized far
+        // above any single partition's row count so it never truncates the rows a
+        // partition legitimately produced — dropping them here silently starves
+        // the algorithm of market/custom data. Real memory backpressure comes from
+        // the bounded producer→consumer channel (the producer blocks on a full
+        // channel) plus the partition load window, not from discarding staged rows.
+        let max_rows = self.context.effective_cache_policy().max_prefetch_rows;
         for point in points {
             let frontier_time = point.frontier_time();
+            // #region agent log
+            if matches!(point, SubscriptionDataPoint::CustomData { .. })
+                && self
+                    .last_emitted_time
+                    .map(|last| frontier_time == last)
+                    .unwrap_or(false)
+            {
+                agent_debug_log(
+                    "initial",
+                    "H4",
+                    "crates/lean-engine/src/subscription_reader.rs:551",
+                    "staging custom row at last emitted frontier",
+                    serde_json::json!({
+                        "symbol": self.config.symbol.value,
+                        "resolution": format!("{:?}", self.config.resolution),
+                        "partition_date": self.partition_date.to_string(),
+                        "frontier_time": frontier_time.to_string(),
+                        "last_emitted_time": self.last_emitted_time.map(|time| time.to_string()),
+                        "pending_at_frontier": self.pending.iter().filter(|buffered| buffered.frontier_time() == frontier_time).count(),
+                        "prefetched_at_frontier": self.prefetched.get(&frontier_time).map(|rows| rows.len()).unwrap_or(0),
+                    }),
+                );
+            }
+            // #endregion
             if self
                 .last_emitted_time
-                .map(|last| frontier_time <= last)
+                .map(|last| {
+                    frontier_time < last
+                        || (frontier_time == last
+                            && !matches!(point, SubscriptionDataPoint::CustomData { .. }))
+                })
                 .unwrap_or(false)
             {
                 tracing::warn!(
@@ -507,7 +697,8 @@ impl SubscriptionProducerState {
             let staged_rows: usize = self.prefetched.values().map(VecDeque::len).sum();
             if staged_rows >= max_rows {
                 tracing::warn!(
-                    "subscription prefetch buffer for {} reached {} rows; keeping stream bounded",
+                    "subscription prefetch buffer for {} exceeded safety valve of {} rows; \
+                     this indicates an oversized load window, not normal operation",
                     self.config.symbol.value,
                     max_rows
                 );
@@ -614,7 +805,23 @@ impl SubscriptionProducerState {
         } else {
             DataType::TradeBar
         };
-        let (window_start, window_end) = self.cache_fill_window();
+        let (raw_start, raw_end) = self.cache_fill_window();
+        // Warm-cache fast path: probe local coverage on the full (unclamped)
+        // window first. One index probe can prove a whole year of daily data is
+        // cached, setting `cache_filled_until` far out so the producer never
+        // re-probes or touches the provider again. Clamping this probe to the
+        // prefetch horizon would force a re-probe every few days, and any
+        // clamped window with a benign coverage gap (holiday, sparse symbol)
+        // would fall through to a live provider fetch — turning a warm run
+        // into a provider crawl.
+        if self.has_local_market_window(raw_start, raw_end).await? {
+            self.cache_filled_until = Some(raw_end);
+            return Ok(Vec::new());
+        }
+        let (window_start, window_end) = match self.clamp_fetch_window(raw_start, raw_end) {
+            None => return Ok(Vec::new()),
+            Some(window) => window,
+        };
         if self
             .has_local_market_window(window_start, window_end)
             .await?
@@ -629,50 +836,42 @@ impl SubscriptionProducerState {
             end: partition_day_end(window_end),
             data_type,
         };
-
         let mut cache_filled_until = Some(window_end);
         let points = match data_type {
             DataType::TradeBar => {
-                let rows = {
-                    let _fetch_permit = self
-                        .context
-                        .market_fetch_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market fetch throttle closed")?;
-                    provider
-                        .get_history(&request)
-                        .await?
-                        .into_iter()
-                        .filter(|row| {
-                            self.trade_bar_belongs_to_window(row, window_start, window_end)
-                        })
-                        .collect::<Vec<_>>()
-                };
+                let rows = self
+                    .fetch_trade_bars_adaptive(
+                        provider.as_ref(),
+                        &request,
+                        window_start,
+                        window_end,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|row| self.trade_bar_belongs_to_window(row, window_start, window_end))
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    "provider fetch {} {:?} {:?} {}..{} rows={}",
+                    self.config.symbol.value,
+                    self.config.resolution,
+                    data_type,
+                    window_start,
+                    window_end,
+                    rows.len()
+                );
                 if self.config.resolution == Resolution::Daily {
                     cache_filled_until =
                         self.daily_fetched_trade_bars_until(&rows, window_start, window_end);
                 }
-                {
-                    let _append_permit = self
-                        .context
-                        .market_append_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market append throttle closed")?;
-                    self.context
-                        .store
-                        .append_trade_bars_unchecked(
-                            &rows,
-                            self.config.symbol.security_type(),
-                            self.config.symbol.market().as_str(),
-                            self.config.resolution,
-                            self.config.tick_type,
-                        )
-                        .await?;
-                }
+                self.context
+                    .buffer_trade_bar_cache_write(
+                        &rows,
+                        self.config.symbol.security_type(),
+                        self.config.symbol.market().as_str(),
+                        self.config.resolution,
+                        self.config.tick_type,
+                    )
+                    .await?;
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -680,46 +879,39 @@ impl SubscriptionProducerState {
                 self.trade_bars_to_points(rows, window_start, window_end)?
             }
             DataType::QuoteBar => {
-                let rows = {
-                    let _fetch_permit = self
-                        .context
-                        .market_fetch_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market fetch throttle closed")?;
-                    provider
-                        .get_quote_bars(&request)
-                        .await?
-                        .into_iter()
-                        .filter(|row| {
-                            self.quote_bar_belongs_to_window(row, window_start, window_end)
-                        })
-                        .collect::<Vec<_>>()
-                };
+                let rows = self
+                    .fetch_quote_bars_adaptive(
+                        provider.as_ref(),
+                        &request,
+                        window_start,
+                        window_end,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|row| self.quote_bar_belongs_to_window(row, window_start, window_end))
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    "provider fetch {} {:?} {:?} {}..{} rows={}",
+                    self.config.symbol.value,
+                    self.config.resolution,
+                    data_type,
+                    window_start,
+                    window_end,
+                    rows.len()
+                );
                 if self.config.resolution == Resolution::Daily {
                     cache_filled_until =
                         self.daily_fetched_quote_bars_until(&rows, window_start, window_end);
                 }
-                {
-                    let _append_permit = self
-                        .context
-                        .market_append_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market append throttle closed")?;
-                    self.context
-                        .store
-                        .append_quote_bars_unchecked(
-                            &rows,
-                            self.config.symbol.security_type(),
-                            self.config.symbol.market().as_str(),
-                            self.config.resolution,
-                            self.config.tick_type,
-                        )
-                        .await?;
-                }
+                self.context
+                    .buffer_quote_bar_cache_write(
+                        &rows,
+                        self.config.symbol.security_type(),
+                        self.config.symbol.market().as_str(),
+                        self.config.resolution,
+                        self.config.tick_type,
+                    )
+                    .await?;
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -727,40 +919,21 @@ impl SubscriptionProducerState {
                 self.quote_bars_to_points(rows, window_start, window_end)?
             }
             DataType::Tick => {
-                let rows = {
-                    let _fetch_permit = self
-                        .context
-                        .market_fetch_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market fetch throttle closed")?;
-                    provider
-                        .get_ticks(&request)
-                        .await?
-                        .into_iter()
-                        .filter(|row| self.tick_belongs_to_window(row, window_start, window_end))
-                        .collect::<Vec<_>>()
-                };
-                {
-                    let _append_permit = self
-                        .context
-                        .market_append_permits
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("market append throttle closed")?;
-                    self.context
-                        .store
-                        .append_ticks(
-                            &rows,
-                            self.config.symbol.security_type(),
-                            self.config.symbol.market().as_str(),
-                            self.config.resolution,
-                            self.config.tick_type,
-                        )
-                        .await?;
-                }
+                let rows = self
+                    .fetch_ticks_adaptive(provider.as_ref(), &request, window_start, window_end)
+                    .await?
+                    .into_iter()
+                    .filter(|row| self.tick_belongs_to_window(row, window_start, window_end))
+                    .collect::<Vec<_>>();
+                self.context
+                    .buffer_tick_cache_write(
+                        &rows,
+                        self.config.symbol.security_type(),
+                        self.config.symbol.market().as_str(),
+                        self.config.resolution,
+                        self.config.tick_type,
+                    )
+                    .await?;
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -771,6 +944,89 @@ impl SubscriptionProducerState {
         };
         self.cache_filled_until = cache_filled_until;
         Ok(points)
+    }
+
+    async fn fetch_trade_bars_adaptive(
+        &self,
+        provider: &dyn IHistoryProvider,
+        request: &HistoryRequest,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        let mut rows = Vec::new();
+        let mut pending = vec![(window_start, window_end)];
+        while let Some((start, end)) = pending.pop() {
+            let segment = history_request_for_window(request, start, end);
+            match self.context.fetch_trade_bars(provider, &segment).await {
+                Ok(mut segment_rows) => rows.append(&mut segment_rows),
+                Err(error) if self.should_split_provider_window(&error, start, end) => {
+                    push_split_windows(&mut pending, start, end);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn fetch_quote_bars_adaptive(
+        &self,
+        provider: &dyn IHistoryProvider,
+        request: &HistoryRequest,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let mut rows = Vec::new();
+        let mut pending = vec![(window_start, window_end)];
+        while let Some((start, end)) = pending.pop() {
+            let segment = history_request_for_window(request, start, end);
+            match self.context.fetch_quote_bars(provider, &segment).await {
+                Ok(mut segment_rows) => rows.append(&mut segment_rows),
+                Err(error) if self.should_split_provider_window(&error, start, end) => {
+                    push_split_windows(&mut pending, start, end);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn fetch_ticks_adaptive(
+        &self,
+        provider: &dyn IHistoryProvider,
+        request: &HistoryRequest,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<Tick>> {
+        let mut rows = Vec::new();
+        let mut pending = vec![(window_start, window_end)];
+        while let Some((start, end)) = pending.pop() {
+            let segment = history_request_for_window(request, start, end);
+            match self.context.fetch_ticks(provider, &segment).await {
+                Ok(mut segment_rows) => rows.append(&mut segment_rows),
+                Err(error) if self.should_split_provider_window(&error, start, end) => {
+                    push_split_windows(&mut pending, start, end);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(rows)
+    }
+
+    fn should_split_provider_window(
+        &self,
+        error: &anyhow::Error,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> bool {
+        if !DataFeedContext::is_retryable_provider_error(error) || window_start >= window_end {
+            return false;
+        }
+        let min_days = self
+            .context
+            .provider_backoff_policy()
+            .recursive_split_min_days
+            .max(2);
+        window_end.signed_duration_since(window_start).num_days() + 1 >= min_days
     }
 
     async fn persist_crypto_future_derived_data(
@@ -794,9 +1050,18 @@ impl SubscriptionProducerState {
             ..base_request.clone()
         };
 
-        let contexts = provider.get_perpetual_contexts(&context_request).await?;
-        let margin_rates = provider.get_margin_interest_rates(&margin_request).await?;
-        let open_interest_ticks = provider.get_ticks(&open_interest_request).await?;
+        let contexts = self
+            .context
+            .fetch_perpetual_contexts(provider, &context_request)
+            .await?;
+        let margin_rates = self
+            .context
+            .fetch_margin_interest_rates(provider, &margin_request)
+            .await?;
+        let open_interest_ticks = self
+            .context
+            .fetch_ticks(provider, &open_interest_request)
+            .await?;
 
         let _append_permit = self
             .context
@@ -1265,8 +1530,9 @@ impl SubscriptionProducerState {
         let Some(provider) = self.context.history_provider.as_ref() else {
             return Ok(Vec::new());
         };
-        rows = provider
-            .get_option_eod_bars(&metadata.underlying_ticker, date)
+        rows = self
+            .context
+            .fetch_option_eod_bars(provider.as_ref(), &metadata.underlying_ticker, date)
             .await
             .map_err(|error| lean_core::LeanError::DataError(error.to_string()))?;
         if !rows.is_empty() {
@@ -1305,7 +1571,11 @@ impl SubscriptionProducerState {
             .await?;
         if bars.is_empty() {
             if let Some(provider) = self.context.history_provider.as_ref() {
-                bars = provider.get_history(&request).await.unwrap_or_default();
+                bars = self
+                    .context
+                    .fetch_trade_bars(provider.as_ref(), &request)
+                    .await
+                    .unwrap_or_default();
                 if !bars.is_empty() {
                     self.context
                         .store
@@ -1366,6 +1636,36 @@ impl SubscriptionProducerState {
     }
 
     async fn load_custom_partition(&mut self) -> LeanResult<LoadedPartition> {
+        if !self.custom_overflow.is_empty() {
+            let overflow_before = self.custom_overflow.len();
+            let drained = drain_subscription_points_chunk(
+                &mut self.custom_overflow,
+                CUSTOM_PARTITION_STAGE_CHUNK_ROWS,
+            );
+            // #region agent log
+            agent_debug_log(
+                "initial",
+                "H1,H2",
+                "crates/lean-engine/src/subscription_reader.rs:1438",
+                "draining custom overflow chunk",
+                serde_json::json!({
+                    "symbol": self.config.symbol.value,
+                    "resolution": format!("{:?}", self.config.resolution),
+                    "partition_date": self.partition_date.to_string(),
+                    "returned_through_date": self.partition_date.to_string(),
+                    "overflow_before": overflow_before,
+                    "drained_points": drained.len(),
+                    "overflow_after": self.custom_overflow.len(),
+                    "first_frontier": drained.first().map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                    "last_frontier": drained.last().map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                }),
+            );
+            // #endregion
+            return Ok(LoadedPartition {
+                points: drained,
+                through_date: self.partition_date,
+            });
+        }
         let Some(custom) = self.config.custom.as_ref() else {
             return Ok(LoadedPartition {
                 points: Vec::new(),
@@ -1374,11 +1674,41 @@ impl SubscriptionProducerState {
         };
         let source_type = custom.source_type.clone();
         let ticker = custom.ticker.clone();
-        let (window_start, window_end) = if self.config.resolution == Resolution::Daily {
+        let (window_start, raw_window_end) = if self.config.resolution == Resolution::Daily {
             (self.partition_date, self.partition_date)
         } else {
             self.cache_fill_window()
         };
+        let window_end = self
+            .context
+            .prefetch_ceiling_date()
+            .map(|ceiling| raw_window_end.min(ceiling))
+            .unwrap_or(raw_window_end);
+        // #region agent log
+        agent_debug_log(
+            "initial",
+            "H3,H5",
+            "crates/lean-engine/src/subscription_reader.rs:1477",
+            "loading custom partition window",
+            serde_json::json!({
+                "symbol": self.config.symbol.value,
+                "source_type": source_type,
+                "ticker": ticker,
+                "resolution": format!("{:?}", self.config.resolution),
+                "partition_date": self.partition_date.to_string(),
+                "window_start": window_start.to_string(),
+                "raw_window_end": raw_window_end.to_string(),
+                "window_end": window_end.to_string(),
+                "prefetch_ceiling": self.context.prefetch_ceiling_date().map(|date| date.to_string()),
+            }),
+        );
+        // #endregion
+        if window_start > window_end {
+            return Ok(LoadedPartition {
+                points: Vec::new(),
+                through_date: raw_window_end,
+            });
+        }
         let us_equity_hours = ExchangeHours::us_equity();
         let mut date = window_start;
         let mut has_open_date = false;
@@ -1422,20 +1752,23 @@ impl SubscriptionProducerState {
             )
             .await
             .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
-        // Cache coverage is about source/ticker/window existence, not whether
-        // the current dynamic query happens to match rows. A query can
-        // legitimately select zero rows from a populated Iceberg window; that is
-        // still a cache hit and must not fall through to the provider.
+        // Cache coverage must reflect rows whose event time actually falls in the
+        // requested window. Iceberg `day` partitions can be stale when older cache
+        // writes kept `point.time` at the fetch source date while `end_time` carried
+        // the real event timestamp — scanning by day alone then creates false cache
+        // hits and skips the provider even though nothing is deliverable.
         let cache_has_window_data = if points.is_empty() {
-            !self
-                .context
+            self.context
                 .store
                 .scan_custom_points_range(&source_type, &ticker, window_start, window_end)
                 .await
                 .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?
-                .is_empty()
+                .iter()
+                .any(|point| custom_point_in_date_window(point, window_start, window_end))
         } else {
-            true
+            points
+                .iter()
+                .any(|point| custom_point_in_date_window(point, window_start, window_end))
         };
         let custom_source = self
             .context
@@ -1462,11 +1795,8 @@ impl SubscriptionProducerState {
         // Incremental per-day sources must refetch any date missing from Iceberg
         // even when another date exists.
         let should_fetch = self.context.options.fetch_missing_custom_data
-            && if is_full_history {
-                !cache_has_window_data && !self.custom_history_fetched && !window_dates_empty
-            } else {
-                !cache_has_window_data && !window_dates_empty
-            };
+            && !cache_has_window_data
+            && !window_dates_empty;
         if should_fetch {
             let custom_metadata = custom.clone();
             match self
@@ -1480,6 +1810,7 @@ impl SubscriptionProducerState {
                         .await
                         .map_err(|e| lean_core::LeanError::DataError(e.to_string()))?;
                     if is_full_history {
+                        self.custom_history_fetched = true;
                         points = self
                             .context
                             .store
@@ -1506,32 +1837,89 @@ impl SubscriptionProducerState {
                         date = date.succ_opt().unwrap_or(date);
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // A full-history fetch that found nothing must still count
+                    // as done: leaving the flag unset re-triggers the whole
+                    // multi-year enumeration on every subsequent partition,
+                    // turning one empty result into an O(days) fetch storm.
+                    self.custom_history_fetched = true;
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        "failed to fetch custom data {} {} on {}: {:#}",
-                        source_type,
-                        ticker,
-                        self.partition_date,
-                        error
-                    );
+                    if is_full_history {
+                        self.custom_history_fetched = true;
+                        tracing::warn!(
+                            "full custom history fetch for {} {} failed; further fetches disabled for this run: {:#}",
+                            source_type,
+                            ticker,
+                            error
+                        );
+                    } else {
+                        tracing::warn!(
+                            "failed to fetch custom data {} {} on {}: {:#}",
+                            source_type,
+                            ticker,
+                            self.partition_date,
+                            error
+                        );
+                    }
                 }
             }
         }
         let through_date = window_end;
+        let stale_cached_rows = points.len();
         let mut out = Vec::new();
-        for point in points {
-            if !custom_point_matches_query(&point, &query) {
+        for point in &points {
+            if !custom_point_matches_query(point, &query) {
                 continue;
             }
             let data_point = SubscriptionDataPoint::CustomData {
                 symbol: self.config.symbol.clone(),
                 ticker: ticker.clone(),
-                point,
+                point: point.clone(),
             };
             if data_point.frontier_time() >= self.start && data_point.frontier_time() <= self.end {
                 out.push(data_point);
             }
+        }
+        if out.is_empty()
+            && stale_cached_rows > 0
+            && points
+                .iter()
+                .any(|point| custom_point_in_session_window(point, self.start, self.end))
+        {
+            tracing::warn!(
+                "custom data {} {} on {} had {} cached rows but none mapped to subscription points",
+                source_type,
+                ticker,
+                self.partition_date,
+                stale_cached_rows
+            );
+        }
+        if out.len() > CUSTOM_PARTITION_STAGE_CHUNK_ROWS {
+            let overflow_rows = out.len() - CUSTOM_PARTITION_STAGE_CHUNK_ROWS;
+            // #region agent log
+            agent_debug_log(
+                "initial",
+                "H1,H3",
+                "crates/lean-engine/src/subscription_reader.rs:1680",
+                "custom partition overflow created",
+                serde_json::json!({
+                    "symbol": self.config.symbol.value,
+                    "resolution": format!("{:?}", self.config.resolution),
+                    "partition_date": self.partition_date.to_string(),
+                    "through_date": through_date.to_string(),
+                    "output_rows_before_split": out.len(),
+                    "staged_chunk_rows": CUSTOM_PARTITION_STAGE_CHUNK_ROWS,
+                    "overflow_rows": overflow_rows,
+                    "first_frontier": out.first().map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                    "chunk_last_frontier": out.get(CUSTOM_PARTITION_STAGE_CHUNK_ROWS - 1).map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                    "overflow_first_frontier": out.get(CUSTOM_PARTITION_STAGE_CHUNK_ROWS).map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                    "last_frontier": out.last().map(SubscriptionDataPoint::frontier_time).map(|time| time.to_string()),
+                }),
+            );
+            // #endregion
+            self.custom_overflow
+                .extend(out.drain(CUSTOM_PARTITION_STAGE_CHUNK_ROWS..));
         }
         Ok(LoadedPartition {
             points: out,
@@ -1563,43 +1951,115 @@ impl SubscriptionProducerState {
             config.query = custom.config.query.merge(&custom.dynamic_query);
             if config.query.start_date.is_none() {
                 config.query.start_date = Some(self.start.date_utc());
-            };
+            }
             if config.query.end_date.is_none() {
                 config.query.end_date = Some(self.end.date_utc());
             }
+            // The resolved window drives how many per-day objects a plugin
+            // enumerates; an unexpectedly wide window (e.g. a degenerate reader
+            // start) turns the first fetch into an hours-long listing, so make
+            // it visible.
+            tracing::info!(
+                "fetching full custom history {}/{}: {} -> {}",
+                custom.source_type,
+                custom.ticker,
+                config
+                    .query
+                    .start_date
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "unset".into()),
+                config
+                    .query
+                    .end_date
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "unset".into()),
+            );
 
-            let points = if let Some(result) = source.history(&custom.ticker, &config) {
+            // `ICustomDataSource::history`/`history_sources` are deliberately
+            // synchronous (simpler ABI for plugin authors), and some plugins do
+            // blocking network I/O inside them (e.g. paginated S3 listings,
+            // scraping a full options-curve history). Run them on the blocking
+            // thread pool so they never tie up an async runtime worker thread
+            // and stall unrelated subscription fetches.
+            let blocking_source = source.clone();
+            let blocking_ticker = custom.ticker.clone();
+            let blocking_config = config.clone();
+            let history_result = tokio::task::spawn_blocking(move || {
+                blocking_source.history(&blocking_ticker, &blocking_config)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("custom history task panicked: {error}"))?;
+
+            let points = if let Some(result) = history_result {
                 result.map_err(|error| anyhow::anyhow!(error))?
-            } else if let Some(result) = source.history_sources(&custom.ticker, &config) {
-                let mut out = Vec::new();
-                for (source_date, data_source) in result.map_err(|error| anyhow::anyhow!(error))? {
-                    out.extend(
-                        read_custom_source_points(
-                            source.as_ref(),
-                            data_source,
-                            source_date,
-                            &config,
-                            true,
-                        )
-                        .await?,
-                    );
-                }
-                out
-            } else if let Some(data_source) =
-                source.get_source(&custom.ticker, window_start, &config)
-            {
-                read_custom_source_points(source.as_ref(), data_source, window_start, &config, true)
-                    .await?
             } else {
-                Vec::new()
-            };
+                let blocking_source = source.clone();
+                let blocking_ticker = custom.ticker.clone();
+                let blocking_config = config.clone();
+                let history_sources_result = tokio::task::spawn_blocking(move || {
+                    blocking_source.history_sources(&blocking_ticker, &blocking_config)
+                })
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("custom history_sources task panicked: {error}")
+                })?;
 
-            // Only mark full-history sources fetched after we actually persisted rows.
-            // TradeAlert-style per-day S3 listings legitimately return empty for dates
-            // before dataset inception; marking fetched on empty would skip 2021+ data.
-            if !points.is_empty() {
-                self.custom_history_fetched = true;
-            }
+                if let Some(result) = history_sources_result {
+                    let sources = result.map_err(|error| anyhow::anyhow!(error))?;
+                    // A full-history source can return thousands of individual
+                    // per-day/per-minute file descriptors (e.g. Unusual
+                    // Whales' 1-minute parquet objects); fetching them one at
+                    // a time serially made this the dominant cost of loading
+                    // the first custom subscription. `buffered` runs many
+                    // fetches concurrently while still flattening results in
+                    // the original (date-ordered) sequence, matching the
+                    // determinism requirements of the daily-window fetch path
+                    // above.
+                    let fetch_permits = self.context.custom_fetch_permits.clone();
+                    let concurrency = self
+                        .context
+                        .effective_cache_policy()
+                        .channel_capacity()
+                        .min(32);
+                    let out: Vec<Vec<CustomDataPoint>> = stream::iter(sources)
+                        .map(|(source_date, data_source)| {
+                            let source = source.clone();
+                            let config = config.clone();
+                            let fetch_permits = fetch_permits.clone();
+                            async move {
+                                let _permit = fetch_permits
+                                    .acquire_owned()
+                                    .await
+                                    .context("custom fetch throttle closed")?;
+                                read_custom_source_points(
+                                    source.as_ref(),
+                                    data_source,
+                                    source_date,
+                                    &config,
+                                    true,
+                                )
+                                .await
+                            }
+                        })
+                        .buffered(concurrency)
+                        .try_collect()
+                        .await?;
+                    out.into_iter().flatten().collect()
+                } else if let Some(data_source) =
+                    source.get_source(&custom.ticker, window_start, &config)
+                {
+                    read_custom_source_points(
+                        source.as_ref(),
+                        data_source,
+                        window_start,
+                        &config,
+                        true,
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                }
+            };
 
             // Return the whole fetched series/window so the caller persists it to
             // Iceberg. `load_custom_partition` filters emitted rows to the current
@@ -1612,25 +2072,55 @@ impl SubscriptionProducerState {
                 .collect());
         }
 
-        let mut out = Vec::new();
-        let mut date = window_start;
         let mut fetch_config = custom.config.clone();
         fetch_config.query = fetch_config.query.merge(&custom.dynamic_query);
-        while date <= window_end {
-            if let Some(data_source) = source.get_source(&custom.ticker, date, &fetch_config) {
-                out.extend(
-                    read_custom_source_points(
-                        source.as_ref(),
-                        data_source,
-                        date,
-                        &fetch_config,
-                        false,
-                    )
-                    .await?,
-                );
-            }
+        let fetch_ceiling = self.context.prefetch_ceiling_date();
+        let effective_end = fetch_ceiling
+            .map(|ceiling| window_end.min(ceiling))
+            .unwrap_or(window_end);
+        let mut dates = Vec::new();
+        let mut date = window_start;
+        while date <= effective_end {
+            dates.push(date);
             date = date.succ_opt().unwrap_or(date);
         }
+        let fetch_permits = self.context.custom_fetch_permits.clone();
+        let ticker = custom.ticker.clone();
+        let out = stream::iter(dates)
+            .map(|date| {
+                let source = source.clone();
+                let config = fetch_config.clone();
+                let fetch_permits = fetch_permits.clone();
+                let ticker = ticker.clone();
+                async move {
+                    let Some(data_source) = source.get_source(&ticker, date, &config) else {
+                        return Ok(Vec::new());
+                    };
+                    let _permit = fetch_permits
+                        .acquire_owned()
+                        .await
+                        .context("custom fetch throttle closed")?;
+                    read_custom_source_points(source.as_ref(), data_source, date, &config, false)
+                        .await
+                }
+            })
+            // `buffered` (not `buffer_unordered`): fetches run concurrently but
+            // results flatten in date order. Strategies consume sweep rows in
+            // FIFO order, so completion-order flattening makes backtests
+            // nondeterministic.
+            .buffered(
+                self.context
+                    .effective_cache_policy()
+                    .channel_capacity()
+                    .min(32),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(out)
     }
 
@@ -1801,7 +2291,17 @@ impl SubscriptionProducerState {
     }
 
     fn cache_fill_window(&self) -> (chrono::NaiveDate, chrono::NaiveDate) {
-        let intervals = self.context.options.cache_policy.prefetch_intervals.max(1);
+        // Load-window size only controls how many dates a single partition read
+        // covers; the producer loop advances through every date regardless, so
+        // this does not drop data. Memory is bounded by the producer→consumer
+        // channel (the producer blocks on a full channel), NOT by shrinking this
+        // window. Shrinking it fragments Iceberg reads into tiny per-day queries
+        // that miss the warm cache and trigger live provider re-fetches — a large
+        // throughput regression — while saving negligible RAM (Daily is ~252
+        // bars/symbol/year; Minute already loads only same-day here). Keep the
+        // wide windows that let a warm cache satisfy reads in bulk.
+        let policy = self.context.effective_cache_policy();
+        let intervals = policy.prefetch_intervals.max(1);
         let mut start = self.partition_date;
         let mut end = match self.config.resolution {
             Resolution::Daily => add_years_saturating(start, intervals as i32),
@@ -1912,6 +2412,7 @@ async fn read_custom_source_points(
                 date,
                 &data_source.uri,
                 &value_column_refs,
+                data_source.symbol_column.as_deref(),
             )
         }
     }
@@ -1960,19 +2461,38 @@ fn custom_data_http_client() -> reqwest::Client {
         .clone()
 }
 
+fn custom_data_frontier(point: &CustomDataPoint) -> DateTime {
+    point.end_time.unwrap_or_else(|| {
+        point
+            .time
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .into()
+    })
+}
+
+fn custom_point_in_date_window(
+    point: &CustomDataPoint,
+    window_start: chrono::NaiveDate,
+    window_end: chrono::NaiveDate,
+) -> bool {
+    let date = custom_data_frontier(point).date_utc();
+    date >= window_start && date <= window_end
+}
+
+fn custom_point_in_session_window(point: &CustomDataPoint, start: DateTime, end: DateTime) -> bool {
+    let frontier = custom_data_frontier(point);
+    frontier >= start && frontier <= end
+}
+
 fn custom_point_matches_query(point: &CustomDataPoint, query: &CustomDataQuery) -> bool {
     if let Some(symbols) = &query.symbols {
-        let Some(usymbol) = point
-            .fields
-            .get("usymbol")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_ascii_uppercase())
-        else {
+        let Some(point_symbol) = point.symbol.as_deref() else {
             return false;
         };
         if !symbols
             .iter()
-            .any(|symbol| symbol.eq_ignore_ascii_case(&usymbol))
+            .any(|symbol| symbol.eq_ignore_ascii_case(point_symbol))
         {
             return false;
         }
@@ -2355,7 +2875,9 @@ fn fill_forward_point(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_feed::{DataFeedContext, DataFeedOptions, SubscriptionCachePolicy};
+    use crate::data_feed::{
+        DataFeedContext, DataFeedOptions, ProviderBackoffPolicy, SubscriptionCachePolicy,
+    };
     use async_trait::async_trait;
     use chrono::{NaiveDate, TimeZone, Utc};
     use lean_core::{DataNormalizationMode, Market, Resolution, Symbol, TimeSpan};
@@ -2366,7 +2888,7 @@ mod tests {
     use lean_data_providers::{
         CustomDataContext, HistoryRequest, ICustomDataSource, IHistoryProvider,
     };
-    use lean_storage::IcebergStore;
+    use lean_storage::{FactorFileEntry, IcebergStore, MapFileEntry};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::sync::{
@@ -2401,7 +2923,9 @@ mod tests {
         DataFeedContext::new(store).with_options(DataFeedOptions {
             cache_policy: SubscriptionCachePolicy {
                 prefetch_intervals: 1,
-                max_prefetch_rows: 16,
+                max_prefetch_rows: 100_000,
+                channel_capacity: 16,
+                max_prefetch_ahead_days: 365,
             },
             fetch_missing_custom_data: true,
             ..Default::default()
@@ -2427,12 +2951,11 @@ mod tests {
             _config: &CustomDataConfig,
         ) -> Option<Result<Vec<CustomDataPoint>, String>> {
             let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
-            Some(Ok(vec![CustomDataPoint {
-                time: day,
-                end_time: Some(dt(day, 16, 0)),
-                value: dec!(42),
-                fields: std::collections::HashMap::new(),
-            }]))
+            Some(Ok(vec![CustomDataPoint::empty(
+                day,
+                Some(dt(day, 16, 0)),
+                dec!(42),
+            )]))
         }
     }
 
@@ -2482,6 +3005,92 @@ mod tests {
             } else {
                 Ok(Vec::new())
             }
+        }
+    }
+
+    struct SplitOnLargeWindowProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for SplitOnLargeWindowProvider {
+        async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let start = request.start.date_utc();
+            let end = request.end.date_utc();
+            if end.signed_duration_since(start).num_days() + 1 > 1 {
+                anyhow::bail!("provider overloaded by request window")
+            }
+            Ok(vec![daily_trade_bar_start_dated(
+                request.symbol.clone(),
+                start,
+                start.day() as i64,
+            )])
+        }
+    }
+
+    struct RetryThenSucceedProvider {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        failures_remaining: AtomicUsize,
+        calls: AtomicUsize,
+        symbol: Symbol,
+        day: NaiveDate,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for RetryThenSucceedProvider {
+        async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now_active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                anyhow::bail!("temporary provider overload")
+            }
+            if request.symbol.id.sid == self.symbol.id.sid {
+                Ok(vec![daily_trade_bar_start_dated(
+                    self.symbol.clone(),
+                    self.day,
+                    99,
+                )])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    struct FlakyCorporateActionProvider {
+        factor_calls: AtomicUsize,
+        map_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for FlakyCorporateActionProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+            if self.factor_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("temporary provider overload")
+            }
+            Ok(vec![FactorFileEntry {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                price_factor: 1.0,
+                split_factor: 1.0,
+                reference_price: 0.0,
+            }])
+        }
+
+        async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![MapFileEntry {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                ticker: "SPY".to_string(),
+            }])
         }
     }
 
@@ -2700,6 +3309,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_loaded_points_keeps_full_partition_within_safety_valve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let context = context(store);
+        context
+            .active_subscription_count
+            .store(512, Ordering::Relaxed);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let mut stream =
+            SubscriptionProducerState::new(config, context, dt(day, 0, 0), dt(day, 23, 59));
+
+        // A full minute session (390 bars) must be staged in its entirety even
+        // for a large universe; truncation here would drop real market data.
+        let bars = (0..390)
+            .map(|i| {
+                let hour = 14 + (i / 60);
+                let minute = i % 60;
+                trade_bar(
+                    stream.config.symbol.clone(),
+                    day,
+                    hour as u32,
+                    minute as u32,
+                    10 + i as i64,
+                )
+            })
+            .map(SubscriptionDataPoint::TradeBar)
+            .collect::<Vec<_>>();
+        stream.stage_loaded_points(bars);
+        let staged: usize = stream.prefetched.values().map(VecDeque::len).sum();
+        assert_eq!(
+            staged, 390,
+            "full session must be retained; large universes must not drop staged rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_loaded_points_allows_same_frontier_custom_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol =
+            Symbol::create_with_security_type("SNAPSHOT", SecurityType::Base, Some(Market::usa()));
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "fixture".to_string(),
+            ticker: "SNAPSHOT".to_string(),
+            config: CustomDataConfig {
+                ticker: "SNAPSHOT".to_string(),
+                source_type: "fixture".to_string(),
+                resolution: Resolution::Daily,
+                properties: std::collections::HashMap::new(),
+                query: CustomDataQuery::default(),
+            },
+            dynamic_query: CustomDataQuery::default(),
+        };
+        let config =
+            SubscriptionDataConfig::new_custom(symbol.clone(), Resolution::Daily, metadata);
+        let mut stream =
+            SubscriptionProducerState::new(config, context(store), dt(day, 0, 0), dt(day, 23, 59));
+        let first = SubscriptionDataPoint::CustomData {
+            symbol: symbol.clone(),
+            ticker: "SNAPSHOT".to_string(),
+            point: CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(1)),
+        };
+        let second = SubscriptionDataPoint::CustomData {
+            symbol,
+            ticker: "SNAPSHOT".to_string(),
+            point: CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(2)),
+        };
+
+        stream.stage_loaded_points(vec![first, second]);
+
+        let staged: usize = stream.prefetched.values().map(VecDeque::len).sum();
+        assert_eq!(staged, 2);
+    }
+
+    #[tokio::test]
+    async fn daily_prefetch_uses_wide_window_regardless_of_universe_size() {
+        // The daily load window must stay wide even for large universes so a warm
+        // Iceberg cache can satisfy reads in bulk. Shrinking it fragmented reads
+        // into per-day queries that missed the cache and forced live provider
+        // re-fetches (a large throughput regression). Memory is bounded by the
+        // producer→consumer channel, not by this window.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let context = context(store);
+        context
+            .active_subscription_count
+            .store(256, Ordering::Relaxed);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let start = NaiveDate::from_ymd_opt(2022, 1, 3).unwrap();
+        // Run end sits within the one-year window, so the window clamps to it.
+        let run_end = NaiveDate::from_ymd_opt(2022, 2, 1).unwrap();
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Daily,
+            DataNormalizationMode::Raw,
+        );
+        let stream =
+            SubscriptionProducerState::new(config, context, dt(start, 0, 0), dt(run_end, 23, 59));
+        let (_, end) = stream.cache_fill_window();
+        assert_eq!(
+            end, run_end,
+            "daily window must span far ahead (clamped to run end), not a narrow slice"
+        );
+    }
+
+    #[tokio::test]
     async fn prefetch_does_not_make_future_frontier_visible() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
@@ -2744,6 +3466,84 @@ mod tests {
             stream.pending.front().unwrap().frontier_time(),
             bars[1].end_time
         );
+    }
+
+    #[test]
+    fn clamp_fetch_window_skips_remote_fetch_beyond_horizon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(IcebergStore::connect_local(tmp.path()))
+                .unwrap(),
+        );
+        let context = context(store);
+        context
+            .active_subscription_count
+            .store(300, Ordering::Relaxed); // 7-day horizon
+        let frontier = NaiveDate::from_ymd_opt(2022, 1, 5).unwrap();
+        context.observe_consumer_frontier(frontier);
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let stream = SubscriptionProducerState::new(
+            config,
+            context,
+            dt(frontier, 0, 0),
+            dt(NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(), 23, 59),
+        );
+
+        // Within horizon: clamped but fetchable.
+        let within = stream
+            .clamp_fetch_window(frontier, frontier + chrono::Duration::days(10))
+            .expect("partial overlap");
+        assert_eq!(within.0, frontier);
+        assert_eq!(within.1, frontier + chrono::Duration::days(7));
+
+        // Entirely beyond horizon: no remote fetch.
+        let far = frontier + chrono::Duration::days(60);
+        assert!(stream
+            .clamp_fetch_window(far, far + chrono::Duration::days(5))
+            .is_none());
+    }
+
+    #[test]
+    fn partition_beyond_horizon_only_when_past_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(IcebergStore::connect_local(tmp.path()))
+                .unwrap(),
+        );
+        let context = context(store);
+        context
+            .active_subscription_count
+            .store(4, Ordering::Relaxed);
+        let frontier = NaiveDate::from_ymd_opt(2022, 1, 5).unwrap();
+        context.observe_consumer_frontier(frontier);
+
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let mut stream = SubscriptionProducerState::new(
+            config,
+            context,
+            dt(frontier, 0, 0),
+            dt(NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(), 23, 59),
+        );
+        stream.partition_date = frontier + chrono::Duration::days(10);
+        assert!(!stream.partition_beyond_prefetch_horizon());
+
+        stream.partition_date = frontier + chrono::Duration::days(400);
+        assert!(stream.partition_beyond_prefetch_horizon());
     }
 
     #[tokio::test]
@@ -2995,18 +3795,8 @@ mod tests {
                 "fixture",
                 "ALT",
                 &[
-                    CustomDataPoint {
-                        time: first_day,
-                        end_time: Some(dt(first_day, 16, 0)),
-                        value: dec!(10),
-                        fields: std::collections::HashMap::new(),
-                    },
-                    CustomDataPoint {
-                        time: second_day,
-                        end_time: Some(dt(second_day, 16, 0)),
-                        value: dec!(11),
-                        fields: std::collections::HashMap::new(),
-                    },
+                    CustomDataPoint::empty(first_day, Some(dt(first_day, 16, 0)), dec!(10)),
+                    CustomDataPoint::empty(second_day, Some(dt(second_day, 16, 0)), dec!(11)),
                 ],
             )
             .await
@@ -3058,12 +3848,7 @@ mod tests {
             .append_custom_points(
                 "fixture",
                 "ALT",
-                &[CustomDataPoint {
-                    time: day,
-                    end_time: Some(dt(day, 16, 0)),
-                    value: dec!(10),
-                    fields: std::collections::HashMap::new(),
-                }],
+                &[CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(10))],
             )
             .await
             .unwrap();
@@ -3122,12 +3907,10 @@ mod tests {
             .append_custom_points(
                 "fixture",
                 "ALT",
-                &[CustomDataPoint {
-                    time: day,
-                    end_time: Some(dt(day, 16, 0)),
-                    value: dec!(10),
-                    fields,
-                }],
+                &[
+                    CustomDataPoint::new(day, Some(dt(day, 16, 0)), dec!(10), fields)
+                        .with_symbol(Some("AAPL".to_string())),
+                ],
             )
             .await
             .unwrap();
@@ -3257,6 +4040,115 @@ mod tests {
         assert!(
             stream.pop_next().await.unwrap().is_none(),
             "provider fetch errors are warnings so missing local data remains an empty stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_overload_splits_window_and_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let start = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(SplitOnLargeWindowProvider {
+            calls: calls.clone(),
+        });
+        let context = context(store).with_history_provider(Some(provider));
+        let mut stream = SubscriptionStream::new(
+            SubscriptionDataConfig::new_equity(
+                symbol,
+                Resolution::Daily,
+                DataNormalizationMode::Raw,
+            ),
+            context,
+            dt(start, 0, 0),
+            dt(end, 23, 59),
+        );
+
+        let mut emitted = Vec::new();
+        while let Some(point) = stream.pop_next().await.unwrap() {
+            emitted.push(point);
+        }
+
+        assert_eq!(emitted.len(), 2);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "expected initial overloaded request plus split child requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_retry_uses_existing_fetch_semaphore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let provider = Arc::new(RetryThenSucceedProvider {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(1),
+            calls: AtomicUsize::new(0),
+            symbol: symbol.clone(),
+            day,
+        });
+        let context = DataFeedContext::new(store).with_options(DataFeedOptions {
+            cache_policy: SubscriptionCachePolicy {
+                prefetch_intervals: 1,
+                max_prefetch_rows: 100_000,
+                channel_capacity: 16,
+                max_prefetch_ahead_days: 365,
+            },
+            fetch_missing_custom_data: true,
+            max_concurrent_market_fetches: 1,
+            provider_backoff: ProviderBackoffPolicy {
+                max_attempts: 2,
+                initial_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+                recursive_split_min_days: 2,
+            },
+            ..Default::default()
+        });
+        let context = context.with_history_provider(Some(provider.clone()));
+        let mut stream = SubscriptionStream::new(
+            SubscriptionDataConfig::new_equity(
+                symbol,
+                Resolution::Daily,
+                DataNormalizationMode::Raw,
+            ),
+            context,
+            dt(day, 0, 0),
+            dt(day, 23, 59),
+        );
+
+        let point = stream.pop_next().await.unwrap().expect("daily bar");
+        assert_eq!(point.frontier_time(), dt(day, 16, 0));
+        assert_eq!(provider.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn corporate_action_fetch_retries_after_transient_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let provider = Arc::new(FlakyCorporateActionProvider {
+            factor_calls: AtomicUsize::new(0),
+            map_calls: AtomicUsize::new(0),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider.clone()));
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        let factors = store.scan_factor_file("usa", "SPY").await.unwrap();
+        let maps = store.scan_map_file("usa", "SPY").await.unwrap();
+
+        assert_eq!(factors.len(), 1);
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            provider.factor_calls.load(Ordering::SeqCst),
+            2,
+            "generic retry should recover without a process-global attempt cache"
         );
     }
 
@@ -3410,5 +4302,38 @@ mod tests {
         stream.maybe_stage_fill_forward(last.end_time + TimeSpan::from_days(4));
 
         assert!(stream.prefetched.is_empty());
+    }
+
+    #[test]
+    fn custom_point_matches_query_filters_on_point_symbol() {
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+        let point = CustomDataPoint::new(
+            day,
+            Some(dt(day, 16, 0)),
+            dec!(1),
+            std::collections::HashMap::new(),
+        )
+        .with_symbol(Some("AAPL".to_string()));
+
+        let matching = CustomDataQuery {
+            symbols: Some(vec!["aapl".to_string()]),
+            ..Default::default()
+        };
+        assert!(custom_point_matches_query(&point, &matching));
+
+        let non_matching = CustomDataQuery {
+            symbols: Some(vec!["MSFT".to_string()]),
+            ..Default::default()
+        };
+        assert!(!custom_point_matches_query(&point, &non_matching));
+
+        // A point without a canonical symbol never matches a symbol filter.
+        let symbolless = CustomDataPoint::new(
+            day,
+            Some(dt(day, 16, 0)),
+            dec!(1),
+            std::collections::HashMap::new(),
+        );
+        assert!(!custom_point_matches_query(&symbolless, &matching));
     }
 }

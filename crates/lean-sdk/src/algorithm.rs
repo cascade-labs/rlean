@@ -25,8 +25,9 @@ use crate::indicators::{
 use crate::orders::{OrderTicketContext, OrderTicketHandle};
 use crate::portfolio::PortfolioView;
 use crate::securities::{
-    read_algorithm_security_price, AlgorithmSettingsHandle, OptionSecurityHandle, SecurityHandle,
-    SecurityManagerHandle, SymbolHandle,
+    read_algorithm_security_price, set_algorithm_security_price_from_float,
+    AlgorithmSettingsHandle, OptionSecurityHandle, SecurityHandle, SecurityManagerHandle,
+    SymbolHandle,
 };
 use crate::types::MovingAverageType;
 use crate::universe::{DateRulesHandle, TimeRulesHandle, UniverseSettings, UniverseSettingsHandle};
@@ -253,8 +254,25 @@ impl AlgorithmHandle {
 
     pub fn set_security_initializer(&self, _initializer: BrokerageModelSecurityInitializerHandle) {}
 
+    /// Rust equivalent of C# LEAN's `QCAlgorithm.GetLastKnownPrices(Symbol)`: a real
+    /// history-provider lookup for seeding a security's price, not a re-read of the
+    /// security's (possibly still-zero) live price.
     pub fn get_last_known_prices(&self, security: SecurityHandle) -> Option<f64> {
-        read_algorithm_security_price(&self.inner, security.symbol_inner()).ok()
+        let symbol = security.symbol_inner();
+        let resolution = {
+            let algorithm = self.inner.lock().unwrap();
+            algorithm
+                .subscription_manager
+                .get_configs_for_symbol(symbol)
+                .iter()
+                .map(|config| config.resolution)
+                .min()
+                .unwrap_or(Resolution::Minute)
+        };
+        let algorithm = self.inner.lock().unwrap();
+        self.runtime_services
+            .history_service()
+            .last_known_close_price(&algorithm, symbol, resolution)
     }
 
     pub fn set_benchmark(&self, ticker: String) {
@@ -338,7 +356,26 @@ impl AlgorithmHandle {
             }
             symbol
         };
+        self.seed_security_price_from_history(&symbol, resolution);
         SecurityHandle::new(symbol)
+    }
+
+    fn seed_security_price_from_history(&self, symbol: &Symbol, resolution: Resolution) {
+        if read_algorithm_security_price(&self.inner, symbol)
+            .map(|price| price > 0.0)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let price = {
+            let algorithm = self.inner.lock().unwrap();
+            self.runtime_services
+                .history_service()
+                .last_known_close_price(&algorithm, symbol, resolution)
+        };
+        if let Some(price) = price {
+            let _ = set_algorithm_security_price_from_float(&self.inner, symbol, price);
+        }
     }
 
     pub fn add_forex(&self, ticker: String, resolution: Resolution) -> SymbolHandle {
