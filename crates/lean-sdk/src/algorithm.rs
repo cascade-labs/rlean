@@ -124,6 +124,7 @@ impl AlgorithmConstructionContext {
         }
     }
 
+    /// Shared algorithm-settings store carried into constructed algorithm handles.
     pub fn algorithm_settings(&self) -> Arc<Mutex<crate::securities::AlgorithmSettings>> {
         self.algorithm_settings.clone()
     }
@@ -190,6 +191,10 @@ impl AlgorithmHandle {
     }
     pub fn portfolio(&self) -> PortfolioView {
         PortfolioView::from_algorithm(self.inner.clone())
+    }
+    /// Security manager bound to this algorithm for symbol lookup.
+    pub fn securities(&self) -> SecurityManagerHandle {
+        SecurityManagerHandle::new(self.inner())
     }
     pub fn universe_settings(&self) -> UniverseSettingsHandle {
         UniverseSettingsHandle::from_shared(self.universe_settings.clone())
@@ -1166,7 +1171,7 @@ impl AlgorithmHandle {
 
     #[getter(securities)]
     fn py_securities(&self) -> SecurityManagerHandle {
-        SecurityManagerHandle::new(self.inner())
+        self.securities()
     }
 
     #[getter(time)]

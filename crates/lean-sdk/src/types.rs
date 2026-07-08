@@ -358,6 +358,25 @@ impl From<SecurityType> for CoreSecurityType {
     }
 }
 
+impl From<CoreSecurityType> for SecurityType {
+    fn from(value: CoreSecurityType) -> Self {
+        match value {
+            CoreSecurityType::Base => SecurityType::Base,
+            CoreSecurityType::Equity => SecurityType::Equity,
+            CoreSecurityType::Option => SecurityType::Option,
+            CoreSecurityType::Commodity => SecurityType::Commodity,
+            CoreSecurityType::Forex => SecurityType::Forex,
+            CoreSecurityType::Future => SecurityType::Future,
+            CoreSecurityType::Cfd => SecurityType::Cfd,
+            CoreSecurityType::Crypto => SecurityType::Crypto,
+            CoreSecurityType::FutureOption => SecurityType::FutureOption,
+            CoreSecurityType::IndexOption => SecurityType::IndexOption,
+            CoreSecurityType::Index => SecurityType::Index,
+            CoreSecurityType::CryptoFuture => SecurityType::CryptoFuture,
+        }
+    }
+}
+
 impl From<DataNormalizationMode> for CoreDataNormalizationMode {
     fn from(value: DataNormalizationMode) -> Self {
         match value {

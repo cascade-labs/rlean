@@ -1103,6 +1103,16 @@ impl InsightProjection {
     pub fn score_direction_value(&self) -> Option<f64> {
         self.score_direction
     }
+
+    /// Monotonic insight identifier. Mirrors LEAN `Insight.Id`.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Insight prediction period. Mirrors LEAN `Insight.Period`.
+    pub fn period(&self) -> chrono::Duration {
+        chrono::Duration::nanoseconds(self.period_nanos)
+    }
 }
 
 #[cfg(feature = "python")]
@@ -1139,6 +1149,16 @@ impl InsightProjection {
         direction: InsightDirection,
     ) -> pyo3::PyResult<Self> {
         Self::py_price(symbol, period, direction, None, None, None, None)
+    }
+
+    #[getter(id)]
+    fn py_id(&self) -> u64 {
+        self.id()
+    }
+
+    #[getter(period)]
+    fn py_period(&self) -> chrono::Duration {
+        self.period()
     }
 
     #[getter(symbol)]

@@ -313,17 +313,53 @@ impl OrderTicketHandle {
     }
 }
 
+/// Maps a LEAN-compatible status integer to the python `OrderStatus` enum.
+#[cfg(feature = "python")]
+fn order_status_from_code(code: i64) -> crate::types::OrderStatus {
+    use crate::types::OrderStatus;
+    match code {
+        0 => OrderStatus::New,
+        1 => OrderStatus::Submitted,
+        2 => OrderStatus::PartiallyFilled,
+        3 => OrderStatus::Filled,
+        5 => OrderStatus::Canceled,
+        7 => OrderStatus::CancelPending,
+        8 => OrderStatus::UpdateSubmitted,
+        _ => OrderStatus::Invalid,
+    }
+}
+
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl OrderTicketHandle {
+    #[getter(order_id)]
+    fn py_order_id(&self) -> i64 {
+        self.order_id()
+    }
+
+    #[getter(id)]
+    fn py_id(&self) -> i64 {
+        self.id()
+    }
+
     #[getter(symbol)]
     fn py_symbol(&self) -> Option<crate::securities::SymbolHandle> {
         self.symbol().map(crate::securities::SymbolHandle::new)
     }
 
+    #[getter(status)]
+    fn py_status(&self) -> crate::types::OrderStatus {
+        order_status_from_code(self.status_code())
+    }
+
     #[getter(quantity)]
     fn py_quantity(&self) -> f64 {
         self.quantity()
+    }
+
+    #[getter(quantity_filled)]
+    fn py_quantity_filled(&self) -> f64 {
+        self.filled_quantity()
     }
 
     #[getter(average_fill_price)]
@@ -339,6 +375,36 @@ impl OrderTicketHandle {
     #[getter(stop_price)]
     fn py_stop_price(&self) -> Option<f64> {
         self.stop_price()
+    }
+
+    #[getter(tag)]
+    fn py_tag(&self) -> String {
+        self.tag()
+    }
+
+    #[pyo3(name = "get_order_events")]
+    fn py_get_order_events(&self) -> Vec<OrderEventView> {
+        self.order_events()
+    }
+
+    #[pyo3(name = "cancel", signature = (tag=None))]
+    fn py_cancel(&self, tag: Option<String>) -> bool {
+        self.cancel(tag)
+    }
+
+    #[pyo3(name = "update_limit_price", signature = (limit_price, tag=None))]
+    fn py_update_limit_price(&self, limit_price: f64, tag: Option<String>) -> bool {
+        self.update_limit_price(limit_price, tag)
+    }
+
+    #[pyo3(name = "update_stop_price", signature = (stop_price, tag=None))]
+    fn py_update_stop_price(&self, stop_price: f64, tag: Option<String>) -> bool {
+        self.update_stop_price(stop_price, tag)
+    }
+
+    #[pyo3(name = "update_tag")]
+    fn py_update_tag(&self, tag: String) -> bool {
+        self.update_tag(tag)
     }
 }
 
@@ -456,6 +522,132 @@ impl OrderEventView {
     }
     pub fn trailing_as_percentage(&self) -> bool {
         self.event.trailing_as_percentage
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl OrderEventView {
+    #[getter(order_id)]
+    fn py_order_id(&self) -> i64 {
+        self.order_id()
+    }
+
+    #[getter(id)]
+    fn py_id(&self) -> i64 {
+        self.id()
+    }
+
+    #[getter(symbol)]
+    fn py_symbol(&self) -> crate::securities::SymbolHandle {
+        crate::securities::SymbolHandle::new(self.event.symbol.clone())
+    }
+
+    #[getter(utc_time)]
+    fn py_utc_time(&self) -> chrono::NaiveDateTime {
+        lean_core::NanosecondTimestamp(self.utc_time_ns())
+            .to_utc()
+            .naive_utc()
+    }
+
+    #[getter(status)]
+    fn py_status(&self) -> crate::types::OrderStatus {
+        use lean_orders::OrderStatus as Core;
+        match self.event.status {
+            Core::New => crate::types::OrderStatus::New,
+            Core::Submitted => crate::types::OrderStatus::Submitted,
+            Core::PartiallyFilled => crate::types::OrderStatus::PartiallyFilled,
+            Core::Filled => crate::types::OrderStatus::Filled,
+            Core::Canceled => crate::types::OrderStatus::Canceled,
+            Core::None | Core::Invalid => crate::types::OrderStatus::Invalid,
+            Core::CancelPending => crate::types::OrderStatus::CancelPending,
+            Core::UpdateSubmitted => crate::types::OrderStatus::UpdateSubmitted,
+        }
+    }
+
+    #[getter(direction)]
+    fn py_direction(&self) -> crate::types::OrderDirection {
+        use lean_orders::OrderDirection as Core;
+        match self.event.direction {
+            Core::Buy => crate::types::OrderDirection::Buy,
+            Core::Sell => crate::types::OrderDirection::Sell,
+            Core::Hold => crate::types::OrderDirection::Hold,
+        }
+    }
+
+    #[getter(fill_price)]
+    fn py_fill_price(&self) -> f64 {
+        self.fill_price()
+    }
+
+    #[getter(fill_price_currency)]
+    fn py_fill_price_currency(&self) -> String {
+        self.fill_price_currency().to_string()
+    }
+
+    #[getter(fill_quantity)]
+    fn py_fill_quantity(&self) -> f64 {
+        self.fill_quantity()
+    }
+
+    #[getter(absolute_fill_quantity)]
+    fn py_absolute_fill_quantity(&self) -> f64 {
+        self.absolute_fill_quantity()
+    }
+
+    #[getter(quantity)]
+    fn py_quantity(&self) -> f64 {
+        self.quantity()
+    }
+
+    #[getter(is_assignment)]
+    fn py_is_assignment(&self) -> bool {
+        self.is_assignment()
+    }
+
+    #[getter(is_in_the_money)]
+    fn py_is_in_the_money(&self) -> bool {
+        self.is_in_the_money()
+    }
+
+    #[getter(message)]
+    fn py_message(&self) -> String {
+        self.message().to_string()
+    }
+
+    #[getter(order_fee)]
+    fn py_order_fee(&self) -> f64 {
+        self.order_fee()
+    }
+
+    #[getter(limit_price)]
+    fn py_limit_price(&self) -> Option<f64> {
+        self.limit_price()
+    }
+
+    #[getter(stop_price)]
+    fn py_stop_price(&self) -> Option<f64> {
+        self.stop_price()
+    }
+
+    #[getter(trigger_price)]
+    fn py_trigger_price(&self) -> Option<f64> {
+        self.trigger_price()
+    }
+
+    #[getter(trailing_amount)]
+    fn py_trailing_amount(&self) -> Option<f64> {
+        self.trailing_amount()
+    }
+
+    #[getter(trailing_as_percentage)]
+    fn py_trailing_as_percentage(&self) -> bool {
+        self.trailing_as_percentage()
+    }
+
+    #[pyo3(name = "is_fill")]
+    fn py_is_fill(&self) -> bool {
+        self.is_fill()
     }
 }
 
