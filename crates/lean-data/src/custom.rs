@@ -290,8 +290,10 @@ mod tests {
 
     #[test]
     fn matches_point_filters_on_symbol_case_insensitively() {
-        let mut query = CustomDataQuery::default();
-        query.symbols = Some(vec!["nvda".to_string(), "META".to_string()]);
+        let query = CustomDataQuery {
+            symbols: Some(vec!["nvda".to_string(), "META".to_string()]),
+            ..Default::default()
+        };
 
         assert!(query.matches_point(&point_with_symbol(Some("NVDA"))));
         assert!(query.matches_point(&point_with_symbol(Some("meta"))));
@@ -300,8 +302,10 @@ mod tests {
 
     #[test]
     fn matches_point_drops_symbol_less_point_when_filter_active() {
-        let mut query = CustomDataQuery::default();
-        query.symbols = Some(vec!["NVDA".to_string()]);
+        let query = CustomDataQuery {
+            symbols: Some(vec!["NVDA".to_string()]),
+            ..Default::default()
+        };
         // Live providers must populate point.symbol; an unset symbol is dropped
         // when a symbol filter is active (mirrors the historical parquet path).
         assert!(!query.matches_point(&point_with_symbol(None)));
