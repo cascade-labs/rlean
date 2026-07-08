@@ -8,7 +8,7 @@
 //! ```text
 //! lean-core
 //!   └─ lean-data          (TradeBar, QuoteBar, …)
-//!        └─ lean-storage  (ParquetReader/Writer, PathResolver, …)
+//!        └─ lean-storage  (IcebergStore, schema conversion, …)
 //!             └─ lean-data-providers   ← this crate (traits + local provider)
 //!                  ├─ rlean-plugins/thetadata  (implements IHistoryProvider)
 //!                  └─ rlean-plugins/massive    (implements IHistoryProvider)

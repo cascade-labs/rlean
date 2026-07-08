@@ -77,8 +77,8 @@ pub struct RegistryEntry {
 
 #[derive(Debug, Deserialize)]
 struct RemoteRegistry {
-    #[allow(dead_code)]
-    version: String,
+    #[serde(rename = "version")]
+    _version: String,
     plugins: Vec<RegistryEntry>,
 }
 

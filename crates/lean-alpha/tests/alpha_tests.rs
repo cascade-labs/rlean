@@ -160,7 +160,7 @@ mod insight_tests {
             None,
             "MyAlphaModel",
         );
-        assert_eq!(insight.source_model, "MyAlphaModel");
+        assert_eq!(insight.source_model.as_ref(), "MyAlphaModel");
     }
 
     #[test]
@@ -385,16 +385,16 @@ mod insight_collection_tests {
 
         let mut active =
             Insight::up(spy_sym.clone(), TimeSpan::from_days(5)).with_generated_time_utc(now);
-        active.source_model = "momentum".to_string();
+        active.source_model = "momentum".into();
         active.reference_value = Some(dec!(100));
         col.add(active.clone());
 
         let mut expired =
             Insight::down(aapl_sym.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now);
-        expired.source_model = "mean_reversion".to_string();
+        expired.source_model = "mean_reversion".into();
         expired.reference_value = Some(dec!(200));
         col.add(expired);
-        col.score_active(&HashMap::from([(aapl_sym.value.clone(), dec!(190))]), now);
+        col.score_active(&HashMap::from([(aapl_sym.id.sid, dec!(190))]), now);
         col.remove_expired(now + TimeSpan::from_days(2));
 
         let snapshot = col.snapshot();
@@ -548,7 +548,7 @@ mod alpha_model_tests {
         };
         let slice = empty_slice(0);
         let insights = model.update(&slice, &[spy()]);
-        assert_eq!(insights[0].source_model, "ConstantAlphaModel");
+        assert_eq!(insights[0].source_model.as_ref(), "ConstantAlphaModel");
     }
 
     #[test]

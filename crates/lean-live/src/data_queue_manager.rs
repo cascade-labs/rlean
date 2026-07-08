@@ -1,7 +1,7 @@
 use lean_core::{LeanError, Result};
 use lean_data::{
-    CustomDataSubscription, DataQueueHandler, LiveDataSubscription, LiveNodePacket,
-    LiveSubscriptionKey, LiveUniverseSubscriptionConfig, SubscriptionDataConfig,
+    DataQueueHandler, LiveDataSubscription, LiveNodePacket, LiveSubscriptionKey,
+    LiveUniverseSubscriptionConfig, SubscriptionDataConfig,
 };
 use std::collections::HashMap;
 
@@ -67,41 +67,6 @@ impl DataQueueHandlerManager {
         )))
     }
 
-    pub fn subscribe_custom(
-        &mut self,
-        subscription: &CustomDataSubscription,
-    ) -> Result<LiveDataSubscription> {
-        let key = LiveSubscriptionKey::Custom {
-            source_type: subscription.source_type.clone(),
-            ticker: subscription.ticker.clone(),
-        };
-        if self.owners.contains_key(&key) {
-            return Err(LeanError::DataError(format!(
-                "live custom subscription already exists for {}:{}",
-                subscription.source_type, subscription.ticker
-            )));
-        }
-
-        let mut unsupported = Vec::new();
-        for (index, handler) in self.handlers.iter_mut().enumerate() {
-            match handler.subscribe_custom(subscription) {
-                Ok(live_subscription) => {
-                    self.owners.insert(key, index);
-                    return Ok(live_subscription);
-                }
-                Err(LeanError::Unsupported(reason)) => unsupported.push(reason),
-                Err(err) => return Err(err),
-            }
-        }
-
-        Err(LeanError::Unsupported(format!(
-            "no live data queue handler supports custom subscription {}:{}; tried: {}",
-            subscription.source_type,
-            subscription.ticker,
-            unsupported.join("; ")
-        )))
-    }
-
     pub fn subscribe_universe(
         &mut self,
         subscription: &LiveUniverseSubscriptionConfig,
@@ -143,17 +108,6 @@ impl DataQueueHandlerManager {
             return Ok(());
         };
         self.handlers[owner].unsubscribe(config)
-    }
-
-    pub fn unsubscribe_custom(&mut self, subscription: &CustomDataSubscription) -> Result<()> {
-        let key = LiveSubscriptionKey::Custom {
-            source_type: subscription.source_type.clone(),
-            ticker: subscription.ticker.clone(),
-        };
-        let Some(owner) = self.owners.remove(&key) else {
-            return Ok(());
-        };
-        self.handlers[owner].unsubscribe_custom(subscription)
     }
 
     pub fn unsubscribe_universe(

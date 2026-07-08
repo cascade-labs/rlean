@@ -1,8 +1,10 @@
+use crate::data_feed::DataFeedContext;
 use lean_core::{DataNormalizationMode, DateTime, SecurityType, Symbol};
 use lean_data::{QuoteBar, TradeBar};
-use lean_storage::{FactorFileEntry, ParquetReader, PathResolver};
+use lean_storage::{FactorFileEntry, IcebergStore};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use std::sync::Arc;
 
 /// LEAN-style price scale frontier: use `EndTime` when a bar crosses calendar days.
 pub fn price_scale_frontier(time: DateTime, end_time: DateTime) -> chrono::NaiveDate {
@@ -17,17 +19,161 @@ pub fn price_scale_frontier(time: DateTime, end_time: DateTime) -> chrono::Naive
     time_date
 }
 
-pub fn read_factor_rows(
-    reader: &ParquetReader,
-    resolver: &PathResolver,
-    symbol: &Symbol,
-) -> Vec<FactorFileEntry> {
+pub fn read_factor_rows(store: &IcebergStore, symbol: &Symbol) -> Vec<FactorFileEntry> {
     if !matches!(symbol.security_type(), SecurityType::Equity) {
         return Vec::new();
     }
-    reader
-        .read_factor_file(&resolver.factor_file(symbol.market().as_str(), &symbol.permtick))
+    let store = store.clone();
+    let market = symbol.market().as_str().to_string();
+    let ticker = symbol.permtick.to_string();
+    block_on_background(async move { store.scan_factor_file(&market, &ticker).await })
         .unwrap_or_default()
+}
+
+/// Ensure the symbol's corporate-action files (factor + map) are present in the
+/// Iceberg store, fetching them from the history provider and persisting them
+/// here if the tables are empty for this symbol.
+///
+/// This is the framework side of the provider/framework split: providers are
+/// pure data sources (`get_factor_file`/`get_map_file` return rows), and the
+/// framework owns *all* persistence — writing the rows into Iceberg exactly as
+/// it does trade/quote bars. Providers must never write files themselves.
+///
+/// Cache-first and idempotent: if the tables already have rows for the symbol,
+/// no provider call is made. Only equities carry corporate actions.
+pub fn ensure_corporate_actions_cached(context: &DataFeedContext, symbol: &Symbol) {
+    if !matches!(symbol.security_type(), SecurityType::Equity) {
+        return;
+    }
+    let Some(provider) = context.history_provider.as_ref() else {
+        return;
+    };
+
+    let market = symbol.market().as_str().to_string();
+    let ticker = symbol.permtick.to_string();
+    let symbol_value = symbol.value.to_string();
+    let provider = Arc::clone(provider);
+    let context_for_task = context.clone();
+    let symbol = symbol.clone();
+
+    // Run the fetch+persist on a dedicated current-thread runtime so it works
+    // regardless of the caller's async context, mirroring `read_factor_rows`.
+    let outcome = block_on_background(async move {
+        // Factor file: fetch + persist only when absent for this symbol.
+        let have_factors = context_for_task
+            .store
+            .scan_factor_file(&market, &ticker)
+            .await
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+        if !have_factors {
+            match context_for_task
+                .fetch_factor_file(provider.as_ref(), &symbol)
+                .await
+            {
+                Ok(rows) if !rows.is_empty() => {
+                    let rows_len = rows.len();
+                    if let Err(err) = context_for_task
+                        .buffer_factor_file_cache_write(market.clone(), ticker.clone(), rows)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to persist factor file for {}: {}",
+                            symbol.value,
+                            err
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Buffered {} factor rows for {} into Iceberg",
+                            rows_len,
+                            symbol.value
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!("No factor file available for {}: {}", symbol.value, err);
+                }
+            }
+        }
+
+        // Map file: fetch + persist only when absent for this symbol.
+        let have_map = context_for_task
+            .store
+            .scan_map_file(&market, &ticker)
+            .await
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+        if !have_map {
+            match context_for_task
+                .fetch_map_file(provider.as_ref(), &symbol)
+                .await
+            {
+                Ok(rows) if !rows.is_empty() => {
+                    let rows_len = rows.len();
+                    if let Err(err) = context_for_task
+                        .buffer_map_file_cache_write(market.clone(), ticker.clone(), rows)
+                        .await
+                    {
+                        tracing::warn!("Failed to persist map file for {}: {}", symbol.value, err);
+                    } else {
+                        tracing::debug!(
+                            "Buffered {} map rows for {} into Iceberg",
+                            rows_len,
+                            symbol.value
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!("No map file available for {}: {}", symbol.value, err);
+                }
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+    if let Err(err) = outcome {
+        tracing::debug!(
+            "Corporate-action cache worker failed for {}: {}",
+            symbol_value,
+            err
+        );
+    }
+}
+
+/// The symbol's map-file inception date (first tradable date), if known.
+///
+/// LEAN uses map files to determine when a security first started trading.
+/// Symbols that IPO'd mid-history (e.g. XLC in June 2018) have no data before
+/// this date, so the cache-coverage check must not expect it — otherwise the
+/// window head is permanently "missing" and re-fetched every run.
+pub fn read_map_first_date(store: &IcebergStore, symbol: &Symbol) -> Option<chrono::NaiveDate> {
+    if !matches!(symbol.security_type(), SecurityType::Equity) {
+        return None;
+    }
+    let store = store.clone();
+    let market = symbol.market().as_str().to_string();
+    let ticker = symbol.permtick.to_string();
+    let rows =
+        block_on_background(async move { store.scan_map_file(&market, &ticker).await }).ok()?;
+    rows.into_iter().map(|row| row.date).min()
+}
+
+fn block_on_background<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!(e))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("factor reader worker panicked"))?
 }
 
 pub fn factor_for_entry(rows: &[FactorFileEntry], date: chrono::NaiveDate) -> (f64, f64) {

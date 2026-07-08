@@ -10,17 +10,21 @@
 /// is safe to pass even when all data is cached: if `pre_fetch_all` finds
 /// existing Parquet files it skips fetching entirely and the dylibs are
 /// never loaded.
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
+use lean_core::{DateTime, Resolution};
 use lean_data::DataQueueHandler;
+use lean_data::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource};
 use lean_data_providers::{
-    config::ProviderConfig, CustomDataContext, IHistoryProvider, LocalHistoryProvider,
-    StackedHistoryProvider,
+    CustomDataContext, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider,
 };
 use lean_live::DataQueueHandlerManager;
+use lean_storage::IcebergStore;
 
 /// A lazy wrapper around a named plugin provider.
 ///
@@ -29,6 +33,161 @@ struct LazyPluginProvider {
     name: String,
     args: ProviderArgs,
     inner: OnceLock<Result<Arc<dyn IHistoryProvider>, String>>,
+}
+
+struct LazyCustomDataSource {
+    name: String,
+    path: PathBuf,
+    data_root: PathBuf,
+    plugin_config: serde_json::Map<String, serde_json::Value>,
+    inner: OnceLock<Result<Arc<dyn lean_data_providers::ICustomDataSource>, String>>,
+}
+
+impl LazyCustomDataSource {
+    fn new(
+        name: String,
+        path: PathBuf,
+        data_root: PathBuf,
+        plugin_config: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            name,
+            path,
+            data_root,
+            plugin_config,
+            inner: OnceLock::new(),
+        }
+    }
+
+    fn get(&self) -> anyhow::Result<Arc<dyn lean_data_providers::ICustomDataSource>> {
+        self.inner
+            .get_or_init(|| {
+                load_custom_data_source(
+                    &self.path,
+                    &self.name,
+                    &self.data_root,
+                    self.plugin_config.clone(),
+                )
+                .map_err(|e| format!("{e:#}"))
+            })
+            .clone()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_source(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+        config: &CustomDataConfig,
+    ) -> Option<CustomDataSource> {
+        self.get()
+            .ok()
+            .and_then(|source| source.get_source(ticker, date, config))
+    }
+
+    fn get_live_points(
+        &self,
+        ticker: &str,
+        utc_time: DateTime,
+        config: &CustomDataConfig,
+        query: &CustomDataQuery,
+    ) -> Option<Vec<lean_data::CustomDataPoint>> {
+        self.get()
+            .ok()
+            .and_then(|source| source.get_live_points(ticker, utc_time, config, query))
+    }
+
+    fn live_poll_delay(
+        &self,
+        ticker: &str,
+        utc_time: DateTime,
+        source_available: bool,
+        config: &CustomDataConfig,
+        query: &CustomDataQuery,
+    ) -> Duration {
+        self.get()
+            .ok()
+            .map(|source| source.live_poll_delay(ticker, utc_time, source_available, config, query))
+            .unwrap_or_else(|| Duration::from_secs(300))
+    }
+
+    fn reader(
+        &self,
+        line: &str,
+        date: chrono::NaiveDate,
+        config: &CustomDataConfig,
+    ) -> Option<CustomDataPoint> {
+        self.get()
+            .ok()
+            .and_then(|source| source.reader(line, date, config))
+    }
+
+    fn default_resolution(&self) -> Resolution {
+        self.get()
+            .ok()
+            .map(|source| source.default_resolution())
+            .unwrap_or(Resolution::Daily)
+    }
+
+    fn default_resolution_for_ticker(&self, ticker: &str) -> Resolution {
+        self.get()
+            .ok()
+            .map(|source| source.default_resolution_for_ticker(ticker))
+            .unwrap_or(Resolution::Daily)
+    }
+
+    fn requires_mapping(&self) -> bool {
+        self.get()
+            .ok()
+            .map(|source| source.requires_mapping())
+            .unwrap_or(false)
+    }
+
+    fn is_parquet_native(&self) -> bool {
+        self.get()
+            .ok()
+            .map(|source| source.is_parquet_native())
+            .unwrap_or(false)
+    }
+
+    fn is_full_history_source(&self) -> bool {
+        self.get()
+            .ok()
+            .map(|source| source.is_full_history_source())
+            .unwrap_or(false)
+    }
+
+    fn read_history_line(&self, line: &str, config: &CustomDataConfig) -> Option<CustomDataPoint> {
+        self.get()
+            .ok()
+            .and_then(|source| source.read_history_line(line, config))
+    }
+
+    fn history(
+        &self,
+        ticker: &str,
+        config: &CustomDataConfig,
+    ) -> Option<Result<Vec<CustomDataPoint>, String>> {
+        self.get()
+            .ok()
+            .and_then(|source| source.history(ticker, config))
+    }
+
+    fn history_sources(
+        &self,
+        ticker: &str,
+        config: &CustomDataConfig,
+    ) -> Option<Result<Vec<(chrono::NaiveDate, CustomDataSource)>, String>> {
+        self.get()
+            .ok()
+            .and_then(|source| source.history_sources(ticker, config))
+    }
 }
 
 impl LazyPluginProvider {
@@ -50,6 +209,10 @@ impl LazyPluginProvider {
 
 #[async_trait]
 impl IHistoryProvider for LazyPluginProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     async fn get_history(
         &self,
         request: &lean_data_providers::HistoryRequest,
@@ -80,6 +243,22 @@ impl IHistoryProvider for LazyPluginProvider {
     ) -> anyhow::Result<Vec<lean_data::MarginInterestRate>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_margin_interest_rates(request).await
+    }
+
+    async fn get_factor_file(
+        &self,
+        symbol: &lean_core::Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::FactorFileEntry>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_factor_file(symbol).await
+    }
+
+    async fn get_map_file(
+        &self,
+        symbol: &lean_core::Symbol,
+    ) -> anyhow::Result<Vec<lean_storage::MapFileEntry>> {
+        let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
+        provider.get_map_file(symbol).await
     }
 
     async fn get_history_batch(
@@ -213,6 +392,7 @@ impl IHistoryProvider for LazyPluginProvider {
 #[derive(Clone, Default)]
 pub struct ProviderArgs {
     pub data_root: std::path::PathBuf,
+    pub data_store: Option<Arc<IcebergStore>>,
     pub polygon_rate: f64,
     pub thetadata_rate: f64,
     pub thetadata_concurrent: usize,
@@ -263,8 +443,14 @@ pub fn build_history_provider(
     let provider_names: Vec<&str> = names.split(',').map(str::trim).collect();
 
     let has_local_first = matches!(provider_names.first(), Some(&"local") | Some(&""));
+    // When we auto-prepend local in front of remote providers, it must report a
+    // miss for windows it cannot fully cover so the remotes backfill the gap
+    // (e.g. indicator warmup reaching before the cached history). A local-only
+    // stack keeps best-effort behavior.
     let mut providers: Vec<Arc<dyn IHistoryProvider>> = if !has_local_first {
-        vec![Arc::new(LocalHistoryProvider::new(&args.data_root))]
+        vec![build_local_history_provider_with_strict_coverage(
+            &args, true,
+        )]
     } else {
         vec![]
     };
@@ -280,6 +466,22 @@ pub fn build_history_provider(
         Ok(providers.into_iter().next().unwrap())
     } else {
         Ok(Arc::new(StackedHistoryProvider::new(providers)))
+    }
+}
+
+fn build_local_history_provider(args: &ProviderArgs) -> Arc<dyn IHistoryProvider> {
+    build_local_history_provider_with_strict_coverage(args, false)
+}
+
+fn build_local_history_provider_with_strict_coverage(
+    args: &ProviderArgs,
+    strict: bool,
+) -> Arc<dyn IHistoryProvider> {
+    match &args.data_store {
+        Some(store) => {
+            Arc::new(LocalHistoryProvider::from_store(store.clone()).with_strict_coverage(strict))
+        }
+        None => Arc::new(LocalHistoryProvider::new(&args.data_root).with_strict_coverage(strict)),
     }
 }
 
@@ -306,7 +508,6 @@ pub fn build_live_data_queue(names: &str, args: ProviderArgs) -> Result<DataQueu
 ///
 /// Paper brokerage is built into `lean-brokerages`; this loader is for
 /// real-money brokerage plugins that export `rlean_create_brokerage`.
-#[allow(dead_code)]
 pub fn load_brokerage_plugin(
     name: &str,
     args: &ProviderArgs,
@@ -354,13 +555,7 @@ pub fn load_brokerage_plugin(
 /// dylib is not loaded until a fetch is actually needed.
 fn build_single_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHistoryProvider>> {
     match name {
-        "local" | "" => {
-            let config = ProviderConfig {
-                data_root: args.data_root.clone(),
-                ..Default::default()
-            };
-            Ok(Arc::new(LocalHistoryProvider::new(&config.data_root)))
-        }
+        "local" | "" => Ok(build_local_history_provider(args)),
         name => {
             // Validate plugin path exists before accepting the name, so the user
             // gets a clear error at startup rather than at first fetch.
@@ -500,17 +695,12 @@ fn plugin_config_json(name: &str, args: &ProviderArgs) -> Result<String> {
     Ok(serde_json::Value::Object(plugin_cfg).to_string())
 }
 
-/// Scan `~/.rlean/plugins/` for dylibs that export `rlean_custom_data_factory`
-/// and load them as `ICustomDataSource` instances.
-///
-/// Plugins that don't export the symbol are silently skipped — not every plugin
-/// is a custom data source.  Any dylib that does export it is loaded eagerly
-/// (custom data sources are lightweight and used throughout the backtest).
+/// Scan `~/.rlean/plugins/` for installed plugin filenames and return lazy
+/// custom-data wrappers. The actual plugin library is not opened until a
+/// strategy subscribes to that source type.
 pub fn load_custom_data_plugins(
     data_root: &std::path::Path,
 ) -> Vec<Arc<dyn lean_data_providers::ICustomDataSource>> {
-    use libloading::{Library, Symbol};
-
     let plugins_dir = match home_dir() {
         Ok(h) => h.join(".rlean").join("plugins"),
         Err(_) => return vec![],
@@ -532,58 +722,83 @@ pub fn load_custom_data_plugins(
     };
 
     for path in paths {
-        // Safety: the plugin must export the factory with C ABI.
-        let lib = match unsafe { Library::new(&path) } {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::debug!("Could not load plugin {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        initialize_plugin_library(&lib, &path.display().to_string());
-
-        let factory: Symbol<unsafe extern "C" fn() -> *mut ()> =
-            match unsafe { lib.get(b"rlean_custom_data_factory\0") } {
-                Ok(f) => f,
-                Err(_) => continue, // this plugin doesn't have a custom data factory
-            };
-
-        let raw = unsafe { factory() };
-        if raw.is_null() {
-            tracing::warn!(
-                "Plugin {} returned null from rlean_custom_data_factory",
-                path.display()
-            );
+        let Some(source_name) = plugin_name_from_library_path(&path) else {
             continue;
-        }
-
-        // The factory returns *mut () pointing to a heap-allocated
-        // Box<dyn ICustomDataSource> (double-boxed to keep a thin pointer over FFI).
-        let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
-            unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
-        let source_name = source_box.name().to_string();
-        let context = CustomDataContext::with_plugin_config(
-            data_root,
-            plugin_configs.get_plugin(&source_name),
+        };
+        let plugin_config = plugin_configs.get_plugin(&source_name);
+        sources.push(Arc::new(LazyCustomDataSource::new(
+            source_name.clone(),
+            path.clone(),
+            data_root.to_path_buf(),
+            plugin_config,
+        )));
+        tracing::debug!(
+            "Registered lazy custom data plugin candidate: {}",
+            source_name
         );
-        source_box.initialize(&context);
-        let source: Arc<dyn lean_data_providers::ICustomDataSource> = Arc::from(source_box);
-
-        tracing::info!(
-            "Loaded custom data plugin: {} ({})",
-            source.name(),
-            path.display()
-        );
-        sources.push(source);
-
-        // Leak the library so the vtable stays valid for the process lifetime.
-        Box::leak(Box::new(lib));
     }
 
     sources
 }
 
+fn plugin_name_from_library_path(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let name = stem.strip_prefix("librlean_plugin_")?;
+    Some(name.to_string())
+}
+
+fn load_custom_data_source(
+    path: &std::path::Path,
+    expected_name: &str,
+    data_root: &std::path::Path,
+    plugin_config: serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<dyn lean_data_providers::ICustomDataSource>> {
+    use libloading::{Library, Symbol};
+
+    let lib = Box::leak(Box::new(unsafe { Library::new(path) }.with_context(
+        || format!("Failed to load custom data plugin: {}", path.display()),
+    )?));
+    initialize_plugin_library(lib, &path.display().to_string());
+
+    let factory: Symbol<unsafe extern "C" fn() -> *mut ()> =
+        unsafe { lib.get(b"rlean_custom_data_factory\0") }.map_err(|_| {
+            anyhow::anyhow!(
+                "Plugin '{}' does not export rlean_custom_data_factory",
+                path.display()
+            )
+        })?;
+
+    let raw = unsafe { factory() };
+    if raw.is_null() {
+        bail!(
+            "Plugin {} returned null from rlean_custom_data_factory",
+            path.display()
+        );
+    }
+
+    let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
+        unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+    let source_name = source_box.name().to_string();
+    if !source_name.eq_ignore_ascii_case(expected_name) {
+        tracing::warn!(
+            "Custom data plugin descriptor name '{}' differs from source name '{}'",
+            expected_name,
+            source_name
+        );
+    }
+    let context = CustomDataContext::with_plugin_config(data_root, plugin_config);
+    source_box.initialize(&context);
+    Ok(Arc::from(source_box))
+}
+
 fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) {
+    let _ = plugin_descriptor(lib, requested_plugin);
+}
+
+fn plugin_descriptor(
+    lib: &libloading::Library,
+    requested_plugin: &str,
+) -> Option<lean_plugin::PluginDescriptor> {
     type DescriptorFn = unsafe extern "C" fn() -> lean_plugin::PluginDescriptor;
 
     let descriptor: libloading::Symbol<DescriptorFn> =
@@ -593,7 +808,7 @@ fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) 
                 tracing::debug!(
                     "Plugin {requested_plugin} does not export rlean_plugin_descriptor: {error}"
                 );
-                return;
+                return None;
             }
         };
 
@@ -605,6 +820,7 @@ fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) 
         kind = %descriptor.kind,
         "Initialized plugin descriptor"
     );
+    Some(descriptor)
 }
 
 fn dylib_ext() -> &'static str {

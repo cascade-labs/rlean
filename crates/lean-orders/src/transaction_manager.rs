@@ -3,10 +3,10 @@ use crate::{
     order_event::OrderEvent,
     order_ticket::{OrderTicket, UpdateOrderFields},
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use lean_core::{DateTime, Price};
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,20 +27,24 @@ pub struct UpdateOrderRequest {
 /// Thread-safe store for all orders in a strategy run.
 pub struct TransactionManager {
     orders: DashMap<i64, Arc<RwLock<Order>>>,
+    open_order_ids: DashSet<i64>,
     tickets: DashMap<i64, OrderTicket>,
     cancel_requests: DashMap<i64, CancelOrderRequest>,
     update_requests: DashMap<i64, UpdateOrderRequest>,
     next_order_id: AtomicI64,
+    open_order_count: AtomicUsize,
 }
 
 impl TransactionManager {
     pub fn new() -> Self {
         TransactionManager {
             orders: DashMap::new(),
+            open_order_ids: DashSet::new(),
             tickets: DashMap::new(),
             cancel_requests: DashMap::new(),
             update_requests: DashMap::new(),
             next_order_id: AtomicI64::new(1),
+            open_order_count: AtomicUsize::new(0),
         }
     }
 
@@ -51,6 +55,10 @@ impl TransactionManager {
     pub fn add_order(&self, order: Order) -> OrderTicket {
         let id = order.id;
         let ticket = OrderTicket::new(order.clone());
+        if order.is_open() {
+            self.open_order_ids.insert(id);
+            self.open_order_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.orders.insert(id, Arc::new(RwLock::new(order)));
         self.tickets.insert(id, ticket.clone());
         ticket
@@ -59,7 +67,10 @@ impl TransactionManager {
     pub fn add_or_update_order(&self, order: Order) -> OrderTicket {
         let id = order.id;
         if let Some(order_lock) = self.orders.get(&id) {
+            let was_open = order_lock.read().is_open();
+            let is_open = order.is_open();
             *order_lock.write() = order.clone();
+            self.adjust_open_order_index(id, was_open, is_open);
             if let Some(ticket) = self.tickets.get(&id) {
                 ticket.set_order(order);
                 return ticket.clone();
@@ -70,7 +81,10 @@ impl TransactionManager {
 
     pub fn update_order(&self, order: Order) -> bool {
         if let Some(order_lock) = self.orders.get(&order.id) {
+            let was_open = order_lock.read().is_open();
+            let is_open = order.is_open();
             *order_lock.write() = order.clone();
+            self.adjust_open_order_index(order.id, was_open, is_open);
             if let Some(ticket) = self.tickets.get(&order.id) {
                 ticket.set_order(order);
             }
@@ -92,6 +106,7 @@ impl TransactionManager {
         // Update the order's status so it no longer appears in get_open_orders().
         if let Some(order_lock) = self.orders.get(&event.order_id) {
             let mut order = order_lock.write();
+            let was_open = order.is_open();
             order.status = event.status;
             if event.status == OrderStatus::Canceled {
                 order.canceled_time = Some(event.utc_time);
@@ -107,6 +122,7 @@ impl TransactionManager {
                 }
                 order.filled_quantity = new_filled;
             }
+            self.adjust_open_order_index(order.id, was_open, order.is_open());
         }
         if let Some(ticket) = self.tickets.get(&event.order_id) {
             ticket.add_order_event(event);
@@ -114,11 +130,21 @@ impl TransactionManager {
     }
 
     pub fn get_open_orders(&self) -> Vec<Order> {
-        self.orders
+        if !self.has_open_orders() {
+            return Vec::new();
+        }
+        self.open_order_ids
             .iter()
-            .filter(|entry| entry.read().is_open())
-            .map(|entry| entry.read().clone())
+            .filter_map(|order_id| {
+                self.orders
+                    .get(order_id.key())
+                    .map(|entry| entry.read().clone())
+            })
             .collect()
+    }
+
+    pub fn has_open_orders(&self) -> bool {
+        self.open_order_count.load(Ordering::Relaxed) != 0
     }
 
     /// Apply C# LEAN's default split order adjustment to open orders.
@@ -160,6 +186,20 @@ impl TransactionManager {
             .collect()
     }
 
+    fn adjust_open_order_index(&self, order_id: i64, was_open: bool, is_open: bool) {
+        match (was_open, is_open) {
+            (false, true) => {
+                self.open_order_ids.insert(order_id);
+                self.open_order_count.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.open_order_ids.remove(&order_id);
+                self.open_order_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
     pub fn request_cancel_order(&self, order_id: i64, time: DateTime, tag: String) -> bool {
         let Some(order_lock) = self.orders.get(&order_id) else {
             return false;
@@ -170,8 +210,10 @@ impl TransactionManager {
             if !order.is_open() {
                 return false;
             }
+            let was_open = order.is_open();
             order.status = OrderStatus::CancelPending;
             order.canceled_time = None;
+            self.adjust_open_order_index(order_id, was_open, order.is_open());
         }
 
         let event_symbol = order_lock.read().symbol.clone();
@@ -263,11 +305,16 @@ impl TransactionManager {
     }
 
     pub fn cancel_open_orders(&self, time: DateTime) {
-        for entry in self.orders.iter() {
+        for order_id in self.open_order_ids.iter().map(|id| *id).collect::<Vec<_>>() {
+            let Some(entry) = self.orders.get(&order_id) else {
+                continue;
+            };
             let mut order = entry.write();
             if order.is_open() {
+                let was_open = order.is_open();
                 order.status = OrderStatus::Canceled;
                 order.canceled_time = Some(time);
+                self.adjust_open_order_index(order.id, was_open, order.is_open());
                 if let Some(ticket) = self.tickets.get(&order.id) {
                     ticket.cancel(time);
                 }
@@ -276,11 +323,16 @@ impl TransactionManager {
     }
 
     pub fn cancel_open_orders_for_symbol(&self, symbol_sid: u64, time: DateTime) {
-        for entry in self.orders.iter() {
+        for order_id in self.open_order_ids.iter().map(|id| *id).collect::<Vec<_>>() {
+            let Some(entry) = self.orders.get(&order_id) else {
+                continue;
+            };
             let mut order = entry.write();
             if order.symbol.id.sid == symbol_sid && order.is_open() {
+                let was_open = order.is_open();
                 order.status = OrderStatus::Canceled;
                 order.canceled_time = Some(time);
+                self.adjust_open_order_index(order.id, was_open, order.is_open());
                 if let Some(ticket) = self.tickets.get(&order.id) {
                     ticket.cancel(time);
                 }

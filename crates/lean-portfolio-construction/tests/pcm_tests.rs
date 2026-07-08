@@ -2,11 +2,11 @@
 // Mirrors the C# EqualWeightingPortfolioConstructionModelTests and
 // InsightWeightingPortfolioConstructionModelTests from LEAN.
 
-use lean_core::{Market, Symbol};
+use lean_core::{Market, Symbol, TimeSpan};
 use lean_portfolio_construction::{
     EqualWeightingPortfolioConstructionModel, IPortfolioConstructionModel, InsightDirection,
     InsightForPcm, InsightWeightingPortfolioConstructionModel, NullPortfolioConstructionModel,
-    PortfolioBias, PortfolioTarget,
+    PortfolioBias, PortfolioTarget, RebalanceCadence, RebalancePolicy,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -45,10 +45,10 @@ fn make_insight_with_confidence(
 }
 
 /// Build a price map from (ticker, price) pairs.
-fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
+fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
     pairs
         .iter()
-        .map(|(ticker, price)| (ticker.to_uppercase(), *price))
+        .map(|(ticker, price)| (make_equity(ticker).id.sid, *price))
         .collect()
 }
 
@@ -58,6 +58,75 @@ fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
 
 mod equal_weighting_tests {
     use super::*;
+
+    #[test]
+    fn equal_weighting_default_rebalance_policy_is_daily() {
+        let model = EqualWeightingPortfolioConstructionModel::new();
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(
+            policy.cadence(),
+            RebalanceCadence::Period(period) if *period == TimeSpan::ONE_DAY
+        ));
+        assert!(policy.rebalance_on_security_changes());
+        assert!(policy.rebalance_on_insight_changes());
+    }
+
+    #[test]
+    fn equal_weighting_none_period_uses_every_slice_policy() {
+        let model = EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance(
+            PortfolioBias::LongShort,
+            None,
+            None,
+        );
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(policy.cadence(), RebalanceCadence::EverySlice));
+    }
+
+    #[test]
+    fn equal_weighting_accepts_explicit_rebalance_policy() {
+        let model =
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::period(TimeSpan::from_nanos(30_000_000_000)),
+            );
+        let policy = model.rebalance_policy();
+
+        assert_eq!(
+            policy.period_value(),
+            Some(TimeSpan::from_nanos(30_000_000_000))
+        );
+    }
+
+    /// A custom PCM that never sets a rebalancing function must rebalance on
+    /// every slice, mirroring C# LEAN's base `PortfolioConstructionModel`
+    /// (default `rebalancingFunc == null` -> `IsRebalanceDue` returns true every
+    /// bar). This is the default a Python subclass of
+    /// `PortfolioConstructionModel` inherits; returning `daily()` here silently
+    /// throttled custom PCMs to one rebalance per day.
+    #[test]
+    fn custom_pcm_trait_default_rebalance_policy_is_every_slice() {
+        struct BareCustomPcm;
+        impl IPortfolioConstructionModel for BareCustomPcm {
+            fn create_targets(
+                &mut self,
+                _insights: &[InsightForPcm],
+                _portfolio_value: rust_decimal::Decimal,
+                _prices: &std::collections::HashMap<u64, rust_decimal::Decimal>,
+            ) -> Vec<PortfolioTarget> {
+                Vec::new()
+            }
+        }
+
+        let model = BareCustomPcm;
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(policy.cadence(), RebalanceCadence::EverySlice));
+        assert!(policy.rebalance_on_security_changes());
+        assert!(policy.rebalance_on_insight_changes());
+    }
 
     /// Two Up insights: each should get 50 % of portfolio → equal long shares.
     /// Mirrors C# InsightsReturnsTargetsConsistentWithDirection (Up, N=2).
@@ -87,7 +156,7 @@ mod equal_weighting_tests {
         let find = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .expect("target not found")
                 .quantity
         };
@@ -127,7 +196,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -159,7 +228,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -258,7 +327,7 @@ mod equal_weighting_tests {
         let holdings_value: Decimal = targets
             .iter()
             .map(|t| {
-                let price = prices[&t.symbol.value];
+                let price = prices[&t.symbol.id.sid];
                 t.quantity * price
             })
             .sum();
@@ -266,7 +335,7 @@ mod equal_weighting_tests {
         // Each slot should have approximately portfolio_value / 3.
         let expected_per_slot = portfolio_value / dec!(3);
         for target in &targets {
-            let price = prices[&target.symbol.value];
+            let price = prices[&target.symbol.id.sid];
             let slot_value = target.quantity * price;
             let diff = (slot_value - expected_per_slot).abs();
             assert!(
@@ -311,7 +380,7 @@ mod equal_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -462,7 +531,7 @@ mod insight_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };
@@ -565,7 +634,7 @@ mod insight_weighting_tests {
         let get_qty = |ticker: &str| {
             targets
                 .iter()
-                .find(|t| t.symbol.value == ticker.to_uppercase())
+                .find(|t| t.symbol.value.as_ref() == ticker.to_uppercase())
                 .unwrap()
                 .quantity
         };

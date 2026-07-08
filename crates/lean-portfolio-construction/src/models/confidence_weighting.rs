@@ -38,7 +38,7 @@ impl IPortfolioConstructionModel for ConfidenceWeightingPortfolioConstructionMod
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         // Key difference vs InsightWeighting: skip insights with no confidence value.
         let eligible: Vec<&InsightForPcm> =
@@ -77,8 +77,10 @@ impl IPortfolioConstructionModel for ConfidenceWeightingPortfolioConstructionMod
                     direction_sign * confidence * weight_factor
                 };
 
-                let ticker = insight.symbol.value.clone();
-                let price = prices.get(&ticker).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.id.sid)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
             })
             .collect()
@@ -101,8 +103,11 @@ mod tests {
         Symbol::create_equity(ticker, &Market::usa())
     }
 
-    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
+        pairs
+            .iter()
+            .map(|(ticker, value)| (make_symbol(ticker).id.sid, *value))
+            .collect()
     }
 
     #[test]
@@ -134,8 +139,14 @@ mod tests {
         let targets = pcm.create_targets(&insights, portfolio_value, &prices);
         assert_eq!(targets.len(), 2);
 
-        let spy_target = targets.iter().find(|t| t.symbol.value == "SPY").unwrap();
-        let ibm_target = targets.iter().find(|t| t.symbol.value == "IBM").unwrap();
+        let spy_target = targets
+            .iter()
+            .find(|t| t.symbol.value.as_ref() == "SPY")
+            .unwrap();
+        let ibm_target = targets
+            .iter()
+            .find(|t| t.symbol.value.as_ref() == "IBM")
+            .unwrap();
 
         // SPY confidence is 4x IBM, so SPY quantity should be 4x IBM quantity.
         assert!(

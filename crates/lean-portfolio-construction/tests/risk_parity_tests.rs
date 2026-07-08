@@ -18,6 +18,13 @@ fn make_equity(ticker: &str) -> Symbol {
     Symbol::create_equity(ticker, &Market::new(Market::USA))
 }
 
+fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
+    pairs
+        .iter()
+        .map(|(ticker, price)| (make_equity(ticker).id.sid, *price))
+        .collect()
+}
+
 fn make_insight(symbol: Symbol, direction: InsightDirection) -> InsightForPcm {
     InsightForPcm {
         symbol,
@@ -57,7 +64,7 @@ fn warm_up_model(
     let mut prices: Vec<f64> = base_prices.clone();
 
     for _ in 0..n_bars {
-        let price_map: HashMap<String, Decimal> = ticker_vols
+        let price_map: HashMap<u64, Decimal> = ticker_vols
             .iter()
             .enumerate()
             .map(|(i, (ticker, vol))| {
@@ -65,7 +72,7 @@ fn warm_up_model(
                 let noise = pseudo_rand() * vol;
                 prices[i] *= 1.0 + noise;
                 let p = prices[i].max(0.01);
-                (ticker.to_uppercase(), Decimal::try_from(p).unwrap())
+                (make_equity(ticker).id.sid, Decimal::try_from(p).unwrap())
             })
             .collect();
 
@@ -205,7 +212,7 @@ fn returns_empty_without_enough_history() {
 
     let spy = make_equity("SPY");
     let insights = vec![make_insight(spy.clone(), InsightDirection::Up)];
-    let prices = HashMap::from([("SPY".to_string(), dec!(400))]);
+    let prices = make_prices(&[("SPY", dec!(400))]);
 
     // Only 1 price → not enough
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
@@ -225,10 +232,7 @@ fn lower_vol_asset_gets_higher_allocation_in_pcm() {
     // SPY: high vol (3% daily), TLT: low vol (0.5% daily)
     warm_up_model(&mut model, &[("SPY", 0.03), ("TLT", 0.005)], 60);
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(415)),
-        ("TLT".to_string(), dec!(100)),
-    ]);
+    let prices = make_prices(&[("SPY", dec!(415)), ("TLT", dec!(100))]);
 
     let insights = vec![
         make_insight(make_equity("SPY"), InsightDirection::Up),
@@ -246,12 +250,12 @@ fn lower_vol_asset_gets_higher_allocation_in_pcm() {
 
     let spy_qty = targets
         .iter()
-        .find(|t| t.symbol.value == "SPY")
+        .find(|t| t.symbol.value.as_ref() == "SPY")
         .map(|t| t.quantity)
         .unwrap_or(Decimal::ZERO);
     let tlt_qty = targets
         .iter()
-        .find(|t| t.symbol.value == "TLT")
+        .find(|t| t.symbol.value.as_ref() == "TLT")
         .map(|t| t.quantity)
         .unwrap_or(Decimal::ZERO);
 
@@ -290,10 +294,10 @@ fn equal_vol_assets_produce_equal_allocations() {
         80,
     );
 
-    let prices = HashMap::from([
-        ("SPY".to_string(), dec!(100)), // Equal prices for easy weight comparison
-        ("IEF".to_string(), dec!(100)),
-        ("GLD".to_string(), dec!(100)),
+    let prices = make_prices(&[
+        ("SPY", dec!(100)), // Equal prices for easy weight comparison
+        ("IEF", dec!(100)),
+        ("GLD", dec!(100)),
     ]);
 
     let insights = vec![
@@ -352,10 +356,7 @@ fn on_securities_changed_removes_symbol_data() {
 
     // Warm up with some data
     for i in 0..15 {
-        let prices = HashMap::from([(
-            "SPY".to_string(),
-            Decimal::try_from(100.0 + i as f64).unwrap(),
-        )]);
+        let prices = make_prices(&[("SPY", Decimal::try_from(100.0 + i as f64).unwrap())]);
         let insights = vec![make_insight(spy.clone(), InsightDirection::Up)];
         model.create_targets(&insights, dec!(100_000), &prices);
     }
@@ -364,7 +365,7 @@ fn on_securities_changed_removes_symbol_data() {
     model.on_securities_changed(&[], std::slice::from_ref(&spy));
 
     // After removal, the next call should start fresh with no data
-    let prices = HashMap::from([("SPY".to_string(), dec!(115))]);
+    let prices = make_prices(&[("SPY", dec!(115))]);
     let insights = vec![make_insight(spy.clone(), InsightDirection::Up)];
     let targets = model.create_targets(&insights, dec!(100_000), &prices);
     // Only one price now → empty targets

@@ -11,6 +11,7 @@ use lean_risk::{
     max_unrealized_profit::MaximumUnrealizedProfitPercentPerSecurity,
     risk_management::{HoldingSnapshot, PortfolioTarget, RiskContext, RiskManagementModel},
     sector_exposure::MaximumSectorExposureRiskManagementModel,
+    trailing_stop::TrailingStopRiskManagementModel,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -68,7 +69,7 @@ fn test_security_drawdown_triggers_below_threshold() {
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "25% drawdown should trigger 20% limit");
     assert_eq!(result[0].quantity, Decimal::ZERO);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -81,6 +82,26 @@ fn test_security_drawdown_skips_uninvested() {
 
     let result = model.manage_risk_with_context(&[], &ctx);
     assert!(result.is_empty(), "Uninvested holding should be skipped");
+}
+
+#[test]
+fn per_security_drawdown_uses_strict_less_than_threshold() {
+    // Mirrors LEAN MaximumDrawdownPercentPerSecurityTests boundary behavior:
+    // exactly at the configured drawdown threshold does not liquidate.
+    let mut model = MaximumDrawdownPercentPerSecurity::new(dec!(0.20));
+    let ctx = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![
+            holding(spy(), dec!(10), dec!(100), dec!(80)),
+            holding(aapl(), dec!(10), dec!(100), dec!(79.99)),
+        ],
+    };
+
+    let result = model.manage_risk_with_context(&[], &ctx);
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].symbol.value.as_ref(), "AAPL");
+    assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
 // ─── MaximumDrawdownPercentPortfolio ─────────────────────────────────────────
@@ -154,7 +175,7 @@ fn test_drawdown_portfolio_triggers_at_threshold() {
         Decimal::ZERO,
         "Liquidation qty must be 0"
     );
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -222,6 +243,44 @@ fn test_drawdown_portfolio_trailing_updates_high() {
     assert_eq!(result[0].quantity, Decimal::ZERO);
 }
 
+#[test]
+fn portfolio_drawdown_liquidates_all_targets_only_beyond_threshold() {
+    // Mirrors LEAN MaximumDrawdownPercentPortfolioTests boundary behavior.
+    let mut model = MaximumDrawdownPercentPortfolio::new(dec!(0.05), false);
+    let targets = vec![
+        make_target(spy(), dec!(100)),
+        make_target(aapl(), dec!(-50)),
+    ];
+    model.manage_risk_with_context(
+        &targets,
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![],
+        },
+    );
+
+    let at_threshold = model.manage_risk_with_context(
+        &targets,
+        &RiskContext {
+            total_portfolio_value: dec!(95_000),
+            holdings: vec![],
+        },
+    );
+    assert!(at_threshold.is_empty());
+
+    let beyond_threshold = model.manage_risk_with_context(
+        &targets,
+        &RiskContext {
+            total_portfolio_value: dec!(94_999),
+            holdings: vec![],
+        },
+    );
+    assert_eq!(beyond_threshold.len(), 2);
+    assert!(beyond_threshold
+        .iter()
+        .all(|target| target.quantity == Decimal::ZERO));
+}
+
 // ─── MaximumUnrealizedProfitPercentPerSecurity ───────────────────────────────
 
 #[test]
@@ -252,7 +311,7 @@ fn test_unrealized_profit_triggers_above_threshold() {
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "7.5% profit should trigger 5% threshold");
     assert_eq!(result[0].quantity, Decimal::ZERO);
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -283,7 +342,7 @@ fn test_unrealized_profit_multiple_holdings_mixed() {
     };
     let result = model.manage_risk_with_context(&[], &ctx);
     assert_eq!(result.len(), 1, "Only SPY should be liquidated");
-    assert_eq!(result[0].symbol.value, "SPY");
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
 }
 
 #[test]
@@ -302,6 +361,128 @@ fn test_unrealized_profit_short_position() {
         "Short position with 7.5% profit should trigger"
     );
     assert_eq!(result[0].quantity, Decimal::ZERO);
+}
+
+// ─── TrailingStopRiskManagementModel ──────────────────────────────────────────
+
+#[test]
+fn test_trailing_stop_long_updates_high_and_triggers_drawdown() {
+    let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
+
+    // Initial long holding: cost/value = 1000.
+    let ctx_initial = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(100))],
+    };
+    assert!(model.manage_risk_with_context(&[], &ctx_initial).is_empty());
+
+    // Value rises to 1100, updating the trailing high-water mark.
+    let ctx_high = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(110))],
+    };
+    assert!(model.manage_risk_with_context(&[], &ctx_high).is_empty());
+
+    // Drop to 1030: drawdown from 1100 is > 5%, so liquidate.
+    let ctx_drawdown = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(103))],
+    };
+    let result = model.manage_risk_with_context(&[], &ctx_drawdown);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
+    assert_eq!(result[0].quantity, Decimal::ZERO);
+}
+
+#[test]
+fn test_trailing_stop_short_updates_low_and_triggers_drawdown() {
+    let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
+
+    // Initial short holding: absolute cost/value = 1000.
+    let ctx_initial = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(-10), dec!(100), dec!(100))],
+    };
+    assert!(model.manage_risk_with_context(&[], &ctx_initial).is_empty());
+
+    // Short profits as price falls: absolute holdings value drops to 900,
+    // updating the trailing minimum.
+    let ctx_low = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(-10), dec!(100), dec!(90))],
+    };
+    assert!(model.manage_risk_with_context(&[], &ctx_low).is_empty());
+
+    // Price rebounds: absolute value rises from the 900 low to 960.
+    let ctx_rebound = RiskContext {
+        total_portfolio_value: dec!(100_000),
+        holdings: vec![holding(spy(), dec!(-10), dec!(100), dec!(96))],
+    };
+    let result = model.manage_risk_with_context(&[], &ctx_rebound);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].symbol.value.as_ref(), "SPY");
+    assert_eq!(result[0].quantity, Decimal::ZERO);
+}
+
+#[test]
+fn test_trailing_stop_resets_on_position_side_change() {
+    let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
+
+    // Establish a long trailing state and update the long high-water mark.
+    model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(110))],
+        },
+    );
+
+    // Flip to short. The state should reset to absolute holdings cost/value, not
+    // reuse the long high-water mark.
+    let result = model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(-10), dec!(100), dec!(96))],
+        },
+    );
+    assert!(
+        result.is_empty(),
+        "Position-side flip should reset trailing state instead of triggering"
+    );
+}
+
+#[test]
+fn test_trailing_stop_removes_state_when_uninvested() {
+    let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
+
+    model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(110))],
+        },
+    );
+
+    // No invested holdings should clear the internal state.
+    model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![],
+        },
+    );
+
+    // Re-entry at 100 should initialise fresh; it should not liquidate because
+    // of the prior 110 high-water mark.
+    let result = model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(100))],
+        },
+    );
+    assert!(result.is_empty());
 }
 
 // ─── MaximumSectorExposureRiskManagementModel ─────────────────────────────────

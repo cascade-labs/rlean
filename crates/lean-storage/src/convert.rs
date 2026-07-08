@@ -5,6 +5,22 @@ use arrow_array::*;
 use lean_data::{Bar, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar};
 use std::sync::Arc;
 
+fn optional_string_value(array: &dyn arrow_array::Array, index: usize) -> Option<String> {
+    if array.is_null(index) {
+        return None;
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(values.value(index).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(values.value(index).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some(values.value(index).to_string());
+    }
+    None
+}
+
 // ─── TradeBar ────────────────────────────────────────────────────────────────
 
 pub fn trade_bars_to_record_batch(bars: &[TradeBar]) -> arrow_array::RecordBatch {
@@ -12,8 +28,8 @@ pub fn trade_bars_to_record_batch(bars: &[TradeBar]) -> arrow_array::RecordBatch
 
     let time_ns: Vec<i64> = bars.iter().map(|b| b.time.0).collect();
     let end_time_ns: Vec<i64> = bars.iter().map(|b| b.end_time.0).collect();
-    let sym_sid: Vec<u64> = bars.iter().map(|b| b.symbol.id.sid).collect();
-    let sym_val: Vec<&str> = bars.iter().map(|b| b.symbol.value.as_str()).collect();
+    let sym_sid: Vec<i64> = bars.iter().map(|b| b.symbol.id.sid as i64).collect();
+    let sym_val: Vec<&str> = bars.iter().map(|b| b.symbol.value.as_ref()).collect();
     let open: Vec<i64> = bars.iter().map(|b| price_to_i64(&b.open)).collect();
     let high: Vec<i64> = bars.iter().map(|b| price_to_i64(&b.high)).collect();
     let low: Vec<i64> = bars.iter().map(|b| price_to_i64(&b.low)).collect();
@@ -26,7 +42,7 @@ pub fn trade_bars_to_record_batch(bars: &[TradeBar]) -> arrow_array::RecordBatch
         vec![
             Arc::new(Int64Array::from(time_ns)),
             Arc::new(Int64Array::from(end_time_ns)),
-            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(Int64Array::from(sym_sid)),
             Arc::new(StringArray::from(sym_val)),
             Arc::new(Int64Array::from(open)),
             Arc::new(Int64Array::from(high)),
@@ -114,8 +130,8 @@ pub fn ticks_to_record_batch(ticks: &[Tick]) -> arrow_array::RecordBatch {
     let schema = crate::schema::tick_schema();
 
     let time_ns: Vec<i64> = ticks.iter().map(|t| t.time.0).collect();
-    let sym_sid: Vec<u64> = ticks.iter().map(|t| t.symbol.id.sid).collect();
-    let sym_val: Vec<&str> = ticks.iter().map(|t| t.symbol.value.as_str()).collect();
+    let sym_sid: Vec<i64> = ticks.iter().map(|t| t.symbol.id.sid as i64).collect();
+    let sym_val: Vec<&str> = ticks.iter().map(|t| t.symbol.value.as_ref()).collect();
     let tick_type: Vec<u8> = ticks.iter().map(|t| t.tick_type as u8).collect();
     let value: Vec<i64> = ticks.iter().map(|t| price_to_i64(&t.value)).collect();
     let quantity: Vec<i64> = ticks.iter().map(|t| price_to_i64(&t.quantity)).collect();
@@ -131,7 +147,7 @@ pub fn ticks_to_record_batch(ticks: &[Tick]) -> arrow_array::RecordBatch {
         schema,
         vec![
             Arc::new(Int64Array::from(time_ns)),
-            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(Int64Array::from(sym_sid)),
             Arc::new(StringArray::from(sym_val)),
             Arc::new(UInt8Array::from(tick_type)),
             Arc::new(Int64Array::from(value)),
@@ -162,11 +178,11 @@ pub fn record_batch_to_ticks(
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    let tick_type = batch
+    let tick_type_u8 = batch.column(3).as_any().downcast_ref::<UInt8Array>();
+    let tick_type_i32 = batch
         .column(3)
         .as_any()
-        .downcast_ref::<UInt8Array>()
-        .unwrap();
+        .downcast_ref::<arrow_array::Int32Array>();
     let value_col = batch
         .column(4)
         .as_any()
@@ -197,16 +213,8 @@ pub fn record_batch_to_ticks(
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    let exchange_col = batch
-        .column(10)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let sale_condition_col = batch
-        .column(11)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let exchange_col = batch.column(10).as_ref();
+    let sale_condition_col = batch.column(11).as_ref();
     let suspicious_col = batch
         .column(12)
         .as_any()
@@ -217,7 +225,11 @@ pub fn record_batch_to_ticks(
         .map(|i| Tick {
             symbol: symbol.clone(),
             time: lean_core::NanosecondTimestamp(time_ns.value(i)),
-            tick_type: match tick_type.value(i) {
+            tick_type: match tick_type_u8
+                .map(|values| values.value(i) as i32)
+                .or_else(|| tick_type_i32.map(|values| values.value(i)))
+                .unwrap_or_default()
+            {
                 0 => lean_core::TickType::Trade,
                 1 => lean_core::TickType::Quote,
                 2 => lean_core::TickType::OpenInterest,
@@ -229,16 +241,8 @@ pub fn record_batch_to_ticks(
             ask_price: i64_to_price(ask_price_col.value(i)),
             bid_size: i64_to_price(bid_size_col.value(i)),
             ask_size: i64_to_price(ask_size_col.value(i)),
-            exchange: if exchange_col.is_null(i) {
-                None
-            } else {
-                Some(exchange_col.value(i).to_string())
-            },
-            sale_condition: if sale_condition_col.is_null(i) {
-                None
-            } else {
-                Some(sale_condition_col.value(i).to_string())
-            },
+            exchange: optional_string_value(exchange_col, i),
+            sale_condition: optional_string_value(sale_condition_col, i),
             suspicious: suspicious_col.value(i),
         })
         .collect()
@@ -252,8 +256,8 @@ pub fn margin_interest_rates_to_record_batch(
     let schema = crate::schema::margin_interest_rate_schema();
 
     let time_ns: Vec<i64> = rates.iter().map(|r| r.time.0).collect();
-    let sym_sid: Vec<u64> = rates.iter().map(|r| r.symbol.id.sid).collect();
-    let sym_val: Vec<&str> = rates.iter().map(|r| r.symbol.value.as_str()).collect();
+    let sym_sid: Vec<i64> = rates.iter().map(|r| r.symbol.id.sid as i64).collect();
+    let sym_val: Vec<&str> = rates.iter().map(|r| r.symbol.value.as_ref()).collect();
     let interest_rate: Vec<i64> = rates
         .iter()
         .map(|r| price_to_i64(&r.interest_rate))
@@ -263,7 +267,7 @@ pub fn margin_interest_rates_to_record_batch(
         schema,
         vec![
             Arc::new(Int64Array::from(time_ns)),
-            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(Int64Array::from(sym_sid)),
             Arc::new(StringArray::from(sym_val)),
             Arc::new(Int64Array::from(interest_rate)),
         ],
@@ -309,8 +313,8 @@ pub fn perpetual_contexts_to_record_batch(
 
     let time_ns: Vec<i64> = contexts.iter().map(|c| c.time.0).collect();
     let end_time_ns: Vec<i64> = contexts.iter().map(|c| c.end_time.0).collect();
-    let sym_sid: Vec<u64> = contexts.iter().map(|c| c.symbol.id.sid).collect();
-    let sym_val: Vec<&str> = contexts.iter().map(|c| c.symbol.value.as_str()).collect();
+    let sym_sid: Vec<i64> = contexts.iter().map(|c| c.symbol.id.sid as i64).collect();
+    let sym_val: Vec<&str> = contexts.iter().map(|c| c.symbol.value.as_ref()).collect();
     let funding: Vec<i64> = contexts.iter().map(|c| price_to_i64(&c.funding)).collect();
     let open_interest: Vec<i64> = contexts
         .iter()
@@ -346,7 +350,7 @@ pub fn perpetual_contexts_to_record_batch(
         vec![
             Arc::new(Int64Array::from(time_ns)),
             Arc::new(Int64Array::from(end_time_ns)),
-            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(Int64Array::from(sym_sid)),
             Arc::new(StringArray::from(sym_val)),
             Arc::new(Int64Array::from(funding)),
             Arc::new(Int64Array::from(open_interest)),
@@ -466,8 +470,8 @@ pub fn quote_bars_to_record_batch(bars: &[QuoteBar]) -> arrow_array::RecordBatch
 
     let time_ns: Vec<i64> = bars.iter().map(|b| b.time.0).collect();
     let end_time_ns: Vec<i64> = bars.iter().map(|b| b.end_time.0).collect();
-    let sym_sid: Vec<u64> = bars.iter().map(|b| b.symbol.id.sid).collect();
-    let sym_val: Vec<&str> = bars.iter().map(|b| b.symbol.value.as_str()).collect();
+    let sym_sid: Vec<i64> = bars.iter().map(|b| b.symbol.id.sid as i64).collect();
+    let sym_val: Vec<&str> = bars.iter().map(|b| b.symbol.value.as_ref()).collect();
     let bid_open: Vec<Option<i64>> = bars
         .iter()
         .map(|b| b.bid.as_ref().map(|bar| price_to_i64(&bar.open)))
@@ -515,7 +519,7 @@ pub fn quote_bars_to_record_batch(bars: &[QuoteBar]) -> arrow_array::RecordBatch
         vec![
             Arc::new(Int64Array::from(time_ns)),
             Arc::new(Int64Array::from(end_time_ns)),
-            Arc::new(UInt64Array::from(sym_sid)),
+            Arc::new(Int64Array::from(sym_sid)),
             Arc::new(StringArray::from(sym_val)),
             Arc::new(Int64Array::from(bid_open)),
             Arc::new(Int64Array::from(bid_high)),
@@ -688,6 +692,49 @@ pub fn option_eod_bars_to_record_batch(bars: &[OptionEodBar]) -> arrow_array::Re
     .expect("schema/column count mismatch — this is a bug")
 }
 
+pub fn record_batch_to_option_eod_bars(batch: &arrow_array::RecordBatch) -> Vec<OptionEodBar> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return vec![];
+    }
+
+    let date_ns_col = int64_column(batch, "date_ns");
+    let sym_val_col = string_column(batch, "symbol_value");
+    let underlying_col = string_column(batch, "underlying");
+    let exp_ns_col = int64_column(batch, "expiration_ns");
+    let strike_col = int64_column(batch, "strike");
+    let right_col = string_column(batch, "right");
+    let open_col = int64_column(batch, "open");
+    let high_col = int64_column(batch, "high");
+    let low_col = int64_column(batch, "low");
+    let close_col = int64_column(batch, "close");
+    let volume_col = int64_column(batch, "volume");
+    let bid_col = int64_column(batch, "bid");
+    let ask_col = int64_column(batch, "ask");
+    let bid_size_col = int64_column(batch, "bid_size");
+    let ask_size_col = int64_column(batch, "ask_size");
+
+    (0..n)
+        .map(|i| OptionEodBar {
+            date: ns_to_date(date_ns_col.value(i)),
+            symbol_value: sym_val_col.value(i).to_string(),
+            underlying: underlying_col.value(i).to_string(),
+            expiration: ns_to_date(exp_ns_col.value(i)),
+            strike: i64_to_price(strike_col.value(i)),
+            right: right_col.value(i).to_string(),
+            open: i64_to_price(open_col.value(i)),
+            high: i64_to_price(high_col.value(i)),
+            low: i64_to_price(low_col.value(i)),
+            close: i64_to_price(close_col.value(i)),
+            volume: volume_col.value(i),
+            bid: i64_to_price(bid_col.value(i)),
+            ask: i64_to_price(ask_col.value(i)),
+            bid_size: bid_size_col.value(i),
+            ask_size: ask_size_col.value(i),
+        })
+        .collect()
+}
+
 // ─── OptionUniverseRow ────────────────────────────────────────────────────────
 
 pub fn option_universe_rows_to_record_batch(
@@ -765,4 +812,22 @@ pub fn record_batch_to_option_universe_rows(
             right: right_col.value(i).to_string(),
         })
         .collect()
+}
+
+fn int64_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> &'a Int64Array {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("{name} column missing"))
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap_or_else(|| panic!("{name} must be int64"))
+}
+
+fn string_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> &'a StringArray {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("{name} column missing"))
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap_or_else(|| panic!("{name} must be utf8"))
 }

@@ -10,6 +10,7 @@ mod custom_data_tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// A minimal mock custom data source for testing.
     struct MockVixSource;
@@ -38,6 +39,8 @@ mod custom_data_tests {
                 ),
                 transport: CustomDataTransport::Http,
                 format: CustomDataFormat::Csv,
+                headers: HashMap::new(),
+                symbol_column: None,
             })
         }
 
@@ -69,7 +72,8 @@ mod custom_data_tests {
                 time: date,
                 end_time: None,
                 value: close,
-                fields,
+                symbol: None,
+                fields: Arc::new(fields),
             })
         }
 
@@ -193,30 +197,6 @@ mod custom_data_tests {
             .reader("2024-01-08,abc,14.20,13.10,bad_close", date, &config)
             .is_none());
     }
-
-    #[test]
-    fn test_cache_path_format() {
-        // Test that the cache path function produces the expected layout.
-        let root = std::path::Path::new("/data");
-        let date = NaiveDate::from_ymd_opt(2024, 1, 8).unwrap();
-        let path = lean_storage::custom_data_path(root, "fred", "UNRATE", date);
-
-        let path_str = path.to_string_lossy();
-        assert!(path_str.contains("custom"), "path should contain 'custom'");
-        assert!(path_str.contains("fred"), "path should contain source_type");
-        assert!(
-            path_str.contains("unrate"),
-            "path should contain ticker (lowercase)"
-        );
-        assert!(
-            path_str.contains("20240108"),
-            "path should contain YYYYMMDD date"
-        );
-        assert!(
-            path_str.ends_with(".parquet"),
-            "path should end with .parquet"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -229,9 +209,7 @@ mod provider_tests {
         Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TickType, TimeSpan,
     };
     use lean_data::{TradeBar, TradeBarData};
-    use lean_storage::{
-        OptionEodBar, OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig,
-    };
+    use lean_storage::{IcebergStore, OptionEodBar, OptionUniverseRow};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -242,12 +220,12 @@ mod provider_tests {
     use crate::traits::IHistoryProvider;
 
     fn make_symbol_for(ticker: &str) -> Symbol {
-        Symbol {
-            id: SecurityIdentifier::generate_equity(ticker, &Market::usa()),
-            value: ticker.to_string(),
-            permtick: ticker.to_string(),
-            underlying: None,
-        }
+        Symbol::from_parts(
+            SecurityIdentifier::generate_equity(ticker, &Market::usa()),
+            ticker.to_string(),
+            ticker.to_string(),
+            None,
+        )
     }
 
     fn make_symbol() -> Symbol {
@@ -298,42 +276,26 @@ mod provider_tests {
     fn make_bar_for(symbol: Symbol, date: NaiveDate) -> TradeBar {
         TradeBar::new(
             symbol,
+            date_time(date - chrono::Duration::days(1), 16, 0, 0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
+        )
+    }
+
+    fn make_start_dated_bar_for(symbol: Symbol, date: NaiveDate) -> TradeBar {
+        TradeBar::new(
+            symbol,
             date_time(date, 16, 0, 0),
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
         )
     }
 
-    fn write_daily_bars(root: &std::path::Path, bars: &[TradeBar]) {
-        let resolver = PathResolver::new(root);
-        let writer = ParquetWriter::new(WriterConfig::default());
-        for bar in bars {
-            let path = resolver.market_data_partition(
-                &bar.symbol,
-                Resolution::Daily,
-                TickType::Trade,
-                bar.time.date_utc(),
-            );
-            writer
-                .merge_trade_bar_partition(std::slice::from_ref(bar), &path)
-                .unwrap();
-        }
-    }
-
-    fn write_daily_bars_to_partition_dates(root: &std::path::Path, bars: &[(NaiveDate, TradeBar)]) {
-        let resolver = PathResolver::new(root);
-        let writer = ParquetWriter::new(WriterConfig::default());
-        for (partition_date, bar) in bars {
-            let path = resolver.market_data_partition(
-                &bar.symbol,
-                Resolution::Daily,
-                TickType::Trade,
-                *partition_date,
-            );
-            writer
-                .merge_trade_bar_partition(std::slice::from_ref(bar), &path)
-                .unwrap();
-        }
+    async fn local_provider_with_store(
+        root: &std::path::Path,
+    ) -> (LocalHistoryProvider, Arc<IcebergStore>) {
+        let store = Arc::new(IcebergStore::connect_local(root).await.unwrap());
+        (LocalHistoryProvider::from_store(store.clone()), store)
     }
 
     fn make_option_universe_row(
@@ -351,11 +313,16 @@ mod provider_tests {
         }
     }
 
-    fn write_option_universe(root: &std::path::Path, date: NaiveDate, rows: &[OptionUniverseRow]) {
-        let resolver = PathResolver::new(root);
-        let writer = ParquetWriter::new(WriterConfig::default());
-        writer
-            .write_option_universe(rows, &resolver.option_universe_partition(date))
+    async fn write_daily_bars(store: &IcebergStore, bars: &[TradeBar]) {
+        store
+            .append_trade_bars(
+                bars,
+                lean_core::SecurityType::Equity,
+                Market::usa().as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
             .unwrap();
     }
 
@@ -399,12 +366,12 @@ mod provider_tests {
     }
 
     #[derive(Clone)]
-    struct MockSideEffectProvider {
+    struct MockFactorRowsProvider {
         implemented: bool,
     }
 
     #[async_trait::async_trait]
-    impl IHistoryProvider for MockSideEffectProvider {
+    impl IHistoryProvider for MockFactorRowsProvider {
         async fn get_history(
             &self,
             request: &HistoryRequest,
@@ -417,12 +384,12 @@ mod provider_tests {
     }
 
     #[derive(Clone)]
-    struct RecordingSideEffectProvider {
+    struct RecordingEmptyRowsProvider {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
-    impl IHistoryProvider for RecordingSideEffectProvider {
+    impl IHistoryProvider for RecordingEmptyRowsProvider {
         async fn get_history(
             &self,
             _request: &HistoryRequest,
@@ -474,7 +441,7 @@ mod provider_tests {
             &self,
             request: &HistoryRequest,
         ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
-            if request.symbol.value == self.failed_symbol {
+            if request.symbol.value.as_ref() == self.failed_symbol {
                 anyhow::bail!("provider has no data for {}", request.symbol.value);
             }
             Ok(vec![make_bar_for(
@@ -550,10 +517,10 @@ mod provider_tests {
     }
 
     #[tokio::test]
-    async fn stacked_provider_falls_back_for_side_effect_not_implemented() {
+    async fn stacked_provider_falls_back_for_factor_rows_not_implemented() {
         let provider = StackedHistoryProvider::new(vec![
-            Arc::new(MockSideEffectProvider { implemented: false }),
-            Arc::new(MockSideEffectProvider { implemented: true }),
+            Arc::new(MockFactorRowsProvider { implemented: false }),
+            Arc::new(MockFactorRowsProvider { implemented: true }),
         ]);
         let mut request = make_history_request();
         request.data_type = DataType::FactorFile;
@@ -564,14 +531,14 @@ mod provider_tests {
     }
 
     #[tokio::test]
-    async fn stacked_provider_tries_all_side_effect_providers_after_empty_ok() {
+    async fn stacked_provider_tries_next_factor_provider_after_empty_ok() {
         let first_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = StackedHistoryProvider::new(vec![
-            Arc::new(RecordingSideEffectProvider {
+            Arc::new(RecordingEmptyRowsProvider {
                 calls: Arc::clone(&first_calls),
             }),
-            Arc::new(RecordingSideEffectProvider {
+            Arc::new(RecordingEmptyRowsProvider {
                 calls: Arc::clone(&second_calls),
             }),
         ]);
@@ -612,7 +579,7 @@ mod provider_tests {
         let batch = provider.get_history_batch(&request).await.unwrap();
 
         assert_eq!(batch.trade_bars.len(), 1);
-        assert_eq!(batch.trade_bars[0].symbol.value, "SPY");
+        assert_eq!(batch.trade_bars[0].symbol.value.as_ref(), "SPY");
     }
 
     #[tokio::test]
@@ -689,7 +656,7 @@ mod provider_tests {
     #[tokio::test]
     async fn local_provider_returns_empty_when_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = LocalHistoryProvider::new(dir.path());
+        let (provider, _store) = local_provider_with_store(dir.path()).await;
 
         let request = make_history_request();
         let bars = provider.get_history(&request).await.unwrap();
@@ -702,16 +669,17 @@ mod provider_tests {
     }
 
     #[tokio::test]
-    async fn local_provider_returns_empty_for_partial_daily_coverage() {
+    async fn local_provider_returns_partial_daily_coverage() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = LocalHistoryProvider::new(dir.path());
+        let (provider, store) = local_provider_with_store(dir.path()).await;
         write_daily_bars(
-            dir.path(),
+            &store,
             &[
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
             ],
-        );
+        )
+        .await;
 
         let request = make_history_request_for_range(
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
@@ -719,25 +687,64 @@ mod provider_tests {
         );
         let bars = provider.get_history(&request).await.unwrap();
 
-        assert!(
-            bars.is_empty(),
-            "partial local cache should fall through to the next stacked provider"
+        assert_eq!(
+            bars.len(),
+            2,
+            "partial local cache should return cached rows instead of forcing remote re-fetch"
         );
+    }
+
+    #[tokio::test]
+    async fn stacked_provider_uses_partial_local_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, store) = local_provider_with_store(dir.path()).await;
+        write_daily_bars(
+            &store,
+            &[
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
+                make_bar(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
+            ],
+        )
+        .await;
+
+        struct RemoteOnly;
+        #[async_trait::async_trait]
+        impl IHistoryProvider for RemoteOnly {
+            fn name(&self) -> &str {
+                "remote"
+            }
+
+            async fn get_history(
+                &self,
+                _request: &HistoryRequest,
+            ) -> anyhow::Result<Vec<TradeBar>> {
+                panic!("remote provider should not be called when local cache has rows");
+            }
+        }
+
+        let provider = StackedHistoryProvider::new(vec![Arc::new(local), Arc::new(RemoteOnly)]);
+        let request = make_history_request_for_range(
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+        );
+        let bars = provider.get_history(&request).await.unwrap();
+        assert_eq!(bars.len(), 2);
     }
 
     #[tokio::test]
     async fn local_provider_returns_data_for_complete_daily_coverage() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = LocalHistoryProvider::new(dir.path());
+        let (provider, store) = local_provider_with_store(dir.path()).await;
         write_daily_bars(
-            dir.path(),
+            &store,
             &[
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()),
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()),
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 4).unwrap()),
                 make_bar(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
             ],
-        );
+        )
+        .await;
 
         let request = make_history_request_for_range(
             NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
@@ -751,7 +758,7 @@ mod provider_tests {
     #[tokio::test]
     async fn local_provider_daily_coverage_uses_partition_date_not_bar_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = LocalHistoryProvider::new(dir.path());
+        let (provider, store) = local_provider_with_store(dir.path()).await;
         let symbol = make_symbol();
         let request_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let request_end = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
@@ -763,14 +770,33 @@ mod provider_tests {
         ];
         let bars = partition_dates
             .into_iter()
-            .map(|partition_date| {
-                (
-                    partition_date,
-                    make_bar_for(symbol.clone(), partition_date - chrono::Duration::days(1)),
-                )
-            })
+            .map(|partition_date| make_bar_for(symbol.clone(), partition_date))
             .collect::<Vec<_>>();
-        write_daily_bars_to_partition_dates(dir.path(), &bars);
+        write_daily_bars(&store, &bars).await;
+
+        let request = make_history_request_for_range(request_start, request_end);
+        let bars = provider.get_history(&request).await.unwrap();
+
+        assert_eq!(bars.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn local_provider_daily_coverage_accepts_start_dated_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let symbol = make_symbol();
+        let request_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let request_end = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
+        let bars = [
+            request_start,
+            NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 4).unwrap(),
+            request_end,
+        ]
+        .into_iter()
+        .map(|date| make_start_dated_bar_for(symbol.clone(), date))
+        .collect::<Vec<_>>();
+        write_daily_bars(&store, &bars).await;
 
         let request = make_history_request_for_range(request_start, request_end);
         let bars = provider.get_history(&request).await.unwrap();
@@ -781,17 +807,16 @@ mod provider_tests {
     #[tokio::test]
     async fn local_provider_batches_option_universe_by_underlying() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = LocalHistoryProvider::new(dir.path());
+        let (provider, store) = local_provider_with_store(dir.path()).await;
         let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
-        write_option_universe(
-            dir.path(),
-            date,
-            &[
+        store
+            .append_option_universe(&[
                 make_option_universe_row(date, "SPY", "SPY240216C00100000"),
                 make_option_universe_row(date, "QQQ", "QQQ240216C00100000"),
                 make_option_universe_row(date, "AAPL", "AAPL240216C00100000"),
-            ],
-        );
+            ])
+            .await
+            .unwrap();
 
         let batch = provider
             .get_option_universes(&["SPY".to_string(), "AAPL".to_string()], date)
@@ -810,7 +835,7 @@ mod provider_tests {
     #[test]
     fn history_request_fields() {
         let req = make_history_request();
-        assert_eq!(req.symbol.permtick, "SPY");
+        assert_eq!(req.symbol.permtick.as_ref(), "SPY");
         assert_eq!(req.resolution, Resolution::Daily);
         assert_eq!(req.data_type, DataType::TradeBar);
     }
@@ -821,7 +846,7 @@ mod provider_tests {
     #[tokio::test]
     async fn local_provider_handles_non_existent_dir_gracefully() {
         // A data root that doesn't exist should return empty rather than error.
-        let provider = LocalHistoryProvider::new("/nonexistent/path/to/data");
+        let provider = LocalHistoryProvider::new("/tmp/rlean-nonexistent-path-to-data");
         let request = make_history_request();
         let result = provider.get_history(&request).await;
         // Either Ok(empty) or we accept errors — the key property is no panic.

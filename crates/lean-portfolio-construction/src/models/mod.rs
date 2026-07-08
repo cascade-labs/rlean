@@ -8,5 +8,6 @@ pub mod maximum_sharpe_ratio;
 pub mod mean_reversion;
 pub mod mean_variance;
 pub mod null_pcm;
+pub mod returns_symbol_data;
 pub mod risk_parity;
 pub mod sector_weighting;

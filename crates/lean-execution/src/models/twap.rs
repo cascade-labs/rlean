@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::execution_model::{
-    ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest, SecurityData,
+    ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
 };
 use lean_core::Symbol;
 use rust_decimal::Decimal;
@@ -26,7 +26,7 @@ struct TwapState {
 pub struct TwapExecutionModel {
     /// Number of equal time slices (default: 4)
     pub num_slices: u32,
-    state: HashMap<String, TwapState>,
+    state: HashMap<u64, TwapState>,
 }
 
 impl TwapExecutionModel {
@@ -49,13 +49,13 @@ impl IExecutionModel for TwapExecutionModel {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
+        context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         // Register or update targets
         for target in targets {
-            let key = target.symbol.value.clone();
-            let current_qty = securities
-                .get(&key)
+            let key = target.symbol.id.sid;
+            let current_qty = context
+                .security(&target.symbol)
                 .map(|s| s.current_quantity)
                 .unwrap_or(Decimal::ZERO);
             let total_delta = target.quantity - current_qty;
@@ -81,7 +81,7 @@ impl IExecutionModel for TwapExecutionModel {
                 continue;
             }
 
-            let sec = match securities.get(key) {
+            let sec = match context.securities.get(key) {
                 Some(s) => s,
                 None => continue,
             };
@@ -136,7 +136,7 @@ impl IExecutionModel for TwapExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.state.remove(&sym.value);
+            self.state.remove(&sym.id.sid);
         }
     }
 

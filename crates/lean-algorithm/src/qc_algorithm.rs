@@ -3,12 +3,14 @@ use crate::{
     runtime_statistics::RuntimeStatistics, securities::SecurityManager, BuyingPowerModel,
 };
 use chrono::Timelike;
-use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{
-    DataNormalizationMode, DateTime, Market, OptionRight, OptionStyle, Price, Quantity, Resolution,
-    SecurityType, SettlementType, Symbol, SymbolOptionsExt, SymbolProperties, TimeSpan,
+    DataNormalizationMode, DateTime, Market, MarketHoursDatabase, OptionRight, OptionStyle, Price,
+    Quantity, Resolution, SecurityType, SettlementType, Symbol, SymbolOptionsExt, SymbolProperties,
+    TimeSpan,
 };
-use lean_data::{CustomDataSubscription, SubscriptionDataConfig, SubscriptionManager};
+use lean_data::{
+    subscription::CustomSubscriptionMetadata, SubscriptionDataConfig, SubscriptionManager,
+};
 use lean_options::OptionChain;
 use lean_orders::{
     combo_orders::{ComboLegDetails, ComboLegLimitOrder, ComboLimitOrder, ComboMarketOrder},
@@ -166,11 +168,9 @@ pub struct QcAlgorithm {
     /// When None, the runner defaults to SPY automatically.
     pub benchmark_symbol: Option<String>,
 
-    /// Custom data subscriptions registered via `add_data()`.
-    pub custom_data_subscriptions: Vec<CustomDataSubscription>,
-
     pub brokerage_name: BrokerageName,
     pub account_type: AccountType,
+    pub market_hours_database: Arc<MarketHoursDatabase>,
     security_leverage_overrides: HashMap<u64, f64>,
 }
 
@@ -201,11 +201,15 @@ impl QcAlgorithm {
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
             benchmark_symbol: None,
-            custom_data_subscriptions: Vec::new(),
             brokerage_name: BrokerageName::Default,
             account_type: AccountType::Margin,
+            market_hours_database: MarketHoursDatabase::global(),
             security_leverage_overrides: HashMap::new(),
         }
+    }
+
+    pub fn set_market_hours_database(&mut self, market_hours_database: Arc<MarketHoursDatabase>) {
+        self.market_hours_database = market_hours_database;
     }
 
     pub fn set_brokerage_model(&mut self, brokerage: BrokerageName, account_type: AccountType) {
@@ -407,9 +411,15 @@ impl QcAlgorithm {
             return symbol;
         }
 
-        let hours = ExchangeHours::us_equity();
+        let hours = self.market_hours_database.exchange_hours(&symbol);
         let props = SymbolProperties::default();
-        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
         self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
@@ -417,6 +427,7 @@ impl QcAlgorithm {
 
     pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         match symbol.security_type() {
+            SecurityType::Base => self.add_base_symbol(symbol, resolution),
             SecurityType::Equity => {
                 self.add_equity_symbol(symbol, resolution, DataNormalizationMode::Adjusted)
             }
@@ -435,6 +446,92 @@ impl QcAlgorithm {
             }
             other => panic!("Universe selection does not support {other:?} securities yet"),
         }
+    }
+
+    pub fn add_custom_data(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        resolution: Resolution,
+        properties: HashMap<String, String>,
+    ) -> Symbol {
+        let market = Market::usa();
+        let symbol = Symbol::create_base(source_type, ticker, &market);
+        let query = lean_data::CustomDataQuery::default();
+        let config = lean_data::CustomDataConfig {
+            ticker: ticker.to_string(),
+            source_type: source_type.to_string(),
+            resolution,
+            properties,
+            query,
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: source_type.to_string(),
+            ticker: ticker.to_string(),
+            config,
+            dynamic_query: lean_data::CustomDataQuery::default(),
+        };
+        self.subscription_manager
+            .add(SubscriptionDataConfig::new_custom(
+                symbol.clone(),
+                resolution,
+                metadata,
+            ));
+        self.ensure_base_security(symbol, resolution)
+    }
+
+    pub fn add_custom_universe_data(
+        &mut self,
+        source_type: &str,
+        ticker: &str,
+        resolution: Resolution,
+        properties: HashMap<String, String>,
+    ) -> Symbol {
+        let market = Market::usa();
+        let symbol = Symbol::create_base(source_type, ticker, &market);
+        let query = lean_data::CustomDataQuery::default();
+        let config = lean_data::CustomDataConfig {
+            ticker: ticker.to_string(),
+            source_type: source_type.to_string(),
+            resolution,
+            properties,
+            query,
+        };
+        let metadata = CustomSubscriptionMetadata {
+            source_type: source_type.to_string(),
+            ticker: ticker.to_string(),
+            config,
+            dynamic_query: lean_data::CustomDataQuery::default(),
+        };
+        self.subscription_manager
+            .add(SubscriptionDataConfig::new_custom_universe(
+                symbol.clone(),
+                resolution,
+                metadata,
+            ));
+        self.ensure_base_security(symbol, resolution)
+    }
+
+    fn add_base_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        self.ensure_base_security(symbol, resolution)
+    }
+
+    fn ensure_base_security(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        if self.securities.contains(&symbol) {
+            return symbol;
+        }
+        let hours = self.market_hours_database.exchange_hours(&symbol);
+        let props = SymbolProperties::default();
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
+        self.initialize_security_models(&security);
+        self.securities.add(security);
+        symbol
     }
 
     fn add_equity_subscriptions(
@@ -472,9 +569,15 @@ impl QcAlgorithm {
         let symbol = Symbol::create_forex(ticker);
         let config = SubscriptionDataConfig::new_forex(symbol.clone(), resolution);
         self.subscription_manager.add(config);
-        let hours = ExchangeHours::forex_24h();
+        let hours = self.market_hours_database.exchange_hours(&symbol);
         let props = SymbolProperties::default();
-        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
         self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
@@ -487,9 +590,15 @@ impl QcAlgorithm {
         let mut quote_config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
         quote_config.tick_type = lean_core::TickType::Quote;
         self.subscription_manager.add(quote_config);
-        let hours = ExchangeHours::crypto_24_7();
+        let hours = self.market_hours_database.exchange_hours(&symbol);
         let props = self.symbol_properties_for_symbol(&symbol);
-        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
         self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
@@ -513,9 +622,15 @@ impl QcAlgorithm {
             return symbol;
         }
 
-        let hours = ExchangeHours::crypto_24_7();
+        let hours = self.market_hours_database.exchange_hours(&symbol);
         let props = self.symbol_properties_for_symbol(&symbol);
-        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
         self.initialize_security_models(&security);
         self.securities.add(security);
         symbol
@@ -523,7 +638,7 @@ impl QcAlgorithm {
 
     fn symbol_properties_for_symbol(&self, symbol: &Symbol) -> SymbolProperties {
         let mut props = SymbolProperties::default();
-        props.market_ticker = symbol.value.clone();
+        props.market_ticker = symbol.value.to_string();
         props.quote_currency = match symbol.security_type() {
             SecurityType::CryptoFuture if symbol.market().as_str() == Market::HYPERLIQUID => {
                 "USDC".into()
@@ -659,11 +774,20 @@ impl QcAlgorithm {
             let Some(security) = self.securities.get(&holding.symbol) else {
                 continue;
             };
+            let price = if let Some((order, fill_price)) = order {
+                if holding.symbol.id.sid == order.symbol.id.sid {
+                    fill_price
+                } else {
+                    security.current_price()
+                }
+            } else {
+                security.current_price()
+            };
             total += security
                 .buying_power_model()
                 .maintenance_margin_requirement(
                     holding.quantity,
-                    holding.last_price,
+                    price,
                     holding.contract_multiplier,
                     security.leverage(),
                 );
@@ -705,7 +829,7 @@ impl QcAlgorithm {
         let collateral = if symbol.security_type() == SecurityType::CryptoFuture {
             *self.portfolio.cash.read()
         } else {
-            self.portfolio.total_portfolio_value()
+            self.portfolio_value()
         };
         let used = self.margin_used_after_order(None, symbol);
         (collateral - used).max(Decimal::ZERO)
@@ -736,7 +860,7 @@ impl QcAlgorithm {
         let collateral = if order.symbol.security_type() == SecurityType::CryptoFuture {
             *self.portfolio.cash.read()
         } else {
-            self.portfolio.total_portfolio_value()
+            self.portfolio_value()
         };
         let collateral_after_fee = (collateral - order_fee.max(Decimal::ZERO)).max(Decimal::ZERO);
         let used_after = self.margin_used_after_order(Some((order, fill_price)), &order.symbol);
@@ -1296,7 +1420,7 @@ impl QcAlgorithm {
 
     /// Set holdings to a target portfolio weight (0.0 = 0%, 1.0 = 100% of portfolio value).
     pub fn set_holdings(&mut self, symbol: &Symbol, target: Decimal) -> Option<OrderTicket> {
-        let portfolio_value = self.portfolio.total_portfolio_value();
+        let portfolio_value = self.portfolio_value();
         let security = self.securities.get(symbol)?;
         let current_price = security.current_price();
 
@@ -1435,7 +1559,64 @@ impl QcAlgorithm {
         *self.portfolio.cash.read()
     }
     pub fn portfolio_value(&self) -> Price {
-        self.portfolio.total_portfolio_value()
+        let cash = *self.portfolio.cash.read();
+        let holdings_value: Price = self
+            .portfolio
+            .all_holdings()
+            .into_iter()
+            .filter(|holding| holding.is_invested())
+            .map(|holding| {
+                let price = self
+                    .securities
+                    .get(&holding.symbol)
+                    .map(|security| security.current_price())
+                    .filter(|price| !price.is_zero())
+                    .unwrap_or(holding.last_price);
+                match holding.symbol.security_type() {
+                    SecurityType::CryptoFuture => {
+                        (price - holding.average_price)
+                            * holding.quantity
+                            * holding.contract_multiplier
+                    }
+                    _ => holding.get_quantity_value(holding.quantity, price),
+                }
+            })
+            .sum();
+        cash + holdings_value
+    }
+
+    pub fn unrealized_profit(&self) -> Price {
+        self.portfolio
+            .all_holdings()
+            .into_iter()
+            .filter(|holding| holding.is_invested())
+            .map(|holding| {
+                let price = self
+                    .securities
+                    .get(&holding.symbol)
+                    .map(|security| security.current_price())
+                    .filter(|price| !price.is_zero())
+                    .unwrap_or(holding.last_price);
+                (price - holding.average_price) * holding.quantity * holding.contract_multiplier
+            })
+            .sum()
+    }
+
+    pub fn total_holdings_value(&self) -> Price {
+        self.portfolio
+            .all_holdings()
+            .into_iter()
+            .filter(|holding| holding.is_invested())
+            .map(|holding| {
+                let price = self
+                    .securities
+                    .get(&holding.symbol)
+                    .map(|security| security.current_price())
+                    .filter(|price| !price.is_zero())
+                    .unwrap_or(holding.last_price);
+                holding.get_quantity_value(holding.quantity, price).abs()
+            })
+            .sum()
     }
     pub fn is_invested(&self, symbol: &Symbol) -> bool {
         self.portfolio.is_invested(symbol)
@@ -1477,15 +1658,15 @@ impl QcAlgorithm {
             self.option_subscriptions.push(canonical.clone());
         }
         self.option_subscription_resolutions
-            .insert(canonical.permtick.clone(), resolution);
+            .insert(canonical.permtick.to_string(), resolution);
         self.option_filters
-            .insert(canonical.permtick.clone(), OptionFilter::default());
+            .insert(canonical.permtick.to_string(), OptionFilter::default());
         canonical
     }
 
     pub fn set_option_filter(&mut self, canonical: &Symbol, filter: OptionFilter) {
         self.option_filters
-            .insert(canonical.permtick.clone(), filter);
+            .insert(canonical.permtick.to_string(), filter);
     }
 
     /// Subscribe to a specific option contract.
@@ -1550,7 +1731,7 @@ impl QcAlgorithm {
     }
 
     fn remove_option_subscription(&mut self, canonical: &Symbol) -> bool {
-        let canonical_key = canonical.permtick.clone();
+        let canonical_key = canonical.permtick.to_string();
         let underlying_key = Self::canonical_underlying_key(canonical);
         let existed = self
             .option_subscriptions
@@ -1613,12 +1794,18 @@ impl QcAlgorithm {
         if self.securities.contains(symbol) {
             return;
         }
-        let hours = ExchangeHours::us_equity();
+        let hours = self.market_hours_database.exchange_hours(symbol);
         let props = SymbolProperties {
             contract_multiplier: 100.0,
             ..SymbolProperties::default()
         };
-        let security = crate::securities::Security::new(symbol.clone(), resolution, props, hours);
+        let security = crate::securities::Security::new(
+            symbol.clone(),
+            resolution,
+            props,
+            hours,
+            self.portfolio.holdings_store(),
+        );
         self.initialize_security_models(&security);
         self.securities.add(security);
     }
@@ -1918,7 +2105,7 @@ mod tests {
             },
         );
         alg.option_chains.insert(
-            canonical.permtick.clone(),
+            canonical.permtick.to_string(),
             OptionChain::new(canonical.clone(), dec!(200)),
         );
         alg.add_option_contract(contract.clone(), Resolution::Minute);
@@ -1939,9 +2126,9 @@ mod tests {
             .any(|symbol| symbol.id.sid == canonical.id.sid));
         assert!(!alg
             .option_subscription_resolutions
-            .contains_key(&canonical.permtick));
-        assert!(!alg.option_filters.contains_key(&canonical.permtick));
-        assert!(!alg.option_chains.contains_key(&canonical.permtick));
+            .contains_key(canonical.permtick.as_ref()));
+        assert!(!alg.option_filters.contains_key(canonical.permtick.as_ref()));
+        assert!(!alg.option_chains.contains_key(canonical.permtick.as_ref()));
         assert!(!alg.is_option_underlying(&underlying));
         assert!(!alg
             .open_option_contracts

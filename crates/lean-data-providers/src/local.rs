@@ -1,14 +1,11 @@
-/// Local disk-only history provider — reads Parquet trade bars with no network calls.
+/// Local Iceberg history provider — reads cached market data with no network calls.
 ///
 /// Useful as a fallback when data has already been downloaded to the local
 /// Parquet store, or in tests.
-use chrono::{Datelike, NaiveDate};
-use lean_core::{
-    exchange_hours::ExchangeHours, Market, OptionRight, OptionStyle, Resolution, SecurityType,
-    Symbol, SymbolOptionsExt, TickType,
-};
+use chrono::NaiveDate;
+use lean_core::{Resolution, Symbol, TickType};
 use lean_data::{MarginInterestRate, QuoteBar, Tick, TradeBar};
-use lean_storage::{OptionUniverseRow, ParquetReader, PathResolver, QueryParams};
+use lean_storage::{IcebergStore, OptionEodBar, OptionUniverseRow, QueryParams};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +14,15 @@ use crate::traits::IHistoryProvider;
 use async_trait::async_trait;
 
 pub struct LocalHistoryProvider {
-    pub(crate) data_root: std::path::PathBuf,
+    store: Arc<IcebergStore>,
+    daily_trade_cache: Mutex<HashMap<u64, Arc<Vec<TradeBar>>>>,
     option_universe_cache: Mutex<Option<OptionUniverseCacheEntry>>,
+    /// When true, a daily request that the local store cannot fully satisfy
+    /// returns empty (a "miss") instead of best-effort partial rows, so a
+    /// stacked remote provider is given a chance to backfill the gap. Enabled
+    /// when local sits in front of remote providers; disabled for local-only
+    /// runs where partial cached data is better than nothing.
+    strict_coverage: bool,
 }
 
 struct OptionUniverseCacheEntry {
@@ -29,10 +33,71 @@ struct OptionUniverseCacheEntry {
 
 impl LocalHistoryProvider {
     pub fn new(data_root: impl AsRef<std::path::Path>) -> Self {
+        let data_root = data_root.as_ref().to_path_buf();
+        let store = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("local history runtime")
+                .block_on(IcebergStore::connect_local(data_root))
+                .expect("failed to connect local Iceberg history store")
+        })
+        .join()
+        .expect("local history store worker panicked");
         LocalHistoryProvider {
-            data_root: data_root.as_ref().to_path_buf(),
+            store: Arc::new(store),
+            daily_trade_cache: Mutex::new(HashMap::new()),
             option_universe_cache: Mutex::new(None),
+            strict_coverage: false,
         }
+    }
+
+    pub fn from_store(store: Arc<IcebergStore>) -> Self {
+        LocalHistoryProvider {
+            store,
+            daily_trade_cache: Mutex::new(HashMap::new()),
+            option_universe_cache: Mutex::new(None),
+            strict_coverage: false,
+        }
+    }
+
+    /// Enable strict coverage: incomplete daily windows are reported as a miss
+    /// (empty result) so remote providers in the stack can backfill the gap.
+    pub fn with_strict_coverage(mut self, strict: bool) -> Self {
+        self.strict_coverage = strict;
+        self
+    }
+
+    async fn cached_daily_trade_rows(&self, symbol: &Symbol) -> anyhow::Result<Arc<Vec<TradeBar>>> {
+        let sid = symbol.id.sid;
+        if let Some(rows) = self
+            .daily_trade_cache
+            .lock()
+            .expect("local daily trade cache poisoned")
+            .get(&sid)
+            .cloned()
+        {
+            return Ok(rows);
+        }
+
+        let mut grouped = self
+            .store
+            .scan_trade_bar_partitions_grouped(
+                &HashMap::from([(sid, symbol.clone())]),
+                Resolution::Daily,
+                TickType::Trade,
+                &QueryParams::new().with_symbols(vec![sid]),
+            )
+            .await?;
+        let rows = Arc::new(grouped.remove(&sid).unwrap_or_default());
+        let mut guard = self
+            .daily_trade_cache
+            .lock()
+            .expect("local daily trade cache poisoned");
+        Ok(guard
+            .entry(sid)
+            .or_insert_with(|| Arc::clone(&rows))
+            .clone())
     }
 
     fn merge_option_universe_cache(
@@ -68,8 +133,77 @@ impl LocalHistoryProvider {
     }
 }
 
+fn expected_daily_dates(
+    symbol: &Symbol,
+    start: lean_core::DateTime,
+    end: lean_core::DateTime,
+) -> HashSet<NaiveDate> {
+    let mut dates = HashSet::new();
+    let hours = lean_core::MarketHoursDatabase::global().exchange_hours(symbol);
+    let mut date = start.date_utc();
+    let end_date = end.date_utc();
+    while date <= end_date {
+        if date
+            .and_hms_opt(12, 0, 0)
+            .map(|midday| hours.is_open_at_local_naive(midday))
+            .unwrap_or(false)
+        {
+            dates.insert(date);
+        }
+        date += chrono::Duration::days(1);
+    }
+    dates
+}
+
+fn timestamp_in_range(
+    timestamp: lean_core::DateTime,
+    start: lean_core::DateTime,
+    end: lean_core::DateTime,
+) -> bool {
+    timestamp >= start && timestamp <= end
+}
+
+fn daily_bar_overlaps_range(
+    row: &TradeBar,
+    start: lean_core::DateTime,
+    end: lean_core::DateTime,
+) -> bool {
+    timestamp_in_range(row.time, start, end) || timestamp_in_range(row.end_time, start, end)
+}
+
+fn has_complete_daily_coverage(
+    symbol: &Symbol,
+    rows: &[TradeBar],
+    start: lean_core::DateTime,
+    end: lean_core::DateTime,
+) -> bool {
+    let expected = expected_daily_dates(symbol, start, end);
+    if expected.is_empty() {
+        return rows.is_empty();
+    }
+    let mut available = HashSet::new();
+    let mut unique_rows = HashSet::new();
+    for row in rows {
+        let time_date = row.time.date_utc();
+        let end_date = row.end_time.date_utc();
+        if expected.contains(&time_date) {
+            available.insert(time_date);
+            unique_rows.insert((row.symbol.id.sid, row.time.0, row.end_time.0));
+        }
+        if expected.contains(&end_date) {
+            available.insert(end_date);
+            unique_rows.insert((row.symbol.id.sid, row.time.0, row.end_time.0));
+        }
+    }
+    expected.is_subset(&available) && unique_rows.len() >= expected.len()
+}
+
 #[async_trait]
 impl IHistoryProvider for LocalHistoryProvider {
+    fn name(&self) -> &str {
+        "local"
+    }
+
     async fn get_history(&self, request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
         use crate::request::DataType;
         // LocalHistoryProvider only serves trade bars from disk.
@@ -80,199 +214,122 @@ impl IHistoryProvider for LocalHistoryProvider {
                 request.data_type
             ));
         }
-        let resolver = PathResolver::new(&self.data_root);
-
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-        let is_daily = request.resolution == Resolution::Daily;
-
-        let mut paths = Vec::new();
-        for current in &expected_dates {
-            let p = resolver.market_data_partition(
-                &request.symbol,
-                request.resolution,
-                TickType::Trade,
-                *current,
-            );
-            if p.exists() {
-                paths.push(p);
-            } else {
-                return Ok(vec![]);
-            }
-        }
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
         let symbol = request.symbol.clone();
         let sid = symbol.id.sid;
-        let reader = ParquetReader::new();
-        if is_daily && !partition_paths_cover_symbol_sid(&reader, &paths, sid, 2) {
-            return Ok(vec![]);
-        }
-        let params = if is_daily {
-            QueryParams::new().with_symbols(vec![sid])
+        let mut rows = if request.resolution == Resolution::Daily {
+            self.cached_daily_trade_rows(&symbol)
+                .await?
+                .as_ref()
+                .clone()
         } else {
-            QueryParams::new()
-                .with_time_range(request.start, request.end)
-                .with_symbols(vec![sid])
+            let params = QueryParams::new()
+                .with_day_range(request.start, request.end)
+                .with_bar_range(request.start, request.end)
+                .with_symbols(vec![sid]);
+            let mut grouped = self
+                .store
+                .scan_trade_bar_partitions_grouped(
+                    &HashMap::from([(sid, symbol)]),
+                    request.resolution,
+                    TickType::Trade,
+                    &params,
+                )
+                .await?;
+            grouped.remove(&sid).unwrap_or_default()
         };
-        let mut grouped = reader
-            .read_trade_bar_partitions_grouped_async(
-                &paths,
-                &HashMap::from([(sid, symbol)]),
-                &params,
-            )
-            .await?;
-        let bars = grouped.remove(&sid).unwrap_or_default();
-
-        if is_daily {
-            if bars.len() < expected_dates.len() {
-                return Ok(vec![]);
+        if request.resolution == Resolution::Daily {
+            rows.retain(|row| daily_bar_overlaps_range(row, request.start, request.end));
+            if rows.is_empty() {
+                return Ok(Vec::new());
             }
-        } else if !local_bars_cover_expected_dates(&bars, &expected_dates) {
-            return Ok(vec![]);
+            if !has_complete_daily_coverage(&request.symbol, &rows, request.start, request.end) {
+                if self.strict_coverage {
+                    tracing::debug!(
+                        symbol = %request.symbol.value,
+                        start = %request.start,
+                        end = %request.end,
+                        rows = rows.len(),
+                        "local daily coverage incomplete; reporting miss so remote can backfill"
+                    );
+                    return Ok(Vec::new());
+                }
+                tracing::debug!(
+                    symbol = %request.symbol.value,
+                    start = %request.start,
+                    end = %request.end,
+                    rows = rows.len(),
+                    "returning best-effort local daily history"
+                );
+            }
         }
-
-        Ok(bars)
+        Ok(rows)
     }
 
     async fn get_quote_bars(&self, request: &HistoryRequest) -> anyhow::Result<Vec<QuoteBar>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-        let is_daily = request.resolution == Resolution::Daily;
-
-        let mut paths = Vec::new();
-        for current in &expected_dates {
-            let p = resolver.market_data_partition(
-                &request.symbol,
-                request.resolution,
-                TickType::Quote,
-                *current,
-            );
-            if p.exists() {
-                paths.push(p);
-            } else {
-                return Ok(vec![]);
-            }
-        }
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
         let symbol = request.symbol.clone();
         let sid = symbol.id.sid;
-        let reader = ParquetReader::new();
-        if is_daily && !partition_paths_cover_symbol_sid(&reader, &paths, sid, 2) {
-            return Ok(vec![]);
-        }
-        let params = if is_daily {
-            QueryParams::new().with_symbols(vec![sid])
-        } else {
-            QueryParams::new()
-                .with_time_range(request.start, request.end)
-                .with_symbols(vec![sid])
-        };
-        let mut grouped = reader
-            .read_quote_bar_partitions_grouped_async(
-                &paths,
+        let params = QueryParams::new()
+            .with_day_range(request.start, request.end)
+            .with_bar_range(request.start, request.end)
+            .with_symbols(vec![sid]);
+        let mut grouped = self
+            .store
+            .scan_quote_bar_partitions_grouped(
                 &HashMap::from([(sid, symbol)]),
+                request.resolution,
+                TickType::Quote,
                 &params,
             )
             .await?;
-        let bars = grouped.remove(&sid).unwrap_or_default();
-        if is_daily {
-            if bars.len() < expected_dates.len() {
-                return Ok(vec![]);
-            }
-        } else if !local_quote_bars_cover_expected_dates(&bars, &expected_dates) {
-            return Ok(vec![]);
-        }
-        Ok(bars)
+        Ok(grouped.remove(&sid).unwrap_or_default())
     }
 
     async fn get_ticks(&self, request: &HistoryRequest) -> anyhow::Result<Vec<Tick>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-
-        let mut paths = Vec::new();
-        for current in &expected_dates {
-            let p = resolver.market_data_partition(
-                &request.symbol,
-                Resolution::Tick,
-                TickType::Trade,
-                *current,
-            );
-            if p.exists() {
-                paths.push(p);
-            } else {
-                return Ok(vec![]);
-            }
-        }
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
         let symbol = request.symbol.clone();
         let sid = symbol.id.sid;
-        let reader = ParquetReader::new();
         let params = QueryParams::new()
             .with_time_range(request.start, request.end)
             .with_symbols(vec![sid]);
-        let mut grouped = reader
-            .read_tick_partitions_grouped_async(&paths, &HashMap::from([(sid, symbol)]), &params)
+        let mut grouped = self
+            .store
+            .scan_tick_partitions_grouped(&HashMap::from([(sid, symbol)]), &params)
             .await?;
-        let ticks = grouped.remove(&sid).unwrap_or_default();
-        if !local_ticks_cover_expected_dates(&ticks, &expected_dates) {
-            return Ok(vec![]);
-        }
-        Ok(ticks)
+        Ok(grouped.remove(&sid).unwrap_or_default())
     }
 
     async fn get_margin_interest_rates(
         &self,
         request: &HistoryRequest,
     ) -> anyhow::Result<Vec<MarginInterestRate>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let start_date = request.start.date_utc();
-        let end_date = request.end.date_utc();
-        let expected_dates = expected_market_dates(&request.symbol, start_date, end_date);
-
-        let mut paths = Vec::new();
-        for current in &expected_dates {
-            let p = resolver.margin_interest_partition(&request.symbol, *current);
-            if p.exists() {
-                paths.push(p);
-            } else {
-                return Ok(vec![]);
-            }
-        }
-
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let reader = ParquetReader::new();
         let mut params = QueryParams::new().with_time_range(request.start, request.end);
         params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
-        let mut rates = Vec::new();
-        for path in &paths {
-            rates.extend(reader.read_margin_interest_rate_partition(
-                path,
-                &request.symbol,
-                &params,
-            )?);
-        }
-        Ok(rates)
+        Ok(self
+            .store
+            .scan_margin_interest_rates(&request.symbol, &params)
+            .await?)
+    }
+
+    async fn get_perpetual_contexts(
+        &self,
+        request: &HistoryRequest,
+    ) -> anyhow::Result<Vec<lean_data::PerpetualContext>> {
+        let mut params = QueryParams::new().with_time_range(request.start, request.end);
+        params.predicate = params.predicate.with_symbols(vec![request.symbol.id.sid]);
+        Ok(self
+            .store
+            .scan_perpetual_contexts(&request.symbol, &params)
+            .await?)
+    }
+
+    async fn get_option_eod_bars(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionEodBar>> {
+        let ticker_key = normalize_underlying(ticker);
+        self.store
+            .scan_option_eod_bars(std::slice::from_ref(&ticker_key), date)
+            .await
     }
 
     async fn get_option_universe(
@@ -292,13 +349,9 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(filter_option_universe_rows(&rows, &ticker_key));
         }
 
-        let path = option_partition_path(&self.data_root, Resolution::Daily, "universe", date);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let rows = ParquetReader::new()
-            .read_option_universe_filtered(&[path], std::slice::from_ref(&ticker_key))
+        let rows = self
+            .store
+            .scan_option_universe(std::slice::from_ref(&ticker_key), date)
             .await?;
         self.merge_option_universe_cache(date, &HashSet::from([ticker_key.clone()]), &rows);
 
@@ -340,17 +393,7 @@ impl IHistoryProvider for LocalHistoryProvider {
             return Ok(out);
         }
 
-        let path = option_partition_path(&self.data_root, Resolution::Daily, "universe", date);
-        if !path.exists() {
-            for ticker in missing {
-                out.entry(ticker).or_insert_with(Vec::new);
-            }
-            return Ok(out);
-        }
-
-        let loaded_rows = ParquetReader::new()
-            .read_option_universe_filtered(&[path], &missing)
-            .await?;
+        let loaded_rows = self.store.scan_option_universe(&missing, date).await?;
         let loaded_underlyings = missing.iter().cloned().collect::<HashSet<_>>();
         self.merge_option_universe_cache(date, &loaded_underlyings, &loaded_rows);
 
@@ -363,299 +406,6 @@ impl IHistoryProvider for LocalHistoryProvider {
 
         Ok(out)
     }
-
-    async fn get_option_trade_bars(
-        &self,
-        ticker: &str,
-        resolution: Resolution,
-        date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<TradeBar>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let path = option_partition_path(&self.data_root, resolution, "trade", date);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = load_option_symbols(&resolver, ticker, date)?;
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, resolution);
-        Ok(ParquetReader::new().read_trade_bars_with_symbols(
-            &[path],
-            &symbols_by_value,
-            &params,
-        )?)
-    }
-
-    async fn get_option_trade_bars_filtered(
-        &self,
-        ticker: &str,
-        resolution: Resolution,
-        date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<TradeBar>> {
-        let path = option_partition_path(&self.data_root, resolution, "trade", date);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = option_symbols_by_value_from_contracts(ticker, contracts);
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, resolution);
-        Ok(ParquetReader::new().read_trade_bars_with_symbols(
-            &[path],
-            &symbols_by_value,
-            &params,
-        )?)
-    }
-
-    async fn get_option_quote_bars(
-        &self,
-        ticker: &str,
-        resolution: Resolution,
-        date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<QuoteBar>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let path = option_partition_path(&self.data_root, resolution, "quote", date);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = load_option_symbols(&resolver, ticker, date)?;
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, resolution);
-        Ok(ParquetReader::new().read_quote_bars_with_symbols(
-            &[path],
-            &symbols_by_value,
-            &params,
-        )?)
-    }
-
-    async fn get_option_quote_bars_filtered(
-        &self,
-        ticker: &str,
-        resolution: Resolution,
-        date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<QuoteBar>> {
-        let path = option_partition_path(&self.data_root, resolution, "quote", date);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = option_symbols_by_value_from_contracts(ticker, contracts);
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, resolution);
-        Ok(ParquetReader::new().read_quote_bars_with_symbols(
-            &[path],
-            &symbols_by_value,
-            &params,
-        )?)
-    }
-
-    async fn get_option_ticks(
-        &self,
-        ticker: &str,
-        date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<Tick>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let paths = [
-            resolver.option_partition(Resolution::Tick, TickType::Trade, date),
-            resolver.option_partition(Resolution::Tick, TickType::Quote, date),
-            resolver.option_partition(Resolution::Tick, TickType::OpenInterest, date),
-        ];
-        let existing_paths = paths
-            .into_iter()
-            .filter(|path| path.exists())
-            .collect::<Vec<_>>();
-        if existing_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = load_option_symbols(&resolver, ticker, date)?;
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, Resolution::Tick);
-        let mut ticks = ParquetReader::new().read_ticks_with_symbols(
-            &existing_paths,
-            &symbols_by_value,
-            &params,
-        )?;
-        ticks.sort_by_key(|tick| (tick.time.0, tick.symbol.id.sid, tick.tick_type as u8));
-        Ok(ticks)
-    }
-
-    async fn get_option_ticks_filtered(
-        &self,
-        ticker: &str,
-        date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<Tick>> {
-        let resolver = PathResolver::new(&self.data_root);
-        let paths = [
-            resolver.option_partition(Resolution::Tick, TickType::Trade, date),
-            resolver.option_partition(Resolution::Tick, TickType::Quote, date),
-            resolver.option_partition(Resolution::Tick, TickType::OpenInterest, date),
-        ];
-        let existing_paths = paths
-            .into_iter()
-            .filter(|path| path.exists())
-            .collect::<Vec<_>>();
-        if existing_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let symbols_by_value = option_symbols_by_value_from_contracts(ticker, contracts);
-        if symbols_by_value.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let params = day_params(date, Resolution::Tick);
-        let mut ticks = ParquetReader::new().read_ticks_with_symbols(
-            &existing_paths,
-            &symbols_by_value,
-            &params,
-        )?;
-        ticks.sort_by_key(|tick| (tick.time.0, tick.symbol.id.sid, tick.tick_type as u8));
-        Ok(ticks)
-    }
-}
-
-fn local_bars_cover_expected_dates(bars: &[TradeBar], expected_dates: &[NaiveDate]) -> bool {
-    if expected_dates.is_empty() {
-        return true;
-    }
-    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
-    expected_dates.iter().all(|date| available.contains(date))
-}
-
-fn partition_paths_cover_symbol_sid(
-    reader: &ParquetReader,
-    paths: &[std::path::PathBuf],
-    sid: u64,
-    symbol_sid_column: usize,
-) -> bool {
-    paths.iter().all(|path| {
-        reader
-            .read_partition_symbol_sids(path, symbol_sid_column)
-            .is_ok_and(|sids| sids.contains(&sid))
-    })
-}
-
-fn local_quote_bars_cover_expected_dates(bars: &[QuoteBar], expected_dates: &[NaiveDate]) -> bool {
-    if expected_dates.is_empty() {
-        return true;
-    }
-    let available: HashSet<NaiveDate> = bars.iter().map(|bar| bar.time.date_utc()).collect();
-    expected_dates.iter().all(|date| available.contains(date))
-}
-
-fn local_ticks_cover_expected_dates(ticks: &[Tick], expected_dates: &[NaiveDate]) -> bool {
-    if expected_dates.is_empty() {
-        return true;
-    }
-    let available: HashSet<NaiveDate> = ticks.iter().map(|tick| tick.time.date_utc()).collect();
-    expected_dates.iter().all(|date| available.contains(date))
-}
-
-fn expected_market_dates(symbol: &Symbol, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
-    let mut dates = Vec::new();
-    let mut current = start;
-    while current <= end {
-        if is_expected_market_date(symbol, current) {
-            dates.push(current);
-        }
-        current += chrono::Duration::days(1);
-    }
-    dates
-}
-
-fn is_expected_market_date(symbol: &Symbol, date: NaiveDate) -> bool {
-    match symbol.security_type() {
-        SecurityType::Equity | SecurityType::Option | SecurityType::IndexOption => {
-            let hours = ExchangeHours::us_equity();
-            let dow = date.weekday().num_days_from_sunday() as usize;
-            hours.schedule[dow].is_open() && !hours.holidays.contains(&date)
-        }
-        SecurityType::Crypto | SecurityType::CryptoFuture => true,
-        _ => !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun),
-    }
-}
-
-fn load_option_symbols(
-    resolver: &PathResolver,
-    ticker: &str,
-    date: chrono::NaiveDate,
-) -> anyhow::Result<std::collections::HashMap<String, Symbol>> {
-    let underlying = Symbol::create_equity(ticker, &Market::usa());
-    let universe_path =
-        option_partition_path(&resolver.data_root, Resolution::Daily, "universe", date);
-    if !universe_path.exists() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let universe_rows = ParquetReader::new()
-        .read_option_universe(&[universe_path])?
-        .into_iter()
-        .filter(|row| row.underlying.eq_ignore_ascii_case(ticker));
-    let mut out = std::collections::HashMap::new();
-    for row in universe_rows {
-        let right = match row.right.to_ascii_uppercase().as_str() {
-            "C" | "CALL" => OptionRight::Call,
-            "P" | "PUT" => OptionRight::Put,
-            _ => continue,
-        };
-        let sym = Symbol::create_option_osi(
-            underlying.clone(),
-            row.strike,
-            row.expiration,
-            right,
-            OptionStyle::American,
-            &Market::usa(),
-        );
-        out.insert(row.symbol_value, sym.clone());
-        out.insert(sym.value.clone(), sym);
-    }
-    Ok(out)
-}
-
-fn option_symbols_by_value_from_contracts(
-    ticker: &str,
-    contracts: &[lean_storage::OptionUniverseRow],
-) -> HashMap<String, Symbol> {
-    let underlying = Symbol::create_equity(ticker, &Market::usa());
-    let mut out = HashMap::new();
-    for row in contracts {
-        let right = match row.right.to_ascii_uppercase().as_str() {
-            "C" | "CALL" => OptionRight::Call,
-            "P" | "PUT" => OptionRight::Put,
-            _ => continue,
-        };
-        let sym = Symbol::create_option_osi(
-            underlying.clone(),
-            row.strike,
-            row.expiration,
-            right,
-            OptionStyle::American,
-            &Market::usa(),
-        );
-        out.insert(row.symbol_value.clone(), sym.clone());
-        out.insert(sym.value.clone(), sym);
-    }
-    out
 }
 
 fn normalize_underlying(ticker: &str) -> String {
@@ -680,32 +430,4 @@ fn filter_option_universe_rows(rows: &[OptionUniverseRow], ticker: &str) -> Vec<
         .filter(|row| row.underlying.eq_ignore_ascii_case(ticker))
         .cloned()
         .collect()
-}
-
-fn option_partition_path(
-    data_root: &std::path::Path,
-    resolution: Resolution,
-    tick_type: &str,
-    date: chrono::NaiveDate,
-) -> std::path::PathBuf {
-    data_root
-        .join("option")
-        .join("usa")
-        .join(resolution.folder_name())
-        .join(tick_type)
-        .join(format!("date={date}"))
-        .join("data.parquet")
-}
-
-fn day_params(date: chrono::NaiveDate, resolution: Resolution) -> QueryParams {
-    let start = lean_core::DateTime::from(chrono::DateTime::from_naive_utc_and_offset(
-        date.and_hms_opt(0, 0, 0).unwrap(),
-        chrono::Utc,
-    ));
-    let _ = resolution;
-    let end = lean_core::DateTime::from(chrono::DateTime::from_naive_utc_and_offset(
-        date.and_hms_opt(23, 59, 59).unwrap(),
-        chrono::Utc,
-    ));
-    QueryParams::new().with_time_range(start, end)
 }

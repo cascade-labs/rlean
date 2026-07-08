@@ -1,6 +1,7 @@
 use crate::buying_power::BuyingPowerModel;
+use crate::portfolio::{SecurityHolding, SharedHoldings};
 use lean_core::exchange_hours::ExchangeHours;
-use lean_core::{Price, Resolution, Symbol, SymbolProperties};
+use lean_core::{Price, Resolution, SecurityType, Symbol, SymbolProperties};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ pub struct Security {
     pub symbol: Symbol,
     pub resolution: Resolution,
     pub symbol_properties: SymbolProperties,
-    pub exchange_hours: ExchangeHours,
+    pub exchange_hours: Arc<ExchangeHours>,
     pub leverage: RwLock<f64>,
     pub buying_power_model: RwLock<BuyingPowerModel>,
     pub is_tradable: bool,
@@ -19,6 +20,7 @@ pub struct Security {
     pub price: RwLock<Price>,
     pub bid_price: RwLock<Price>,
     pub ask_price: RwLock<Price>,
+    holdings: SharedHoldings,
 }
 
 impl Security {
@@ -26,8 +28,20 @@ impl Security {
         symbol: Symbol,
         resolution: Resolution,
         symbol_properties: SymbolProperties,
-        exchange_hours: ExchangeHours,
+        exchange_hours: Arc<ExchangeHours>,
+        holdings: SharedHoldings,
     ) -> Self {
+        // Base securities back custom-data subscriptions (e.g. flow alerts, FRED
+        // series). They are never tradable positions, so they must not seed an
+        // entry in the shared holdings map — otherwise they surface as zero-
+        // quantity "holdings" in portfolio snapshots. Genuine positions insert
+        // their holding lazily on fill/set_holdings.
+        if symbol.security_type() != SecurityType::Base {
+            holdings
+                .write()
+                .entry(symbol.id.sid)
+                .or_insert_with(|| SecurityHolding::new(symbol.clone()));
+        }
         Security {
             symbol,
             resolution,
@@ -40,6 +54,7 @@ impl Security {
             price: RwLock::new(rust_decimal_macros::dec!(0)),
             bid_price: RwLock::new(rust_decimal_macros::dec!(0)),
             ask_price: RwLock::new(rust_decimal_macros::dec!(0)),
+            holdings,
         }
     }
 
@@ -65,6 +80,14 @@ impl Security {
         if bid_price > rust_decimal_macros::dec!(0) && ask_price > rust_decimal_macros::dec!(0) {
             *self.price.write() = (bid_price + ask_price) / rust_decimal_macros::dec!(2);
         }
+    }
+
+    pub fn holding(&self) -> SecurityHolding {
+        self.holdings
+            .read()
+            .get(&self.symbol.id.sid)
+            .cloned()
+            .unwrap_or_else(|| SecurityHolding::new(self.symbol.clone()))
     }
 
     pub fn leverage(&self) -> f64 {

@@ -201,7 +201,7 @@ del _vd, _k, _v, _t
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
-    use lean_python::AlgorithmImports;
+    use lean_python_runtime::AlgorithmImports;
 
     let sdir = session_dir(&args.session)?;
     let sock = sdir.join("server.sock");

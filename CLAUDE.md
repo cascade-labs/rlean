@@ -53,7 +53,7 @@ data/
     chains/spy/20240115.parquet # per-date option universe
 ```
 
-- `lean-storage` owns all Parquet I/O — use `ParquetWriter`/`ParquetReader` from that crate.
+- `lean-storage` owns all persisted data I/O through `IcebergStore`. Providers only return rows to the engine; they must not write files or query local storage.
 - If adding a new data type: define a Parquet schema in `lean-storage`, never CSV.
 
 ## Plugin System

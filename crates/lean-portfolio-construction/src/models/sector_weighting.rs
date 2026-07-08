@@ -33,7 +33,7 @@ impl IPortfolioConstructionModel for SectorWeightingPortfolioConstructionModel {
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         // Group non-Flat insights by market string.
         let mut market_groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -76,8 +76,10 @@ impl IPortfolioConstructionModel for SectorWeightingPortfolioConstructionModel {
                     .unwrap_or(Decimal::ZERO);
                 let pct = direction_sign * w;
 
-                let ticker = insight.symbol.value.clone();
-                let price = prices.get(&ticker).copied().unwrap_or(Decimal::ZERO);
+                let price = prices
+                    .get(&insight.symbol.id.sid)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
             })
             .collect()

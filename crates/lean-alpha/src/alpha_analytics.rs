@@ -43,7 +43,7 @@ const MIN_PARTIAL_IC: f64 = 0.01;
 /// Gate 2 floor — minimum REALIZED, friction-adjusted marginal contribution. Partial
 /// IC is the frictionless additive-information upper bound (Grinold-Kahn); the marginal
 /// contribution haircuts it by signal turnover (arXiv:2105.10306 — Turnover-Adjusted IR:
-/// IC volatility + turnover lower realized IR) and by the long-only transfer coefficient
+/// IC volatility + turnover lower realized IR) and by the signed-book transfer coefficient
 /// (Clarke-de Silva-Thorley — constraints cap how much edge a real book can capture).
 /// Set below MIN_PARTIAL_IC because both factors are ≤ 1 and only shrink partial IC.
 const MIN_MARGINAL_CONTRIB: f64 = 0.005;
@@ -187,12 +187,12 @@ impl AlphaPerformanceTracker {
                 })
                 .unwrap_or(1.0);
             self.by_model
-                .entry(ins.source_model.clone())
+                .entry(ins.source_model.to_string())
                 .or_default()
                 .push(Observation {
                     period: ins.generated_time_utc.0,
                     date: ins.generated_time_utc.date_utc().to_string(),
-                    symbol: ins.symbol.value.clone(),
+                    symbol: ins.symbol.value.to_string(),
                     signal: sign * strength,
                     forward_return: fwd,
                 });
@@ -396,7 +396,7 @@ impl AlphaPerformanceTracker {
             let partial_ic = (s.mean - pred_ic) / resid_var.sqrt();
 
             // 5. MARGINAL CONTRIBUTION (Gate 2) — friction-adjust the frictionless
-            //    partial IC by the alpha's own signal turnover and its long-only
+            //    partial IC by the alpha's own signal turnover and signed-book
             //    transfer coefficient, both computed one-pass from this alpha's
             //    per-period observations.
             let turnover_factor = turnover_factor(&self.by_model[name]);
@@ -645,13 +645,16 @@ fn turnover_factor(obs: &[Observation]) -> f64 {
     (1.0 - turnover).clamp(0.0, 1.0)
 }
 
-/// Gate-2 long-only transfer coefficient (Clarke-de Silva-Thorley). `long_side_ic` is
-/// the mean over periods of the per-period Spearman(signal, forward_return) computed
-/// ONLY over the names at/above that period's cross-sectional signal median — the names
-/// a long-only book can actually overweight. If an alpha's edge lives on the names it
-/// ranks LOW (which long-only can't short), `long_side_ic << mean_ic` and the factor is
-/// small. `transfer_factor = clamp(long_side_ic / max(|mean_ic|, 1e-6), 0, 1)`. Periods
-/// with <3 top-half names are skipped; no usable periods → 1.0.
+/// Gate-2 signed-book transfer coefficient (Clarke-de Silva-Thorley). We estimate how
+/// much of an alpha's edge is harvestable by a PCM that can both overweight favorable
+/// names and short unfavorable names:
+/// - long sleeve: Spearman(signal, forward_return) over names at/above the median signal.
+/// - short sleeve: Spearman(-signal, -forward_return) over names below the median signal.
+///
+/// The short-side transform scores whether the alpha correctly ranks the names to short
+/// among the names it wants short. The transfer factor is the better sleeve IC normalized
+/// by the alpha's overall mean edge. Periods with <3 usable names on a sleeve are skipped;
+/// no usable periods → 1.0.
 fn transfer_factor(obs: &[Observation], mean_ic: f64) -> f64 {
     let mut periods: BTreeMap<i64, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for o in obs {
@@ -659,32 +662,57 @@ fn transfer_factor(obs: &[Observation], mean_ic: f64) -> f64 {
         e.0.push(o.signal);
         e.1.push(o.forward_return);
     }
-    let mut top_ics = Vec::new();
+    let mut long_ics = Vec::new();
+    let mut short_ics = Vec::new();
     for (sig, fwd) in periods.values() {
         let ranks = rank(sig);
         let n = sig.len() as f64;
         // 1-based ranks; median line at (n+1)/2, "at/above median" = rank ≥ that.
         let median_rank = (n + 1.0) / 2.0;
         let (mut top_sig, mut top_fwd) = (Vec::new(), Vec::new());
+        let (mut bottom_sig, mut bottom_fwd) = (Vec::new(), Vec::new());
         for i in 0..sig.len() {
             if ranks[i] >= median_rank {
                 top_sig.push(sig[i]);
                 top_fwd.push(fwd[i]);
+            } else {
+                bottom_sig.push(-sig[i]);
+                bottom_fwd.push(-fwd[i]);
             }
         }
         if top_sig.len() < 3 {
-            continue;
+            // no long-sleeve estimate for this period
+        } else {
+            let ic = spearman(&top_sig, &top_fwd);
+            if ic.is_finite() {
+                long_ics.push(ic);
+            }
         }
-        let ic = spearman(&top_sig, &top_fwd);
-        if ic.is_finite() {
-            top_ics.push(ic);
+        if bottom_sig.len() >= 3 {
+            let ic = spearman(&bottom_sig, &bottom_fwd);
+            if ic.is_finite() {
+                short_ics.push(ic);
+            }
         }
     }
-    if top_ics.is_empty() {
+    if long_ics.is_empty() && short_ics.is_empty() {
         return 1.0;
     }
-    let long_side_ic = top_ics.iter().sum::<f64>() / top_ics.len() as f64;
-    (long_side_ic / mean_ic.abs().max(1e-6)).clamp(0.0, 1.0)
+    let long_side_ic = mean_or_nan(&long_ics);
+    let short_side_ic = mean_or_nan(&short_ics);
+    let signed_side_ic = [long_side_ic, short_side_ic]
+        .into_iter()
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    (signed_side_ic / mean_ic.abs().max(1e-6)).clamp(0.0, 1.0)
+}
+
+fn mean_or_nan(vals: &[f64]) -> f64 {
+    if vals.is_empty() {
+        f64::NAN
+    } else {
+        vals.iter().sum::<f64>() / vals.len() as f64
+    }
 }
 
 fn rolling(ics: &[(String, f64)], window: usize) -> Vec<AlphaIcPoint> {
@@ -857,6 +885,7 @@ fn spearman(x: &[f64], y: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lean_core::Symbol;
 
     #[test]
     fn spearman_perfect_monotonic() {
@@ -949,24 +978,107 @@ mod tests {
     }
 
     #[test]
-    fn transfer_factor_short_side_edge_haircut() {
-        // Symmetric V: signal predicts return ONLY on the low-signal (short) names;
-        // among the top-half (long-side) names the relationship is reversed, so
-        // long_side_ic is negative → transfer_factor clamps to ~0.
-        // signal s in {0..5}; forward return = -(s - 2.5) shape on top half.
-        let returns = [5.0, 3.0, 1.0, -1.0, -3.0, -5.0]; // top-half (high signal) does worst
+    fn transfer_factor_short_side_edge_full_for_signed_book() {
+        // The edge lives on the low-signal names a signed PCM will short. The old long-only
+        // transfer metric looked only at the top half and reported transfer×0.00 here.
+        let signals = [-3.0, -2.0, -1.0, 0.0, 0.0, 0.0];
+        let returns = [-3.0, -2.0, -1.0, 0.0, 0.0, 0.0];
         let mut o = Vec::new();
         for p in 0..3 {
-            for (k, &ret) in returns.iter().enumerate() {
-                o.push(obs(p, &format!("S{k}"), k as f64, ret));
+            for k in 0..signals.len() {
+                o.push(obs(p, &format!("S{k}"), signals[k], returns[k]));
             }
         }
-        // Whole-book IC is strongly negative; mean_ic.abs() is large. The top-half
-        // (signals 3,4,5) returns are -1,-3,-5: signal up ⇒ return down ⇒ long-side
-        // IC negative ⇒ factor clamps to 0.
-        let mean_ic = 0.5;
+        let mean_ic = spearman(&signals, &returns);
         let tf = transfer_factor(&o, mean_ic);
-        assert!(tf < 1e-9, "expected ~0 (short-side edge), got {tf}");
+        assert!(
+            tf > 0.95,
+            "expected signed short-side transfer ~1.0, got {tf}"
+        );
+    }
+
+    #[test]
+    fn ranking_keeps_short_side_alpha_when_signed_transfer_is_positive() {
+        let mut tracker = AlphaPerformanceTracker::new();
+        let symbols: Vec<Symbol> = (0..6)
+            .map(|i| Symbol::create_equity(&format!("S{i}"), &lean_core::Market::usa()))
+            .collect();
+
+        let mut expired = Vec::new();
+        for p in 0..6 {
+            let ts = lean_core::NanosecondTimestamp::from_secs(1_700_000_000 + p);
+
+            // Anchor alpha: clean long-side edge so the candidate is evaluated through Gate 2.
+            for (k, sym) in symbols.iter().enumerate() {
+                let ref_price = rust_decimal_macros::dec!(100);
+                let final_price = ref_price + rust_decimal::Decimal::from(k as i64 + 1);
+                let mut ins = Insight::new(
+                    sym.clone(),
+                    InsightDirection::Up,
+                    lean_core::TimeSpan::from_days(1),
+                    Some(rust_decimal::Decimal::from(k as i64 + 1)),
+                    None,
+                    "AnchorAlpha",
+                )
+                .with_generated_time_utc(ts);
+                ins.reference_value = Some(ref_price);
+                ins.reference_value_final = Some(final_price);
+                expired.push(ins);
+            }
+
+            // Candidate alpha: all useful edge is on the short side. Negative signals
+            // correctly short names whose subsequent forward returns are negative.
+            for (k, sym) in symbols.iter().enumerate() {
+                let signal = match k {
+                    0 => -3,
+                    1 => -2,
+                    2 => -1,
+                    _ => 0,
+                };
+                let forward_return_bps = match k {
+                    0 => -3,
+                    1 => -2,
+                    2 => -1,
+                    _ => 0,
+                };
+                let ref_price = rust_decimal_macros::dec!(100);
+                let final_price = ref_price + rust_decimal::Decimal::from(forward_return_bps);
+                let mut ins = Insight::new(
+                    sym.clone(),
+                    if signal < 0 {
+                        InsightDirection::Down
+                    } else {
+                        InsightDirection::Flat
+                    },
+                    lean_core::TimeSpan::from_days(1),
+                    Some(rust_decimal::Decimal::from(signal).abs()),
+                    None,
+                    "ShortSideAlpha",
+                )
+                .with_generated_time_utc(ts);
+                ins.reference_value = Some(ref_price);
+                ins.reference_value_final = Some(final_price);
+                expired.push(ins);
+            }
+        }
+
+        tracker.record_expired(&expired);
+        let analytics = tracker.compute();
+        let row = analytics
+            .ranking
+            .iter()
+            .find(|row| row.name == "ShortSideAlpha")
+            .expect("missing ShortSideAlpha ranking row");
+        assert!(
+            row.marginal_contribution > 0.005,
+            "short-side alpha should have positive signed-book contribution: {:?}",
+            row
+        );
+        assert!(
+            !row.reason.contains("transfer×0.00"),
+            "short-side alpha should not be reported as zero transfer: {}",
+            row.reason
+        );
     }
 
     #[test]

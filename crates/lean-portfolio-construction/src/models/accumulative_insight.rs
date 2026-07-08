@@ -113,7 +113,7 @@ impl AccumulativeInsightPortfolioConstructionModel {
     pub fn compute_targets(
         &self,
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         let now = self.current_secs();
 
@@ -171,7 +171,7 @@ impl AccumulativeInsightPortfolioConstructionModel {
             }
 
             let pct = pct_per_symbol.unwrap_or(Decimal::ZERO);
-            let price = prices.get(&sym.value).copied().unwrap_or(Decimal::ZERO);
+            let price = prices.get(&sym.id.sid).copied().unwrap_or(Decimal::ZERO);
             targets.push(PortfolioTarget::percent(
                 sym.clone(),
                 pct,
@@ -201,7 +201,7 @@ impl IPortfolioConstructionModel for AccumulativeInsightPortfolioConstructionMod
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         let now = self.current_secs();
 
@@ -237,8 +237,11 @@ mod tests {
         Symbol::create_equity(ticker, &Market::usa())
     }
 
-    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
+        pairs
+            .iter()
+            .map(|(ticker, value)| (make_symbol(ticker).id.sid, *value))
+            .collect()
     }
 
     /// 3 % of 100_000 at price 100 = 3000 → qty = 30
@@ -265,7 +268,7 @@ mod tests {
         );
         let qty1 = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         assert_eq!(qty1, dec!(30), "first Up: expected qty=30, got {}", qty1);
@@ -284,7 +287,7 @@ mod tests {
         );
         let qty2 = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         assert_eq!(qty2, dec!(60), "second Up: expected qty=60, got {}", qty2);
@@ -306,7 +309,7 @@ mod tests {
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
         let qty = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         assert_eq!(qty, dec!(30), "after Flat: expected qty=30, got {}", qty);
@@ -316,7 +319,7 @@ mod tests {
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
         let qty = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         assert_eq!(
@@ -342,7 +345,7 @@ mod tests {
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
         let qty = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         // Only the second insight is active → pct=0.03, qty=30
@@ -369,12 +372,12 @@ mod tests {
         let targets = pcm.compute_targets(PORTFOLIO, &prices);
         let spy_qty = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
         let ibm_qty = targets
             .iter()
-            .find(|t| t.symbol.value == "IBM")
+            .find(|t| t.symbol.value.as_ref() == "IBM")
             .unwrap()
             .quantity;
 

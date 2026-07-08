@@ -9,11 +9,16 @@ lean-data = { path = "../lean-data" }
 
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-cast = { workspace = true }
 parquet = { workspace = true }
 datafusion = { workspace = true }
 object_store = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-datafusion = { workspace = true }
+sqlx = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -37,6 +42,11 @@ dashmap = { workspace = true }
 zip = { workspace = true }
 fs2 = { workspace = true }
 uuid = { workspace = true }
+clap = { workspace = true }
+
+
+[features]
+fixture-bin = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

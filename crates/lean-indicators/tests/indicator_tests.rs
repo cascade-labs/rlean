@@ -779,6 +779,23 @@ fn vwap_warm_up_period_is_one() {
     assert_eq!(vwap.warm_up_period(), 1);
 }
 
+#[test]
+fn vwap_reset_clears_price_volume_and_samples() {
+    // Mirrors LEAN VolumeWeightedAveragePriceIndicatorTests reset coverage:
+    // Reset returns the indicator to its default not-ready state.
+    let mut vwap = Vwap::new();
+    let ready = vwap.update_bar(&bar(0, dec!(105), dec!(95), dec!(100)));
+    assert!(ready.is_ready());
+    assert!(vwap.is_ready());
+    assert_eq!(vwap.samples(), 1);
+
+    vwap.reset();
+
+    assert!(!vwap.is_ready());
+    assert_eq!(vwap.samples(), 0);
+    assert!(!vwap.current().is_ready());
+}
+
 // ─── OBV Tests ────────────────────────────────────────────────────────────────
 
 #[test]

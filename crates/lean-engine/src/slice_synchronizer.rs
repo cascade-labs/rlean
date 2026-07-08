@@ -1,3 +1,4 @@
+use crate::data_feed::DataFeedContext;
 use crate::subscription_reader::SubscriptionStream;
 use lean_core::{DateTime, Result as LeanResult};
 use lean_data::Slice;
@@ -7,44 +8,95 @@ use lean_data::Slice;
 pub struct SliceSynchronizer {
     streams: Vec<SubscriptionStream>,
     end: DateTime,
+    context: DataFeedContext,
 }
 
 impl SliceSynchronizer {
-    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime) -> Self {
-        SliceSynchronizer { streams, end }
+    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime, context: DataFeedContext) -> Self {
+        SliceSynchronizer {
+            streams,
+            end,
+            context,
+        }
     }
 
     pub async fn next_slice(&mut self) -> LeanResult<Option<Slice>> {
-        let mut frontier: Option<DateTime> = None;
+        loop {
+            let mut frontier: Option<DateTime> = None;
 
-        for stream in &mut self.streams {
-            stream.fill_pending().await?;
-            if let Some(point) = stream.peek() {
-                let time = point.frontier_time();
-                frontier = Some(match frontier {
-                    Some(current) => current.min(time),
-                    None => time,
-                });
-            }
-        }
-
-        let frontier = match frontier {
-            Some(time) if time <= self.end => time,
-            _ => return Ok(None),
-        };
-
-        let mut slice = Slice::new(frontier);
-        for stream in &mut self.streams {
-            while let Some(point) = stream.peek() {
-                if point.frontier_time() != frontier {
-                    break;
+            for stream in &mut self.streams {
+                stream.drain_available_messages()?;
+                if let Some(point) = stream.peek() {
+                    let time = point.frontier_time();
+                    frontier = Some(match frontier {
+                        Some(current) => current.min(time),
+                        None => time,
+                    });
                 }
-                let point = stream.pop_next().await?.expect("peek implied pending data");
-                point.add_to_slice(&mut slice);
             }
-        }
 
-        Ok(Some(slice))
+            let Some(candidate) = frontier else {
+                // No stream has a current point. Ratchet the frontier to the
+                // minimum watermark so producers gated on the prefetch horizon
+                // wake up and load the next partitions; otherwise a data gap
+                // longer than the horizon deadlocks producer<->consumer.
+                let min_watermark = self
+                    .streams
+                    .iter()
+                    .filter(|stream| !stream.is_exhausted())
+                    .filter_map(|stream| stream.watermark())
+                    .min();
+                if let Some(watermark) = min_watermark {
+                    self.context.observe_consumer_frontier(watermark.date_utc());
+                }
+                let mut advanced_any = false;
+                for stream in self
+                    .streams
+                    .iter_mut()
+                    .filter(|stream| !stream.is_exhausted())
+                {
+                    stream.advance_until_progress().await?;
+                    advanced_any = true;
+                    if stream.peek().is_some() {
+                        break;
+                    }
+                }
+                if advanced_any {
+                    continue;
+                }
+                return Ok(None);
+            };
+            if candidate > self.end {
+                return Ok(None);
+            }
+            // LEAN's frontier is the candidate being synchronized (the minimum
+            // current emit time), not the last emitted slice. Publish it before
+            // waiting on any stream so a producer whose next partition is needed
+            // for this candidate is never gated behind the prefetch horizon —
+            // gating on the previous slice date deadlocks across market-closed
+            // gaps (weekend + holiday) longer than the horizon.
+            self.context.observe_consumer_frontier(candidate.date_utc());
+            if let Some(stream) = self
+                .streams
+                .iter_mut()
+                .find(|stream| !stream.is_ready_for(candidate))
+            {
+                stream.advance_until_progress().await?;
+                continue;
+            }
+
+            let mut slice = Slice::new(candidate);
+            for stream in &mut self.streams {
+                while let Some(point) = stream.peek() {
+                    if point.frontier_time() != candidate {
+                        break;
+                    }
+                    let point = stream.pop_pending().expect("peek implied pending data");
+                    point.add_to_slice(&mut slice);
+                }
+            }
+            return Ok(Some(slice));
+        }
     }
 
     pub fn streams(&self) -> &[SubscriptionStream] {
@@ -54,71 +106,74 @@ impl SliceSynchronizer {
     pub fn streams_mut(&mut self) -> &mut [SubscriptionStream] {
         &mut self.streams
     }
+
+    pub fn add_stream(&mut self, stream: SubscriptionStream) {
+        self.streams.push(stream);
+    }
+
+    pub fn remove_stream(&mut self, subscription_id: u64) {
+        self.streams
+            .retain(|stream| stream.config().unique_id() != subscription_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_feed::DataFeedContext;
     use crate::subscription_reader::SubscriptionStream;
     use chrono::{NaiveDate, TimeZone, Utc};
     use lean_core::{Market, Resolution, Symbol, TimeSpan};
     use lean_data::{SubscriptionDataConfig, TradeBar, TradeBarData};
-    use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
+    use lean_storage::IcebergStore;
     use rust_decimal_macros::dec;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
         DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()))
     }
 
-    async fn write_minute_bars(
-        root: &PathBuf,
-        symbol: &Symbol,
-        date: NaiveDate,
-        bars: Vec<TradeBar>,
-    ) {
-        let resolver = PathResolver::new(root);
-        let writer = ParquetWriter::new(WriterConfig::default());
-        let path = resolver.market_data_partition(
-            symbol,
-            Resolution::Minute,
-            lean_core::TickType::Trade,
-            date,
-        );
-        writer.write_trade_bars(&bars, &path).unwrap();
+    async fn write_minute_bars(store: &IcebergStore, symbol: &Symbol, bars: Vec<TradeBar>) {
+        store
+            .append_trade_bars(
+                &bars,
+                symbol.security_type(),
+                symbol.market().as_str(),
+                Resolution::Minute,
+                lean_core::TickType::Trade,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn synchronizer_emits_all_intraday_bars() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let day = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bars = vec![
             TradeBar::new(
                 symbol.clone(),
-                dt(day, 9, 31),
+                dt(day, 14, 31),
                 TimeSpan::ONE_MINUTE,
                 TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
             ),
             TradeBar::new(
                 symbol.clone(),
-                dt(day, 9, 32),
+                dt(day, 14, 32),
                 TimeSpan::ONE_MINUTE,
                 TradeBarData::new(dec!(2), dec!(2), dec!(2), dec!(2), dec!(100)),
             ),
             TradeBar::new(
                 symbol.clone(),
-                dt(day, 9, 33),
+                dt(day, 14, 33),
                 TimeSpan::ONE_MINUTE,
                 TradeBarData::new(dec!(3), dec!(3), dec!(3), dec!(3), dec!(100)),
             ),
         ];
-        write_minute_bars(&root, &symbol, day, bars).await;
+        write_minute_bars(&store, &symbol, bars).await;
 
-        let reader = Arc::new(lean_storage::ParquetReader::new());
-        let resolver = PathResolver::new(&root);
         let config = SubscriptionDataConfig::new_equity(
             symbol.clone(),
             Resolution::Minute,
@@ -126,8 +181,9 @@ mod tests {
         );
         let start = dt(day, 0, 0);
         let end = dt(day, 23, 59);
-        let stream = SubscriptionStream::new(config, reader, resolver, start, end);
-        let mut sync = SliceSynchronizer::new(vec![stream], end);
+        let context = DataFeedContext::new(store);
+        let stream = SubscriptionStream::new(config, context.clone(), start, end);
+        let mut sync = SliceSynchronizer::new(vec![stream], end, context);
 
         let mut closes = Vec::new();
         while let Some(slice) = sync.next_slice().await.unwrap() {

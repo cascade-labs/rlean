@@ -40,14 +40,14 @@ impl Statistics {
         Decimal::from_f64_retain(annual).unwrap_or(dec!(0))
     }
 
-    /// Sharpe ratio from returns and risk-free rate.
+    /// Sharpe ratio from daily returns and annual risk-free rate.
     pub fn sharpe_ratio(returns: &[Decimal], risk_free_rate: Decimal) -> Decimal {
         if returns.len() < 2 {
             return dec!(0);
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
-        let excess = mean - risk_free_rate;
+        let daily_rf = risk_free_rate / dec!(252);
         let variance = returns
             .iter()
             .map(|r| (r - mean) * (r - mean))
@@ -59,19 +59,19 @@ impl Statistics {
         if std == 0.0 {
             return dec!(0);
         }
-        let std_dec = Decimal::from_f64_retain(std).unwrap_or(dec!(1));
 
-        (excess / std_dec) * Decimal::from_f64_retain(252_f64.sqrt()).unwrap_or(dec!(1))
+        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
+        Decimal::from_f64_retain(daily_excess / std * 252_f64.sqrt()).unwrap_or(dec!(0))
     }
 
-    /// Sortino ratio — penalizes only downside deviation.
+    /// Sortino ratio from daily returns and annual risk-free rate.
     pub fn sortino_ratio(returns: &[Decimal], risk_free_rate: Decimal) -> Decimal {
         if returns.len() < 2 {
             return dec!(0);
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
-        let excess = mean - risk_free_rate;
+        let daily_rf = risk_free_rate / dec!(252);
 
         let downside_sq: Decimal = returns
             .iter()
@@ -93,8 +93,8 @@ impl Statistics {
             return dec!(0);
         }
 
-        let std_dec = Decimal::from_f64_retain(downside_std).unwrap_or(dec!(1));
-        (excess / std_dec) * Decimal::from_f64_retain(252_f64.sqrt()).unwrap_or(dec!(1))
+        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
+        Decimal::from_f64_retain(daily_excess / downside_std * 252_f64.sqrt()).unwrap_or(dec!(0))
     }
 
     /// Maximum drawdown from an equity curve.

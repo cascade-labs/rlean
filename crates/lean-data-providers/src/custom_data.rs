@@ -1,8 +1,6 @@
 use chrono::{NaiveDate, Timelike};
 use lean_core::{DateTime, Resolution};
-use lean_data::custom::{
-    CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource, CustomParquetSource,
-};
+use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,9 +46,8 @@ impl CustomDataContext {
 
 /// Trait implemented by custom data source plugins.
 ///
-/// Supports two custom data modes:
-/// - Native parquet via `get_parquet_source()` and `is_parquet_native()`.
-/// - Text sources via `get_source()` + `reader()`.
+/// Custom data history is stored in the engine-owned Iceberg `lean.custom_points` table.
+/// Plugins only describe/fetch live source records; they do not expose file layouts.
 ///
 /// # Plugin ABI
 ///
@@ -93,33 +90,15 @@ pub trait ICustomDataSource: Send + Sync {
         None
     }
 
-    /// Return parquet files for the given ticker/date/query when this provider
-    /// can expose native parquet. The runner applies generic projection and
-    /// predicates, then materializes `CustomDataPoint`s.
-    fn get_parquet_source(
+    /// Return decoded in-memory points for live custom-data polling.
+    fn get_live_points(
         &self,
         _ticker: &str,
-        _date: NaiveDate,
+        _utc_time: DateTime,
         _config: &CustomDataConfig,
         _query: &CustomDataQuery,
-    ) -> Option<CustomParquetSource> {
+    ) -> Option<Vec<CustomDataPoint>> {
         None
-    }
-
-    /// Return parquet files for a live custom data request.
-    ///
-    /// This is the provider-side equivalent of C# LEAN custom data
-    /// `GetSource(config, date, isLiveMode: true)`: the engine supplies the
-    /// current UTC frontier and the provider decides which live source, if any,
-    /// is currently available.
-    fn get_live_parquet_source(
-        &self,
-        ticker: &str,
-        utc_time: DateTime,
-        config: &CustomDataConfig,
-        query: &CustomDataQuery,
-    ) -> Option<CustomParquetSource> {
-        self.get_parquet_source(ticker, utc_time.date_utc(), config, query)
     }
 
     /// Delay before the engine asks this provider for live data again.
@@ -136,13 +115,6 @@ pub trait ICustomDataSource: Send + Sync {
         _query: &CustomDataQuery,
     ) -> Duration {
         default_live_poll_delay(utc_time, source_available, config.resolution)
-    }
-
-    /// Returns `true` for providers whose canonical storage is native parquet.
-    /// The runner will not call `get_source()`/`reader()` for these providers;
-    /// a missing parquet source means no data for that request.
-    fn is_parquet_native(&self) -> bool {
-        false
     }
 
     /// Parse one line/record from the fetched data.
@@ -163,11 +135,24 @@ pub trait ICustomDataSource: Send + Sync {
         lean_core::Resolution::Daily
     }
 
+    /// Default resolution for a specific data ticker handled by this source.
+    ///
+    /// Multi-dataset providers can override this when one plugin serves both
+    /// daily and intraday datasets.
+    fn default_resolution_for_ticker(&self, _ticker: &str) -> lean_core::Resolution {
+        self.default_resolution()
+    }
+
     /// Whether the data ticker requires symbol mapping (ticker rename history).
     ///
     /// Almost always `false` for alternative data; set to `true` only for
     /// sources that track equity corporate actions (e.g. equity fundamental data).
     fn requires_mapping(&self) -> bool {
+        false
+    }
+
+    /// Whether this source returns native Parquet payloads instead of text rows.
+    fn is_parquet_native(&self) -> bool {
         false
     }
 
@@ -197,6 +182,33 @@ pub trait ICustomDataSource: Send + Sync {
         _line: &str,
         _config: &CustomDataConfig,
     ) -> Option<CustomDataPoint> {
+        None
+    }
+
+    /// Return a provider-owned full-history series as custom points.
+    ///
+    /// This is the rlean equivalent of a custom data type resolving an external
+    /// source through the subscription framework, but lets plugins model APIs
+    /// that do not expose a single line-oriented file. The engine remains
+    /// responsible for persisting the returned points to Iceberg.
+    fn history(
+        &self,
+        _ticker: &str,
+        _config: &CustomDataConfig,
+    ) -> Option<Result<Vec<CustomDataPoint>, String>> {
+        None
+    }
+
+    /// Return provider source objects for a full custom-data history request.
+    ///
+    /// The engine fetches each source, decodes it according to
+    /// [`CustomDataSource::format`], persists the resulting rows to Iceberg, and
+    /// serves subsequent reads from the Iceberg custom-data table.
+    fn history_sources(
+        &self,
+        _ticker: &str,
+        _config: &CustomDataConfig,
+    ) -> Option<Result<Vec<(NaiveDate, CustomDataSource)>, String>> {
         None
     }
 }

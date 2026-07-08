@@ -1,5 +1,6 @@
 use crate::contract::OptionContract;
 use chrono::{NaiveDate, TimeZone, Utc};
+use implied_vol::{DefaultSpecialFn, ImpliedBlackVolatility};
 use lean_core::time::tz;
 use lean_core::{DateTime, Greeks, OptionRight};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -20,6 +21,18 @@ pub trait IOptionPriceModel: Send + Sync {
         risk_free_rate: f64,
         dividend_yield: f64,
     ) -> OptionPriceModelResult;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OptionPricingInput {
+    pub spot: f64,
+    pub forward: f64,
+    pub strike: f64,
+    pub expiry_years: f64,
+    pub market_price: f64,
+    pub risk_free_rate: f64,
+    pub dividend_yield: f64,
+    pub is_call: bool,
 }
 
 /// Returns current bid/ask mid as the theoretical price; no Greeks.
@@ -51,80 +64,223 @@ impl IOptionPriceModel for BlackScholesPriceModel {
         risk_free_rate: f64,
         dividend_yield: f64,
     ) -> OptionPriceModelResult {
-        let s = contract.data.underlying_last_price.to_f64().unwrap_or(0.0);
-        let k = contract.strike.to_f64().unwrap_or(0.0);
-        let t = time_to_expiry_years(contract.expiry, valuation_time);
-        let r = risk_free_rate;
-        let q = dividend_yield;
+        let input =
+            pricing_input_from_contract(contract, valuation_time, risk_free_rate, dividend_yield);
         let sigma = contract.data.implied_volatility.to_f64().unwrap_or(0.20);
-        let is_call = contract.right == OptionRight::Call;
-
-        if t <= 0.0 || s <= 0.0 || k <= 0.0 || sigma <= 0.0 {
-            return OptionPriceModelResult {
-                theoretical_price: crate::payoff::intrinsic_value(
-                    contract.data.underlying_last_price,
-                    contract.strike,
-                    contract.right,
-                ),
-                ..Default::default()
-            };
-        }
-
-        let d1 = (f64::ln(s / k) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
-        let d2 = d1 - sigma * t.sqrt();
-
-        let is_call_flag = is_call;
-
-        let price = if is_call_flag {
-            s * f64::exp(-q * t) * norm_cdf(d1) - k * f64::exp(-r * t) * norm_cdf(d2)
-        } else {
-            k * f64::exp(-r * t) * norm_cdf(-d2) - s * f64::exp(-q * t) * norm_cdf(-d1)
-        };
-
-        let delta = if is_call_flag {
-            f64::exp(-q * t) * norm_cdf(d1)
-        } else {
-            -f64::exp(-q * t) * norm_cdf(-d1)
-        };
-
-        let gamma = f64::exp(-q * t) * norm_pdf(d1) / (s * sigma * t.sqrt());
-        let vega = s * f64::exp(-q * t) * norm_pdf(d1) * t.sqrt() / 100.0;
-        let theta = if is_call_flag {
-            (-s * norm_pdf(d1) * sigma * f64::exp(-q * t) / (2.0 * t.sqrt())
-                - r * k * f64::exp(-r * t) * norm_cdf(d2)
-                + q * s * f64::exp(-q * t) * norm_cdf(d1))
-                / 365.0
-        } else {
-            (-s * norm_pdf(d1) * sigma * f64::exp(-q * t) / (2.0 * t.sqrt())
-                + r * k * f64::exp(-r * t) * norm_cdf(-d2)
-                - q * s * f64::exp(-q * t) * norm_cdf(-d1))
-                / 365.0
-        };
-        let rho = if is_call_flag {
-            k * t * f64::exp(-r * t) * norm_cdf(d2) / 100.0
-        } else {
-            -k * t * f64::exp(-r * t) * norm_cdf(-d2) / 100.0
-        };
-
-        let d = |v: f64| Decimal::from_f64(v).unwrap_or(Decimal::ZERO);
-
-        OptionPriceModelResult {
-            theoretical_price: d(price.max(0.0)),
-            implied_volatility: Decimal::from_f64(sigma).unwrap_or(Decimal::ZERO),
-            greeks: Greeks {
-                delta: d(delta),
-                gamma: d(gamma),
-                vega: d(vega),
-                theta: d(theta),
-                rho: d(rho),
-                lambda: if price > 0.0 {
-                    d(delta * s / price)
-                } else {
-                    Decimal::ZERO
-                },
-            },
-        }
+        evaluate_black_scholes_with_iv(input, sigma).unwrap_or_else(|| OptionPriceModelResult {
+            theoretical_price: crate::payoff::intrinsic_value(
+                contract.data.underlying_last_price,
+                contract.strike,
+                contract.right,
+            ),
+            ..Default::default()
+        })
     }
+}
+
+pub fn pricing_input_from_contract(
+    contract: &OptionContract,
+    valuation_time: DateTime,
+    risk_free_rate: f64,
+    dividend_yield: f64,
+) -> OptionPricingInput {
+    let spot = contract.data.underlying_last_price.to_f64().unwrap_or(0.0);
+    let expiry_years = time_to_expiry_years(contract.expiry, valuation_time);
+    let forward = if expiry_years > 0.0 && spot > 0.0 {
+        spot * ((risk_free_rate - dividend_yield) * expiry_years).exp()
+    } else {
+        spot
+    };
+    let market_price = if risk_free_rate != 0.0 && expiry_years > 0.0 {
+        contract.mid_price().to_f64().unwrap_or(0.0) * (risk_free_rate * expiry_years).exp()
+    } else {
+        contract.mid_price().to_f64().unwrap_or(0.0)
+    };
+    OptionPricingInput {
+        spot,
+        forward,
+        strike: contract.strike.to_f64().unwrap_or(0.0),
+        expiry_years,
+        market_price,
+        risk_free_rate,
+        dividend_yield,
+        is_call: contract.right == OptionRight::Call,
+    }
+}
+
+pub fn price_batch(inputs: &[OptionPricingInput]) -> Vec<OptionPriceModelResult> {
+    inputs.iter().copied().map(price_one).collect()
+}
+
+fn price_one(input: OptionPricingInput) -> OptionPriceModelResult {
+    let Some(sigma) = implied_volatility_from_input(input)
+        .or_else(|| lean_newton_implied_volatility_from_input(input))
+    else {
+        return OptionPriceModelResult::default();
+    };
+    evaluate_black_scholes_with_iv(input, sigma).unwrap_or_default()
+}
+
+fn implied_volatility_from_input(input: OptionPricingInput) -> Option<f64> {
+    if input.market_price <= 0.0
+        || input.forward <= 0.0
+        || input.strike <= 0.0
+        || input.expiry_years <= 0.0
+    {
+        return None;
+    }
+    ImpliedBlackVolatility::builder()
+        .option_price(input.market_price)
+        .forward(input.forward)
+        .strike(input.strike)
+        .expiry(input.expiry_years)
+        .is_call(input.is_call)
+        .build()?
+        .calculate::<DefaultSpecialFn>()
+        .filter(|sigma| sigma.is_finite() && *sigma > 0.0)
+}
+
+fn lean_newton_implied_volatility_from_input(input: OptionPricingInput) -> Option<f64> {
+    if input.market_price <= 0.0
+        || input.spot <= 0.0
+        || input.forward <= 0.0
+        || input.strike <= 0.0
+        || input.expiry_years <= 0.0
+    {
+        return None;
+    }
+
+    let discounted_price = input.market_price * (-input.risk_free_rate * input.expiry_years).exp();
+    let risk_free_discount = (-input.risk_free_rate * input.expiry_years).exp();
+    let mut sigma =
+        (2.0 * std::f64::consts::PI / input.expiry_years).sqrt() * discounted_price / input.spot;
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return None;
+    }
+
+    const TOLERANCE: f64 = 1e-3;
+    const LOWER_BOUND: f64 = 1e-7;
+    const UPPER_BOUND: f64 = 4.0;
+    let mut error = f64::MAX;
+    let mut iterations_remaining = 10;
+
+    while error > TOLERANCE && iterations_remaining > 0 {
+        let old_sigma = sigma;
+        let std_dev = old_sigma * input.expiry_years.sqrt();
+        let price = black_value(
+            input.forward,
+            input.strike,
+            std_dev,
+            risk_free_discount,
+            input.is_call,
+        );
+        let vega = black_vega(
+            input.forward,
+            input.strike,
+            std_dev,
+            risk_free_discount,
+            input.expiry_years.sqrt(),
+        );
+        if !price.is_finite() || !vega.is_finite() || vega.abs() <= f64::EPSILON {
+            return None;
+        }
+
+        sigma -= (price - discounted_price) / vega;
+        sigma = sigma.clamp(LOWER_BOUND, UPPER_BOUND);
+        error = ((sigma - old_sigma) / sigma).abs();
+        iterations_remaining -= 1;
+    }
+
+    (iterations_remaining > 0 && sigma.is_finite() && sigma > 0.0).then_some(sigma)
+}
+
+fn black_value(forward: f64, strike: f64, std_dev: f64, discount: f64, is_call: bool) -> f64 {
+    if std_dev <= 0.0 || forward <= 0.0 || strike <= 0.0 || discount <= 0.0 {
+        return 0.0;
+    }
+    let d1 = (forward / strike).ln() / std_dev + 0.5 * std_dev;
+    let d2 = d1 - std_dev;
+    if is_call {
+        discount * (forward * norm_cdf(d1) - strike * norm_cdf(d2))
+    } else {
+        discount * (strike * norm_cdf(-d2) - forward * norm_cdf(-d1))
+    }
+}
+
+fn black_vega(forward: f64, strike: f64, std_dev: f64, discount: f64, sqrt_time: f64) -> f64 {
+    if std_dev <= 0.0 || forward <= 0.0 || strike <= 0.0 || discount <= 0.0 {
+        return 0.0;
+    }
+    let d1 = (forward / strike).ln() / std_dev + 0.5 * std_dev;
+    discount * forward * norm_pdf(d1) * sqrt_time
+}
+
+fn evaluate_black_scholes_with_iv(
+    input: OptionPricingInput,
+    sigma: f64,
+) -> Option<OptionPriceModelResult> {
+    let s = input.spot;
+    let k = input.strike;
+    let t = input.expiry_years;
+    let r = input.risk_free_rate;
+    let q = input.dividend_yield;
+    if t <= 0.0 || s <= 0.0 || k <= 0.0 || sigma <= 0.0 {
+        return None;
+    }
+
+    let sqrt_t = t.sqrt();
+    let d1 = (f64::ln(s / k) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t);
+    let d2 = d1 - sigma * sqrt_t;
+    let discount_q = f64::exp(-q * t);
+    let discount_r = f64::exp(-r * t);
+    let pdf_d1 = norm_pdf(d1);
+
+    let price = if input.is_call {
+        s * discount_q * norm_cdf(d1) - k * discount_r * norm_cdf(d2)
+    } else {
+        k * discount_r * norm_cdf(-d2) - s * discount_q * norm_cdf(-d1)
+    };
+
+    let delta = if input.is_call {
+        discount_q * norm_cdf(d1)
+    } else {
+        -discount_q * norm_cdf(-d1)
+    };
+
+    let gamma = discount_q * pdf_d1 / (s * sigma * sqrt_t);
+    let vega = s * discount_q * pdf_d1 * sqrt_t / 100.0;
+    let theta = if input.is_call {
+        (-s * pdf_d1 * sigma * discount_q / (2.0 * sqrt_t) - r * k * discount_r * norm_cdf(d2)
+            + q * s * discount_q * norm_cdf(d1))
+            / 365.0
+    } else {
+        (-s * pdf_d1 * sigma * discount_q / (2.0 * sqrt_t) + r * k * discount_r * norm_cdf(-d2)
+            - q * s * discount_q * norm_cdf(-d1))
+            / 365.0
+    };
+    let rho = if input.is_call {
+        k * t * discount_r * norm_cdf(d2) / 100.0
+    } else {
+        -k * t * discount_r * norm_cdf(-d2) / 100.0
+    };
+
+    let d = |v: f64| Decimal::from_f64(v).unwrap_or(Decimal::ZERO);
+    Some(OptionPriceModelResult {
+        theoretical_price: d(price.max(0.0)),
+        implied_volatility: Decimal::from_f64(sigma).unwrap_or(Decimal::ZERO),
+        greeks: Greeks {
+            delta: d(delta),
+            gamma: d(gamma),
+            vega: d(vega),
+            theta: d(theta),
+            rho: d(rho),
+            lambda: if price > 0.0 {
+                d(delta * s / price)
+            } else {
+                Decimal::ZERO
+            },
+        },
+    })
 }
 
 pub fn time_to_expiry_years(expiry: NaiveDate, valuation_time: DateTime) -> f64 {
@@ -194,7 +350,7 @@ pub fn evaluate_contract_with_market_iv<M: IOptionPriceModel>(
     result
 }
 
-/// Compute IV from market price using Newton-Raphson bisection.
+/// Compute IV from market price using Peter Jaeckel's Lets Be Rational algorithm.
 pub fn implied_volatility(
     market_price: f64,
     s: f64,
@@ -204,35 +360,39 @@ pub fn implied_volatility(
     q: f64,
     right: OptionRight,
 ) -> f64 {
-    if t <= 0.0 || market_price <= 0.0 {
-        return 0.0;
-    }
-    let is_call = right == OptionRight::Call;
-    let mut lo = 1e-6_f64;
-    let mut hi = 10.0_f64;
-    for _ in 0..100 {
-        let mid = (lo + hi) / 2.0;
-        let price = bs_price(s, k, t, r, q, mid, is_call);
-        if (price - market_price).abs() < 1e-8 {
-            return mid;
-        }
-        if price < market_price {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    (lo + hi) / 2.0
-}
-
-fn bs_price(s: f64, k: f64, t: f64, r: f64, q: f64, sigma: f64, is_call: bool) -> f64 {
-    let d1 = (f64::ln(s / k) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
-    let d2 = d1 - sigma * t.sqrt();
-    if is_call {
-        s * f64::exp(-q * t) * norm_cdf(d1) - k * f64::exp(-r * t) * norm_cdf(d2)
+    let forward = if t > 0.0 && s > 0.0 {
+        s * ((r - q) * t).exp()
     } else {
-        k * f64::exp(-r * t) * norm_cdf(-d2) - s * f64::exp(-q * t) * norm_cdf(-d1)
-    }
+        s
+    };
+    let option_price = if r != 0.0 && t > 0.0 {
+        market_price * (r * t).exp()
+    } else {
+        market_price
+    };
+    implied_volatility_from_input(OptionPricingInput {
+        spot: s,
+        forward,
+        strike: k,
+        expiry_years: t,
+        market_price: option_price,
+        risk_free_rate: r,
+        dividend_yield: q,
+        is_call: right == OptionRight::Call,
+    })
+    .or_else(|| {
+        lean_newton_implied_volatility_from_input(OptionPricingInput {
+            spot: s,
+            forward,
+            strike: k,
+            expiry_years: t,
+            market_price: option_price,
+            risk_free_rate: r,
+            dividend_yield: q,
+            is_call: right == OptionRight::Call,
+        })
+    })
+    .unwrap_or(0.0)
 }
 
 fn norm_cdf(x: f64) -> f64 {
@@ -306,5 +466,113 @@ mod tests {
     #[test]
     fn norm_cdf_is_centered_at_half() {
         assert!((norm_cdf(0.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn implied_volatility_recovers_known_sigma() {
+        let s = 100.0;
+        let k = 105.0;
+        let t = 45.0 / 365.0;
+        let sigma = 0.32;
+        let price = evaluate_black_scholes_with_iv(
+            OptionPricingInput {
+                spot: s,
+                forward: s,
+                strike: k,
+                expiry_years: t,
+                market_price: 0.0,
+                risk_free_rate: 0.0,
+                dividend_yield: 0.0,
+                is_call: true,
+            },
+            sigma,
+        )
+        .unwrap()
+        .theoretical_price
+        .to_f64()
+        .unwrap();
+
+        let recovered = implied_volatility(price, s, k, t, 0.0, 0.0, OptionRight::Call);
+        assert!((recovered - sigma).abs() < 1e-4);
+    }
+
+    #[test]
+    fn batch_pricing_matches_scalar_contract_evaluation() {
+        let market = Market::usa();
+        let underlying = Symbol::create_equity("SPY", &market);
+        let expiry = NaiveDate::from_ymd_opt(2024, 2, 16).unwrap();
+        let valuation_time = DateTime::from(
+            Utc.with_ymd_and_hms(2024, 1, 19, 19, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let symbol = Symbol::create_option_osi(
+            underlying,
+            dec!(430),
+            expiry,
+            OptionRight::Put,
+            OptionStyle::American,
+            &market,
+        );
+        let mut contract = OptionContract::new(symbol);
+        contract.data.underlying_last_price = dec!(450);
+        contract.data.bid_price = dec!(3.80);
+        contract.data.ask_price = dec!(4.10);
+
+        let input = pricing_input_from_contract(&contract, valuation_time, 0.0, 0.0);
+        let batch_result = price_batch(&[input]).remove(0);
+        let model = BlackScholesPriceModel;
+        let scalar_result =
+            evaluate_contract_with_market_iv(&model, &mut contract, valuation_time, 0.0, 0.0);
+
+        assert!(
+            (batch_result.implied_volatility - scalar_result.implied_volatility).abs()
+                < dec!(0.0000000001)
+        );
+        assert!(
+            (batch_result.theoretical_price - scalar_result.theoretical_price).abs()
+                < dec!(0.0000000001)
+        );
+        assert!(
+            (batch_result.greeks.delta - scalar_result.greeks.delta).abs() < dec!(0.0000000001)
+        );
+        assert!(
+            (batch_result.greeks.gamma - scalar_result.greeks.gamma).abs() < dec!(0.0000000001)
+        );
+    }
+
+    #[test]
+    fn batch_pricing_supports_multiple_underlyings() {
+        let inputs = [
+            OptionPricingInput {
+                spot: 100.0,
+                forward: 100.0,
+                strike: 105.0,
+                expiry_years: 30.0 / 365.0,
+                market_price: 1.20,
+                risk_free_rate: 0.0,
+                dividend_yield: 0.0,
+                is_call: true,
+            },
+            OptionPricingInput {
+                spot: 45.0,
+                forward: 45.0,
+                strike: 42.0,
+                expiry_years: 60.0 / 365.0,
+                market_price: 0.95,
+                risk_free_rate: 0.0,
+                dividend_yield: 0.0,
+                is_call: false,
+            },
+        ];
+        let results = price_batch(&inputs);
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.implied_volatility > Decimal::ZERO));
+        assert!(results
+            .iter()
+            .all(|result| result.greeks.gamma > Decimal::ZERO));
     }
 }

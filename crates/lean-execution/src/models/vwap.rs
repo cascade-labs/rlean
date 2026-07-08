@@ -4,7 +4,7 @@ use crate::execution_model::{
     ExecutionContext, ExecutionOrderType, ExecutionTarget, IExecutionModel, OrderRequest,
     SecurityData,
 };
-use lean_core::{DateTime, Symbol, TimeSpan};
+use lean_core::{Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -18,8 +18,8 @@ pub struct VwapExecutionModel {
     /// Maximum fraction of current bar volume to submit per bar (default 0.01).
     pub participation_rate: Decimal,
     /// Desired target quantity per symbol (ticker -> target quantity).
-    targets: HashMap<String, (Symbol, Decimal)>,
-    vwap: HashMap<String, VwapState>,
+    targets: HashMap<u64, (Symbol, Decimal)>,
+    vwap: HashMap<u64, VwapState>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ impl VwapExecutionModel {
             return;
         }
 
-        let key = sec.symbol.value.clone();
+        let key = sec.symbol.id.sid;
         let state = self.vwap.entry(key).or_insert_with(|| VwapState {
             day: None,
             sum_volume: Decimal::ZERO,
@@ -113,16 +113,6 @@ impl IExecutionModel for VwapExecutionModel {
     fn execute(
         &mut self,
         targets: &[ExecutionTarget],
-        securities: &HashMap<String, SecurityData>,
-    ) -> Vec<OrderRequest> {
-        let open_orders = Vec::new();
-        let context = ExecutionContext::new(DateTime::MIN, securities, &open_orders, Decimal::ZERO);
-        self.execute_with_context(targets, &context)
-    }
-
-    fn execute_with_context(
-        &mut self,
-        targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for sec in context.securities.values() {
@@ -131,7 +121,7 @@ impl IExecutionModel for VwapExecutionModel {
 
         // Merge new targets into the persistent target collection.
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.id.sid;
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -143,18 +133,18 @@ impl IExecutionModel for VwapExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let sec = match context.securities.get(&key) {
+            let sec = match context.security(&symbol) {
                 Some(s) => s,
                 None => continue,
             };
 
             if context.actual_holding_delta(sec, target_quantity) == Decimal::ZERO {
-                fulfilled.push(key.clone());
+                fulfilled.push(key);
                 continue;
             }
 
@@ -220,8 +210,8 @@ impl IExecutionModel for VwapExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
-            self.vwap.remove(&sym.value);
+            self.targets.remove(&sym.id.sid);
+            self.vwap.remove(&sym.id.sid);
         }
     }
 

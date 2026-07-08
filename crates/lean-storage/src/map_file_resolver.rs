@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 use chrono::NaiveDate;
 use lean_core::{LeanError, Result};
 
-use crate::{MapFileEntry, ParquetReader};
+use crate::MapFileEntry;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapFile {
@@ -80,7 +79,7 @@ impl MapFileResolver {
         let mut by_symbol: HashMap<String, BTreeMap<NaiveDate, MapFileRowEntry>> = HashMap::new();
 
         for map_file in map_files {
-            let permtick = map_file.permtick.clone();
+            let permtick = map_file.permtick.to_string();
             for row in &map_file.rows {
                 let symbol_entries = by_symbol.entry(row.ticker.clone()).or_default();
                 if let Some(existing) = symbol_entries.get(&row.date) {
@@ -107,30 +106,6 @@ impl MapFileResolver {
             by_permtick,
             by_symbol,
         })
-    }
-
-    pub fn from_directory(reader: &ParquetReader, map_file_directory: &Path) -> Result<Self> {
-        if !map_file_directory.exists() {
-            return Ok(Self::default());
-        }
-
-        let mut map_files = Vec::new();
-        for entry in std::fs::read_dir(map_file_directory)
-            .map_err(|e| LeanError::DataError(format!("{}: {e}", map_file_directory.display())))?
-        {
-            let entry = entry.map_err(|e| LeanError::DataError(e.to_string()))?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
-                continue;
-            }
-            let Some(permtick) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let rows = reader.read_map_file(&path)?;
-            map_files.push(MapFile::new(permtick, rows));
-        }
-
-        Self::new(map_files)
     }
 
     pub fn get_by_permtick(&self, permtick: &str) -> Option<&MapFile> {

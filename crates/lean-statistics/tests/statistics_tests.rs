@@ -80,6 +80,17 @@ fn sharpe_ratio_higher_with_better_returns() {
     assert!(s2 > s1, "Better returns should yield higher Sharpe");
 }
 
+#[test]
+fn sharpe_ratio_uses_annualized_daily_excess_return() {
+    let returns = vec![dec!(0.01), dec!(-0.005), dec!(0.012), dec!(0.003)];
+    let sharpe = Statistics::sharpe_ratio(&returns, dec!(0.04));
+
+    assert!(
+        (sharpe - dec!(9.977234654099509)).abs() < dec!(0.000000000001),
+        "expected annualized daily excess-return Sharpe, got {sharpe}"
+    );
+}
+
 // ─── Sortino ratio ───────────────────────────────────────────────────────────
 
 #[test]

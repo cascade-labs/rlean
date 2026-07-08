@@ -17,6 +17,7 @@ pub mod time;
 pub use currency::CurrencyPair;
 pub use data_normalization::DataNormalizationMode;
 pub use error::{LeanError, Result};
+pub use exchange_hours::{ExchangeHours, MarketHoursDatabase, MarketHoursKey};
 pub use market::Market;
 pub use option_right::OptionRight;
 pub use option_style::OptionStyle;

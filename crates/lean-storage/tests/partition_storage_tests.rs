@@ -1,7 +1,10 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use lean_core::{Market, NanosecondTimestamp, Resolution, Symbol, TickType, TimeSpan};
 use lean_data::{TradeBar, TradeBarData};
-use lean_storage::{ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig};
+use lean_storage::{
+    iceberg_store::{MARKET_QUOTE_BARS, MARKET_TRADE_BARS},
+    IcebergStore, MarketPartitionDayQuery, QueryParams,
+};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -14,78 +17,8 @@ fn date_time(date: NaiveDate, h: u32, m: u32, s: u32) -> NanosecondTimestamp {
     NanosecondTimestamp::from(Utc.from_utc_datetime(&date.and_hms_opt(h, m, s).unwrap()))
 }
 
-fn bar(ticker: &str, date: NaiveDate, close: rust_decimal::Decimal) -> TradeBar {
-    TradeBar::new(
-        Symbol::create_equity(ticker, &Market::usa()),
-        date_time(date, 9, 30, 0),
-        TimeSpan::from_nanos(60_000_000_000),
-        TradeBarData::new(close, close, close, close, dec!(1000)),
-    )
-}
-
-#[test]
-fn market_data_partition_path_is_date_partitioned() {
-    let resolver = PathResolver::new("/data");
-    let path = resolver.market_data_partition(
-        &Symbol::create_equity("SPY", &Market::usa()),
-        Resolution::Minute,
-        TickType::Trade,
-        date(2022, 5, 3),
-    );
-
-    assert_eq!(
-        path,
-        std::path::PathBuf::from("/data/equity/usa/minute/trade/date=2022-05-03/data.parquet")
-    );
-}
-
-#[test]
-fn merge_trade_partition_preserves_existing_symbols_and_replaces_symbol_rows() {
-    let tmp = TempDir::new().unwrap();
-    let resolver = PathResolver::new(tmp.path());
-    let day = date(2022, 5, 3);
-    let path = resolver.market_data_partition(
-        &Symbol::create_equity("SPY", &Market::usa()),
-        Resolution::Minute,
-        TickType::Trade,
-        day,
-    );
-    let writer = ParquetWriter::new(WriterConfig::default());
-
-    writer
-        .merge_trade_bar_partition(
-            &[bar("SPY", day, dec!(100)), bar("QQQ", day, dec!(200))],
-            &path,
-        )
-        .unwrap();
-    writer
-        .merge_trade_bar_partition(&[bar("SPY", day, dec!(101))], &path)
-        .unwrap();
-
-    let reader = ParquetReader::new();
-    let rows = reader
-        .read_trade_bar_partition(
-            &path,
-            &Symbol::create_equity("SPY", &Market::usa()),
-            &QueryParams::new(),
-        )
-        .unwrap();
-
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.symbol.value == "SPY")
-            .unwrap()
-            .close,
-        dec!(101)
-    );
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.symbol.value == "QQQ")
-            .unwrap()
-            .close,
-        dec!(200)
-    );
+fn days_since_epoch(value: NaiveDate) -> i32 {
+    value.signed_duration_since(date(1970, 1, 1)).num_days() as i32
 }
 
 #[test]
@@ -94,10 +27,9 @@ fn query_params_default_preserves_time_ordering_default() {
 }
 
 #[tokio::test]
-async fn grouped_multi_partition_trade_reader_returns_chronological_rows() {
+async fn iceberg_trade_bar_scan_returns_chronological_rows_by_symbol() {
     let tmp = TempDir::new().unwrap();
-    let resolver = PathResolver::new(tmp.path());
-    let writer = ParquetWriter::new(WriterConfig::default());
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let qqq = Symbol::create_equity("QQQ", &market);
@@ -106,9 +38,8 @@ async fn grouped_multi_partition_trade_reader_returns_chronological_rows() {
     let day3 = date(2022, 5, 5);
 
     for day in [day1, day2, day3] {
-        let path = resolver.market_data_partition(&spy, Resolution::Daily, TickType::Trade, day);
-        writer
-            .write_trade_bars(
+        store
+            .append_trade_bars(
                 &[
                     TradeBar::new(
                         spy.clone(),
@@ -123,24 +54,28 @@ async fn grouped_multi_partition_trade_reader_returns_chronological_rows() {
                         TradeBarData::new(dec!(200), dec!(200), dec!(200), dec!(200), dec!(1000)),
                     ),
                 ],
-                &path,
+                lean_core::SecurityType::Equity,
+                market.as_str(),
+                Resolution::Daily,
+                TickType::Trade,
             )
+            .await
             .unwrap();
     }
 
-    let paths = [day3, day1, day2]
-        .into_iter()
-        .map(|day| resolver.market_data_partition(&spy, Resolution::Daily, TickType::Trade, day))
-        .collect::<Vec<_>>();
     let mut params = QueryParams::new()
-        .with_time_range(date_time(day1, 0, 0, 0), date_time(day3, 23, 59, 59))
+        .with_bar_range(
+            date_time(day1, 0, 0, 0),
+            date_time(day3 + chrono::Duration::days(1), 23, 59, 59),
+        )
         .with_symbols(vec![spy.id.sid, qqq.id.sid]);
     params.order_by_time = false;
 
-    let grouped = ParquetReader::new()
-        .read_trade_bar_partitions_grouped_async(
-            &paths,
+    let grouped = store
+        .scan_trade_bar_partitions_grouped(
             &HashMap::from([(spy.id.sid, spy.clone()), (qqq.id.sid, qqq.clone())]),
+            Resolution::Daily,
+            TickType::Trade,
             &params,
         )
         .await
@@ -157,4 +92,275 @@ async fn grouped_multi_partition_trade_reader_returns_chronological_rows() {
 
     assert_eq!(spy_dates, vec![day1, day2, day3]);
     assert_eq!(qqq_dates, vec![day1, day2, day3]);
+}
+
+#[tokio::test]
+async fn market_partition_days_tracks_appended_market_partitions() {
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let market = Market::usa();
+    let spy = Symbol::create_equity("SPY", &market);
+    let day1 = date(2022, 5, 3);
+    let day2 = date(2022, 5, 4);
+    let day3 = date(2022, 5, 5);
+
+    store
+        .append_trade_bars(
+            &[
+                TradeBar::new(
+                    spy.clone(),
+                    date_time(day1, 9, 31, 0),
+                    TimeSpan::ONE_MINUTE,
+                    TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+                ),
+                TradeBar::new(
+                    spy.clone(),
+                    date_time(day2, 9, 31, 0),
+                    TimeSpan::ONE_MINUTE,
+                    TradeBarData::new(dec!(101), dec!(101), dec!(101), dec!(101), dec!(1000)),
+                ),
+            ],
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
+
+    let first_days = store
+        .market_partition_days(MarketPartitionDayQuery::new(
+            MARKET_TRADE_BARS,
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            spy.id.sid,
+            days_since_epoch(day1),
+            days_since_epoch(day3),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_days,
+        [days_since_epoch(day1), days_since_epoch(day2)]
+            .into_iter()
+            .collect()
+    );
+
+    store
+        .append_trade_bars(
+            &[TradeBar::new(
+                spy.clone(),
+                date_time(day3, 9, 31, 0),
+                TimeSpan::ONE_MINUTE,
+                TradeBarData::new(dec!(102), dec!(102), dec!(102), dec!(102), dec!(1000)),
+            )],
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
+
+    let updated_days = store
+        .market_partition_days(MarketPartitionDayQuery::new(
+            MARKET_TRADE_BARS,
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            spy.id.sid,
+            days_since_epoch(day1),
+            days_since_epoch(day3),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        updated_days,
+        [
+            days_since_epoch(day1),
+            days_since_epoch(day2),
+            days_since_epoch(day3),
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    let quote_days = store
+        .market_partition_days(MarketPartitionDayQuery::new(
+            MARKET_QUOTE_BARS,
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            spy.id.sid,
+            days_since_epoch(day1),
+            days_since_epoch(day3),
+        ))
+        .await
+        .unwrap();
+    assert!(quote_days.is_empty());
+}
+
+#[tokio::test]
+async fn warmed_market_partition_index_tracks_appends() {
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let market = Market::usa();
+    let spy = Symbol::create_equity("SPY", &market);
+    let day1 = date(2022, 5, 3);
+    let day2 = date(2022, 5, 4);
+
+    store
+        .append_trade_bars(
+            &[TradeBar::new(
+                spy.clone(),
+                date_time(day1, 9, 31, 0),
+                TimeSpan::ONE_MINUTE,
+                TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
+            )],
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
+
+    store
+        .warm_market_partition_index(MARKET_TRADE_BARS)
+        .await
+        .unwrap();
+
+    store
+        .append_trade_bars(
+            &[TradeBar::new(
+                spy.clone(),
+                date_time(day2, 9, 31, 0),
+                TimeSpan::ONE_MINUTE,
+                TradeBarData::new(dec!(101), dec!(101), dec!(101), dec!(101), dec!(1000)),
+            )],
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
+
+    let warmed_days = store
+        .market_partition_days(MarketPartitionDayQuery::new(
+            MARKET_TRADE_BARS,
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Minute,
+            spy.id.sid,
+            days_since_epoch(day1),
+            days_since_epoch(day2),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        warmed_days,
+        [days_since_epoch(day1), days_since_epoch(day2)]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[tokio::test]
+async fn daily_trade_bar_is_partitioned_by_end_time_day() {
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let market = Market::usa();
+    let spy = Symbol::create_equity("SPY", &market);
+    let start_day = date(2024, 1, 16);
+    let end_day = date(2024, 1, 17);
+    let bar = TradeBar::new(
+        spy.clone(),
+        date_time(start_day, 20, 0, 0),
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
+    );
+
+    store
+        .append_trade_bars(
+            &[bar],
+            lean_core::SecurityType::Equity,
+            market.as_str(),
+            Resolution::Daily,
+            TickType::Trade,
+        )
+        .await
+        .unwrap();
+
+    let params = QueryParams::new()
+        .with_day_range(date_time(end_day, 0, 0, 0), date_time(end_day, 23, 59, 59))
+        .with_bar_range(date_time(end_day, 0, 0, 0), date_time(end_day, 23, 59, 59))
+        .with_symbols(vec![spy.id.sid]);
+    let grouped = store
+        .scan_trade_bar_partitions_grouped(
+            &HashMap::from([(spy.id.sid, spy.clone())]),
+            Resolution::Daily,
+            TickType::Trade,
+            &params,
+        )
+        .await
+        .unwrap();
+
+    let rows = grouped.get(&spy.id.sid).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].time.date_utc(), start_day);
+    assert_eq!(rows[0].end_time.date_utc(), end_day);
+}
+
+#[tokio::test]
+async fn appending_same_trade_bar_twice_does_not_duplicate_key() {
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let market = Market::usa();
+    let spy = Symbol::create_equity("SPY", &market);
+    let day = date(2024, 1, 16);
+    let storage_day = date(2024, 1, 17);
+    let bar = TradeBar::new(
+        spy.clone(),
+        date_time(day, 16, 0, 0),
+        TimeSpan::ONE_DAY,
+        TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
+    );
+
+    for _ in 0..2 {
+        store
+            .append_trade_bars(
+                std::slice::from_ref(&bar),
+                lean_core::SecurityType::Equity,
+                market.as_str(),
+                Resolution::Daily,
+                TickType::Trade,
+            )
+            .await
+            .unwrap();
+    }
+
+    let params = QueryParams::new()
+        .with_day_range(
+            date_time(storage_day, 0, 0, 0),
+            date_time(storage_day, 23, 59, 59),
+        )
+        .with_bar_range(
+            date_time(storage_day, 0, 0, 0),
+            date_time(storage_day, 23, 59, 59),
+        )
+        .with_symbols(vec![spy.id.sid]);
+    let grouped = store
+        .scan_trade_bar_partitions_grouped(
+            &HashMap::from([(spy.id.sid, spy.clone())]),
+            Resolution::Daily,
+            TickType::Trade,
+            &params,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(grouped.get(&spy.id.sid).unwrap().len(), 1);
 }

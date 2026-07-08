@@ -1,6 +1,6 @@
 use crate::{
-    CustomDataPoint, CustomDataSubscription, MarginInterestRate, OrderBook, PerpetualContext,
-    QuoteBar, Slice, SubscriptionDataConfig, Tick, TradeBar,
+    CustomDataPoint, MarginInterestRate, OrderBook, PerpetualContext, QuoteBar, Slice,
+    SubscriptionDataConfig, Tick, TradeBar,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use lean_core::{DateTime, LeanError, Resolution, Result, Symbol};
@@ -23,8 +23,7 @@ pub struct LiveNodePacket {
 
 #[derive(Debug, Clone)]
 pub enum LiveDataSubscriptionConfig {
-    Market(SubscriptionDataConfig),
-    Custom(Box<CustomDataSubscription>),
+    Market(Box<SubscriptionDataConfig>),
     Universe(LiveUniverseSubscriptionConfig),
 }
 
@@ -32,10 +31,6 @@ impl LiveDataSubscriptionConfig {
     pub fn key(&self) -> LiveSubscriptionKey {
         match self {
             Self::Market(config) => LiveSubscriptionKey::Market(config.unique_id()),
-            Self::Custom(subscription) => LiveSubscriptionKey::Custom {
-                source_type: subscription.source_type.clone(),
-                ticker: subscription.ticker.clone(),
-            },
             Self::Universe(subscription) => LiveSubscriptionKey::Universe {
                 source_type: subscription.source_type.clone(),
                 ticker: subscription.ticker.clone(),
@@ -47,7 +42,6 @@ impl LiveDataSubscriptionConfig {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum LiveSubscriptionKey {
     Market(u64),
-    Custom { source_type: String, ticker: String },
     Universe { source_type: String, ticker: String },
 }
 
@@ -97,6 +91,7 @@ pub enum LiveDataItem {
     PerpetualContext(PerpetualContext),
     OrderBook(OrderBook),
     CustomData {
+        symbol: Symbol,
         source_type: String,
         ticker: String,
         point: CustomDataPoint,
@@ -160,7 +155,8 @@ impl LiveDataItem {
             Self::MarginInterestRate(rate) => Some(&rate.symbol),
             Self::PerpetualContext(context) => Some(&context.symbol),
             Self::OrderBook(book) => Some(&book.symbol),
-            Self::CustomData { .. } | Self::UniverseData { .. } | Self::Heartbeat(_) => None,
+            Self::CustomData { symbol, .. } => Some(symbol),
+            Self::UniverseData { .. } | Self::Heartbeat(_) => None,
         }
     }
 
@@ -173,10 +169,14 @@ impl LiveDataItem {
             Self::PerpetualContext(context) => slice.add_perpetual_context(context),
             Self::OrderBook(book) => slice.add_order_book(book),
             Self::CustomData {
+                symbol,
                 source_type,
                 ticker,
                 point,
-            } => slice.add_custom_data(source_type, ticker, point),
+            } => {
+                let _ = source_type;
+                slice.add_custom_data_for_symbol(symbol, ticker, point)
+            }
             Self::UniverseData { .. } => {}
             Self::Heartbeat(_) => {}
         }
@@ -199,18 +199,6 @@ pub trait DataQueueHandler: Send + Sync {
 
     fn subscribe(&mut self, config: &SubscriptionDataConfig) -> Result<LiveDataSubscription>;
 
-    fn subscribe_custom(
-        &mut self,
-        subscription: &CustomDataSubscription,
-    ) -> Result<LiveDataSubscription> {
-        Err(LeanError::Unsupported(format!(
-            "{} does not support custom live subscriptions for {}:{}",
-            self.name(),
-            subscription.source_type,
-            subscription.ticker
-        )))
-    }
-
     fn subscribe_universe(
         &mut self,
         subscription: &LiveUniverseSubscriptionConfig,
@@ -224,10 +212,6 @@ pub trait DataQueueHandler: Send + Sync {
     }
 
     fn unsubscribe(&mut self, config: &SubscriptionDataConfig) -> Result<()>;
-
-    fn unsubscribe_custom(&mut self, _subscription: &CustomDataSubscription) -> Result<()> {
-        Ok(())
-    }
 
     fn unsubscribe_universe(
         &mut self,

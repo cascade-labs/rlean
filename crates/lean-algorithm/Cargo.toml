@@ -10,9 +10,12 @@ lean-orders = { path = "../lean-orders" }
 lean-indicators = { path = "../lean-indicators" }
 lean-options = { path = "../lean-options" }
 lean-risk = { path = "../lean-risk" }
+lean-execution = { path = "../lean-execution" }
 lean-universe = { path = "../lean-universe" }
 lean-scheduling = { path = "../lean-scheduling" }
 lean-statistics = { path = "../lean-statistics" }
+lean-alpha = { path = "../lean-alpha" }
+lean-portfolio-construction = { path = "../lean-portfolio-construction" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use crate::execution_model::{ExecutionTarget, IExecutionModel, OrderRequest, SecurityData};
+use crate::execution_model::{ExecutionContext, ExecutionTarget, IExecutionModel, OrderRequest};
 use lean_core::Symbol;
 
 /// Null execution model — never submits any orders.
@@ -24,7 +22,7 @@ impl IExecutionModel for NullExecutionModel {
     fn execute(
         &mut self,
         _targets: &[ExecutionTarget],
-        _securities: &HashMap<String, SecurityData>,
+        _context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         vec![]
     }

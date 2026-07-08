@@ -81,8 +81,8 @@ impl PortfolioStatistics {
         let annual_return = Statistics::annual_performance(total_return, trading_days);
         let drawdown = Statistics::max_drawdown(equity_curve);
         let daily_rf = risk_free_rate / dec!(252);
-        let sharpe = Statistics::sharpe_ratio(&daily_returns, daily_rf);
-        let sortino = Statistics::sortino_ratio(&daily_returns, daily_rf);
+        let sharpe = Statistics::sharpe_ratio(&daily_returns, risk_free_rate);
+        let sortino = Statistics::sortino_ratio(&daily_returns, risk_free_rate);
         let beta = Statistics::beta(&daily_returns, &benchmark_returns);
         let benchmark_total_return = if benchmark_curve.len() >= 2 && !benchmark_curve[0].is_zero()
         {

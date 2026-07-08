@@ -1,6 +1,7 @@
 use lean_core::{DateTime, NanosecondTimestamp, Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InsightType {
@@ -30,7 +31,7 @@ pub struct Insight {
     pub magnitude: Option<Decimal>,
     /// Confidence in [0, 1] (optional).
     pub confidence: Option<Decimal>,
-    pub source_model: String,
+    pub source_model: Arc<str>,
     pub generated_time_utc: DateTime,
     pub close_time_utc: DateTime,
     /// Filled in by a scoring layer after the fact.
@@ -66,7 +67,7 @@ impl Insight {
             period,
             magnitude,
             confidence,
-            source_model: source_model.to_string(),
+            source_model: Arc::from(source_model),
             generated_time_utc: now,
             close_time_utc: close,
             score: None,

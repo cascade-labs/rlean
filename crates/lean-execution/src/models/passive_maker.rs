@@ -20,8 +20,8 @@ pub struct PassiveMakerExecutionModel {
     pub adverse_selection_threshold: Decimal,
     /// Optional notional cap per submitted order. Zero disables the cap.
     pub maximum_order_value: Decimal,
-    targets: HashMap<String, (Symbol, Decimal)>,
-    states: HashMap<String, PassiveState>,
+    targets: HashMap<u64, (Symbol, Decimal)>,
+    states: HashMap<u64, PassiveState>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,8 +58,8 @@ impl PassiveMakerExecutionModel {
     }
 
     pub fn remove_target(&mut self, symbol: &Symbol) {
-        self.targets.remove(&symbol.value);
-        self.states.remove(&symbol.value);
+        self.targets.remove(&symbol.id.sid);
+        self.states.remove(&symbol.id.sid);
     }
 
     fn cap_order_quantity(
@@ -76,8 +76,8 @@ impl PassiveMakerExecutionModel {
     }
 
     fn reset_state_if_needed<'a>(
-        states: &'a mut HashMap<String, PassiveState>,
-        key: &str,
+        states: &'a mut HashMap<u64, PassiveState>,
+        key: &u64,
         target_quantity: Decimal,
         direction: Decimal,
         bid: Decimal,
@@ -95,7 +95,7 @@ impl PassiveMakerExecutionModel {
 
         if reset {
             states.insert(
-                key.to_string(),
+                *key,
                 PassiveState {
                     target_quantity,
                     direction,
@@ -228,13 +228,13 @@ fn single_updateable_passive_order<'a>(
 }
 
 impl IExecutionModel for PassiveMakerExecutionModel {
-    fn execute_with_context(
+    fn execute(
         &mut self,
         targets: &[ExecutionTarget],
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for target in targets {
-            let key = target.symbol.value.clone();
+            let key = target.symbol.id.sid;
             self.targets
                 .insert(key, (target.symbol.clone(), target.quantity));
         }
@@ -245,19 +245,19 @@ impl IExecutionModel for PassiveMakerExecutionModel {
         let mut target_snapshot: Vec<_> = self
             .targets
             .iter()
-            .map(|(key, (symbol, target_quantity))| (key.clone(), symbol.clone(), *target_quantity))
+            .map(|(key, (symbol, target_quantity))| (*key, symbol.clone(), *target_quantity))
             .collect();
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let Some(sec) = context.securities.get(&key) else {
+            let Some(sec) = context.security(&symbol) else {
                 continue;
             };
             let open_order_quantity = Self::open_order_quantity(context, sec);
 
             let target_delta = context.actual_holding_delta(sec, target_quantity);
             if target_delta == Decimal::ZERO {
-                fulfilled.push(key.clone());
+                fulfilled.push(key);
                 self.states.remove(&key);
                 if open_order_quantity != Decimal::ZERO {
                     orders.push(cancel_request(
@@ -409,8 +409,8 @@ impl IExecutionModel for PassiveMakerExecutionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.targets.remove(&sym.value);
-            self.states.remove(&sym.value);
+            self.targets.remove(&sym.id.sid);
+            self.states.remove(&sym.id.sid);
         }
     }
 

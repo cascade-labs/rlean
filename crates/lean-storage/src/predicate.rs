@@ -6,6 +6,10 @@ use lean_core::DateTime;
 pub struct Predicate {
     pub start_time: Option<DateTime>,
     pub end_time: Option<DateTime>,
+    pub start_bar_time: Option<DateTime>,
+    pub end_bar_time: Option<DateTime>,
+    pub start_day: Option<DateTime>,
+    pub end_day: Option<DateTime>,
     pub symbol_sids: Option<Vec<u64>>,
     pub min_close: Option<i64>, // scaled price (×1e8)
     pub max_close: Option<i64>,
@@ -17,6 +21,10 @@ impl Predicate {
         Predicate {
             start_time: None,
             end_time: None,
+            start_bar_time: None,
+            end_bar_time: None,
+            start_day: None,
+            end_day: None,
             symbol_sids: None,
             min_close: None,
             max_close: None,
@@ -27,6 +35,18 @@ impl Predicate {
     pub fn with_time_range(mut self, start: DateTime, end: DateTime) -> Self {
         self.start_time = Some(start);
         self.end_time = Some(end);
+        self
+    }
+
+    pub fn with_bar_range(mut self, start: DateTime, end: DateTime) -> Self {
+        self.start_bar_time = Some(start);
+        self.end_bar_time = Some(end);
+        self
+    }
+
+    pub fn with_day_range(mut self, start: DateTime, end: DateTime) -> Self {
+        self.start_day = Some(start);
+        self.end_day = Some(end);
         self
     }
 
@@ -63,11 +83,17 @@ impl Predicate {
         if let Some(end) = self.end_time {
             exprs.push(col("time_ns").lt(lit(end.0)));
         }
+        if let Some(start) = self.start_bar_time {
+            exprs.push(col("end_time_ns").gt_eq(lit(start.0)));
+        }
+        if let Some(end) = self.end_bar_time {
+            exprs.push(col("end_time_ns").lt_eq(lit(end.0)));
+        }
         if let Some(ref sids) = self.symbol_sids {
             if sids.len() == 1 {
-                exprs.push(col("symbol_sid").eq(lit(sids[0])));
+                exprs.push(col("symbol_sid").eq(lit(sids[0] as i64)));
             } else if !sids.is_empty() {
-                let sid_exprs: Vec<Expr> = sids.iter().map(|&s| lit(s)).collect();
+                let sid_exprs: Vec<Expr> = sids.iter().map(|&s| lit(s as i64)).collect();
                 exprs.push(col("symbol_sid").in_list(sid_exprs, false));
             }
         }
@@ -88,6 +114,57 @@ impl Predicate {
 impl Default for Predicate {
     fn default() -> Self {
         Predicate::new()
+    }
+}
+
+/// Parameters for an Iceberg-backed data query.
+#[derive(Debug, Clone)]
+pub struct QueryParams {
+    pub predicate: Predicate,
+    /// Maximum rows to return. None = unlimited.
+    pub limit: Option<usize>,
+    /// Market-data scans normalize output order by time regardless of this value.
+    pub order_by_time: bool,
+}
+
+impl QueryParams {
+    pub fn new() -> Self {
+        QueryParams {
+            predicate: Predicate::new(),
+            limit: None,
+            order_by_time: true,
+        }
+    }
+
+    pub fn with_time_range(mut self, start: DateTime, end: DateTime) -> Self {
+        self.predicate = self.predicate.with_time_range(start, end);
+        self
+    }
+
+    pub fn with_bar_range(mut self, start: DateTime, end: DateTime) -> Self {
+        self.predicate = self.predicate.with_bar_range(start, end);
+        self
+    }
+
+    pub fn with_day_range(mut self, start: DateTime, end: DateTime) -> Self {
+        self.predicate = self.predicate.with_day_range(start, end);
+        self
+    }
+
+    pub fn with_symbols(mut self, sids: Vec<u64>) -> Self {
+        self.predicate = self.predicate.with_symbols(sids);
+        self
+    }
+
+    pub fn with_limit(mut self, n: usize) -> Self {
+        self.limit = Some(n);
+        self
+    }
+}
+
+impl Default for QueryParams {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

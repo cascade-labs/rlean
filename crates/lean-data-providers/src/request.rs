@@ -9,12 +9,12 @@ pub enum DataType {
     MarginInterestRate,
     PerpetualContext,
     OpenInterest,
-    /// Request a provider to generate/cache a factor file for the symbol.
-    /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
+    /// Request factor-file rows for the symbol. The framework persists any
+    /// returned rows; providers do not write the store as a side effect.
     /// Providers that do not support corporate actions return `NotImplemented:`.
     FactorFile,
-    /// Request a provider to generate/cache a map file for the symbol.
-    /// Returns `Ok(vec![])` on success (the file is written as a side-effect).
+    /// Request map-file rows for the symbol. The framework persists any
+    /// returned rows; providers do not write the store as a side effect.
     /// Providers that do not support ticker details return `NotImplemented:`.
     MapFile,
 }

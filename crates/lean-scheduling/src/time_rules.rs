@@ -34,6 +34,10 @@ impl TimeRules {
     }
 
     pub fn every(minutes: i64) -> TimeRule {
+        assert!(
+            minutes > 0,
+            "TimeRules::every(): interval can not be zero or less"
+        );
         TimeRule::Every(TimeSpan::from_mins(minutes))
     }
 }

@@ -7,14 +7,16 @@ use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{Market, Resolution, Symbol, SymbolProperties};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::sync::Arc;
 
-fn aapl_security() -> Security {
+fn aapl_security(holdings: lean_algorithm::portfolio::SharedHoldings) -> Security {
     let symbol = Symbol::create_equity("AAPL", &Market::usa());
     Security::new(
         symbol,
         Resolution::Daily,
         SymbolProperties::default(),
-        ExchangeHours::us_equity(),
+        Arc::new(ExchangeHours::us_equity()),
+        holdings,
     )
 }
 
@@ -25,7 +27,7 @@ fn setup_leveraged_portfolio(
     leverage: f64,
 ) -> QcAlgorithm {
     let mut algorithm = QcAlgorithm::new("margin-call-test", cash);
-    let security = aapl_security();
+    let security = aapl_security(algorithm.portfolio.holdings_store());
     security.set_leverage(leverage);
     security.set_price(price);
     algorithm.securities.add(security);

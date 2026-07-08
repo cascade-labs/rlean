@@ -1,46 +1,52 @@
-use lean_core::Symbol;
+use lean_core::{DateTime, Symbol};
+use lean_indicators::{Indicator, Sma};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{IPortfolioConstructionModel, InsightForPcm};
 use crate::portfolio_target::PortfolioTarget;
 
-/// Per-symbol rolling price window used to compute the moving-average reversion level.
-struct SymbolWindow {
-    prices: VecDeque<f64>,
-    window_size: usize,
+/// Per-symbol price state used to compute the moving-average reversion level.
+///
+/// Mirrors C# `MeanReversionPortfolioConstructionModel.SymbolData`, which pairs an
+/// `Identity` indicator (current price) with a `SimpleMovingAverage`. Here the
+/// current price is tracked directly and the SMA reuses `lean_indicators::Sma`.
+struct SymbolData {
+    sma: Sma,
+    last_price: f64,
+    has_price: bool,
 }
 
-impl SymbolWindow {
+impl SymbolData {
     fn new(window_size: usize) -> Self {
         Self {
-            prices: VecDeque::with_capacity(window_size + 1),
-            window_size,
+            sma: Sma::new(window_size.max(1)),
+            last_price: 0.0,
+            has_price: false,
         }
     }
 
     fn push(&mut self, price: f64) {
-        self.prices.push_back(price);
-        if self.prices.len() > self.window_size {
-            self.prices.pop_front();
+        self.last_price = price;
+        self.has_price = true;
+        if let Ok(value) = Decimal::try_from(price) {
+            self.sma.update_price(DateTime::now(), value);
         }
     }
 
     fn is_ready(&self) -> bool {
-        self.prices.len() >= self.window_size
+        self.has_price && self.sma.is_ready()
     }
 
     /// Current price (last pushed value, analogous to C# Identity indicator).
     fn current(&self) -> f64 {
-        *self.prices.back().unwrap_or(&0.0)
+        self.last_price
     }
 
-    /// Simple moving average of all prices in the window.
+    /// Simple moving average over the window, or 0.0 if not yet ready.
     fn sma(&self) -> f64 {
-        if self.prices.is_empty() {
-            return 0.0;
-        }
-        self.prices.iter().copied().sum::<f64>() / self.prices.len() as f64
+        self.sma.current().value.to_f64().unwrap_or(0.0)
     }
 }
 
@@ -71,7 +77,7 @@ pub struct MeanReversionPortfolioConstructionModel {
     /// Number of assets last seen — used to detect universe changes.
     num_of_assets: usize,
     /// Per-symbol price windows.
-    symbol_data: HashMap<String, SymbolWindow>,
+    symbol_data: HashMap<u64, SymbolData>,
 }
 
 impl MeanReversionPortfolioConstructionModel {
@@ -91,12 +97,12 @@ impl MeanReversionPortfolioConstructionModel {
         }
     }
 
-    /// Feed a price observation for a symbol.  Call this before `create_targets` to
+    /// Feed a price observation for a symbol. Call this before `create_targets` to
     /// warm up the SMA indicators.
-    pub fn update_price(&mut self, ticker: &str, price: f64) {
+    pub fn update_price(&mut self, symbol: &Symbol, price: f64) {
         self.symbol_data
-            .entry(ticker.to_string())
-            .or_insert_with(|| SymbolWindow::new(self.window_size))
+            .entry(symbol.id.sid)
+            .or_insert_with(|| SymbolData::new(self.window_size))
             .push(price);
     }
 
@@ -113,7 +119,7 @@ impl MeanReversionPortfolioConstructionModel {
                     let dir_sign = insight.direction.as_i32() as f64;
                     1.0 + mag_f * dir_sign
                 } else {
-                    let sd = self.symbol_data.get(&insight.symbol.value);
+                    let sd = self.symbol_data.get(&insight.symbol.id.sid);
                     match sd {
                         Some(sd) if sd.sma() != 0.0 => sd.current() / sd.sma(),
                         _ => 1.0, // fallback: no reversion signal
@@ -180,16 +186,16 @@ impl IPortfolioConstructionModel for MeanReversionPortfolioConstructionModel {
         &mut self,
         insights: &[InsightForPcm],
         portfolio_value: Decimal,
-        prices: &HashMap<String, Decimal>,
+        prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
         // Update price windows from the current prices map.
         for insight in insights {
-            if let Some(&price) = prices.get(&insight.symbol.value) {
+            if let Some(&price) = prices.get(&insight.symbol.id.sid) {
                 let price_f: f64 = price.try_into().unwrap_or(0.0);
                 if price_f > 0.0 {
                     self.symbol_data
-                        .entry(insight.symbol.value.clone())
-                        .or_insert_with(|| SymbolWindow::new(self.window_size))
+                        .entry(insight.symbol.id.sid)
+                        .or_insert_with(|| SymbolData::new(self.window_size))
                         .push(price_f);
                 }
             }
@@ -202,7 +208,7 @@ impl IPortfolioConstructionModel for MeanReversionPortfolioConstructionModel {
         // Check that all symbol windows are ready.
         let all_ready = insights.iter().all(|i| {
             self.symbol_data
-                .get(&i.symbol.value)
+                .get(&i.symbol.id.sid)
                 .map(|sd| sd.is_ready())
                 .unwrap_or(false)
         });
@@ -262,7 +268,7 @@ impl IPortfolioConstructionModel for MeanReversionPortfolioConstructionModel {
             .map(|(insight, &w)| {
                 let pct = Decimal::try_from(w).unwrap_or(Decimal::ZERO);
                 let price = prices
-                    .get(&insight.symbol.value)
+                    .get(&insight.symbol.id.sid)
                     .copied()
                     .unwrap_or(Decimal::ZERO);
                 PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
@@ -276,7 +282,7 @@ impl IPortfolioConstructionModel for MeanReversionPortfolioConstructionModel {
 
     fn on_securities_changed(&mut self, _added: &[Symbol], removed: &[Symbol]) {
         for sym in removed {
-            self.symbol_data.remove(&sym.value);
+            self.symbol_data.remove(&sym.id.sid);
         }
         // If universe changed, weight vector will be reset on the next create_targets call.
     }
@@ -293,8 +299,11 @@ mod tests {
         Symbol::create_equity(ticker, &Market::usa())
     }
 
-    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<String, Decimal> {
-        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn make_prices(pairs: &[(&str, Decimal)]) -> HashMap<u64, Decimal> {
+        pairs
+            .iter()
+            .map(|(ticker, value)| (make_symbol(ticker).id.sid, *value))
+            .collect()
     }
 
     #[test]
@@ -355,8 +364,8 @@ mod tests {
         let prices = make_prices(&[("AAPL", dec!(10)), ("SPY", dec!(10))]);
 
         // Warm up windows (window_size=1 → ready after 1 price).
-        pcm.update_price("AAPL", 10.0);
-        pcm.update_price("SPY", 10.0);
+        pcm.update_price(&make_symbol("AAPL"), 10.0);
+        pcm.update_price(&make_symbol("SPY"), 10.0);
 
         let insights = vec![
             InsightForPcm {
@@ -389,8 +398,8 @@ mod tests {
         // With magnitude=-0.5, direction=Up → x̃ = 1 + (-0.5)*1 = 0.5
         // Mirrors C# test "GetPriceRelativesWithInsightMagnitude" → expected = {2, 0.5}
         let mut pcm = MeanReversionPortfolioConstructionModel::with_params(1.0, 1);
-        pcm.update_price("AAPL", 10.0);
-        pcm.update_price("SPY", 10.0);
+        pcm.update_price(&make_symbol("AAPL"), 10.0);
+        pcm.update_price(&make_symbol("SPY"), 10.0);
 
         let insights = vec![
             InsightForPcm {
@@ -426,8 +435,8 @@ mod tests {
         let portfolio_value = dec!(950);
         let prices = make_prices(&[("AAPL", dec!(10)), ("SPY", dec!(10))]);
 
-        pcm.update_price("AAPL", 10.0);
-        pcm.update_price("SPY", 10.0);
+        pcm.update_price(&make_symbol("AAPL"), 10.0);
+        pcm.update_price(&make_symbol("SPY"), 10.0);
 
         let insights = vec![
             InsightForPcm {
@@ -449,12 +458,12 @@ mod tests {
         let targets = pcm.create_targets(&insights, portfolio_value, &prices);
         let aapl_qty = targets
             .iter()
-            .find(|t| t.symbol.value == "AAPL")
+            .find(|t| t.symbol.value.as_ref() == "AAPL")
             .unwrap()
             .quantity;
         let spy_qty = targets
             .iter()
-            .find(|t| t.symbol.value == "SPY")
+            .find(|t| t.symbol.value.as_ref() == "SPY")
             .unwrap()
             .quantity;
 

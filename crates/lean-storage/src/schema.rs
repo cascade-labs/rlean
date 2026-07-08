@@ -9,7 +9,7 @@ pub fn trade_bar_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
         Field::new("end_time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         // Prices stored as i64, scaled by PRICE_SCALE (1e8) to preserve 8 decimal places
         Field::new("open", DataType::Int64, false),
@@ -26,7 +26,7 @@ pub fn quote_bar_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
         Field::new("end_time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         Field::new("bid_open", DataType::Int64, true),
         Field::new("bid_high", DataType::Int64, true),
@@ -46,7 +46,7 @@ pub fn quote_bar_schema() -> Arc<Schema> {
 pub fn tick_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         Field::new("tick_type", DataType::UInt8, false),
         Field::new("value", DataType::Int64, false),
@@ -65,7 +65,7 @@ pub fn tick_schema() -> Arc<Schema> {
 pub fn open_interest_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         Field::new("value", DataType::Int64, false),
     ]))
@@ -75,7 +75,7 @@ pub fn open_interest_schema() -> Arc<Schema> {
 pub fn margin_interest_rate_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         Field::new("interest_rate", DataType::Int64, false),
     ]))
@@ -86,7 +86,7 @@ pub fn perpetual_context_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("time_ns", DataType::Int64, false),
         Field::new("end_time_ns", DataType::Int64, false),
-        Field::new("symbol_sid", DataType::UInt64, false),
+        Field::new("symbol_sid", DataType::Int64, false),
         Field::new("symbol_value", DataType::Utf8, false),
         Field::new("funding", DataType::Int64, false),
         Field::new("open_interest", DataType::Int64, false),
@@ -247,11 +247,13 @@ pub struct OptionUniverseRow {
 /// - `date_ns`    — nanoseconds since Unix epoch (midnight UTC) for the data point date
 /// - `value`      — primary scalar value (Float64)
 /// - `fields_json`— JSON-encoded extra fields map (Utf8)
+/// - `symbol`     — canonical UPPERCASE underlying ticker (Utf8, nullable)
 pub fn custom_data_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("date_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("fields_json", DataType::Utf8, false),
+        Field::new("symbol", DataType::Utf8, true),
     ]))
 }
 
