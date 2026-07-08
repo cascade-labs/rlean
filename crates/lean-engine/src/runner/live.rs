@@ -681,6 +681,13 @@ async fn run_live_custom_poller(
     let Some(custom) = config.custom.clone() else {
         return;
     };
+    // Match the historical reader: filter live points by the merged query so the
+    // engine-side `CustomDataQuery::symbols` (and string/numeric) filters apply
+    // identically live and in backtests. Providers populate `point.symbol`
+    // directly on the live path (the engine copies `symbol_column` on the
+    // parquet history path); a point that never got a symbol is dropped when a
+    // symbol filter is active, mirroring backtest behavior.
+    let query = custom.config.query.merge(&custom.dynamic_query);
     let mut seen = HashSet::new();
     while !stop.load(Ordering::Relaxed) {
         let utc_now = lean_core::DateTime::now();
@@ -699,6 +706,9 @@ async fn run_live_custom_poller(
                 points.len()
             );
             for point in points {
+                if !query.matches_point(&point) {
+                    continue;
+                }
                 let key = custom_point_key(&point);
                 if !seen.insert(key) {
                     continue;

@@ -18,6 +18,6 @@ logs/
 # Claude memory files — may contain secrets
 .claude/projects/
 
-# Cursor local state (debug logs, IDE settings) — keep committed skills tracked
-.cursor/*
-!.cursor/skills/
+# Cursor local state
+.cursor/
+.vscode/

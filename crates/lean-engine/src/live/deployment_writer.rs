@@ -103,6 +103,14 @@ impl LiveDeploymentWriter {
         let holdings = portfolio
             .all_holdings()
             .into_iter()
+            // Custom-data (Base) subscriptions are not positions. They should
+            // never have been inserted into the holdings map, but filter any
+            // non-invested Base entry here as defense-in-depth so snapshots from
+            // older state files never surface a custom feed as a holding.
+            .filter(|holding| {
+                holding.symbol.security_type() != lean_core::SecurityType::Base
+                    || holding.is_invested()
+            })
             .map(|holding| {
                 serde_json::json!({
                     "symbol": holding.symbol.value,

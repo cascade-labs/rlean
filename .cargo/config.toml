@@ -2,7 +2,6 @@
 # Allow pyo3 to build against Python 3.14 using the stable ABI forward compatibility.
 # Python 3.14 is newer than pyo3's explicitly tested range but is ABI-compatible.
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
-PYO3_PYTHON = "/opt/homebrew/opt/python@3.14/bin/python3.14"
 
 [net]
 # Required for SSH-key auth when resolving git deps from private cascade-labs repos.

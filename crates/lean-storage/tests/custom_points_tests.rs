@@ -86,3 +86,85 @@ async fn custom_query_symbols_filter_matches_point_symbol() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].symbol.as_deref(), Some("MSFT"));
 }
+
+fn snapshot_row(date: NaiveDate, symbol: &str) -> CustomDataPoint {
+    // EOD snapshot shape: no provider row id, every ticker's row shares the
+    // same 16:00 stamp — only the symbol distinguishes rows.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "usymbol".to_string(),
+        serde_json::Value::String(symbol.to_string()),
+    );
+    CustomDataPoint::new(date, Some(end_time(date)), Decimal::from(1), fields)
+        .with_symbol(Some(symbol.to_string()))
+}
+
+#[tokio::test]
+async fn same_timestamp_idless_rows_keep_all_symbols_and_stay_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
+
+    let rows: Vec<CustomDataPoint> = ["AAPL", "MSFT", "OMI", "SPY"]
+        .iter()
+        .map(|s| snapshot_row(day, s))
+        .collect();
+
+    store
+        .append_custom_points("tradealert", "snapshot", &rows)
+        .await
+        .unwrap();
+    let scanned = store
+        .scan_custom_points_range("tradealert", "snapshot", day, day)
+        .await
+        .unwrap();
+    // Every ticker's row survives the append despite identical timestamps.
+    assert_eq!(scanned.len(), 4);
+
+    // Re-appending the same day is idempotent (cross-append dedupe).
+    store
+        .append_custom_points("tradealert", "snapshot", &rows)
+        .await
+        .unwrap();
+    let rescanned = store
+        .scan_custom_points_range("tradealert", "snapshot", day, day)
+        .await
+        .unwrap();
+    assert_eq!(rescanned.len(), 4);
+}
+
+#[tokio::test]
+async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
+    // EOD snapshot shape: every ticker's row shares one 16:00 stamp and has no
+    // provider id — only the canonical symbol distinguishes rows. A time-only
+    // dedupe key collapses ~3,900 rows/day to one.
+    let tmp = TempDir::new().unwrap();
+    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let date = NaiveDate::from_ymd_opt(2021, 6, 1).unwrap();
+    let points: Vec<CustomDataPoint> = ["OMI", "GDDY", "ASR"]
+        .iter()
+        .map(|sym| {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "usymbol".to_string(),
+                serde_json::Value::String(sym.to_string()),
+            );
+            CustomDataPoint::new(date, Some(end_time(date)), Decimal::from(1), fields)
+                .with_symbol(Some(sym.to_string()))
+        })
+        .collect();
+    store
+        .append_custom_points("tradealert", "snapshot", &points)
+        .await
+        .unwrap();
+    let rows = store
+        .scan_custom_points_range("tradealert", "snapshot", date, date)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "same-timestamp no-id points must not collapse: got {:?}",
+        rows.iter().map(|p| p.symbol.clone()).collect::<Vec<_>>()
+    );
+}

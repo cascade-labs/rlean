@@ -1425,7 +1425,18 @@ impl IcebergStore {
         }
         Ok(points
             .iter()
-            .filter(|point| existing.insert(custom_point_key(point)))
+            .filter(|point| {
+                let key = custom_point_key(point);
+                if key.1.is_empty() {
+                    // Without a provider row id the key cannot distinguish
+                    // same-timestamp same-symbol rows, so only dedupe against
+                    // already-persisted rows; dropping within-batch "twins"
+                    // here would silently discard real data.
+                    !existing.contains(&key)
+                } else {
+                    existing.insert(key)
+                }
+            })
             .cloned()
             .collect())
     }
@@ -2673,20 +2684,23 @@ fn custom_points_to_record_batch(
     )?)
 }
 
-fn custom_point_key(point: &CustomDataPoint) -> (i64, String) {
+fn custom_point_key(point: &CustomDataPoint) -> (i64, String, String) {
     let time = point
         .end_time
         .map(|time| time.0)
         .unwrap_or_else(|| schema::date_to_ns(point.time));
-    // Distinct events can share a millisecond timestamp (e.g. two Unusual
-    // Whales alerts emitted in the same batch), so the timestamp alone
-    // over-dedupes; the provider row id disambiguates when present.
+    // Distinct events can share a timestamp: two Unusual Whales alerts in the
+    // same millisecond, or an EOD snapshot where every ticker's row carries
+    // the same 16:00 stamp. The provider row id disambiguates events when
+    // present; the canonical symbol separates per-ticker rows (without it, a
+    // ~3,900-ticker snapshot day would dedupe down to a single row).
     let id = point
         .fields
         .get("id")
         .map(|value| value.to_string())
         .unwrap_or_default();
-    (time, id)
+    let symbol = point.symbol.clone().unwrap_or_default();
+    (time, id, symbol)
 }
 
 /// Maximum tolerated distance between a cached row's `date_ns` (which drives

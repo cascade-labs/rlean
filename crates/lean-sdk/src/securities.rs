@@ -593,6 +593,14 @@ pub fn set_algorithm_security_price(
 ) -> bool {
     let alg = algorithm.lock().unwrap();
     alg.securities.update_price(symbol, price);
+    // Seed the portfolio holding's last_price too, so a security seeded from
+    // history (FuncSecuritySeeder / get_last_known_prices) reports a non-zero
+    // market price in snapshots before the live feed delivers its first bar.
+    // Skip Base (custom-data) symbols: they are not positions and must not be
+    // materialized into the holdings map.
+    if symbol.security_type() != lean_core::SecurityType::Base {
+        alg.portfolio.update_prices(symbol, price);
+    }
     true
 }
 

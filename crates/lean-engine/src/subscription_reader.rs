@@ -2486,70 +2486,7 @@ fn custom_point_in_session_window(point: &CustomDataPoint, start: DateTime, end:
 }
 
 fn custom_point_matches_query(point: &CustomDataPoint, query: &CustomDataQuery) -> bool {
-    if let Some(symbols) = &query.symbols {
-        let Some(point_symbol) = point.symbol.as_deref() else {
-            return false;
-        };
-        if !symbols
-            .iter()
-            .any(|symbol| symbol.eq_ignore_ascii_case(point_symbol))
-        {
-            return false;
-        }
-    }
-
-    for (field, expected) in &query.string_equals {
-        if point
-            .fields
-            .get(field)
-            .and_then(|value| value.as_str())
-            .map(|actual| actual == expected)
-            != Some(true)
-        {
-            return false;
-        }
-    }
-
-    for (field, expected_values) in &query.string_in {
-        let Some(actual) = point.fields.get(field).and_then(|value| value.as_str()) else {
-            return false;
-        };
-        if !expected_values.iter().any(|expected| expected == actual) {
-            return false;
-        }
-    }
-
-    for (field, min_value) in &query.numeric_min {
-        if point
-            .fields
-            .get(field)
-            .and_then(json_number)
-            .map(|actual| actual >= *min_value)
-            != Some(true)
-        {
-            return false;
-        }
-    }
-
-    for (field, max_value) in &query.numeric_max {
-        if point
-            .fields
-            .get(field)
-            .and_then(json_number)
-            .map(|actual| actual <= *max_value)
-            != Some(true)
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn json_number(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+    query.matches_point(point)
 }
 
 fn partition_day_start(date: chrono::NaiveDate) -> DateTime {

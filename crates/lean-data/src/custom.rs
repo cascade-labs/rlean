@@ -84,6 +84,80 @@ impl CustomDataQuery {
         );
         merged
     }
+
+    /// Whether a decoded point satisfies this query's symbol, string, and numeric
+    /// filters. Both the historical (Iceberg/parquet) reader and the live poller
+    /// use this so live custom data is filtered identically to backtests.
+    ///
+    /// Symbol matching is case-insensitive against [`CustomDataPoint::symbol`],
+    /// which providers populate directly (live) or the engine copies from the
+    /// declared `symbol_column` (historical parquet).
+    pub fn matches_point(&self, point: &CustomDataPoint) -> bool {
+        if let Some(symbols) = &self.symbols {
+            let Some(point_symbol) = point.symbol.as_deref() else {
+                return false;
+            };
+            if !symbols
+                .iter()
+                .any(|symbol| symbol.eq_ignore_ascii_case(point_symbol))
+            {
+                return false;
+            }
+        }
+
+        for (field, expected) in &self.string_equals {
+            if point
+                .fields
+                .get(field)
+                .and_then(|value| value.as_str())
+                .map(|actual| actual == expected)
+                != Some(true)
+            {
+                return false;
+            }
+        }
+
+        for (field, expected_values) in &self.string_in {
+            let Some(actual) = point.fields.get(field).and_then(|value| value.as_str()) else {
+                return false;
+            };
+            if !expected_values.iter().any(|expected| expected == actual) {
+                return false;
+            }
+        }
+
+        for (field, min_value) in &self.numeric_min {
+            if point
+                .fields
+                .get(field)
+                .and_then(json_number)
+                .map(|actual| actual >= *min_value)
+                != Some(true)
+            {
+                return false;
+            }
+        }
+
+        for (field, max_value) in &self.numeric_max {
+            if point
+                .fields
+                .get(field)
+                .and_then(json_number)
+                .map(|actual| actual <= *max_value)
+                != Some(true)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
 }
 
 /// Configuration for a custom data subscription.
@@ -200,5 +274,47 @@ impl CustomDataPoint {
 
     pub fn empty(time: NaiveDate, end_time: Option<DateTime>, value: Decimal) -> Self {
         Self::new(time, end_time, value, HashMap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use rust_decimal_macros::dec;
+
+    fn point_with_symbol(symbol: Option<&str>) -> CustomDataPoint {
+        CustomDataPoint::empty(
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            None,
+            dec!(1),
+        )
+        .with_symbol(symbol.map(str::to_string))
+    }
+
+    #[test]
+    fn matches_point_filters_on_symbol_case_insensitively() {
+        let mut query = CustomDataQuery::default();
+        query.symbols = Some(vec!["nvda".to_string(), "META".to_string()]);
+
+        assert!(query.matches_point(&point_with_symbol(Some("NVDA"))));
+        assert!(query.matches_point(&point_with_symbol(Some("meta"))));
+        assert!(!query.matches_point(&point_with_symbol(Some("SPY"))));
+    }
+
+    #[test]
+    fn matches_point_drops_symbol_less_point_when_filter_active() {
+        let mut query = CustomDataQuery::default();
+        query.symbols = Some(vec!["NVDA".to_string()]);
+        // Live providers must populate point.symbol; an unset symbol is dropped
+        // when a symbol filter is active (mirrors the historical parquet path).
+        assert!(!query.matches_point(&point_with_symbol(None)));
+    }
+
+    #[test]
+    fn matches_point_accepts_any_symbol_without_filter() {
+        let query = CustomDataQuery::default();
+        assert!(query.matches_point(&point_with_symbol(Some("ANYTHING"))));
+        assert!(query.matches_point(&point_with_symbol(None)));
     }
 }

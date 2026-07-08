@@ -1,8 +1,11 @@
 use lean_algorithm::portfolio::{SecurityHolding, SecurityPortfolioManager};
-use lean_core::{Market, NanosecondTimestamp, Symbol};
+use lean_algorithm::securities::Security;
+use lean_core::exchange_hours::ExchangeHours;
+use lean_core::{Market, NanosecondTimestamp, Resolution, Symbol, SymbolProperties};
 use lean_data::MarginInterestRate;
 use lean_orders::{Order, OrderStatus};
 use rust_decimal_macros::dec;
+use std::sync::Arc;
 
 // ─── Option exercise/assignment equity accounting ────────────────────────────
 //
@@ -40,6 +43,44 @@ fn new_holding_is_flat() {
     assert!(!h.is_short());
     assert_eq!(h.quantity, dec!(0));
     assert_eq!(h.market_value(), dec!(0));
+}
+
+/// A Base (custom-data) subscription must NOT seed a portfolio holding.
+/// Regression: a custom-data feed (e.g. "FLOW_ALERTS") surfaced as a zero-
+/// quantity holding in live portfolio snapshots because `Security::new`
+/// eagerly inserted a SecurityHolding for every added security.
+#[test]
+fn base_security_does_not_create_holding() {
+    let portfolio = SecurityPortfolioManager::new(dec!(100000));
+    let base = Symbol::create_base("UNUSUAL_WHALES", "FLOW_ALERTS", &Market::usa());
+    let _sec = Security::new(
+        base.clone(),
+        Resolution::Minute,
+        SymbolProperties::default(),
+        Arc::new(ExchangeHours::us_equity()),
+        portfolio.holdings_store(),
+    );
+    assert!(
+        portfolio.all_holdings().is_empty(),
+        "custom-data Base subscription must not appear in holdings"
+    );
+    assert!(!portfolio.is_invested(&base));
+}
+
+/// A tradable (Equity) subscription still seeds a flat holding as before.
+#[test]
+fn equity_security_seeds_flat_holding() {
+    let portfolio = SecurityPortfolioManager::new(dec!(100000));
+    let _sec = Security::new(
+        spy(),
+        Resolution::Minute,
+        SymbolProperties::default(),
+        Arc::new(ExchangeHours::us_equity()),
+        portfolio.holdings_store(),
+    );
+    let holdings = portfolio.all_holdings();
+    assert_eq!(holdings.len(), 1);
+    assert!(!holdings[0].is_invested());
 }
 
 /// Opening a new long position sets average price to fill price
