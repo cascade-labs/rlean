@@ -1,23 +1,29 @@
-/// rlean — unified Lean-Rust execution CLI
-///
-/// Usage:
-///   rlean init                                   # bootstrap workspace
-///   rlean create-project <name>                  # scaffold a new strategy project
-///   rlean backtest <strategy> [OPTIONS]           # run a backtest
-///   rlean live     <strategy> [OPTIONS]           # run live trading
-///   rlean research <project> [OPTIONS]            # launch Jupyter research session
-///
-/// Strategy types (auto-detected by file extension):
-///   .py             Python strategy (AlgorithmImports / QCAlgorithm)
-///   .so / .dylib    Compiled Rust strategy plugin (exports `create_algorithm`)
-///
-/// Examples:
-///   rlean init
-///   rlean create-project my_strategy
-///   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
-///   rlean research my_strategy
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+//! rlean — unified Lean-Rust execution CLI
+//!
+//! Usage:
+//!   rlean init                                   # bootstrap workspace
+//!   rlean create-project <name>                  # scaffold a new strategy project
+//!   rlean backtest <strategy> [OPTIONS]           # run a backtest
+//!   rlean live     <strategy> [OPTIONS]           # run live trading
+//!   rlean research <project> [OPTIONS]            # launch Jupyter research session
+//!
+//! Strategy types (auto-detected by file extension):
+//!   .py             Python strategy (AlgorithmImports / QCAlgorithm)
+//!   .so / .dylib    Compiled Rust strategy plugin (exports `create_algorithm`)
+//!
+//! Examples:
+//!   rlean init
+//!   rlean create-project my_strategy
+//!   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
+//!   rlean research my_strategy
+
+// NOTE: do NOT install a custom #[global_allocator] (e.g. mimalloc) in this
+// binary. Plugins are cdylibs linked against the system allocator, and owned
+// Rust types (Order, CustomDataPoint, ...) move across that boundary by value,
+// so heap data allocated on either side must be freeable by the other. A
+// mismatched allocator aborts with "pointer being freed was not allocated"
+// the first time a plugin drops an engine-allocated value (observed live via
+// Brokerage::place_order_with_brokerage_ids).
 
 use anyhow::Result;
 use clap::Parser;

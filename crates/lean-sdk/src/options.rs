@@ -254,6 +254,158 @@ impl OptionContractView {
     fn py_symbol(&self) -> crate::securities::SymbolHandle {
         crate::securities::SymbolHandle::new(self.symbol())
     }
+
+    #[getter(right)]
+    fn py_right(&self) -> crate::types::OptionRight {
+        self.right.into()
+    }
+
+    #[getter(style)]
+    fn py_style(&self) -> crate::types::OptionStyle {
+        match self.style {
+            OptionStyleView::American => crate::types::OptionStyle::American,
+            OptionStyleView::European => crate::types::OptionStyle::European,
+        }
+    }
+
+    #[getter(strike)]
+    fn py_strike(&self) -> f64 {
+        self.strike
+    }
+
+    #[getter(expiry)]
+    fn py_expiry(&self) -> NaiveDateTime {
+        self.expiry
+    }
+
+    #[getter(underlying_price)]
+    fn py_underlying_price(&self) -> f64 {
+        self.underlying_price
+    }
+
+    #[getter(theoretical_price)]
+    fn py_theoretical_price(&self) -> f64 {
+        self.theoretical_price
+    }
+
+    #[getter(implied_volatility)]
+    fn py_implied_volatility(&self) -> f64 {
+        self.implied_volatility
+    }
+
+    #[getter(open_interest)]
+    fn py_open_interest(&self) -> f64 {
+        self.open_interest
+    }
+
+    #[getter(greeks)]
+    fn py_greeks(&self) -> GreeksView {
+        self.greeks
+    }
+
+    #[getter(last_price)]
+    fn py_last_price(&self) -> f64 {
+        self.last_price
+    }
+
+    #[getter(bid_price)]
+    fn py_bid_price(&self) -> f64 {
+        self.bid_price
+    }
+
+    #[getter(ask_price)]
+    fn py_ask_price(&self) -> f64 {
+        self.ask_price
+    }
+
+    #[getter(mid_price)]
+    fn py_mid_price(&self) -> f64 {
+        self.mid_price
+    }
+
+    #[getter(volume)]
+    fn py_volume(&self) -> i64 {
+        self.volume
+    }
+
+    #[getter(ticker)]
+    fn py_ticker(&self) -> String {
+        self.ticker.clone()
+    }
+
+    #[getter(intrinsic_value)]
+    fn py_intrinsic_value(&self) -> f64 {
+        self.intrinsic_value
+    }
+
+    #[getter(time_value)]
+    fn py_time_value(&self) -> f64 {
+        self.time_value
+    }
+
+    #[pyo3(name = "is_call")]
+    fn py_is_call(&self) -> bool {
+        self.is_call()
+    }
+
+    #[pyo3(name = "is_put")]
+    fn py_is_put(&self) -> bool {
+        self.is_put()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl GreeksView {
+    #[getter(delta)]
+    fn py_delta(&self) -> f64 {
+        self.delta
+    }
+
+    #[getter(gamma)]
+    fn py_gamma(&self) -> f64 {
+        self.gamma
+    }
+
+    #[getter(vega)]
+    fn py_vega(&self) -> f64 {
+        self.vega
+    }
+
+    #[getter(theta)]
+    fn py_theta(&self) -> f64 {
+        self.theta
+    }
+
+    #[getter(rho)]
+    fn py_rho(&self) -> f64 {
+        self.rho
+    }
+
+    // `lambda` is a Python keyword; LEAN exposes the underscore alias.
+    #[getter(lambda_)]
+    fn py_lambda(&self) -> f64 {
+        self.lambda
+    }
+
+    #[getter(theta_per_day)]
+    fn py_theta_per_day(&self) -> f64 {
+        self.theta / 365.0
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl UnderlyingView {
+    #[getter(price)]
+    fn py_price(&self) -> f64 {
+        self.price
+    }
+
+    #[getter(close)]
+    fn py_close(&self) -> f64 {
+        self.close
+    }
 }
 
 pub fn chain_underlying(chain: &OptionChain) -> UnderlyingView {

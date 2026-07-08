@@ -127,23 +127,6 @@ fn best_bid(bar: &TradeBar, qb: Option<&QuoteBar>) -> Price {
         .unwrap_or(bar.close)
 }
 
-/// Mid-point of bid/ask, falling back to close.
-fn mid_price(bar: &TradeBar, qb: Option<&QuoteBar>) -> Price {
-    match qb {
-        Some(q) => {
-            let ask = q.ask.as_ref().map(|a| a.close);
-            let bid = q.bid.as_ref().map(|b| b.close);
-            match (bid, ask) {
-                (Some(b), Some(a)) => (b + a) / dec!(2),
-                (Some(b), None) => b,
-                (None, Some(a)) => a,
-                _ => bar.close,
-            }
-        }
-        None => bar.close,
-    }
-}
-
 fn directional_quote_trade_bar(
     order: &Order,
     fallback: &TradeBar,
@@ -513,13 +496,15 @@ impl FillModel for EquityFillModel {
 
 /// Fill model for futures contracts.
 ///
-/// Mirrors LEAN's `FutureFillModel`:
-/// - Uses the current price (close) rather than bid/ask, since futures trade on
-///   an exchange with a single consolidated tape.
+/// Mirrors LEAN's base `FillModel.GetPrices`:
+/// - **Market (buy)**: fills at ask price (+ slippage) when quote data is
+///   available; falls back to the trade-bar close otherwise.
+/// - **Market (sell)**: fills at bid price (- slippage) when quote data is
+///   available; falls back to the trade-bar close otherwise.
 /// - Requires the exchange to be open (including extended hours for overnight
 ///   sessions) before filling.
-/// - Stop fills behave identically to EquityFillModel but use the last price
-///   rather than quote data.
+/// - Stop and MOO/MOC use the order-direction quote side via the trait-level
+///   quote-aware paths (`*_with_quotes`), falling back to trade-bar prices.
 pub struct FuturesFillModel {
     pub slippage: Box<dyn SlippageModel>,
     /// Whether the model should allow fills during extended market hours.
@@ -544,13 +529,36 @@ impl FuturesFillModel {
 }
 
 impl FillModel for FuturesFillModel {
-    /// Market fill at current (close) price ± slippage.
+    /// Market fill using close as best-effort (no quote bar here); use the
+    /// extended `market_fill_with_quotes` for real bid/ask.
     fn market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
         let fill_price = if order.quantity > dec!(0) {
             bar.close + slip
         } else {
             bar.close - slip
+        };
+        make_filled(order, time, fill_price, slip)
+    }
+
+    fn market_fill_with_quotes(
+        &self,
+        order: &Order,
+        bar: &TradeBar,
+        quote_bar: Option<&QuoteBar>,
+        time: DateTime,
+    ) -> Fill {
+        let slip = self.slippage.get_slippage_amount(order, bar);
+        // Buy at ask, sell at bid; fall back to close when no quote data.
+        let base_price = if order.quantity > dec!(0) {
+            best_ask(bar, quote_bar)
+        } else {
+            best_bid(bar, quote_bar)
+        };
+        let fill_price = if order.quantity > dec!(0) {
+            base_price + slip
+        } else {
+            base_price - slip
         };
         make_filled(order, time, fill_price, slip)
     }
@@ -652,12 +660,14 @@ impl FillModel for FuturesFillModel {
 /// Fill model for equity/index options.
 ///
 /// Options are quoted with explicit bid/ask spreads.  This model mirrors LEAN's
-/// option fill behaviour:
-/// - **Market**: fills at mid-price `(bid + ask) / 2`; falls back to close.
+/// base `FillModel.GetPrices`, which fills at the order-direction quote side
+/// whenever quote data is subscribed:
+/// - **Market (buy)**: fills at ask price (+ slippage); falls back to close.
+/// - **Market (sell)**: fills at bid price (- slippage); falls back to close.
 /// - **Limit (buy)**: fills when ask ≤ limit price, at min(ask, limit).
 /// - **Limit (sell)**: fills when bid ≥ limit price, at max(bid, limit).
-/// - Stop and MOO/MOC delegate to trade-bar prices as options rarely have these
-///   order types in practice; they are included for completeness.
+/// - Stop and MOO/MOC use the order-direction quote side via the trait-level
+///   quote-aware paths (`*_with_quotes`), falling back to trade-bar prices.
 pub struct OptionFillModel {
     pub slippage: Box<dyn SlippageModel>,
 }
@@ -669,10 +679,10 @@ impl OptionFillModel {
 }
 
 impl FillModel for OptionFillModel {
-    /// Market fill at mid-price. Override via `market_fill_with_quotes` for real bid/ask.
+    /// Market fill using close as best-effort (no quote bar here); use the
+    /// extended `market_fill_with_quotes` for real bid/ask.
     fn market_fill(&self, order: &Order, bar: &TradeBar, time: DateTime) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        // Without quote data, use close as mid-price proxy.
         let fill_price = if order.quantity > dec!(0) {
             bar.close + slip
         } else {
@@ -689,8 +699,12 @@ impl FillModel for OptionFillModel {
         time: DateTime,
     ) -> Fill {
         let slip = self.slippage.get_slippage_amount(order, bar);
-        // Options fill at mid of bid/ask
-        let base_price = mid_price(bar, quote_bar);
+        // Buy at ask, sell at bid; fall back to close when no quote data.
+        let base_price = if order.quantity > dec!(0) {
+            best_ask(bar, quote_bar)
+        } else {
+            best_bid(bar, quote_bar)
+        };
         let fill_price = if order.quantity > dec!(0) {
             base_price + slip
         } else {
@@ -818,9 +832,9 @@ impl OptionFillModel {
 ///
 /// Forex markets trade around the clock (Sunday open – Friday close) with
 /// explicit bid/ask spreads provided by dealers.  This model mirrors LEAN's
-/// forex fill behaviour:
-/// - **Market buy**: fills at ask price (+ slippage).
-/// - **Market sell**: fills at bid price (- slippage).
+/// base `FillModel.GetPrices` (quote-side fills):
+/// - **Market buy**: fills at ask price (+ slippage); falls back to close.
+/// - **Market sell**: fills at bid price (- slippage); falls back to close.
 /// - **Limit**: fills when ask/bid crosses the limit.
 /// - No market-hours restriction — 24/5 trading assumed.
 pub struct ForexFillModel {
@@ -1127,5 +1141,178 @@ impl LatencyFillModel {
         if let Some(fill) = self.inner.stop_limit_fill(order, bar, time) {
             self.enqueue(current_bar, fill);
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slippage::NullSlippageModel;
+    use lean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
+    use lean_data::Bar;
+
+    fn ts(i: i64) -> DateTime {
+        NanosecondTimestamp::from_secs(i * 86400)
+    }
+
+    fn sym() -> Symbol {
+        Symbol::create_equity("SPY", &Market::usa())
+    }
+
+    fn trade_bar(close: f64) -> TradeBar {
+        TradeBar::new(
+            sym(),
+            ts(0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(
+                Price::try_from(close).unwrap(),
+                Price::try_from(close).unwrap(),
+                Price::try_from(close).unwrap(),
+                Price::try_from(close).unwrap(),
+                dec!(100000),
+            ),
+        )
+    }
+
+    /// Quote bar with a `bid` close and an `ask` close (both flat OHLC).
+    fn quote_bar(bid: f64, ask: f64) -> QuoteBar {
+        let b = Price::try_from(bid).unwrap();
+        let a = Price::try_from(ask).unwrap();
+        QuoteBar::new(
+            sym(),
+            ts(0),
+            TimeSpan::ONE_DAY,
+            Some(Bar::new(b, b, b, b)),
+            Some(Bar::new(a, a, a, a)),
+            dec!(10),
+            dec!(10),
+        )
+    }
+
+    fn buy() -> Order {
+        Order::market(1, sym(), dec!(10), ts(0), "")
+    }
+
+    fn sell() -> Order {
+        Order::market(1, sym(), dec!(-10), ts(0), "")
+    }
+
+    // Each closure builds a fresh model with no slippage so fills equal the
+    // raw quote side.  We test the trait entry point `market_fill_with_quotes`
+    // that the order processor actually calls.
+    macro_rules! quote_side_suite {
+        ($name:ident, $model:expr) => {
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn buy_fills_at_ask() {
+                    let model = $model;
+                    let bar = trade_bar(100.0);
+                    let qb = quote_bar(99.0, 101.0);
+                    let fill = model.market_fill_with_quotes(&buy(), &bar, Some(&qb), ts(0));
+                    assert_eq!(
+                        fill.order_event.fill_price,
+                        dec!(101),
+                        "market buy must fill at ask, not mid/last"
+                    );
+                }
+
+                #[test]
+                fn sell_fills_at_bid() {
+                    let model = $model;
+                    let bar = trade_bar(100.0);
+                    let qb = quote_bar(99.0, 101.0);
+                    let fill = model.market_fill_with_quotes(&sell(), &bar, Some(&qb), ts(0));
+                    assert_eq!(
+                        fill.order_event.fill_price,
+                        dec!(99),
+                        "market sell must fill at bid, not mid/last"
+                    );
+                }
+
+                #[test]
+                fn buy_never_fills_at_mid() {
+                    let model = $model;
+                    let bar = trade_bar(100.0);
+                    let qb = quote_bar(99.0, 101.0);
+                    let fill = model.market_fill_with_quotes(&buy(), &bar, Some(&qb), ts(0));
+                    // mid = 100; ensure we are NOT filling there.
+                    assert_ne!(fill.order_event.fill_price, dec!(100));
+                }
+
+                #[test]
+                fn falls_back_to_close_without_quotes() {
+                    let model = $model;
+                    let bar = trade_bar(100.0);
+                    let buy_fill = model.market_fill_with_quotes(&buy(), &bar, None, ts(0));
+                    let sell_fill = model.market_fill_with_quotes(&sell(), &bar, None, ts(0));
+                    assert_eq!(buy_fill.order_event.fill_price, dec!(100));
+                    assert_eq!(sell_fill.order_event.fill_price, dec!(100));
+                }
+            }
+        };
+    }
+
+    quote_side_suite!(
+        immediate,
+        ImmediateFillModel::new(Box::new(NullSlippageModel))
+    );
+    quote_side_suite!(equity, EquityFillModel::new(Box::new(NullSlippageModel)));
+    quote_side_suite!(option, OptionFillModel::new(Box::new(NullSlippageModel)));
+    quote_side_suite!(futures, FuturesFillModel::new(Box::new(NullSlippageModel)));
+    quote_side_suite!(forex, ForexFillModel::new(Box::new(NullSlippageModel)));
+
+    // Regression: options previously filled at mid (bid+ask)/2. Guard against
+    // reintroducing that bug with an asymmetric spread.
+    #[test]
+    fn option_market_does_not_fill_at_mid_regression() {
+        let model = OptionFillModel::new(Box::new(NullSlippageModel));
+        let bar = trade_bar(5.0);
+        // bid=1, ask=3 → mid=2. Buy must be 3, sell must be 1.
+        let qb = quote_bar(1.0, 3.0);
+        let buy_fill = model.market_fill_with_quotes(&buy(), &bar, Some(&qb), ts(0));
+        let sell_fill = model.market_fill_with_quotes(&sell(), &bar, Some(&qb), ts(0));
+        assert_eq!(buy_fill.order_event.fill_price, dec!(3));
+        assert_eq!(sell_fill.order_event.fill_price, dec!(1));
+        assert_ne!(buy_fill.order_event.fill_price, dec!(2));
+        assert_ne!(sell_fill.order_event.fill_price, dec!(2));
+    }
+
+    // The order processor triggers stop orders through the `*_with_quotes`
+    // trait paths, which build a directional trade bar from the quote side.
+    // Verify a triggered buy stop respects the ask side.
+    #[test]
+    fn stop_market_buy_uses_ask_side_when_quotes_present() {
+        let model = EquityFillModel::new(Box::new(NullSlippageModel));
+        // Trade bar high 110 triggers a buy stop @105.
+        let bar = TradeBar::new(
+            sym(),
+            ts(0),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(100), dec!(110), dec!(90), dec!(105), dec!(1000)),
+        );
+        // Ask bar: high 112 (triggers), open 106.
+        let ask = Bar::new(dec!(106), dec!(112), dec!(104), dec!(108));
+        let bid = Bar::new(dec!(105), dec!(111), dec!(103), dec!(107));
+        let qb = QuoteBar::new(
+            sym(),
+            ts(0),
+            TimeSpan::ONE_DAY,
+            Some(bid),
+            Some(ask),
+            dec!(10),
+            dec!(10),
+        );
+        let order = Order::stop_market(1, sym(), dec!(10), dec!(105), ts(0), "");
+        let fill = model
+            .stop_market_fill_with_quotes(&order, &bar, Some(&qb), ts(0))
+            .expect("buy stop should trigger");
+        // Fill uses the ask bar: max(stop=105, ask.open=106) = 106.
+        assert_eq!(fill.order_event.fill_price, dec!(106));
     }
 }

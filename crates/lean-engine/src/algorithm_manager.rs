@@ -5,7 +5,7 @@ use lean_algorithm::charting::ChartCollection;
 use lean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubscription};
 use lean_alpha::AlphaAnalytics;
 use lean_core::{DateTime, MarketHoursDatabase, Resolution, TimeSpan};
-use lean_data::{Slice, SubscriptionDataConfig, TradeBar, TradeBarData};
+use lean_data::{Bar, QuoteBar, Slice, SubscriptionDataConfig, TradeBar, TradeBarData};
 use lean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
 use lean_orders::{order_processor::OrderProcessor, OrderEvent};
 use lean_statistics::{Trade, TradeBuilder};
@@ -264,8 +264,13 @@ where
             .map(|(sid, bar)| (*sid, bar.clone()))
             .collect();
         extend_bars_with_option_contracts(&mut bars, slice, option_chains);
+        // Option contracts live in chains, not slice.quote_bars; synthesize
+        // per-contract quote bars so market fills pay the spread (buy at ask,
+        // sell at bid) instead of falling back to the synthesized trade bar.
+        let mut quote_bars = slice.quote_bars.clone();
+        extend_quote_bars_with_option_contracts(&mut quote_bars, slice, option_chains);
         let mut events =
-            processor.generate_order_events_with_quotes(&bars, &slice.quote_bars, slice.time);
+            processor.generate_order_events_with_quotes(&bars, &quote_bars, slice.time);
         for event in events.iter_mut() {
             let fee = settle_fill_event_bridge(&self.algorithm, portfolio, processor, event);
             processor
@@ -489,6 +494,39 @@ where
             self.trading_days
         );
         self.algorithm.on_end_of_algorithm(services);
+    }
+}
+
+/// Synthesize quote bars for option contracts from their chain bid/ask so the
+/// fill model prices market orders at the quote side. Contracts without any
+/// positive quote are skipped and fall back to the synthesized trade bar.
+fn extend_quote_bars_with_option_contracts(
+    quote_bars: &mut std::collections::HashMap<u64, QuoteBar>,
+    slice: &Slice,
+    option_chains: &[(&str, &lean_options::OptionChain)],
+) {
+    for (_, chain) in option_chains {
+        for contract in chain.contracts.values() {
+            let bid = contract.data.bid_price;
+            let ask = contract.data.ask_price;
+            if bid <= dec!(0) && ask <= dec!(0) {
+                continue;
+            }
+            let side =
+                |price: rust_decimal::Decimal| (price > dec!(0)).then(|| Bar::from_price(price));
+            quote_bars.insert(
+                contract.symbol.id.sid,
+                QuoteBar::new(
+                    contract.symbol.clone(),
+                    slice.time,
+                    TimeSpan::from_days(1),
+                    side(bid),
+                    side(ask),
+                    contract.data.bid_size.into(),
+                    contract.data.ask_size.into(),
+                ),
+            );
+        }
     }
 }
 

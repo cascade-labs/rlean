@@ -706,10 +706,16 @@ impl IcebergStore {
             .partition_spec(spec.into_unbound())
             .location(location)
             .build();
-        self.catalog
-            .create_table(&self.namespace, creation)
-            .await
-            .with_context(|| format!("failed to create Iceberg table {NAMESPACE}.{name}"))?;
+        if let Err(error) = self.catalog.create_table(&self.namespace, creation).await {
+            // Concurrent connects race between the existence check and the
+            // create (the catalog enforces uniqueness); losing that race is
+            // success as long as the table now exists.
+            if self.catalog.table_exists(&ident).await.unwrap_or(false) {
+                return Ok(());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to create Iceberg table {NAMESPACE}.{name}"));
+        }
         Ok(())
     }
 

@@ -112,7 +112,6 @@ iceberg = "0.9.1"
 iceberg-catalog-sql = "0.9.1"
 iceberg-datafusion = "0.9.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
-mimalloc = "0.1"
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
 lean-core           = { path = "crates/lean-core" }

@@ -1180,6 +1180,16 @@ impl InsightProjection {
     fn py_is_final_score(&self) -> bool {
         self.is_final_score
     }
+
+    #[getter(generated_time_utc)]
+    fn py_generated_time_utc(&self) -> chrono::NaiveDateTime {
+        self.generated_time_utc.to_utc().naive_utc()
+    }
+
+    #[getter(close_time_utc)]
+    fn py_close_time_utc(&self) -> chrono::NaiveDateTime {
+        self.close_time_utc.to_utc().naive_utc()
+    }
 }
 
 pub fn project_alpha_insight(insight: &Insight) -> InsightProjection {
