@@ -1,7 +1,6 @@
 use crate::data_feed::DataFeedContext;
 use crate::normalization::{
-    ensure_corporate_actions_cached, normalize_quote_bar, normalize_trade_bar, read_factor_rows,
-    read_map_first_date,
+    ensure_corporate_actions_cached, normalize_quote_bar, normalize_trade_bar,
 };
 use crate::options_service::{
     build_daily_eod_chain, option_underlying_ticker, underlying_price_from_bars,
@@ -347,16 +346,42 @@ impl SubscriptionProducerState {
         start: DateTime,
         end: DateTime,
     ) -> Self {
-        // Populate the Iceberg factor/map tables from the history provider if
-        // they're empty for this symbol. Providers supply the rows; the
-        // framework owns persistence. This must run before we read factor rows
-        // or the map-file inception date below.
-        ensure_corporate_actions_cached(&context, &config.symbol);
+        // Resolve the factor/map files for this symbol, fetching + persisting them
+        // from the history provider when the Iceberg tables are empty. This runs
+        // at subscription creation independent of bar data — a ticker whose bars
+        // are already cached still resolves its corporate actions here (issue
+        // #30), mirroring LEAN's SubscriptionDataReader.Initialize. The returned
+        // resolution carries the resolved factor rows and map inception date, so
+        // there is no read-after-write re-scan of the freshly-persisted rows.
+        let resolution = ensure_corporate_actions_cached(&context, &config.symbol);
         let factor_rows = if config.normalization_mode != lean_core::DataNormalizationMode::Raw {
-            read_factor_rows(&context.store, &config.symbol)
+            resolution.factor_rows.clone()
         } else {
             Vec::new()
         };
+        // Loud, per-symbol warning: an equity subscribed under an adjusting
+        // normalization mode whose factor file could not be resolved trades on RAW
+        // prices, so any split/dividend during the run produces phantom P&L (issue
+        // #27). The warn fires only when resolution actually failed
+        // (`!factors_available`) — not merely because a re-scan came back empty
+        // before the fetch landed. Record it for the end-of-run summary too.
+        if config.normalization_mode != lean_core::DataNormalizationMode::Raw
+            && matches!(
+                config.symbol.security_type(),
+                lean_core::SecurityType::Equity
+            )
+            && !resolution.factors_available
+        {
+            let ticker = config.symbol.value.to_string();
+            tracing::warn!(
+                "No factor file for {} under {:?} normalization: split/dividend \
+                 adjustment is DISABLED for this symbol — prices are raw and any \
+                 corporate action will produce phantom P&L (issue #27)",
+                ticker,
+                config.normalization_mode,
+            );
+            context.record_unadjusted_equity(&ticker);
+        }
         let partition_date = start.date_utc();
         let end_partition_date = end.date_utc();
         // The earliest date any provider can supply, combined with the symbol's
@@ -367,7 +392,7 @@ impl SubscriptionProducerState {
                 .history_provider
                 .as_ref()
                 .and_then(|provider| provider.earliest_date());
-            let symbol_inception = read_map_first_date(&context.store, &config.symbol);
+            let symbol_inception = resolution.map_first_date;
             match (provider_floor, symbol_inception) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
@@ -3042,6 +3067,78 @@ mod tests {
         }
     }
 
+    /// Returns an empty factor file (the default trait behavior) and counts
+    /// calls, so tests can prove the fetch is retried each run rather than being
+    /// permanently poisoned by a durable empty marker.
+    struct EmptyFactorProvider {
+        factor_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for EmptyFactorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+            self.factor_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Always errors on the factor-file fetch (e.g. rate-limit exhaustion).
+    struct FactorErrorProvider;
+
+    #[async_trait]
+    impl IHistoryProvider for FactorErrorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+            anyhow::bail!("rate limit exhausted")
+        }
+    }
+
+    /// Returns an empty map file (the default trait behavior) and counts calls,
+    /// so tests can prove the map fetch is retried each run rather than being
+    /// poisoned by a durable empty marker. Mirrors `EmptyFactorProvider`.
+    struct EmptyMapProvider {
+        map_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for EmptyMapProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Always errors on the map-file fetch (e.g. a failed ticker-events call).
+    /// This is the issue #29 failure mode from the engine's side: the provider
+    /// returns `Err` rather than a synthesized default map. Mirrors
+    /// `FactorErrorProvider`.
+    struct MapErrorProvider {
+        map_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for MapErrorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("ticker events fetch failed")
+        }
+    }
+
     struct SlowConcurrentHistoryProvider {
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -4098,6 +4195,204 @@ mod tests {
             2,
             "generic retry should recover without a process-global attempt cache"
         );
+    }
+
+    #[tokio::test]
+    async fn resolution_persists_factor_rows_eagerly_without_end_of_run_flush() {
+        // Issue #30: a ticker whose bars are already cached still resolves its
+        // corporate actions at subscription time, and the fetched rows must land
+        // in Iceberg *eagerly* — not only at an end-of-run flush that a killed
+        // long run never reaches. Prove the rows are queryable straight after
+        // resolution, with no explicit flush call.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        // A provider whose *second* call returns rows (first errors), matching the
+        // generic retry path; the point is that resolution persists eagerly.
+        let provider = Arc::new(FlakyCorporateActionProvider {
+            factor_calls: AtomicUsize::new(0),
+            map_calls: AtomicUsize::new(0),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider));
+
+        let resolution = context.resolve_corporate_actions(&symbol).await;
+        assert!(resolution.factors_available);
+        assert_eq!(resolution.factor_rows.len(), 1);
+
+        // No flush_corporate_action_cache_writes() call here on purpose: eager
+        // persistence must have already committed the rows.
+        let factors = store.scan_factor_file("usa", "SPY").await.unwrap();
+        let maps = store.scan_map_file("usa", "SPY").await.unwrap();
+        assert_eq!(factors.len(), 1, "factor rows must be persisted eagerly");
+        assert_eq!(maps.len(), 1, "map rows must be persisted eagerly");
+    }
+
+    #[tokio::test]
+    async fn empty_factor_file_returns_unavailable_and_is_not_cached() {
+        // An empty provider result must NOT be persisted as a durable "0 rows"
+        // marker (issue #27): nothing is written and the next run retries. The
+        // per-run resolution cache means the retry happens on the *next run*
+        // (a fresh context), not on a repeat resolution within the same run.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("DPST", &Market::usa());
+        let factor_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(EmptyFactorProvider {
+            factor_calls: factor_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider.clone()));
+
+        let resolution = ensure_corporate_actions_cached(&context, &symbol);
+        assert!(
+            !resolution.factors_available,
+            "empty factor file must report unavailable"
+        );
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store
+                .scan_factor_file("usa", "DPST")
+                .await
+                .unwrap()
+                .is_empty(),
+            "empty result must not be persisted as a durable empty marker"
+        );
+
+        // Second run (fresh context = fresh per-run cache): because nothing
+        // durable was written, the fetch is retried.
+        let context2 = self::context(store.clone()).with_history_provider(Some(provider));
+        let resolution_again = ensure_corporate_actions_cached(&context2, &symbol);
+        assert!(!resolution_again.factors_available);
+        assert_eq!(
+            factor_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the fetch rather than trust a poisoned empty cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_run_cache_prevents_repeat_fetch_within_a_run() {
+        // Within a single run, a ticker resolved once — including resolved as
+        // absent — must not re-hit the provider on repeat subscriptions
+        // (universe churn / re-adds), mirroring LEAN's per-process factor-file
+        // cache. This is what bounds the fetch load and dedups the WARN.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("DPST", &Market::usa());
+        let factor_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(EmptyFactorProvider {
+            factor_calls: factor_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider));
+
+        for _ in 0..5 {
+            let resolution = ensure_corporate_actions_cached(&context, &symbol);
+            assert!(!resolution.factors_available);
+        }
+        assert_eq!(
+            factor_calls.load(Ordering::SeqCst),
+            1,
+            "repeat resolutions in one run must reuse the cached outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn factor_fetch_error_reports_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("WAL", &Market::usa());
+        let context =
+            context(store.clone()).with_history_provider(Some(Arc::new(FactorErrorProvider)));
+
+        let resolution = ensure_corporate_actions_cached(&context, &symbol);
+        assert!(
+            !resolution.factors_available,
+            "a fetch error must report the factor file unavailable"
+        );
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(store
+            .scan_factor_file("usa", "WAL")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_fetch_error_persists_nothing_and_retries_next_run() {
+        // Issue #29: a failed map fetch (e.g. the ticker-events call errored)
+        // must persist nothing, so the next run retries instead of durably
+        // caching a wrong/default map. Same rule the factor path follows.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        // FB is the canonical rename case (FB -> META): a poisoned default map
+        // would erase that rename history forever.
+        let symbol = Symbol::create_equity("FB", &Market::usa());
+        let map_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MapErrorProvider {
+            map_calls: map_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider.clone()));
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store.scan_map_file("usa", "FB").await.unwrap().is_empty(),
+            "a map fetch error must not persist any map rows"
+        );
+
+        // Second run (fresh context): nothing durable was written, so retried.
+        let context2 = self::context(store.clone()).with_history_provider(Some(provider));
+        ensure_corporate_actions_cached(&context2, &symbol);
+        assert_eq!(
+            map_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the map fetch rather than trust a poisoned cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_map_file_is_not_cached_and_retries_next_run() {
+        // An empty map result (default trait behavior for providers with no
+        // ticker-detail source) must not be persisted as a durable empty
+        // marker: nothing is written and the next run retries.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let map_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(EmptyMapProvider {
+            map_calls: map_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider.clone()));
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store.scan_map_file("usa", "SPY").await.unwrap().is_empty(),
+            "an empty map result must not be persisted as a durable empty marker"
+        );
+
+        // Second run (fresh context): retried because nothing durable was written.
+        let context2 = self::context(store.clone()).with_history_provider(Some(provider));
+        ensure_corporate_actions_cached(&context2, &symbol);
+        assert_eq!(
+            map_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the map fetch rather than trust a poisoned empty cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn unadjusted_equity_collector_records_and_drains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let context = context(store);
+        context.record_unadjusted_equity("DPST");
+        context.record_unadjusted_equity("SMCI");
+        context.record_unadjusted_equity("DPST"); // dedup
+
+        let drained = context.take_unadjusted_equities();
+        assert_eq!(drained, vec!["DPST".to_string(), "SMCI".to_string()]);
+        // Draining empties the collector.
+        assert!(context.take_unadjusted_equities().is_empty());
     }
 
     #[tokio::test]

@@ -1,10 +1,9 @@
-use crate::data_feed::DataFeedContext;
+use crate::data_feed::{CorporateActionResolution, DataFeedContext};
 use lean_core::{DataNormalizationMode, DateTime, SecurityType, Symbol};
 use lean_data::{QuoteBar, TradeBar};
 use lean_storage::{FactorFileEntry, IcebergStore};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
-use std::sync::Arc;
 
 /// LEAN-style price scale frontier: use `EndTime` when a bar crosses calendar days.
 pub fn price_scale_frontier(time: DateTime, end_time: DateTime) -> chrono::NaiveDate {
@@ -30,115 +29,73 @@ pub fn read_factor_rows(store: &IcebergStore, symbol: &Symbol) -> Vec<FactorFile
         .unwrap_or_default()
 }
 
-/// Ensure the symbol's corporate-action files (factor + map) are present in the
-/// Iceberg store, fetching them from the history provider and persisting them
-/// here if the tables are empty for this symbol.
+/// Resolve the symbol's corporate-action files (factor + map) for this run,
+/// fetching them from the history provider and persisting them into Iceberg if
+/// the tables are empty for this symbol.
 ///
 /// This is the framework side of the provider/framework split: providers are
 /// pure data sources (`get_factor_file`/`get_map_file` return rows), and the
 /// framework owns *all* persistence — writing the rows into Iceberg exactly as
 /// it does trade/quote bars. Providers must never write files themselves.
 ///
-/// Cache-first and idempotent: if the tables already have rows for the symbol,
-/// no provider call is made. Only equities carry corporate actions.
-pub fn ensure_corporate_actions_cached(context: &DataFeedContext, symbol: &Symbol) {
+/// Resolution is decoupled from bar fetching, mirroring C# LEAN where
+/// `SubscriptionDataReader.Initialize` resolves the factor/map file through
+/// `IFactorFileProvider.Get` / `IMapFileProvider.ResolveMapFile` at subscription
+/// creation regardless of whether the symbol's bars are already on disk
+/// (Engine/DataFeeds/SubscriptionDataReader.cs:203-249). A ticker whose bars are
+/// already cached in Iceberg still gets its factor/map files fetched here — that
+/// is exactly issue #30.
+///
+/// Cache-first and idempotent, and additionally guarded by a per-run resolution
+/// cache (LEAN's per-process `_seededMarket`/`_factorFiles`): repeat
+/// subscriptions of a ticker in one run resolve once, never re-hitting the store
+/// or provider. Only equities carry corporate actions.
+///
+/// Returns `true` if the symbol has factor rows available (already cached or
+/// freshly fetched), `false` if the factor file is still absent afterwards —
+/// including on a fetch error or an empty provider result. A `false` for an
+/// Adjusted-mode equity means its prices will flow through unadjusted, so callers
+/// should warn. Non-equities always return `true` (nothing to adjust). Nothing
+/// durable is written on empty/error, so the fetch is retried on the next run
+/// rather than being permanently poisoned.
+///
+/// This is a synchronous wrapper (the subscription producer builds its state on a
+/// blocking worker); it runs the async resolution on a dedicated current-thread
+/// runtime, mirroring `read_factor_rows`. Returns the full resolution — the
+/// caller uses `factor_rows` for normalization and `map_first_date` for the
+/// provider-earliest bound without re-scanning Iceberg.
+pub fn ensure_corporate_actions_cached(
+    context: &DataFeedContext,
+    symbol: &Symbol,
+) -> CorporateActionResolution {
     if !matches!(symbol.security_type(), SecurityType::Equity) {
-        return;
+        return CorporateActionResolution {
+            factors_available: true,
+            factor_rows: Vec::new(),
+            map_first_date: None,
+        };
     }
-    let Some(provider) = context.history_provider.as_ref() else {
-        return;
-    };
-
-    let market = symbol.market().as_str().to_string();
-    let ticker = symbol.permtick.to_string();
     let symbol_value = symbol.value.to_string();
-    let provider = Arc::clone(provider);
     let context_for_task = context.clone();
     let symbol = symbol.clone();
-
-    // Run the fetch+persist on a dedicated current-thread runtime so it works
-    // regardless of the caller's async context, mirroring `read_factor_rows`.
-    let outcome = block_on_background(async move {
-        // Factor file: fetch + persist only when absent for this symbol.
-        let have_factors = context_for_task
-            .store
-            .scan_factor_file(&market, &ticker)
-            .await
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
-        if !have_factors {
-            match context_for_task
-                .fetch_factor_file(provider.as_ref(), &symbol)
-                .await
-            {
-                Ok(rows) if !rows.is_empty() => {
-                    let rows_len = rows.len();
-                    if let Err(err) = context_for_task
-                        .buffer_factor_file_cache_write(market.clone(), ticker.clone(), rows)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to persist factor file for {}: {}",
-                            symbol.value,
-                            err
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Buffered {} factor rows for {} into Iceberg",
-                            rows_len,
-                            symbol.value
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::debug!("No factor file available for {}: {}", symbol.value, err);
-                }
+    match block_on_background(async move {
+        Ok::<CorporateActionResolution, anyhow::Error>(
+            context_for_task.resolve_corporate_actions(&symbol).await,
+        )
+    }) {
+        Ok(resolution) => resolution,
+        Err(err) => {
+            tracing::warn!(
+                "Corporate-action resolution worker failed for {}: {}",
+                symbol_value,
+                err
+            );
+            CorporateActionResolution {
+                factors_available: false,
+                factor_rows: Vec::new(),
+                map_first_date: None,
             }
         }
-
-        // Map file: fetch + persist only when absent for this symbol.
-        let have_map = context_for_task
-            .store
-            .scan_map_file(&market, &ticker)
-            .await
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
-        if !have_map {
-            match context_for_task
-                .fetch_map_file(provider.as_ref(), &symbol)
-                .await
-            {
-                Ok(rows) if !rows.is_empty() => {
-                    let rows_len = rows.len();
-                    if let Err(err) = context_for_task
-                        .buffer_map_file_cache_write(market.clone(), ticker.clone(), rows)
-                        .await
-                    {
-                        tracing::warn!("Failed to persist map file for {}: {}", symbol.value, err);
-                    } else {
-                        tracing::debug!(
-                            "Buffered {} map rows for {} into Iceberg",
-                            rows_len,
-                            symbol.value
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::debug!("No map file available for {}: {}", symbol.value, err);
-                }
-            }
-        }
-
-        Ok::<(), anyhow::Error>(())
-    });
-    if let Err(err) = outcome {
-        tracing::debug!(
-            "Corporate-action cache worker failed for {}: {}",
-            symbol_value,
-            err
-        );
     }
 }
 
@@ -338,5 +295,99 @@ mod tests {
         ];
         normalize_trade_bar(&mut bar, DataNormalizationMode::Adjusted, &rows);
         assert_eq!(bar.close, dec!(200));
+    }
+
+    /// Issue #27: with the refetched DPST factor file, a pre-split bar must be
+    /// scaled up by the 1:10 reverse-split factor so it lines up with post-split
+    /// prices (no phantom 10x jump). Missing factors would leave it unadjusted.
+    #[test]
+    fn dpst_reverse_split_scales_pre_split_bar() {
+        // Reverse split effective 2023-06-05: split_factor 10 applies to all
+        // dates before it (newest-first factor file, base row far in the past).
+        let split_date = NaiveDate::from_ymd_opt(2023, 6, 5).unwrap();
+        let pre_split = NaiveDate::from_ymd_opt(2023, 5, 30).unwrap();
+        let rows = vec![
+            FactorFileEntry {
+                date: split_date,
+                price_factor: 1.0,
+                split_factor: 1.0,
+                reference_price: 0.0,
+            },
+            FactorFileEntry {
+                date: NaiveDate::from_ymd_opt(1900, 1, 1).unwrap(),
+                price_factor: 1.0,
+                split_factor: 10.0,
+                reference_price: 0.0,
+            },
+        ];
+        // A pre-split raw close of ~$5 must become ~$50 (× 10) after adjustment.
+        let symbol = Symbol::create_equity("DPST", &Market::usa());
+        let mut bar = TradeBar::new(
+            symbol,
+            dt(pre_split, 20),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(5), dec!(5), dec!(5), dec!(5), dec!(1000)),
+        );
+        normalize_trade_bar(&mut bar, DataNormalizationMode::Adjusted, &rows);
+        assert_eq!(
+            bar.close,
+            dec!(50),
+            "pre-split bar must scale up by the 10x reverse split"
+        );
+
+        // Empty factor rows (the bug) leave the price raw — no adjustment.
+        let mut raw_bar = TradeBar::new(
+            Symbol::create_equity("DPST", &Market::usa()),
+            dt(pre_split, 20),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(5), dec!(5), dec!(5), dec!(5), dec!(1000)),
+        );
+        normalize_trade_bar(&mut raw_bar, DataNormalizationMode::Adjusted, &[]);
+        assert_eq!(
+            raw_bar.close,
+            dec!(5),
+            "no factor rows leaves the price unadjusted"
+        );
+    }
+
+    /// Validation for issue #27 against the *backfilled* shared warehouse: read
+    /// DPST's refetched factor rows via the real engine path and confirm a
+    /// pre-2023-06-05 bar is scaled up by the 1:10 reverse split (no phantom
+    /// 10x). Ignored by default (needs the shared warehouse):
+    ///   RLEAN_DATA=/Volumes/data_cache/rlean/iceberg \
+    ///     cargo test -p lean-engine --lib -- --ignored --nocapture \
+    ///     dpst_backfilled_factor_file_adjusts_pre_split_bar
+    #[test]
+    #[ignore]
+    fn dpst_backfilled_factor_file_adjusts_pre_split_bar() {
+        let data_root =
+            std::env::var("RLEAN_DATA").expect("set RLEAN_DATA to the warehouse data root");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = rt
+            .block_on(IcebergStore::connect_local(&data_root))
+            .expect("connect warehouse");
+        let symbol = Symbol::create_equity("DPST", &Market::usa());
+        let rows = read_factor_rows(&store, &symbol);
+        assert!(!rows.is_empty(), "DPST must have backfilled factor rows");
+
+        // A pre-split raw close from spring 2023 (~$5) must adjust upward by the
+        // 10x reverse split; without the backfill it would pass through raw.
+        let pre_split = NaiveDate::from_ymd_opt(2023, 5, 30).unwrap();
+        let mut bar = TradeBar::new(
+            symbol,
+            dt(pre_split, 20),
+            TimeSpan::ONE_DAY,
+            TradeBarData::new(dec!(5), dec!(5), dec!(5), dec!(5), dec!(1000)),
+        );
+        normalize_trade_bar(&mut bar, DataNormalizationMode::Adjusted, &rows);
+        // 10x split factor × dividend price factor (~0.96) => close well above $40.
+        assert!(
+            bar.close > dec!(40),
+            "pre-split DPST bar should be adjusted up by the reverse split, got {}",
+            bar.close
+        );
     }
 }

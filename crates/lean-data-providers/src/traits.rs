@@ -101,6 +101,17 @@ pub trait IHistoryProvider: Send + Sync {
     ///
     /// Returns `Ok(vec![])` (default) when the provider has no corporate-action
     /// source for the symbol; the framework treats that as "nothing to persist".
+    ///
+    /// CONTRACT — partial failure MUST return `Err`. If any upstream call needed
+    /// to build the factor file fails (a splits/dividends fetch errors or rate
+    /// limits), the provider MUST return `Err`, not a synthesized or default
+    /// factor file built from the data it did manage to get. The framework
+    /// persists any non-empty `Ok` result and never refetches once rows exist,
+    /// so returning fabricated rows after an upstream error poisons the cache
+    /// permanently — every later run reads the wrong factors and skips real
+    /// split/dividend adjustment. On `Err` the framework persists nothing and
+    /// retries on the next run. Only synthesize a default/identity file when
+    /// every fetch succeeded and the symbol genuinely has no corporate actions.
     async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
         Ok(vec![])
     }
@@ -111,6 +122,17 @@ pub trait IHistoryProvider: Send + Sync {
     ///
     /// Returns `Ok(vec![])` (default) when the provider has no ticker-detail
     /// source for the symbol.
+    ///
+    /// CONTRACT — partial failure MUST return `Err`. Same rule as
+    /// `get_factor_file`: if any upstream call needed to build the map file
+    /// fails (e.g. the ticker-events fetch errors or rate limits), the provider
+    /// MUST return `Err`, not a default map built from partial data. The
+    /// framework persists any non-empty `Ok` result and never refetches once
+    /// rows exist, so a default map returned after a failed events fetch
+    /// permanently erases a ticker's rename history (e.g. FB -> META) from the
+    /// cache. On `Err` the framework persists nothing and retries next run.
+    /// Only synthesize a default map when every fetch succeeded and the symbol
+    /// genuinely has no rename events.
     async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
         Ok(vec![])
     }

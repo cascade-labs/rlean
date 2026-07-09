@@ -1,5 +1,6 @@
 use crate::{
     algorithm_manager::{AlgorithmManager, OrderEventProcessing},
+    data_feed::DataFeedContext,
     runner::backtest::{
         benchmark_subscription_for_symbol, subscriptions_with_benchmark,
         subscriptions_with_option_chains,
@@ -135,6 +136,17 @@ where
         subscriptions_with_option_chains(subscriptions, &algorithm_manager.option_subscriptions());
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
     algorithm_manager.warmup_finished(&mut services);
+
+    // Resolve factor/map files for the initial live subscriptions the same way
+    // the backtest feed does, independent of any bar data (issue #30). Live price
+    // seeding pulls daily history through the same provider, so a live deployment
+    // must fetch + persist corporate actions for every subscribed equity too — it
+    // does not build subscriptions through DataManager/SubscriptionStream, so the
+    // resolution that path performs would otherwise never run here. The
+    // DataFeedContext holds the per-run resolution cache and persists eagerly.
+    let feed_context = DataFeedContext::new(config.data_store.clone())
+        .with_history_provider(config.history_provider.clone());
+    resolve_live_corporate_actions(&feed_context, &subscriptions).await;
 
     let mut live_subscriptions = LiveSubscriptionSet::subscribe_initial(
         &mut config.live_data_queue,
@@ -329,6 +341,7 @@ where
                 &mut completed_trades,
                 &mut pending_price_restores,
                 &mut insight_retry_budget,
+                &feed_context,
                 &slice,
             )
             .await?;
@@ -376,6 +389,7 @@ where
                     &mut completed_trades,
                     &mut pending_price_restores,
                     &mut insight_retry_budget,
+                    &feed_context,
                     &slice,
                 )
                 .await?;
@@ -387,6 +401,11 @@ where
         router.shutdown();
     }
     algorithm_manager.finish(&mut services);
+    // Flush any corporate-action rows still buffered (eager persistence flushes
+    // as symbols resolve, so this is a final safety net for the tail).
+    if let Err(err) = feed_context.flush_corporate_action_cache_writes().await {
+        tracing::warn!("failed to flush corporate-action cache on live shutdown: {err}");
+    }
     live_subscriptions.unsubscribe_all(&mut config.live_data_queue);
     custom_subscriptions.unsubscribe_all();
     snapshot.slices_processed = algorithm_manager.slices_processed() as usize;
@@ -769,6 +788,7 @@ async fn process_live_slice<B: AlgorithmBridge>(
     completed_trades: &mut Vec<Trade>,
     pending_price_restores: &mut HashMap<u64, lean_core::Symbol>,
     insight_retry_budget: &mut HashMap<u64, u32>,
+    feed_context: &DataFeedContext,
     slice: &lean_data::Slice,
 ) -> Result<()> {
     if !slice.has_data {
@@ -785,7 +805,9 @@ async fn process_live_slice<B: AlgorithmBridge>(
             live_subscriptions,
             custom_subscriptions,
             benchmark_subscription,
-        )?;
+            feed_context,
+        )
+        .await?;
     }
 
     algorithm_manager.advance_frontier(slice, services);
@@ -867,7 +889,9 @@ async fn process_live_slice<B: AlgorithmBridge>(
         live_subscriptions,
         custom_subscriptions,
         benchmark_subscription,
-    )?;
+        feed_context,
+    )
+    .await?;
     algorithm_manager.end_time_step(services);
     let custom_points: usize = slice.custom_data.values().map(Vec::len).sum();
     tracing::debug!(
@@ -896,12 +920,13 @@ async fn process_live_slice<B: AlgorithmBridge>(
     Ok(())
 }
 
-fn sync_live_subscriptions<B: AlgorithmBridge>(
+async fn sync_live_subscriptions<B: AlgorithmBridge>(
     algorithm_manager: &AlgorithmManager<B>,
     config: &mut LiveRunConfig,
     live_subscriptions: &mut LiveSubscriptionSet,
     custom_subscriptions: &mut LiveCustomSubscriptionSet,
     benchmark_subscription: Option<&SubscriptionDataConfig>,
+    feed_context: &DataFeedContext,
 ) -> Result<()> {
     let subscriptions = subscriptions_with_option_chains(
         subscriptions_with_benchmark(
@@ -910,9 +935,31 @@ fn sync_live_subscriptions<B: AlgorithmBridge>(
         ),
         &algorithm_manager.option_subscriptions(),
     );
+    // Resolve factor/map files for any equity added mid-session (e.g. add_equity
+    // from an alpha model). The per-run cache makes this a no-op for symbols
+    // already resolved, so it is cheap to call on every sync.
+    resolve_live_corporate_actions(feed_context, &subscriptions).await;
     live_subscriptions.sync(config, &subscriptions)?;
     custom_subscriptions.sync(&subscriptions, &config.custom_data_sources);
     Ok(())
+}
+
+/// Resolve + persist factor/map files for the given live subscription configs,
+/// mirroring the backtest feed. Bar-independent; the per-run resolution cache in
+/// `DataFeedContext` dedups repeat symbols and eager persistence keeps fetched
+/// rows even if the deployment is later stopped (issue #30). Equity subscriptions
+/// only; non-equities are skipped by `resolve_corporate_actions` itself.
+async fn resolve_live_corporate_actions(
+    feed_context: &DataFeedContext,
+    subscriptions: &[SubscriptionDataConfig],
+) {
+    let mut seen = HashSet::new();
+    for config in subscriptions {
+        if !seen.insert(config.symbol.clone()) {
+            continue;
+        }
+        feed_context.resolve_corporate_actions(&config.symbol).await;
+    }
 }
 
 fn should_stop(
