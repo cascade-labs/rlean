@@ -151,9 +151,29 @@ pub fn ensure_corporate_actions_cached(context: &DataFeedContext, symbol: &Symbo
                         );
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // Provider returned an empty map file. Nothing is persisted,
+                    // so the next run retries. An empty map is far less harmful
+                    // than an empty factor file (the engine falls back to the
+                    // symbol's own ticker), so keep this at debug.
+                    tracing::debug!(
+                        "Map file for {} came back empty; ticker rename history \
+                         will be unavailable this run (will retry next run)",
+                        symbol.value
+                    );
+                }
                 Err(err) => {
-                    tracing::debug!("No map file available for {}: {}", symbol.value, err);
+                    // Mirror the factor-file path: a fetch error is surfaced at
+                    // WARN, not debug. A failed map fetch means any ticker rename
+                    // history (e.g. FB -> META) is missing this run. Nothing is
+                    // persisted, so the fetch retries next run rather than being
+                    // permanently poisoned.
+                    tracing::warn!(
+                        "Failed to fetch map file for {}: {} — ticker rename \
+                         history will be unavailable this run (will retry next run)",
+                        symbol.value,
+                        err
+                    );
                 }
             }
         }

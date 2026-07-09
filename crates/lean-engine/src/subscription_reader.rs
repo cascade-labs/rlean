@@ -3099,6 +3099,45 @@ mod tests {
         }
     }
 
+    /// Returns an empty map file (the default trait behavior) and counts calls,
+    /// so tests can prove the map fetch is retried each run rather than being
+    /// poisoned by a durable empty marker. Mirrors `EmptyFactorProvider`.
+    struct EmptyMapProvider {
+        map_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for EmptyMapProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Always errors on the map-file fetch (e.g. a failed ticker-events call).
+    /// This is the issue #29 failure mode from the engine's side: the provider
+    /// returns `Err` rather than a synthesized default map. Mirrors
+    /// `FactorErrorProvider`.
+    struct MapErrorProvider {
+        map_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for MapErrorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_map_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+            self.map_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("ticker events fetch failed")
+        }
+    }
+
     struct SlowConcurrentHistoryProvider {
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -4211,6 +4250,67 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_fetch_error_persists_nothing_and_retries_next_run() {
+        // Issue #29: a failed map fetch (e.g. the ticker-events call errored)
+        // must persist nothing, so the next run retries instead of durably
+        // caching a wrong/default map. Same rule the factor path follows.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        // FB is the canonical rename case (FB -> META): a poisoned default map
+        // would erase that rename history forever.
+        let symbol = Symbol::create_equity("FB", &Market::usa());
+        let map_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MapErrorProvider {
+            map_calls: map_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider));
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store.scan_map_file("usa", "FB").await.unwrap().is_empty(),
+            "a map fetch error must not persist any map rows"
+        );
+
+        // Second run: nothing durable was written, so the fetch is retried.
+        ensure_corporate_actions_cached(&context, &symbol);
+        assert_eq!(
+            map_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the map fetch rather than trust a poisoned cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_map_file_is_not_cached_and_retries_next_run() {
+        // An empty map result (default trait behavior for providers with no
+        // ticker-detail source) must not be persisted as a durable empty
+        // marker: nothing is written and the next run retries.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let map_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(EmptyMapProvider {
+            map_calls: map_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider));
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store.scan_map_file("usa", "SPY").await.unwrap().is_empty(),
+            "an empty map result must not be persisted as a durable empty marker"
+        );
+
+        ensure_corporate_actions_cached(&context, &symbol);
+        assert_eq!(
+            map_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the map fetch rather than trust a poisoned empty cache"
+        );
     }
 
     #[tokio::test]
