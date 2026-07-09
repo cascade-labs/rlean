@@ -44,8 +44,11 @@ enum BrokerageRequest {
 }
 
 /// A brokerage-originated notification for the live loop to apply.
+///
+/// `pub(crate)` so engine-side tests (e.g. the runner's cross-symbol guard
+/// regression) can construct events and drive `apply_event` directly.
 #[derive(Debug, Clone)]
-enum BrokerageEvent {
+pub(crate) enum BrokerageEvent {
     /// The order was accepted by the brokerage; record its brokerage ids and
     /// transition New -> Submitted.
     Submitted {
@@ -55,9 +58,13 @@ enum BrokerageEvent {
     /// Submission was rejected by the brokerage.
     Invalid { order_id: i64, message: String },
     /// A status/fill update polled from the brokerage. `cumulative_filled` is the
-    /// signed total filled quantity the brokerage reports for the order.
+    /// signed total filled quantity the brokerage reports for the order. `symbol`
+    /// is the symbol the brokerage reports for the polled order; the loop verifies
+    /// it matches the engine order's symbol before applying any effect, so a
+    /// mis-resolved id can never apply a fill across symbols (issue #33).
     Status {
         order_id: i64,
+        symbol: lean_core::Symbol,
         status: OrderStatus,
         fill_price: Price,
         cumulative_filled: Quantity,
@@ -166,7 +173,7 @@ impl LiveBrokerageRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_event<B: AlgorithmBridge>(
+    pub(crate) fn apply_event<B: AlgorithmBridge>(
         &mut self,
         event: BrokerageEvent,
         algorithm_manager: &mut AlgorithmManager<B>,
@@ -226,6 +233,7 @@ impl LiveBrokerageRouter {
             }
             BrokerageEvent::Status {
                 order_id,
+                symbol,
                 status,
                 fill_price,
                 cumulative_filled,
@@ -234,6 +242,24 @@ impl LiveBrokerageRouter {
                 let Some(order) = transactions.get_order(order_id) else {
                     return;
                 };
+                // Defense in depth (issue #33): the brokerage-reported symbol for
+                // this polled order MUST match the engine order the id resolved
+                // to. If a brokerage id ever mis-resolves to the wrong engine
+                // order (id collision, map overwrite, plugin bug), applying the
+                // fill would corrupt a different symbol's holdings. Refuse: log an
+                // ERROR with both symbols/ids and do not apply the event or touch
+                // any tracked state for this pairing. Cross-symbol application is
+                // impossible regardless of id bookkeeping.
+                if symbol != order.symbol {
+                    tracing::error!(
+                        "brokerage order/engine order symbol mismatch; refusing to apply fill: \
+                         engine_order_id={order_id} engine_symbol={} brokerage_symbol={} \
+                         status={status:?} cumulative_filled={cumulative_filled}",
+                        order.symbol.value,
+                        symbol.value,
+                    );
+                    return;
+                }
                 // Ignore stale/no-op transitions: the order already reached this
                 // (or a later) terminal state.
                 if order.status == status && !status.is_fill() {
@@ -474,6 +500,9 @@ fn poll_account_orders(
         let commission = None; // Brokerages that expose per-fill fees can set this later.
         let _ = event_tx.send(BrokerageEvent::Status {
             order_id: engine_order_id,
+            // Thread the brokerage-reported symbol through so the loop can verify
+            // it against the engine order before applying anything (issue #33).
+            symbol: account_order.symbol.clone(),
             status: account_order.status,
             fill_price: account_order.average_fill_price,
             cumulative_filled: account_order.filled_quantity,

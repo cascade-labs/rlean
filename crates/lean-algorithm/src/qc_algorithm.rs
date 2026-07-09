@@ -882,7 +882,12 @@ impl QcAlgorithm {
 
     // ─── Ordering ────────────────────────────────────────────────────────────
 
-    fn next_order_id(&mut self) -> i64 {
+    /// Allocate the next engine order id from the algorithm's single order-id
+    /// authority. Framework/algorithm orders and any engine-initiated orders
+    /// (e.g. startup liquidations) must all draw ids from this one counter so no
+    /// two live orders ever share an id. Public so the live runner can allocate
+    /// liquidation-order ids from the same sequence framework orders use.
+    pub fn next_order_id(&mut self) -> i64 {
         self.order_id_counter += 1;
         self.order_id_counter
     }
