@@ -42,6 +42,21 @@ impl SecurityHandle {
     pub fn symbol(&self) -> SymbolHandle {
         SymbolHandle::new(self.symbol.clone())
     }
+
+    /// Current market price of the security, or `0.0` when the handle is not
+    /// bound to a live algorithm or the security is uninitialized.
+    pub fn price(&self) -> f64 {
+        self.algorithm
+            .as_ref()
+            .and_then(|algorithm| read_algorithm_security_price(algorithm, &self.symbol).ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Exchange-hours projection for the security's market.
+    pub fn exchange(&self) -> SecurityExchangeView {
+        let hours = lean_core::MarketHoursDatabase::global().exchange_hours(&self.symbol);
+        SecurityExchangeView { hours }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -54,16 +69,12 @@ impl SecurityHandle {
 
     #[getter(price)]
     fn py_price(&self) -> f64 {
-        self.algorithm
-            .as_ref()
-            .and_then(|algorithm| read_algorithm_security_price(algorithm, &self.symbol).ok())
-            .unwrap_or(0.0)
+        self.price()
     }
 
     #[getter(exchange)]
     fn py_exchange(&self) -> SecurityExchangeView {
-        let hours = lean_core::MarketHoursDatabase::global().exchange_hours(&self.symbol);
-        SecurityExchangeView { hours }
+        self.exchange()
     }
 }
 
@@ -130,24 +141,20 @@ impl OptionSecurityHandle {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyo3::pyclass(name = "SecurityExchangeHours")]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "SecurityExchangeHours"))]
 #[derive(Clone)]
 pub struct ExchangeHoursHandle {
     hours: std::sync::Arc<lean_core::ExchangeHours>,
 }
 
-#[cfg(feature = "python")]
-#[pyo3::pymethods]
 impl ExchangeHoursHandle {
-    #[pyo3(name = "is_open", signature = (start, end=None, extended=None))]
-    fn py_is_open(
+    /// True when the exchange is open at any point in `[start, end)` (or exactly
+    /// at `start` when `end` is `None`/equal). Mirrors LEAN `is_open`.
+    pub fn is_open(
         &self,
         start: chrono::NaiveDateTime,
         end: Option<chrono::NaiveDateTime>,
-        extended: Option<bool>,
     ) -> bool {
-        let _ = extended.unwrap_or(false);
         match end {
             None => self.hours.is_open_at_local_naive(start),
             Some(end) if start == end => self.hours.is_open_at_local_naive(start),
@@ -169,10 +176,33 @@ impl ExchangeHoursHandle {
 }
 
 #[cfg(feature = "python")]
-#[pyo3::pyclass(name = "SecurityExchange")]
+#[pyo3::pymethods]
+impl ExchangeHoursHandle {
+    #[pyo3(name = "is_open", signature = (start, end=None, extended=None))]
+    fn py_is_open(
+        &self,
+        start: chrono::NaiveDateTime,
+        end: Option<chrono::NaiveDateTime>,
+        extended: Option<bool>,
+    ) -> bool {
+        let _ = extended.unwrap_or(false);
+        self.is_open(start, end)
+    }
+}
+
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "SecurityExchange"))]
 #[derive(Clone)]
 pub struct SecurityExchangeView {
     pub hours: std::sync::Arc<lean_core::ExchangeHours>,
+}
+
+impl SecurityExchangeView {
+    /// Exchange trading hours for this security.
+    pub fn hours(&self) -> ExchangeHoursHandle {
+        ExchangeHoursHandle {
+            hours: self.hours.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -180,9 +210,7 @@ pub struct SecurityExchangeView {
 impl SecurityExchangeView {
     #[getter(hours)]
     fn py_hours(&self) -> ExchangeHoursHandle {
-        ExchangeHoursHandle {
-            hours: self.hours.clone(),
-        }
+        self.hours()
     }
 }
 
@@ -273,6 +301,17 @@ impl SymbolHandle {
     pub fn sid(&self) -> u64 {
         self.inner.id.sid
     }
+
+    /// Underlying symbol for derivative symbols (options), else `None`.
+    /// Mirrors LEAN `Symbol.Underlying`.
+    pub fn underlying(&self) -> Option<SymbolHandle> {
+        self.inner.underlying().cloned().map(SymbolHandle::new)
+    }
+
+    /// Security type of the symbol. Mirrors LEAN `Symbol.SecurityType`.
+    pub fn security_type(&self) -> SecurityType {
+        self.inner.security_type().into()
+    }
 }
 
 #[cfg(feature = "python")]
@@ -327,6 +366,16 @@ impl SymbolHandle {
     #[getter(sid)]
     fn py_sid(&self) -> u64 {
         self.sid()
+    }
+
+    #[getter(underlying)]
+    fn py_underlying(&self) -> Option<SymbolHandle> {
+        self.underlying()
+    }
+
+    #[getter(security_type)]
+    fn py_security_type(&self) -> SecurityType {
+        self.security_type()
     }
 
     fn __str__(&self) -> &str {
@@ -402,6 +451,17 @@ impl SecurityManagerHandle {
     pub fn new(algorithm: Arc<Mutex<QcAlgorithm>>) -> Self {
         Self { algorithm }
     }
+
+    /// Security handle for `symbol`, bound to the live algorithm so price and
+    /// exchange projections resolve against current state.
+    pub fn get(&self, symbol: &Symbol) -> SecurityHandle {
+        SecurityHandle::with_algorithm(symbol.clone(), self.algorithm.clone())
+    }
+
+    /// True when the algorithm's security manager holds `symbol`.
+    pub fn contains_key(&self, symbol: &Symbol) -> bool {
+        self.algorithm.lock().unwrap().securities.contains(symbol)
+    }
 }
 
 #[cfg(feature = "python")]
@@ -409,16 +469,12 @@ impl SecurityManagerHandle {
 impl SecurityManagerHandle {
     #[pyo3(name = "__getitem__")]
     fn py_getitem(&self, symbol: SymbolHandle) -> SecurityHandle {
-        SecurityHandle::with_algorithm(symbol.into_inner(), self.algorithm.clone())
+        self.get(symbol.inner())
     }
 
     #[pyo3(name = "contains_key")]
     fn py_contains_key(&self, symbol: SymbolHandle) -> bool {
-        self.algorithm
-            .lock()
-            .unwrap()
-            .securities
-            .contains(&symbol.into_inner())
+        self.contains_key(symbol.inner())
     }
 }
 
@@ -456,6 +512,16 @@ impl AlgorithmSettingsHandle {
     pub fn from_shared(inner: Arc<Mutex<AlgorithmSettings>>) -> Self {
         Self { inner }
     }
+
+    /// Value stored under `name`, defaulting to integer `0` when unset.
+    pub fn get(&self, name: &str) -> AlgorithmSettingValue {
+        self.inner.lock().unwrap().get(name)
+    }
+
+    /// Store `value` under `name`.
+    pub fn set(&self, name: impl Into<String>, value: AlgorithmSettingValue) {
+        self.inner.lock().unwrap().set(name, value);
+    }
 }
 
 impl Default for AlgorithmSettingsHandle {
@@ -469,14 +535,14 @@ impl Default for AlgorithmSettingsHandle {
 impl AlgorithmSettingsHandle {
     #[pyo3(name = "get")]
     fn py_get(&self, name: String) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-        let value = self.inner.lock().unwrap().get(&name);
+        let value = self.get(&name);
         Python::attach(|py| algorithm_setting_value_to_py(py, value))
     }
 
     #[pyo3(name = "set")]
     fn py_set(&self, name: String, value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<()> {
         let parsed = algorithm_setting_value_from_py(&value)?;
-        self.inner.lock().unwrap().set(name, parsed);
+        self.set(name, parsed);
         Ok(())
     }
 
@@ -484,13 +550,13 @@ impl AlgorithmSettingsHandle {
     // Back them with the generic key/value store so any LEAN setting name reads/writes
     // without a dedicated field per property.
     fn __getattr__(&self, name: String) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-        let value = self.inner.lock().unwrap().get(&name);
+        let value = self.get(&name);
         Python::attach(|py| algorithm_setting_value_to_py(py, value))
     }
 
     fn __setattr__(&self, name: String, value: pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<()> {
         let parsed = algorithm_setting_value_from_py(&value)?;
-        self.inner.lock().unwrap().set(name, parsed);
+        self.set(name, parsed);
         Ok(())
     }
 }

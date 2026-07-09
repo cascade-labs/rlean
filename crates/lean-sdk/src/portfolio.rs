@@ -134,6 +134,11 @@ impl SecurityHoldingView {
         self.total_fees()
     }
 
+    #[getter(total_funding)]
+    fn py_total_funding(&self) -> f64 {
+        self.total_funding()
+    }
+
     #[getter(invested)]
     fn py_invested(&self) -> bool {
         self.invested()
@@ -277,6 +282,31 @@ impl PortfolioView {
     #[getter(total_portfolio_value)]
     fn py_total_portfolio_value(&self) -> f64 {
         self.total_portfolio_value()
+    }
+
+    #[getter(total_holdings_value)]
+    fn py_total_holdings_value(&self) -> f64 {
+        self.total_holdings_value()
+    }
+
+    #[getter(total_unrealized_profit)]
+    fn py_total_unrealized_profit(&self) -> f64 {
+        self.unrealized_pnl()
+    }
+
+    #[getter(total_fees)]
+    fn py_total_fees(&self) -> f64 {
+        self.total_fees()
+    }
+
+    #[getter(total_funding)]
+    fn py_total_funding(&self) -> f64 {
+        self.total_funding()
+    }
+
+    #[getter(invested)]
+    fn py_invested(&self) -> bool {
+        self.invested()
     }
 
     #[getter(hold_stock)]

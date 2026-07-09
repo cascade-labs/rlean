@@ -155,6 +155,12 @@ impl OptionContractView {
         self.symbol.clone()
     }
 
+    /// Underlying equity/index symbol for this option contract.
+    /// Mirrors LEAN `OptionContract.UnderlyingSymbol` (`Symbol.Underlying`).
+    pub fn underlying_symbol(&self) -> Option<Symbol> {
+        self.symbol.underlying().cloned()
+    }
+
     pub fn is_call(&self) -> bool {
         self.right == OptionRight::Call
     }
@@ -253,6 +259,12 @@ impl OptionContractView {
     #[getter(symbol)]
     fn py_symbol(&self) -> crate::securities::SymbolHandle {
         crate::securities::SymbolHandle::new(self.symbol())
+    }
+
+    #[getter(underlying_symbol)]
+    fn py_underlying_symbol(&self) -> Option<crate::securities::SymbolHandle> {
+        self.underlying_symbol()
+            .map(crate::securities::SymbolHandle::new)
     }
 
     #[getter(right)]

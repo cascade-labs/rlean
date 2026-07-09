@@ -276,6 +276,11 @@ impl TradeBarView {
         self.volume()
     }
 
+    #[getter(value)]
+    fn py_value(&self) -> f64 {
+        self.value()
+    }
+
     #[getter(time)]
     fn py_time(&self) -> chrono::NaiveDateTime {
         self.time()
@@ -926,11 +931,28 @@ impl CustomDataFieldsView {
         Self { fields }
     }
 
-    fn get_field(&self, key: &str) -> Option<String> {
+    /// String value stored under `key`, if present.
+    pub fn get_field(&self, key: &str) -> Option<String> {
         self.fields.get(key).map(json_value_to_field_string)
     }
 
-    fn keys_vec(&self) -> Vec<String> {
+    /// True when `key` is present in the field map.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.fields.contains_key(key)
+    }
+
+    /// Number of fields in the map.
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// True when the field map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// All field keys.
+    pub fn keys_vec(&self) -> Vec<String> {
         self.fields.keys().cloned().collect()
     }
 }
@@ -962,12 +984,12 @@ impl CustomDataFieldsView {
 
     #[pyo3(name = "__contains__")]
     fn py_contains(&self, key: &str) -> bool {
-        self.fields.contains_key(key)
+        self.contains_key(key)
     }
 
     #[pyo3(name = "__len__")]
     fn py_len(&self) -> usize {
-        self.fields.len()
+        self.len()
     }
 
     #[pyo3(name = "keys")]
