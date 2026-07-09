@@ -707,6 +707,16 @@ fn is_restorable_security_type(security_type: lean_core::SecurityType) -> bool {
 /// manages them). For each unmanaged holding a `-quantity` market order is
 /// registered in the transaction manager and dispatched through the existing
 /// brokerage router submission path, so it reconciles via the normal poll path.
+///
+/// Order ids for these liquidations are drawn from the algorithm's single
+/// order-id authority (`QcAlgorithm::next_order_id`) — the exact same counter
+/// every framework/algorithm order uses. Historically this path pulled ids from
+/// `TransactionManager::next_order_id`, a *parallel* counter that also starts at
+/// 1, so liquidation id=1,2,... collided with the framework's id=1,2,.... The
+/// router maps brokerage ids back to engine ids, so a colliding pair let a
+/// liquidation's fill be applied to a different framework order (different
+/// symbol/quantity) — the production incident in issue #33. Using the algorithm
+/// counter guarantees liquidation and framework orders never share an id.
 fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     algorithm_manager: &AlgorithmManager<B>,
     transactions: Option<&Arc<lean_orders::TransactionManager>>,
@@ -716,6 +726,12 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     let Some(transactions) = transactions else {
         tracing::warn!(
             "liquidate-unmanaged-holdings requested but no transaction manager is available; skipping"
+        );
+        return;
+    };
+    let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() else {
+        tracing::warn!(
+            "liquidate-unmanaged-holdings requested but no algorithm state is available; skipping"
         );
         return;
     };
@@ -744,7 +760,19 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
         // Asset-agnostic: -quantity closes longs (sell) and shorts (buy-to-cover)
         // alike, and preserves fractional/options/crypto quantities unchanged.
         let quantity = -holding.quantity;
-        let order_id = transactions.next_order_id();
+        // Single id authority: allocate from the algorithm's order-id counter, the
+        // same sequence framework/algorithm orders draw from, so ids never collide
+        // with later framework orders (issue #33).
+        let order_id = match algorithm_state.lock() {
+            Ok(mut algorithm) => algorithm.next_order_id(),
+            Err(_) => {
+                tracing::error!(
+                    "liquidate-unmanaged-holdings: algorithm lock poisoned; skipping {}",
+                    holding.symbol.value
+                );
+                continue;
+            }
+        };
         let order = lean_orders::Order::market(
             order_id,
             holding.symbol.clone(),
@@ -755,7 +783,7 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
         transactions.add_or_update_order(order);
         liquidated += 1;
         tracing::info!(
-            "liquidating unmanaged holding: {} quantity={}",
+            "liquidating unmanaged holding: {} (order_id={order_id}) quantity={}",
             holding.symbol.value,
             quantity
         );
@@ -2094,7 +2122,9 @@ mod tests {
 
     // ─── Live brokerage routing tests ───────────────────────────────────────
 
-    use crate::live::transaction_handler::{test_support::MockBrokerage, LiveBrokerageRouter};
+    use crate::live::transaction_handler::{
+        test_support::MockBrokerage, BrokerageEvent, LiveBrokerageRouter,
+    };
     use lean_brokerages::Brokerage;
     use lean_orders::OrderStatus;
 
@@ -2871,6 +2901,152 @@ mod tests {
             submitted_orders[0].quantity,
             dec!(-7),
             "sell the full A position"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #33 regression: a startup liquidation and a later framework/algorithm
+    /// order created in the SAME session must get DISTINCT engine order ids. Before
+    /// the fix, liquidations drew ids from `TransactionManager::next_order_id`
+    /// (a parallel counter starting at 1) while framework orders drew from the
+    /// algorithm's `order_id_counter` (also starting at 1), so both produced id=1.
+    /// This asserts the single id authority: liquidation gets id=1, the next
+    /// algorithm order gets id=2, and both distinct orders are registered.
+    #[test]
+    fn liquidation_and_framework_orders_get_distinct_ids() {
+        let a = Symbol::create_equity("AAA", &Market::usa());
+        let b = Symbol::create_equity("BBB", &Market::usa());
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let (manager, _context) = framework_manager(state.clone());
+
+        // Register + price both securities so the algorithm order is well-formed.
+        {
+            let mut algorithm = state.lock().unwrap();
+            algorithm.add_security_symbol(a.clone(), Resolution::Minute);
+            algorithm.securities.update_price(&a, dec!(14));
+            algorithm.portfolio.update_prices(&a, dec!(14));
+            algorithm.add_security_symbol(b.clone(), Resolution::Minute);
+            algorithm.securities.update_price(&b, dec!(50));
+            algorithm.portfolio.update_prices(&b, dec!(50));
+        }
+
+        let transactions = state.lock().unwrap().transactions.clone();
+        // A is unmanaged (no insight) → liquidated. Takes the first id from the
+        // algorithm counter.
+        let holdings = vec![holding(a.clone(), dec!(16269))];
+
+        let mut router = LiveBrokerageRouter::spawn(Box::new(MockBrokerage::new()));
+        liquidate_unmanaged_holdings(&manager, Some(&transactions), &holdings, &mut router);
+
+        // The framework/algorithm now places its own order (e.g. an SPSC sell) — it
+        // must NOT reuse the liquidation's id.
+        let framework_order_id = {
+            let mut algorithm = state.lock().unwrap();
+            algorithm.market_order(&b, dec!(-371)).order_id
+        };
+
+        // Liquidation got id=1, framework order got id=2 — distinct, same authority.
+        let liquidation = transactions
+            .get_order(1)
+            .expect("liquidation registered as order id=1");
+        assert_eq!(liquidation.symbol, a, "id=1 is the AAA liquidation");
+        assert_eq!(liquidation.quantity, dec!(-16269));
+        assert_eq!(framework_order_id, 2, "framework order gets the next id");
+        let framework_order = transactions
+            .get_order(framework_order_id)
+            .expect("framework order registered");
+        assert_eq!(framework_order.symbol, b, "id=2 is the BBB framework order");
+        assert_ne!(
+            liquidation.id, framework_order.id,
+            "liquidation and framework ids must never collide"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #33 defense-in-depth: the router refuses to apply a poll Status/fill
+    /// event when the brokerage-reported symbol does not match the engine order's
+    /// symbol. This is the guard that makes cross-symbol fill application
+    /// impossible even if an id ever mis-resolves. The mismatched fill must NOT
+    /// touch the portfolio and NOT advance the order's tracked fill state.
+    #[test]
+    fn router_refuses_cross_symbol_fill() {
+        let spsc = Symbol::create_equity("SPSC", &Market::usa());
+        let aci = Symbol::create_equity("ACI", &Market::usa());
+        let (mut manager, mut services, transactions, portfolio) =
+            manager_with_order_state(spsc.clone());
+        // Engine order id=1 is an SPSC order (from `with_order_state`).
+        assert_eq!(transactions.get_order(1).unwrap().symbol, spsc);
+
+        let mut router = LiveBrokerageRouter::spawn(Box::new(MockBrokerage::new()));
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        // A poll event resolves brokerage id → engine order 1, but carries a fill
+        // for a DIFFERENT symbol (ACI) — the exact production corruption: an ACI
+        // fill about to be applied to the SPSC order.
+        let mismatched = BrokerageEvent::Status {
+            order_id: 1,
+            symbol: aci.clone(),
+            status: OrderStatus::Filled,
+            fill_price: dec!(14.16),
+            cumulative_filled: dec!(-16269),
+            commission: None,
+        };
+        router.apply_event(
+            mismatched,
+            &mut manager,
+            &mut services,
+            &transactions,
+            Some(&portfolio),
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+        );
+
+        // Refused: no order event emitted, no holdings created for either symbol,
+        // and the engine order's fill state is untouched.
+        assert!(
+            events.is_empty(),
+            "mismatched fill must not emit an order event"
+        );
+        assert!(
+            portfolio.get_holding(&aci).quantity.is_zero(),
+            "ACI holdings must not be created by an SPSC-order fill"
+        );
+        assert!(
+            portfolio.get_holding(&spsc).quantity.is_zero(),
+            "SPSC holdings must not move from a mismatched fill"
+        );
+        assert!(
+            transactions.get_order(1).unwrap().filled_quantity.is_zero(),
+            "engine order must not record the mismatched fill"
+        );
+
+        // A correctly-matched fill on the same order DOES apply, proving the guard
+        // only blocks the mismatch.
+        let matched = BrokerageEvent::Status {
+            order_id: 1,
+            symbol: spsc.clone(),
+            status: OrderStatus::Filled,
+            fill_price: dec!(50),
+            cumulative_filled: dec!(10),
+            commission: None,
+        };
+        router.apply_event(
+            matched,
+            &mut manager,
+            &mut services,
+            &transactions,
+            Some(&portfolio),
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+        );
+        assert_eq!(
+            portfolio.get_holding(&spsc).quantity,
+            dec!(10),
+            "matched SPSC fill applies normally"
         );
         router.shutdown();
     }
