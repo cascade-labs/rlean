@@ -331,6 +331,21 @@ where
         .flush_corporate_action_cache_writes()
         .await?;
 
+    // End-of-run summary: surface every Adjusted-mode equity that traded with no
+    // factor rows, so silent unadjusted symbols (issue #27) are impossible to
+    // miss even if the per-symbol WARNs scrolled past.
+    let unadjusted = data_manager.context().take_unadjusted_equities();
+    if !unadjusted.is_empty() {
+        tracing::warn!(
+            "{} equit{} ran WITHOUT factor files (split/dividend adjustment \
+             skipped — prices were raw, corporate actions produce phantom P&L; \
+             issue #27): {}",
+            unadjusted.len(),
+            if unadjusted.len() == 1 { "y" } else { "ies" },
+            unadjusted.join(", "),
+        );
+    }
+
     algorithm_manager.finish(&mut services);
 
     let total_fees: f64 = all_order_events

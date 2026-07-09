@@ -145,6 +145,10 @@ pub struct DataFeedContext {
     pub history_provider: Option<Arc<dyn IHistoryProvider>>,
     pub custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
     pub failed_custom_data_uris: Arc<Mutex<HashSet<String>>>,
+    /// Adjusted-mode equities that were subscribed with no factor rows available
+    /// (split/dividend adjustment silently skipped). Populated at subscription
+    /// time and drained into an end-of-run WARN summary. Shared across clones.
+    pub unadjusted_equities: Arc<Mutex<HashSet<String>>>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     pub market_fetch_permits: Arc<Semaphore>,
@@ -392,6 +396,7 @@ impl DataFeedContext {
             history_provider: None,
             custom_data_sources: Vec::new(),
             failed_custom_data_uris: Arc::new(Mutex::new(HashSet::new())),
+            unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
             market_fetch_permits: Arc::new(Semaphore::new(
@@ -435,6 +440,27 @@ impl DataFeedContext {
     /// with a finite prefetch horizon instead of treating startup as unbounded.
     pub fn seed_consumer_frontier(&self, date: chrono::NaiveDate) {
         self.observe_consumer_frontier(date);
+    }
+
+    /// Record that an Adjusted-mode equity was subscribed with no factor rows, so
+    /// its prices flow through unadjusted (split/dividend adjustment silently
+    /// skipped). Collected for the end-of-run summary.
+    pub fn record_unadjusted_equity(&self, ticker: &str) {
+        if let Ok(mut set) = self.unadjusted_equities.lock() {
+            set.insert(ticker.to_string());
+        }
+    }
+
+    /// Drain and return the set of Adjusted-mode equities that ran without factor
+    /// rows, sorted for stable reporting. Empties the collector.
+    pub fn take_unadjusted_equities(&self) -> Vec<String> {
+        let mut tickers: Vec<String> = self
+            .unadjusted_equities
+            .lock()
+            .map(|mut set| set.drain().collect())
+            .unwrap_or_default();
+        tickers.sort();
+        tickers
     }
 
     /// Await a frontier advance using the standard Notify pattern: callers must

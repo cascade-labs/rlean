@@ -351,12 +351,36 @@ impl SubscriptionProducerState {
         // they're empty for this symbol. Providers supply the rows; the
         // framework owns persistence. This must run before we read factor rows
         // or the map-file inception date below.
-        ensure_corporate_actions_cached(&context, &config.symbol);
+        let factors_available = ensure_corporate_actions_cached(&context, &config.symbol);
         let factor_rows = if config.normalization_mode != lean_core::DataNormalizationMode::Raw {
             read_factor_rows(&context.store, &config.symbol)
         } else {
             Vec::new()
         };
+        // Loud, per-symbol warning: an equity subscribed under an adjusting
+        // normalization mode with no factor rows trades on RAW prices, so any
+        // split/dividend during the run produces phantom P&L (issue #27). Record
+        // it for the end-of-run summary as well. `factor_rows` may be empty even
+        // when `factors_available` is true on the very first run that populates
+        // the cache (the freshly-fetched rows are buffered, not yet in Iceberg),
+        // so treat either signal as a coverage gap.
+        if config.normalization_mode != lean_core::DataNormalizationMode::Raw
+            && matches!(
+                config.symbol.security_type(),
+                lean_core::SecurityType::Equity
+            )
+            && (!factors_available || factor_rows.is_empty())
+        {
+            let ticker = config.symbol.value.to_string();
+            tracing::warn!(
+                "No factor file for {} under {:?} normalization: split/dividend \
+                 adjustment is DISABLED for this symbol — prices are raw and any \
+                 corporate action will produce phantom P&L (issue #27)",
+                ticker,
+                config.normalization_mode,
+            );
+            context.record_unadjusted_equity(&ticker);
+        }
         let partition_date = start.date_utc();
         let end_partition_date = end.date_utc();
         // The earliest date any provider can supply, combined with the symbol's
@@ -3042,6 +3066,39 @@ mod tests {
         }
     }
 
+    /// Returns an empty factor file (the default trait behavior) and counts
+    /// calls, so tests can prove the fetch is retried each run rather than being
+    /// permanently poisoned by a durable empty marker.
+    struct EmptyFactorProvider {
+        factor_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IHistoryProvider for EmptyFactorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+            self.factor_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Always errors on the factor-file fetch (e.g. rate-limit exhaustion).
+    struct FactorErrorProvider;
+
+    #[async_trait]
+    impl IHistoryProvider for FactorErrorProvider {
+        async fn get_history(&self, _request: &HistoryRequest) -> anyhow::Result<Vec<TradeBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_factor_file(&self, _symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+            anyhow::bail!("rate limit exhausted")
+        }
+    }
+
     struct SlowConcurrentHistoryProvider {
         active: AtomicUsize,
         max_active: AtomicUsize,
@@ -4098,6 +4155,77 @@ mod tests {
             2,
             "generic retry should recover without a process-global attempt cache"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_factor_file_returns_unavailable_and_is_not_cached() {
+        // An empty provider result must NOT be persisted as a durable "0 rows"
+        // marker (issue #27): nothing is written and the next run retries.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("DPST", &Market::usa());
+        let factor_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(EmptyFactorProvider {
+            factor_calls: factor_calls.clone(),
+        });
+        let context = context(store.clone()).with_history_provider(Some(provider));
+
+        let available = ensure_corporate_actions_cached(&context, &symbol);
+        assert!(!available, "empty factor file must report unavailable");
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(
+            store
+                .scan_factor_file("usa", "DPST")
+                .await
+                .unwrap()
+                .is_empty(),
+            "empty result must not be persisted as a durable empty marker"
+        );
+
+        // Second run: because nothing durable was written, the fetch is retried.
+        let available_again = ensure_corporate_actions_cached(&context, &symbol);
+        assert!(!available_again);
+        assert_eq!(
+            factor_calls.load(Ordering::SeqCst),
+            2,
+            "each run must re-attempt the fetch rather than trust a poisoned empty cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn factor_fetch_error_reports_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("WAL", &Market::usa());
+        let context =
+            context(store.clone()).with_history_provider(Some(Arc::new(FactorErrorProvider)));
+
+        let available = ensure_corporate_actions_cached(&context, &symbol);
+        assert!(
+            !available,
+            "a fetch error must report the factor file unavailable"
+        );
+        context.flush_corporate_action_cache_writes().await.unwrap();
+        assert!(store
+            .scan_factor_file("usa", "WAL")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn unadjusted_equity_collector_records_and_drains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let context = context(store);
+        context.record_unadjusted_equity("DPST");
+        context.record_unadjusted_equity("SMCI");
+        context.record_unadjusted_equity("DPST"); // dedup
+
+        let drained = context.take_unadjusted_equities();
+        assert_eq!(drained, vec!["DPST".to_string(), "SMCI".to_string()]);
+        // Draining empties the collector.
+        assert!(context.take_unadjusted_equities().is_empty());
     }
 
     #[tokio::test]
