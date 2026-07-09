@@ -1,10 +1,9 @@
-use crate::data_feed::DataFeedContext;
+use crate::data_feed::{CorporateActionResolution, DataFeedContext};
 use lean_core::{DataNormalizationMode, DateTime, SecurityType, Symbol};
 use lean_data::{QuoteBar, TradeBar};
 use lean_storage::{FactorFileEntry, IcebergStore};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
-use std::sync::Arc;
 
 /// LEAN-style price scale frontier: use `EndTime` when a bar crosses calendar days.
 pub fn price_scale_frontier(time: DateTime, end_time: DateTime) -> chrono::NaiveDate {
@@ -30,165 +29,72 @@ pub fn read_factor_rows(store: &IcebergStore, symbol: &Symbol) -> Vec<FactorFile
         .unwrap_or_default()
 }
 
-/// Ensure the symbol's corporate-action files (factor + map) are present in the
-/// Iceberg store, fetching them from the history provider and persisting them
-/// here if the tables are empty for this symbol.
+/// Resolve the symbol's corporate-action files (factor + map) for this run,
+/// fetching them from the history provider and persisting them into Iceberg if
+/// the tables are empty for this symbol.
 ///
 /// This is the framework side of the provider/framework split: providers are
 /// pure data sources (`get_factor_file`/`get_map_file` return rows), and the
 /// framework owns *all* persistence — writing the rows into Iceberg exactly as
 /// it does trade/quote bars. Providers must never write files themselves.
 ///
-/// Cache-first and idempotent: if the tables already have rows for the symbol,
-/// no provider call is made. Only equities carry corporate actions.
+/// Resolution is decoupled from bar fetching, mirroring C# LEAN where
+/// `SubscriptionDataReader.Initialize` resolves the factor/map file through
+/// `IFactorFileProvider.Get` / `IMapFileProvider.ResolveMapFile` at subscription
+/// creation regardless of whether the symbol's bars are already on disk
+/// (Engine/DataFeeds/SubscriptionDataReader.cs:203-249). A ticker whose bars are
+/// already cached in Iceberg still gets its factor/map files fetched here — that
+/// is exactly issue #30.
+///
+/// Cache-first and idempotent, and additionally guarded by a per-run resolution
+/// cache (LEAN's per-process `_seededMarket`/`_factorFiles`): repeat
+/// subscriptions of a ticker in one run resolve once, never re-hitting the store
+/// or provider. Only equities carry corporate actions.
 ///
 /// Returns `true` if the symbol has factor rows available (already cached or
 /// freshly fetched), `false` if the factor file is still absent afterwards —
-/// including on a swallowed fetch error or an empty provider result. A `false`
-/// for an Adjusted-mode equity means its prices will flow through unadjusted,
-/// so callers should warn. Non-equities always return `true` (nothing to
-/// adjust). Note: nothing durable is written on empty/error, so the fetch is
-/// retried on the next run rather than being permanently poisoned.
-pub fn ensure_corporate_actions_cached(context: &DataFeedContext, symbol: &Symbol) -> bool {
+/// including on a fetch error or an empty provider result. A `false` for an
+/// Adjusted-mode equity means its prices will flow through unadjusted, so callers
+/// should warn. Non-equities always return `true` (nothing to adjust). Nothing
+/// durable is written on empty/error, so the fetch is retried on the next run
+/// rather than being permanently poisoned.
+///
+/// This is a synchronous wrapper (the subscription producer builds its state on a
+/// blocking worker); it runs the async resolution on a dedicated current-thread
+/// runtime, mirroring `read_factor_rows`. Returns the full resolution — the
+/// caller uses `factor_rows` for normalization and `map_first_date` for the
+/// provider-earliest bound without re-scanning Iceberg.
+pub fn ensure_corporate_actions_cached(
+    context: &DataFeedContext,
+    symbol: &Symbol,
+) -> CorporateActionResolution {
     if !matches!(symbol.security_type(), SecurityType::Equity) {
-        return true;
+        return CorporateActionResolution {
+            factors_available: true,
+            factor_rows: Vec::new(),
+            map_first_date: None,
+        };
     }
-    let Some(provider) = context.history_provider.as_ref() else {
-        // No provider to fetch from: can't determine coverage. Treat as
-        // available so we don't spuriously warn in provider-less setups.
-        return true;
-    };
-
-    let market = symbol.market().as_str().to_string();
-    let ticker = symbol.permtick.to_string();
     let symbol_value = symbol.value.to_string();
-    let provider = Arc::clone(provider);
     let context_for_task = context.clone();
     let symbol = symbol.clone();
-
-    // Run the fetch+persist on a dedicated current-thread runtime so it works
-    // regardless of the caller's async context, mirroring `read_factor_rows`.
-    let outcome = block_on_background(async move {
-        // Factor file: fetch + persist only when absent for this symbol.
-        let mut have_factors = context_for_task
-            .store
-            .scan_factor_file(&market, &ticker)
-            .await
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
-        if !have_factors {
-            match context_for_task
-                .fetch_factor_file(provider.as_ref(), &symbol)
-                .await
-            {
-                Ok(rows) if !rows.is_empty() => {
-                    let rows_len = rows.len();
-                    if let Err(err) = context_for_task
-                        .buffer_factor_file_cache_write(market.clone(), ticker.clone(), rows)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to persist factor file for {}: {}",
-                            symbol.value,
-                            err
-                        );
-                    } else {
-                        have_factors = true;
-                        tracing::debug!(
-                            "Buffered {} factor rows for {} into Iceberg",
-                            rows_len,
-                            symbol.value
-                        );
-                    }
-                }
-                Ok(_) => {
-                    // Provider returned an empty factor file. This is
-                    // indistinguishable from a silently-failed fetch, and
-                    // nothing is persisted, so the next run retries. Surface it
-                    // at WARN because an Adjusted equity with no factors trades
-                    // on unadjusted prices (see subscription-time check).
-                    tracing::warn!(
-                        "Factor file for {} came back empty; split/dividend \
-                         adjustment will be skipped this run (will retry next run)",
-                        symbol.value
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to fetch factor file for {}: {} — split/dividend \
-                         adjustment will be skipped this run (will retry next run)",
-                        symbol.value,
-                        err
-                    );
-                }
-            }
-        }
-
-        // Map file: fetch + persist only when absent for this symbol.
-        let have_map = context_for_task
-            .store
-            .scan_map_file(&market, &ticker)
-            .await
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
-        if !have_map {
-            match context_for_task
-                .fetch_map_file(provider.as_ref(), &symbol)
-                .await
-            {
-                Ok(rows) if !rows.is_empty() => {
-                    let rows_len = rows.len();
-                    if let Err(err) = context_for_task
-                        .buffer_map_file_cache_write(market.clone(), ticker.clone(), rows)
-                        .await
-                    {
-                        tracing::warn!("Failed to persist map file for {}: {}", symbol.value, err);
-                    } else {
-                        tracing::debug!(
-                            "Buffered {} map rows for {} into Iceberg",
-                            rows_len,
-                            symbol.value
-                        );
-                    }
-                }
-                Ok(_) => {
-                    // Provider returned an empty map file. Nothing is persisted,
-                    // so the next run retries. An empty map is far less harmful
-                    // than an empty factor file (the engine falls back to the
-                    // symbol's own ticker), so keep this at debug.
-                    tracing::debug!(
-                        "Map file for {} came back empty; ticker rename history \
-                         will be unavailable this run (will retry next run)",
-                        symbol.value
-                    );
-                }
-                Err(err) => {
-                    // Mirror the factor-file path: a fetch error is surfaced at
-                    // WARN, not debug. A failed map fetch means any ticker rename
-                    // history (e.g. FB -> META) is missing this run. Nothing is
-                    // persisted, so the fetch retries next run rather than being
-                    // permanently poisoned.
-                    tracing::warn!(
-                        "Failed to fetch map file for {}: {} — ticker rename \
-                         history will be unavailable this run (will retry next run)",
-                        symbol.value,
-                        err
-                    );
-                }
-            }
-        }
-
-        Ok::<bool, anyhow::Error>(have_factors)
-    });
-    match outcome {
-        Ok(have_factors) => have_factors,
+    match block_on_background(async move {
+        Ok::<CorporateActionResolution, anyhow::Error>(
+            context_for_task.resolve_corporate_actions(&symbol).await,
+        )
+    }) {
+        Ok(resolution) => resolution,
         Err(err) => {
             tracing::warn!(
-                "Corporate-action cache worker failed for {}: {}",
+                "Corporate-action resolution worker failed for {}: {}",
                 symbol_value,
                 err
             );
-            false
+            CorporateActionResolution {
+                factors_available: false,
+                factor_rows: Vec::new(),
+                map_first_date: None,
+            }
         }
     }
 }

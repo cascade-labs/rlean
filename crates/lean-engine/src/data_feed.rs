@@ -149,6 +149,16 @@ pub struct DataFeedContext {
     /// (split/dividend adjustment silently skipped). Populated at subscription
     /// time and drained into an end-of-run WARN summary. Shared across clones.
     pub unadjusted_equities: Arc<Mutex<HashSet<String>>>,
+    /// Per-run corporate-action resolution cache, mirroring LEAN's per-process
+    /// `LocalZipFactorFileProvider._factorFiles`/`_seededMarket`
+    /// (Common/Data/Auxiliary/LocalZipFactorFileProvider.cs:33-34, 87-108). Once a
+    /// symbol's factor/map data has been resolved for this run — whether it
+    /// resolved to real rows or resolved-as-absent — the outcome is cached here so
+    /// repeat subscriptions of the same ticker (universe churn, re-adds) never
+    /// re-hit the store or the history provider. The bool is whether factor rows
+    /// are available. This also serves as the per-run WARN dedup. Shared across
+    /// clones so warm-up, the normal feed, and mid-run add_equity share one cache.
+    corporate_action_resolutions: Arc<Mutex<HashMap<AuxKey, CorporateActionResolution>>>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     pub market_fetch_permits: Arc<Semaphore>,
@@ -176,6 +186,39 @@ struct MarketCacheKey {
     tick_type: TickType,
 }
 
+/// Corporate-action resolution cache key, mirroring LEAN's `AuxiliaryDataKey`
+/// (market + permtick). Factor/map files are keyed by lowercased market and
+/// permanent ticker, matching the Iceberg scan filters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AuxKey {
+    market: String,
+    ticker: String,
+}
+
+impl AuxKey {
+    fn for_symbol(symbol: &Symbol) -> Self {
+        Self {
+            market: symbol.market().as_str().to_lowercase(),
+            ticker: symbol.permtick.to_lowercase(),
+        }
+    }
+}
+
+/// One symbol's resolved corporate-action state for a run, cached in the per-run
+/// resolution map. `factor_rows` are the resolved factor entries (empty when the
+/// factor file resolved-as-absent), held here so repeat subscriptions reuse them
+/// without re-scanning Iceberg — analogous to LEAN caching the resolved
+/// `IFactorProvider` in `LocalZipFactorFileProvider._factorFiles`.
+#[derive(Clone)]
+pub struct CorporateActionResolution {
+    /// Whether factor rows are available (already cached or freshly fetched).
+    pub factors_available: bool,
+    /// The resolved factor rows for adjustment, or empty if none are available.
+    pub factor_rows: Vec<FactorFileEntry>,
+    /// The symbol's inception (earliest map-file date), if a map file exists.
+    pub map_first_date: Option<NaiveDate>,
+}
+
 #[derive(Default)]
 struct MarketCacheWriteBuffer {
     trade_bars: Mutex<HashMap<MarketCacheKey, Vec<TradeBar>>>,
@@ -190,7 +233,15 @@ struct CorporateActionWriteBuffer {
 }
 
 const MARKET_CACHE_FLUSH_CHUNK_ROWS: usize = 250_000;
-const CORPORATE_ACTION_BUFFER_SYMBOLS: usize = 512;
+/// Corporate-action rows are persisted eagerly, one symbol per flush. Factor/map
+/// resolution happens at most once per symbol per run (guarded by the per-run
+/// resolution cache), so the volume is a few hundred small appends over a whole
+/// run — cheap. Eager persistence is deliberate: a long backtest that is killed
+/// mid-run (common) must not lose the factor/map files it already fetched, which
+/// is exactly the failure mode where a buffer-until-end-of-run design left the
+/// Iceberg tables empty despite successful fetches (issue #30). Setting the
+/// threshold to 1 flushes each freshly-resolved symbol immediately.
+const CORPORATE_ACTION_BUFFER_SYMBOLS: usize = 1;
 
 impl MarketCacheWriteBuffer {
     fn key(
@@ -397,6 +448,7 @@ impl DataFeedContext {
             custom_data_sources: Vec::new(),
             failed_custom_data_uris: Arc::new(Mutex::new(HashSet::new())),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
+            corporate_action_resolutions: Arc::new(Mutex::new(HashMap::new())),
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
             market_fetch_permits: Arc::new(Semaphore::new(
@@ -680,6 +732,205 @@ impl DataFeedContext {
             || provider.get_map_file(symbol),
         )
         .await
+    }
+
+    /// Resolve the symbol's corporate-action files (factor + map) for this run,
+    /// mirroring C# LEAN's `SubscriptionDataReader.Initialize`
+    /// (Engine/DataFeeds/SubscriptionDataReader.cs:203-249) resolving through
+    /// `IFactorFileProvider.Get` / `IMapFileProvider.ResolveMapFile`, backed by
+    /// the per-process cache in `LocalZipFactorFileProvider.Get`
+    /// (Common/Data/Auxiliary/LocalZipFactorFileProvider.cs:87-108).
+    ///
+    /// This is bar-independent: it is called at subscription creation, never gated
+    /// by whether the symbol's bars are already cached. That is the whole point of
+    /// issue #30 — a ticker whose bars are already in Iceberg must still have its
+    /// factor/map files resolved (and fetched, if absent) through the provider.
+    ///
+    /// Resolution order per file, matching the provider/framework split (providers
+    /// are pure data sources; the framework owns persistence):
+    ///   1. Iceberg store already has rows for the symbol -> use them.
+    ///   2. Store empty -> fetch from the history provider; on a non-empty success
+    ///      persist the rows here (eagerly, so a killed run keeps them); on an
+    ///      empty result or a fetch error, persist nothing and retry next run.
+    ///
+    /// The per-run cache (`corporate_action_resolutions`) records the outcome the
+    /// first time a symbol is resolved — including resolved-as-absent — so repeat
+    /// subscriptions of the same ticker in one run never re-hit the store or the
+    /// provider, exactly like LEAN's `_seededMarket`/`_factorFiles`.
+    ///
+    /// Returns the resolved [`CorporateActionResolution`] for the symbol,
+    /// including whether factor rows are available, the resolved factor rows for
+    /// adjustment, and the map-file inception date. For a non-equity or a run
+    /// with no history provider, factors are reported available with no rows
+    /// (nothing to adjust). `factors_available == false` for an Adjusted-mode
+    /// equity means its prices flow through unadjusted, so the caller warns.
+    pub async fn resolve_corporate_actions(&self, symbol: &Symbol) -> CorporateActionResolution {
+        if !matches!(symbol.security_type(), SecurityType::Equity) {
+            return CorporateActionResolution {
+                factors_available: true,
+                factor_rows: Vec::new(),
+                map_first_date: None,
+            };
+        }
+        let key = AuxKey::for_symbol(symbol);
+        // Per-run cache hit: resolved (or resolved-as-absent) already this run.
+        if let Some(resolution) = self
+            .corporate_action_resolutions
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned())
+        {
+            return resolution;
+        }
+
+        let Some(provider) = self.history_provider.as_ref() else {
+            // No provider to fetch from: fall back to whatever the store holds and
+            // treat as available so we don't spuriously warn in provider-less
+            // setups. Cache the decision so it is stable for the run.
+            let factor_rows = self
+                .store
+                .scan_factor_file(&key.market, &key.ticker)
+                .await
+                .unwrap_or_default();
+            let map_first_date = self.scan_map_first_date(&key.market, &key.ticker).await;
+            let resolution = CorporateActionResolution {
+                factors_available: true,
+                factor_rows,
+                map_first_date,
+            };
+            self.cache_corporate_action_resolution(key, resolution.clone());
+            return resolution;
+        };
+        let provider = Arc::clone(provider);
+
+        let market = key.market.clone();
+        let ticker = key.ticker.clone();
+
+        // Factor file: fetch + persist only when absent for this symbol.
+        let mut factor_rows = self
+            .store
+            .scan_factor_file(&market, &ticker)
+            .await
+            .unwrap_or_default();
+        if factor_rows.is_empty() {
+            match self.fetch_factor_file(provider.as_ref(), symbol).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let rows_len = rows.len();
+                    if let Err(err) = self
+                        .buffer_factor_file_cache_write(
+                            market.clone(),
+                            ticker.clone(),
+                            rows.clone(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to persist factor file for {}: {}",
+                            symbol.value,
+                            err
+                        );
+                    } else {
+                        factor_rows = rows;
+                        tracing::debug!(
+                            "Persisted {} factor rows for {} into Iceberg",
+                            rows_len,
+                            symbol.value
+                        );
+                    }
+                }
+                Ok(_) => {
+                    // Provider returned an empty factor file. Indistinguishable
+                    // from a silently-failed fetch; nothing is persisted, so the
+                    // next run retries. Surfaced at WARN because an Adjusted equity
+                    // with no factors trades on unadjusted prices (see the
+                    // subscription-time check that consumes this result).
+                    tracing::warn!(
+                        "Factor file for {} came back empty; split/dividend \
+                         adjustment will be skipped this run (will retry next run)",
+                        symbol.value
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to fetch factor file for {}: {} — split/dividend \
+                         adjustment will be skipped this run (will retry next run)",
+                        symbol.value,
+                        err
+                    );
+                }
+            }
+        }
+
+        // Map file: fetch + persist only when absent for this symbol.
+        let mut map_rows = self
+            .store
+            .scan_map_file(&market, &ticker)
+            .await
+            .unwrap_or_default();
+        if map_rows.is_empty() {
+            match self.fetch_map_file(provider.as_ref(), symbol).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let rows_len = rows.len();
+                    if let Err(err) = self
+                        .buffer_map_file_cache_write(market.clone(), ticker.clone(), rows.clone())
+                        .await
+                    {
+                        tracing::warn!("Failed to persist map file for {}: {}", symbol.value, err);
+                    } else {
+                        map_rows = rows;
+                        tracing::debug!(
+                            "Persisted {} map rows for {} into Iceberg",
+                            rows_len,
+                            symbol.value
+                        );
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        "Map file for {} came back empty; ticker rename history \
+                         will be unavailable this run (will retry next run)",
+                        symbol.value
+                    );
+                }
+                Err(err) => {
+                    // Mirror the factor path: a fetch error is a WARN, not debug.
+                    // A failed map fetch drops any ticker rename history (e.g.
+                    // FB -> META) for this run. Nothing is persisted, so it retries.
+                    tracing::warn!(
+                        "Failed to fetch map file for {}: {} — ticker rename \
+                         history will be unavailable this run (will retry next run)",
+                        symbol.value,
+                        err
+                    );
+                }
+            }
+        }
+
+        let resolution = CorporateActionResolution {
+            factors_available: !factor_rows.is_empty(),
+            factor_rows,
+            map_first_date: map_rows.iter().map(|row| row.date).min(),
+        };
+        self.cache_corporate_action_resolution(key, resolution.clone());
+        resolution
+    }
+
+    async fn scan_map_first_date(&self, market: &str, ticker: &str) -> Option<NaiveDate> {
+        self.store
+            .scan_map_file(market, ticker)
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().map(|row| row.date).min())
+    }
+
+    fn cache_corporate_action_resolution(
+        &self,
+        key: AuxKey,
+        resolution: CorporateActionResolution,
+    ) {
+        if let Ok(mut cache) = self.corporate_action_resolutions.lock() {
+            cache.insert(key, resolution);
+        }
     }
 
     pub async fn fetch_option_eod_bars(
