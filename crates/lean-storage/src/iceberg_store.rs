@@ -321,6 +321,10 @@ impl IcebergStore {
             return Ok(());
         };
         let bucket = s3_bucket(warehouse)?;
+        // Plain-HTTP endpoints (e.g. a local MinIO / Lakekeeper warehouse) are
+        // rejected by `object_store` unless HTTP is explicitly allowed; HTTPS
+        // endpoints (OCI, AWS) are unaffected.
+        let allow_http = s3.endpoint.starts_with("http://");
         let store = AmazonS3Builder::new()
             .with_bucket_name(&bucket)
             .with_endpoint(&s3.endpoint)
@@ -328,6 +332,7 @@ impl IcebergStore {
             .with_access_key_id(&s3.access_key)
             .with_secret_access_key(&s3.secret_key)
             .with_virtual_hosted_style_request(false)
+            .with_allow_http(allow_http)
             .build()
             .context("failed to build S3 object store for DataFusion")?;
         let url = Url::parse(&format!("s3://{bucket}"))
