@@ -27,11 +27,13 @@
 //!   [`CHECKPOINT_INTERVAL`] so a long run does not hammer S3, and
 //!   [`RunArtifactSink::flush_all`] on completion uploads the final state. A run
 //!   that dies mid-way therefore leaves its last checkpoint in S3.
-//! - **Live** calls [`RunArtifactSink::mirror`] on every snapshot. The sink
-//!   pushes the upload onto a bounded async queue; if S3 is slow or down the
-//!   queue fills and further uploads are dropped with a WARN — the live loop
-//!   never blocks on S3. [`RunArtifactSink::flush_all`] on clean shutdown drains
-//!   the queue.
+//! - **Live** calls [`RunArtifactSink::mirror`] on every snapshot. Each upload
+//!   runs as its own short-lived task on a dedicated runtime, bounded by
+//!   [`LIVE_QUEUE_CAPACITY`] in-flight slots and capped at [`UPLOAD_TIMEOUT`]
+//!   per upload; when every slot is taken (S3 slow or down) further uploads
+//!   are dropped with a WARN — the live loop never blocks on S3.
+//!   [`RunArtifactSink::flush_all`] on clean shutdown waits (bounded) for
+//!   in-flight uploads and then uploads the final state of every file.
 //!
 //! S3 key layout mirrors the local dirs:
 //! `<prefix>/<project>/backtests/<run-id>/<file>` and
@@ -52,7 +54,6 @@ use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
-use tokio::sync::mpsc;
 
 /// How often a backtest checkpoint re-uploads a given file, at most.
 ///
@@ -61,9 +62,15 @@ use tokio::sync::mpsc;
 /// throttled to this cadence. `flush_all` on completion bypasses the throttle.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Bound on the live mirror queue. When full, further mirror requests are
-/// dropped with a WARN rather than blocking the live loop.
+/// Bound on concurrent in-flight live uploads. When every slot is taken,
+/// further mirror requests are dropped with a WARN rather than blocking the
+/// live loop.
 pub const LIVE_QUEUE_CAPACITY: usize = 256;
+
+/// Upper bound on a single live artifact upload. A hung endpoint (stalled
+/// connection, aggressive retry loop) releases its in-flight slot after this
+/// long and logs a WARN instead of silently wedging the pipeline.
+pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Credentials / endpoint for an S3-compatible object store. Works against AWS
 /// and any S3-compatible endpoint (OCI, MinIO, etc.) via a custom endpoint URL.
@@ -125,15 +132,10 @@ struct S3Relay {
     store: Arc<dyn ObjectStore>,
     /// `<prefix>/<project>/<backtests|live>/<run-id>` — files are appended.
     key_base: String,
-    /// Bounded queue to the background upload task (live mode).
-    tx: Mutex<Option<mpsc::Sender<UploadJob>>>,
-    /// Handle to the background task, joined on flush.
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-struct UploadJob {
-    key: String,
-    bytes: Vec<u8>,
+    /// Present for live sinks: bounds concurrent background uploads. Each
+    /// upload runs as its own short-lived task on the upload runtime, so a
+    /// single hung upload can never stall the others.
+    live_inflight: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl S3Relay {
@@ -249,29 +251,27 @@ impl RunArtifactSink {
         };
         let _ = std::fs::create_dir_all(&working_dir);
 
-        // Live mode gets a bounded async queue with a drop-and-warn drain task.
-        let (tx, task) = if kind == RunKind::Live {
-            let (tx, mut rx) = mpsc::channel::<UploadJob>(LIVE_QUEUE_CAPACITY);
-            let store_for_task = store.clone();
-            let handle = upload_runtime().spawn(async move {
-                while let Some(job) = rx.recv().await {
-                    let path = ObjectPath::from(job.key.clone());
-                    if let Err(err) = store_for_task.put(&path, PutPayload::from(job.bytes)).await {
-                        tracing::warn!("live artifact S3 upload failed for {}: {err}", job.key);
-                    }
-                }
-            });
-            (Mutex::new(Some(tx)), Mutex::new(Some(handle)))
-        } else {
-            (Mutex::new(None), Mutex::new(None))
-        };
+        // Start the dedicated upload runtime eagerly so its worker threads
+        // exist before the first mirror call.
+        let _ = upload_runtime();
+
+        // Live sinks bound concurrent background uploads with a semaphore.
+        // Each upload is its own short-lived task (matching the backtest
+        // checkpoint path), so a hung upload only wedges its own slot.
+        let live_inflight = (kind == RunKind::Live)
+            .then(|| Arc::new(tokio::sync::Semaphore::new(LIVE_QUEUE_CAPACITY)));
 
         let relay = Arc::new(S3Relay {
             store,
             key_base,
-            tx,
-            task,
+            live_inflight,
         });
+        tracing::info!(
+            "artifact S3 mirroring active: mode={:?} kind={:?} key_base={}",
+            mode,
+            kind,
+            relay.key_base
+        );
 
         Self {
             mode,
@@ -311,14 +311,13 @@ impl RunArtifactSink {
     /// - Local mode: no-op.
     /// - Backtest (Both/S3): throttled — uploads at most once per
     ///   [`CHECKPOINT_INTERVAL`] per file. Reads the current file contents.
-    /// - Live (Both/S3): enqueues the current file contents on the bounded
-    ///   queue; drops with a WARN if the queue is full.
+    /// - Live (Both/S3): spawns a bounded background upload of the current
+    ///   file contents; drops with a WARN if all in-flight slots are taken.
     pub fn mirror(&self, file_name: &str) {
         let Some(relay) = self.relay.as_ref() else {
             return;
         };
-        let is_live = { relay.tx.lock().unwrap().is_some() };
-        if is_live {
+        if relay.live_inflight.is_some() {
             self.mirror_live(relay, file_name);
         } else {
             self.mirror_checkpoint(relay, file_name);
@@ -326,23 +325,35 @@ impl RunArtifactSink {
     }
 
     fn mirror_live(&self, relay: &Arc<S3Relay>, file_name: &str) {
-        let Some(bytes) = self.read_working_file(file_name) else {
+        let Some(semaphore) = relay.live_inflight.clone() else {
             return;
         };
         let key = relay.key_for(file_name);
-        let guard = relay.tx.lock().unwrap();
-        if let Some(tx) = guard.as_ref() {
-            match tx.try_send(UploadJob { key, bytes }) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(job)) => {
+        // Bounded and non-blocking: if too many uploads are already in flight
+        // (S3 slow or down), drop this snapshot and warn. The live loop must
+        // never wait on S3.
+        let Ok(permit) = semaphore.try_acquire_owned() else {
+            tracing::warn!("live artifact S3 queue full; dropping upload of {key}");
+            return;
+        };
+        let Some(bytes) = self.read_working_file(file_name) else {
+            return;
+        };
+        let relay = relay.clone();
+        upload_runtime().spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(UPLOAD_TIMEOUT, relay.put(&key, bytes)).await {
+                Ok(Ok(())) => tracing::debug!("live artifact uploaded: {key}"),
+                Ok(Err(err)) => {
+                    tracing::warn!("live artifact S3 upload failed for {key}: {err}");
+                }
+                Err(_) => {
                     tracing::warn!(
-                        "live artifact S3 queue full; dropping upload of {}",
-                        job.key
+                        "live artifact S3 upload timed out for {key} after {UPLOAD_TIMEOUT:?}"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
-        }
+        });
     }
 
     fn mirror_checkpoint(&self, relay: &Arc<S3Relay>, file_name: &str) {
@@ -368,20 +379,24 @@ impl RunArtifactSink {
     }
 
     /// Upload every file currently in the working dir to S3, bypassing the
-    /// checkpoint throttle, and drain the live queue. Call on completion / clean
-    /// shutdown. No-op for local-only sinks.
+    /// checkpoint throttle, after waiting (bounded) for in-flight live uploads.
+    /// Call on completion / clean shutdown. No-op for local-only sinks.
     pub fn flush_all(&self) {
         let Some(relay) = self.relay.as_ref() else {
             return;
         };
 
-        // Drain the live queue first so nothing in flight is lost, then close it.
-        {
-            let mut guard = relay.tx.lock().unwrap();
-            *guard = None;
-        }
-        if let Some(handle) = relay.task.lock().unwrap().take() {
-            let _ = run_blocking(handle);
+        // Let in-flight live uploads finish first so they cannot race (and
+        // overwrite) the final full upload below. Bounded wait: a wedged
+        // upload times out on its own and must not hang shutdown.
+        if let Some(semaphore) = relay.live_inflight.clone() {
+            let _ = run_blocking(async move {
+                tokio::time::timeout(
+                    UPLOAD_TIMEOUT,
+                    semaphore.acquire_many_owned(LIVE_QUEUE_CAPACITY as u32),
+                )
+                .await
+            });
         }
 
         // Upload every file in the working dir.
@@ -833,18 +848,73 @@ mod tests {
         );
         write_file(&dir, "portfolio.json", "snap");
 
-        // Fire many more mirrors than the queue can hold. Each call must return
-        // promptly (the loop finishing at all proves it never blocked).
+        // Fire many more mirrors than there are in-flight slots. Each call must
+        // return promptly (the loop finishing at all proves it never blocked).
         for _ in 0..(LIVE_QUEUE_CAPACITY + 50) {
             sink.mirror("portfolio.json");
         }
-        // At most one job is in-flight in the worker; the queue holds the rest
-        // up to its bound and everything beyond was dropped.
-        assert!(accepted.load(Ordering::SeqCst) <= 1);
+        // Exactly LIVE_QUEUE_CAPACITY uploads may start (each hangs on the
+        // gate); everything beyond was dropped without blocking. Wait for the
+        // spawned tasks to reach the store.
+        for _ in 0..200 {
+            if accepted.load(Ordering::SeqCst) >= LIVE_QUEUE_CAPACITY {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), LIVE_QUEUE_CAPACITY);
 
-        // Close the gate so every pending and future put completes immediately,
-        // then drain the queue on flush.
+        // With all slots wedged, another mirror is dropped immediately and
+        // never reaches the store.
+        sink.mirror("portfolio.json");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), LIVE_QUEUE_CAPACITY);
+
+        // Release the gate so every wedged put completes, then flush.
         gate.close();
         sink.flush_all();
+    }
+
+    /// Reproduction of the live path: construct the sink exactly the way the
+    /// live runner does (RunKind::Live, Both mode, from inside a multi-thread
+    /// tokio runtime), mirror a snapshot, and assert the upload lands WITHOUT
+    /// any explicit flush — i.e. the background uploads actually drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_sink_drains_in_background_without_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("live").join("deploy1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sink, store) = in_memory_sink(
+            ArtifactStoreMode::Both,
+            RunKind::Live,
+            dir.clone(),
+            "uw_control",
+            "deploy1",
+            "runs",
+        );
+        write_file(&dir, "portfolio.json", "snap1");
+        write_file(&dir, "heartbeat.log", "beat");
+        sink.mirror("portfolio.json");
+        sink.mirror("heartbeat.log");
+
+        // No flush: poll until the background uploads land.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let keys = list_keys(&store).await;
+            if keys.contains(&"runs/uw_control/live/deploy1/portfolio.json".to_string())
+                && keys.contains(&"runs/uw_control/live/deploy1/heartbeat.log".to_string())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live uploads never drained in the background: {keys:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            get_key(&store, "runs/uw_control/live/deploy1/portfolio.json").await,
+            "snap1"
+        );
     }
 }

@@ -238,7 +238,7 @@ fn build_live_artifact_sink(
     }
     // Never use an s3-only temp buffer for live — force local-primary mirroring.
     let mode = lean_engine::ArtifactStoreMode::Both;
-    let project = crate::runtime::strategy_name_from_path(&args.strategy);
+    let project = live_project_name(dir, &args.strategy);
     let deploy_id = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -253,6 +253,39 @@ fn build_live_artifact_sink(
         artifact_config.s3.as_ref(),
     );
     Ok(Some(std::sync::Arc::new(sink)))
+}
+
+/// Resolve the project name for a live deployment's S3 keys.
+///
+/// The strategy path inside a deployment is the code snapshot
+/// (`<project>/live/<deploy-id>/code/main.py`), so deriving the name from the
+/// file's parent dir would yield `code`. Prefer the recorded metadata:
+///
+/// 1. `deployment.json` in the deploy dir (`strategy_name` field),
+/// 2. the project dir name when the deploy dir sits at `<project>/live/<id>`,
+/// 3. the strategy file name as a last resort.
+fn live_project_name(deploy_dir: &std::path::Path, strategy: &std::path::Path) -> String {
+    if let Ok(text) = std::fs::read_to_string(deploy_dir.join("deployment.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(name) = value.get("strategy_name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    if let Some(live_dir) = deploy_dir.parent() {
+        if live_dir.file_name().and_then(|n| n.to_str()) == Some("live") {
+            if let Some(project) = live_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+            {
+                return project.to_string();
+            }
+        }
+    }
+    crate::runtime::strategy_name_from_path(strategy)
 }
 
 fn live_brokerage_model_for_name(name: &str) -> Option<BrokerageName> {
@@ -308,5 +341,61 @@ mod tests {
         assert!(is_paper_brokerage_name("PaperBrokerage"));
         assert!(!is_paper_brokerage_name("tradier"));
         assert_eq!(live_brokerage_model_for_name("custom"), None);
+    }
+
+    /// A deployment's strategy path is the code snapshot
+    /// (`<project>/live/<deploy-id>/code/main.py`). The S3 project component
+    /// must resolve to the project name, never the `code` snapshot dir.
+    #[test]
+    fn test_live_project_name_prefers_deployment_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy_dir = tmp
+            .path()
+            .join("uw_control")
+            .join("live")
+            .join("2026-07-08_060145_uw_control");
+        let code_dir = deploy_dir.join("code");
+        std::fs::create_dir_all(&code_dir).unwrap();
+        let strategy = code_dir.join("main.py");
+        std::fs::write(&strategy, "pass").unwrap();
+        std::fs::write(
+            deploy_dir.join("deployment.json"),
+            r#"{"deploy_id":"2026-07-08_060145_uw_control","strategy_name":"uw_control"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(live_project_name(&deploy_dir, &strategy), "uw_control");
+    }
+
+    #[test]
+    fn test_live_project_name_falls_back_to_project_dir() {
+        // No deployment.json: derive the project from <project>/live/<deploy-id>.
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy_dir = tmp
+            .path()
+            .join("uw_control")
+            .join("live")
+            .join("2026-07-08_060145_uw_control");
+        let code_dir = deploy_dir.join("code");
+        std::fs::create_dir_all(&code_dir).unwrap();
+        let strategy = code_dir.join("main.py");
+        std::fs::write(&strategy, "pass").unwrap();
+
+        assert_eq!(live_project_name(&deploy_dir, &strategy), "uw_control");
+    }
+
+    #[test]
+    fn test_live_project_name_last_resort_uses_strategy_path() {
+        // Exotic layout without live/<id> structure or metadata: fall back to
+        // the strategy file's name derivation.
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy_dir = tmp.path().join("somewhere");
+        std::fs::create_dir_all(&deploy_dir).unwrap();
+        let strategy_dir = tmp.path().join("my_algo");
+        std::fs::create_dir_all(&strategy_dir).unwrap();
+        let strategy = strategy_dir.join("main.py");
+        std::fs::write(&strategy, "pass").unwrap();
+
+        assert_eq!(live_project_name(&deploy_dir, &strategy), "my_algo");
     }
 }
