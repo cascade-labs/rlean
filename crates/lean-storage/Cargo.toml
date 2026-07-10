@@ -18,6 +18,7 @@ object_store = { version = "0.12", features = ["aws"] }
 url = "2"
 iceberg = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 typetag = { workspace = true }

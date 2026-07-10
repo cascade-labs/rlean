@@ -13,12 +13,23 @@
 //! env vars) so one credential set can serve both the data store and the
 //! artifact relay.
 //!
+//! The two modes use different Iceberg catalogs:
+//! - `local`: plain local-filesystem warehouse + SQLite catalog (no server).
+//! - `s3`: S3 warehouse + Lakekeeper REST catalog. `data_catalog`
+//!   (`RLEAN_DATA_CATALOG`, default `http://localhost:8181/catalog`) and
+//!   `data_warehouse` (`RLEAN_DATA_WAREHOUSE`, default `rlean`) apply only here.
+//!
 //! Default is local-only. Nothing changes for users who do not opt in.
 
 use anyhow::{bail, Result};
-use lean_storage::S3DataStoreConfig;
+use lean_storage::{RestCatalogConnection, S3DataStoreConfig};
 
 use crate::config::GlobalConfig;
+
+/// Default Iceberg REST catalog (Lakekeeper) URL when `data_catalog` is unset.
+const DEFAULT_DATA_CATALOG: &str = "http://localhost:8181/catalog";
+/// Default Lakekeeper warehouse name when `data_warehouse` is unset.
+const DEFAULT_DATA_WAREHOUSE: &str = "rlean";
 
 /// Which backend the market-data store reads from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +41,9 @@ pub(crate) enum DataStoreMode {
 /// Resolved market-data store configuration for a run.
 pub(crate) struct ResolvedDataStoreConfig {
     pub mode: DataStoreMode,
+    /// S3 warehouse settings + REST catalog connection. `Some` only in S3 mode.
     pub s3: Option<S3DataStoreConfig>,
+    pub catalog: Option<RestCatalogConnection>,
 }
 
 /// Read an env var, treating an empty/whitespace value as unset.
@@ -58,7 +71,11 @@ fn resolve_mode(config: &GlobalConfig) -> Result<DataStoreMode> {
 pub(crate) fn resolve(config: &GlobalConfig) -> Result<ResolvedDataStoreConfig> {
     let mode = resolve_mode(config)?;
     if mode == DataStoreMode::Local {
-        return Ok(ResolvedDataStoreConfig { mode, s3: None });
+        return Ok(ResolvedDataStoreConfig {
+            mode,
+            s3: None,
+            catalog: None,
+        });
     }
 
     let warehouse = env("RLEAN_DATA_S3")
@@ -91,6 +108,13 @@ pub(crate) fn resolve(config: &GlobalConfig) -> Result<ResolvedDataStoreConfig> 
         .or_else(|| config.s3_secret_key.clone())
         .ok_or_else(|| missing("secret key", "data_s3_secret_key"))?;
 
+    let catalog_uri = env("RLEAN_DATA_CATALOG")
+        .or_else(|| config.data_catalog.clone())
+        .unwrap_or_else(|| DEFAULT_DATA_CATALOG.to_string());
+    let catalog_warehouse = env("RLEAN_DATA_WAREHOUSE")
+        .or_else(|| config.data_warehouse.clone())
+        .unwrap_or_else(|| DEFAULT_DATA_WAREHOUSE.to_string());
+
     Ok(ResolvedDataStoreConfig {
         mode,
         s3: Some(S3DataStoreConfig {
@@ -99,6 +123,10 @@ pub(crate) fn resolve(config: &GlobalConfig) -> Result<ResolvedDataStoreConfig> 
             region,
             access_key,
             secret_key,
+        }),
+        catalog: Some(RestCatalogConnection {
+            uri: catalog_uri,
+            warehouse: catalog_warehouse,
         }),
     })
 }
@@ -138,6 +166,8 @@ mod tests {
             "RLEAN_S3_REGION",
             "RLEAN_S3_ACCESS_KEY",
             "RLEAN_S3_SECRET_KEY",
+            "RLEAN_DATA_CATALOG",
+            "RLEAN_DATA_WAREHOUSE",
         ] {
             std::env::remove_var(key);
         }
@@ -178,6 +208,28 @@ mod tests {
         assert_eq!(s3.region, "us-ashburn-1");
         assert_eq!(s3.access_key, "ak");
         assert_eq!(s3.secret_key, "sk");
+        // Catalog defaults apply when data_catalog / data_warehouse are unset.
+        let catalog = resolved.catalog.unwrap();
+        assert_eq!(catalog.uri, DEFAULT_DATA_CATALOG);
+        assert_eq!(catalog.warehouse, DEFAULT_DATA_WAREHOUSE);
+    }
+
+    #[test]
+    fn catalog_overrides_apply_in_s3_mode() {
+        let _guard = env_lock();
+        clear_env();
+        let mut cfg = base_config();
+        cfg.data_store = Some("s3".to_string());
+        cfg.data_s3 = Some("s3://rlean-data/iceberg-lk".to_string());
+        cfg.data_s3_endpoint = Some("https://example.com".to_string());
+        cfg.data_s3_region = Some("us-ashburn-1".to_string());
+        cfg.data_s3_access_key = Some("ak".to_string());
+        cfg.data_s3_secret_key = Some("sk".to_string());
+        cfg.data_catalog = Some("http://catalog.example:8181/catalog".to_string());
+        cfg.data_warehouse = Some("rlean_lk".to_string());
+        let catalog = resolve(&cfg).unwrap().catalog.unwrap();
+        assert_eq!(catalog.uri, "http://catalog.example:8181/catalog");
+        assert_eq!(catalog.warehouse, "rlean_lk");
     }
 
     #[test]

@@ -35,6 +35,9 @@ use iceberg::{
     Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
     TableCreation, TableIdent,
 };
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_datafusion::IcebergTableProviderFactory;
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -135,14 +138,30 @@ pub struct CompactionStats {
     pub appends: usize,
 }
 
-/// Connection settings for an S3-backed market-data warehouse.
+/// Iceberg REST catalog (Lakekeeper) connection settings for `data_store = s3`.
 ///
-/// All fields are required; the resolver in the `rlean` crate enforces their
-/// presence before constructing this. Path-style addressing is always used
-/// (the bucket name may contain characters that break virtual-host addressing).
+/// The S3 data store always resolves its tables through a REST catalog; the
+/// resolver in the `rlean` crate enforces the presence of these before
+/// constructing the store. (Local mode uses its own SQLite catalog and does not
+/// take this.)
+#[derive(Clone, Debug)]
+pub struct RestCatalogConnection {
+    /// REST catalog base URL, e.g. `http://localhost:8181/catalog`.
+    pub uri: String,
+    /// Lakekeeper warehouse name the catalog resolves for this run.
+    pub warehouse: String,
+}
+
+/// S3 FileIO settings for an S3-backed market-data warehouse.
+///
+/// Path-style addressing is always used (the bucket name may contain characters
+/// that break virtual-host addressing). These props are also merged into the
+/// FileIO the REST catalog constructs, so the store never depends on Lakekeeper
+/// vending a complete-and-correct S3 config.
 #[derive(Clone, Debug)]
 pub struct S3DataStoreConfig {
-    /// Iceberg warehouse root, e.g. `s3://bucket/prefix`.
+    /// Iceberg warehouse root, e.g. `s3://bucket/prefix`. Used to derive the
+    /// DataFusion object-store bucket; the catalog resolves data-file locations.
     pub warehouse: String,
     pub endpoint: String,
     pub region: String,
@@ -188,6 +207,14 @@ fn is_catalog_commit_conflict(err: &anyhow::Error) -> bool {
 }
 
 impl IcebergStore {
+    /// Connect to a local-filesystem warehouse via the Iceberg SQL (SQLite)
+    /// catalog.
+    ///
+    /// This is the `data_store = local` path: a plain on-disk warehouse under
+    /// `data_root/iceberg` with a co-located SQLite catalog. It is deliberately
+    /// independent of Lakekeeper — the REST catalog cannot back a local-FS
+    /// warehouse (it has no filesystem storage profile), so local mode keeps its
+    /// own single-node catalog.
     pub async fn connect_local(data_root: impl AsRef<Path>) -> Result<Self> {
         let warehouse_root = data_root.as_ref().join("iceberg");
         tokio::fs::create_dir_all(&warehouse_root)
@@ -229,47 +256,25 @@ impl IcebergStore {
         Ok(store)
     }
 
-    /// Connect to an S3-backed warehouse.
+    /// Connect to an S3-backed warehouse through the Iceberg REST catalog.
     ///
-    /// The Iceberg SQLite catalog cannot live on S3, so `catalog_db_path` is a
-    /// deterministic *local* path (the caller derives it under `~/.rlean/` from
-    /// the warehouse URL). Its parent directory and the SQLite database are
-    /// created if missing, mirroring [`IcebergStore::connect_local`].
-    pub async fn connect_s3(config: S3DataStoreConfig, catalog_db_path: PathBuf) -> Result<Self> {
-        if let Some(parent) = catalog_db_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let catalog_uri = format!("sqlite:{}", catalog_db_path.display());
-        if !Sqlite::database_exists(&catalog_uri).await.unwrap_or(false) {
-            Sqlite::create_database(&catalog_uri)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to create Iceberg catalog {}",
-                        catalog_db_path.display()
-                    )
-                })?;
-        }
-
+    /// The REST catalog at `catalog.uri` owns table metadata; `config` supplies
+    /// the S3 FileIO props (endpoint/region/credentials, path-style) used both
+    /// for the catalog's own FileIO and for the DataFusion object store.
+    pub async fn connect_s3(
+        config: S3DataStoreConfig,
+        catalog: RestCatalogConnection,
+    ) -> Result<Self> {
         let s3_props = s3_file_io_props(&config);
-        let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(s3_storage_factory(&config)))
-            .uri(catalog_uri)
-            .warehouse_location(config.warehouse.clone())
-            .sql_bind_style(SqlBindStyle::QMark)
-            .load(CATALOG_NAME, s3_props)
-            .await
-            .context("failed to load Iceberg SQL catalog")?;
+        let rest =
+            build_rest_catalog(&catalog, Arc::new(s3_storage_factory(&config)), s3_props).await?;
 
         let store = Self {
             backend: WarehouseBackend::S3 {
                 warehouse: config.warehouse.clone(),
                 s3: config,
             },
-            catalog: Arc::new(catalog),
+            catalog: Arc::new(rest),
             namespace: NamespaceIdent::new(NAMESPACE.into()),
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
             partition_indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -289,14 +294,15 @@ impl IcebergStore {
         }
     }
 
-    /// Iceberg table `location` URI for `table` under this warehouse.
-    fn table_location(&self, table: &str) -> Result<String> {
+    /// Client-assigned Iceberg table `location` for the local (SQLite-catalog)
+    /// warehouse. `None` in S3 mode: the Lakekeeper REST catalog owns the
+    /// warehouse and assigns each table's location itself.
+    fn table_location(&self, table: &str) -> Result<Option<String>> {
         match &self.backend {
-            WarehouseBackend::Local { root } => path_to_file_uri(&root.join(NAMESPACE).join(table)),
-            WarehouseBackend::S3 { warehouse, .. } => Ok(format!(
-                "{}/{NAMESPACE}/{table}",
-                warehouse.trim_end_matches('/')
-            )),
+            WarehouseBackend::Local { root } => {
+                Ok(Some(path_to_file_uri(&root.join(NAMESPACE).join(table))?))
+            }
+            WarehouseBackend::S3 { .. } => Ok(None),
         }
     }
 
@@ -854,13 +860,16 @@ impl IcebergStore {
             return Ok(());
         }
         let spec = partition_spec(schema.clone(), partition_columns)?;
-        let location = self.table_location(name)?;
-        let creation = TableCreation::builder()
+        // Local mode (SQLite catalog) assigns the table location client-side.
+        // S3 mode's REST catalog (Lakekeeper) owns the warehouse and assigns
+        // each table's physical location itself, so no client location is set
+        // (`None`).
+        let mut creation = TableCreation::builder()
             .name(name.into())
             .schema(schema)
             .partition_spec(spec.into_unbound())
-            .location(location)
             .build();
+        creation.location = self.table_location(name)?;
         if let Err(error) = self.catalog.create_table(&self.namespace, creation).await {
             // Concurrent connects race between the existence check and the
             // create (the catalog enforces uniqueness); losing that race is
@@ -2402,15 +2411,50 @@ impl IcebergStore {
     }
 }
 
+/// Build the Iceberg REST catalog (Lakekeeper) client.
+///
+/// `storage_props` are merged into the catalog `load()` props so they reach the
+/// FileIO the catalog builds for every table (`iceberg-catalog-rest` 0.9.1
+/// forwards catalog props into `FileIOBuilder::with_props`). For S3 this carries
+/// the endpoint/region/credentials and path-style flag; the props-carrying
+/// `S3ConfiguredStorageFactory` additionally forces them on every FileIO so the
+/// store never depends on Lakekeeper vending a complete S3 config. The initial
+/// `namespace_exists` probe in [`IcebergStore::ensure_tables`] surfaces an
+/// unreachable or unbootstrapped catalog as a clear hard error.
+async fn build_rest_catalog(
+    connection: &RestCatalogConnection,
+    storage_factory: Arc<dyn StorageFactory>,
+    storage_props: HashMap<String, String>,
+) -> Result<impl Catalog> {
+    let mut props = storage_props;
+    props.insert(REST_CATALOG_PROP_URI.to_string(), connection.uri.clone());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        connection.warehouse.clone(),
+    );
+    RestCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
+        .load(CATALOG_NAME, props)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load Iceberg REST catalog at {} (warehouse '{}'). \
+                 Is Lakekeeper running and bootstrapped, with that warehouse created?",
+                connection.uri, connection.warehouse
+            )
+        })
+}
+
 /// Storage factory that carries the S3 connection properties itself.
 ///
-/// `iceberg-catalog-sql` 0.9.1 builds its `FileIO` as
-/// `FileIOBuilder::new(factory).build()` without forwarding any catalog props,
-/// so a bare `OpenDalStorageFactory::S3` would see an empty `StorageConfig`
-/// (no endpoint / region / credentials) and fail with "region is missing".
-/// This wrapper merges the configured S3 props into whatever config it is
-/// handed before delegating to the OpenDAL S3 factory. The same applies to the
-/// DataFusion `IcebergTableProviderFactory` FileIO path.
+/// `iceberg-catalog-rest` 0.9.1 builds its `FileIO` from the catalog props plus
+/// whatever storage config Lakekeeper vends. This wrapper additionally merges
+/// the configured S3 props into whatever config it is handed before delegating
+/// to the OpenDAL S3 factory, so `s3.path-style-access=true` and the
+/// endpoint/region/credentials are always present even if the vended config
+/// omits or differs on them (a bare `OpenDalStorageFactory::S3` would otherwise
+/// fail with "region is missing"). The same applies to the DataFusion
+/// `IcebergTableProviderFactory` FileIO path.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct S3ConfiguredStorageFactory {
     props: HashMap<String, String>,

@@ -24,6 +24,8 @@
 ///   data_s3_region              Data-store region (falls back to s3_region)
 ///   data_s3_access_key          Data-store access key (falls back to s3_access_key)
 ///   data_s3_secret_key          Data-store secret key (falls back to s3_secret_key)
+///   data_catalog                S3-mode Iceberg REST catalog URL (Lakekeeper; default http://localhost:8181/catalog)
+///   data_warehouse              S3-mode Lakekeeper warehouse name (default rlean)
 ///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -155,7 +157,9 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
         | "data_s3_endpoint"
         | "data_s3_region"
         | "data_s3_access_key"
-        | "data_s3_secret_key" => {
+        | "data_s3_secret_key"
+        | "data_catalog"
+        | "data_warehouse" => {
             let mut cfg = GlobalConfig::load()?;
             set_s3_key(&mut cfg, key, value.to_string())?;
             cfg.save()?;
@@ -167,7 +171,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
              artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
              artifact_s3_access_key, artifact_s3_secret_key, \
              data_store, data_s3, data_s3_endpoint, data_s3_region, \
-             data_s3_access_key, data_s3_secret_key. \
+             data_s3_access_key, data_s3_secret_key, data_catalog, data_warehouse. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -224,7 +228,9 @@ fn cmd_get(key: &str) -> Result<()> {
         | "data_s3_endpoint"
         | "data_s3_region"
         | "data_s3_access_key"
-        | "data_s3_secret_key" => {
+        | "data_s3_secret_key"
+        | "data_catalog"
+        | "data_warehouse" => {
             let cfg = GlobalConfig::load()?;
             match get_s3_key(&cfg, key)? {
                 Some(value) if is_secret_key(key) => println!("{}", mask(value)),
@@ -238,7 +244,7 @@ fn cmd_get(key: &str) -> Result<()> {
              artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
              artifact_s3_access_key, artifact_s3_secret_key, \
              data_store, data_s3, data_s3_endpoint, data_s3_region, \
-             data_s3_access_key, data_s3_secret_key. \
+             data_s3_access_key, data_s3_secret_key, data_catalog, data_warehouse. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -280,6 +286,8 @@ fn cmd_list() -> Result<()> {
         "data_s3_region",
         "data_s3_access_key",
         "data_s3_secret_key",
+        "data_catalog",
+        "data_warehouse",
     ] {
         if let Some(value) = get_s3_key(&global, key)? {
             let display = if is_secret_key(key) {
@@ -352,6 +360,8 @@ fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
         "data_s3_region" => cfg.data_s3_region = Some(value),
         "data_s3_access_key" => cfg.data_s3_access_key = Some(value),
         "data_s3_secret_key" => cfg.data_s3_secret_key = Some(value),
+        "data_catalog" => cfg.data_catalog = Some(value),
+        "data_warehouse" => cfg.data_warehouse = Some(value),
         _ => bail!("unknown S3 config key '{key}'"),
     }
     Ok(())
@@ -374,6 +384,8 @@ fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
         "data_s3_region" => Ok(cfg.data_s3_region.as_deref()),
         "data_s3_access_key" => Ok(cfg.data_s3_access_key.as_deref()),
         "data_s3_secret_key" => Ok(cfg.data_s3_secret_key.as_deref()),
+        "data_catalog" => Ok(cfg.data_catalog.as_deref()),
+        "data_warehouse" => Ok(cfg.data_warehouse.as_deref()),
         _ => bail!("unknown S3 config key '{key}'"),
     }
 }

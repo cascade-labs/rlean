@@ -122,6 +122,27 @@ pub struct GlobalConfig {
     #[serde(default, rename = "data_s3", skip_serializing_if = "Option::is_none")]
     pub data_s3: Option<String>,
 
+    /// Iceberg REST catalog (Lakekeeper) base URL. Defaults to
+    /// `http://localhost:8181` when unset. The catalog is always REST in both
+    /// `local` and `s3` data-store modes.
+    #[serde(
+        default,
+        rename = "data_catalog",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_catalog: Option<String>,
+
+    /// Lakekeeper warehouse name the REST catalog resolves for this run. Falls
+    /// back to `rlean` when unset. `data_store` selects where that warehouse's
+    /// storage points (local dir vs S3), but the warehouse itself is created and
+    /// named operator-side in Lakekeeper.
+    #[serde(
+        default,
+        rename = "data_warehouse",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_warehouse: Option<String>,
+
     /// Data-store S3 endpoint URL. Falls back to `s3_endpoint` when unset.
     #[serde(
         default,
