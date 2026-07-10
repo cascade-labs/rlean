@@ -76,6 +76,7 @@ async fn run_strategy_backtest(
     let end_date_override = args.end_date.as_deref().map(parse_date).transpose()?;
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 
+    let strategy_name = strategy_name_from_path(&args.strategy);
     let (backtest_dir, backtests_root) = if let Some(p) = args.report.clone() {
         std::fs::create_dir_all(&p)?;
         (p, None)
@@ -86,10 +87,40 @@ async fn run_strategy_backtest(
             .map(|p| p.join("backtests"))
             .unwrap_or_else(|| PathBuf::from("backtests"));
         let now = chrono::Utc::now();
-        let name = strategy_name_from_path(&args.strategy);
-        let backtest_dir = reserve_backtest_dir(&backtests_root, now, &name)?;
+        let backtest_dir = reserve_backtest_dir(&backtests_root, now, &strategy_name)?;
         (backtest_dir, Some(backtests_root))
     };
+
+    // Resolve the artifact store (local | s3 | both) and build the sink. The run
+    // id is the reserved dir's final path component; the project is the strategy
+    // name. The sink's working dir is where all run files (streaming + report)
+    // are written: the real dir for local/both, a temp buffer for s3-only.
+    let run_id = backtest_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&strategy_name)
+        .to_string();
+    let global_config = config::GlobalConfig::load()?;
+    let artifact_config = crate::artifacts_config::resolve(
+        args.artifact_store.as_deref(),
+        args.artifact_s3.as_deref(),
+        &global_config,
+    )?;
+    let sink = Arc::new(lean_engine::RunArtifactSink::new(
+        artifact_config.mode,
+        lean_engine::RunKind::Backtest,
+        backtest_dir.clone(),
+        &strategy_name,
+        &run_id,
+        artifact_config.s3.as_ref(),
+    ));
+    // All run files go into the sink's working dir. For local/both this is the
+    // real backtest dir; for s3-only it is a temp buffer uploaded and deleted at
+    // the end — remove the just-reserved (empty) local dir in that case.
+    if !sink.writes_local_run_dir() {
+        let _ = std::fs::remove_dir(&backtest_dir);
+    }
+    let backtest_dir = sink.working_dir().to_path_buf();
 
     let code_dir = backtest_dir.join("code");
     if let Err(e) = std::fs::create_dir_all(&code_dir) {
@@ -149,6 +180,7 @@ async fn run_strategy_backtest(
         custom_data_sources,
         data_feed_options,
         output_dir: Some(backtest_dir.clone()),
+        artifact_sink: Some(sink.clone()),
         progress: Some(progress),
     };
 
@@ -245,13 +277,42 @@ async fn run_strategy_backtest(
         eprintln!("Failed to write report: {e}");
     }
 
-    if let Some(root) = backtests_root {
-        if let Err(e) = update_backtests_latest_symlink(&root, &backtest_dir) {
-            eprintln!("Warning: could not update backtests/latest symlink: {e}");
+    // Final artifact upload: mirror the complete run dir (streaming + report
+    // files) to S3, bypassing the per-file checkpoint throttle. In s3-only mode
+    // this uploads then deletes the temp working buffer when `sink` is dropped.
+    sink.flush_all();
+
+    // Only maintain the local `latest` symlink when we actually kept a local run
+    // dir (skip in s3-only mode, whose working dir is a temp buffer).
+    if sink.writes_local_run_dir() {
+        if let Some(root) = backtests_root {
+            if let Err(e) = update_backtests_latest_symlink(&root, &backtest_dir) {
+                eprintln!("Warning: could not update backtests/latest symlink: {e}");
+            }
         }
     }
 
-    println!("Results: {}", backtest_dir.display());
+    match sink.mode() {
+        lean_engine::ArtifactStoreMode::S3 => {
+            if let Some(base) = sink.s3_key_base() {
+                println!(
+                    "Results: s3://{}/{}",
+                    s3_bucket_display(&artifact_config),
+                    base
+                );
+            }
+        }
+        _ => {
+            println!("Results: {}", backtest_dir.display());
+            if let Some(base) = sink.s3_key_base() {
+                println!(
+                    "Mirrored to: s3://{}/{}",
+                    s3_bucket_display(&artifact_config),
+                    base
+                );
+            }
+        }
+    }
 
     // Results are on disk; now (best-effort) collapse the snapshot/manifest
     // bloat that the run's appends left in the cache so the next backtest plans
@@ -262,6 +323,15 @@ async fn run_strategy_backtest(
     }
 
     Ok(())
+}
+
+/// Bucket name for display in the "Results" / "Mirrored to" lines.
+fn s3_bucket_display(config: &crate::artifacts_config::ArtifactConfig) -> String {
+    config
+        .s3
+        .as_ref()
+        .map(|s| s.bucket.clone())
+        .unwrap_or_default()
 }
 
 /// Minimum per-table metadata-version count before the post-backtest pass

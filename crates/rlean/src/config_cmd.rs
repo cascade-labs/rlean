@@ -12,6 +12,12 @@
 ///   s3_bucket                   S3 bucket name
 ///   s3_endpoint                 S3-compatible endpoint URL
 ///   s3_region                   S3 region
+///   artifact_store              Run artifact relay mode: local | s3 | both
+///   artifact_s3                 Artifact destination: s3://bucket/prefix
+///   artifact_s3_endpoint        Artifact endpoint URL (falls back to s3_endpoint)
+///   artifact_s3_region          Artifact region (falls back to s3_region)
+///   artifact_s3_access_key      Artifact access key (falls back to s3_access_key)
+///   artifact_s3_secret_key      Artifact secret key (falls back to s3_secret_key)
 ///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -108,7 +114,25 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             cfg.save()?;
             println!("Set datastore = {value} in ~/.rlean/config");
         }
-        "s3_access_key" | "s3_secret_key" | "s3_bucket" | "s3_endpoint" | "s3_region" => {
+        "artifact_store" => {
+            if lean_engine::ArtifactStoreMode::parse(value).is_none() {
+                bail!("artifact_store must be local, s3, or both, got '{}'", value);
+            }
+            let mut cfg = GlobalConfig::load()?;
+            cfg.artifact_store = Some(value.to_string());
+            cfg.save()?;
+            println!("Set artifact_store = {value} in ~/.rlean/config");
+        }
+        "s3_access_key"
+        | "s3_secret_key"
+        | "s3_bucket"
+        | "s3_endpoint"
+        | "s3_region"
+        | "artifact_s3"
+        | "artifact_s3_endpoint"
+        | "artifact_s3_region"
+        | "artifact_s3_access_key"
+        | "artifact_s3_secret_key" => {
             let mut cfg = GlobalConfig::load()?;
             set_s3_key(&mut cfg, key, value.to_string())?;
             cfg.save()?;
@@ -116,7 +140,9 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
-             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region. \
+             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
+             artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
+             artifact_s3_access_key, artifact_s3_secret_key. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -151,7 +177,20 @@ fn cmd_get(key: &str) -> Result<()> {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.datastore);
         }
-        "s3_access_key" | "s3_secret_key" | "s3_bucket" | "s3_endpoint" | "s3_region" => {
+        "artifact_store" => {
+            let cfg = GlobalConfig::load()?;
+            println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
+        }
+        "s3_access_key"
+        | "s3_secret_key"
+        | "s3_bucket"
+        | "s3_endpoint"
+        | "s3_region"
+        | "artifact_s3"
+        | "artifact_s3_endpoint"
+        | "artifact_s3_region"
+        | "artifact_s3_access_key"
+        | "artifact_s3_secret_key" => {
             let cfg = GlobalConfig::load()?;
             match get_s3_key(&cfg, key)? {
                 Some(value) if is_secret_key(key) => println!("{}", mask(value)),
@@ -161,7 +200,9 @@ fn cmd_get(key: &str) -> Result<()> {
         }
         _ => bail!(
             "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
-             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region. \
+             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
+             artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
+             artifact_s3_access_key, artifact_s3_secret_key. \
              Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
             key
         ),
@@ -181,12 +222,20 @@ fn cmd_list() -> Result<()> {
     println!("{:<30} {}", "default-language", global.default_language);
     println!("{:<30} {}", "datastore", global.datastore);
     println!("{:<30} {}", "data-folder", data_folder);
+    if let Some(mode) = &global.artifact_store {
+        println!("{:<30} {}", "artifact_store", mode);
+    }
     for key in [
         "s3_access_key",
         "s3_secret_key",
         "s3_bucket",
         "s3_endpoint",
         "s3_region",
+        "artifact_s3",
+        "artifact_s3_endpoint",
+        "artifact_s3_region",
+        "artifact_s3_access_key",
+        "artifact_s3_secret_key",
     ] {
         if let Some(value) = get_s3_key(&global, key)? {
             let display = if is_secret_key(key) {
@@ -249,6 +298,11 @@ fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
         "s3_bucket" => cfg.s3_bucket = Some(value),
         "s3_endpoint" => cfg.s3_endpoint = Some(value),
         "s3_region" => cfg.s3_region = Some(value),
+        "artifact_s3" => cfg.artifact_s3 = Some(value),
+        "artifact_s3_endpoint" => cfg.artifact_s3_endpoint = Some(value),
+        "artifact_s3_region" => cfg.artifact_s3_region = Some(value),
+        "artifact_s3_access_key" => cfg.artifact_s3_access_key = Some(value),
+        "artifact_s3_secret_key" => cfg.artifact_s3_secret_key = Some(value),
         _ => bail!("unknown S3 config key '{key}'"),
     }
     Ok(())
@@ -261,10 +315,18 @@ fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
         "s3_bucket" => Ok(cfg.s3_bucket.as_deref()),
         "s3_endpoint" => Ok(cfg.s3_endpoint.as_deref()),
         "s3_region" => Ok(cfg.s3_region.as_deref()),
+        "artifact_s3" => Ok(cfg.artifact_s3.as_deref()),
+        "artifact_s3_endpoint" => Ok(cfg.artifact_s3_endpoint.as_deref()),
+        "artifact_s3_region" => Ok(cfg.artifact_s3_region.as_deref()),
+        "artifact_s3_access_key" => Ok(cfg.artifact_s3_access_key.as_deref()),
+        "artifact_s3_secret_key" => Ok(cfg.artifact_s3_secret_key.as_deref()),
         _ => bail!("unknown S3 config key '{key}'"),
     }
 }
 
 fn is_secret_key(key: &str) -> bool {
-    matches!(key, "s3_access_key" | "s3_secret_key")
+    matches!(
+        key,
+        "s3_access_key" | "s3_secret_key" | "artifact_s3_access_key" | "artifact_s3_secret_key"
+    )
 }

@@ -179,12 +179,21 @@ where
     let mut trade_builder = TradeBuilder::new();
     let mut completed_trades = Vec::new();
 
-    // Optional incremental result streamer. When an output directory is set the
-    // runner appends order events / trades and rewrites progress.json while the
-    // backtest is still running, matching the live path's streaming sidecars.
-    let mut stream_writer = config.output_dir.as_ref().map(|dir| {
-        crate::runner::stream_writer::BacktestStreamWriter::new(dir.clone(), start, end)
-    });
+    // Optional incremental result streamer. When an output directory (or an
+    // artifact sink) is set the runner appends order events / trades and
+    // rewrites progress.json while the backtest is still running, matching the
+    // live path's streaming sidecars. An artifact sink also mirrors these files
+    // to S3 per its configured mode.
+    let mut stream_writer = config
+        .artifact_sink
+        .clone()
+        .or_else(|| {
+            config
+                .output_dir
+                .as_ref()
+                .map(|dir| Arc::new(crate::artifacts::RunArtifactSink::local(dir.clone())))
+        })
+        .map(|sink| crate::runner::stream_writer::BacktestStreamWriter::new(sink, start, end));
     let mut streamed_order_events = 0usize;
     let mut streamed_trades = 0usize;
 

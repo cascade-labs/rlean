@@ -1,3 +1,4 @@
+use crate::artifacts::RunArtifactSink;
 use crate::data_feed::DataFeedOptions;
 use lean_algorithm::charting::ChartCollection;
 use lean_algorithm::qc_algorithm::BrokerageName;
@@ -43,6 +44,10 @@ pub struct BacktestRunConfig {
     /// Optional backtest output directory. When set, progress/order/trade sidecar
     /// files are written while the backtest is still running.
     pub output_dir: Option<PathBuf>,
+    /// Optional artifact sink. When set, streaming files are written into the
+    /// sink's working dir and mirrored to S3 per the sink's mode. Takes
+    /// precedence over `output_dir` for the streaming writer's location.
+    pub artifact_sink: Option<Arc<RunArtifactSink>>,
     pub progress: Option<Arc<dyn Fn(BacktestProgress) + Send + Sync>>,
 }
 
@@ -59,6 +64,7 @@ impl Default for BacktestRunConfig {
             custom_data_sources: vec![],
             data_feed_options: DataFeedOptions::default(),
             output_dir: None,
+            artifact_sink: None,
             progress: None,
         }
     }
@@ -102,6 +108,9 @@ pub struct LiveRunConfig {
     /// Optional live deployment directory. When set, live portfolio/order/log
     /// sidecars are written while the run is still active.
     pub output_dir: Option<PathBuf>,
+    /// Optional artifact sink. When set, snapshots are written into the sink's
+    /// working dir and mirrored to S3 asynchronously per the sink's mode.
+    pub artifact_sink: Option<Arc<RunArtifactSink>>,
 }
 
 pub struct LiveRunResult {

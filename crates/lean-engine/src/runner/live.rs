@@ -224,10 +224,15 @@ where
             brokerage_router = Some(router);
         }
     }
-    let live_writer = config
-        .output_dir
-        .as_ref()
-        .map(|dir| crate::live::deployment_writer::LiveDeploymentWriter::new(dir.clone()));
+    // Prefer an artifact sink (mirrors snapshots to S3 per its mode); fall back
+    // to a plain local writer when only an output dir is set.
+    let live_writer = match config.artifact_sink.clone() {
+        Some(sink) => Some(crate::live::deployment_writer::LiveDeploymentWriter::with_sink(sink)),
+        None => config
+            .output_dir
+            .as_ref()
+            .map(|dir| crate::live::deployment_writer::LiveDeploymentWriter::new(dir.clone())),
+    };
     let restored = if config.paper_trading {
         config
             .output_dir
@@ -415,6 +420,11 @@ where
         .parse::<f64>()
         .unwrap_or(0.0);
     snapshot.recent_order_events = all_order_events.clone();
+
+    // Clean shutdown: drain any queued S3 uploads so the final snapshot lands.
+    if let Some(writer) = live_writer.as_ref() {
+        writer.flush();
+    }
 
     Ok(LiveRunResult {
         slices_processed: algorithm_manager.slices_processed() as usize,
@@ -1841,6 +1851,7 @@ mod tests {
             max_slices: Some(1),
             max_runtime: Some(Duration::from_millis(50)),
             output_dir: None,
+            artifact_sink: None,
         }
     }
 

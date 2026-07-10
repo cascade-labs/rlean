@@ -128,6 +128,11 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         bail!("Live trading currently supports Python strategies only");
     }
 
+    // Build the artifact sink for this deployment. Live always keeps the local
+    // deploy dir (the live control surface reads it); `s3`-only is treated like
+    // `both` so we never delete the local dir out from under the control layer.
+    let artifact_sink = build_live_artifact_sink(&global_config, deploy_dir.as_deref(), &args)?;
+
     let strategy_path = args.strategy.clone();
     let live_config = lean_engine::LiveRunConfig {
         data_root: datastore.data_root.clone(),
@@ -145,6 +150,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             .live_max_runtime_seconds
             .map(Duration::from_secs),
         output_dir: deploy_dir,
+        artifact_sink,
     };
     let state = Arc::new(std::sync::Mutex::new(
         lean_algorithm::qc_algorithm::QcAlgorithm::new(
@@ -206,6 +212,47 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Build the artifact sink for a live deployment.
+///
+/// Returns `None` when there is no deploy dir (nothing to mirror) or the mode
+/// is local. For live, `s3`-only is treated like `both`: the local deploy dir
+/// is always kept because the live control surface reads it, and snapshots are
+/// mirrored to S3 asynchronously.
+fn build_live_artifact_sink(
+    global_config: &config::GlobalConfig,
+    deploy_dir: Option<&std::path::Path>,
+    args: &crate::cli::RunArgs,
+) -> Result<Option<std::sync::Arc<lean_engine::RunArtifactSink>>> {
+    let Some(dir) = deploy_dir else {
+        return Ok(None);
+    };
+    let artifact_config = crate::artifacts_config::resolve(
+        args.artifact_store.as_deref(),
+        args.artifact_s3.as_deref(),
+        global_config,
+    )?;
+    if artifact_config.mode == lean_engine::ArtifactStoreMode::Local {
+        return Ok(None);
+    }
+    // Never use an s3-only temp buffer for live — force local-primary mirroring.
+    let mode = lean_engine::ArtifactStoreMode::Both;
+    let project = crate::runtime::strategy_name_from_path(&args.strategy);
+    let deploy_id = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&project)
+        .to_string();
+    let sink = lean_engine::RunArtifactSink::new(
+        mode,
+        lean_engine::RunKind::Live,
+        dir.to_path_buf(),
+        &project,
+        &deploy_id,
+        artifact_config.s3.as_ref(),
+    );
+    Ok(Some(std::sync::Arc::new(sink)))
 }
 
 fn live_brokerage_model_for_name(name: &str) -> Option<BrokerageName> {
