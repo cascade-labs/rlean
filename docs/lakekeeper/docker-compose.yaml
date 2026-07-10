@@ -1,0 +1,77 @@
+name: rlean-lakekeeper-test
+services:
+  lakekeeper-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lakekeeper"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5433:5432"
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: ["migrate"]
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: rlean-test-key
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://postgres:postgres@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://postgres:postgres@lakekeeper-db:5432/lakekeeper
+      RUST_LOG: info
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: ["serve"]
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: rlean-test-key
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://postgres:postgres@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://postgres:postgres@lakekeeper-db:5432/lakekeeper
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8181:8181"
+
+  # Local S3 for the `local` end-to-end proof (Lakekeeper has no filesystem
+  # storage profile). Not needed for the real OCI `s3` run.
+  minio:
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+
+  minio-createbucket:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/rlean-data &&
+      echo bucket-ready
+      "
+    restart: "no"
