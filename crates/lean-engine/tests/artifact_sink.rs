@@ -38,7 +38,7 @@ async fn backtest_stream_writer_mirrors_run_files() {
     let tmp = tempfile::tempdir().unwrap();
     let run_dir = tmp.path().join("backtests").join("20260101_120000_algo");
     let (sink, store) = in_memory_sink(
-        ArtifactStoreMode::Both,
+        ArtifactStoreMode::Mirror,
         RunKind::Backtest,
         run_dir.clone(),
         "algo",
@@ -83,7 +83,7 @@ async fn backtest_stream_writer_mirrors_run_files() {
     .await;
     assert!(final_progress.contains("\"status\": \"completed\""));
 
-    // Local run dir still holds everything (Both is local-primary).
+    // Local run dir still holds everything (Mirror is local-primary).
     assert!(run_dir.join("progress.json").exists());
     assert!(run_dir.join("order-events.jsonl").exists());
 }
@@ -93,7 +93,7 @@ async fn live_deployment_writer_flush_uploads_deploy_files() {
     let tmp = tempfile::tempdir().unwrap();
     let deploy_dir = tmp.path().join("live").join("deploy-1");
     let (sink, store) = in_memory_sink(
-        ArtifactStoreMode::Both,
+        ArtifactStoreMode::Mirror,
         RunKind::Live,
         deploy_dir.clone(),
         "algo",

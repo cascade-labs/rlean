@@ -12,7 +12,7 @@
 ///   s3_bucket                   S3 bucket name
 ///   s3_endpoint                 S3-compatible endpoint URL
 ///   s3_region                   S3 region
-///   artifact_store              Run artifact relay mode: local | s3 | both
+///   artifact_store              Run artifact relay mode: local | s3 | mirror
 ///   artifact_s3                 Artifact destination: s3://bucket/prefix
 ///   artifact_s3_endpoint        Artifact endpoint URL (falls back to s3_endpoint)
 ///   artifact_s3_region          Artifact region (falls back to s3_region)
@@ -116,7 +116,10 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
         }
         "artifact_store" => {
             if lean_engine::ArtifactStoreMode::parse(value).is_none() {
-                bail!("artifact_store must be local, s3, or both, got '{}'", value);
+                bail!(
+                    "artifact_store must be local, s3, or mirror, got '{}'",
+                    value
+                );
             }
             let mut cfg = GlobalConfig::load()?;
             cfg.artifact_store = Some(value.to_string());

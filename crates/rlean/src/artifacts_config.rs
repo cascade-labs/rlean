@@ -33,7 +33,7 @@ fn resolve_mode(cli_mode: Option<&str>, config: &GlobalConfig) -> Result<Artifac
     match raw {
         None => Ok(ArtifactStoreMode::Local),
         Some(value) => ArtifactStoreMode::parse(&value).ok_or_else(|| {
-            anyhow::anyhow!("invalid artifact store '{value}', expected local|s3|both")
+            anyhow::anyhow!("invalid artifact store '{value}', expected local|s3|mirror")
         }),
     }
 }
@@ -79,7 +79,7 @@ pub(crate) fn resolve(
              RLEAN_ARTIFACT_S3, or `rlean config set artifact_s3 s3://bucket/prefix`",
             match mode {
                 ArtifactStoreMode::S3 => "s3",
-                ArtifactStoreMode::Both => "both",
+                ArtifactStoreMode::Mirror => "mirror",
                 ArtifactStoreMode::Local => unreachable!(),
             }
         )
@@ -141,9 +141,9 @@ mod tests {
     }
 
     #[test]
-    fn both_mode_requires_destination() {
+    fn mirror_mode_requires_destination() {
         let mut cfg = base_config();
-        cfg.artifact_store = Some("both".to_string());
+        cfg.artifact_store = Some("mirror".to_string());
         assert!(resolve(None, None, &cfg).is_err());
     }
 
@@ -154,8 +154,8 @@ mod tests {
         cfg.s3_access_key = Some("shared-key".to_string());
         cfg.s3_region = Some("us-east-1".to_string());
         // CLI overrides the config's local mode.
-        let resolved = resolve(Some("both"), Some("s3://bucket/prefix"), &cfg).unwrap();
-        assert_eq!(resolved.mode, ArtifactStoreMode::Both);
+        let resolved = resolve(Some("mirror"), Some("s3://bucket/prefix"), &cfg).unwrap();
+        assert_eq!(resolved.mode, ArtifactStoreMode::Mirror);
         let s3 = resolved.s3.unwrap();
         assert_eq!(s3.bucket, "bucket");
         assert_eq!(s3.prefix, "prefix");

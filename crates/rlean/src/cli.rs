@@ -111,12 +111,12 @@ pub(crate) struct RuntimeArgs {
 
     // ── Run artifact relay ────────────────────────────────────────────────────
     /// Where run artifacts (backtest/live run dirs) are written: local, s3, or
-    /// both. Defaults to local. Overrides RLEAN_ARTIFACT_STORE and config.
-    #[arg(long, value_name = "local|s3|both", env = "RLEAN_ARTIFACT_STORE")]
+    /// mirror. Defaults to local. Overrides RLEAN_ARTIFACT_STORE and config.
+    #[arg(long, value_name = "local|s3|mirror", env = "RLEAN_ARTIFACT_STORE")]
     pub(crate) artifact_store: Option<String>,
 
     /// S3 destination for run artifacts as s3://bucket/prefix. Required when
-    /// --artifact-store is s3 or both. Overrides RLEAN_ARTIFACT_S3 and config.
+    /// --artifact-store is s3 or mirror. Overrides RLEAN_ARTIFACT_S3 and config.
     #[arg(long, value_name = "s3://bucket/prefix", env = "RLEAN_ARTIFACT_S3")]
     pub(crate) artifact_s3: Option<String>,
 

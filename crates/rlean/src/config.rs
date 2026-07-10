@@ -61,7 +61,7 @@ pub struct GlobalConfig {
     pub s3_region: Option<String>,
 
     // ── Run artifact relay (backtest/live run dirs → S3) ──────────────────────
-    /// Where run artifacts are written: `local` (default), `s3`, or `both`.
+    /// Where run artifacts are written: `local` (default), `s3`, or `mirror`.
     #[serde(
         default,
         rename = "artifact_store",

@@ -130,7 +130,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     // Build the artifact sink for this deployment. Live always keeps the local
     // deploy dir (the live control surface reads it); `s3`-only is treated like
-    // `both` so we never delete the local dir out from under the control layer.
+    // `mirror` so we never delete the local dir out from under the control layer.
     let artifact_sink = build_live_artifact_sink(&global_config, deploy_dir.as_deref(), &args)?;
 
     let strategy_path = args.strategy.clone();
@@ -217,7 +217,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 /// Build the artifact sink for a live deployment.
 ///
 /// Returns `None` when there is no deploy dir (nothing to mirror) or the mode
-/// is local. For live, `s3`-only is treated like `both`: the local deploy dir
+/// is local. For live, `s3`-only is treated like `mirror`: the local deploy dir
 /// is always kept because the live control surface reads it, and snapshots are
 /// mirrored to S3 asynchronously.
 fn build_live_artifact_sink(
@@ -237,7 +237,7 @@ fn build_live_artifact_sink(
         return Ok(None);
     }
     // Never use an s3-only temp buffer for live — force local-primary mirroring.
-    let mode = lean_engine::ArtifactStoreMode::Both;
+    let mode = lean_engine::ArtifactStoreMode::Mirror;
     let project = live_project_name(dir, &args.strategy);
     let deploy_id = dir
         .file_name()

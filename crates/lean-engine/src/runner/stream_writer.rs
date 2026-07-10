@@ -27,7 +27,7 @@ use crate::artifacts::RunArtifactSink;
 /// Streams incremental backtest results to sidecar files in the output dir.
 ///
 /// Files are written into the sink's working dir. When the sink mirrors to S3
-/// (mode `s3`/`both`), each write is followed by a throttled checkpoint upload;
+/// (mode `s3`/`mirror`), each write is followed by a throttled checkpoint upload;
 /// [`BacktestStreamWriter::finish`] on completion uploads the final state so a
 /// run that dies mid-way still leaves its last checkpoint in S3.
 pub struct BacktestStreamWriter {

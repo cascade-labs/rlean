@@ -11,7 +11,7 @@
 //!
 //! - **Local**: write to the run dir only. No S3. This is the default; nothing
 //!   changes for users who do not opt in.
-//! - **Both**: write to the run dir AND mirror files to S3. Local is primary;
+//! - **Mirror**: write to the run dir AND mirror files to S3. Local is primary;
 //!   S3 upload is best-effort and never blocks the writer.
 //! - **S3 only**: use a temp local dir as a working buffer, upload files to S3,
 //!   and delete the temp dir when the run finishes.
@@ -39,7 +39,7 @@
 //! `<prefix>/<project>/backtests/<run-id>/<file>` and
 //! `<prefix>/<project>/live/<deploy-id>/<file>`.
 //!
-//! The sink is strictly write-only: it exposes no read API. In `both` mode all
+//! The sink is strictly write-only: it exposes no read API. In `mirror` mode all
 //! artifact reads (live restore, `rlean live portfolio`, report access) keep
 //! going through the local dir exactly as before — S3 is replication only.
 
@@ -107,23 +107,23 @@ impl RunKind {
 pub enum ArtifactStoreMode {
     Local,
     S3,
-    Both,
+    Mirror,
 }
 
 impl ArtifactStoreMode {
-    /// Parse `local` / `s3` / `both` (case-insensitive). Unknown values return
+    /// Parse `local` / `s3` / `mirror` (case-insensitive). Unknown values return
     /// `None` so callers can reject a typo rather than silently losing S3.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" => Some(Self::Local),
             "s3" => Some(Self::S3),
-            "both" => Some(Self::Both),
+            "mirror" => Some(Self::Mirror),
             _ => None,
         }
     }
 
     fn uses_s3(self) -> bool {
-        matches!(self, Self::S3 | Self::Both)
+        matches!(self, Self::S3 | Self::Mirror)
     }
 }
 
@@ -155,7 +155,7 @@ impl S3Relay {
 /// The one abstraction consumed by both artifact writers.
 pub struct RunArtifactSink {
     mode: ArtifactStoreMode,
-    /// The dir the writers actually write files into. For `Local`/`Both` this
+    /// The dir the writers actually write files into. For `Local`/`Mirror` this
     /// is the real run dir. For `S3` only it is a temp dir working buffer.
     working_dir: PathBuf,
     /// Present when `mode` uses S3.
@@ -298,7 +298,7 @@ impl RunArtifactSink {
         self.mode
     }
 
-    /// True when the working dir is the real, persistent run dir (local / both).
+    /// True when the working dir is the real, persistent run dir (local / mirror).
     /// False in `s3`-only mode, where the working dir is a temp buffer that is
     /// deleted after upload — callers should not, e.g., point a `latest` symlink
     /// at it.
@@ -309,9 +309,9 @@ impl RunArtifactSink {
     /// Mirror the named file (relative to the working dir) to S3.
     ///
     /// - Local mode: no-op.
-    /// - Backtest (Both/S3): throttled — uploads at most once per
+    /// - Backtest (Mirror/S3): throttled — uploads at most once per
     ///   [`CHECKPOINT_INTERVAL`] per file. Reads the current file contents.
-    /// - Live (Both/S3): spawns a bounded background upload of the current
+    /// - Live (Mirror/S3): spawns a bounded background upload of the current
     ///   file contents; drops with a WARN if all in-flight slots are taken.
     pub fn mirror(&self, file_name: &str) {
         let Some(relay) = self.relay.as_ref() else {
@@ -597,8 +597,8 @@ mod tests {
         );
         assert_eq!(ArtifactStoreMode::parse("S3"), Some(ArtifactStoreMode::S3));
         assert_eq!(
-            ArtifactStoreMode::parse(" Both "),
-            Some(ArtifactStoreMode::Both)
+            ArtifactStoreMode::parse(" Mirror "),
+            Some(ArtifactStoreMode::Mirror)
         );
         assert_eq!(ArtifactStoreMode::parse("nope"), None);
     }
@@ -633,12 +633,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn both_mode_mirrors_on_flush() {
+    async fn mirror_mode_mirrors_on_flush() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("backtests").join("run1");
         std::fs::create_dir_all(&dir).unwrap();
         let (sink, store) = in_memory_sink(
-            ArtifactStoreMode::Both,
+            ArtifactStoreMode::Mirror,
             RunKind::Backtest,
             dir.clone(),
             "proj",
@@ -649,7 +649,7 @@ mod tests {
         write_file(&dir, "code/main.py", "print(1)");
         sink.flush_all();
 
-        // Local files still present (Both is local-primary).
+        // Local files still present (Mirror is local-primary).
         assert!(dir.join("progress.json").exists());
 
         let keys = list_keys(&store).await;
@@ -672,7 +672,7 @@ mod tests {
         let dir = tmp.path().join("run1");
         std::fs::create_dir_all(&dir).unwrap();
         let (sink, store) = in_memory_sink(
-            ArtifactStoreMode::Both,
+            ArtifactStoreMode::Mirror,
             RunKind::Backtest,
             dir.clone(),
             "proj",
@@ -735,7 +735,7 @@ mod tests {
         let dir = tmp.path().join("live").join("deploy1");
         std::fs::create_dir_all(&dir).unwrap();
         let (sink, store) = in_memory_sink(
-            ArtifactStoreMode::Both,
+            ArtifactStoreMode::Mirror,
             RunKind::Live,
             dir.clone(),
             "proj",
@@ -838,7 +838,7 @@ mod tests {
             accepted: accepted.clone(),
         });
         let sink = RunArtifactSink::with_store(
-            ArtifactStoreMode::Both,
+            ArtifactStoreMode::Mirror,
             RunKind::Live,
             dir.clone(),
             "proj",
@@ -876,7 +876,7 @@ mod tests {
     }
 
     /// Reproduction of the live path: construct the sink exactly the way the
-    /// live runner does (RunKind::Live, Both mode, from inside a multi-thread
+    /// live runner does (RunKind::Live, Mirror mode, from inside a multi-thread
     /// tokio runtime), mirror a snapshot, and assert the upload lands WITHOUT
     /// any explicit flush — i.e. the background uploads actually drain.
     #[tokio::test(flavor = "multi_thread")]
@@ -885,7 +885,7 @@ mod tests {
         let dir = tmp.path().join("live").join("deploy1");
         std::fs::create_dir_all(&dir).unwrap();
         let (sink, store) = in_memory_sink(
-            ArtifactStoreMode::Both,
+            ArtifactStoreMode::Mirror,
             RunKind::Live,
             dir.clone(),
             "uw_control",

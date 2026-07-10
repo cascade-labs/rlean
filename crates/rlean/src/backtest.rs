@@ -91,10 +91,10 @@ async fn run_strategy_backtest(
         (backtest_dir, Some(backtests_root))
     };
 
-    // Resolve the artifact store (local | s3 | both) and build the sink. The run
+    // Resolve the artifact store (local | s3 | mirror) and build the sink. The run
     // id is the reserved dir's final path component; the project is the strategy
     // name. The sink's working dir is where all run files (streaming + report)
-    // are written: the real dir for local/both, a temp buffer for s3-only.
+    // are written: the real dir for local/mirror, a temp buffer for s3-only.
     let run_id = backtest_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -114,7 +114,7 @@ async fn run_strategy_backtest(
         &run_id,
         artifact_config.s3.as_ref(),
     ));
-    // All run files go into the sink's working dir. For local/both this is the
+    // All run files go into the sink's working dir. For local/mirror this is the
     // real backtest dir; for s3-only it is a temp buffer uploaded and deleted at
     // the end — remove the just-reserved (empty) local dir in that case.
     if !sink.writes_local_run_dir() {
