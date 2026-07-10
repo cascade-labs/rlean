@@ -499,37 +499,96 @@ fn resolve_backtest_dates(
     Ok((start, end))
 }
 
+/// Result of diffing the previously-active subscriptions against the current
+/// desired set. Empty across all fields means "no change".
+struct SubscriptionDiff {
+    /// Configs whose stream must be torn down and re-added (id unchanged but the
+    /// underlying custom query changed).
+    replaced: Vec<lean_data::SubscriptionDataConfig>,
+    /// Configs to subscribe: brand-new ids plus the `replaced` ones.
+    added: Vec<lean_data::SubscriptionDataConfig>,
+    /// Ids present in the previous set but not the current one — subscriptions to
+    /// tear down.
+    removed_ids: std::collections::HashSet<u64>,
+}
+
+impl SubscriptionDiff {
+    fn is_empty(&self) -> bool {
+        self.replaced.is_empty() && self.added.is_empty() && self.removed_ids.is_empty()
+    }
+}
+
+/// Diff previous vs. current subscriptions in O(N) using a single HashMap of the
+/// previous ids, replacing the old O(N²) nested `.find()` scans (issue #39).
+fn compute_subscription_diff(
+    previous: &[lean_data::SubscriptionDataConfig],
+    current: &[lean_data::SubscriptionDataConfig],
+) -> SubscriptionDiff {
+    use std::collections::{HashMap, HashSet};
+
+    let previous_by_id: HashMap<u64, &lean_data::SubscriptionDataConfig> = previous
+        .iter()
+        .map(|config| (config.unique_id(), config))
+        .collect();
+    let current_ids: HashSet<u64> = current.iter().map(|config| config.unique_id()).collect();
+
+    let replaced: Vec<lean_data::SubscriptionDataConfig> = current
+        .iter()
+        .filter(|config| {
+            previous_by_id
+                .get(&config.unique_id())
+                .map(|existing| subscription_requires_stream_replacement(existing, config))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let replaced_ids: HashSet<u64> = replaced.iter().map(|config| config.unique_id()).collect();
+
+    let added: Vec<lean_data::SubscriptionDataConfig> = current
+        .iter()
+        .filter(|config| {
+            let id = config.unique_id();
+            !previous_by_id.contains_key(&id) || replaced_ids.contains(&id)
+        })
+        .cloned()
+        .collect();
+
+    let removed_ids: HashSet<u64> = previous
+        .iter()
+        .map(|config| config.unique_id())
+        .filter(|id| !current_ids.contains(id))
+        .collect();
+
+    SubscriptionDiff {
+        replaced,
+        added,
+        removed_ids,
+    }
+}
+
 async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     data_manager: &mut DataManager,
     active_subscriptions: &mut Vec<lean_data::SubscriptionDataConfig>,
     bridge: &B,
     start: lean_core::DateTime,
 ) -> anyhow::Result<()> {
-    let previous = active_subscriptions
-        .iter()
-        .map(|config| config.unique_id())
-        .collect::<std::collections::HashSet<_>>();
     let current_subscriptions = lean_style_active_subscriptions(&subscriptions_with_option_chains(
         bridge.subscriptions(),
         &bridge.option_subscriptions(),
     ));
-    let current = current_subscriptions
-        .iter()
-        .map(|config| config.unique_id())
-        .collect::<std::collections::HashSet<_>>();
 
-    let replaced = current_subscriptions
-        .iter()
-        .filter(|config| {
-            active_subscriptions
-                .iter()
-                .find(|existing| existing.unique_id() == config.unique_id())
-                .map(|existing| subscription_requires_stream_replacement(existing, config))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for config in &replaced {
+    let diff = compute_subscription_diff(active_subscriptions, &current_subscriptions);
+
+    // Short-circuit: nothing added, removed, or replaced. This is the common case
+    // (the sync runs on every slice) and skips all data-manager churn below.
+    if diff.is_empty() {
+        // Refresh the cached configs to the latest instances — ids are identical,
+        // so consumers observe no change.
+        *active_subscriptions = current_subscriptions;
+        return Ok(());
+    }
+
+    for config in &diff.replaced {
         if let Some(custom) = &config.custom {
             tracing::debug!(
                 "replacing custom subscription {}:{} with dynamic symbols={}",
@@ -546,19 +605,11 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         data_manager.remove_subscription(config);
     }
 
-    let added = current_subscriptions
-        .iter()
-        .filter(|config| {
-            !previous.contains(&config.unique_id())
-                || replaced
-                    .iter()
-                    .any(|replacement| replacement.unique_id() == config.unique_id())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    data_manager.add_subscriptions_async(added, start).await?;
+    data_manager
+        .add_subscriptions_async(diff.added, start)
+        .await?;
     for config in active_subscriptions.iter() {
-        if !current.contains(&config.unique_id()) {
+        if diff.removed_ids.contains(&config.unique_id()) {
             data_manager.remove_subscription(config);
         }
     }
@@ -737,15 +788,142 @@ fn build_backtest_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        lean_style_active_subscriptions, resolve_backtest_dates,
+        compute_subscription_diff, lean_style_active_subscriptions, resolve_backtest_dates,
         subscription_requires_stream_replacement,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use lean_core::{DateTime, Market, Resolution, Symbol};
+    use lean_core::{DataNormalizationMode, DateTime, Market, Resolution, Symbol};
     use lean_data::{
         CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, SubscriptionDataConfig,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    fn equity_config(ticker: &str) -> SubscriptionDataConfig {
+        SubscriptionDataConfig::new_equity(
+            Symbol::create_equity(ticker, &Market::usa()),
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        )
+    }
+
+    /// Reference implementation of the diff using the original O(N²) nested-scan
+    /// semantics, so the fast `compute_subscription_diff` can be checked against
+    /// it. Returns (replaced_ids, added_ids, removed_ids).
+    fn reference_diff(
+        previous: &[SubscriptionDataConfig],
+        current: &[SubscriptionDataConfig],
+    ) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
+        let previous_ids: HashSet<u64> = previous.iter().map(|c| c.unique_id()).collect();
+        let current_ids: HashSet<u64> = current.iter().map(|c| c.unique_id()).collect();
+
+        let replaced: HashSet<u64> = current
+            .iter()
+            .filter(|config| {
+                previous
+                    .iter()
+                    .find(|existing| existing.unique_id() == config.unique_id())
+                    .map(|existing| subscription_requires_stream_replacement(existing, config))
+                    .unwrap_or(false)
+            })
+            .map(|c| c.unique_id())
+            .collect();
+        let added: HashSet<u64> = current
+            .iter()
+            .filter(|config| {
+                !previous_ids.contains(&config.unique_id())
+                    || replaced.contains(&config.unique_id())
+            })
+            .map(|c| c.unique_id())
+            .collect();
+        let removed: HashSet<u64> = previous_ids
+            .iter()
+            .copied()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        (replaced, added, removed)
+    }
+
+    fn assert_diff_matches_reference(
+        previous: &[SubscriptionDataConfig],
+        current: &[SubscriptionDataConfig],
+    ) {
+        let diff = compute_subscription_diff(previous, current);
+        let (ref_replaced, ref_added, ref_removed) = reference_diff(previous, current);
+
+        let replaced: HashSet<u64> = diff.replaced.iter().map(|c| c.unique_id()).collect();
+        let added: HashSet<u64> = diff.added.iter().map(|c| c.unique_id()).collect();
+        assert_eq!(replaced, ref_replaced, "replaced mismatch");
+        assert_eq!(added, ref_added, "added mismatch");
+        assert_eq!(diff.removed_ids, ref_removed, "removed mismatch");
+    }
+
+    #[test]
+    fn diff_matches_reference_on_representative_cases() {
+        let spy = equity_config("SPY");
+        let xlk = equity_config("XLK");
+        let xlf = equity_config("XLF");
+
+        // No change.
+        assert_diff_matches_reference(&[spy.clone(), xlk.clone()], &[spy.clone(), xlk.clone()]);
+        // Pure add.
+        assert_diff_matches_reference(&[spy.clone()], &[spy.clone(), xlk.clone(), xlf.clone()]);
+        // Pure remove.
+        assert_diff_matches_reference(&[spy.clone(), xlk.clone(), xlf.clone()], &[spy.clone()]);
+        // Add + remove.
+        assert_diff_matches_reference(&[spy.clone(), xlk.clone()], &[spy.clone(), xlf.clone()]);
+        // Empty -> populated and populated -> empty.
+        assert_diff_matches_reference(&[], &[spy.clone(), xlk.clone()]);
+        assert_diff_matches_reference(&[spy.clone(), xlk.clone()], &[]);
+
+        // Replacement: same id, changed dynamic custom query.
+        let sweeps = custom_config("sweeps", Resolution::Minute);
+        let mut sweeps_changed = sweeps.clone();
+        sweeps_changed
+            .custom
+            .as_mut()
+            .unwrap()
+            .dynamic_query
+            .symbols = Some(vec!["NRG".to_string()]);
+        assert_diff_matches_reference(&[sweeps.clone()], &[sweeps_changed.clone()]);
+        // Replacement mixed with an add and a remove.
+        assert_diff_matches_reference(
+            &[sweeps.clone(), spy.clone(), xlk.clone()],
+            &[sweeps_changed, spy.clone(), xlf.clone()],
+        );
+    }
+
+    #[test]
+    fn diff_is_empty_when_unchanged() {
+        let configs: Vec<SubscriptionDataConfig> =
+            (0..10).map(|i| equity_config(&format!("S{i}"))).collect();
+        // Cloning yields the same ids, so the diff must report no change.
+        let cloned: Vec<SubscriptionDataConfig> = configs.iter().cloned().collect();
+        let diff = compute_subscription_diff(&configs, &cloned);
+        assert!(
+            diff.is_empty(),
+            "unchanged subscription set must diff empty"
+        );
+    }
+
+    #[test]
+    fn diff_scales_to_400_configs() {
+        // Bench-style: 400 configs, one removed and one added between calls.
+        // The O(N) diff must produce exactly one add and one remove and agree
+        // with the reference. (The old O(N²) path did ~120k hashes per day at
+        // this N; the memoized id keeps this to one hash per config.)
+        let previous: Vec<SubscriptionDataConfig> = (0..400)
+            .map(|i| equity_config(&format!("SYM{i:04}")))
+            .collect();
+        let mut current = previous.clone();
+        current.remove(0);
+        current.push(equity_config("NEWSYM"));
+
+        let diff = compute_subscription_diff(&previous, &current);
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.removed_ids.len(), 1);
+        assert!(diff.replaced.is_empty());
+        assert_diff_matches_reference(&previous, &current);
+    }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
