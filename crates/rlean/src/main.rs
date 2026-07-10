@@ -29,6 +29,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+mod artifacts_config;
 mod backtest;
 mod cli;
 mod config;

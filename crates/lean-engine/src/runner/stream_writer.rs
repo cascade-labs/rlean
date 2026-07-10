@@ -14,6 +14,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -21,8 +22,16 @@ use lean_orders::OrderEvent;
 use lean_statistics::Trade;
 use rust_decimal::Decimal;
 
+use crate::artifacts::RunArtifactSink;
+
 /// Streams incremental backtest results to sidecar files in the output dir.
+///
+/// Files are written into the sink's working dir. When the sink mirrors to S3
+/// (mode `s3`/`mirror`), each write is followed by a throttled checkpoint upload;
+/// [`BacktestStreamWriter::finish`] on completion uploads the final state so a
+/// run that dies mid-way still leaves its last checkpoint in S3.
 pub struct BacktestStreamWriter {
+    sink: Arc<RunArtifactSink>,
     dir: PathBuf,
     progress_path: PathBuf,
     order_events_path: PathBuf,
@@ -36,9 +45,10 @@ pub struct BacktestStreamWriter {
 }
 
 impl BacktestStreamWriter {
-    /// Create sidecar files under `dir`. Truncates any pre-existing streaming
-    /// files so a re-run starts clean.
-    pub fn new(dir: PathBuf, start_date: NaiveDate, end_date: NaiveDate) -> Self {
+    /// Create sidecar files in the sink's working dir. Truncates any
+    /// pre-existing streaming files so a re-run starts clean.
+    pub fn new(sink: Arc<RunArtifactSink>, start_date: NaiveDate, end_date: NaiveDate) -> Self {
+        let dir = sink.working_dir().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let writer = Self {
             progress_path: dir.join("progress.json"),
@@ -46,6 +56,7 @@ impl BacktestStreamWriter {
             trades_path: dir.join("trades.jsonl"),
             heartbeat_path: dir.join("heartbeat.log"),
             dir,
+            sink,
             start_date,
             end_date,
             started_at: chrono::Utc::now(),
@@ -60,6 +71,11 @@ impl BacktestStreamWriter {
         let _ = std::fs::File::create(&writer.trades_path);
         let _ = std::fs::File::create(&writer.heartbeat_path);
         writer
+    }
+
+    /// The working directory files are written into (the sink's working dir).
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn progress_fraction(&self, current_date: NaiveDate) -> f64 {
@@ -122,6 +138,14 @@ impl BacktestStreamWriter {
             self.append_heartbeat(current_date, progress, trading_days, portfolio_value);
             self.last_heartbeat = Instant::now();
         }
+
+        // Checkpoint the streaming files to S3. The sink throttles these to at
+        // most one upload per file per checkpoint interval, so calling on every
+        // progress flush is cheap and no-ops entirely in local mode.
+        self.sink.mirror("progress.json");
+        self.sink.mirror("order-events.jsonl");
+        self.sink.mirror("trades.jsonl");
+        self.sink.mirror("heartbeat.log");
     }
 
     fn append_heartbeat(
@@ -171,6 +195,20 @@ impl BacktestStreamWriter {
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
         write_json_pretty_atomic(&self.progress_path, &payload);
+    }
+
+    /// Upload the final run state to S3 (no-op in local mode). Call after all
+    /// report files have been written into the run dir so the S3 copy includes
+    /// them. In `s3`-only mode this also deletes the local working buffer when
+    /// the writer is dropped.
+    pub fn finish(&self) {
+        self.sink.flush_all();
+    }
+
+    /// Clone the artifact sink handle so the CLI can flush again after it writes
+    /// the final report files into the run dir.
+    pub fn sink(&self) -> Arc<RunArtifactSink> {
+        self.sink.clone()
     }
 }
 

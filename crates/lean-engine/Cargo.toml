@@ -42,6 +42,8 @@ rayon = { workspace = true }
 num_cpus = { workspace = true }
 lean-brokerages = { path = "../lean-brokerages" }
 lean-indicators = { path = "../lean-indicators" }
+object_store = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

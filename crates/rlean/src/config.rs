@@ -60,6 +60,55 @@ pub struct GlobalConfig {
     #[serde(default, rename = "s3_region", skip_serializing_if = "Option::is_none")]
     pub s3_region: Option<String>,
 
+    // ── Run artifact relay (backtest/live run dirs → S3) ──────────────────────
+    /// Where run artifacts are written: `local` (default), `s3`, or `mirror`.
+    #[serde(
+        default,
+        rename = "artifact_store",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_store: Option<String>,
+
+    /// Destination for artifact uploads as `s3://bucket/prefix`.
+    #[serde(
+        default,
+        rename = "artifact_s3",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_s3: Option<String>,
+
+    /// Artifact store endpoint URL. Falls back to `s3_endpoint` when unset.
+    #[serde(
+        default,
+        rename = "artifact_s3_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_s3_endpoint: Option<String>,
+
+    /// Artifact store region. Falls back to `s3_region` when unset.
+    #[serde(
+        default,
+        rename = "artifact_s3_region",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_s3_region: Option<String>,
+
+    /// Artifact store access key. Falls back to `s3_access_key` when unset.
+    #[serde(
+        default,
+        rename = "artifact_s3_access_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_s3_access_key: Option<String>,
+
+    /// Artifact store secret key. Falls back to `s3_secret_key` when unset.
+    #[serde(
+        default,
+        rename = "artifact_s3_secret_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_s3_secret_key: Option<String>,
+
     /// Global Parquet data root directory
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_folder: Option<String>,

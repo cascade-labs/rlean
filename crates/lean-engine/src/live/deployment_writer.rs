@@ -51,10 +51,24 @@ pub struct LiveDeploymentWriter {
     heartbeat_path: PathBuf,
     started_at: chrono::DateTime<chrono::Utc>,
     last_heartbeat: Mutex<Instant>,
+    /// Optional artifact sink. When set, each snapshot write is mirrored to S3
+    /// asynchronously through the sink's bounded queue (drop-and-warn if S3 is
+    /// slow, so the live loop never blocks).
+    sink: Option<Arc<crate::artifacts::RunArtifactSink>>,
 }
 
 impl LiveDeploymentWriter {
+    /// Local-only writer: writes deployment files into `dir`, no S3 mirroring.
     pub fn new(dir: PathBuf) -> Self {
+        let sink = Arc::new(crate::artifacts::RunArtifactSink::local(dir));
+        Self::with_sink(sink)
+    }
+
+    /// Build a writer whose files live in `sink.working_dir()` and are mirrored
+    /// to S3 per the sink's mode. For live, the working dir is always the real
+    /// deploy dir (the live control surface reads it locally).
+    pub fn with_sink(sink: Arc<crate::artifacts::RunArtifactSink>) -> Self {
+        let dir = sink.working_dir().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let writer = Self {
             progress_path: dir.join("progress.json"),
@@ -69,6 +83,7 @@ impl LiveDeploymentWriter {
             dir,
             started_at: chrono::Utc::now(),
             last_heartbeat: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            sink: Some(sink),
         };
         let ensure_exists = |path: &Path| {
             let _ = std::fs::OpenOptions::new()
@@ -81,6 +96,20 @@ impl LiveDeploymentWriter {
         ensure_exists(&writer.insight_events_path);
         let _ = std::fs::File::create(&writer.heartbeat_path);
         writer
+    }
+
+    fn mirror(&self, file_name: &str) {
+        if let Some(sink) = &self.sink {
+            sink.mirror(file_name);
+        }
+    }
+
+    /// Flush any queued S3 uploads. Call on clean shutdown so the live loop's
+    /// final snapshot lands in S3.
+    pub fn flush(&self) {
+        if let Some(sink) = &self.sink {
+            sink.flush_all();
+        }
     }
 
     pub fn append_order_events(&self, events: &[OrderEvent]) {
@@ -180,6 +209,16 @@ impl LiveDeploymentWriter {
             counts.order_events,
             counts.trades,
         );
+
+        // Mirror this snapshot to S3 (no-op in local mode). Each mirror enqueues
+        // the current file on the sink's bounded queue; a slow/down S3 drops
+        // with a WARN rather than stalling the live loop.
+        self.mirror("portfolio.json");
+        self.mirror("orders.json");
+        self.mirror("progress.json");
+        self.mirror("order-events.jsonl");
+        self.mirror("trades.jsonl");
+        self.mirror("heartbeat.log");
     }
 
     fn record_insight_snapshot(&self, framework: Option<&Arc<Mutex<FrameworkState>>>) {
@@ -200,6 +239,9 @@ impl LiveDeploymentWriter {
         write_json_pretty_atomic(&self.alpha_analytics_path, &analytics);
         let events = fw.take_insight_events();
         append_json_lines(&self.insight_events_path, &events);
+        self.mirror("insights.json");
+        self.mirror("alpha-analytics.json");
+        self.mirror("insight-events.jsonl");
     }
 
     fn append_heartbeat(

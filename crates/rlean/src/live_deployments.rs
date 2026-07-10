@@ -492,6 +492,13 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
     if let Some(value) = args.live_limits.live_max_runtime_seconds {
         values.extend(["--live-max-runtime-seconds".to_string(), value.to_string()]);
     }
+    // Propagate the artifact relay flags so the detached child mirrors to S3 too.
+    if let Some(value) = &args.artifact_store {
+        values.extend(["--artifact-store".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.artifact_s3 {
+        values.extend(["--artifact-s3".to_string(), value.clone()]);
+    }
     if args.verbose {
         values.push("--verbose".to_string());
     }
@@ -1005,6 +1012,8 @@ mod tests {
                 polygon_rate: 5.0,
                 thetadata_rate: 4.0,
                 thetadata_concurrent: 4,
+                artifact_store: None,
+                artifact_s3: None,
                 verbose: true,
             },
             report: None,
