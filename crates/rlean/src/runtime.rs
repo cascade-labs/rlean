@@ -33,17 +33,53 @@ pub(crate) fn resolve_datastore_for_data_root(
     data_folder: &Path,
     global_config: &config::GlobalConfig,
 ) -> Result<ResolvedDataStore> {
-    match global_config.datastore.as_str() {
-        "file" => {
+    // The market-data store backend is decided solely by the `data_store`
+    // resolver (env/config); the legacy `datastore` string is not consulted.
+    let resolved = crate::data_store_config::resolve(global_config)?;
+    match resolved.mode {
+        crate::data_store_config::DataStoreMode::Local => {
             let store = block_connect_iceberg_store(data_folder.to_path_buf())?;
             Ok(ResolvedDataStore {
                 store,
                 data_root: data_folder.to_path_buf(),
             })
         }
-        "s3" => bail!("datastore=s3 is not supported until Iceberg S3 FileIO is wired"),
-        other => bail!("unsupported datastore '{other}', expected 'file' or 's3'"),
+        crate::data_store_config::DataStoreMode::S3 => {
+            let s3 = resolved
+                .s3
+                .expect("s3 mode resolves to Some(S3DataStoreConfig)");
+            let catalog_db_path = s3_catalog_db_path(&s3.warehouse)?;
+            let store = block_connect_iceberg_store_s3(s3, catalog_db_path)?;
+            // `data_root` is only used for report file layout and provider hints
+            // (no market data is written there), so the local data folder is a
+            // fine placeholder in S3 mode.
+            Ok(ResolvedDataStore {
+                store,
+                data_root: data_folder.to_path_buf(),
+            })
+        }
     }
+}
+
+/// Deterministic local path for the SQLite catalog of an S3 warehouse. The
+/// catalog cannot live on S3, so it is kept under `~/.rlean/iceberg-catalogs/`
+/// keyed by a filesystem-safe slug of the warehouse URL plus a stable FNV-1a
+/// hash (so different warehouses never collide and the path never changes
+/// across releases).
+fn s3_catalog_db_path(warehouse: &str) -> Result<PathBuf> {
+    // FNV-1a: stable across Rust releases, unlike std's DefaultHasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in warehouse.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let slug: String = warehouse
+        .trim_start_matches("s3://")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let dir = config::rlean_dir()?.join("iceberg-catalogs");
+    Ok(dir.join(format!("{slug}-{hash:016x}.db")))
 }
 
 fn block_connect_iceberg_store(data_root: PathBuf) -> Result<Arc<IcebergStore>> {
@@ -53,6 +89,22 @@ fn block_connect_iceberg_store(data_root: PathBuf) -> Result<Arc<IcebergStore>> 
             .build()
             .context("failed to build Iceberg store runtime")?
             .block_on(IcebergStore::connect_local(data_root))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Iceberg store worker panicked"))?
+    .map(Arc::new)
+}
+
+fn block_connect_iceberg_store_s3(
+    config: lean_storage::S3DataStoreConfig,
+    catalog_db_path: PathBuf,
+) -> Result<Arc<IcebergStore>> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build Iceberg store runtime")?
+            .block_on(IcebergStore::connect_s3(config, catalog_db_path))
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Iceberg store worker panicked"))?

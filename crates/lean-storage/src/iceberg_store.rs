@@ -17,7 +17,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::*;
-use iceberg::io::LocalFsStorageFactory;
+use iceberg::io::{LocalFsStorageFactory, Storage, StorageConfig, StorageFactory};
 use iceberg::spec::{
     DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
     Struct, Transform, Type,
@@ -37,16 +37,19 @@ use iceberg::{
 };
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_datafusion::IcebergTableProviderFactory;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use lean_core::{Resolution, SecurityType, Symbol, TickType};
 use lean_data::{
     CustomDataPoint, CustomDataQuery, MarginInterestRate, PerpetualContext, QuoteBar, Tick,
     TradeBar,
 };
+use object_store::aws::AmazonS3Builder;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::sqlite::Sqlite;
+use url::Url;
 
 static APPEND_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -132,9 +135,36 @@ pub struct CompactionStats {
     pub appends: usize,
 }
 
+/// Connection settings for an S3-backed market-data warehouse.
+///
+/// All fields are required; the resolver in the `rlean` crate enforces their
+/// presence before constructing this. Path-style addressing is always used
+/// (the bucket name may contain characters that break virtual-host addressing).
+#[derive(Clone, Debug)]
+pub struct S3DataStoreConfig {
+    /// Iceberg warehouse root, e.g. `s3://bucket/prefix`.
+    pub warehouse: String,
+    pub endpoint: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+/// Where an [`IcebergStore`]'s data and metadata live.
+#[derive(Clone)]
+enum WarehouseBackend {
+    /// Local filesystem warehouse rooted at `root`.
+    Local { root: PathBuf },
+    /// S3-compatible object store warehouse.
+    S3 {
+        warehouse: String,
+        s3: S3DataStoreConfig,
+    },
+}
+
 #[derive(Clone)]
 pub struct IcebergStore {
-    warehouse_root: PathBuf,
+    backend: WarehouseBackend,
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
     table_contexts: Arc<Mutex<HashMap<String, Arc<IcebergTableContext>>>>,
@@ -185,7 +215,9 @@ impl IcebergStore {
             .context("failed to load Iceberg SQL catalog")?;
 
         let store = Self {
-            warehouse_root,
+            backend: WarehouseBackend::Local {
+                root: warehouse_root,
+            },
             catalog: Arc::new(catalog),
             namespace: NamespaceIdent::new(NAMESPACE.into()),
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
@@ -197,8 +229,116 @@ impl IcebergStore {
         Ok(store)
     }
 
-    pub fn warehouse_root(&self) -> &Path {
-        &self.warehouse_root
+    /// Connect to an S3-backed warehouse.
+    ///
+    /// The Iceberg SQLite catalog cannot live on S3, so `catalog_db_path` is a
+    /// deterministic *local* path (the caller derives it under `~/.rlean/` from
+    /// the warehouse URL). Its parent directory and the SQLite database are
+    /// created if missing, mirroring [`IcebergStore::connect_local`].
+    pub async fn connect_s3(config: S3DataStoreConfig, catalog_db_path: PathBuf) -> Result<Self> {
+        if let Some(parent) = catalog_db_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let catalog_uri = format!("sqlite:{}", catalog_db_path.display());
+        if !Sqlite::database_exists(&catalog_uri).await.unwrap_or(false) {
+            Sqlite::create_database(&catalog_uri)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create Iceberg catalog {}",
+                        catalog_db_path.display()
+                    )
+                })?;
+        }
+
+        let s3_props = s3_file_io_props(&config);
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(s3_storage_factory(&config)))
+            .uri(catalog_uri)
+            .warehouse_location(config.warehouse.clone())
+            .sql_bind_style(SqlBindStyle::QMark)
+            .load(CATALOG_NAME, s3_props)
+            .await
+            .context("failed to load Iceberg SQL catalog")?;
+
+        let store = Self {
+            backend: WarehouseBackend::S3 {
+                warehouse: config.warehouse.clone(),
+                s3: config,
+            },
+            catalog: Arc::new(catalog),
+            namespace: NamespaceIdent::new(NAMESPACE.into()),
+            table_contexts: Arc::new(Mutex::new(HashMap::new())),
+            partition_indexes: Arc::new(Mutex::new(HashMap::new())),
+            custom_partition_indexes: Arc::new(Mutex::new(HashMap::new())),
+            table_write_locks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        store.ensure_tables().await?;
+        Ok(store)
+    }
+
+    /// Local warehouse root, if this store is backed by the local filesystem.
+    /// Returns `None` for S3-backed stores (there is no local warehouse dir).
+    pub fn warehouse_root(&self) -> Option<&Path> {
+        match &self.backend {
+            WarehouseBackend::Local { root } => Some(root.as_path()),
+            WarehouseBackend::S3 { .. } => None,
+        }
+    }
+
+    /// Iceberg table `location` URI for `table` under this warehouse.
+    fn table_location(&self, table: &str) -> Result<String> {
+        match &self.backend {
+            WarehouseBackend::Local { root } => path_to_file_uri(&root.join(NAMESPACE).join(table)),
+            WarehouseBackend::S3 { warehouse, .. } => Ok(format!(
+                "{}/{NAMESPACE}/{table}",
+                warehouse.trim_end_matches('/')
+            )),
+        }
+    }
+
+    /// The Iceberg storage factory matching this store's backend.
+    fn iceberg_storage_factory(&self) -> Arc<dyn StorageFactory> {
+        match &self.backend {
+            WarehouseBackend::Local { .. } => Arc::new(LocalFsStorageFactory),
+            WarehouseBackend::S3 { s3, .. } => Arc::new(s3_storage_factory(s3)),
+        }
+    }
+
+    /// Register an S3 object store on `ctx` so DataFusion can read `s3://`
+    /// data-file paths. A no-op for local-backed stores.
+    fn register_s3_object_store(&self, ctx: &SessionContext) -> Result<()> {
+        let WarehouseBackend::S3 { warehouse, s3 } = &self.backend else {
+            return Ok(());
+        };
+        let bucket = s3_bucket(warehouse)?;
+        let store = AmazonS3Builder::new()
+            .with_bucket_name(&bucket)
+            .with_endpoint(&s3.endpoint)
+            .with_region(&s3.region)
+            .with_access_key_id(&s3.access_key)
+            .with_secret_access_key(&s3.secret_key)
+            .with_virtual_hosted_style_request(false)
+            .build()
+            .context("failed to build S3 object store for DataFusion")?;
+        let url = Url::parse(&format!("s3://{bucket}"))
+            .with_context(|| format!("invalid s3 bucket url for '{bucket}'"))?;
+        ctx.register_object_store(&url, Arc::new(store));
+        Ok(())
+    }
+
+    /// Translate an Iceberg data-file path into a path DataFusion's
+    /// `read_parquet` can open. Local paths are stripped of their `file://`
+    /// scheme; `s3://` paths are returned unchanged (an S3 object store must be
+    /// registered on the reading context via [`register_s3_object_store`]).
+    fn warehouse_file_path(&self, iceberg_path: &str) -> Result<String> {
+        match &self.backend {
+            WarehouseBackend::Local { .. } => local_path_from_iceberg_file_path(iceberg_path),
+            WarehouseBackend::S3 { .. } => Ok(iceberg_path.to_string()),
+        }
     }
 
     /// Number of persisted table-metadata versions (`*.metadata.json`) for
@@ -207,11 +347,13 @@ impl IcebergStore {
     /// the snapshot/manifest bloat that slows query planning. A freshly
     /// compacted (or absent) table reports a small handful.
     pub fn metadata_version_count(&self, table: &str) -> usize {
-        let dir = self
-            .warehouse_root
-            .join(NAMESPACE)
-            .join(table)
-            .join("metadata");
+        // Metadata bloat is only measured (and compacted) for local warehouses;
+        // S3 warehouse compaction is out of scope here, so report 0 so the
+        // auto-compaction pass simply skips S3-backed tables.
+        let WarehouseBackend::Local { root } = &self.backend else {
+            return 0;
+        };
+        let dir = root.join(NAMESPACE).join(table).join("metadata");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return 0;
         };
@@ -292,6 +434,10 @@ impl IcebergStore {
         use futures::StreamExt;
         use parquet::arrow::ArrowWriter;
 
+        if matches!(self.backend, WarehouseBackend::S3 { .. }) {
+            anyhow::bail!("compaction not supported for s3 data store yet");
+        }
+
         let lock = self.table_write_lock(table).await;
         let _guard = lock.lock().await;
 
@@ -322,7 +468,7 @@ impl IcebergStore {
         }
         let mut local_paths = file_paths
             .iter()
-            .map(|path| local_path_from_iceberg_file_path(path))
+            .map(|path| self.warehouse_file_path(path))
             .collect::<Result<Vec<_>>>()?;
         drop(catalog_table);
         // Iceberg writes each identity partition's data files under a distinct
@@ -348,6 +494,7 @@ impl IcebergStore {
             // order and reads sequentially, keeping memory to one batch.
             let ctx =
                 SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            self.register_s3_object_store(&ctx)?;
             let mut stream = ctx
                 .read_parquet(local_paths, ParquetReadOptions::default())
                 .await?
@@ -468,7 +615,12 @@ impl IcebergStore {
     }
 
     fn staging_dir(&self, table: &str) -> PathBuf {
-        self.warehouse_root.join(format!(".compact_tmp_{table}"))
+        match &self.backend {
+            WarehouseBackend::Local { root } => root.join(format!(".compact_tmp_{table}")),
+            WarehouseBackend::S3 { .. } => {
+                std::env::temp_dir().join(format!("rlean_compact_tmp_{table}"))
+            }
+        }
     }
 
     /// Total number of live rows visible through the current snapshot of
@@ -520,6 +672,7 @@ impl IcebergStore {
             // pull gigabytes into memory at once.
             let ctx =
                 SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            self.register_s3_object_store(&ctx)?;
             let mut stream = ctx
                 .read_parquet(
                     vec![path.to_string_lossy().to_string()],
@@ -615,13 +768,15 @@ impl IcebergStore {
                 .with_context(|| format!("failed to drop Iceberg table {NAMESPACE}.{name}"))?;
         }
 
-        let table_dir = self.warehouse_root.join(NAMESPACE).join(name);
-        match tokio::fs::remove_dir_all(&table_dir).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to remove {}", table_dir.display()));
+        if let WarehouseBackend::Local { root } = &self.backend {
+            let table_dir = root.join(NAMESPACE).join(name);
+            match tokio::fs::remove_dir_all(&table_dir).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to remove {}", table_dir.display()));
+                }
             }
         }
 
@@ -699,7 +854,7 @@ impl IcebergStore {
             return Ok(());
         }
         let spec = partition_spec(schema.clone(), partition_columns)?;
-        let location = path_to_file_uri(&self.warehouse_root.join(NAMESPACE).join(name))?;
+        let location = self.table_location(name)?;
         let creation = TableCreation::builder()
             .name(name.into())
             .schema(schema)
@@ -2031,10 +2186,11 @@ impl IcebergStore {
         state.table_factories_mut().insert(
             "ICEBERG".to_string(),
             Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
-                Arc::new(LocalFsStorageFactory),
+                self.iceberg_storage_factory(),
             )),
         );
         let ctx = SessionContext::new_with_state(state);
+        self.register_s3_object_store(&ctx)?;
         let sql = format!(
             "CREATE EXTERNAL TABLE {table} STORED AS ICEBERG LOCATION '{}'",
             metadata_location.replace('\'', "''")
@@ -2054,9 +2210,10 @@ impl IcebergStore {
     ) -> Result<DataFrame> {
         let paths = file_paths
             .into_iter()
-            .map(|path| local_path_from_iceberg_file_path(path))
+            .map(|path| self.warehouse_file_path(path))
             .collect::<Result<Vec<_>>>()?;
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        self.register_s3_object_store(&ctx)?;
         Ok(ctx
             .read_parquet(paths, ParquetReadOptions::default())
             .await?)
@@ -2243,6 +2400,68 @@ impl IcebergStore {
     fn ident(&self, name: &str) -> TableIdent {
         TableIdent::new(self.namespace.clone(), name.into())
     }
+}
+
+/// Storage factory that carries the S3 connection properties itself.
+///
+/// `iceberg-catalog-sql` 0.9.1 builds its `FileIO` as
+/// `FileIOBuilder::new(factory).build()` without forwarding any catalog props,
+/// so a bare `OpenDalStorageFactory::S3` would see an empty `StorageConfig`
+/// (no endpoint / region / credentials) and fail with "region is missing".
+/// This wrapper merges the configured S3 props into whatever config it is
+/// handed before delegating to the OpenDAL S3 factory. The same applies to the
+/// DataFusion `IcebergTableProviderFactory` FileIO path.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct S3ConfiguredStorageFactory {
+    props: HashMap<String, String>,
+}
+
+#[typetag::serde]
+impl StorageFactory for S3ConfiguredStorageFactory {
+    fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        let mut props = self.props.clone();
+        props.extend(config.props().clone());
+        let inner = OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        };
+        inner.build(&StorageConfig::from_props(props))
+    }
+}
+
+/// Build the props-carrying S3 storage factory for `config`.
+fn s3_storage_factory(config: &S3DataStoreConfig) -> S3ConfiguredStorageFactory {
+    S3ConfiguredStorageFactory {
+        props: s3_file_io_props(config),
+    }
+}
+
+/// The S3 FileIO property map the OpenDAL storage factory reads from the
+/// catalog's props. Path-style addressing is mandatory (the bucket name may
+/// break virtual-host addressing).
+fn s3_file_io_props(config: &S3DataStoreConfig) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    props.insert("s3.endpoint".to_string(), config.endpoint.clone());
+    props.insert("s3.access-key-id".to_string(), config.access_key.clone());
+    props.insert(
+        "s3.secret-access-key".to_string(),
+        config.secret_key.clone(),
+    );
+    props.insert("s3.region".to_string(), config.region.clone());
+    props.insert("s3.path-style-access".to_string(), "true".to_string());
+    props
+}
+
+/// Extract the bucket from an `s3://bucket/prefix` warehouse URL.
+fn s3_bucket(warehouse: &str) -> Result<String> {
+    let rest = warehouse
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow!("s3 warehouse must start with s3://, got '{warehouse}'"))?;
+    let bucket = rest.split('/').next().unwrap_or("");
+    if bucket.is_empty() {
+        return Err(anyhow!("s3 warehouse '{warehouse}' has an empty bucket"));
+    }
+    Ok(bucket.to_string())
 }
 
 fn path_to_file_uri(path: &Path) -> Result<String> {

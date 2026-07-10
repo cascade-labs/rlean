@@ -109,6 +109,51 @@ pub struct GlobalConfig {
     )]
     pub artifact_s3_secret_key: Option<String>,
 
+    // ── Market-data store (Iceberg warehouse backend) ─────────────────────────
+    /// Where market data is read from: `local` (default) or `s3`.
+    #[serde(
+        default,
+        rename = "data_store",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_store: Option<String>,
+
+    /// S3 warehouse root for the market-data store as `s3://bucket/prefix`.
+    #[serde(default, rename = "data_s3", skip_serializing_if = "Option::is_none")]
+    pub data_s3: Option<String>,
+
+    /// Data-store S3 endpoint URL. Falls back to `s3_endpoint` when unset.
+    #[serde(
+        default,
+        rename = "data_s3_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_endpoint: Option<String>,
+
+    /// Data-store S3 region. Falls back to `s3_region` when unset.
+    #[serde(
+        default,
+        rename = "data_s3_region",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_region: Option<String>,
+
+    /// Data-store S3 access key. Falls back to `s3_access_key` when unset.
+    #[serde(
+        default,
+        rename = "data_s3_access_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_access_key: Option<String>,
+
+    /// Data-store S3 secret key. Falls back to `s3_secret_key` when unset.
+    #[serde(
+        default,
+        rename = "data_s3_secret_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_secret_key: Option<String>,
+
     /// Global Parquet data root directory
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_folder: Option<String>,
