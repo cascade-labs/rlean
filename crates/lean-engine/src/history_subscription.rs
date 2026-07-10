@@ -170,11 +170,11 @@ pub fn config_from_history_request(
             normalization_mode,
         ),
     };
-    config.tick_type = match request.data_type {
+    config.set_tick_type(match request.data_type {
         DataType::QuoteBar => TickType::Quote,
         DataType::Tick => TickType::Trade,
         _ => TickType::Trade,
-    };
+    });
     config
 }
 

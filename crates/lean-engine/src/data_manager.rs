@@ -293,8 +293,7 @@ mod tests {
     use lean_data::{
         CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataQuery, CustomDataSource,
         CustomDataTransport, CustomSubscriptionMetadata, OptionChainFilterMetadata,
-        OptionChainSubscriptionMetadata, SubscriptionDataConfig, SubscriptionDataKind, Tick,
-        TradeBar, TradeBarData,
+        OptionChainSubscriptionMetadata, SubscriptionDataConfig, Tick, TradeBar, TradeBarData,
     };
     use lean_data_providers::{
         CustomDataContext, HistoryRequest, ICustomDataSource, IHistoryProvider,
@@ -594,21 +593,12 @@ mod tests {
             Tick::trade(symbol.clone(), dt(day, 9, 32), dec!(2), dec!(100)),
         ];
 
-        let config = SubscriptionDataConfig {
-            symbol: symbol.clone(),
-            resolution: Resolution::Tick,
-            tick_type: TickType::Trade,
-            normalization_mode: DataNormalizationMode::Raw,
-            fill_data_forward: false,
-            extended_market_hours: false,
-            is_internal_feed: false,
-            is_filtered_subscription: false,
-            data_time_zone: "America/New_York".into(),
-            exchange_time_zone: "America/New_York".into(),
-            data_kind: SubscriptionDataKind::Market,
-            custom: None,
-            option_chain: None,
-        };
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Tick,
+            DataNormalizationMode::Raw,
+        );
+        config.fill_data_forward = false;
         let mut manager = DataManager::new(tmp.path().to_path_buf());
         manager
             .store()

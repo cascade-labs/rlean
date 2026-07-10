@@ -3,7 +3,7 @@ use lean_core::{DataNormalizationMode, Resolution, Symbol, TickType};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SubscriptionDataKind {
@@ -37,7 +37,17 @@ pub struct OptionChainSubscriptionMetadata {
 }
 
 /// All configuration needed to subscribe to a data stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `unique_id()` SipHashes several identity fields. Because it is called
+/// thousands of times per simulated day by the subscription-sync logic (issue
+/// #39), the result is memoized in `cached_unique_id` and computed at most once
+/// per config value. The two identity fields that are ever mutated after
+/// construction (`tick_type`, `data_kind`) must be changed through
+/// [`SubscriptionDataConfig::set_tick_type`] / [`set_data_kind`], which clear
+/// the cache. Direct writes to the other identity fields do not occur anywhere
+/// in the codebase. Cloning starts with an empty cache (see the manual `Clone`
+/// impl) so a clone can never inherit a stale id.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SubscriptionDataConfig {
     pub symbol: Symbol,
     pub resolution: Resolution,
@@ -52,6 +62,33 @@ pub struct SubscriptionDataConfig {
     pub data_kind: SubscriptionDataKind,
     pub custom: Option<CustomSubscriptionMetadata>,
     pub option_chain: Option<OptionChainSubscriptionMetadata>,
+    /// Memoized `unique_id()`. Not serialized; never contributes to identity.
+    #[serde(skip)]
+    cached_unique_id: OnceLock<u64>,
+}
+
+impl Clone for SubscriptionDataConfig {
+    fn clone(&self) -> Self {
+        // Deliberately start the clone with an empty cache rather than copying
+        // the memoized id. The id is recomputed lazily and cannot go stale even
+        // if the clone's identity fields are subsequently mutated.
+        SubscriptionDataConfig {
+            symbol: self.symbol.clone(),
+            resolution: self.resolution,
+            tick_type: self.tick_type,
+            normalization_mode: self.normalization_mode,
+            fill_data_forward: self.fill_data_forward,
+            extended_market_hours: self.extended_market_hours,
+            is_internal_feed: self.is_internal_feed,
+            is_filtered_subscription: self.is_filtered_subscription,
+            data_time_zone: self.data_time_zone.clone(),
+            exchange_time_zone: self.exchange_time_zone.clone(),
+            data_kind: self.data_kind,
+            custom: self.custom.clone(),
+            option_chain: self.option_chain.clone(),
+            cached_unique_id: OnceLock::new(),
+        }
+    }
 }
 
 impl SubscriptionDataConfig {
@@ -74,6 +111,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Market,
             custom: None,
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -94,6 +132,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Market,
             custom: None,
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -112,6 +151,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Market,
             custom: None,
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -130,6 +170,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Market,
             custom: None,
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -148,6 +189,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Market,
             custom: None,
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -170,6 +212,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Custom,
             custom: Some(metadata),
             option_chain: None,
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -179,7 +222,7 @@ impl SubscriptionDataConfig {
         metadata: CustomSubscriptionMetadata,
     ) -> Self {
         let mut config = Self::new_custom(symbol, resolution, metadata);
-        config.data_kind = SubscriptionDataKind::Universe;
+        config.set_data_kind(SubscriptionDataKind::Universe);
         config.is_internal_feed = true;
         config
     }
@@ -203,6 +246,7 @@ impl SubscriptionDataConfig {
             data_kind: SubscriptionDataKind::Option,
             custom: None,
             option_chain: Some(metadata),
+            cached_unique_id: OnceLock::new(),
         }
     }
 
@@ -214,7 +258,16 @@ impl SubscriptionDataConfig {
         self.data_kind == SubscriptionDataKind::Universe
     }
 
+    /// Stable identity hash. Memoized after the first call — this is invoked
+    /// thousands of times per simulated day by the subscription-sync path, so
+    /// recomputing the SipHash every time dominated backtest CPU (issue #39).
     pub fn unique_id(&self) -> u64 {
+        *self
+            .cached_unique_id
+            .get_or_init(|| self.compute_unique_id())
+    }
+
+    fn compute_unique_id(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hash;
         let mut h = DefaultHasher::new();
@@ -230,6 +283,27 @@ impl SubscriptionDataConfig {
             option_chain.canonical_permtick.hash(&mut h);
         }
         std::hash::Hasher::finish(&h)
+    }
+
+    /// Set the tick type, clearing the memoized `unique_id`. Use this instead of
+    /// writing `config.tick_type` directly so the cached id can never go stale.
+    pub fn set_tick_type(&mut self, tick_type: TickType) {
+        self.tick_type = tick_type;
+        self.cached_unique_id = OnceLock::new();
+    }
+
+    /// Set the data kind, clearing the memoized `unique_id`. Use this instead of
+    /// writing `config.data_kind` directly so the cached id can never go stale.
+    pub fn set_data_kind(&mut self, data_kind: SubscriptionDataKind) {
+        self.data_kind = data_kind;
+        self.cached_unique_id = OnceLock::new();
+    }
+
+    /// Whether the `unique_id` has been memoized yet. Test-only; lets tests
+    /// assert memoization without a process-global counter.
+    #[cfg(test)]
+    pub(crate) fn is_unique_id_cached(&self) -> bool {
+        self.cached_unique_id.get().is_some()
     }
 }
 
@@ -381,7 +455,7 @@ impl SubscriptionManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{SubscriptionDataConfig, SubscriptionManager};
+    use super::{SubscriptionDataConfig, SubscriptionDataKind, SubscriptionManager};
     use lean_core::{
         DataNormalizationMode, Market, OptionRight, OptionStyle, Resolution, Symbol, TickType,
     };
@@ -477,7 +551,7 @@ mod tests {
             Resolution::Minute,
             DataNormalizationMode::Adjusted,
         );
-        quote_config.tick_type = TickType::Quote;
+        quote_config.set_tick_type(TickType::Quote);
         manager.add(quote_config);
 
         let updated = manager.set_normalization_mode(&spy, DataNormalizationMode::Raw);
@@ -500,5 +574,83 @@ mod tests {
         );
         let config = SubscriptionDataConfig::new_option(option, Resolution::Minute);
         assert_eq!(config.normalization_mode, DataNormalizationMode::Raw);
+    }
+
+    #[test]
+    fn unique_id_is_memoized_after_first_call() {
+        let config = equity_config("SPY");
+        assert!(!config.is_unique_id_cached(), "cache must start empty");
+        let first = config.unique_id();
+        assert!(
+            config.is_unique_id_cached(),
+            "first call must populate the cache"
+        );
+        for _ in 0..1000 {
+            assert_eq!(config.unique_id(), first);
+        }
+    }
+
+    #[test]
+    fn set_tick_type_invalidates_cached_unique_id() {
+        let mut config = equity_config("SPY");
+        let trade_id = config.unique_id();
+        config.set_tick_type(TickType::Quote);
+        let quote_id = config.unique_id();
+        assert_ne!(
+            trade_id, quote_id,
+            "changing tick_type must change unique_id (no stale cache)"
+        );
+        // And it must match a config built as a quote from the start.
+        let mut fresh = equity_config("SPY");
+        fresh.set_tick_type(TickType::Quote);
+        assert_eq!(quote_id, fresh.unique_id());
+    }
+
+    #[test]
+    fn set_data_kind_invalidates_cached_unique_id() {
+        let mut config = equity_config("SPY");
+        let market_id = config.unique_id();
+        config.set_data_kind(SubscriptionDataKind::Universe);
+        assert_ne!(market_id, config.unique_id());
+    }
+
+    #[test]
+    fn clone_recomputes_id_and_does_not_inherit_stale_cache() {
+        // Prime the cache on the original, then clone and mutate the clone's
+        // identity. The clone must reflect its own identity, never the original's.
+        let original = equity_config("SPY");
+        let _ = original.unique_id();
+        let mut cloned = original.clone();
+        cloned.set_tick_type(TickType::Quote);
+        assert_ne!(original.unique_id(), cloned.unique_id());
+        // A plain clone (no mutation) must still report the same id.
+        let plain = original.clone();
+        assert_eq!(original.unique_id(), plain.unique_id());
+    }
+
+    #[test]
+    fn many_configs_have_distinct_stable_ids() {
+        // Build 400 configs and simulate the sync diff touching every config
+        // many times per "slice" across many "slices". Every id must be stable
+        // and each config's cache is populated exactly once (verified by the
+        // memoization test); here we assert ids are distinct and stable so the
+        // O(N) HashMap-based diff is sound.
+        let configs: Vec<SubscriptionDataConfig> = (0..400)
+            .map(|i| equity_config(&format!("SYM{i:04}")))
+            .collect();
+
+        let baseline: Vec<u64> = configs.iter().map(|c| c.unique_id()).collect();
+        let distinct: std::collections::HashSet<u64> = baseline.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            400,
+            "all 400 configs must have distinct ids"
+        );
+
+        for _slice in 0..50 {
+            for (config, expected) in configs.iter().zip(&baseline) {
+                assert_eq!(config.unique_id(), *expected);
+            }
+        }
     }
 }

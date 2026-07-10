@@ -549,7 +549,7 @@ impl QcAlgorithm {
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
             let mut quote_config =
                 SubscriptionDataConfig::new_equity(symbol, resolution, normalization_mode);
-            quote_config.tick_type = lean_core::TickType::Quote;
+            quote_config.set_tick_type(lean_core::TickType::Quote);
             self.subscription_manager.add(quote_config);
         }
     }
@@ -588,7 +588,7 @@ impl QcAlgorithm {
         let config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
         self.subscription_manager.add(config);
         let mut quote_config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
-        quote_config.tick_type = lean_core::TickType::Quote;
+        quote_config.set_tick_type(lean_core::TickType::Quote);
         self.subscription_manager.add(quote_config);
         let hours = self.market_hours_database.exchange_hours(&symbol);
         let props = self.symbol_properties_for_symbol(&symbol);
@@ -615,7 +615,7 @@ impl QcAlgorithm {
         self.subscription_manager.add(trade_config);
         let mut quote_config =
             SubscriptionDataConfig::new_crypto_future(symbol.clone(), resolution);
-        quote_config.tick_type = lean_core::TickType::Quote;
+        quote_config.set_tick_type(lean_core::TickType::Quote);
         self.subscription_manager.add(quote_config);
 
         if self.securities.contains(&symbol) {
@@ -1828,7 +1828,7 @@ impl QcAlgorithm {
             ));
         if resolution != Resolution::Hour && resolution != Resolution::Daily {
             let mut quote_config = SubscriptionDataConfig::new_option(symbol, resolution);
-            quote_config.tick_type = lean_core::TickType::Quote;
+            quote_config.set_tick_type(lean_core::TickType::Quote);
             self.subscription_manager.add(quote_config);
         }
     }

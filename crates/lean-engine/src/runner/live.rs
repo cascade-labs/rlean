@@ -973,12 +973,25 @@ async fn sync_live_subscriptions<B: AlgorithmBridge>(
         ),
         &algorithm_manager.option_subscriptions(),
     );
+    // Short-circuit the per-slice sync when the subscription set is unchanged
+    // (issue #39). The unique-ids are now cached, so building this set is cheap,
+    // and both `.sync()` calls below key purely on unique-id — an unchanged id
+    // set means neither would add or remove anything, and the corporate-action
+    // resolver is already a no-op for symbols it has seen.
+    let desired_ids: HashSet<u64> = subscriptions
+        .iter()
+        .map(SubscriptionDataConfig::unique_id)
+        .collect();
+    if live_subscriptions.last_synced_ids.as_ref() == Some(&desired_ids) {
+        return Ok(());
+    }
     // Resolve factor/map files for any equity added mid-session (e.g. add_equity
     // from an alpha model). The per-run cache makes this a no-op for symbols
     // already resolved, so it is cheap to call on every sync.
     resolve_live_corporate_actions(feed_context, &subscriptions).await;
     live_subscriptions.sync(config, &subscriptions)?;
     custom_subscriptions.sync(&subscriptions, &config.custom_data_sources);
+    live_subscriptions.last_synced_ids = Some(desired_ids);
     Ok(())
 }
 
@@ -1058,6 +1071,10 @@ fn next_live_item(
 struct LiveSubscriptionSet {
     market: HashMap<u64, LiveDataSubscription>,
     configs: HashMap<u64, SubscriptionDataConfig>,
+    /// Unique-id set from the last full `sync_live_subscriptions` pass. Used to
+    /// short-circuit the per-slice sync when the subscription set is unchanged
+    /// (issue #39). `None` until the first sync runs.
+    last_synced_ids: Option<HashSet<u64>>,
 }
 
 impl LiveSubscriptionSet {
@@ -1081,6 +1098,7 @@ impl LiveSubscriptionSet {
         let mut set = Self {
             market: HashMap::new(),
             configs: HashMap::new(),
+            last_synced_ids: None,
         };
         for config in subscriptions {
             if is_custom_subscription(config, custom_data_sources) {
