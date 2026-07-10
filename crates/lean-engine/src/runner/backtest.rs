@@ -866,9 +866,15 @@ mod tests {
         // No change.
         assert_diff_matches_reference(&[spy.clone(), xlk.clone()], &[spy.clone(), xlk.clone()]);
         // Pure add.
-        assert_diff_matches_reference(&[spy.clone()], &[spy.clone(), xlk.clone(), xlf.clone()]);
+        assert_diff_matches_reference(
+            std::slice::from_ref(&spy),
+            &[spy.clone(), xlk.clone(), xlf.clone()],
+        );
         // Pure remove.
-        assert_diff_matches_reference(&[spy.clone(), xlk.clone(), xlf.clone()], &[spy.clone()]);
+        assert_diff_matches_reference(
+            &[spy.clone(), xlk.clone(), xlf.clone()],
+            std::slice::from_ref(&spy),
+        );
         // Add + remove.
         assert_diff_matches_reference(&[spy.clone(), xlk.clone()], &[spy.clone(), xlf.clone()]);
         // Empty -> populated and populated -> empty.
@@ -884,7 +890,10 @@ mod tests {
             .unwrap()
             .dynamic_query
             .symbols = Some(vec!["NRG".to_string()]);
-        assert_diff_matches_reference(&[sweeps.clone()], &[sweeps_changed.clone()]);
+        assert_diff_matches_reference(
+            std::slice::from_ref(&sweeps),
+            std::slice::from_ref(&sweeps_changed),
+        );
         // Replacement mixed with an add and a remove.
         assert_diff_matches_reference(
             &[sweeps.clone(), spy.clone(), xlk.clone()],
@@ -897,7 +906,7 @@ mod tests {
         let configs: Vec<SubscriptionDataConfig> =
             (0..10).map(|i| equity_config(&format!("S{i}"))).collect();
         // Cloning yields the same ids, so the diff must report no change.
-        let cloned: Vec<SubscriptionDataConfig> = configs.iter().cloned().collect();
+        let cloned: Vec<SubscriptionDataConfig> = configs.to_vec();
         let diff = compute_subscription_diff(&configs, &cloned);
         assert!(
             diff.is_empty(),
