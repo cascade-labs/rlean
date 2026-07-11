@@ -4,8 +4,8 @@ pub use lean_algorithm::lifecycle::{
 };
 use lean_algorithm::qc_algorithm::{AccountType, BrokerageName, QcAlgorithm};
 use lean_core::{
-    DataNormalizationMode, DateTime, Market, Price, Resolution, SecurityType, Symbol, TickType,
-    TimeSpan,
+    DataNormalizationMode, DateTime, Market, Price, Resolution, SecurityType, Symbol,
+    SymbolOptionsExt, TickType, TimeSpan,
 };
 use lean_data::{CustomDataQuery, SubscriptionDataConfig, SubscriptionDataKind};
 use lean_orders::order::TimeInForce;
@@ -51,22 +51,78 @@ pub struct AlgorithmHandle {
     universe_settings: Arc<Mutex<UniverseSettings>>,
     algorithm_settings: Arc<Mutex<crate::securities::AlgorithmSettings>>,
     runtime_services: Arc<dyn AlgorithmRuntimeServices>,
+    /// User-supplied security initializer (LEAN `ISecurityInitializer`). When set
+    /// with a price seeder, the seeder runs on every security add.
+    security_initializer: Arc<Mutex<Option<BrokerageModelSecurityInitializerHandle>>>,
 }
 
 #[derive(Clone)]
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "BrokerageModel"))]
 pub struct BrokerageModelHandle;
 
-#[derive(Clone)]
-#[cfg_attr(feature = "python", pyo3::pyclass(name = "FuncSecuritySeeder"))]
-pub struct FuncSecuritySeederHandle;
+/// Native seed function: given a security handle bound to the algorithm, return
+/// its seed price (mirrors C# LEAN's `Func<Security, BaseData>` seed function,
+/// reduced to the last-known close price that rlean seeds).
+pub type SecuritySeedFn = Arc<dyn Fn(&SecurityHandle) -> Option<f64> + Send + Sync>;
 
-#[derive(Clone)]
+/// Seed a security's price from a seed function, mirroring C# LEAN's
+/// `FuncSecuritySeeder` (`Lean/Common/Securities/FuncSecuritySeeder.cs`).
+///
+/// Universal: native Rust strategies construct it with a Rust seed function; the
+/// pyo3 constructor stores the Python seed callable and adapts it to the same
+/// native seed function.
+#[derive(Clone, Default)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "FuncSecuritySeeder"))]
+pub struct FuncSecuritySeederHandle {
+    seed_fn: Option<SecuritySeedFn>,
+}
+
+impl FuncSecuritySeederHandle {
+    /// Construct a seeder from a native Rust seed function.
+    pub fn from_fn(seed_fn: SecuritySeedFn) -> Self {
+        Self {
+            seed_fn: Some(seed_fn),
+        }
+    }
+
+    /// Seed the security, mirroring `FuncSecuritySeeder.SeedSecurity`: skip
+    /// canonical symbols, otherwise apply the seed price. Returns the seeded
+    /// price when one was produced.
+    pub fn seed_price(&self, security: &SecurityHandle) -> Option<f64> {
+        if security.symbol_inner().is_canonical_option() {
+            return None;
+        }
+        let seed_fn = self.seed_fn.as_ref()?;
+        seed_fn(security).filter(|price| *price > 0.0 && price.is_finite())
+    }
+}
+
+/// Security initializer, mirroring C# LEAN's `BrokerageModelSecurityInitializer`
+/// (`Lean/Common/Securities/BrokerageModelSecurityInitializer.cs`). rlean already
+/// sets the brokerage models on every security add, so the SDK-facing initializer
+/// only carries the optional price seeder that runs on add.
+#[derive(Clone, Default)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(name = "BrokerageModelSecurityInitializer")
 )]
-pub struct BrokerageModelSecurityInitializerHandle;
+pub struct BrokerageModelSecurityInitializerHandle {
+    seeder: Option<FuncSecuritySeederHandle>,
+}
+
+impl BrokerageModelSecurityInitializerHandle {
+    /// Construct an initializer carrying the given price seeder.
+    pub fn with_seeder(seeder: FuncSecuritySeederHandle) -> Self {
+        Self {
+            seeder: Some(seeder),
+        }
+    }
+
+    /// The configured price seeder, if any.
+    pub fn seeder(&self) -> Option<&FuncSecuritySeederHandle> {
+        self.seeder.as_ref()
+    }
+}
 
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
@@ -80,26 +136,63 @@ impl BrokerageModelHandle {
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl FuncSecuritySeederHandle {
+    /// `FuncSecuritySeeder(seed_function)` — stores the Python seed callable. The
+    /// callable is invoked with the `Security` being seeded and must return its
+    /// seed price (e.g. `self.get_last_known_prices`).
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn py_new(
-        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
-        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
-    ) -> Self {
-        Self
+    #[pyo3(signature = (seed_function=None))]
+    fn py_new(seed_function: Option<pyo3::Py<pyo3::PyAny>>) -> Self {
+        let Some(seed_function) = seed_function else {
+            return Self::default();
+        };
+        let seed_fn: SecuritySeedFn = Arc::new(move |security: &SecurityHandle| {
+            pyo3::Python::attach(|py| {
+                let result = seed_function.call1(py, (security.clone(),)).ok()?;
+                py_seed_result_to_price(py, result)
+            })
+        });
+        Self::from_fn(seed_fn)
     }
+}
+
+/// Coerce a Python seed-function result into a price. Accepts a plain number
+/// (rlean's `get_last_known_prices` returns a float) or a `Security` handle whose
+/// current price is read back.
+#[cfg(feature = "python")]
+fn py_seed_result_to_price(py: pyo3::Python<'_>, result: pyo3::Py<pyo3::PyAny>) -> Option<f64> {
+    use pyo3::types::PyAnyMethods;
+    let bound = result.bind(py);
+    if bound.is_none() {
+        return None;
+    }
+    if let Ok(price) = bound.extract::<f64>() {
+        return Some(price);
+    }
+    if let Ok(security) = bound.extract::<SecurityHandle>() {
+        let price = security.price();
+        if price > 0.0 {
+            return Some(price);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl BrokerageModelSecurityInitializerHandle {
+    /// `BrokerageModelSecurityInitializer(brokerage_model, seeder=None)` — the
+    /// brokerage model is applied by rlean on every security add already, so only
+    /// the optional seeder is retained.
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs))]
+    #[pyo3(signature = (_brokerage_model=None, seeder=None))]
     fn py_new(
-        _args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
-        _kwargs: Option<&pyo3::Bound<'_, pyo3::types::PyDict>>,
+        _brokerage_model: Option<pyo3::Py<pyo3::PyAny>>,
+        seeder: Option<FuncSecuritySeederHandle>,
     ) -> Self {
-        Self
+        match seeder {
+            Some(seeder) => Self::with_seeder(seeder),
+            None => Self::default(),
+        }
     }
 }
 
@@ -150,6 +243,7 @@ impl AlgorithmHandle {
                 universe_settings: Arc::new(Mutex::new(UniverseSettings::default())),
                 algorithm_settings: context.algorithm_settings,
                 runtime_services: context.runtime_services,
+                security_initializer: Arc::new(Mutex::new(None)),
             };
         }
 
@@ -257,7 +351,15 @@ impl AlgorithmHandle {
         BrokerageModelHandle
     }
 
-    pub fn set_security_initializer(&self, _initializer: BrokerageModelSecurityInitializerHandle) {}
+    /// Store the security initializer, mirroring C# LEAN's
+    /// `QCAlgorithm.SetSecurityInitializer`. Its price seeder (if any) runs when a
+    /// security is added (`add_equity` / `add_option` / `add_security`).
+    pub fn set_security_initializer(&self, initializer: BrokerageModelSecurityInitializerHandle) {
+        *self
+            .security_initializer
+            .lock()
+            .expect("security initializer poisoned") = Some(initializer);
+    }
 
     /// Rust equivalent of C# LEAN's `QCAlgorithm.GetLastKnownPrices(Symbol)`: a real
     /// history-provider lookup for seeding a security's price, not a re-read of the
@@ -361,17 +463,42 @@ impl AlgorithmHandle {
             }
             symbol
         };
-        self.seed_security_price_from_history(&symbol, resolution);
+        self.apply_security_initializer(&symbol, resolution);
         SecurityHandle::new(symbol)
     }
 
-    fn seed_security_price_from_history(&self, symbol: &Symbol, resolution: Resolution) {
+    /// Seed a newly added security's price, mirroring C# LEAN's
+    /// `SecurityInitializer.Initialize(security)` seeding step. When a user
+    /// initializer with a price seeder is set, invoke it; otherwise fall back to
+    /// rlean's default history seeding. Skips securities that already have a
+    /// non-zero price.
+    fn apply_security_initializer(&self, symbol: &Symbol, resolution: Resolution) {
         if read_algorithm_security_price(&self.inner, symbol)
             .map(|price| price > 0.0)
             .unwrap_or(false)
         {
             return;
         }
+
+        let seeder = self
+            .security_initializer
+            .lock()
+            .expect("security initializer poisoned")
+            .as_ref()
+            .and_then(|initializer| initializer.seeder().cloned());
+
+        if let Some(seeder) = seeder {
+            let security = SecurityHandle::with_algorithm(symbol.clone(), self.inner.clone());
+            if let Some(price) = seeder.seed_price(&security) {
+                let _ = set_algorithm_security_price_from_float(&self.inner, symbol, price);
+            }
+            return;
+        }
+
+        self.seed_security_price_from_history(symbol, resolution);
+    }
+
+    fn seed_security_price_from_history(&self, symbol: &Symbol, resolution: Resolution) {
         let price = {
             let algorithm = self.inner.lock().unwrap();
             self.runtime_services
@@ -424,10 +551,10 @@ impl AlgorithmHandle {
     ) -> SymbolHandle {
         let market = Market::usa();
         let symbol = Symbol::create_with_security_type(&ticker, security_type, Some(market));
-        SymbolHandle::new(
-            AlgorithmApi::new(&mut self.inner.lock().unwrap())
-                .add_security_symbol(symbol, resolution),
-        )
+        let symbol = AlgorithmApi::new(&mut self.inner.lock().unwrap())
+            .add_security_symbol(symbol, resolution);
+        self.apply_security_initializer(&symbol, resolution);
+        SymbolHandle::new(symbol)
     }
 
     pub fn add_option(
@@ -437,6 +564,10 @@ impl AlgorithmHandle {
     ) -> OptionSecurityHandle {
         let symbol = AlgorithmApi::new(&mut self.inner.lock().unwrap())
             .add_option(&underlying_ticker, resolution);
+        // The canonical option symbol is skipped by the seeder (LEAN
+        // `FuncSecuritySeeder` skips canonical symbols); calling the initializer
+        // here keeps the add path uniform and seeds any non-canonical add path.
+        self.apply_security_initializer(&symbol, resolution);
         OptionSecurityHandle::new(symbol, self.inner.clone())
     }
 
@@ -925,6 +1056,16 @@ impl AlgorithmHandle {
         properties: Option<HashMap<String, String>>,
     ) -> SecurityHandle {
         self.add_data(source_type, ticker, resolution.into(), properties)
+    }
+
+    #[pyo3(name = "remove_security", signature = (symbol, tag=None))]
+    fn py_remove_security(&self, symbol: SymbolHandle, tag: Option<String>) -> bool {
+        self.remove_security(symbol, tag)
+    }
+
+    #[pyo3(name = "remove_option_contract", signature = (symbol, tag=None))]
+    fn py_remove_option_contract(&self, symbol: SymbolHandle, tag: Option<String>) -> bool {
+        self.remove_option_contract(symbol, tag)
     }
 
     #[pyo3(name = "set_warm_up", signature = (n, resolution=None))]

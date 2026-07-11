@@ -5,7 +5,10 @@ use lean_algorithm::lifecycle::{
 use lean_algorithm::qc_algorithm::QcAlgorithm;
 use lean_core::{Resolution, SecurityType};
 use lean_orders::order::TimeInForce;
-use lean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
+use lean_sdk::algorithm::{
+    AlgorithmConstructionContext, AlgorithmHandle, BrokerageModelSecurityInitializerHandle,
+    FuncSecuritySeederHandle, SecuritySeedFn,
+};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -117,4 +120,39 @@ fn algorithm_handle_order_helpers_return_lean_ticket_projections() {
     let stop = algorithm.stop_market_order(symbol, 3.0, 399.5, None, false);
     assert_close(stop.quantity(), 3.0);
     assert_eq!(stop.stop_price(), Some(399.5));
+}
+
+#[test]
+fn security_initializer_seeder_seeds_price_on_add() {
+    let algorithm = test_algorithm();
+
+    // Native seed function mirroring LEAN's FuncSecuritySeeder seed function.
+    let seed_fn: SecuritySeedFn = Arc::new(|_security| Some(411.25));
+    let seeder = FuncSecuritySeederHandle::from_fn(seed_fn);
+    algorithm
+        .set_security_initializer(BrokerageModelSecurityInitializerHandle::with_seeder(seeder));
+
+    // The test history service returns no last-known price, so absent the seeder
+    // the price would stay zero. The seeder must set it on add.
+    let security = algorithm.add_equity("spy".to_string(), Resolution::Daily, None);
+    let symbol = security.symbol();
+    let price = algorithm.securities().get(symbol.inner()).price();
+    assert_close(price, 411.25);
+}
+
+#[test]
+fn security_initializer_seeder_skips_canonical_option() {
+    let algorithm = test_algorithm();
+
+    let seed_fn: SecuritySeedFn = Arc::new(|_security| Some(999.0));
+    algorithm.set_security_initializer(BrokerageModelSecurityInitializerHandle::with_seeder(
+        FuncSecuritySeederHandle::from_fn(seed_fn),
+    ));
+
+    // add_option registers a canonical option symbol; LEAN's FuncSecuritySeeder
+    // skips canonical symbols, so no seed price is applied to the canonical.
+    let option = algorithm.add_option("spy".to_string(), Resolution::Daily);
+    let canonical = option.symbol();
+    let price = algorithm.securities().get(canonical.inner()).price();
+    assert_close(price, 0.0);
 }
