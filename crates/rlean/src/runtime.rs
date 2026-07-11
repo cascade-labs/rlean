@@ -380,14 +380,10 @@ pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
 pub(crate) fn provider_args(
     data_root: PathBuf,
     data_store: Option<Arc<IcebergStore>>,
-    args: &RunArgs,
 ) -> providers::ProviderArgs {
     providers::ProviderArgs {
         data_root,
         data_store,
-        polygon_rate: args.polygon_rate,
-        thetadata_rate: args.thetadata_rate,
-        thetadata_concurrent: args.thetadata_concurrent,
     }
 }
 
@@ -402,7 +398,7 @@ pub(crate) fn build_providers(
 
     let raw = providers::build_history_provider(
         names,
-        provider_args(args.data.clone(), Some(data_store), args),
+        provider_args(args.data.clone(), Some(data_store)),
     )?;
     Ok(Some(raw))
 }

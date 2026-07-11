@@ -477,15 +477,6 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
     for parameter in &args.parameters {
         values.extend(["--parameter".to_string(), parameter.clone()]);
     }
-    values.extend(["--polygon-rate".to_string(), args.polygon_rate.to_string()]);
-    values.extend([
-        "--thetadata-rate".to_string(),
-        args.thetadata_rate.to_string(),
-    ]);
-    values.extend([
-        "--thetadata-concurrent".to_string(),
-        args.thetadata_concurrent.to_string(),
-    ]);
     if let Some(value) = args.live_limits.live_max_slices {
         values.extend(["--live-max-slices".to_string(), value.to_string()]);
     }
@@ -1009,9 +1000,6 @@ mod tests {
                 start_date: None,
                 end_date: None,
                 parameters: vec!["foo=bar".to_string()],
-                polygon_rate: 5.0,
-                thetadata_rate: 4.0,
-                thetadata_concurrent: 4,
                 artifact_store: None,
                 artifact_s3: None,
                 verbose: true,
