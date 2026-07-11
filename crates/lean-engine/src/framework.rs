@@ -30,7 +30,6 @@ use lean_risk::risk_management::{
     HoldingSnapshot, NullRiskManagement, PortfolioTarget as RiskTarget, RiskContext,
     RiskManagementModel,
 };
-use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
 /// Callback used by the framework to publish the current scored insight set back
@@ -481,14 +480,23 @@ pub fn run_framework_pipeline(
         }
     }
 
-    let initial_inputs = build_framework_inputs(algorithm, slice);
+    // The alpha's Update() reads only the security symbol list, so give it a cheap
+    // symbols-only snapshot instead of a full FrameworkInputs build (holdings,
+    // orders, prices, portfolio value). Behaviourally identical: collect_alpha_insights
+    // touches nothing else on the inputs.
+    let alpha_securities: Vec<Symbol> = {
+        let alg = algorithm.lock().unwrap();
+        alg.securities.all().map(|s| s.symbol.clone()).collect()
+    };
     let alpha_insights = {
         let mut fw = framework.lock().unwrap();
-        fw.collect_alpha_insights(slice, &initial_inputs.securities)
+        fw.collect_alpha_insights(slice, &alpha_securities)
     };
 
-    // Alpha models can add securities and seed prices during Update(); rebuild
-    // inputs so PCM/risk/execution consume the post-alpha algorithm state.
+    // Alpha models can add securities and seed prices during Update(); build the
+    // full inputs once here so PCM/risk/execution consume the post-alpha algorithm
+    // state. This single post-alpha build already reflects any securities the alpha
+    // added, so no pre-alpha full build is needed.
     let inputs = build_framework_inputs(algorithm, slice);
     let mut fw = framework.lock().unwrap();
     let execution_context = ExecutionContext::new(
@@ -535,7 +543,6 @@ pub fn rearm_framework_rebalance_for_symbol(
 }
 
 struct FrameworkInputs {
-    securities: Vec<Symbol>,
     prices: HashMap<u64, Decimal>,
     portfolio_value: Decimal,
     risk_context: RiskContext,
@@ -548,12 +555,9 @@ fn build_framework_inputs(
     slice: &lean_data::Slice,
 ) -> FrameworkInputs {
     let alg = algorithm.lock().unwrap();
-    let securities: Vec<Symbol> = alg.securities.all().map(|s| s.symbol.clone()).collect();
+    // Single holdings map keyed by sid. `current_qty` and the risk-model snapshot
+    // both derive from this, so there is no need for a second parallel quantity map.
     let portfolio_holdings = alg.portfolio.all_holdings();
-    let mut holdings: HashMap<u64, Decimal> = HashMap::with_capacity(portfolio_holdings.len());
-    for holding in &portfolio_holdings {
-        holdings.insert(holding.symbol.id.sid, holding.quantity);
-    }
     let mut holding_data: HashMap<u64, lean_algorithm::portfolio::SecurityHolding> =
         HashMap::with_capacity(portfolio_holdings.len());
     for holding in portfolio_holdings {
@@ -590,20 +594,20 @@ fn build_framework_inputs(
         });
     }
     let portfolio_value = alg.portfolio_value();
-    let mut security_data: HashMap<u64, SecurityData> = HashMap::with_capacity(securities.len());
+    let mut security_data: HashMap<u64, SecurityData> =
+        HashMap::with_capacity(alg.securities.count());
     for security in alg.securities.all() {
         let symbol = security.symbol.clone();
         let sid = symbol.id.sid;
         let base_price = security.current_price();
-        let current_qty = holdings.get(&sid).copied().unwrap_or(Decimal::ZERO);
+        let current_qty = holding_data
+            .get(&sid)
+            .map(|holding| holding.quantity)
+            .unwrap_or(Decimal::ZERO);
         let open_order_qty = open_orders.get(&sid).copied().unwrap_or(Decimal::ZERO);
-        let lot_size = Decimal::from_f64(security.symbol_properties.lot_size)
-            .filter(|lot| *lot > Decimal::ZERO)
-            .unwrap_or(Decimal::ONE);
-        let minimum_price_variation =
-            Decimal::from_f64(security.symbol_properties.minimum_price_variation)
-                .filter(|tick| *tick > Decimal::ZERO)
-                .unwrap_or(Decimal::new(1, 2));
+        // Immutable per-security decimals converted once at security construction.
+        let lot_size = security.lot_size_decimal();
+        let minimum_price_variation = security.minimum_price_variation_decimal();
         let data = execution_security_data_from_slice(
             slice,
             symbol,
@@ -643,7 +647,6 @@ fn build_framework_inputs(
     };
 
     FrameworkInputs {
-        securities,
         prices,
         portfolio_value,
         risk_context,

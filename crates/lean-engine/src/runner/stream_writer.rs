@@ -67,9 +67,12 @@ impl BacktestStreamWriter {
                 .unwrap_or_else(Instant::now),
         };
         // Truncate append-only streams so a re-run into the same dir is clean.
+        // progress.json is now append-only (one JSON line per trading day), so it
+        // is truncated here alongside the other streaming files.
         let _ = std::fs::File::create(&writer.order_events_path);
         let _ = std::fs::File::create(&writer.trades_path);
         let _ = std::fs::File::create(&writer.heartbeat_path);
+        let _ = std::fs::File::create(&writer.progress_path);
         writer
     }
 
@@ -94,7 +97,14 @@ impl BacktestStreamWriter {
         append_json_lines(&self.trades_path, trades);
     }
 
-    /// Rewrite `progress.json` and (at most every 30s) append to `heartbeat.log`.
+    /// Append one progress entry to `progress.json` at each end of trading day and
+    /// (at most every 30s) append to `heartbeat.log`.
+    ///
+    /// `progress.json` is append-only: one newline-delimited JSON object per
+    /// trading day, gated on the same day-boundary hook as the daily progress log.
+    /// This removes the per-slice atomic rewrite that dominated the per-slice cost
+    /// on many-ticker backtests (#54). Readers take the last line for current
+    /// status; `mark_completed` appends the terminal entry at run end.
     pub fn record_progress(
         &mut self,
         current_date: NaiveDate,
@@ -104,23 +114,26 @@ impl BacktestStreamWriter {
         trades: usize,
     ) {
         let progress = self.progress_fraction(current_date);
-        let payload = serde_json::json!({
-            "status": "running",
-            "current_date": current_date.to_string(),
-            "start_date": self.start_date.to_string(),
-            "end_date": self.end_date.to_string(),
-            "progress": progress,
-            "progress_percent": (progress * 100.0),
-            "trading_days": trading_days,
-            "portfolio_value": portfolio_value.to_string(),
-            "order_events": order_events,
-            "trades": trades,
-            "started_at": self.started_at.to_rfc3339(),
-            "updated_at": chrono::Utc::now().to_rfc3339(),
-        });
-        write_json_pretty_atomic(&self.progress_path, &payload);
 
+        // One progress entry per trading day, on the day boundary. `last_log_date`
+        // already tracks this cadence for the daily tracing log.
         if self.last_log_date != Some(current_date) {
+            let payload = serde_json::json!({
+                "status": "running",
+                "current_date": current_date.to_string(),
+                "start_date": self.start_date.to_string(),
+                "end_date": self.end_date.to_string(),
+                "progress": progress,
+                "progress_percent": (progress * 100.0),
+                "trading_days": trading_days,
+                "portfolio_value": portfolio_value.to_string(),
+                "order_events": order_events,
+                "trades": trades,
+                "started_at": self.started_at.to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            });
+            append_progress_line(&self.progress_path, &payload);
+            self.sink.mirror("progress.json");
             tracing::info!(
                 "Backtest progress: {} ({:.1}%) trading_days={} portfolio={} orders={} trades={} output={}",
                 current_date,
@@ -141,8 +154,8 @@ impl BacktestStreamWriter {
 
         // Checkpoint the streaming files to S3. The sink throttles these to at
         // most one upload per file per checkpoint interval, so calling on every
-        // progress flush is cheap and no-ops entirely in local mode.
-        self.sink.mirror("progress.json");
+        // progress flush is cheap and no-ops entirely in local mode. (progress.json
+        // is mirrored above, only when a new daily entry is appended.)
         self.sink.mirror("order-events.jsonl");
         self.sink.mirror("trades.jsonl");
         self.sink.mirror("heartbeat.log");
@@ -172,7 +185,9 @@ impl BacktestStreamWriter {
         }
     }
 
-    /// Flip `progress.json` to a terminal `completed` state after the run loop.
+    /// Append the terminal `completed` progress entry after the run loop. Readers
+    /// take the last line of `progress.json`, so this final append is what surfaces
+    /// as the run's completed status.
     pub fn mark_completed(
         &self,
         trading_days: i64,
@@ -194,7 +209,7 @@ impl BacktestStreamWriter {
             "started_at": self.started_at.to_rfc3339(),
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
-        write_json_pretty_atomic(&self.progress_path, &payload);
+        append_progress_line(&self.progress_path, &payload);
     }
 
     /// Upload the final run state to S3 (no-op in local mode). Call after all
@@ -212,11 +227,19 @@ impl BacktestStreamWriter {
     }
 }
 
-fn write_json_pretty_atomic<T: serde::Serialize>(path: &Path, value: &T) {
-    let tmp = path.with_extension("json.tmp");
-    if let Ok(json) = serde_json::to_string_pretty(value) {
-        let _ = std::fs::write(&tmp, json);
-        let _ = std::fs::rename(&tmp, path);
+/// Append a single compact (one-line) JSON entry to the append-only progress file.
+/// Each line is a self-contained object; readers take the last line for the current
+/// status. A lone `writeln!` of a serialized object is written atomically enough for
+/// a line-delimited status file, so no temp-file rename is needed.
+fn append_progress_line<T: serde::Serialize>(path: &Path, value: &T) {
+    if let Ok(line) = serde_json::to_string(value) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
     }
 }
 

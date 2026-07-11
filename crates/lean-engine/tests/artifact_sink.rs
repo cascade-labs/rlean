@@ -51,7 +51,8 @@ async fn backtest_stream_writer_mirrors_run_files() {
     let end = chrono::NaiveDate::from_ymd_opt(2024, 1, 31).unwrap();
     let mut writer = BacktestStreamWriter::new(sink.clone(), start, end);
 
-    // First progress flush checkpoints immediately (no prior upload timestamp).
+    // First progress on a new trading day appends one line and checkpoints it.
+    // progress.json is append-only compact JSON, one object per line.
     writer.record_progress(
         chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
         10,
@@ -64,9 +65,9 @@ async fn backtest_stream_writer_mirrors_run_files() {
         "runs/algo/backtests/20260101_120000_algo/progress.json",
     )
     .await;
-    assert!(uploaded.contains("\"status\": \"running\""));
+    assert!(uploaded.contains("\"status\":\"running\""));
 
-    // Completion: mark + flush uploads the final state of every file.
+    // Completion: mark appends the terminal line; finish uploads every file.
     writer.mark_completed(21, dec!(105000), 3, 2);
     writer.finish();
 
@@ -81,7 +82,11 @@ async fn backtest_stream_writer_mirrors_run_files() {
         "runs/algo/backtests/20260101_120000_algo/progress.json",
     )
     .await;
-    assert!(final_progress.contains("\"status\": \"completed\""));
+    // Append-only: the running line is retained and the completed line is last,
+    // so a reader that takes the last line sees the terminal status.
+    assert!(final_progress.contains("\"status\":\"running\""));
+    let last_line = final_progress.lines().last().unwrap();
+    assert!(last_line.contains("\"status\":\"completed\""));
 
     // Local run dir still holds everything (Mirror is local-primary).
     assert!(run_dir.join("progress.json").exists());

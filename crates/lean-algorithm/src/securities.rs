@@ -3,6 +3,8 @@ use crate::portfolio::{SecurityHolding, SharedHoldings};
 use lean_core::exchange_hours::ExchangeHours;
 use lean_core::{Price, Resolution, SecurityType, Symbol, SymbolProperties};
 use parking_lot::RwLock;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,6 +22,13 @@ pub struct Security {
     pub price: RwLock<Price>,
     pub bid_price: RwLock<Price>,
     pub ask_price: RwLock<Price>,
+    /// `lot_size` as a `Decimal`, converted once at construction. `symbol_properties`
+    /// is immutable, so this never changes over the security's lifetime. Cached to
+    /// avoid re-running `Decimal::from_f64` on every framework slice.
+    lot_size_decimal: Decimal,
+    /// `minimum_price_variation` as a `Decimal`, cached at construction for the same
+    /// reason as `lot_size_decimal`.
+    minimum_price_variation_decimal: Decimal,
     holdings: SharedHoldings,
 }
 
@@ -42,6 +51,13 @@ impl Security {
                 .entry(symbol.id.sid)
                 .or_insert_with(|| SecurityHolding::new(symbol.clone()));
         }
+        let lot_size_decimal = Decimal::from_f64(symbol_properties.lot_size)
+            .filter(|lot| *lot > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE);
+        let minimum_price_variation_decimal =
+            Decimal::from_f64(symbol_properties.minimum_price_variation)
+                .filter(|tick| *tick > Decimal::ZERO)
+                .unwrap_or(Decimal::new(1, 2));
         Security {
             symbol,
             resolution,
@@ -54,8 +70,24 @@ impl Security {
             price: RwLock::new(rust_decimal_macros::dec!(0)),
             bid_price: RwLock::new(rust_decimal_macros::dec!(0)),
             ask_price: RwLock::new(rust_decimal_macros::dec!(0)),
+            lot_size_decimal,
+            minimum_price_variation_decimal,
             holdings,
         }
+    }
+
+    /// `lot_size` converted to `Decimal`, cached at construction. Matches the
+    /// framework's historical inline conversion: falls back to `Decimal::ONE` when
+    /// the configured lot size is non-positive or not representable.
+    pub fn lot_size_decimal(&self) -> Decimal {
+        self.lot_size_decimal
+    }
+
+    /// `minimum_price_variation` converted to `Decimal`, cached at construction.
+    /// Falls back to `0.01` when the configured tick is non-positive or not
+    /// representable, matching the framework's historical inline conversion.
+    pub fn minimum_price_variation_decimal(&self) -> Decimal {
+        self.minimum_price_variation_decimal
     }
 
     pub fn current_price(&self) -> Price {
