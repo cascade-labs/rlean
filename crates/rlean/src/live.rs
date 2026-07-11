@@ -90,7 +90,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
-    let provider_args = provider_args(args.data.clone(), Some(datastore.store.clone()), &args);
+    let provider_args = provider_args(args.data.clone(), Some(datastore.store.clone()));
     let live_data_queue =
         providers::build_live_data_queue(live_provider_names, provider_args.clone())?;
     let brokerage = if requested_paper_brokerage {

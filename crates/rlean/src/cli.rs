@@ -96,19 +96,6 @@ pub(crate) struct RuntimeArgs {
     #[arg(long = "parameter", short = 'p', value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     pub(crate) parameters: Vec<String>,
 
-    // ── Rate limits (plugin API keys/URLs live in ~/.rlean/plugin-configs.json) ─
-    /// Polygon/Massive requests/second (default: 5)
-    #[arg(long, default_value_t = 5.0)]
-    pub(crate) polygon_rate: f64,
-
-    /// ThetaData requests/second (default: 4)
-    #[arg(long, default_value_t = 4.0)]
-    pub(crate) thetadata_rate: f64,
-
-    /// ThetaData max concurrent requests (default: 4)
-    #[arg(long, default_value_t = 4)]
-    pub(crate) thetadata_concurrent: usize,
-
     // ── Run artifact relay ────────────────────────────────────────────────────
     /// Where run artifacts (backtest/live run dirs) are written: local, s3, or
     /// mirror. Defaults to local. Overrides RLEAN_ARTIFACT_STORE and config.

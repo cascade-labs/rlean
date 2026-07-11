@@ -385,38 +385,14 @@ impl IHistoryProvider for LazyPluginProvider {
     }
 }
 
-/// Rate-limit settings for the CLI — passed alongside plugin config.
+/// Data-root and store settings for the CLI — passed alongside plugin config.
 ///
-/// Plugin-specific config (API keys, URLs, etc.) lives in
+/// Plugin-specific config (API keys, URLs, rate limits, etc.) lives in
 /// ~/.rlean/plugin-configs.json and is loaded separately in `load_plugin_provider`.
 #[derive(Clone, Default)]
 pub struct ProviderArgs {
     pub data_root: std::path::PathBuf,
     pub data_store: Option<Arc<IcebergStore>>,
-    pub polygon_rate: f64,
-    pub thetadata_rate: f64,
-    pub thetadata_concurrent: usize,
-}
-
-impl ProviderArgs {
-    fn rps_for(&self, provider: &str) -> f64 {
-        match provider {
-            "thetadata" => {
-                if self.thetadata_rate > 0.0 {
-                    self.thetadata_rate
-                } else {
-                    4.0
-                }
-            }
-            _ => {
-                if self.polygon_rate > 0.0 {
-                    self.polygon_rate
-                } else {
-                    5.0
-                }
-            }
-        }
-    }
 }
 
 /// Build a historical data provider from a (possibly comma-separated) name
@@ -672,12 +648,6 @@ fn load_plugin_live_data_provider(
 }
 
 fn plugin_config_json(name: &str, args: &ProviderArgs) -> Result<String> {
-    let max_concurrent = if args.thetadata_concurrent > 0 {
-        args.thetadata_concurrent
-    } else {
-        4
-    };
-
     use crate::config::PluginConfigs;
     let plugin_configs = PluginConfigs::load().unwrap_or_default();
     let mut plugin_cfg = plugin_configs.get_plugin(name);
@@ -685,12 +655,6 @@ fn plugin_config_json(name: &str, args: &ProviderArgs) -> Result<String> {
     plugin_cfg
         .entry("data_root".to_string())
         .or_insert_with(|| serde_json::json!(args.data_root.display().to_string()));
-    plugin_cfg
-        .entry("requests_per_second".to_string())
-        .or_insert_with(|| serde_json::json!(args.rps_for(name)));
-    plugin_cfg
-        .entry("max_concurrent".to_string())
-        .or_insert_with(|| serde_json::json!(max_concurrent));
 
     Ok(serde_json::Value::Object(plugin_cfg).to_string())
 }
