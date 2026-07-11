@@ -33,33 +33,16 @@ pub(crate) fn resolve_datastore_for_data_root(
     data_folder: &Path,
     global_config: &config::GlobalConfig,
 ) -> Result<ResolvedDataStore> {
-    // The market-data store backend is decided solely by the `data_store`
-    // resolver (env/config); the legacy `datastore` string is not consulted.
-    let resolved = crate::data_store_config::resolve(global_config)?;
-    match resolved.mode {
-        crate::data_store_config::DataStoreMode::Local => {
+    match global_config.datastore.as_str() {
+        "file" => {
             let store = block_connect_iceberg_store(data_folder.to_path_buf())?;
             Ok(ResolvedDataStore {
                 store,
                 data_root: data_folder.to_path_buf(),
             })
         }
-        crate::data_store_config::DataStoreMode::S3 => {
-            let s3 = resolved
-                .s3
-                .expect("s3 mode resolves to Some(S3DataStoreConfig)");
-            let catalog = resolved
-                .catalog
-                .expect("s3 mode resolves to Some(RestCatalogConnection)");
-            let store = block_connect_iceberg_store_s3(s3, catalog)?;
-            // `data_root` is only used for report file layout and provider hints
-            // (no market data is written there), so the local data folder is a
-            // fine placeholder in S3 mode.
-            Ok(ResolvedDataStore {
-                store,
-                data_root: data_folder.to_path_buf(),
-            })
-        }
+        "s3" => bail!("datastore=s3 is not supported until Iceberg S3 FileIO is wired"),
+        other => bail!("unsupported datastore '{other}', expected 'file' or 's3'"),
     }
 }
 
@@ -70,22 +53,6 @@ fn block_connect_iceberg_store(data_root: PathBuf) -> Result<Arc<IcebergStore>> 
             .build()
             .context("failed to build Iceberg store runtime")?
             .block_on(IcebergStore::connect_local(data_root))
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("Iceberg store worker panicked"))?
-    .map(Arc::new)
-}
-
-fn block_connect_iceberg_store_s3(
-    config: lean_storage::S3DataStoreConfig,
-    catalog: lean_storage::RestCatalogConnection,
-) -> Result<Arc<IcebergStore>> {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to build Iceberg store runtime")?
-            .block_on(IcebergStore::connect_s3(config, catalog))
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Iceberg store worker panicked"))?

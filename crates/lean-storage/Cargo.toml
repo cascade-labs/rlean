@@ -14,14 +14,10 @@ arrow-schema = { workspace = true }
 arrow-cast = { workspace = true }
 parquet = { workspace = true }
 datafusion = { workspace = true }
-object_store = { version = "0.12", features = ["aws"] }
-url = "2"
+object_store = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
-typetag = { workspace = true }
 sqlx = { workspace = true }
 
 tokio = { workspace = true }
