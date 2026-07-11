@@ -854,6 +854,18 @@ impl SubscriptionProducerState {
             self.cache_filled_until = Some(window_end);
             return Ok(Vec::new());
         }
+        // The window is not fully cached, but part of it may be. Persist ONLY the
+        // days the cache is genuinely missing — never re-buffer rows for days that
+        // are already stored. This mirrors C# LEAN, where a cache hit is a plain
+        // file read that writes nothing and only a missing file is downloaded and
+        // persisted (BaseDownloaderDataProvider.DownloadOnce /
+        // `!File.Exists(filePath)`): cached data must produce zero writes even
+        // when the surrounding fetch window straddles a coverage gap (e.g. a
+        // symbol's uncached warm-up head in front of its cached body).
+        let cached_days = self
+            .local_market_days(window_start, window_end)
+            .await
+            .unwrap_or_default();
         let request = HistoryRequest {
             symbol: self.config.symbol.clone(),
             resolution: self.config.resolution,
@@ -888,15 +900,18 @@ impl SubscriptionProducerState {
                     cache_filled_until =
                         self.daily_fetched_trade_bars_until(&rows, window_start, window_end);
                 }
-                self.context
-                    .buffer_trade_bar_cache_write(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                let to_write = self.trade_bars_for_uncached_days(&rows, &cached_days);
+                if !to_write.is_empty() {
+                    self.context
+                        .buffer_trade_bar_cache_write(
+                            &to_write,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -928,15 +943,18 @@ impl SubscriptionProducerState {
                     cache_filled_until =
                         self.daily_fetched_quote_bars_until(&rows, window_start, window_end);
                 }
-                self.context
-                    .buffer_quote_bar_cache_write(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                let to_write = self.quote_bars_for_uncached_days(&rows, &cached_days);
+                if !to_write.is_empty() {
+                    self.context
+                        .buffer_quote_bar_cache_write(
+                            &to_write,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -950,15 +968,18 @@ impl SubscriptionProducerState {
                     .into_iter()
                     .filter(|row| self.tick_belongs_to_window(row, window_start, window_end))
                     .collect::<Vec<_>>();
-                self.context
-                    .buffer_tick_cache_write(
-                        &rows,
-                        self.config.symbol.security_type(),
-                        self.config.symbol.market().as_str(),
-                        self.config.resolution,
-                        self.config.tick_type,
-                    )
-                    .await?;
+                let to_write = self.ticks_for_uncached_days(&rows, &cached_days);
+                if !to_write.is_empty() {
+                    self.context
+                        .buffer_tick_cache_write(
+                            &to_write,
+                            self.config.symbol.security_type(),
+                            self.config.symbol.market().as_str(),
+                            self.config.resolution,
+                            self.config.tick_type,
+                        )
+                        .await?;
+                }
                 if self.config.symbol.security_type() == SecurityType::CryptoFuture {
                     self.persist_crypto_future_derived_data(provider.as_ref(), &request)
                         .await?;
@@ -1188,6 +1209,109 @@ impl SubscriptionProducerState {
             &expected,
             &covered,
         )
+    }
+
+    /// The set of partition days (`day` column values) already cached for this
+    /// subscription within `[window_start, window_end]`. Used to skip re-writing
+    /// rows the cache already holds when a fetch window straddles a coverage gap
+    /// (see `fetch_market_window_if_missing`). Reads the same partition index the
+    /// coverage probe uses, so it is a cheap in-memory lookup on a warm run.
+    async fn local_market_days(
+        &self,
+        window_start: chrono::NaiveDate,
+        window_end: chrono::NaiveDate,
+    ) -> anyhow::Result<HashSet<chrono::NaiveDate>> {
+        let day_start = partition_day_start(window_start);
+        let day_end = partition_day_end(window_end);
+        let table = if self.config.resolution.is_tick() {
+            lean_storage::iceberg_store::MARKET_TICKS
+        } else if self.config.tick_type == TickType::Quote {
+            lean_storage::iceberg_store::MARKET_QUOTE_BARS
+        } else {
+            lean_storage::iceberg_store::MARKET_TRADE_BARS
+        };
+        Ok(self
+            .context
+            .store
+            .market_partition_days(MarketPartitionDayQuery::new(
+                table,
+                self.config.symbol.security_type(),
+                self.config.symbol.market().as_str(),
+                self.config.resolution,
+                self.config.symbol.id.sid,
+                days_since_epoch(day_start.0),
+                days_since_epoch(day_end.0),
+            ))
+            .await?
+            .into_iter()
+            .filter_map(date_from_days_since_epoch)
+            .collect())
+    }
+
+    /// The partition `day` the storage write path assigns to a market row. The
+    /// Iceberg `day` column is `days_since_epoch(end_time_ns)` for Daily bars and
+    /// `days_since_epoch(time_ns)` for every finer resolution (see
+    /// `lean_storage::iceberg_store::market_day_values`). Keying the uncached-day
+    /// filter on the identical field guarantees a fetched bar is compared against
+    /// the exact `day` the cache probe reports for it.
+    fn market_row_partition_day(&self, time: DateTime, end_time: DateTime) -> chrono::NaiveDate {
+        if self.config.resolution == Resolution::Daily {
+            end_time.date_utc()
+        } else {
+            time.date_utc()
+        }
+    }
+
+    /// Trade bars whose partition day is not already cached — the only rows that
+    /// should be persisted after a partial-coverage fetch. An already-cached day
+    /// is never re-written.
+    fn trade_bars_for_uncached_days(
+        &self,
+        rows: &[TradeBar],
+        cached_days: &HashSet<chrono::NaiveDate>,
+    ) -> Vec<TradeBar> {
+        if cached_days.is_empty() {
+            return rows.to_vec();
+        }
+        rows.iter()
+            .filter(|row| {
+                !cached_days.contains(&self.market_row_partition_day(row.time, row.end_time))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Quote-bar counterpart of [`Self::trade_bars_for_uncached_days`].
+    fn quote_bars_for_uncached_days(
+        &self,
+        rows: &[QuoteBar],
+        cached_days: &HashSet<chrono::NaiveDate>,
+    ) -> Vec<QuoteBar> {
+        if cached_days.is_empty() {
+            return rows.to_vec();
+        }
+        rows.iter()
+            .filter(|row| {
+                !cached_days.contains(&self.market_row_partition_day(row.time, row.end_time))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Tick counterpart of [`Self::trade_bars_for_uncached_days`]. Ticks are only
+    /// ever written at tick resolution, so the partition day is the tick time.
+    fn ticks_for_uncached_days(
+        &self,
+        rows: &[Tick],
+        cached_days: &HashSet<chrono::NaiveDate>,
+    ) -> Vec<Tick> {
+        if cached_days.is_empty() {
+            return rows.to_vec();
+        }
+        rows.iter()
+            .filter(|row| !cached_days.contains(&row.time.date_utc()))
+            .cloned()
+            .collect()
     }
 
     async fn has_local_market_window(
@@ -3285,6 +3409,58 @@ mod tests {
             "window start must be clamped up to the provider earliest date"
         );
         assert!(window_end >= window_start);
+    }
+
+    #[tokio::test]
+    async fn uncached_days_filter_drops_already_cached_rows() {
+        // A partial-coverage fetch (a symbol's uncached warm-up head in front of
+        // its already-cached body) must persist ONLY the uncached days. Re-buffering
+        // the cached days is the redundant-write bug: cached data must produce zero
+        // writes even when the surrounding fetch window straddles the gap.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        let start = NaiveDate::from_ymd_opt(2022, 1, 3).unwrap();
+        let end = NaiveDate::from_ymd_opt(2022, 1, 7).unwrap();
+        let state = SubscriptionProducerState::new(
+            config,
+            context(store),
+            dt(start, 0, 0),
+            dt(end, 23, 59),
+        );
+
+        let day3 = NaiveDate::from_ymd_opt(2022, 1, 3).unwrap();
+        let day4 = NaiveDate::from_ymd_opt(2022, 1, 4).unwrap();
+        let day5 = NaiveDate::from_ymd_opt(2022, 1, 5).unwrap();
+        let rows = vec![
+            trade_bar(symbol.clone(), day3, 9, 31, 100),
+            trade_bar(symbol.clone(), day4, 9, 31, 101),
+            trade_bar(symbol.clone(), day5, 9, 31, 102),
+        ];
+
+        // Jan 4 already cached -> only Jan 3 and Jan 5 survive the filter.
+        let cached: HashSet<chrono::NaiveDate> = [day4].into_iter().collect();
+        let kept = state.trade_bars_for_uncached_days(&rows, &cached);
+        let kept_days: HashSet<chrono::NaiveDate> =
+            kept.iter().map(|row| row.time.date_utc()).collect();
+        assert_eq!(kept_days, [day3, day5].into_iter().collect());
+
+        // Nothing cached -> every fetched row is written (a genuine cold fetch).
+        assert_eq!(
+            state
+                .trade_bars_for_uncached_days(&rows, &HashSet::new())
+                .len(),
+            3
+        );
+
+        // Whole window cached -> zero writes.
+        let all: HashSet<chrono::NaiveDate> = [day3, day4, day5].into_iter().collect();
+        assert!(state.trade_bars_for_uncached_days(&rows, &all).is_empty());
     }
 
     /// Blocks the *constructing* thread inside `earliest_date()` until an async
