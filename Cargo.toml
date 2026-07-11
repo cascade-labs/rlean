@@ -110,7 +110,10 @@ libloading = "0.8"
 lean-plugin            = { path = "crates/lean-plugin" }
 iceberg = "0.9.1"
 iceberg-catalog-sql = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
+iceberg-storage-opendal = { version = "0.9.1", default-features = false, features = ["opendal-fs", "opendal-s3"] }
+typetag = "0.2"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
