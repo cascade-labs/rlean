@@ -321,7 +321,7 @@ impl IcebergStore {
             return Ok(());
         };
         let bucket = s3_bucket(warehouse)?;
-        // Plain-HTTP endpoints (e.g. a local MinIO / Lakekeeper warehouse) are
+        // Plain-HTTP endpoints (e.g. a local S3-compatible warehouse) are
         // rejected by `object_store` unless HTTP is explicitly allowed; HTTPS
         // endpoints (OCI, AWS) are unaffected.
         let allow_http = s3.endpoint.starts_with("http://");

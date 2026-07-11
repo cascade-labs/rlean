@@ -73,7 +73,7 @@ pub const LIVE_QUEUE_CAPACITY: usize = 256;
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Credentials / endpoint for an S3-compatible object store. Works against AWS
-/// and any S3-compatible endpoint (OCI, MinIO, etc.) via a custom endpoint URL.
+/// and any S3-compatible endpoint (OCI, etc.) via a custom endpoint URL.
 #[derive(Debug, Clone, Default)]
 pub struct S3Settings {
     pub bucket: String,
@@ -468,8 +468,8 @@ fn build_object_store(settings: &S3Settings) -> anyhow::Result<Arc<dyn ObjectSto
     }
     if let Some(endpoint) = &settings.endpoint {
         builder = builder.with_endpoint(endpoint);
-        // Custom endpoints (MinIO / OCI / local) commonly use path-style and
-        // may be plain HTTP. Allow both so S3-compatible stores work.
+        // Custom S3-compatible endpoints (OCI, etc.) commonly use path-style
+        // and may be plain HTTP. Allow both so S3-compatible stores work.
         builder = builder.with_virtual_hosted_style_request(false);
         if endpoint.starts_with("http://") {
             builder = builder.with_allow_http(true);
