@@ -1,14 +1,24 @@
 name: Release
 
-# Builds the rlean CLI binary for the fleet's Linux/arm64 nodes and publishes it
-# to a GitHub Release as a versioned bundle that `rlean cloud install` downloads.
+# Universal multi-platform release of the rlean CLI binary.
+#
+# One normal semver tag (e.g. v0.1.1, or v0.1.1-rc1 for a prerelease) produces a
+# GitHub Release carrying an rlean-<version>-<triple>.tar.gz for EVERY supported
+# platform plus a top-level manifest.json describing the release. Any consumer can
+# pull the tarball for its triple; `rlean cloud install` is just one such consumer.
 #
 # The binary embeds CPython via PyO3 (auto-initialize), so it dynamically links
-# libpython at runtime. Fleet nodes run Oracle Linux 9 (glibc 2.34) with the
-# distro python3.9 (libpython3.9.so.1.0). To guarantee an ABI match we build
-# inside an oraclelinux:9 container against that same python3.9 — a binary built
-# on the ubuntu-24.04-arm runner directly would link glibc 2.39 and python 3.12
-# and would not run on the node.
+# libpython at runtime. Each target therefore pins the interpreter that the target
+# platform provides:
+#
+#   * Linux (both arches): built inside oraclelinux:9 against the distro python3.9
+#     (libpython3.9.so.1.0). The fleet nodes run Oracle Linux 9 (glibc 2.34); a
+#     binary built on the bare ubuntu runner would link glibc 2.39 / python 3.12 and
+#     would not run there. We verify the libpython link and the glibc baseline.
+#   * macOS (aarch64-apple-darwin): built against Homebrew python@3.14 at its stable
+#     opt path /opt/homebrew/opt/python@3.14 — exactly what the operator's own working
+#     mac binary links. darwin artifacts therefore require Homebrew python@3.14 to be
+#     installed on the target mac.
 
 on:
   push:
@@ -17,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to (re)build, e.g. v0.1.0 or cloud-latest"
+        description: "Release tag to (re)build, e.g. v0.1.1 or v0.1.1-rc1"
         required: true
-        default: "cloud-latest"
+        default: "v0.1.1"
 
 permissions:
   contents: write
@@ -29,19 +39,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  linux-arm64:
-    name: rlean aarch64-unknown-linux-gnu
-    runs-on: ubuntu-24.04-arm
-    container:
-      # Same distro/glibc as the fleet nodes (Oracle Linux 9.x, glibc 2.34).
-      image: oraclelinux:9
+  build:
+    name: build ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: oraclelinux:9
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            container: oraclelinux:9
+          - triple: aarch64-apple-darwin
+            runner: macos-15
+            container: ""
+    runs-on: ${{ matrix.runner }}
+    # An empty string here means "no container" — the job runs directly on the
+    # runner (required for the macOS leg). GitHub accepts an empty container value.
+    container: ${{ matrix.container }}
     env:
-      TRIPLE: aarch64-unknown-linux-gnu
-      # PyO3 links the binary against this interpreter's libpython (3.9), whose
-      # soname libpython3.9.so.1.0 is present on the nodes at /usr/lib64.
-      PYO3_PYTHON: /usr/bin/python3.9
+      TRIPLE: ${{ matrix.triple }}
     steps:
-      - name: Install toolchain and Python 3.9 headers
+      # --- Linux toolchain (inside oraclelinux:9) -------------------------------
+      - name: Install Linux toolchain and Python 3.9 headers
+        if: matrix.container != ''
         run: |
           dnf -y install gcc gcc-c++ make git tar gzip findutils binutils file \
             python3.9 python3.9-devel openssl-devel perl
@@ -49,33 +71,73 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # gh is preinstalled on the runner but not inside this container;
-          # the publish step needs it.
-          dnf -y install 'dnf-command(config-manager)'
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf -y install gh
+          # PyO3 links against this interpreter's libpython (3.9), whose soname
+          # libpython3.9.so.1.0 is present on the nodes at /usr/lib64.
+          echo "PYO3_PYTHON=/usr/bin/python3.9" >> "$GITHUB_ENV"
+
+      # --- macOS toolchain ------------------------------------------------------
+      - name: Install macOS Python 3.14 (Homebrew)
+        if: matrix.container == ''
+        run: |
+          # Idempotent: the macos runner already ships Homebrew.
+          brew install python@3.14
+          PYPREFIX="$(brew --prefix python@3.14)"
+          echo "PYO3_PYTHON=${PYPREFIX}/bin/python3.14" >> "$GITHUB_ENV"
+          # rustup is preinstalled on the macos runner; make sure stable is present.
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Resolve release tag
         id: tag
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.event.inputs.tag }}"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            TAG="${GITHUB_REF#refs/tags/}"
           fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
 
       - name: Mark workspace safe for git
+        shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Build rlean (release)
+      # Assert the tag and the workspace version agree. The comparison version is
+      # the tag with a leading `v` and any `-<prerelease>` suffix stripped, so both
+      # v0.1.1 and v0.1.1-rc1 require Cargo.toml [workspace.package] version = 0.1.1.
+      # The FULL tag version (e.g. 0.1.1-rc1) is what lands in filenames/manifests.
+      - name: Assert tag matches workspace version
+        id: ver
+        shell: bash
         run: |
-          python3.9 --version
+          TAG="${{ steps.tag.outputs.tag }}"
+          FULL="${TAG#v}"                 # 0.1.1-rc1
+          BASE="${FULL%%-*}"              # 0.1.1
+          CARGO_VER=$(awk '
+            /^\[workspace\.package\]/ {inpkg=1; next}
+            /^\[/ {inpkg=0}
+            inpkg && /^version[[:space:]]*=/ {
+              gsub(/[",]/, "", $0); print $NF; exit
+            }' Cargo.toml)
+          echo "tag=${TAG} full=${FULL} base=${BASE} cargo=${CARGO_VER}"
+          if [ "$BASE" != "$CARGO_VER" ]; then
+            echo "ERROR: tag base version '$BASE' != Cargo.toml workspace version '$CARGO_VER'" >&2
+            exit 1
+          fi
+          echo "version=${FULL}" >> "$GITHUB_OUTPUT"
+
+      - name: Build rlean (release)
+        shell: bash
+        run: |
+          "$PYO3_PYTHON" --version
           cargo build --release -p rlean
           ./target/release/rlean --version
 
-      - name: Verify the binary links python3.9 (not 3.12) and node glibc
+      - name: Verify Linux binary links python3.9 and node glibc baseline
+        if: matrix.container != ''
+        shell: bash
         run: |
           bin=target/release/rlean
           echo "== dynamic dependencies =="
@@ -93,17 +155,59 @@ jobs:
             exit 1
           fi
 
+      - name: Verify macOS binary links Homebrew python@3.14 (stable opt path)
+        if: matrix.container == ''
+        shell: bash
+        run: |
+          bin=target/release/rlean
+          echo "== otool -L =="
+          otool -L "$bin"
+          if ! otool -L "$bin" | grep -q "/opt/homebrew/opt/python@3.14/"; then
+            echo "ERROR: rlean does not link /opt/homebrew/opt/python@3.14 — target macs need Homebrew python@3.14." >&2
+            otool -L "$bin" | grep -i python || true
+            exit 1
+          fi
+          # No runner-local paths may be baked into the binary.
+          if otool -L "$bin" | grep -qE "${GITHUB_WORKSPACE}|/Users/runner/"; then
+            echo "ERROR: rlean references a runner-local path (\$GITHUB_WORKSPACE or /Users/runner)." >&2
+            otool -L "$bin" | grep -E "${GITHUB_WORKSPACE}|/Users/runner/" || true
+            exit 1
+          fi
+
       - name: Package bundle
         id: pkg
+        shell: bash
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${TAG#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           OUT="dist"
-          mkdir -p "$OUT/rlean"
-          cp target/release/rlean "$OUT/rlean/rlean"
-          SHA=$(sha256sum "$OUT/rlean/rlean" | awk '{print $1}')
-          PYVER=$(python3.9 -c 'import platform; print(platform.python_version())')
-          cat > "$OUT/rlean/manifest.json" <<EOF
+          mkdir -p "$OUT/stage"
+          cp target/release/rlean "$OUT/stage/rlean"
+          # coreutils sha256sum on Linux, shasum -a 256 on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHACMD="sha256sum"
+          else
+            SHACMD="shasum -a 256"
+          fi
+          SHA=$($SHACMD "$OUT/stage/rlean" | awk '{print $1}')
+          if [ -z "${{ matrix.container }}" ]; then
+            PYVER=$("$PYO3_PYTHON" -c 'import platform; print(platform.python_version())')
+            cat > "$OUT/stage/manifest.json" <<EOF
+          {
+            "component": "rlean",
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "triple": "${TRIPLE}",
+            "python_abi": "3.14",
+            "python_build_version": "${PYVER}",
+            "requires_python_framework": "/opt/homebrew/opt/python@3.14",
+            "sha256": "${SHA}",
+            "git_sha": "${GITHUB_SHA}"
+          }
+          EOF
+          else
+            PYVER=$("$PYO3_PYTHON" -c 'import platform; print(platform.python_version())')
+            cat > "$OUT/stage/manifest.json" <<EOF
           {
             "component": "rlean",
             "version": "${VERSION}",
@@ -116,34 +220,96 @@ jobs:
             "git_sha": "${GITHUB_SHA}"
           }
           EOF
+          fi
           TARBALL="rlean-${VERSION}-${TRIPLE}.tar.gz"
-          tar -C "$OUT/rlean" -czf "$TARBALL" rlean manifest.json
-          sha256sum "$TARBALL" | awk '{print $1}' > "${TARBALL}.sha256"
-          echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
-          echo "== bundle =="; ls -la "$TARBALL"*; cat "$OUT/rlean/manifest.json"
+          tar -C "$OUT/stage" -czf "$OUT/${TARBALL}" rlean manifest.json
+          ( cd "$OUT" && $SHACMD "${TARBALL}" > "${TARBALL}.sha256" )
+          rm -rf "$OUT/stage"
+          echo "== bundle =="; ls -la "$OUT"; cat "$OUT/${TARBALL}.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rlean-${{ env.TRIPLE }}
-          path: |
-            ${{ steps.pkg.outputs.tarball }}
-            ${{ steps.pkg.outputs.tarball }}.sha256
+          name: dist-${{ matrix.triple }}
+          path: dist/*
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          FULL="${TAG#v}"
+          echo "version=${FULL}" >> "$GITHUB_OUTPUT"
+          # Any prerelease suffix (-rc/-alpha/-beta/...) publishes as a prerelease.
+          case "$FULL" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build top-level manifest.json
+        shell: bash
+        run: |
+          cd dist
+          echo "== collected artifacts =="; ls -la
+          python3 - "$GITHUB_SHA" "${{ steps.tag.outputs.tag }}" "${{ steps.tag.outputs.version }}" <<'PY'
+          import glob, hashlib, json, os, sys, tarfile
+          git_sha, tag, version = sys.argv[1], sys.argv[2], sys.argv[3]
+          artifacts = []
+          for tb in sorted(glob.glob("rlean-*.tar.gz")):
+              sha = hashlib.sha256(open(tb, "rb").read()).hexdigest()
+              triple = None
+              with tarfile.open(tb) as t:
+                  m = t.extractfile("manifest.json")
+                  inner = json.load(m)
+                  triple = inner.get("triple")
+              artifacts.append({"file": tb, "triple": triple, "sha256": sha})
+          top = {
+              "name": "rlean",
+              "repo": os.environ.get("GITHUB_REPOSITORY", "cascade-labs/rlean"),
+              "version": version,
+              "tag": tag,
+              "git_sha": git_sha,
+              "artifacts": artifacts,
+          }
+          json.dump(top, open("manifest.json", "w"), indent=2)
+          print(json.dumps(top, indent=2))
+          PY
 
       - name: Publish to GitHub Release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          TARBALL="${{ steps.pkg.outputs.tarball }}"
-          # Create the release if it does not exist yet (prerelease for the
-          # rolling cloud-latest tag), then attach/overwrite the bundle.
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          cd dist
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             PRERELEASE=""
-            case "$TAG" in *latest*) PRERELEASE="--prerelease";; esac
-            gh release create "$TAG" --title "$TAG" \
-              --notes "rlean fleet bundle for ${TRIPLE} (python 3.9 ABI)." \
-              $PRERELEASE || true
+            if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then
+              PRERELEASE="--prerelease"
+            fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+              --notes "Universal rlean release ${TAG}. Artifacts: rlean-<version>-<triple>.tar.gz per platform + manifest.json." \
+              $PRERELEASE
           fi
-          gh release upload "$TAG" "$TARBALL" "${TARBALL}.sha256" --clobber
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            *.tar.gz *.sha256 manifest.json --clobber
