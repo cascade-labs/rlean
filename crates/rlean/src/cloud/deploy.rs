@@ -48,12 +48,6 @@ impl DeployOptions {
     }
 }
 
-/// Compute the deploy id in the SAME format the local live path uses:
-/// `<YYYY-MM-DD_HHMMSS>_<strategy-name>` in UTC.
-pub(crate) fn deploy_id(now: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
-    format!("{}_{}", now.format("%Y-%m-%d_%H%M%S"), strategy_name)
-}
-
 /// Derive the strategy name from a local strategy directory or main.py path.
 ///
 /// Mirrors `runtime::strategy_name_from_path`: a `main.py` uses the parent
@@ -66,46 +60,44 @@ pub(crate) fn strategy_name_from_dir(strategy_dir: &Path) -> String {
         .to_string()
 }
 
-/// The absolute node paths for a deployment.
+/// The absolute node paths for a strategy (the deploy dir is created by the
+/// node's own `rlean live` launcher under `<strategy_dir>/live/<deploy-id>`).
 pub(crate) struct NodePaths {
     pub strategy_dir: String,
-    pub deploy_dir: String,
     pub data_dir: String,
     pub main_py: String,
 }
 
-pub(crate) fn node_paths(node_home: &str, strategy_name: &str, deploy_id: &str) -> NodePaths {
+pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
     let node_home = node_home.trim_end_matches('/');
     let strategy_dir = format!("{node_home}/rlean-cloud/workspace/{strategy_name}");
     NodePaths {
-        deploy_dir: format!("{strategy_dir}/live/{deploy_id}"),
         main_py: format!("{strategy_dir}/main.py"),
         data_dir: format!("{node_home}/rlean-cloud/data"),
         strategy_dir,
     }
 }
 
-/// Build the shell command run on the node to launch the deployment so it
-/// survives ssh disconnect.
+/// Build the shell command run on the node to launch the deployment.
 ///
-/// We `cd` into the strategy dir (so `rlean live` resolves relative config and
-/// so later `rlean live status <id>` run from the same cwd discovers the deploy
-/// under `<cwd>/live/`), then `nohup setsid` the foreground live run detached
-/// from the tty: stdin from /dev/null, stdout+stderr appended to `nohup.out`,
-/// backgrounded with `&`, and `echo $!` so we capture the PID. `--foreground`
-/// makes rlean run in-process and write its own `deployment.json` / `live.log`.
+/// This invokes the node's own `rlean live` launcher (NOT `--foreground`):
+/// exactly what a local deploy does. The launcher reserves the deploy dir
+/// under `<strategy>/live/`, snapshots the code, writes `deployment.json` and
+/// the pid file, registers the deployment for `rlean live list/status`, and
+/// spawns the engine as a `setsid` child with SIGHUP ignored — so the run
+/// survives the ssh session ending and is natively monitorable on the node.
+/// The launcher exits after confirming startup, printing
+/// `Live deployment started: deploy_id=<id> pid=<pid> ...`, which
+/// [`parse_launch_line`] consumes.
 ///
 /// Extracted as a pure string builder so the exact command is unit-testable.
 pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> String {
     format!(
-        "mkdir -p {deploy}/code && cd {strategy} && \
-         nohup setsid rlean live --foreground --live-deploy-dir {deploy} {main} \
+        "cd {strategy} && rlean live {main} \
          --data {data} \
          --data-provider-historical {hist} \
          --data-provider-live {live} \
-         --brokerage {brok} \
-         </dev/null >> {deploy}/nohup.out 2>&1 & echo $!",
-        deploy = paths.deploy_dir,
+         --brokerage {brok}",
         strategy = paths.strategy_dir,
         main = paths.main_py,
         data = paths.data_dir,
@@ -113,6 +105,24 @@ pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> 
         live = opts.data_provider_live,
         brok = opts.brokerage,
     )
+}
+
+/// Parse the launcher's `Live deployment started: deploy_id=<id> pid=<pid> ...`
+/// stdout line into `(deploy_id, pid)`.
+pub(crate) fn parse_launch_line(stdout: &str) -> Option<(String, u32)> {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("Live deployment started:"))?;
+    let mut deploy_id = None;
+    let mut pid = None;
+    for token in line.split_whitespace() {
+        if let Some(v) = token.strip_prefix("deploy_id=") {
+            deploy_id = Some(v.to_string());
+        } else if let Some(v) = token.strip_prefix("pid=") {
+            pid = v.parse::<u32>().ok();
+        }
+    }
+    Some((deploy_id?, pid?))
 }
 
 /// Build the argv for a `rlean live <sub> <deploy_id> ...` command run on the
@@ -182,34 +192,36 @@ pub(crate) fn cmd_deploy(
         now,
     } = *req;
     let ssh = &node.ssh_dest;
-    let id = deploy_id(now, strategy_name);
-    let paths = node_paths(node_home, strategy_name, &id);
+    let paths = node_paths(node_home, strategy_name);
 
     // 1. rsync the working tree to the node.
     rsync_to(ssh, local_strategy_dir, &paths.strategy_dir, RSYNC_EXCLUDES)?;
 
-    // 2. Launch detached; capture the PID echoed by the launch command.
-    let launch = remote_launch_command(&paths, opts);
+    // 2. Launch via the node's own `rlean live` launcher; it reserves the
+    // deploy dir, writes deployment.json, and spawns the setsid'd engine.
     // The compound command is passed as a SINGLE argv element: OpenSSH joins
     // remote argv with spaces (no quoting), so a ["sh","-c",cmd] triple would
-    // arrive as `sh -c mkdir ...` and `sh -c` would receive only `mkdir` — the
-    // rest of the chain would run in the wrong shell and cwd. One element
-    // arrives intact and the remote login shell evaluates the whole line.
+    // arrive as `sh -c cd ...` and `sh -c` would receive only `cd` — the rest
+    // of the chain would run in the wrong shell and cwd. One element arrives
+    // intact and the remote login shell evaluates the whole line.
+    let launch = remote_launch_command(&paths, opts);
     let out = exec.run(ssh, &[launch.as_str()])?;
     if out.status != 0 {
         bail!(
-            "failed to launch deployment on '{}' (status {}):\n{}",
+            "failed to launch deployment on '{}' (status {}):\n{}{}",
             node.name,
             out.status,
+            out.stdout.trim(),
             out.stderr.trim()
         );
     }
-    let pid = out
-        .stdout
-        .trim()
-        .lines()
-        .last()
-        .and_then(|l| l.trim().parse::<u32>().ok());
+    let (id, pid) = parse_launch_line(&out.stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "node launcher did not report a deployment (stdout: {})",
+            out.stdout.trim()
+        )
+    })?;
+    let deploy_dir = format!("{}/live/{}", paths.strategy_dir, id);
 
     // 3. Record locally.
     reg.record(CloudDeployment {
@@ -217,9 +229,9 @@ pub(crate) fn cmd_deploy(
         strategy_name: strategy_name.to_string(),
         deploy_id: id.clone(),
         strategy_dir: paths.strategy_dir.clone(),
-        deploy_dir: paths.deploy_dir.clone(),
+        deploy_dir: deploy_dir.clone(),
         launched_at: now.to_rfc3339(),
-        pid,
+        pid: Some(pid),
     });
 
     // 4. Poll node status until running or an error surfaces.
@@ -227,8 +239,8 @@ pub(crate) fn cmd_deploy(
 
     Ok(DeploySummary {
         deploy_id: id,
-        deploy_dir: paths.deploy_dir,
-        pid,
+        deploy_dir,
+        pid: Some(pid),
         startup_status,
     })
 }
@@ -450,19 +462,23 @@ mod tests {
     }
 
     #[test]
-    fn deploy_id_matches_local_format() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 10, 14, 30, 5).unwrap();
-        assert_eq!(deploy_id(now, "uw_control"), "2026-07-10_143005_uw_control");
+    fn parse_launch_line_extracts_id_and_pid() {
+        let stdout = "Python baseline ok\nLive deployment started: deploy_id=2026-07-10_143005_uw_control pid=4242 dir=/x log=/x/live.log\n";
+        let (id, pid) = parse_launch_line(stdout).unwrap();
+        assert_eq!(id, "2026-07-10_143005_uw_control");
+        assert_eq!(pid, 4242);
+    }
+
+    #[test]
+    fn parse_launch_line_rejects_missing_marker() {
+        assert!(parse_launch_line("engine crashed\n").is_none());
+        assert!(parse_launch_line("Live deployment started: dir=/x\n").is_none());
     }
 
     #[test]
     fn node_paths_are_absolute_and_nested() {
-        let p = node_paths("/home/opc/", "uw_control", "2026-07-10_143005_uw_control");
+        let p = node_paths("/home/opc/", "uw_control");
         assert_eq!(p.strategy_dir, "/home/opc/rlean-cloud/workspace/uw_control");
-        assert_eq!(
-            p.deploy_dir,
-            "/home/opc/rlean-cloud/workspace/uw_control/live/2026-07-10_143005_uw_control"
-        );
         assert_eq!(p.data_dir, "/home/opc/rlean-cloud/data");
         assert_eq!(
             p.main_py,
@@ -471,23 +487,20 @@ mod tests {
     }
 
     #[test]
-    fn launch_command_survives_disconnect_and_captures_pid() {
-        let p = node_paths("/home/opc", "uw_control", "2026-07-10_143005_uw_control");
+    fn launch_command_uses_native_launcher() {
+        let p = node_paths("/home/opc", "uw_control");
         let opts = DeployOptions {
             brokerage: "tradier".to_string(),
             data_provider_live: "tradier".to_string(),
             data_provider_historical: "thetadata,massive".to_string(),
         };
         let cmd = remote_launch_command(&p, &opts);
-        // Detachment: nohup + setsid + stdin from /dev/null + backgrounded.
-        assert!(cmd.contains("nohup setsid rlean live --foreground"));
-        assert!(cmd.contains("</dev/null"));
-        assert!(cmd.contains("2>&1 &"));
-        assert!(cmd.trim_end().ends_with("echo $!"));
-        // cwd = strategy dir so `rlean live status` resolves the deploy later.
-        assert!(cmd.contains("cd /home/opc/rlean-cloud/workspace/uw_control"));
-        // Flags + defaults are present.
-        assert!(cmd.contains("--live-deploy-dir /home/opc/rlean-cloud/workspace/uw_control/live/2026-07-10_143005_uw_control"));
+        // The node's own launcher owns detachment (setsid + SIGHUP ignore) and
+        // deployment.json — the command must NOT hand-roll --foreground.
+        assert!(cmd.starts_with("cd /home/opc/rlean-cloud/workspace/uw_control && rlean live "));
+        assert!(!cmd.contains("--foreground"));
+        assert!(!cmd.contains("--live-deploy-dir"));
+        assert!(cmd.contains(" /home/opc/rlean-cloud/workspace/uw_control/main.py"));
         assert!(cmd.contains("--brokerage tradier"));
         assert!(cmd.contains("--data-provider-historical thetadata,massive"));
         assert!(cmd.contains("--data-provider-live tradier"));
@@ -524,11 +537,17 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 10, 14, 30, 5).unwrap();
         let id = "2026-07-10_143005_uw_control";
         let opts = DeployOptions::from_cli(None, None, None);
-        let paths = node_paths("/home/opc", "uw_control", id);
+        let paths = node_paths("/home/opc", "uw_control");
 
         let mut fake = FakeExec::new();
         let launch = remote_launch_command(&paths, &opts);
-        fake.set("opc@n1", &[&launch], ok("4242\n"));
+        fake.set(
+            "opc@n1",
+            &[&launch],
+            ok(&format!(
+                "Live deployment started: deploy_id={id} pid=4242 dir=/x log=/x/live.log\n"
+            )),
+        );
         let status_cmd = live_control_command(&paths.strategy_dir, &["status", id]);
         fake.set(
             "opc@n1",
@@ -536,12 +555,13 @@ mod tests {
             ok(r#"{"status":"running","pid":4242}"#),
         );
 
-        // rsync is a real command; skip it by pre-seeding the strategy dir check.
-        // We call cmd_deploy but rsync_to would try to run rsync — so instead we
-        // test the pieces that don't shell out. Here we exercise the launch +
-        // poll path by calling them directly.
+        // rsync shells out to the real rsync, so exercise the launch + poll
+        // path directly: run the launch command, parse the launcher line, and
+        // poll status exactly as cmd_deploy does after its rsync step.
         let out = fake.run("opc@n1", &[&launch]).unwrap();
-        assert_eq!(out.stdout.trim(), "4242");
+        let (parsed_id, pid) = parse_launch_line(&out.stdout).unwrap();
+        assert_eq!(parsed_id, id);
+        assert_eq!(pid, 4242);
         let status = poll_startup(&fake, "opc@n1", &paths.strategy_dir, id).unwrap();
         assert_eq!(status, "running");
 
@@ -552,7 +572,7 @@ mod tests {
             strategy_name: "uw_control".to_string(),
             deploy_id: id.to_string(),
             strategy_dir: paths.strategy_dir.clone(),
-            deploy_dir: paths.deploy_dir.clone(),
+            deploy_dir: format!("{}/live/{id}", paths.strategy_dir),
             launched_at: now.to_rfc3339(),
             pid: Some(4242),
         });
