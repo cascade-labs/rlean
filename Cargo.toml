@@ -101,6 +101,7 @@ glob = "0.3"
 reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "http2"], default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
+sha2 = "0.10"
 pyo3 = { version = "0.27", features = ["auto-initialize", "chrono"] }
 pyo3-stub-gen = "0.23"
 zip    = { version = "2", default-features = false, features = ["deflate"] }
