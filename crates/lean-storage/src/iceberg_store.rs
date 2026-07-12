@@ -106,6 +106,15 @@ const COMPACT_APPEND_ROWS: usize = 4_000_000;
 /// Cap on distinct partitions per re-insert append. The fanout writer keeps one
 /// open file per partition until the commit closes, so this bounds open files.
 const COMPACT_APPEND_PARTITIONS: usize = 2_048;
+/// Cap on how many input parquet files a single staging scan reads at once. A
+/// bloated cache table can hold hundreds of thousands of tiny data files; handing
+/// them all to one DataFusion `read_parquet` call opens them concurrently and
+/// exhausts the process/system file-descriptor table ("Too many open files").
+/// Scanning the (partition-clustered) file list in bounded, sorted batches caps
+/// simultaneously open input files to this many while still producing a single
+/// ordered row stream. Comfortably under macOS's default `kern.maxfilesperproc`
+/// (245,760) with headroom for the writer's own descriptors.
+const COMPACT_SCAN_FILES_PER_BATCH: usize = 1_024;
 
 /// Approximate in-memory footprint of a record batch (sum of column buffer
 /// sizes). For sliced batches this over-counts shared buffers, which only makes
@@ -406,6 +415,19 @@ impl IcebergStore {
     /// `.compact_tmp_<table>` so the data can be recovered with
     /// [`IcebergStore::restore_from_staging`].
     pub async fn compact_table(&self, table: &str) -> Result<CompactionStats> {
+        self.compact_table_with_scan_batch(table, COMPACT_SCAN_FILES_PER_BATCH)
+            .await
+    }
+
+    /// [`IcebergStore::compact_table`] with an explicit bound on how many input
+    /// parquet files each staging scan opens at once. Split out so tests can
+    /// exercise the multi-batch scan path without creating thousands of data
+    /// files.
+    async fn compact_table_with_scan_batch(
+        &self,
+        table: &str,
+        scan_files_per_batch: usize,
+    ) -> Result<CompactionStats> {
         use futures::StreamExt;
         use parquet::arrow::ArrowWriter;
 
@@ -461,41 +483,48 @@ impl IcebergStore {
         let mut staged: Vec<PathBuf> = Vec::new();
         let mut rows = 0usize;
         {
-            // A single scan partition preserves the supplied (path-sorted) file
-            // order and reads sequentially, keeping memory to one batch.
-            let ctx =
-                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-            let mut stream = ctx
-                .read_parquet(local_paths, ParquetReadOptions::default())
-                .await?
-                .execute_stream()
-                .await?;
             let mut writer: Option<ArrowWriter<std::fs::File>> = None;
             let mut writer_rows = 0usize;
             let mut writer_bytes = 0usize;
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                rows += batch.num_rows();
-                if writer.is_none() {
-                    let path = staging.join(format!("part-{:06}.parquet", staged.len()));
-                    let file = std::fs::File::create(&path)
-                        .with_context(|| format!("failed to create {}", path.display()))?;
-                    writer = Some(ArrowWriter::try_new(file, batch.schema(), None)?);
-                    staged.push(path);
-                    writer_rows = 0;
-                    writer_bytes = 0;
-                }
-                let active = writer.as_mut().expect("staging writer present");
-                active.write(&batch)?;
-                writer_rows += batch.num_rows();
-                writer_bytes += record_batch_bytes(&batch);
-                // Roll chunks by byte size (with a row ceiling) so no chunk — and
-                // hence no re-read batch — can hold a >2GB string column.
-                if writer_bytes >= COMPACT_CHUNK_BYTES || writer_rows >= COMPACT_CHUNK_ROWS {
-                    writer.take().expect("staging writer present").close()?;
+            // Scan the (path-sorted) input in bounded batches of files rather than
+            // handing every path to one `read_parquet` call: a bloated table can
+            // hold hundreds of thousands of tiny files and opening them all at once
+            // exhausts the file-descriptor table. Consecutive batches preserve the
+            // global sort order, so the staged output stays partition-clustered.
+            for path_batch in local_paths.chunks(scan_files_per_batch.max(1)) {
+                // A single scan partition preserves the supplied (path-sorted) file
+                // order and reads sequentially, keeping memory to one batch.
+                let ctx =
+                    SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+                let mut stream = ctx
+                    .read_parquet(path_batch.to_vec(), ParquetReadOptions::default())
+                    .await?
+                    .execute_stream()
+                    .await?;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    rows += batch.num_rows();
+                    if writer.is_none() {
+                        let path = staging.join(format!("part-{:06}.parquet", staged.len()));
+                        let file = std::fs::File::create(&path)
+                            .with_context(|| format!("failed to create {}", path.display()))?;
+                        writer = Some(ArrowWriter::try_new(file, batch.schema(), None)?);
+                        staged.push(path);
+                        writer_rows = 0;
+                        writer_bytes = 0;
+                    }
+                    let active = writer.as_mut().expect("staging writer present");
+                    active.write(&batch)?;
+                    writer_rows += batch.num_rows();
+                    writer_bytes += record_batch_bytes(&batch);
+                    // Roll chunks by byte size (with a row ceiling) so no chunk — and
+                    // hence no re-read batch — can hold a >2GB string column.
+                    if writer_bytes >= COMPACT_CHUNK_BYTES || writer_rows >= COMPACT_CHUNK_ROWS {
+                        writer.take().expect("staging writer present").close()?;
+                    }
                 }
             }
             if let Some(active) = writer.take() {
@@ -3599,6 +3628,74 @@ mod tests {
         assert!(
             compacted.is_empty(),
             "compaction must be skipped while another run is active"
+        );
+    }
+
+    /// A bloated cache table (hundreds of thousands of tiny data files, one per
+    /// append commit) exhausted the file-descriptor table when the staging scan
+    /// handed every path to a single `read_parquet` call ("Too many open files",
+    /// os error 23, on the real 772k-file `market_trade_bars`). The scan now
+    /// reads the sorted file list in bounded batches; this drives that
+    /// multi-batch path with a scan batch far smaller than the file count and
+    /// verifies every row survives with the file count collapsed.
+    #[tokio::test]
+    async fn compact_scans_input_in_bounded_file_batches() {
+        use chrono::NaiveDate;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+
+        // One append == one commit == one data file. Distinct dates under a
+        // single (market, ticker) partition, so nothing is deduped or merged:
+        // the table ends up with `file_count` tiny single-row files.
+        let file_count = 41usize;
+        let base = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        for i in 0..file_count {
+            let date = base + chrono::Duration::days(i as i64);
+            store
+                .append_factor_file(
+                    "usa",
+                    "spy",
+                    &[FactorFileEntry {
+                        date,
+                        price_factor: 1.0,
+                        split_factor: 1.0,
+                        reference_price: 100.0 + i as f64,
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count_rows(FACTOR_FILES).await.unwrap(), file_count);
+
+        // A scan batch of 8 forces ceil(41/8) = 6 sequential read_parquet calls,
+        // so at most 8 input files are handed to DataFusion at once — the
+        // property that keeps the real pass under the fd limit.
+        let stats = store
+            .compact_table_with_scan_batch(FACTOR_FILES, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.files_before, file_count);
+        assert_eq!(stats.rows, file_count, "staging must see every row once");
+        assert!(
+            stats.appends >= 1,
+            "compaction must write at least one append"
+        );
+
+        // Rows preserved exactly across the batched scan + rewrite, and the
+        // rewritten table holds far fewer data files than it had commits.
+        assert_eq!(
+            store.count_rows(FACTOR_FILES).await.unwrap(),
+            file_count,
+            "compaction must preserve every row"
+        );
+        let entries = store.scan_factor_file("usa", "spy").await.unwrap();
+        assert_eq!(entries.len(), file_count);
+        assert_eq!(entries.first().unwrap().date, base);
+        assert_eq!(
+            entries.last().unwrap().date,
+            base + chrono::Duration::days(file_count as i64 - 1)
         );
     }
 

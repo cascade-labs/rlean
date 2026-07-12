@@ -283,6 +283,12 @@ fn resume_live_deployment(deploy_id: &str) -> Result<()> {
         bail!("live deployment {deploy_id} has no stored command to resume");
     }
 
+    // Deployments saved by an older rlean may carry flags this build no longer
+    // understands (e.g. `--no-compact`, removed once compaction became safe under
+    // the #63 sole-user gate). Drop them so `live resume` still starts instead of
+    // failing clap parsing with "unexpected argument".
+    strip_stale_command_flags(&mut metadata.command);
+
     let deployment_strategy = deployment_strategy_path(&metadata, &dir);
     if deployment_strategy.exists() {
         rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
@@ -553,6 +559,20 @@ fn deployment_strategy_path(metadata: &LiveDeploymentMetadata, dir: &Path) -> Pa
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("main.py")),
     )
+}
+
+/// Flags that older rlean builds baked into saved live-deployment commands but
+/// that this build no longer accepts. Replaying a stored command containing one
+/// of these would abort clap parsing with "unexpected argument", so they are
+/// dropped before a deployment is resumed. All entries are boolean flags (they
+/// take no value), so removing the token alone is sufficient.
+const STALE_LIVE_COMMAND_FLAGS: &[&str] = &["--no-compact"];
+
+/// Remove obsolete flags (see [`STALE_LIVE_COMMAND_FLAGS`]) from a stored
+/// live-deployment command so an old deployment resumes cleanly under the
+/// current CLI.
+fn strip_stale_command_flags(command: &mut Vec<String>) {
+    command.retain(|arg| !STALE_LIVE_COMMAND_FLAGS.contains(&arg.as_str()));
 }
 
 fn rewrite_live_command_strategy(command: &mut [String], deployment_strategy: &Path) {
@@ -1005,7 +1025,6 @@ mod tests {
                 verbose: true,
             },
             report: None,
-            no_compact: false,
             live_limits: LiveLimitArgs {
                 live_max_slices: Some(2),
                 live_max_runtime_seconds: Some(10),
@@ -1041,6 +1060,63 @@ mod tests {
 
         assert_eq!(command[5], "/tmp/deploy/code/main.py");
         assert_eq!(command[7], "/tmp/data");
+    }
+
+    #[test]
+    fn test_strip_stale_command_flags_drops_no_compact() {
+        // A deployment saved by an older rlean carried `--no-compact`; resuming
+        // must strip it so clap does not reject the replayed command.
+        let mut command = vec![
+            "/usr/local/bin/rlean".to_string(),
+            "live".to_string(),
+            "--foreground".to_string(),
+            "--live-deploy-dir".to_string(),
+            "/tmp/deploy".to_string(),
+            "/tmp/source/main.py".to_string(),
+            "--data".to_string(),
+            "/tmp/data".to_string(),
+            "--no-compact".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        strip_stale_command_flags(&mut command);
+
+        assert!(
+            !command.contains(&"--no-compact".to_string()),
+            "the stale --no-compact flag must be removed"
+        );
+        // Everything else is preserved and order is intact.
+        assert_eq!(
+            command,
+            vec![
+                "/usr/local/bin/rlean".to_string(),
+                "live".to_string(),
+                "--foreground".to_string(),
+                "--live-deploy-dir".to_string(),
+                "/tmp/deploy".to_string(),
+                "/tmp/source/main.py".to_string(),
+                "--data".to_string(),
+                "/tmp/data".to_string(),
+                "--verbose".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_strip_stale_command_flags_noop_without_stale_flags() {
+        let mut command = vec![
+            "/usr/local/bin/rlean".to_string(),
+            "live".to_string(),
+            "--foreground".to_string(),
+            "/tmp/source/main.py".to_string(),
+            "--data".to_string(),
+            "/tmp/data".to_string(),
+        ];
+        let expected = command.clone();
+
+        strip_stale_command_flags(&mut command);
+
+        assert_eq!(command, expected);
     }
 
     #[test]

@@ -137,12 +137,6 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) report: Option<PathBuf>,
 
-    /// Skip the post-backtest cache compaction pass. By default, once results
-    /// are written, bloated Iceberg cache tables are compacted to keep the next
-    /// run's query planning fast.
-    #[arg(long)]
-    pub(crate) no_compact: bool,
-
     #[command(flatten)]
     pub(crate) live_limits: LiveLimitArgs,
 }
@@ -259,7 +253,6 @@ impl LiveArgs {
             strategy,
             runtime: self.runtime.clone(),
             report: None,
-            no_compact: false,
             live_limits: self.live_limits.clone(),
         })
     }
