@@ -32,6 +32,7 @@ use tracing_subscriber::EnvFilter;
 mod artifacts_config;
 mod backtest;
 mod cli;
+mod cloud;
 mod config;
 mod config_cmd;
 mod init;
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),
         Command::Vcs(args) => run_vcs(args),
+        Command::Cloud(args) => cloud::run(args),
         Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
