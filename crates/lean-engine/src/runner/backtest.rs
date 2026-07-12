@@ -71,10 +71,28 @@ where
         benchmark_subscription.clone(),
     );
     let option_subscriptions = algorithm_manager.option_subscriptions();
+    let subscriptions: Vec<Arc<lean_data::SubscriptionDataConfig>> =
+        subscriptions.into_iter().map(Arc::new).collect();
     let subscriptions = subscriptions_with_option_chains(subscriptions, &option_subscriptions);
-    algorithm_manager.prepare_data_delivery(&subscriptions)?;
+    // `prepare_data_delivery` receives the full pre-rewrite set, matching the
+    // original ordering (it runs before the custom-query rewrite below).
+    let subscriptions_owned: Vec<lean_data::SubscriptionDataConfig> = subscriptions
+        .iter()
+        .map(|config| (**config).clone())
+        .collect();
+    algorithm_manager.prepare_data_delivery(&subscriptions_owned)?;
     let feed_subscriptions = lean_style_active_subscriptions(&subscriptions);
-    let mut active_subscriptions = feed_subscriptions.clone();
+    // Owned copy of the feed set for `initialize_feed`, which takes owned configs.
+    let feed_subscriptions_owned: Vec<lean_data::SubscriptionDataConfig> = feed_subscriptions
+        .iter()
+        .map(|config| (**config).clone())
+        .collect();
+    // Seed the sync state with the initial feed set. `last_version = None` forces
+    // the first sync to run and reconcile it against the bridge's live set.
+    let mut sync_state = SubscriptionSyncState {
+        active: feed_subscriptions,
+        last_version: None,
+    };
 
     let feed_context = DataFeedContext::new(config.data_store.clone())
         .with_history_provider(config.history_provider.clone())
@@ -107,12 +125,17 @@ where
         // are replayed — mirrors LEAN's HistoryRequestFactory.GetStartTimeAlgoTz.
         // Fall back to the calendar-span warmup_duration otherwise.
         let warmup_start = if let Some(bar_count) = algorithm_manager.warmup_bar_count() {
-            warmup_start_from_bar_count(&market_hours_database, &subscriptions, bar_count, start)
-                .map(|date| {
-                    lean_core::NanosecondTimestamp::from(
-                        date.and_hms_opt(0, 0, 0).expect("valid warmup start"),
-                    )
-                })
+            warmup_start_from_bar_count(
+                &market_hours_database,
+                &subscriptions_owned,
+                bar_count,
+                start,
+            )
+            .map(|date| {
+                lean_core::NanosecondTimestamp::from(
+                    date.and_hms_opt(0, 0, 0).expect("valid warmup start"),
+                )
+            })
         } else {
             algorithm_manager
                 .warmup_duration()
@@ -128,7 +151,7 @@ where
             if warmup_start <= warmup_end {
                 let mut warmup_data_manager = DataManager::from_context(feed_context.clone());
                 warmup_data_manager
-                    .initialize_feed(&feed_subscriptions, warmup_start, warmup_end)
+                    .initialize_feed(&feed_subscriptions_owned, warmup_start, warmup_end)
                     .await?;
                 while let Some(slice) = warmup_data_manager.next_slice().await? {
                     if !slice.has_data {
@@ -159,7 +182,7 @@ where
 
     let mut data_manager = DataManager::from_context(feed_context);
     data_manager
-        .initialize_feed(&feed_subscriptions, normal_start, normal_end)
+        .initialize_feed(&feed_subscriptions_owned, normal_start, normal_end)
         .await?;
 
     let mut result_handler = ResultHandler::new();
@@ -213,7 +236,7 @@ where
             if changes.has_changes() {
                 sync_data_manager_subscriptions(
                     &mut data_manager,
-                    &mut active_subscriptions,
+                    &mut sync_state,
                     algorithm_manager.algorithm(),
                     slice.time,
                 )
@@ -254,7 +277,7 @@ where
         }
         sync_data_manager_subscriptions(
             &mut data_manager,
-            &mut active_subscriptions,
+            &mut sync_state,
             algorithm_manager.algorithm(),
             slice.time,
         )
@@ -278,7 +301,7 @@ where
             algorithm_manager.run_framework(slice.as_ref(), &mut services);
             sync_data_manager_subscriptions(
                 &mut data_manager,
-                &mut active_subscriptions,
+                &mut sync_state,
                 algorithm_manager.algorithm(),
                 slice.time,
             )
@@ -425,8 +448,8 @@ fn slice_has_fill_data(slice: &lean_data::Slice) -> bool {
 /// symbol filter means "universe not selected yet", so start with an explicit
 /// empty filter instead of scanning the full custom dataset.
 fn lean_style_active_subscriptions(
-    subscriptions: &[SubscriptionDataConfig],
-) -> Vec<SubscriptionDataConfig> {
+    subscriptions: &[Arc<SubscriptionDataConfig>],
+) -> Vec<Arc<SubscriptionDataConfig>> {
     let custom_universe_sources = subscriptions
         .iter()
         .filter(|config| config.data_kind == SubscriptionDataKind::Universe)
@@ -440,20 +463,26 @@ fn lean_style_active_subscriptions(
 
     subscriptions
         .iter()
-        .cloned()
-        .map(|mut config| {
-            let Some(custom) = config.custom.as_mut() else {
-                return config;
-            };
-            if config.data_kind == SubscriptionDataKind::Universe {
-                return config;
+        .map(|config| {
+            // Only the custom, non-universe streams fed by a custom universe with
+            // an unset dynamic symbol filter are rewritten. Everything else is
+            // passed through by cloning the shared `Arc` (a refcount bump, no
+            // deep copy) — this replaces the second full deep-clone of the whole
+            // list that dominated the sync path (issue #64).
+            let needs_empty_filter = config.data_kind != SubscriptionDataKind::Universe
+                && config.custom.as_ref().is_some_and(|custom| {
+                    custom.dynamic_query.symbols.is_none()
+                        && custom_universe_sources
+                            .contains(&custom.source_type.to_ascii_lowercase())
+                });
+            if !needs_empty_filter {
+                return config.clone();
             }
-            if custom_universe_sources.contains(&custom.source_type.to_ascii_lowercase())
-                && custom.dynamic_query.symbols.is_none()
-            {
+            let mut rewritten = (**config).clone();
+            if let Some(custom) = rewritten.custom.as_mut() {
                 custom.dynamic_query.symbols = Some(Vec::new());
             }
-            config
+            Arc::new(rewritten)
         })
         .collect()
 }
@@ -520,13 +549,18 @@ impl SubscriptionDiff {
 
 /// Diff previous vs. current subscriptions in O(N) using a single HashMap of the
 /// previous ids, replacing the old O(N²) nested `.find()` scans (issue #39).
+///
+/// Both sides are shared `Arc` handles. Diffing walks them by the memoized
+/// `unique_id()` on the shared instances — no re-hashing and no whole-list deep
+/// clone — and materializes owned `SubscriptionDataConfig` values only for the
+/// configs that are genuinely added or replaced (issue #64).
 fn compute_subscription_diff(
-    previous: &[lean_data::SubscriptionDataConfig],
-    current: &[lean_data::SubscriptionDataConfig],
+    previous: &[Arc<lean_data::SubscriptionDataConfig>],
+    current: &[Arc<lean_data::SubscriptionDataConfig>],
 ) -> SubscriptionDiff {
     use std::collections::{HashMap, HashSet};
 
-    let previous_by_id: HashMap<u64, &lean_data::SubscriptionDataConfig> = previous
+    let previous_by_id: HashMap<u64, &Arc<lean_data::SubscriptionDataConfig>> = previous
         .iter()
         .map(|config| (config.unique_id(), config))
         .collect();
@@ -540,7 +574,7 @@ fn compute_subscription_diff(
                 .map(|existing| subscription_requires_stream_replacement(existing, config))
                 .unwrap_or(false)
         })
-        .cloned()
+        .map(|config| (**config).clone())
         .collect();
     let replaced_ids: HashSet<u64> = replaced.iter().map(|config| config.unique_id()).collect();
 
@@ -550,7 +584,7 @@ fn compute_subscription_diff(
             let id = config.unique_id();
             !previous_by_id.contains_key(&id) || replaced_ids.contains(&id)
         })
-        .cloned()
+        .map(|config| (**config).clone())
         .collect();
 
     let removed_ids: HashSet<u64> = previous
@@ -566,25 +600,47 @@ fn compute_subscription_diff(
     }
 }
 
+/// Carries the subscription-sync fast-path state across the (up to three)
+/// per-slice `sync_data_manager_subscriptions` calls. `active` is the last
+/// synced desired set (shared `Arc`s); `last_version` is the bridge version
+/// stamp observed at that sync. `None` forces the first sync to run so the
+/// initial feed set (which may include a benchmark not present in the bridge's
+/// subscription set) is reconciled exactly as before.
+struct SubscriptionSyncState {
+    active: Vec<Arc<lean_data::SubscriptionDataConfig>>,
+    last_version: Option<u64>,
+}
+
 async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     data_manager: &mut DataManager,
-    active_subscriptions: &mut Vec<lean_data::SubscriptionDataConfig>,
+    sync_state: &mut SubscriptionSyncState,
     bridge: &B,
     start: lean_core::DateTime,
 ) -> anyhow::Result<()> {
+    // Generation short-circuit: if the bridge's subscription set has not changed
+    // since the last sync, there is nothing to diff. This runs on every slice
+    // (minute resolution → 1000+ calls/day), so the integer compare here is what
+    // collapses the sync path from ~73% of the main thread to near-zero (#64).
+    let version = bridge.subscriptions_version();
+    if sync_state.last_version == Some(version) {
+        return Ok(());
+    }
+
     let current_subscriptions = lean_style_active_subscriptions(&subscriptions_with_option_chains(
         bridge.subscriptions(),
         &bridge.option_subscriptions(),
     ));
 
-    let diff = compute_subscription_diff(active_subscriptions, &current_subscriptions);
+    let diff = compute_subscription_diff(&sync_state.active, &current_subscriptions);
 
     // Short-circuit: nothing added, removed, or replaced. This is the common case
     // (the sync runs on every slice) and skips all data-manager churn below.
     if diff.is_empty() {
-        // Refresh the cached configs to the latest instances — ids are identical,
-        // so consumers observe no change.
-        *active_subscriptions = current_subscriptions;
+        // Record the version so subsequent unchanged slices skip the diff walk
+        // above, and refresh the cached configs to the latest instances — ids are
+        // identical, so consumers observe no change.
+        sync_state.active = current_subscriptions;
+        sync_state.last_version = Some(version);
         return Ok(());
     }
 
@@ -608,12 +664,13 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     data_manager
         .add_subscriptions_async(diff.added, start)
         .await?;
-    for config in active_subscriptions.iter() {
+    for config in sync_state.active.iter() {
         if diff.removed_ids.contains(&config.unique_id()) {
             data_manager.remove_subscription(config);
         }
     }
-    *active_subscriptions = current_subscriptions;
+    sync_state.active = current_subscriptions;
+    sync_state.last_version = Some(version);
     Ok(())
 }
 
@@ -672,9 +729,9 @@ pub(crate) fn subscriptions_with_benchmark(
 }
 
 pub(crate) fn subscriptions_with_option_chains(
-    mut subscriptions: Vec<SubscriptionDataConfig>,
+    mut subscriptions: Vec<Arc<SubscriptionDataConfig>>,
     option_subscriptions: &[OptionSubscription],
-) -> Vec<SubscriptionDataConfig> {
+) -> Vec<Arc<SubscriptionDataConfig>> {
     for subscription in option_subscriptions {
         let metadata = OptionChainSubscriptionMetadata {
             canonical_permtick: subscription.canonical.permtick.to_string(),
@@ -695,7 +752,7 @@ pub(crate) fn subscriptions_with_option_chains(
             .iter()
             .any(|existing| existing.unique_id() == config.unique_id())
         {
-            subscriptions.push(config);
+            subscriptions.push(Arc::new(config));
         }
     }
     subscriptions
@@ -797,6 +854,7 @@ mod tests {
         CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, SubscriptionDataConfig,
     };
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     fn equity_config(ticker: &str) -> SubscriptionDataConfig {
         SubscriptionDataConfig::new_equity(
@@ -843,11 +901,15 @@ mod tests {
         (replaced, added, removed)
     }
 
+    fn into_arcs(configs: &[SubscriptionDataConfig]) -> Vec<Arc<SubscriptionDataConfig>> {
+        configs.iter().cloned().map(Arc::new).collect()
+    }
+
     fn assert_diff_matches_reference(
         previous: &[SubscriptionDataConfig],
         current: &[SubscriptionDataConfig],
     ) {
-        let diff = compute_subscription_diff(previous, current);
+        let diff = compute_subscription_diff(&into_arcs(previous), &into_arcs(current));
         let (ref_replaced, ref_added, ref_removed) = reference_diff(previous, current);
 
         let replaced: HashSet<u64> = diff.replaced.iter().map(|c| c.unique_id()).collect();
@@ -907,7 +969,7 @@ mod tests {
             (0..10).map(|i| equity_config(&format!("S{i}"))).collect();
         // Cloning yields the same ids, so the diff must report no change.
         let cloned: Vec<SubscriptionDataConfig> = configs.to_vec();
-        let diff = compute_subscription_diff(&configs, &cloned);
+        let diff = compute_subscription_diff(&into_arcs(&configs), &into_arcs(&cloned));
         assert!(
             diff.is_empty(),
             "unchanged subscription set must diff empty"
@@ -927,7 +989,7 @@ mod tests {
         current.remove(0);
         current.push(equity_config("NEWSYM"));
 
-        let diff = compute_subscription_diff(&previous, &current);
+        let diff = compute_subscription_diff(&into_arcs(&previous), &into_arcs(&current));
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.removed_ids.len(), 1);
         assert!(diff.replaced.is_empty());
@@ -981,7 +1043,8 @@ mod tests {
         );
         let sweeps = custom_config("sweeps", Resolution::Minute);
 
-        let active = lean_style_active_subscriptions(&[snapshot.clone(), sweeps.clone()]);
+        let active =
+            lean_style_active_subscriptions(&into_arcs(&[snapshot.clone(), sweeps.clone()]));
 
         assert_eq!(active.len(), 2);
         assert!(active.iter().any(|config| {

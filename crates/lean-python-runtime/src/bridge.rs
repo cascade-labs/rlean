@@ -507,15 +507,20 @@ impl LifecycleBridge for PythonAlgorithmBridge {
         self.state.lock().unwrap().portfolio.starting_cash()
     }
 
-    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
-        self.state
-            .lock()
-            .unwrap()
+    fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
+        self.state.lock().unwrap().subscription_manager.get_all()
+    }
+
+    fn subscriptions_version(&self) -> u64 {
+        let algorithm = self.state.lock().unwrap();
+        // Combine the subscription-manager stamp with the option-subscription
+        // stamp so a change to either flips the version. Wrapping-add keeps it a
+        // cheap integer; the sync loop only tests for inequality, so overflow
+        // wrap is harmless.
+        algorithm
             .subscription_manager
-            .get_all()
-            .into_iter()
-            .map(|config| (*config).clone())
-            .collect()
+            .generation()
+            .wrapping_add(algorithm.option_subscriptions_generation)
     }
 
     fn prepare_data_delivery(&mut self, _subscriptions: &[SubscriptionDataConfig]) -> Result<()> {

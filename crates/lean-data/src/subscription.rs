@@ -308,9 +308,18 @@ impl SubscriptionDataConfig {
 }
 
 /// Manages the set of active subscriptions.
+///
+/// `generation` is a monotonic version stamp bumped on every mutation that
+/// changes the active set (add of a new id, remove, remove-by-symbol,
+/// normalization-mode change, custom dynamic-query change). The
+/// subscription-sync loop runs on every slice; comparing the stamp against the
+/// last-synced value lets it skip the whole diff walk when nothing changed
+/// (issue #64). The stamp lives on the manager itself, which never crosses the
+/// plugin ABI, so this adds no plugin-rebuild requirement.
 #[derive(Debug, Default)]
 pub struct SubscriptionManager {
     state: RwLock<SubscriptionState>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -322,6 +331,21 @@ struct SubscriptionState {
 impl SubscriptionManager {
     pub fn new() -> Self {
         SubscriptionManager::default()
+    }
+
+    /// Monotonic version stamp of the active subscription set. Bumped by every
+    /// mutation that changes membership or config. The subscription-sync loop
+    /// caches the last value it observed and skips its diff walk entirely when
+    /// the stamp is unchanged (issue #64).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bump the version stamp. Called under the state write lock so the new
+    /// stamp is always published after the mutation it describes.
+    fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Get-or-add: matches C# Lean's `DataManager.SubscriptionManagerGetOrAdd`.
@@ -338,23 +362,30 @@ impl SubscriptionManager {
         let config = Arc::new(config);
         state.order.push(id);
         state.subscriptions.insert(id, config.clone());
+        self.bump_generation();
         config
     }
 
     pub fn remove(&self, config: &SubscriptionDataConfig) {
         let id = config.unique_id();
         let mut state = self.state.write();
-        state.subscriptions.remove(&id);
-        state.order.retain(|existing_id| *existing_id != id);
+        if state.subscriptions.remove(&id).is_some() {
+            state.order.retain(|existing_id| *existing_id != id);
+            self.bump_generation();
+        }
     }
 
     pub fn remove_symbol(&self, symbol: &Symbol) {
         let mut state = self.state.write();
+        let before = state.subscriptions.len();
         state
             .subscriptions
             .retain(|_, config| config.symbol.id.sid != symbol.id.sid);
-        let active_ids: HashSet<_> = state.subscriptions.keys().copied().collect();
-        state.order.retain(|id| active_ids.contains(id));
+        if state.subscriptions.len() != before {
+            let active_ids: HashSet<_> = state.subscriptions.keys().copied().collect();
+            state.order.retain(|id| active_ids.contains(id));
+            self.bump_generation();
+        }
     }
 
     pub fn get_all(&self) -> Vec<Arc<SubscriptionDataConfig>> {
@@ -413,6 +444,9 @@ impl SubscriptionManager {
                 updated += 1;
             }
         }
+        if updated > 0 {
+            self.bump_generation();
+        }
         updated
     }
 
@@ -443,6 +477,7 @@ impl SubscriptionManager {
                 custom.dynamic_query = query;
             }
             state.subscriptions.insert(id, Arc::new(new_config));
+            self.bump_generation();
             return true;
         }
         false
@@ -652,5 +687,77 @@ mod tests {
                 assert_eq!(config.unique_id(), *expected);
             }
         }
+    }
+
+    #[test]
+    fn generation_bumps_only_on_effective_mutation() {
+        let manager = SubscriptionManager::new();
+        assert_eq!(manager.generation(), 0);
+
+        // Adding a new config bumps.
+        let spy = equity_config("SPY");
+        manager.add(spy.clone());
+        let after_add = manager.generation();
+        assert!(
+            after_add > 0,
+            "add of a new config must bump the generation"
+        );
+
+        // Re-adding the same id is a no-op get-or-add: no bump.
+        manager.add(spy.clone());
+        assert_eq!(
+            manager.generation(),
+            after_add,
+            "get-or-add of an existing id must not bump"
+        );
+
+        // Removing a non-existent config must not bump.
+        let xlk = equity_config("XLK");
+        manager.remove(&xlk);
+        assert_eq!(
+            manager.generation(),
+            after_add,
+            "removing an absent config must not bump"
+        );
+
+        // Removing an existing config bumps.
+        manager.remove(&spy);
+        let after_remove = manager.generation();
+        assert!(
+            after_remove > after_add,
+            "removing an existing config must bump"
+        );
+
+        // remove_symbol that removes nothing must not bump.
+        manager.remove_symbol(&Symbol::create_equity("NONE", &Market::new(Market::USA)));
+        assert_eq!(
+            manager.generation(),
+            after_remove,
+            "remove_symbol matching nothing must not bump"
+        );
+    }
+
+    #[test]
+    fn generation_bumps_on_normalization_and_custom_query_change() {
+        let manager = SubscriptionManager::new();
+        let spy_symbol = Symbol::create_equity("SPY", &Market::new(Market::USA));
+        manager.add(equity_config("SPY"));
+        let base = manager.generation();
+
+        // Same mode -> no update -> no bump.
+        manager.set_normalization_mode(&spy_symbol, DataNormalizationMode::Adjusted);
+        assert_eq!(
+            manager.generation(),
+            base,
+            "no-op normalization change must not bump"
+        );
+
+        // Real mode change -> bump.
+        let updated = manager.set_normalization_mode(&spy_symbol, DataNormalizationMode::Raw);
+        assert_eq!(updated, 1);
+        assert!(
+            manager.generation() > base,
+            "effective normalization change must bump"
+        );
     }
 }

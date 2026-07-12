@@ -80,7 +80,11 @@ where
     }
 
     pub fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
-        self.algorithm.subscriptions()
+        self.algorithm
+            .subscriptions()
+            .into_iter()
+            .map(|config| (*config).clone())
+            .collect()
     }
 
     pub fn benchmark_symbol(&self) -> String {

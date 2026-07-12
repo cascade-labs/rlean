@@ -166,15 +166,17 @@ impl LifecycleBridge for QcAlgorithmNativeBridge {
         self.state().lock().unwrap().portfolio_value()
     }
 
-    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
-        self.state()
-            .lock()
-            .unwrap()
+    fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
+        self.state().lock().unwrap().subscription_manager.get_all()
+    }
+
+    fn subscriptions_version(&self) -> u64 {
+        let algorithm = self.state();
+        let algorithm = algorithm.lock().unwrap();
+        algorithm
             .subscription_manager
-            .get_all()
-            .into_iter()
-            .map(|config| (*config).clone())
-            .collect()
+            .generation()
+            .wrapping_add(algorithm.option_subscriptions_generation)
     }
 
     fn prepare_data_delivery(
