@@ -1,0 +1,143 @@
+name: Release
+
+# Builds the rlean CLI binary for the fleet's Linux/arm64 nodes and publishes it
+# to a GitHub Release as a versioned bundle that `rlean cloud install` downloads.
+#
+# The binary embeds CPython via PyO3 (auto-initialize), so it dynamically links
+# libpython at runtime. Fleet nodes run Oracle Linux 9 (glibc 2.34) with the
+# distro python3.9 (libpython3.9.so.1.0). To guarantee an ABI match we build
+# inside an oraclelinux:9 container against that same python3.9 — a binary built
+# on the ubuntu-24.04-arm runner directly would link glibc 2.39 and python 3.12
+# and would not run on the node.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)build, e.g. v0.1.0 or cloud-latest"
+        required: true
+        default: "cloud-latest"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-arm64:
+    name: rlean aarch64-unknown-linux-gnu
+    runs-on: ubuntu-24.04-arm
+    container:
+      # Same distro/glibc as the fleet nodes (Oracle Linux 9.x, glibc 2.34).
+      image: oraclelinux:9
+    env:
+      TRIPLE: aarch64-unknown-linux-gnu
+      # PyO3 links the binary against this interpreter's libpython (3.9), whose
+      # soname libpython3.9.so.1.0 is present on the nodes at /usr/lib64.
+      PYO3_PYTHON: /usr/bin/python3.9
+    steps:
+      - name: Install toolchain and Python 3.9 headers
+        run: |
+          dnf -y install gcc gcc-c++ make git tar gzip findutils \
+            python3.9 python3.9-devel openssl-devel perl
+          # A stable rustup toolchain (the workspace pins rust-version 1.92).
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build rlean (release)
+        run: |
+          python3.9 --version
+          cargo build --release -p rlean
+          ./target/release/rlean --version
+
+      - name: Verify the binary links python3.9 (not 3.12) and node glibc
+        run: |
+          bin=target/release/rlean
+          echo "== dynamic dependencies =="
+          ldd "$bin" || true
+          if ! ldd "$bin" | grep -q "libpython3.9"; then
+            echo "ERROR: rlean is not linked against libpython3.9 — it will not run on the nodes." >&2
+            ldd "$bin" | grep -i python || true
+            exit 1
+          fi
+          # No glibc symbol newer than 2.34 (the node's version).
+          if objdump -T "$bin" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | \
+             sort -uV | awk -F. '$2+0 > 34 {print; found=1} END{exit found?1:0}'; then
+            echo "ERROR: binary references a glibc newer than 2.34 (node baseline)." >&2
+            exit 1
+          fi
+
+      - name: Package bundle
+        id: pkg
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          OUT="dist"
+          mkdir -p "$OUT/rlean"
+          cp target/release/rlean "$OUT/rlean/rlean"
+          SHA=$(sha256sum "$OUT/rlean/rlean" | awk '{print $1}')
+          PYVER=$(python3.9 -c 'import platform; print(platform.python_version())')
+          cat > "$OUT/rlean/manifest.json" <<EOF
+          {
+            "component": "rlean",
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "triple": "${TRIPLE}",
+            "python_abi": "3.9",
+            "python_build_version": "${PYVER}",
+            "requires_libpython": "libpython3.9.so.1.0",
+            "sha256": "${SHA}",
+            "git_sha": "${GITHUB_SHA}"
+          }
+          EOF
+          TARBALL="rlean-${VERSION}-${TRIPLE}.tar.gz"
+          tar -C "$OUT/rlean" -czf "$TARBALL" rlean manifest.json
+          sha256sum "$TARBALL" | awk '{print $1}' > "${TARBALL}.sha256"
+          echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
+          echo "== bundle =="; ls -la "$TARBALL"*; cat "$OUT/rlean/manifest.json"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rlean-${{ env.TRIPLE }}
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
+
+      - name: Publish to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          TARBALL="${{ steps.pkg.outputs.tarball }}"
+          # Create the release if it does not exist yet (prerelease for the
+          # rolling cloud-latest tag), then attach/overwrite the bundle.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            PRERELEASE=""
+            case "$TAG" in *latest*) PRERELEASE="--prerelease";; esac
+            gh release create "$TAG" --title "$TAG" \
+              --notes "rlean fleet bundle for ${TRIPLE} (python 3.9 ABI)." \
+              $PRERELEASE || true
+          fi
+          gh release upload "$TAG" "$TARBALL" "${TARBALL}.sha256" --clobber
