@@ -15,14 +15,23 @@ use crate::config::GlobalConfig;
 /// - `workspace`     → `<node_home>/rlean-cloud/workspace`
 /// - `datastore`     → `"file"`
 /// - `artifact_store`→ `"mirror"` (overrides the local, typically `"local"`)
-/// - `artifact_s3*`  → copied verbatim from the local config (operator creds)
+/// - `artifact_s3*`  → copied verbatim from the local config (operator creds),
+///   except the endpoint, which `artifact_endpoint` overrides when given — a
+///   node often needs a different route to the same object store than the
+///   control machine (e.g. an OCI bucket's `.private.` endpoint is reachable
+///   from the operator's VPN but not from the node's subnet, while the public
+///   form of the same endpoint is).
 /// - `default_language` → copied from local (already defaults to `"python"`)
 ///
 /// The local `data_folder` (a control-machine path such as `/Volumes/...`) is
 /// deliberately dropped; the local `s3_*` fields are left untouched on the
 /// local config and are NOT copied into the node config (only the `artifact_s3*`
 /// fields are, matching how the artifact relay reads its credentials).
-pub(crate) fn node_config_from_local(local: &GlobalConfig, node_home: &str) -> GlobalConfig {
+pub(crate) fn node_config_from_local(
+    local: &GlobalConfig,
+    node_home: &str,
+    artifact_endpoint: Option<&str>,
+) -> GlobalConfig {
     let node_home = node_home.trim_end_matches('/');
     GlobalConfig {
         default_language: local.default_language.clone(),
@@ -36,7 +45,9 @@ pub(crate) fn node_config_from_local(local: &GlobalConfig, node_home: &str) -> G
         s3_region: None,
         artifact_store: Some("mirror".to_string()),
         artifact_s3: local.artifact_s3.clone(),
-        artifact_s3_endpoint: local.artifact_s3_endpoint.clone(),
+        artifact_s3_endpoint: artifact_endpoint
+            .map(str::to_string)
+            .or_else(|| local.artifact_s3_endpoint.clone()),
         artifact_s3_region: local.artifact_s3_region.clone(),
         artifact_s3_access_key: local.artifact_s3_access_key.clone(),
         artifact_s3_secret_key: local.artifact_s3_secret_key.clone(),
@@ -72,7 +83,7 @@ mod tests {
 
     #[test]
     fn node_config_overrides_store_and_paths() {
-        let node = node_config_from_local(&local_with_artifacts(), "/home/opc");
+        let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
         assert_eq!(node.datastore, "file");
         assert_eq!(node.artifact_store.as_deref(), Some("mirror"));
@@ -90,7 +101,7 @@ mod tests {
 
     #[test]
     fn node_config_copies_artifact_creds_only() {
-        let node = node_config_from_local(&local_with_artifacts(), "/home/opc");
+        let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
         assert_eq!(node.artifact_s3.as_deref(), Some("s3://runs-bucket/rlean"));
         assert_eq!(
@@ -116,7 +127,7 @@ mod tests {
             ..GlobalConfig::default()
         };
         local.artifact_s3 = None;
-        let node = node_config_from_local(&local, "/home/opc/");
+        let node = node_config_from_local(&local, "/home/opc/", None);
 
         assert_eq!(node.default_language, "csharp");
         // Missing artifact creds stay missing — we never invent values.
@@ -130,7 +141,7 @@ mod tests {
 
     #[test]
     fn node_config_serializes_with_expected_keys() {
-        let node = node_config_from_local(&local_with_artifacts(), "/home/opc");
+        let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
         let json = serde_json::to_string_pretty(&node).unwrap();
         // The struct uses kebab-case for un-renamed fields but keeps an explicit
         // `artifact_store` rename; the node must parse this exact shape back.
@@ -153,5 +164,21 @@ mod tests {
             reparsed.data_folder.as_deref(),
             Some("/home/opc/rlean-cloud/data")
         );
+    }
+
+    #[test]
+    fn node_config_endpoint_override_replaces_only_the_endpoint() {
+        let node = node_config_from_local(
+            &local_with_artifacts(),
+            "/home/opc",
+            Some("https://public.s3.example"),
+        );
+        assert_eq!(
+            node.artifact_s3_endpoint.as_deref(),
+            Some("https://public.s3.example")
+        );
+        // Everything else still comes from the local config.
+        assert_eq!(node.artifact_s3.as_deref(), Some("s3://runs-bucket/rlean"));
+        assert_eq!(node.artifact_s3_access_key.as_deref(), Some("AKIA_ART"));
     }
 }

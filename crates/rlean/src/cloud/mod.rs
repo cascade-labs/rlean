@@ -89,6 +89,11 @@ pub enum CloudCommand {
         /// Add a plugin from an explicit `owner/repo[:tag][#name]` (repeatable)
         #[arg(long = "plugin-repo")]
         plugin_repo: Vec<String>,
+        /// Override the artifact S3 endpoint written into the node config
+        /// (for nodes that reach the object store via a different route than
+        /// the control machine)
+        #[arg(long)]
+        artifact_s3_endpoint: Option<String>,
     },
     /// Snapshot a strategy to a node and launch `rlean live` there
     Deploy {
@@ -185,10 +190,19 @@ pub fn run(args: CloudArgs) -> Result<()> {
             release_tag,
             plugin,
             plugin_repo,
+            artifact_s3_endpoint,
         } => {
             let reg = NodeRegistry::load()?;
             let tag = release_tag.as_deref().unwrap_or(DEFAULT_RELEASE_TAG);
-            let summary = cmd_install(&exec, &reg, &name, tag, &plugin, &plugin_repo)?;
+            let summary = cmd_install(
+                &exec,
+                &reg,
+                &name,
+                tag,
+                &plugin,
+                &plugin_repo,
+                artifact_s3_endpoint.as_deref(),
+            )?;
             print_install_summary(&summary);
             Ok(())
         }
