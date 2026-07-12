@@ -349,7 +349,7 @@ impl PluginConfigs {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write to a temp file then rename (atomic on same filesystem).
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content).with_context(|| format!("Failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
@@ -357,7 +357,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn secure_owner_read_write(path: &Path) -> Result<()> {
+pub(crate) fn secure_owner_read_write(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = std::fs::metadata(path)
@@ -369,6 +369,6 @@ fn secure_owner_read_write(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn secure_owner_read_write(_path: &Path) -> Result<()> {
+pub(crate) fn secure_owner_read_write(_path: &Path) -> Result<()> {
     Ok(())
 }

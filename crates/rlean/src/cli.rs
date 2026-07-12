@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::cloud::CloudArgs;
 use crate::config_cmd::ConfigArgs;
 use crate::init::InitArgs;
 use crate::plugin_cmd::PluginArgs;
@@ -57,6 +58,9 @@ pub(crate) enum Command {
 
     /// Version control: push, pull, sync, and configure your strategy remote
     Vcs(VcsArgs),
+
+    /// Manage a fleet of remote nodes reachable over SSH
+    Cloud(CloudArgs),
 
     /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
     #[command(name = "__research-daemon", hide = true)]
