@@ -41,6 +41,8 @@ base64             = { workspace = true }
 libc               = "0.2"
 indicatif = "0.18.5"
 ctrlc = "3.5.2"
+tempfile           = { workspace = true }
+sha2               = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
