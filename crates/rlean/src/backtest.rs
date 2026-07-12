@@ -323,10 +323,10 @@ async fn run_strategy_backtest(
     // Results are on disk; now (best-effort) collapse the snapshot/manifest
     // bloat that the run's appends left in the cache so the next backtest plans
     // quickly. Runs after all reporting so a slow/interrupted compaction never
-    // costs the just-computed results.
-    if !args.no_compact {
-        compact_cache_after_backtest(&datastore.store).await;
-    }
+    // costs the just-computed results. The #63 sole-user gate inside
+    // `compact_cache_after_backtest` skips (with a log) when another run shares
+    // the warehouse, so this is always safe to invoke unconditionally.
+    compact_cache_after_backtest(&datastore.store).await;
 
     Ok(())
 }
