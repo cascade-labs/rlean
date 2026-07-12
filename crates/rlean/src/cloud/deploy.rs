@@ -190,7 +190,12 @@ pub(crate) fn cmd_deploy(
 
     // 2. Launch detached; capture the PID echoed by the launch command.
     let launch = remote_launch_command(&paths, opts);
-    let out = exec.run(ssh, &["sh", "-c", &launch])?;
+    // The compound command is passed as a SINGLE argv element: OpenSSH joins
+    // remote argv with spaces (no quoting), so a ["sh","-c",cmd] triple would
+    // arrive as `sh -c mkdir ...` and `sh -c` would receive only `mkdir` — the
+    // rest of the chain would run in the wrong shell and cwd. One element
+    // arrives intact and the remote login shell evaluates the whole line.
+    let out = exec.run(ssh, &[launch.as_str()])?;
     if out.status != 0 {
         bail!(
             "failed to launch deployment on '{}' (status {}):\n{}",
@@ -239,7 +244,7 @@ fn poll_startup(
     let cmd = live_control_command(strategy_dir, &["status", deploy_id]);
     let mut last = "unknown".to_string();
     for attempt in 0..6 {
-        let out = exec.run(ssh, &["sh", "-c", &cmd])?;
+        let out = exec.run(ssh, &[cmd.as_str()])?;
         if out.status == 0 {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out.stdout) {
                 if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
@@ -319,7 +324,7 @@ fn run_live_control(
     live_args: &[&str],
 ) -> Result<String> {
     let cmd = live_control_command(strategy_dir, live_args);
-    let out = exec.run(ssh, &["sh", "-c", &cmd])?;
+    let out = exec.run(ssh, &[cmd.as_str()])?;
     if out.status != 0 {
         bail!(
             "`rlean live {}` failed on node (status {}):\n{}",
@@ -523,11 +528,11 @@ mod tests {
 
         let mut fake = FakeExec::new();
         let launch = remote_launch_command(&paths, &opts);
-        fake.set("opc@n1", &["sh", "-c", &launch], ok("4242\n"));
+        fake.set("opc@n1", &[&launch], ok("4242\n"));
         let status_cmd = live_control_command(&paths.strategy_dir, &["status", id]);
         fake.set(
             "opc@n1",
-            &["sh", "-c", &status_cmd],
+            &[&status_cmd],
             ok(r#"{"status":"running","pid":4242}"#),
         );
 
@@ -535,7 +540,7 @@ mod tests {
         // We call cmd_deploy but rsync_to would try to run rsync — so instead we
         // test the pieces that don't shell out. Here we exercise the launch +
         // poll path by calling them directly.
-        let out = fake.run("opc@n1", &["sh", "-c", &launch]).unwrap();
+        let out = fake.run("opc@n1", &[&launch]).unwrap();
         assert_eq!(out.stdout.trim(), "4242");
         let status = poll_startup(&fake, "opc@n1", &paths.strategy_dir, id).unwrap();
         assert_eq!(status, "running");
@@ -562,21 +567,17 @@ mod tests {
         let dir = "/home/opc/rlean-cloud/workspace/uw";
         fake.set(
             "n1",
-            &["sh", "-c", &live_control_command(dir, &["status", "d1"])],
+            &[&live_control_command(dir, &["status", "d1"])],
             ok(r#"{"status":"running"}"#),
         );
         fake.set(
             "n1",
-            &[
-                "sh",
-                "-c",
-                &live_control_command(dir, &["logs", "d1", "--lines", "10"]),
-            ],
+            &[&live_control_command(dir, &["logs", "d1", "--lines", "10"])],
             ok("log line\n"),
         );
         fake.set(
             "n1",
-            &["sh", "-c", &live_control_command(dir, &["portfolio", "d1"])],
+            &[&live_control_command(dir, &["portfolio", "d1"])],
             ok("{}"),
         );
 
@@ -620,11 +621,7 @@ mod tests {
         let mut fake = FakeExec::new();
         fake.set(
             "opc@n1",
-            &[
-                "sh",
-                "-c",
-                &live_control_command("/home/opc/ws/uw", &["status", "d1"]),
-            ],
+            &[&live_control_command("/home/opc/ws/uw", &["status", "d1"])],
             ok(r#"{"status":"running","pid":7}"#),
         );
 
