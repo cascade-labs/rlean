@@ -159,6 +159,13 @@ pub struct QcAlgorithm {
     pub option_subscription_resolutions: HashMap<String, Resolution>,
     /// LEAN-style option filters keyed by canonical option permtick.
     pub option_filters: HashMap<String, OptionFilter>,
+    /// Monotonic version stamp bumped whenever the option-subscription set,
+    /// resolutions, or filters change. Combined with
+    /// `subscription_manager.generation()` to let the subscription-sync loop
+    /// skip its diff when nothing changed (issue #64). Option state lives on the
+    /// algorithm rather than the `SubscriptionManager`, so it needs its own
+    /// stamp to be covered by the fast-path skip.
+    pub option_subscriptions_generation: u64,
     /// Specific option contracts that have been subscribed to.
     pub open_option_contracts: Vec<Symbol>,
     /// Generated option chains keyed by canonical ticker (e.g. "?SPY").
@@ -198,6 +205,7 @@ impl QcAlgorithm {
             option_subscriptions: Vec::new(),
             option_subscription_resolutions: HashMap::new(),
             option_filters: HashMap::new(),
+            option_subscriptions_generation: 0,
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
             benchmark_symbol: None,
@@ -1666,12 +1674,14 @@ impl QcAlgorithm {
             .insert(canonical.permtick.to_string(), resolution);
         self.option_filters
             .insert(canonical.permtick.to_string(), OptionFilter::default());
+        self.option_subscriptions_generation += 1;
         canonical
     }
 
     pub fn set_option_filter(&mut self, canonical: &Symbol, filter: OptionFilter) {
         self.option_filters
             .insert(canonical.permtick.to_string(), filter);
+        self.option_subscriptions_generation += 1;
     }
 
     /// Subscribe to a specific option contract.
@@ -1751,6 +1761,7 @@ impl QcAlgorithm {
         self.option_subscription_resolutions.remove(&canonical_key);
         self.option_filters.remove(&canonical_key);
         self.option_chains.remove(&canonical_key);
+        self.option_subscriptions_generation += 1;
 
         let child_symbols: Vec<Symbol> = self
             .open_option_contracts

@@ -265,7 +265,15 @@ pub trait LifecycleBridge: Send + AlgorithmStateAccess {
     fn end_date(&self) -> DateTime;
     fn portfolio_value(&self) -> Price;
     fn starting_cash(&self) -> Price;
-    fn subscriptions(&self) -> Vec<SubscriptionDataConfig>;
+    /// Active market/custom subscription configs as shared handles. Returning
+    /// `Arc`s (rather than deep-cloned owned values) lets the subscription-sync
+    /// loop diff by the memoized `unique_id()` on the shared instances without
+    /// re-hashing or reallocating every slice (issue #64).
+    fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>>;
+    /// Monotonic version stamp that changes whenever `subscriptions()` or
+    /// `option_subscriptions()` would return a different set. The sync loop
+    /// caches the last value and skips its diff entirely when unchanged.
+    fn subscriptions_version(&self) -> u64;
     fn prepare_data_delivery(
         &mut self,
         subscriptions: &[SubscriptionDataConfig],
@@ -456,8 +464,12 @@ where
         self.as_ref().starting_cash()
     }
 
-    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
+    fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
         self.as_ref().subscriptions()
+    }
+
+    fn subscriptions_version(&self) -> u64 {
+        self.as_ref().subscriptions_version()
     }
 
     fn prepare_data_delivery(

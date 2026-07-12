@@ -132,8 +132,16 @@ where
         algorithm_manager.subscriptions(),
         benchmark_subscription.clone(),
     );
-    let subscriptions =
-        subscriptions_with_option_chains(subscriptions, &algorithm_manager.option_subscriptions());
+    let subscriptions = subscriptions_with_option_chains(
+        subscriptions.into_iter().map(Arc::new).collect(),
+        &algorithm_manager.option_subscriptions(),
+    );
+    // Live consumers below take owned config slices; live is not the per-slice
+    // hot path (it has its own id-set short-circuit), so materialize once here.
+    let subscriptions: Vec<SubscriptionDataConfig> = subscriptions
+        .iter()
+        .map(|config| (**config).clone())
+        .collect();
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
     algorithm_manager.warmup_finished(&mut services);
 
@@ -970,9 +978,18 @@ async fn sync_live_subscriptions<B: AlgorithmBridge>(
         subscriptions_with_benchmark(
             algorithm_manager.subscriptions(),
             benchmark_subscription.cloned(),
-        ),
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect(),
         &algorithm_manager.option_subscriptions(),
     );
+    // Consumers below take owned config slices; materialize once (live has its
+    // own id-set short-circuit just below, so this is not the hot path).
+    let subscriptions: Vec<SubscriptionDataConfig> = subscriptions
+        .iter()
+        .map(|config| (**config).clone())
+        .collect();
     // Short-circuit the per-slice sync when the subscription set is unchanged
     // (issue #39). The unique-ids are now cached, so building this set is cheap,
     // and both `.sync()` calls below key purely on unique-id — an unchanged id
@@ -1731,8 +1748,22 @@ mod tests {
             dec!(100000)
         }
 
-        fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
-            self.subscriptions.lock().unwrap().clone()
+        fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
+            self.subscriptions
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(Arc::new)
+                .collect()
+        }
+
+        fn subscriptions_version(&self) -> u64 {
+            self.subscriptions
+                .lock()
+                .unwrap()
+                .iter()
+                .fold(0u64, |acc, config| acc.wrapping_add(config.unique_id()))
         }
 
         fn prepare_data_delivery(
@@ -2562,15 +2593,15 @@ mod tests {
         fn starting_cash(&self) -> lean_core::Price {
             dec!(100000)
         }
-        fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
-            self.state
-                .lock()
-                .unwrap()
+        fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
+            self.state.lock().unwrap().subscription_manager.get_all()
+        }
+        fn subscriptions_version(&self) -> u64 {
+            let algorithm = self.state.lock().unwrap();
+            algorithm
                 .subscription_manager
-                .get_all()
-                .into_iter()
-                .map(|config| (*config).clone())
-                .collect()
+                .generation()
+                .wrapping_add(algorithm.option_subscriptions_generation)
         }
         fn prepare_data_delivery(
             &mut self,

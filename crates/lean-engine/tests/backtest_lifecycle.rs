@@ -275,15 +275,20 @@ impl AlgorithmBridge for RecordingBacktestAlgorithm {
         self.algorithm.lock().unwrap().portfolio.starting_cash()
     }
 
-    fn subscriptions(&self) -> Vec<SubscriptionDataConfig> {
+    fn subscriptions(&self) -> Vec<Arc<SubscriptionDataConfig>> {
         self.algorithm
             .lock()
             .unwrap()
             .subscription_manager
             .get_all()
-            .into_iter()
-            .map(|config| (*config).clone())
-            .collect()
+    }
+
+    fn subscriptions_version(&self) -> u64 {
+        let algorithm = self.algorithm.lock().unwrap();
+        algorithm
+            .subscription_manager
+            .generation()
+            .wrapping_add(algorithm.option_subscriptions_generation)
     }
 
     fn prepare_data_delivery(&mut self, subscriptions: &[SubscriptionDataConfig]) -> Result<()> {
