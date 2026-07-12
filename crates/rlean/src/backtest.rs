@@ -68,6 +68,12 @@ async fn run_strategy_backtest(
         pyo3::Python::initialize();
     }
 
+    // Announce this run in the warehouse active-run registry for the whole
+    // backtest. Held until the function returns so the post-run compaction below
+    // sees no *other* active user before it rewrites shared cache tables, and so
+    // any concurrent run's compaction sees us. Dropped on every exit path.
+    let _warehouse_run = datastore.store.register_active_run("backtest");
+
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .map_err(|_| anyhow::anyhow!("invalid date '{}', expected YYYY-MM-DD", s))
@@ -347,7 +353,13 @@ fn s3_bucket_display(config: &crate::artifacts_config::ArtifactConfig) -> String
 const COMPACT_MIN_METADATA_VERSIONS: usize = 256;
 
 async fn compact_cache_after_backtest(store: &lean_storage::IcebergStore) {
-    let compacted = store.compact_bloated(COMPACT_MIN_METADATA_VERSIONS).await;
+    // Sole-user gate: compaction rewrites tables via drop+recreate and is unsafe
+    // while another backtest or the live trader is active on the same warehouse
+    // (issue #26). When others are active this skips with a log and leaves the
+    // rewrite to `iceberg_maintenance compact`.
+    let compacted = store
+        .compact_bloated_if_sole_user(COMPACT_MIN_METADATA_VERSIONS)
+        .await;
     if compacted.is_empty() {
         return;
     }

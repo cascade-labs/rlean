@@ -72,6 +72,11 @@ pub const CUSTOM_POINTS: &str = "custom_points";
 pub const FACTOR_FILES: &str = "factor_files";
 pub const MAP_FILES: &str = "map_files";
 
+/// Directory under the warehouse root holding a marker file per rlean process
+/// actively using the warehouse. Read before running compaction so the
+/// drop+recreate rewrite never races a concurrent reader/writer (issue #26).
+const ACTIVE_RUNS_DIR: &str = ".rlean_active_runs";
+
 /// Every table the local cache manages, in a stable order. Used by maintenance
 /// tooling and the end-of-backtest compaction pass.
 pub const CACHE_TABLES: &[&str] = &[
@@ -130,6 +135,33 @@ pub struct CompactionStats {
     pub rows: usize,
     /// Number of append commits (snapshots + manifests) written afterward.
     pub appends: usize,
+}
+
+/// RAII marker: the current process's entry in the warehouse active-run
+/// registry (see [`IcebergStore::register_active_run`]). Dropping it removes the
+/// marker so the process no longer blocks maintenance once it exits.
+#[must_use = "hold the guard for the lifetime of the run; dropping it deregisters immediately"]
+pub struct WarehouseRunGuard {
+    path: PathBuf,
+}
+
+impl Drop for WarehouseRunGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// True when a process with `pid` still exists. `kill(pid, 0)` performs the
+/// standard existence check without sending a signal; `ESRCH` means gone while
+/// `EPERM` means alive but owned by another user (still an active user).
+fn process_is_alive(pid: u32) -> bool {
+    // Safety: `kill` with signal 0 only probes for the process's existence and
+    // never delivers a signal or mutates any state.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[derive(Clone)]
@@ -264,6 +296,91 @@ impl IcebergStore {
             }
         }
         compacted
+    }
+
+    /// Directory holding one marker file per rlean process that is actively
+    /// reading or writing this warehouse.
+    fn active_runs_dir(&self) -> PathBuf {
+        self.warehouse_root.join(ACTIVE_RUNS_DIR)
+    }
+
+    /// Announce that this process is actively using the warehouse and get an
+    /// RAII guard that removes the marker on drop (and on process exit via the
+    /// stale-pid sweep below). Backtests and live deployments register at start
+    /// so that maintenance which mutates shared tables — compaction's
+    /// drop+recreate — can detect concurrent users and refuse to run, which is
+    /// the crash that killed a 15-hour backtest (issue #26). Best-effort: a
+    /// failure to write the marker is logged, not fatal.
+    pub fn register_active_run(&self, kind: &str) -> WarehouseRunGuard {
+        let dir = self.active_runs_dir();
+        let pid = std::process::id();
+        let path = dir.join(format!("{pid}.json"));
+        if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"pid\":{pid},\"kind\":\"{kind}\",\"started_at\":\"{}\"}}",
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            )
+        }) {
+            tracing::warn!(
+                "failed to register warehouse run marker {}: {error:#}",
+                path.display()
+            );
+        }
+        WarehouseRunGuard { path }
+    }
+
+    /// PIDs of *other* live rlean processes currently using this warehouse.
+    /// Stale markers whose process is gone are pruned as a side effect so a
+    /// crashed run never blocks maintenance forever.
+    pub fn other_active_run_pids(&self) -> Vec<u32> {
+        let self_pid = std::process::id();
+        let dir = self.active_runs_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut others = Vec::new();
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            let Some(pid) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            if process_is_alive(pid) {
+                others.push(pid);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        others
+    }
+
+    /// Compact bloated cache tables, but ONLY when this process is the warehouse's
+    /// sole active user. Compaction rewrites tables via drop+recreate, which is
+    /// unsafe while another backtest or the live trader reads or appends the same
+    /// tables (issue #26): a concurrent scan can hit the dropped state and die
+    /// with a schema error. When other runs are active we skip and log, deferring
+    /// the rewrite to a quiet run or the `iceberg_maintenance compact` command.
+    pub async fn compact_bloated_if_sole_user(&self, min_versions: usize) -> Vec<CompactionStats> {
+        let others = self.other_active_run_pids();
+        if !others.is_empty() {
+            tracing::info!(
+                "skipping end-of-run cache compaction: {} other rlean run(s) active on this \
+                 warehouse (pids {:?}); run `iceberg_maintenance compact` in a quiet window",
+                others.len(),
+                others,
+            );
+            return Vec::new();
+        }
+        self.compact_bloated(min_versions).await
     }
 
     /// Rewrite every live row of `table` into a small number of append commits,
@@ -3431,6 +3548,59 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    #[tokio::test]
+    async fn active_run_registry_tracks_self_and_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+
+        // No markers yet -> nobody else active, and compaction is allowed.
+        assert!(store.other_active_run_pids().is_empty());
+
+        // Our own marker never counts as "another" active user.
+        let guard = store.register_active_run("backtest");
+        assert!(store.other_active_run_pids().is_empty());
+
+        // A live marker from a different, real, alive process (this test process,
+        // under a pid that is not our own) is detected as an active user.
+        let other_pid = std::process::id() + 1_000_000; // certainly dead
+        let dir = store.active_runs_dir();
+        std::fs::write(
+            dir.join(format!("{other_pid}.json")),
+            format!("{{\"pid\":{other_pid},\"kind\":\"live\"}}"),
+        )
+        .unwrap();
+        // The other pid is dead, so it is pruned rather than reported.
+        assert!(store.other_active_run_pids().is_empty());
+        assert!(
+            !dir.join(format!("{other_pid}.json")).exists(),
+            "a stale (dead-pid) marker must be pruned"
+        );
+
+        // Dropping the guard removes our marker.
+        let self_marker = dir.join(format!("{}.json", std::process::id()));
+        assert!(self_marker.exists());
+        drop(guard);
+        assert!(!self_marker.exists());
+    }
+
+    #[tokio::test]
+    async fn compact_skipped_when_another_run_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+        // Plant a marker under pid 1 (launchd/init) — always alive and never our
+        // own pid — so the sole-user gate sees a live concurrent user and refuses
+        // to compact.
+        let dir = store.active_runs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1.json"), "{\"pid\":1,\"kind\":\"live\"}").unwrap();
+        assert_eq!(store.other_active_run_pids(), vec![1]);
+        let compacted = store.compact_bloated_if_sole_user(1).await;
+        assert!(
+            compacted.is_empty(),
+            "compaction must be skipped while another run is active"
+        );
+    }
 
     #[test]
     fn custom_projected_fields_includes_requested_and_filter_columns() {

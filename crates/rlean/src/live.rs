@@ -64,6 +64,11 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
 
+    // Announce the live trader in the warehouse active-run registry so any
+    // concurrent backtest's end-of-run compaction detects it and refuses the
+    // unsafe drop+recreate rewrite (issue #26). Held for the whole live session.
+    let _warehouse_run = datastore.store.register_active_run("live");
+
     let live_provider_names = args
         .data_provider_live
         .as_deref()

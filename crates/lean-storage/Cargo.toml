@@ -43,6 +43,7 @@ zip = { workspace = true }
 fs2 = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
+libc = "0.2"
 
 
 [features]
