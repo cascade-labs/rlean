@@ -297,6 +297,7 @@ pub(crate) fn cmd_install(
     release_tag: &str,
     plugin_filters: &[String],
     plugin_repos: &[String],
+    artifact_endpoint: Option<&str>,
 ) -> Result<InstallSummary> {
     // 1. Resolve node + validate triple.
     let node = reg
@@ -421,7 +422,7 @@ pub(crate) fn cmd_install(
     // 6. Generate the node config locally, ship it, chmod 0600.
     let local_config = GlobalConfig::load().context("failed to read local ~/.rlean/config")?;
     let node_home = probe_node_home(exec, ssh)?;
-    let node_config = node_config_from_local(&local_config, &node_home);
+    let node_config = node_config_from_local(&local_config, &node_home, artifact_endpoint);
     let config_json = serde_json::to_string_pretty(&node_config)?;
     let local_config_tmp = tmp_path.join("node-config");
     atomic_write(&local_config_tmp, &config_json)?;
