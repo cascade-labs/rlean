@@ -27,9 +27,11 @@
 //!   [`CHECKPOINT_INTERVAL`] so a long run does not hammer S3, and
 //!   [`RunArtifactSink::flush_all`] on completion uploads the final state. A run
 //!   that dies mid-way therefore leaves its last checkpoint in S3.
-//! - **Live** calls [`RunArtifactSink::mirror`] on every snapshot. A live
-//!   deployment rewrites the same small set of files (portfolio.json,
-//!   heartbeat, order events, ~9 total) over and over, so uploads are
+//! - **Live**: the deployment writer calls [`RunArtifactSink::mirror`] only on
+//!   state changes (fills, trades, insight events — debounced), at process
+//!   start, at calendar-day rollover, and via `flush_all` on clean shutdown —
+//!   not on every snapshot (see `MirrorPolicy` in `live::deployment_writer`),
+//!   so a quiet live instance enqueues nothing. Beneath that, uploads are
 //!   **latest-wins per file**: at most one upload is ever in flight for a given
 //!   file name, plus at most one pending "dirty" flag. `mirror` on a file that
 //!   is already uploading just sets the dirty flag and returns (coalescing) —
