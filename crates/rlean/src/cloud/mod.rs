@@ -9,13 +9,30 @@
 //!   rlean cloud list [--probe]
 //!   rlean cloud remove <name>
 //!   rlean cloud exec <name> -- <command...>
+//!   rlean cloud install <name> [--release-tag T] [--plugin N...] [--plugin-repo owner/repo:tag...]
+//!   rlean cloud deploy <name> <strategy-dir> [--brokerage B] [--data-provider-live L] [--data-provider-historical H]
+//!   rlean cloud status [<name>] [--deploy-id ID]
+//!   rlean cloud logs <name> [--deploy-id ID] [--lines N]
+//!   rlean cloud portfolio <name> [--deploy-id ID]
 
+mod deploy;
+mod deployments;
+mod install;
+mod nodeconfig;
 mod registry;
 mod remote;
+
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use chrono::Utc;
 
+use deploy::{
+    aggregate_status, cmd_deploy, remote_logs, remote_portfolio, remote_status, resolve_target,
+    DeployOptions, DeployRequest,
+};
+use deployments::CloudDeploymentRegistry;
+use install::{cmd_install, probe_node_home, DEFAULT_RELEASE_TAG};
 use registry::{platform_triple, Node, NodeRegistry};
 use remote::{RemoteExec, SshExec};
 
@@ -58,6 +75,68 @@ pub enum CloudCommand {
         /// Command to run on the node (after `--`)
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Install rlean + plugins + `~/.rlean` subset onto a node
+    Install {
+        /// Node name
+        name: String,
+        /// Release tag for the bundles (defaults to the cloud RC tag)
+        #[arg(long)]
+        release_tag: Option<String>,
+        /// Restrict the default plugin set to these names (repeatable)
+        #[arg(long = "plugin")]
+        plugin: Vec<String>,
+        /// Add a plugin from an explicit `owner/repo[:tag][#name]` (repeatable)
+        #[arg(long = "plugin-repo")]
+        plugin_repo: Vec<String>,
+        /// Override the artifact S3 endpoint written into the node config
+        /// (for nodes that reach the object store via a different route than
+        /// the control machine)
+        #[arg(long)]
+        artifact_s3_endpoint: Option<String>,
+    },
+    /// Snapshot a strategy to a node and launch `rlean live` there
+    Deploy {
+        /// Node name
+        name: String,
+        /// Local strategy directory (or path to its main.py)
+        strategy_dir: PathBuf,
+        /// Live brokerage (default: tradier)
+        #[arg(long)]
+        brokerage: Option<String>,
+        /// Live data provider (default: tradier)
+        #[arg(long)]
+        data_provider_live: Option<String>,
+        /// Historical data provider(s) (default: thetadata,massive)
+        #[arg(long)]
+        data_provider_historical: Option<String>,
+    },
+    /// Show live deployment status (one node, or aggregated across all nodes)
+    Status {
+        /// Node name (omit to aggregate all recorded deployments)
+        name: Option<String>,
+        /// Deploy id (defaults to the node's single recorded deployment)
+        #[arg(long)]
+        deploy_id: Option<String>,
+    },
+    /// Print a node deployment's logs
+    Logs {
+        /// Node name
+        name: String,
+        /// Deploy id (defaults to the node's single recorded deployment)
+        #[arg(long)]
+        deploy_id: Option<String>,
+        /// Number of trailing log lines to print
+        #[arg(long, default_value_t = 250)]
+        lines: usize,
+    },
+    /// Print a node deployment's portfolio snapshot
+    Portfolio {
+        /// Node name
+        name: String,
+        /// Deploy id (defaults to the node's single recorded deployment)
+        #[arg(long)]
+        deploy_id: Option<String>,
     },
 }
 
@@ -106,7 +185,177 @@ pub fn run(args: CloudArgs) -> Result<()> {
             let reg = NodeRegistry::load()?;
             cmd_exec(&exec, &reg, &name, &cmd)
         }
+        CloudCommand::Install {
+            name,
+            release_tag,
+            plugin,
+            plugin_repo,
+            artifact_s3_endpoint,
+        } => {
+            let reg = NodeRegistry::load()?;
+            let tag = release_tag.as_deref().unwrap_or(DEFAULT_RELEASE_TAG);
+            let summary = cmd_install(
+                &exec,
+                &reg,
+                &name,
+                tag,
+                &plugin,
+                &plugin_repo,
+                artifact_s3_endpoint.as_deref(),
+            )?;
+            print_install_summary(&summary);
+            Ok(())
+        }
+        CloudCommand::Deploy {
+            name,
+            strategy_dir,
+            brokerage,
+            data_provider_live,
+            data_provider_historical,
+        } => {
+            let node_reg = NodeRegistry::load()?;
+            let node = node_reg
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("unknown node '{name}' — run `rlean cloud list`"))?
+                .clone();
+            let (local_dir, strategy_name) = deploy::resolve_local_strategy(&strategy_dir)?;
+            let opts =
+                DeployOptions::from_cli(brokerage, data_provider_live, data_provider_historical);
+            let node_home = probe_node_home(&exec, &node.ssh_dest)?;
+
+            let mut deploy_reg = CloudDeploymentRegistry::load()?;
+            let req = DeployRequest {
+                node: &node,
+                node_home: &node_home,
+                local_strategy_dir: &local_dir,
+                strategy_name: &strategy_name,
+                opts: &opts,
+                now: Utc::now(),
+            };
+            let summary = cmd_deploy(&exec, &req, &mut deploy_reg)?;
+            deploy_reg.save()?;
+
+            println!("Deployed '{strategy_name}' to node '{name}'");
+            println!("  deploy id : {}", summary.deploy_id);
+            println!("  node dir  : {}", summary.deploy_dir);
+            if let Some(pid) = summary.pid {
+                println!("  node pid  : {pid}");
+            }
+            println!("  startup   : {}", summary.startup_status);
+            println!(
+                "  monitor   : rlean cloud status {name} --deploy-id {}",
+                summary.deploy_id
+            );
+            println!(
+                "              rlean cloud logs {name} --deploy-id {}",
+                summary.deploy_id
+            );
+            Ok(())
+        }
+        CloudCommand::Status { name, deploy_id } => cmd_status(&exec, name, deploy_id),
+        CloudCommand::Logs {
+            name,
+            deploy_id,
+            lines,
+        } => {
+            let reg = CloudDeploymentRegistry::load()?;
+            let node = require_node(&name)?;
+            let target = resolve_target(&reg, &name, deploy_id.as_deref())?;
+            let out = remote_logs(
+                &exec,
+                &node.ssh_dest,
+                &target.strategy_dir,
+                &target.deploy_id,
+                lines,
+            )?;
+            print!("{out}");
+            Ok(())
+        }
+        CloudCommand::Portfolio { name, deploy_id } => {
+            let reg = CloudDeploymentRegistry::load()?;
+            let node = require_node(&name)?;
+            let target = resolve_target(&reg, &name, deploy_id.as_deref())?;
+            let out = remote_portfolio(
+                &exec,
+                &node.ssh_dest,
+                &target.strategy_dir,
+                &target.deploy_id,
+            )?;
+            print!("{out}");
+            Ok(())
+        }
     }
+}
+
+/// Load a node from the registry by name or error.
+fn require_node(name: &str) -> Result<Node> {
+    NodeRegistry::load()?
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown node '{name}' — run `rlean cloud list`"))
+}
+
+/// Dispatch `rlean cloud status` across its three modes.
+fn cmd_status(
+    exec: &dyn RemoteExec,
+    name: Option<String>,
+    deploy_id: Option<String>,
+) -> Result<()> {
+    let deploy_reg = CloudDeploymentRegistry::load()?;
+    match name {
+        // A specific node: exact deploy id, or its single recorded deploy.
+        Some(name) => {
+            let node = require_node(&name)?;
+            match resolve_target(&deploy_reg, &name, deploy_id.as_deref()) {
+                Ok(target) => {
+                    let out = remote_status(
+                        exec,
+                        &node.ssh_dest,
+                        &target.strategy_dir,
+                        &target.deploy_id,
+                    )?;
+                    print!("{out}");
+                    Ok(())
+                }
+                // No recorded deploy for this node: fall back to listing running
+                // deployments on the node directly.
+                Err(_) if deploy_id.is_none() => {
+                    let out = deploy::remote_list_running(exec, &node.ssh_dest)?;
+                    print!("{out}");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // No node: aggregate every recorded deployment into one table.
+        None => {
+            let node_reg = NodeRegistry::load()?;
+            let rows = aggregate_status(exec, &node_reg, &deploy_reg);
+            println!("{:<16} {:<36} {:<16} PID", "NODE", "DEPLOY ID", "STATUS");
+            for r in &rows {
+                println!(
+                    "{:<16} {:<36} {:<16} {}",
+                    r.node, r.deploy_id, r.status, r.pid
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_install_summary(summary: &install::InstallSummary) {
+    println!(
+        "Installed rlean {} on '{}'",
+        summary.rlean_version, summary.node
+    );
+    println!("  version : {}", summary.version_output);
+    println!("  plugins :");
+    for (name, sha) in &summary.plugins {
+        println!("    - {name} ({sha})");
+    }
+    println!(
+        "  node dirs: ~/.local/bin, ~/.rlean/plugins, ~/rlean-cloud/data, ~/rlean-cloud/workspace"
+    );
 }
 
 // ── Command logic (testable with any RemoteExec) ──────────────────────────────
