@@ -80,7 +80,7 @@ fn run_create(output_override: Option<PathBuf>) -> Result<()> {
 }
 
 fn algorithm_imports_pyi() -> &'static str {
-    include_str!("../../../crates/lean-sdk/AlgorithmImports.pyi")
+    include_str!("../../../crates/rlean-sdk/AlgorithmImports.pyi")
 }
 
 /// Query the active Python interpreter for the primary site-packages directory.

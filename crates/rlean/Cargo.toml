@@ -3,23 +3,27 @@ name = "rlean"
 version.workspace = true
 edition.workspace = true
 description = "Unified Lean-Rust CLI — backtest and live-trade Python or Rust strategies"
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "rlean"
 path = "src/main.rs"
 
 [dependencies]
-lean-core           = { path = "../lean-core" }
-lean-plugin         = { path = "../lean-plugin" }
-lean-data           = { path = "../lean-data" }
-lean-data-providers = { path = "../lean-data-providers" }
-lean-engine         = { path = "../lean-engine" }
-lean-sdk            = { path = "../lean-sdk" }
-lean-algorithm      = { path = "../lean-algorithm" }
-lean-brokerages     = { path = "../lean-brokerages" }
-lean-live           = { path = "../lean-live" }
-lean-python-runtime = { path = "../lean-python-runtime" }
-lean-storage        = { path = "../lean-storage" }
+rlean-core           = { path = "../rlean-core", version = "0.1.1" }
+rlean-plugin         = { path = "../rlean-plugin", version = "0.1.1" }
+rlean-data           = { path = "../rlean-data", version = "0.1.1" }
+rlean-data-providers = { path = "../rlean-data-providers", version = "0.1.1" }
+rlean-engine         = { path = "../rlean-engine", version = "0.1.1" }
+rlean-sdk            = { path = "../rlean-sdk", version = "0.1.1" }
+rlean-algorithm      = { path = "../rlean-algorithm", version = "0.1.1" }
+rlean-brokerages     = { path = "../rlean-brokerages", version = "0.1.1" }
+rlean-live           = { path = "../rlean-live", version = "0.1.1" }
+rlean-python-runtime = { path = "../rlean-python-runtime", version = "0.1.1" }
+rlean-storage        = { path = "../rlean-storage", version = "0.1.1" }
 
 clap               = { workspace = true }
 tokio              = { workspace = true }

@@ -48,7 +48,7 @@ started at connect time and lives for the whole run.
 
 Compaction and snapshot expiry are **AWS-managed** (S3 Tables managed
 maintenance). rlean no longer runs end-of-run compaction. The
-`iceberg_maintenance` binary (in `lean-storage`) can still `report`, `count`,
+`iceberg_maintenance` binary (in `rlean-storage`) can still `report`, `count`,
 `query`, and `reset` tables; it reads the same `RLEAN_DATA_*` environment
 (including `RLEAN_DATA_NAMESPACE`, default `lean`).
 

@@ -1,0 +1,23 @@
+[package]
+name = "rlean-live"
+version.workspace = true
+edition.workspace = true
+description = "Live execution infrastructure for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core     = { path = "../rlean-core", version = "0.1.1" }
+rlean-data     = { path = "../rlean-data", version = "0.1.1" }
+rlean-orders   = { path = "../rlean-orders", version = "0.1.1" }
+rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
+rlean-brokerages = { path = "../rlean-brokerages", version = "0.1.1" }
+rust_decimal  = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono        = { workspace = true }
+serde         = { workspace = true }
+tracing       = { workspace = true }
+tokio         = { workspace = true }
+anyhow        = { workspace = true }

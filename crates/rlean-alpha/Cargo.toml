@@ -1,0 +1,24 @@
+[package]
+name = "rlean-alpha"
+version.workspace = true
+edition.workspace = true
+description = "Alpha model framework for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core       = { path = "../rlean-core", version = "0.1.1" }
+rlean-data       = { path = "../rlean-data", version = "0.1.1" }
+rlean-indicators = { path = "../rlean-indicators", version = "0.1.1" }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono          = { workspace = true }
+serde           = { workspace = true }
+tracing         = { workspace = true }
+
+[dev-dependencies]
+chrono              = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde_json          = { workspace = true }

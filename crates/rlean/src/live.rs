@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use lean_algorithm::qc_algorithm::BrokerageName;
+use rlean_algorithm::qc_algorithm::BrokerageName;
 
 use crate::cli::LiveArgs;
 use crate::live_deployments::{
@@ -88,7 +88,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
 
     ensure_python_baseline_packages()?;
-    use lean_python_runtime::AlgorithmImports;
+    use rlean_python_runtime::AlgorithmImports;
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
@@ -136,7 +136,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let artifact_sink = build_live_artifact_sink(&global_config, deploy_dir.as_deref(), &args)?;
 
     let strategy_path = args.strategy.clone();
-    let live_config = lean_engine::LiveRunConfig {
+    let live_config = rlean_engine::LiveRunConfig {
         data_root: datastore.data_root.clone(),
         data_store: datastore.store.clone(),
         history_provider,
@@ -155,25 +155,25 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         artifact_sink,
     };
     let state = Arc::new(std::sync::Mutex::new(
-        lean_algorithm::qc_algorithm::QcAlgorithm::new(
+        rlean_algorithm::qc_algorithm::QcAlgorithm::new(
             "Algorithm",
             rust_decimal::Decimal::new(100000, 0),
         ),
     ));
-    let runtime_context = lean_engine::AlgorithmRuntimeContext::new(
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
         live_config.data_root.clone(),
         live_config.data_store.clone(),
         live_config.history_provider.clone(),
         live_config.custom_data_sources.clone(),
         live_config.parameters.clone(),
     );
-    let context = lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
+    let context = rlean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
         state,
         Arc::new(runtime_context.clone()),
     );
-    let adapter = lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
+    let adapter = rlean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
 
-    let result = match lean_engine::runner::live::run_live_with_runtime(
+    let result = match rlean_engine::runner::live::run_live_with_runtime(
         adapter,
         live_config,
         runtime_context,
@@ -181,7 +181,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     .await
     {
         Ok(result) => result,
-        Err(error) if lean_sdk::interrupt::is_interrupted_error(&error) => {
+        Err(error) if rlean_sdk::interrupt::is_interrupted_error(&error) => {
             std::process::exit(130);
         }
         Err(error) => return Err(error),
@@ -226,7 +226,7 @@ fn build_live_artifact_sink(
     global_config: &config::GlobalConfig,
     deploy_dir: Option<&std::path::Path>,
     args: &crate::cli::RunArgs,
-) -> Result<Option<std::sync::Arc<lean_engine::RunArtifactSink>>> {
+) -> Result<Option<std::sync::Arc<rlean_engine::RunArtifactSink>>> {
     let Some(dir) = deploy_dir else {
         return Ok(None);
     };
@@ -235,20 +235,20 @@ fn build_live_artifact_sink(
         args.artifact_s3.as_deref(),
         global_config,
     )?;
-    if artifact_config.mode == lean_engine::ArtifactStoreMode::Local {
+    if artifact_config.mode == rlean_engine::ArtifactStoreMode::Local {
         return Ok(None);
     }
     // Never use an s3-only temp buffer for live — force local-primary mirroring.
-    let mode = lean_engine::ArtifactStoreMode::Mirror;
+    let mode = rlean_engine::ArtifactStoreMode::Mirror;
     let project = live_project_name(dir, &args.strategy);
     let deploy_id = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&project)
         .to_string();
-    let sink = lean_engine::RunArtifactSink::new(
+    let sink = rlean_engine::RunArtifactSink::new(
         mode,
-        lean_engine::RunKind::Live,
+        rlean_engine::RunKind::Live,
         dir.to_path_buf(),
         &project,
         &deploy_id,

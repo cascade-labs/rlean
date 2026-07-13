@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use lean_data_providers::IHistoryProvider;
+use rlean_data_providers::IHistoryProvider;
 
 use crate::cli::RunArgs;
 use crate::runtime::{
@@ -52,11 +52,11 @@ async fn run_strategy_backtest(
     history_provider: Option<Arc<dyn IHistoryProvider>>,
     datastore: ResolvedDataStore,
 ) -> Result<()> {
-    use lean_engine::report::{
+    use rlean_engine::report::{
         write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
         write_report, write_results_json, write_summary_json,
     };
-    use lean_python_runtime::AlgorithmImports;
+    use rlean_python_runtime::AlgorithmImports;
 
     let ext = args
         .strategy
@@ -108,9 +108,9 @@ async fn run_strategy_backtest(
         args.artifact_s3.as_deref(),
         &global_config,
     )?;
-    let sink = Arc::new(lean_engine::RunArtifactSink::new(
+    let sink = Arc::new(rlean_engine::RunArtifactSink::new(
         artifact_config.mode,
-        lean_engine::RunKind::Backtest,
+        rlean_engine::RunKind::Backtest,
         backtest_dir.clone(),
         &strategy_name,
         &run_id,
@@ -147,7 +147,7 @@ async fn run_strategy_backtest(
         let progress_bar = progress_bar.clone();
         let last_drawn_percent = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let last_drawn_percent_for_progress = last_drawn_percent.clone();
-        Arc::new(move |progress: lean_engine::BacktestProgress| {
+        Arc::new(move |progress: rlean_engine::BacktestProgress| {
             let total_days = (progress.end_date - progress.start_date).num_days().max(1) as u64;
             let elapsed_days = (progress.current_date - progress.start_date)
                 .num_days()
@@ -167,11 +167,11 @@ async fn run_strategy_backtest(
             }
         })
     };
-    let data_feed_options = lean_engine::data_feed::DataFeedOptions {
+    let data_feed_options = rlean_engine::data_feed::DataFeedOptions {
         fetch_missing_custom_data: args.data_provider_historical.is_some(),
         ..Default::default()
     };
-    let config = lean_engine::BacktestRunConfig {
+    let config = rlean_engine::BacktestRunConfig {
         data_root: datastore.data_root.clone(),
         data_store: datastore.store.clone(),
         _compression_level: 3,
@@ -186,7 +186,7 @@ async fn run_strategy_backtest(
         progress: Some(progress),
     };
 
-    let runtime_context = lean_engine::AlgorithmRuntimeContext::new(
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
         config.data_root.clone(),
         config.data_store.clone(),
         config.history_provider.clone(),
@@ -194,22 +194,22 @@ async fn run_strategy_backtest(
         config.parameters.clone(),
     );
 
-    let bridge: Box<dyn lean_sdk::AlgorithmBridge> = match ext {
+    let bridge: Box<dyn rlean_sdk::AlgorithmBridge> = match ext {
         "py" => {
             let strategy_path = args.strategy.clone();
             let state = Arc::new(std::sync::Mutex::new(
-                lean_algorithm::qc_algorithm::QcAlgorithm::new(
+                rlean_algorithm::qc_algorithm::QcAlgorithm::new(
                     "Algorithm",
                     rust_decimal::Decimal::new(100000, 0),
                 ),
             ));
             let context =
-                lean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
+                rlean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
                     state,
                     Arc::new(runtime_context.clone()),
                 );
             let adapter =
-                lean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
+                rlean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
             Box::new(adapter)
         }
         "so" | "dylib" => load_native_strategy_bridge(&args.strategy)?,
@@ -219,7 +219,7 @@ async fn run_strategy_backtest(
         ),
     };
 
-    let results = match lean_engine::runner::backtest::run_backtest_with_runtime(
+    let results = match rlean_engine::runner::backtest::run_backtest_with_runtime(
         bridge,
         config,
         runtime_context,
@@ -227,7 +227,7 @@ async fn run_strategy_backtest(
     .await
     {
         Ok(results) => results,
-        Err(error) if lean_sdk::interrupt::is_interrupted_error(&error) => {
+        Err(error) if rlean_sdk::interrupt::is_interrupted_error(&error) => {
             std::process::exit(130);
         }
         Err(error) => return Err(error),
@@ -295,7 +295,7 @@ async fn run_strategy_backtest(
     }
 
     match sink.mode() {
-        lean_engine::ArtifactStoreMode::S3 => {
+        rlean_engine::ArtifactStoreMode::S3 => {
             if let Some(base) = sink.s3_key_base() {
                 println!(
                     "Results: s3://{}/{}",
@@ -328,9 +328,11 @@ fn s3_bucket_display(config: &crate::artifacts_config::ArtifactConfig) -> String
         .unwrap_or_default()
 }
 
-fn load_native_strategy_bridge(strategy_path: &Path) -> Result<Box<dyn lean_sdk::AlgorithmBridge>> {
-    use lean_algorithm::algorithm::QcAlgorithmStrategy;
+fn load_native_strategy_bridge(
+    strategy_path: &Path,
+) -> Result<Box<dyn rlean_sdk::AlgorithmBridge>> {
     use libloading::{Library, Symbol};
+    use rlean_algorithm::algorithm::QcAlgorithmStrategy;
 
     // Safety: the plugin must export `create_algorithm` with C ABI.
     let lib = unsafe { Library::new(strategy_path) }
@@ -345,5 +347,5 @@ fn load_native_strategy_bridge(strategy_path: &Path) -> Result<Box<dyn lean_sdk:
             ))?;
 
     let strategy = unsafe { create() };
-    Ok(Box::new(lean_sdk::QcAlgorithmNativeBridge::new(strategy)))
+    Ok(Box::new(rlean_sdk::QcAlgorithmNativeBridge::new(strategy)))
 }
