@@ -22,7 +22,7 @@ use lean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use lean_algorithm::portfolio::SecurityPortfolioManager;
 use lean_brokerages::Brokerage;
 use lean_core::{DateTime, Price, Quantity};
-use lean_orders::{Order, OrderEvent, OrderStatus, TransactionManager};
+use lean_orders::{Order, OrderEvent, OrderStatus, OrderType, TransactionManager};
 use lean_statistics::{Trade, TradeBuilder};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -128,6 +128,9 @@ pub struct LiveBrokerageRouter {
     /// skips a `New` order whose entry here is still in the future, so the retry
     /// wait never blocks the worker or busy-waits.
     retry_not_before: HashMap<i64, std::time::Instant>,
+    /// Market-on-open orders already logged as deferred, so holding an order
+    /// across a closed market logs once instead of once per live iteration.
+    moo_deferred_logged: std::collections::HashSet<i64>,
 }
 
 impl LiveBrokerageRouter {
@@ -161,14 +164,22 @@ impl LiveBrokerageRouter {
             submit_backoff,
             submit_attempts: HashMap::new(),
             retry_not_before: HashMap::new(),
+            moo_deferred_logged: std::collections::HashSet::new(),
         }
     }
 
     /// Forward any `New` orders in the transaction manager to the brokerage, and
     /// forward pending cancel/update requests. Called once per live iteration on
-    /// the loop thread; never blocks on the brokerage.
+    /// the loop thread; never blocks on the brokerage. Evaluates market hours at
+    /// the current wall-clock time.
     pub fn dispatch_pending(&mut self, transactions: &Arc<TransactionManager>) {
-        let now = std::time::Instant::now();
+        self.dispatch_pending_at(transactions, DateTime::now());
+    }
+
+    /// `dispatch_pending` with an explicit market-hours evaluation time, so tests
+    /// can drive closed-market (weekend) and open-market dispatch deterministically.
+    pub fn dispatch_pending_at(&mut self, transactions: &Arc<TransactionManager>, now: DateTime) {
+        let now_instant = std::time::Instant::now();
         for order in transactions.get_open_orders() {
             match order.status {
                 // A `New` order that is not already in flight is (re)submitted
@@ -180,12 +191,9 @@ impl LiveBrokerageRouter {
                         && self
                             .retry_not_before
                             .get(&order.id)
-                            .is_none_or(|not_before| now >= *not_before) =>
+                            .is_none_or(|not_before| now_instant >= *not_before) =>
                 {
-                    self.retry_not_before.remove(&order.id);
-                    self.submitted_ids.insert(order.id);
-                    *self.submit_attempts.entry(order.id).or_default() += 1;
-                    let _ = self.request_tx.send(BrokerageRequest::Submit(order));
+                    self.dispatch_new_order(order, transactions, now);
                 }
                 OrderStatus::CancelPending
                     if !order.brokerage_id.is_empty() && self.cancel_forwarded.insert(order.id) =>
@@ -200,6 +208,86 @@ impl LiveBrokerageRouter {
                 _ => {}
             }
         }
+    }
+
+    /// Dispatch a single `New` order whose backoff (if any) has elapsed,
+    /// respecting market hours:
+    ///
+    /// * A `MarketOnOpen` order is engine-held while its exchange is closed and
+    ///   released only once the exchange is open. Brokerage plugins have no
+    ///   native market-on-open type, so the released submission goes out as a
+    ///   plain market order — the engine-side hold is what provides LEAN's
+    ///   "fill at the next market open" semantics.
+    /// * A retried order (a previous submit failed) whose exchange has closed
+    ///   between attempts is converted to a held `MarketOnOpen` order instead of
+    ///   being retried into a closed market. Futures and future options are
+    ///   exempt (they trade extended hours), mirroring C# LEAN
+    ///   `QCAlgorithm.Trading.cs` `MarketOrder` and
+    ///   `DefaultBrokerageModel.CanSubmitOrder`.
+    fn dispatch_new_order(
+        &mut self,
+        order: Order,
+        transactions: &Arc<TransactionManager>,
+        now: DateTime,
+    ) {
+        let order_id = order.id;
+        let moo_exempt = matches!(
+            order.symbol.security_type(),
+            lean_core::SecurityType::Future | lean_core::SecurityType::FutureOption
+        );
+        let exchange_open = lean_core::MarketHoursDatabase::global()
+            .exchange_hours(&order.symbol)
+            .is_open_at(now);
+
+        if order.order_type == OrderType::MarketOnOpen {
+            if !exchange_open {
+                if self.moo_deferred_logged.insert(order.id) {
+                    tracing::info!(
+                        "order {} ({}) market closed; holding as market-on-open until next open",
+                        order.id,
+                        order.symbol.value,
+                    );
+                }
+                return;
+            }
+            self.moo_deferred_logged.remove(&order.id);
+            tracing::info!(
+                "order {} ({}) market open; releasing held market-on-open order",
+                order.id,
+                order.symbol.value,
+            );
+        } else if !exchange_open
+            && !moo_exempt
+            && self.submit_attempts.get(&order.id).copied().unwrap_or(0) > 0
+        {
+            // The market closed between submission attempts: do not retry into a
+            // closed market. Convert to a held market-on-open order; the release
+            // above submits it at the next open.
+            tracing::info!(
+                "order {} ({}) market closed before retry; converting to market-on-open \
+                 and holding until next open",
+                order.id,
+                order.symbol.value,
+            );
+            let mut held = order;
+            held.order_type = OrderType::MarketOnOpen;
+            transactions.add_or_update_order(held);
+            self.submit_attempts.remove(&order_id);
+            self.retry_not_before.remove(&order_id);
+            return;
+        }
+
+        self.retry_not_before.remove(&order_id);
+        self.submitted_ids.insert(order_id);
+        *self.submit_attempts.entry(order_id).or_default() += 1;
+        // Plugins only translate market/limit/stop types, so a released
+        // market-on-open order crosses the wire as a market order; the engine
+        // order keeps its MarketOnOpen type for the audit trail.
+        let mut wire_order = order;
+        if wire_order.order_type == OrderType::MarketOnOpen {
+            wire_order.order_type = OrderType::Market;
+        }
+        let _ = self.request_tx.send(BrokerageRequest::Submit(wire_order));
     }
 
     /// Drain brokerage events and apply their portfolio/algorithm effects.
@@ -259,9 +347,10 @@ impl LiveBrokerageRouter {
                 order.status = OrderStatus::Submitted;
                 transactions.add_or_update_order(order.clone());
                 // The order left the submission-retry state machine; drop its
-                // per-order retry bookkeeping.
+                // per-order retry/hold bookkeeping.
                 self.submit_attempts.remove(&order_id);
                 self.retry_not_before.remove(&order_id);
+                self.moo_deferred_logged.remove(&order_id);
 
                 let mut order_event = OrderEvent::new(
                     order.id,
@@ -294,6 +383,7 @@ impl LiveBrokerageRouter {
                 transactions.add_or_update_order(order.clone());
                 self.submit_attempts.remove(&order_id);
                 self.retry_not_before.remove(&order_id);
+                self.moo_deferred_logged.remove(&order_id);
                 let order_event =
                     OrderEvent::invalid(order.id, order.symbol.clone(), DateTime::now(), message);
                 self.emit(
