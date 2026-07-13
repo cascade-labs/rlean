@@ -53,16 +53,16 @@ def categorize(name: str) -> str:
         return "tokio/futures runtime"
     if "pyo3" in n or "python" in n or "lean_python" in n:
         return "python bridge"
-    if "lean_storage" in n:
-        return "lean-storage"
-    if "lean_engine" in n:
-        return "lean-engine"
-    if "lean_data" in n:
-        return "lean-data"
-    if "lean_algorithm" in n:
-        return "lean-algorithm"
-    if "lean_core" in n or "symbol" in n:
-        return "lean-core"
+    if "rlean_storage" in n:
+        return "rlean-storage"
+    if "rlean_engine" in n:
+        return "rlean-engine"
+    if "rlean_data" in n:
+        return "rlean-data"
+    if "rlean_algorithm" in n:
+        return "rlean-algorithm"
+    if "rlean_core" in n or "symbol" in n:
+        return "rlean-core"
     if "decimal" in n:
         return "rust_decimal"
     if "serde" in n or "json" in n:
