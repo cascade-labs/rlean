@@ -34,7 +34,7 @@ pub(crate) enum Command {
     #[command(name = "create-project")]
     CreateProject(CreateProjectArgs),
 
-    /// Get, set, or list configuration values (API keys, language, datastore, data-folder)
+    /// Get, set, or list configuration values (API keys, language, data catalog, data-folder)
     Config(ConfigArgs),
 
     /// Manage rlean plugins (brokerages, data providers, AI skills, custom data)
@@ -69,6 +69,33 @@ pub(crate) struct RuntimeArgs {
     /// Parquet data root directory
     #[arg(long, default_value = "data", env = "RLEAN_DATA")]
     pub(crate) data: PathBuf,
+
+    /// REST Iceberg catalog base URI (e.g.
+    /// https://s3tables.us-west-2.amazonaws.com/iceberg). Overrides
+    /// RLEAN_DATA_CATALOG and the config file. Env is read inside resolve, so
+    /// this flag is only set when explicitly passed.
+    #[arg(long)]
+    pub(crate) data_catalog: Option<String>,
+
+    /// Warehouse identifier / S3 Tables table-bucket ARN. Overrides
+    /// RLEAN_DATA_WAREHOUSE and the config file.
+    #[arg(long)]
+    pub(crate) data_warehouse: Option<String>,
+
+    /// SigV4 signing region for the REST catalog (e.g. us-west-2). Overrides
+    /// RLEAN_DATA_SIGV4_REGION and the config file.
+    #[arg(long)]
+    pub(crate) data_sigv4_region: Option<String>,
+
+    /// SigV4 signing name for the REST catalog (e.g. s3tables). Overrides
+    /// RLEAN_DATA_SIGV4_NAME and the config file.
+    #[arg(long)]
+    pub(crate) data_sigv4_name: Option<String>,
+
+    /// Iceberg namespace holding the cache tables (default lean). Overrides
+    /// RLEAN_DATA_NAMESPACE and the config file.
+    #[arg(long)]
+    pub(crate) data_namespace: Option<String>,
 
     /// Comma-separated provider priority list (e.g. thetadata,polygon)
     #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
@@ -240,6 +267,31 @@ impl Deref for LiveArgs {
 impl DerefMut for LiveArgs {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runtime
+    }
+}
+
+impl RuntimeArgs {
+    /// Apply the `--data-*` catalog flags so they win over the environment and
+    /// the config file.
+    ///
+    /// Precedence is **CLI flag > env var > config file**. `data_store_config::
+    /// resolve` reads the env var (falling back to the config file) for each
+    /// key, so to make a CLI flag beat an inherited env var we overwrite the
+    /// process env var with the flag value here. When a flag is absent the env
+    /// var / config file are left to decide, preserving env > config.
+    pub(crate) fn apply_data_catalog_overrides(&self) {
+        let overrides = [
+            ("RLEAN_DATA_CATALOG", self.data_catalog.as_deref()),
+            ("RLEAN_DATA_WAREHOUSE", self.data_warehouse.as_deref()),
+            ("RLEAN_DATA_SIGV4_REGION", self.data_sigv4_region.as_deref()),
+            ("RLEAN_DATA_SIGV4_NAME", self.data_sigv4_name.as_deref()),
+            ("RLEAN_DATA_NAMESPACE", self.data_namespace.as_deref()),
+        ];
+        for (var, value) in overrides {
+            if let Some(value) = value {
+                std::env::set_var(var, value);
+            }
+        }
     }
 }
 

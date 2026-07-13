@@ -1,8 +1,8 @@
 use chrono::NaiveDate;
 use lean_storage::schema::{OptionEodBar, OptionUniverseRow};
 use lean_storage::IcebergStore;
+use lean_storage::{RestCatalogConfig, SigV4Config};
 use rust_decimal_macros::dec;
-use tempfile::TempDir;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -40,9 +40,11 @@ fn sample_universe_row(underlying: &str, osi: &str, expiry: NaiveDate) -> Option
 }
 
 #[tokio::test]
+#[ignore = "needs a live REST Iceberg catalog; set RLEAN_TEST_CATALOG"]
 async fn option_eod_bars_round_trip_through_iceberg() {
-    let tmp = TempDir::new().unwrap();
-    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let Some(store) = connect_test_store().await else {
+        return;
+    };
     let expiry = date(2021, 4, 30);
     let bars = vec![
         sample_eod_bar("SPY", "SPY210430P00480000", expiry, "P"),
@@ -86,9 +88,11 @@ async fn option_eod_bars_round_trip_through_iceberg() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live REST Iceberg catalog; set RLEAN_TEST_CATALOG"]
 async fn option_universe_round_trip_through_iceberg() {
-    let tmp = TempDir::new().unwrap();
-    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let Some(store) = connect_test_store().await else {
+        return;
+    };
     let expiry = date(2021, 4, 16);
     let rows = vec![
         sample_universe_row("SPY", "SPY210416P00400000", expiry),
@@ -118,9 +122,11 @@ async fn option_universe_round_trip_through_iceberg() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live REST Iceberg catalog; set RLEAN_TEST_CATALOG"]
 async fn option_tables_filter_by_underlying() {
-    let tmp = TempDir::new().unwrap();
-    let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
+    let Some(store) = connect_test_store().await else {
+        return;
+    };
     let expiry = date(2021, 4, 16);
     let rows = vec![
         sample_universe_row("SPY", "SPY210416P00480000", expiry),
@@ -138,4 +144,48 @@ async fn option_tables_filter_by_underlying() {
     assert!(filtered.iter().any(|row| row.underlying == "SPY"));
     assert!(filtered.iter().any(|row| row.underlying == "AAPL"));
     assert!(!filtered.iter().any(|row| row.underlying == "QQQ"));
+}
+
+/// Connect to a REST Iceberg catalog for integration testing.
+///
+/// These tests need a live REST catalog (e.g. AWS S3 Tables): they are marked
+/// `#[ignore]` and only run when opted in. Set `RLEAN_TEST_CATALOG` to the
+/// catalog base URI to enable them; `RLEAN_TEST_WAREHOUSE` supplies the
+/// warehouse identifier, and `RLEAN_TEST_SIGV4_REGION` (+ optional
+/// `RLEAN_TEST_SIGV4_NAME`, default `s3tables`) turns on SigV4 signing.
+/// `RLEAN_TEST_NAMESPACE` selects the Iceberg namespace (default `lean_dev`, an
+/// isolated scratch namespace that never touches the production `lean` tables).
+/// When `RLEAN_TEST_CATALOG` is unset the helper returns `None` and the test skips.
+async fn connect_test_store() -> Option<IcebergStore> {
+    let uri = std::env::var("RLEAN_TEST_CATALOG")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let warehouse = std::env::var("RLEAN_TEST_WAREHOUSE")
+        .expect("RLEAN_TEST_WAREHOUSE must be set when RLEAN_TEST_CATALOG is");
+    let sigv4 = std::env::var("RLEAN_TEST_SIGV4_REGION")
+        .ok()
+        .filter(|region| !region.is_empty())
+        .map(|region| SigV4Config {
+            region,
+            signing_name: std::env::var("RLEAN_TEST_SIGV4_NAME")
+                .ok()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "s3tables".to_string()),
+        });
+    // Default to an isolated scratch namespace so gated tests never write into
+    // the production `lean` tables; override with RLEAN_TEST_NAMESPACE.
+    let namespace = std::env::var("RLEAN_TEST_NAMESPACE")
+        .ok()
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or_else(|| "lean_dev".to_string());
+    Some(
+        IcebergStore::connect(RestCatalogConfig {
+            uri,
+            warehouse,
+            sigv4,
+            namespace,
+        })
+        .await
+        .expect("failed to connect to the test REST catalog"),
+    )
 }

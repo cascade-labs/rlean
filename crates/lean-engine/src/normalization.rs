@@ -353,22 +353,22 @@ mod tests {
     /// Validation for issue #27 against the *backfilled* shared warehouse: read
     /// DPST's refetched factor rows via the real engine path and confirm a
     /// pre-2023-06-05 bar is scaled up by the 1:10 reverse split (no phantom
-    /// 10x). Ignored by default (needs the shared warehouse):
-    ///   RLEAN_DATA=/Volumes/data_cache/rlean/iceberg \
+    /// 10x). Ignored by default (needs a REST catalog with the backfilled
+    /// tables):
+    ///   RLEAN_TEST_CATALOG=... RLEAN_TEST_WAREHOUSE=... \
     ///     cargo test -p lean-engine --lib -- --ignored --nocapture \
     ///     dpst_backfilled_factor_file_adjusts_pre_split_bar
     #[test]
-    #[ignore]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn dpst_backfilled_factor_file_adjusts_pre_split_bar() {
-        let data_root =
-            std::env::var("RLEAN_DATA").expect("set RLEAN_DATA to the warehouse data root");
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .worker_threads(1)
             .build()
             .unwrap();
-        let store = rt
-            .block_on(IcebergStore::connect_local(&data_root))
-            .expect("connect warehouse");
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_equity("DPST", &Market::usa());
         let rows = read_factor_rows(&store, &symbol);
         assert!(!rows.is_empty(), "DPST must have backfilled factor rows");

@@ -32,26 +32,6 @@ struct OptionUniverseCacheEntry {
 }
 
 impl LocalHistoryProvider {
-    pub fn new(data_root: impl AsRef<std::path::Path>) -> Self {
-        let data_root = data_root.as_ref().to_path_buf();
-        let store = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("local history runtime")
-                .block_on(IcebergStore::connect_local(data_root))
-                .expect("failed to connect local Iceberg history store")
-        })
-        .join()
-        .expect("local history store worker panicked");
-        LocalHistoryProvider {
-            store: Arc::new(store),
-            daily_trade_cache: Mutex::new(HashMap::new()),
-            option_universe_cache: Mutex::new(None),
-            strict_coverage: false,
-        }
-    }
-
     pub fn from_store(store: Arc<IcebergStore>) -> Self {
         LocalHistoryProvider {
             store,

@@ -4,35 +4,98 @@ use lean_data::TradeBar;
 use lean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi, Sma};
 pub use lean_sdk::research::IndicatorResult;
 use lean_sdk::research::{date_str_from_ns, ResearchBackend};
-use lean_storage::{IcebergStore, QueryParams};
+use lean_storage::{IcebergStore, QueryParams, RestCatalogConfig, SigV4Config, DEFAULT_NAMESPACE};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ResearchDataProviderConfig {
-    Local { data_folder: PathBuf },
-    ThetaData { api_token: String },
-    Polygon { api_key: String },
+    /// Read history from the REST Iceberg catalog (the default market-data
+    /// store). The catalog connection is resolved from the `RLEAN_DATA_*`
+    /// environment, not from a filesystem path.
+    #[default]
+    Catalog,
+    ThetaData {
+        api_token: String,
+    },
+    Polygon {
+        api_key: String,
+    },
 }
 
-impl Default for ResearchDataProviderConfig {
-    fn default() -> Self {
-        Self::Local {
-            data_folder: PathBuf::from("data"),
-        }
+/// A REST catalog store held on a dedicated long-lived runtime thread.
+///
+/// The research kernel's history calls are synchronous, but the store connect
+/// starts a SigV4 signing proxy as a background task that must outlive the
+/// store. Connecting on a throwaway current-thread runtime that is dropped
+/// after `block_on` would abort that proxy task. This handle owns a
+/// multi-thread runtime on its own thread for the whole process, so the proxy
+/// stays alive and every `block_on` runs on that same runtime.
+struct StoreRuntimeHandle {
+    runtime: tokio::runtime::Runtime,
+    store: Arc<IcebergStore>,
+}
+
+impl StoreRuntimeHandle {
+    fn connect_from_env() -> anyhow::Result<Self> {
+        let config = catalog_config_from_env()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()?;
+        let store = runtime.block_on(IcebergStore::connect(config))?;
+        Ok(Self {
+            runtime,
+            store: Arc::new(store),
+        })
     }
+}
+
+/// Resolve the REST catalog connection for research from the `RLEAN_DATA_*`
+/// environment, matching the maintenance binary's contract. Research runs in
+/// the same process environment as `rlean`, which sets these before launching
+/// the kernel.
+fn catalog_config_from_env() -> anyhow::Result<RestCatalogConfig> {
+    let uri = env_var("RLEAN_DATA_CATALOG").ok_or_else(|| {
+        anyhow::anyhow!("RLEAN_DATA_CATALOG must be set to the REST catalog base URI")
+    })?;
+    let warehouse = env_var("RLEAN_DATA_WAREHOUSE").ok_or_else(|| {
+        anyhow::anyhow!("RLEAN_DATA_WAREHOUSE must be set to the warehouse identifier")
+    })?;
+    let sigv4 = env_var("RLEAN_DATA_SIGV4_REGION").map(|region| SigV4Config {
+        region,
+        signing_name: env_var("RLEAN_DATA_SIGV4_NAME").unwrap_or_else(|| "s3tables".to_string()),
+    });
+    let namespace =
+        env_var("RLEAN_DATA_NAMESPACE").unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+    Ok(RestCatalogConfig {
+        uri,
+        warehouse,
+        sigv4,
+        namespace,
+    })
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 pub struct ResearchEngine {
     start_date: NaiveDate,
     end_date: NaiveDate,
     securities: HashMap<String, Symbol>,
-    data_folder: PathBuf,
     provider: ResearchDataProviderConfig,
+    /// Lazily-connected REST catalog store, kept alive for the engine's
+    /// lifetime (see [`StoreRuntimeHandle`]). Connected on first history call.
+    store: OnceLock<Option<StoreRuntimeHandle>>,
 }
 
 impl ResearchEngine {
@@ -42,8 +105,8 @@ impl ResearchEngine {
             start_date: today - chrono::Duration::days(365),
             end_date: today,
             securities: HashMap::new(),
-            data_folder: PathBuf::from("data"),
             provider: ResearchDataProviderConfig::default(),
+            store: OnceLock::new(),
         }
     }
 
@@ -63,11 +126,14 @@ impl ResearchEngine {
         }
     }
 
-    pub fn set_data_folder(&mut self, path: impl Into<PathBuf>) {
-        self.data_folder = path.into();
-        self.provider = ResearchDataProviderConfig::Local {
-            data_folder: self.data_folder.clone(),
-        };
+    /// Select the REST catalog as the history source.
+    ///
+    /// The market-data store is always the REST Iceberg catalog resolved from
+    /// the `RLEAN_DATA_*` environment; the supplied path is not a store path and
+    /// is ignored for reads. The parameter is retained for LEAN API
+    /// compatibility (`QuantBook.set_data_folder`).
+    pub fn set_data_folder(&mut self, _path: impl Into<PathBuf>) {
+        self.provider = ResearchDataProviderConfig::Catalog;
     }
 
     pub fn set_thetadata_provider(&mut self, api_token: impl Into<String>) {
@@ -133,8 +199,8 @@ impl ResearchEngine {
         end: NaiveDate,
     ) -> Vec<TradeBar> {
         match &self.provider {
-            ResearchDataProviderConfig::Local { data_folder } => {
-                Self::load_bars_local(data_folder, symbol, resolution, start, end)
+            ResearchDataProviderConfig::Catalog => {
+                self.load_bars_from_catalog(symbol, resolution, start, end)
             }
             ResearchDataProviderConfig::ThetaData { .. }
             | ResearchDataProviderConfig::Polygon { .. } => {
@@ -188,13 +254,30 @@ impl ResearchEngine {
         self.securities.keys().cloned().collect()
     }
 
-    fn load_bars_local(
-        data_folder: &Path,
+    /// The lazily-connected REST catalog store, or `None` when the catalog is
+    /// not configured / connect failed (logged once).
+    fn store_handle(&self) -> Option<&StoreRuntimeHandle> {
+        self.store
+            .get_or_init(|| match StoreRuntimeHandle::connect_from_env() {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    warn!("research: failed to connect REST catalog store: {error:#}");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    fn load_bars_from_catalog(
+        &self,
         symbol: &Symbol,
         resolution: Resolution,
         start: NaiveDate,
         end: NaiveDate,
     ) -> Vec<TradeBar> {
+        let Some(handle) = self.store_handle() else {
+            return Vec::new();
+        };
         let start_dt = date_to_datetime(start, 0, 0, 0);
         let end_dt = date_to_datetime(end, 23, 59, 59);
         let sid = symbol.id.sid;
@@ -202,32 +285,20 @@ impl ResearchEngine {
             .with_time_range(start_dt, end_dt)
             .with_symbols(vec![sid]);
         let symbol_clone = symbol.clone();
-        let data_folder = data_folder.to_path_buf();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map(|rt| {
-                rt.block_on(async move {
-                    let store = IcebergStore::connect_local(data_folder).await.ok()?;
-                    Some(
-                        store
-                            .scan_trade_bar_partitions_grouped(
-                                &HashMap::from([(sid, symbol_clone)]),
-                                resolution,
-                                TickType::Trade,
-                                &params,
-                            )
-                            .await
-                            .unwrap_or_default()
-                            .remove(&sid)
-                            .unwrap_or_default(),
-                    )
-                })
-            })
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+        let store = handle.store.clone();
+        handle.runtime.block_on(async move {
+            store
+                .scan_trade_bar_partitions_grouped(
+                    &HashMap::from([(sid, symbol_clone)]),
+                    resolution,
+                    TickType::Trade,
+                    &params,
+                )
+                .await
+                .unwrap_or_default()
+                .remove(&sid)
+                .unwrap_or_default()
+        })
     }
 }
 

@@ -30,8 +30,52 @@ pub struct GlobalConfig {
     #[serde(default = "default_language")]
     pub default_language: String,
 
-    #[serde(default = "default_datastore")]
-    pub datastore: String,
+    // ── Market-data REST Iceberg catalog (AWS S3 Tables) ──────────────────────
+    /// REST catalog base URI, e.g.
+    /// `https://s3tables.us-west-2.amazonaws.com/iceberg`. Required at run time;
+    /// there is no local/filesystem data store.
+    #[serde(
+        default,
+        rename = "data_catalog",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_catalog: Option<String>,
+
+    /// Warehouse identifier. For S3 Tables this is the table-bucket ARN, e.g.
+    /// `arn:aws:s3tables:us-west-2:<acct>:bucket/<name>`. Required at run time.
+    #[serde(
+        default,
+        rename = "data_warehouse",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_warehouse: Option<String>,
+
+    /// SigV4 signing region for the REST catalog (e.g. `us-west-2`). When set,
+    /// catalog requests are signed with SigV4; when unset the catalog is used
+    /// unsigned (plain / OAuth REST catalog).
+    #[serde(
+        default,
+        rename = "data_sigv4_region",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_sigv4_region: Option<String>,
+
+    /// SigV4 signing name / service (e.g. `s3tables`). Defaults to `s3tables`
+    /// when a region is set but the name is unset.
+    #[serde(
+        default,
+        rename = "data_sigv4_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_sigv4_name: Option<String>,
+
+    /// Iceberg namespace holding the cache tables. Defaults to `lean` when unset.
+    #[serde(
+        default,
+        rename = "data_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_namespace: Option<String>,
 
     #[serde(
         default,
@@ -120,10 +164,6 @@ pub struct GlobalConfig {
 
 fn default_language() -> String {
     "python".to_string()
-}
-
-fn default_datastore() -> String {
-    "file".to_string()
 }
 
 impl GlobalConfig {
@@ -236,21 +276,6 @@ pub fn configured_data_folder(start: &Path) -> Result<Option<PathBuf>> {
         } else {
             workspace.join(path)
         }));
-    }
-
-    Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))
-}
-
-pub fn configured_data_folder_for_datastore(
-    start: &Path,
-    datastore: &str,
-) -> Result<Option<PathBuf>> {
-    if datastore != "s3" {
-        return configured_data_folder(start);
-    }
-
-    if let Some((_workspace, cfg)) = find_workspace_config(start)? {
-        return Ok(Some(PathBuf::from(cfg.data_folder)));
     }
 
     Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))

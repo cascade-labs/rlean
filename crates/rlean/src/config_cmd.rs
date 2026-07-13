@@ -5,7 +5,11 @@
 ///
 /// Known keys:
 ///   default-language            python | csharp
-///   datastore                   file | s3
+///   data_catalog                REST Iceberg catalog base URI (required to run)
+///   data_warehouse              Warehouse id / S3 Tables table-bucket ARN
+///   data_sigv4_region           SigV4 signing region (e.g. us-west-2)
+///   data_sigv4_name             SigV4 signing name (default s3tables)
+///   data_namespace              Iceberg namespace for cache tables (default lean)
 ///   data-folder                 Parquet data root (relative to rlean.json)
 ///   s3_access_key               S3-compatible access key
 ///   s3_secret_key               S3-compatible secret key
@@ -36,7 +40,7 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Set a configuration value
     Set {
-        /// Config key (e.g. default-language, datastore, thetadata.api_key)
+        /// Config key (e.g. default-language, data_catalog, thetadata.api_key)
         key: String,
         /// Value to set
         value: String,
@@ -105,14 +109,12 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
                 println!("Set data-folder = {value} in ~/.rlean/config");
             }
         }
-        "datastore" => {
-            if value != "file" && value != "s3" {
-                bail!("datastore must be file or s3, got '{}'", value);
-            }
+        "data_catalog" | "data_warehouse" | "data_sigv4_region" | "data_sigv4_name"
+        | "data_namespace" => {
             let mut cfg = GlobalConfig::load()?;
-            cfg.datastore = value.to_string();
+            set_catalog_key(&mut cfg, key, value.to_string())?;
             cfg.save()?;
-            println!("Set datastore = {value} in ~/.rlean/config");
+            println!("Set {key} = {value} in ~/.rlean/config");
         }
         "artifact_store" => {
             if lean_engine::ArtifactStoreMode::parse(value).is_none() {
@@ -141,14 +143,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             cfg.save()?;
             println!("Set {key} in ~/.rlean/config");
         }
-        _ => bail!(
-            "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
-             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
-             artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
-             artifact_s3_access_key, artifact_s3_secret_key. \
-             Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
-            key
-        ),
+        _ => bail!("{}", unknown_key_message(key)),
     }
     Ok(())
 }
@@ -176,9 +171,13 @@ fn cmd_get(key: &str) -> Result<()> {
             let value = effective_data_folder_display(&cwd)?;
             println!("{value}");
         }
-        "datastore" => {
+        "data_catalog" | "data_warehouse" | "data_sigv4_region" | "data_sigv4_name"
+        | "data_namespace" => {
             let cfg = GlobalConfig::load()?;
-            println!("{}", cfg.datastore);
+            match get_catalog_key(&cfg, key)? {
+                Some(value) => println!("{value}"),
+                None => println!("(not set)"),
+            }
         }
         "artifact_store" => {
             let cfg = GlobalConfig::load()?;
@@ -201,14 +200,7 @@ fn cmd_get(key: &str) -> Result<()> {
                 None => println!("(not set)"),
             }
         }
-        _ => bail!(
-            "Unknown key '{}'. Known keys: default-language, datastore, data-folder, \
-             s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
-             artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
-             artifact_s3_access_key, artifact_s3_secret_key. \
-             Use <plugin>.<key> for plugin config (e.g. thetadata.api_key).",
-            key
-        ),
+        _ => bail!("{}", unknown_key_message(key)),
     }
     Ok(())
 }
@@ -223,7 +215,17 @@ fn cmd_list() -> Result<()> {
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
-    println!("{:<30} {}", "datastore", global.datastore);
+    for key in [
+        "data_catalog",
+        "data_warehouse",
+        "data_sigv4_region",
+        "data_sigv4_name",
+        "data_namespace",
+    ] {
+        if let Some(value) = get_catalog_key(&global, key)? {
+            println!("{:<30} {}", key, value);
+        }
+    }
     println!("{:<30} {}", "data-folder", data_folder);
     if let Some(mode) = &global.artifact_store {
         println!("{:<30} {}", "artifact_store", mode);
@@ -292,6 +294,40 @@ fn effective_data_folder_display(start: &Path) -> Result<String> {
         .unwrap_or_else(|| PathBuf::from("data"))
         .display()
         .to_string())
+}
+
+fn unknown_key_message(key: &str) -> String {
+    format!(
+        "Unknown key '{key}'. Known keys: default-language, data_catalog, data_warehouse, \
+         data_sigv4_region, data_sigv4_name, data_namespace, data-folder, \
+         s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
+         artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
+         artifact_s3_access_key, artifact_s3_secret_key. \
+         Use <plugin>.<key> for plugin config (e.g. thetadata.api_key)."
+    )
+}
+
+fn set_catalog_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
+    match key {
+        "data_catalog" => cfg.data_catalog = Some(value),
+        "data_warehouse" => cfg.data_warehouse = Some(value),
+        "data_sigv4_region" => cfg.data_sigv4_region = Some(value),
+        "data_sigv4_name" => cfg.data_sigv4_name = Some(value),
+        "data_namespace" => cfg.data_namespace = Some(value),
+        _ => bail!("unknown catalog config key '{key}'"),
+    }
+    Ok(())
+}
+
+fn get_catalog_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
+    match key {
+        "data_catalog" => Ok(cfg.data_catalog.as_deref()),
+        "data_warehouse" => Ok(cfg.data_warehouse.as_deref()),
+        "data_sigv4_region" => Ok(cfg.data_sigv4_region.as_deref()),
+        "data_sigv4_name" => Ok(cfg.data_sigv4_name.as_deref()),
+        "data_namespace" => Ok(cfg.data_namespace.as_deref()),
+        _ => bail!("unknown catalog config key '{key}'"),
+    }
 }
 
 fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {

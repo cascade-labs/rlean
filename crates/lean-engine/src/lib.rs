@@ -24,6 +24,9 @@ pub mod subscription_data;
 pub mod subscription_reader;
 pub mod universe_selection;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use algorithm_services::{
     register_custom_universe_leverage_metadata, register_universe_changes,
     submit_execution_order_request,

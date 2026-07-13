@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -14,10 +13,13 @@ use arrow_array::{
 use arrow_cast::cast;
 use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::Region;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::*;
-use iceberg::io::LocalFsStorageFactory;
+use iceberg::io::{Storage, StorageConfig, StorageFactory};
 use iceberg::spec::{
     DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
     Struct, Transform, Type,
@@ -35,18 +37,23 @@ use iceberg::{
     Catalog, CatalogBuilder, Error as IcebergError, ErrorKind as IcebergErrorKind, NamespaceIdent,
     TableCreation, TableIdent,
 };
-use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
 use iceberg_datafusion::IcebergTableProviderFactory;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use lean_core::{Resolution, SecurityType, Symbol, TickType};
 use lean_data::{
     CustomDataPoint, CustomDataQuery, MarginInterestRate, PerpetualContext, QuoteBar, Tick,
     TradeBar,
 };
+use object_store::aws::AmazonS3Builder;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
-use sqlx::migrate::MigrateDatabase;
-use sqlx::sqlite::Sqlite;
+use url::Url;
+
+use crate::sigv4_proxy::SigV4Proxy;
 
 static APPEND_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,7 +66,10 @@ use crate::schema::{self, FactorFileEntry, MapFileEntry, OptionUniverseRow};
 use crate::QueryParams;
 
 const CATALOG_NAME: &str = "rlean";
-const NAMESPACE: &str = "lean";
+/// Conventional default Iceberg namespace for rlean's cache tables. Callers set
+/// [`RestCatalogConfig::namespace`] explicitly; this is the value used when they
+/// want the default.
+pub const DEFAULT_NAMESPACE: &str = "lean";
 
 pub const MARKET_TRADE_BARS: &str = "market_trade_bars";
 pub const MARKET_QUOTE_BARS: &str = "market_quote_bars";
@@ -72,61 +82,6 @@ pub const CUSTOM_POINTS: &str = "custom_points";
 pub const FACTOR_FILES: &str = "factor_files";
 pub const MAP_FILES: &str = "map_files";
 
-/// Directory under the warehouse root holding a marker file per rlean process
-/// actively using the warehouse. Read before running compaction so the
-/// drop+recreate rewrite never races a concurrent reader/writer (issue #26).
-const ACTIVE_RUNS_DIR: &str = ".rlean_active_runs";
-
-/// Every table the local cache manages, in a stable order. Used by maintenance
-/// tooling and the end-of-backtest compaction pass.
-pub const CACHE_TABLES: &[&str] = &[
-    MARKET_TRADE_BARS,
-    MARKET_QUOTE_BARS,
-    MARKET_TICKS,
-    OPTION_EOD_BARS,
-    OPTION_UNIVERSE,
-    MARGIN_INTEREST,
-    PERPETUAL_CONTEXT,
-    CUSTOM_POINTS,
-    FACTOR_FILES,
-    MAP_FILES,
-];
-
-/// Byte budget for a single staged compaction chunk (and therefore for any
-/// batch read back from it). Kept well under Arrow's 2GB 32-bit string offset
-/// limit so re-reading a chunk cannot overflow.
-const COMPACT_CHUNK_BYTES: usize = 512 * 1024 * 1024;
-/// Row ceiling for a single staged compaction chunk.
-const COMPACT_CHUNK_ROWS: usize = 4_000_000;
-/// Byte budget for one re-insert append commit. Bounds peak memory and keeps
-/// the concatenated batch's string columns under the 2GB offset limit.
-const COMPACT_APPEND_BYTES: usize = 512 * 1024 * 1024;
-/// Row ceiling for one re-insert append commit.
-const COMPACT_APPEND_ROWS: usize = 4_000_000;
-/// Cap on distinct partitions per re-insert append. The fanout writer keeps one
-/// open file per partition until the commit closes, so this bounds open files.
-const COMPACT_APPEND_PARTITIONS: usize = 2_048;
-/// Cap on how many input parquet files a single staging scan reads at once. A
-/// bloated cache table can hold hundreds of thousands of tiny data files; handing
-/// them all to one DataFusion `read_parquet` call opens them concurrently and
-/// exhausts the process/system file-descriptor table ("Too many open files").
-/// Scanning the (partition-clustered) file list in bounded, sorted batches caps
-/// simultaneously open input files to this many while still producing a single
-/// ordered row stream. Comfortably under macOS's default `kern.maxfilesperproc`
-/// (245,760) with headroom for the writer's own descriptors.
-const COMPACT_SCAN_FILES_PER_BATCH: usize = 1_024;
-
-/// Approximate in-memory footprint of a record batch (sum of column buffer
-/// sizes). For sliced batches this over-counts shared buffers, which only makes
-/// the compaction budgets more conservative.
-fn record_batch_bytes(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|column| column.get_array_memory_size())
-        .sum()
-}
-
 fn concat_record_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     let Some(first) = batches.first() else {
         return Ok(RecordBatch::new_empty(Arc::new(ArrowSchema::empty())));
@@ -134,50 +89,68 @@ fn concat_record_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     Ok(compute::concat_batches(&first.schema(), batches)?)
 }
 
-/// Result of compacting one Iceberg table via [`IcebergStore::compact_table`].
-#[derive(Debug, Clone)]
-pub struct CompactionStats {
-    pub table: String,
-    /// Number of live data files referenced by the snapshot before compaction.
-    pub files_before: usize,
-    /// Number of rows preserved.
-    pub rows: usize,
-    /// Number of append commits (snapshots + manifests) written afterward.
-    pub appends: usize,
+/// Connection to a REST Iceberg catalog. This is the ONLY way to build an
+/// [`IcebergStore`].
+#[derive(Clone, Debug)]
+pub struct RestCatalogConfig {
+    /// REST catalog base URI, e.g. `https://s3tables.us-west-2.amazonaws.com/iceberg`.
+    pub uri: String,
+    /// Warehouse identifier. For S3 Tables: the table-bucket ARN.
+    pub warehouse: String,
+    /// SigV4 signing settings. `Some` => sign catalog requests with SigV4
+    /// (AWS S3 Tables / Glue). `None` => no signing (plain / OAuth REST catalogs).
+    pub sigv4: Option<SigV4Config>,
+    /// Iceberg namespace that holds rlean's cache tables. Defaults to
+    /// [`DEFAULT_NAMESPACE`] (`"lean"`) via [`RestCatalogConfig::default`];
+    /// tests and scratch environments point this at an isolated namespace so
+    /// they never touch the production tables.
+    pub namespace: String,
 }
 
-/// RAII marker: the current process's entry in the warehouse active-run
-/// registry (see [`IcebergStore::register_active_run`]). Dropping it removes the
-/// marker so the process no longer blocks maintenance once it exits.
-#[must_use = "hold the guard for the lifetime of the run; dropping it deregisters immediately"]
-pub struct WarehouseRunGuard {
-    path: PathBuf,
-}
-
-impl Drop for WarehouseRunGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+impl Default for RestCatalogConfig {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            warehouse: String::new(),
+            sigv4: None,
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        }
     }
 }
 
-/// True when a process with `pid` still exists. `kill(pid, 0)` performs the
-/// standard existence check without sending a signal; `ESRCH` means gone while
-/// `EPERM` means alive but owned by another user (still an active user).
-fn process_is_alive(pid: u32) -> bool {
-    // Safety: `kill` with signal 0 only probes for the process's existence and
-    // never delivers a signal or mutates any state.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+/// SigV4 signing settings for an AWS-backed REST catalog.
+#[derive(Clone, Debug)]
+pub struct SigV4Config {
+    /// SigV4 signing region, e.g. `us-west-2`.
+    pub region: String,
+    /// SigV4 signing name / service, e.g. `s3tables`.
+    pub signing_name: String,
+}
+
+/// The temporary AWS credentials resolved once at [`IcebergStore::connect`]
+/// time and fed explicitly into the iceberg S3 FileIO props and the DataFusion
+/// object store. `object_store`'s native AWS providers cannot read the local
+/// SSO/login cache, so the resolved keys must be passed in directly.
+#[derive(Clone)]
+struct ResolvedS3Credentials {
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct IcebergStore {
-    warehouse_root: PathBuf,
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
+    /// Resolved S3 credentials for registering DataFusion object stores against
+    /// `s3://` data-file buckets. `None` for a non-AWS (unsigned) REST catalog.
+    s3_credentials: Option<ResolvedS3Credentials>,
+    /// Held purely to keep the SigV4 signing proxy (and its localhost listener)
+    /// alive for the store's lifetime; the proxy aborts its task on drop. The
+    /// leading underscore marks it as an RAII guard that is never read directly.
+    /// `None` when no signing was requested.
+    _sigv4_proxy: Option<Arc<SigV4Proxy>>,
     table_contexts: Arc<Mutex<HashMap<String, Arc<IcebergTableContext>>>>,
     partition_indexes: Arc<Mutex<HashMap<String, Arc<MarketPartitionIndex>>>>,
     custom_partition_indexes: Arc<Mutex<HashMap<String, Arc<CustomPartitionIndex>>>>,
@@ -199,36 +172,61 @@ fn is_catalog_commit_conflict(err: &anyhow::Error) -> bool {
 }
 
 impl IcebergStore {
-    pub async fn connect_local(data_root: impl AsRef<Path>) -> Result<Self> {
-        let warehouse_root = data_root.as_ref().join("iceberg");
-        tokio::fs::create_dir_all(&warehouse_root)
-            .await
-            .with_context(|| format!("failed to create {}", warehouse_root.display()))?;
+    /// Connect to a REST Iceberg catalog. This is the single constructor.
+    ///
+    /// When `config.sigv4` is set, temporary AWS credentials are resolved from
+    /// the ambient credential chain (which reads the SSO/login cache) and an
+    /// in-process SigV4 signing proxy is started; the REST catalog is pointed at
+    /// the proxy so every catalog request is signed. Those same resolved
+    /// credentials are pushed into the S3 FileIO props and reused when
+    /// registering DataFusion object stores for `s3://` data files. When
+    /// `config.sigv4` is `None`, the catalog is used unsigned and no S3
+    /// credentials are attached.
+    pub async fn connect(config: RestCatalogConfig) -> Result<Self> {
+        let (catalog_uri, s3_credentials, proxy_guard, storage_props) = match &config.sigv4 {
+            Some(sigv4) => {
+                let region = sigv4.region.clone();
+                let credentials_provider = shared_aws_credentials(&region).await?;
+                let resolved = resolve_s3_credentials(&region, &credentials_provider).await?;
+                let proxy = SigV4Proxy::start(
+                    &config.uri,
+                    &region,
+                    &sigv4.signing_name,
+                    credentials_provider,
+                )
+                .await?;
+                let props = s3_file_io_props(&resolved);
+                (
+                    proxy.local_uri().to_string(),
+                    Some(resolved),
+                    Some(Arc::new(proxy)),
+                    props,
+                )
+            }
+            None => (config.uri.clone(), None, None, HashMap::new()),
+        };
 
-        let catalog_db = warehouse_root.join("catalog.db");
-        let catalog_uri = format!("sqlite:{}", catalog_db.display());
-        if !Sqlite::database_exists(&catalog_uri).await.unwrap_or(false) {
-            Sqlite::create_database(&catalog_uri)
-                .await
-                .with_context(|| {
-                    format!("failed to create Iceberg catalog {}", catalog_db.display())
-                })?;
-        }
+        let storage_factory: Arc<dyn StorageFactory> = if s3_credentials.is_some() {
+            Arc::new(S3ConfiguredStorageFactory {
+                props: storage_props.clone(),
+            })
+        } else {
+            Arc::new(iceberg::io::LocalFsStorageFactory)
+        };
 
-        let warehouse = path_to_file_uri(&warehouse_root)?;
-        let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(LocalFsStorageFactory))
-            .uri(catalog_uri)
-            .warehouse_location(warehouse)
-            .sql_bind_style(SqlBindStyle::QMark)
-            .load(CATALOG_NAME, HashMap::new())
-            .await
-            .context("failed to load Iceberg SQL catalog")?;
+        let catalog = build_rest_catalog(
+            &catalog_uri,
+            &config.warehouse,
+            storage_factory,
+            storage_props,
+        )
+        .await?;
 
         let store = Self {
-            warehouse_root,
             catalog: Arc::new(catalog),
-            namespace: NamespaceIdent::new(NAMESPACE.into()),
+            namespace: NamespaceIdent::new(config.namespace.clone()),
+            s3_credentials,
+            _sigv4_proxy: proxy_guard,
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
             partition_indexes: Arc::new(Mutex::new(HashMap::new())),
             custom_partition_indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -238,383 +236,57 @@ impl IcebergStore {
         Ok(store)
     }
 
-    pub fn warehouse_root(&self) -> &Path {
-        &self.warehouse_root
-    }
-
-    /// Number of persisted table-metadata versions (`*.metadata.json`) for
-    /// `table`. iceberg-rust keeps every version and writes a new one on every
-    /// commit, so this count grows by one per append and is a direct measure of
-    /// the snapshot/manifest bloat that slows query planning. A freshly
-    /// compacted (or absent) table reports a small handful.
-    pub fn metadata_version_count(&self, table: &str) -> usize {
-        let dir = self
-            .warehouse_root
-            .join(NAMESPACE)
-            .join(table)
-            .join("metadata");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return 0;
-        };
-        entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".metadata.json")
-            })
-            .count()
-    }
-
-    /// Compact every managed cache table whose metadata bloat
-    /// ([`IcebergStore::metadata_version_count`]) is at or above `min_versions`.
-    ///
-    /// Intended for the end of a backtest, once results are safely written:
-    /// each append-heavy run leaves the touched tables with hundreds of tiny
-    /// snapshots, and rewriting them keeps the next run's query planning fast.
-    /// The threshold skips tables that were not (meaningfully) appended to so a
-    /// large table like `custom_points` is not rewritten on every run.
-    ///
-    /// Best-effort: a per-table failure is logged and skipped so the remaining
-    /// tables are still compacted. Returns the stats of the tables actually
-    /// rewritten.
-    pub async fn compact_bloated(&self, min_versions: usize) -> Vec<CompactionStats> {
-        let mut compacted = Vec::new();
-        for table in CACHE_TABLES {
-            let versions = self.metadata_version_count(table);
-            if versions < min_versions {
-                continue;
-            }
-            match self.compact_table(table).await {
-                Ok(stats) if stats.files_before > 0 => {
-                    tracing::info!(
-                        "compacted {} ({} metadata versions): {} rows, {} live files -> {} appends",
-                        stats.table,
-                        versions,
-                        stats.rows,
-                        stats.files_before,
-                        stats.appends,
-                    );
-                    compacted.push(stats);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!("skipped compaction of {table}: {error:#}");
-                }
-            }
+    /// The iceberg storage factory matching this store's backend, used when the
+    /// DataFusion `IcebergTableProviderFactory` builds a FileIO for a table.
+    fn iceberg_storage_factory(&self) -> Arc<dyn StorageFactory> {
+        match &self.s3_credentials {
+            Some(resolved) => Arc::new(S3ConfiguredStorageFactory {
+                props: s3_file_io_props(resolved),
+            }),
+            None => Arc::new(iceberg::io::LocalFsStorageFactory),
         }
-        compacted
     }
 
-    /// Directory holding one marker file per rlean process that is actively
-    /// reading or writing this warehouse.
-    fn active_runs_dir(&self) -> PathBuf {
-        self.warehouse_root.join(ACTIVE_RUNS_DIR)
-    }
-
-    /// Announce that this process is actively using the warehouse and get an
-    /// RAII guard that removes the marker on drop (and on process exit via the
-    /// stale-pid sweep below). Backtests and live deployments register at start
-    /// so that maintenance which mutates shared tables — compaction's
-    /// drop+recreate — can detect concurrent users and refuse to run, which is
-    /// the crash that killed a 15-hour backtest (issue #26). Best-effort: a
-    /// failure to write the marker is logged, not fatal.
-    pub fn register_active_run(&self, kind: &str) -> WarehouseRunGuard {
-        let dir = self.active_runs_dir();
-        let pid = std::process::id();
-        let path = dir.join(format!("{pid}.json"));
-        if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
-            std::fs::write(
-                &path,
-                format!(
-                    "{{\"pid\":{pid},\"kind\":\"{kind}\",\"started_at\":\"{}\"}}",
-                    chrono::Utc::now().to_rfc3339()
-                ),
-            )
-        }) {
-            tracing::warn!(
-                "failed to register warehouse run marker {}: {error:#}",
-                path.display()
-            );
-        }
-        WarehouseRunGuard { path }
-    }
-
-    /// PIDs of *other* live rlean processes currently using this warehouse.
-    /// Stale markers whose process is gone are pruned as a side effect so a
-    /// crashed run never blocks maintenance forever.
-    pub fn other_active_run_pids(&self) -> Vec<u32> {
-        let self_pid = std::process::id();
-        let dir = self.active_runs_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
+    /// Register an S3 object store on `ctx` for every distinct `s3://<bucket>`
+    /// referenced by `paths`, using this store's resolved credentials.
+    ///
+    /// S3 Tables data files live under an AWS-managed bucket whose name is not
+    /// the warehouse ARN, so the bucket is parsed from each data-file path
+    /// returned by the catalog rather than known ahead of time. A no-op when the
+    /// store has no S3 credentials (unsigned catalog).
+    fn register_object_stores_for_paths<'a>(
+        &self,
+        ctx: &SessionContext,
+        paths: impl IntoIterator<Item = &'a String>,
+    ) -> Result<()> {
+        let Some(resolved) = &self.s3_credentials else {
+            return Ok(());
         };
-        let mut others = Vec::new();
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            let Some(pid) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<u32>().ok())
-            else {
+        let mut registered: HashSet<String> = HashSet::new();
+        for path in paths {
+            let Some(bucket) = s3_bucket_from_path(path) else {
                 continue;
             };
-            if pid == self_pid {
+            if !registered.insert(bucket.clone()) {
                 continue;
             }
-            if process_is_alive(pid) {
-                others.push(pid);
-            } else {
-                let _ = std::fs::remove_file(&path);
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(&bucket)
+                .with_region(&resolved.region)
+                .with_access_key_id(&resolved.access_key_id)
+                .with_secret_access_key(&resolved.secret_access_key)
+                .with_virtual_hosted_style_request(true);
+            if let Some(token) = &resolved.session_token {
+                builder = builder.with_token(token);
             }
+            let store = builder.build().with_context(|| {
+                format!("failed to build S3 object store for bucket '{bucket}'")
+            })?;
+            let url = Url::parse(&format!("s3://{bucket}"))
+                .with_context(|| format!("invalid s3 bucket url for '{bucket}'"))?;
+            ctx.register_object_store(&url, Arc::new(store));
         }
-        others
-    }
-
-    /// Compact bloated cache tables, but ONLY when this process is the warehouse's
-    /// sole active user. Compaction rewrites tables via drop+recreate, which is
-    /// unsafe while another backtest or the live trader reads or appends the same
-    /// tables (issue #26): a concurrent scan can hit the dropped state and die
-    /// with a schema error. When other runs are active we skip and log, deferring
-    /// the rewrite to a quiet run or the `iceberg_maintenance compact` command.
-    pub async fn compact_bloated_if_sole_user(&self, min_versions: usize) -> Vec<CompactionStats> {
-        let others = self.other_active_run_pids();
-        if !others.is_empty() {
-            tracing::info!(
-                "skipping end-of-run cache compaction: {} other rlean run(s) active on this \
-                 warehouse (pids {:?}); run `iceberg_maintenance compact` in a quiet window",
-                others.len(),
-                others,
-            );
-            return Vec::new();
-        }
-        self.compact_bloated(min_versions).await
-    }
-
-    /// Rewrite every live row of `table` into a small number of append commits,
-    /// collapsing the accumulated snapshot/manifest chain.
-    ///
-    /// iceberg-rust 0.9.1 has no snapshot expiration or manifest rewrite, so the
-    /// append-only ingest path writes a new snapshot + manifest set on every
-    /// commit. After tens of thousands of incremental appends a table ends up
-    /// with tens of GB of manifests for a few hundred MB of data, and every
-    /// query plan pays to read and predicate-prune across that manifest set —
-    /// which manifests as a backtest that appears to hang.
-    ///
-    /// The rewrite streams the current rows (clustered by partition via a
-    /// path-sorted single scan) into temporary parquet chunks, drops and
-    /// recreates the table, then re-inserts the rows in append commits bounded
-    /// by distinct partition count (to cap the fanout writer's simultaneously
-    /// open files), a row budget and a byte budget (to cap memory and to keep
-    /// any single string column well under Arrow's 2GB 32-bit offset limit).
-    /// Row content is preserved exactly; only the physical layout and snapshot
-    /// history change.
-    ///
-    /// If the re-insert half fails, the staged chunks are left in place under
-    /// `.compact_tmp_<table>` so the data can be recovered with
-    /// [`IcebergStore::restore_from_staging`].
-    pub async fn compact_table(&self, table: &str) -> Result<CompactionStats> {
-        self.compact_table_with_scan_batch(table, COMPACT_SCAN_FILES_PER_BATCH)
-            .await
-    }
-
-    /// [`IcebergStore::compact_table`] with an explicit bound on how many input
-    /// parquet files each staging scan opens at once. Split out so tests can
-    /// exercise the multi-batch scan path without creating thousands of data
-    /// files.
-    async fn compact_table_with_scan_batch(
-        &self,
-        table: &str,
-        scan_files_per_batch: usize,
-    ) -> Result<CompactionStats> {
-        use futures::StreamExt;
-        use parquet::arrow::ArrowWriter;
-
-        let lock = self.table_write_lock(table).await;
-        let _guard = lock.lock().await;
-
-        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
-        // With identity-transform partitions the spec field name equals the
-        // source column name, so these double as the physical sort columns.
-        let partition_columns: Vec<String> = catalog_table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .iter()
-            .map(|field| field.name.clone())
-            .collect();
-
-        let mut file_paths: Vec<String> = Vec::new();
-        let mut tasks = catalog_table.scan().build()?.plan_files().await?;
-        while let Some(task) = futures::TryStreamExt::try_next(&mut tasks).await? {
-            file_paths.push(task.data_file_path().to_string());
-        }
-        let files_before = file_paths.len();
-        if files_before == 0 {
-            return Ok(CompactionStats {
-                table: table.to_string(),
-                files_before: 0,
-                rows: 0,
-                appends: 0,
-            });
-        }
-        let mut local_paths = file_paths
-            .iter()
-            .map(|path| local_path_from_iceberg_file_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        drop(catalog_table);
-        // Iceberg writes each identity partition's data files under a distinct
-        // `data/<partition-path>/` directory, so sorting paths clusters rows by
-        // partition. Reading them in that order with a single scan partition
-        // then yields a partition-contiguous stream — everything the re-insert
-        // packer needs — without a costly (and memory-hungry) global sort.
-        local_paths.sort();
-
-        // --- Stage: stream the live rows into temporary parquet chunks so the
-        // reset below cannot lose data and the re-insert sees ordered input.
-        let staging = self.staging_dir(table);
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging).ok();
-        }
-        std::fs::create_dir_all(&staging)
-            .with_context(|| format!("failed to create staging dir {}", staging.display()))?;
-
-        let mut staged: Vec<PathBuf> = Vec::new();
-        let mut rows = 0usize;
-        {
-            let mut writer: Option<ArrowWriter<std::fs::File>> = None;
-            let mut writer_rows = 0usize;
-            let mut writer_bytes = 0usize;
-            // Scan the (path-sorted) input in bounded batches of files rather than
-            // handing every path to one `read_parquet` call: a bloated table can
-            // hold hundreds of thousands of tiny files and opening them all at once
-            // exhausts the file-descriptor table. Consecutive batches preserve the
-            // global sort order, so the staged output stays partition-clustered.
-            for path_batch in local_paths.chunks(scan_files_per_batch.max(1)) {
-                // A single scan partition preserves the supplied (path-sorted) file
-                // order and reads sequentially, keeping memory to one batch.
-                let ctx =
-                    SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-                let mut stream = ctx
-                    .read_parquet(path_batch.to_vec(), ParquetReadOptions::default())
-                    .await?
-                    .execute_stream()
-                    .await?;
-                while let Some(batch) = stream.next().await {
-                    let batch = batch?;
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    rows += batch.num_rows();
-                    if writer.is_none() {
-                        let path = staging.join(format!("part-{:06}.parquet", staged.len()));
-                        let file = std::fs::File::create(&path)
-                            .with_context(|| format!("failed to create {}", path.display()))?;
-                        writer = Some(ArrowWriter::try_new(file, batch.schema(), None)?);
-                        staged.push(path);
-                        writer_rows = 0;
-                        writer_bytes = 0;
-                    }
-                    let active = writer.as_mut().expect("staging writer present");
-                    active.write(&batch)?;
-                    writer_rows += batch.num_rows();
-                    writer_bytes += record_batch_bytes(&batch);
-                    // Roll chunks by byte size (with a row ceiling) so no chunk — and
-                    // hence no re-read batch — can hold a >2GB string column.
-                    if writer_bytes >= COMPACT_CHUNK_BYTES || writer_rows >= COMPACT_CHUNK_ROWS {
-                        writer.take().expect("staging writer present").close()?;
-                    }
-                }
-            }
-            if let Some(active) = writer.take() {
-                active.close()?;
-            }
-        }
-
-        // --- Reset: drop + recreate the table, discarding every old snapshot,
-        // manifest and tiny data file.
-        self.reset_table(table).await?;
-
-        if rows == 0 {
-            std::fs::remove_dir_all(&staging).ok();
-            self.invalidate_table_context(table);
-            return Ok(CompactionStats {
-                table: table.to_string(),
-                files_before,
-                rows: 0,
-                appends: 0,
-            });
-        }
-
-        // --- Re-insert the staged rows, then discard the staging area.
-        staged.sort();
-        let appends = self
-            .reinsert_staged_chunks(table, &staged, &partition_columns)
-            .await?;
-        std::fs::remove_dir_all(&staging).ok();
-        self.invalidate_table_context(table);
-        Ok(CompactionStats {
-            table: table.to_string(),
-            files_before,
-            rows,
-            appends,
-        })
-    }
-
-    /// Recover a table from staged chunks left behind by a
-    /// [`IcebergStore::compact_table`] run whose re-insert half failed.
-    ///
-    /// The table must already exist (recreated empty by the interrupted
-    /// compaction) and be empty; the staged chunks under `.compact_tmp_<table>`
-    /// are re-inserted and then removed.
-    pub async fn restore_from_staging(&self, table: &str) -> Result<CompactionStats> {
-        let lock = self.table_write_lock(table).await;
-        let _guard = lock.lock().await;
-
-        let staging = self.staging_dir(table);
-        if !staging.exists() {
-            anyhow::bail!("no staging directory at {}", staging.display());
-        }
-        let mut staged: Vec<PathBuf> = std::fs::read_dir(&staging)
-            .with_context(|| format!("failed to read {}", staging.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .map(|ext| ext == "parquet")
-                    .unwrap_or(false)
-            })
-            .collect();
-        staged.sort();
-        if staged.is_empty() {
-            anyhow::bail!("no staged parquet chunks in {}", staging.display());
-        }
-
-        let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
-        let partition_columns: Vec<String> = catalog_table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .iter()
-            .map(|field| field.name.clone())
-            .collect();
-        drop(catalog_table);
-
-        let appends = self
-            .reinsert_staged_chunks(table, &staged, &partition_columns)
-            .await?;
-        std::fs::remove_dir_all(&staging).ok();
-        self.invalidate_table_context(table);
-        Ok(CompactionStats {
-            table: table.to_string(),
-            files_before: staged.len(),
-            rows: 0,
-            appends,
-        })
-    }
-
-    fn staging_dir(&self, table: &str) -> PathBuf {
-        self.warehouse_root.join(format!(".compact_tmp_{table}"))
+        Ok(())
     }
 
     /// Total number of live rows visible through the current snapshot of
@@ -641,134 +313,15 @@ impl IcebergStore {
         Ok(ctx.sql(sql).await?.collect().await?)
     }
 
-    /// Read the (partition-clustered) staged chunks in order and re-insert them
-    /// as append commits bounded by distinct partition count, row count and
-    /// byte size. Returns the number of append commits written.
-    async fn reinsert_staged_chunks(
-        &self,
-        table: &str,
-        staged: &[PathBuf],
-        partition_columns: &[String],
-    ) -> Result<usize> {
-        use arrow::row::{OwnedRow, RowConverter, SortField};
-        use futures::StreamExt;
-
-        let mut appends = 0usize;
-        let mut group: Vec<RecordBatch> = Vec::new();
-        let mut group_rows = 0usize;
-        let mut group_bytes = 0usize;
-        let mut group_partitions = 0usize;
-        let mut last_key: Option<OwnedRow> = None;
-        let mut converter: Option<RowConverter> = None;
-
-        for path in staged {
-            // Stream (not collect) each chunk so an oversized staged file cannot
-            // pull gigabytes into memory at once.
-            let ctx =
-                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-            let mut stream = ctx
-                .read_parquet(
-                    vec![path.to_string_lossy().to_string()],
-                    ParquetReadOptions::default(),
-                )
-                .await?
-                .execute_stream()
-                .await?;
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let partition_arrays = partition_columns
-                    .iter()
-                    .map(|name| {
-                        let idx = batch
-                            .schema()
-                            .index_of(name)
-                            .with_context(|| format!("partition column {name} missing"))?;
-                        Ok(batch.column(idx).clone())
-                    })
-                    .collect::<Result<Vec<ArrayRef>>>()?;
-                if converter.is_none() {
-                    let fields = partition_arrays
-                        .iter()
-                        .map(|array| SortField::new(array.data_type().clone()))
-                        .collect::<Vec<_>>();
-                    converter = Some(RowConverter::new(fields)?);
-                }
-                let keys = converter
-                    .as_ref()
-                    .expect("row converter present")
-                    .convert_columns(&partition_arrays)?;
-
-                let rows_in_batch = batch.num_rows();
-                let mut run_start = 0usize;
-                for row in 1..=rows_in_batch {
-                    let boundary = row == rows_in_batch || keys.row(row) != keys.row(row - 1);
-                    if !boundary {
-                        continue;
-                    }
-                    let slice = batch.slice(run_start, row - run_start);
-                    let slice_rows = slice.num_rows();
-                    let slice_bytes = record_batch_bytes(&slice);
-                    let run_key = keys.row(run_start).owned();
-                    let is_new_partition = last_key
-                        .as_ref()
-                        .is_none_or(|key| key.row() != run_key.row());
-                    // Flush before the slice would overflow any budget. The byte
-                    // budget also keeps the concatenated batch's string columns
-                    // under Arrow's 2GB 32-bit offset limit.
-                    let would_exceed = !group.is_empty()
-                        && (group_bytes + slice_bytes > COMPACT_APPEND_BYTES
-                            || group_rows + slice_rows > COMPACT_APPEND_ROWS
-                            || (is_new_partition && group_partitions >= COMPACT_APPEND_PARTITIONS));
-                    if would_exceed {
-                        let schema = group[0].schema();
-                        let combined = compute::concat_batches(&schema, &group)?;
-                        self.insert_batch_locked(table, combined).await?;
-                        appends += 1;
-                        group.clear();
-                        group_rows = 0;
-                        group_bytes = 0;
-                        group_partitions = 0;
-                    }
-                    if is_new_partition || group.is_empty() {
-                        group_partitions += 1;
-                    }
-                    group_rows += slice_rows;
-                    group_bytes += slice_bytes;
-                    group.push(slice);
-                    last_key = Some(run_key);
-                    run_start = row;
-                }
-            }
-        }
-        if !group.is_empty() {
-            let schema = group[0].schema();
-            let combined = compute::concat_batches(&schema, &group)?;
-            self.insert_batch_locked(table, combined).await?;
-            appends += 1;
-        }
-        Ok(appends)
-    }
-
     pub async fn reset_table(&self, name: &str) -> Result<()> {
         let ident = self.ident(name);
         if self.catalog.table_exists(&ident).await? {
-            self.catalog
-                .drop_table(&ident)
-                .await
-                .with_context(|| format!("failed to drop Iceberg table {NAMESPACE}.{name}"))?;
-        }
-
-        let table_dir = self.warehouse_root.join(NAMESPACE).join(name);
-        match tokio::fs::remove_dir_all(&table_dir).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to remove {}", table_dir.display()));
-            }
+            self.catalog.drop_table(&ident).await.with_context(|| {
+                format!(
+                    "failed to drop Iceberg table {}.{name}",
+                    self.namespace_display()
+                )
+            })?;
         }
 
         self.invalidate_table_context(name);
@@ -845,12 +398,12 @@ impl IcebergStore {
             return Ok(());
         }
         let spec = partition_spec(schema.clone(), partition_columns)?;
-        let location = path_to_file_uri(&self.warehouse_root.join(NAMESPACE).join(name))?;
+        // The REST catalog (S3 Tables) owns the warehouse and assigns each
+        // table's storage location itself, so no client-chosen location is set.
         let creation = TableCreation::builder()
             .name(name.into())
             .schema(schema)
             .partition_spec(spec.into_unbound())
-            .location(location)
             .build();
         if let Err(error) = self.catalog.create_table(&self.namespace, creation).await {
             // Concurrent connects race between the existence check and the
@@ -859,8 +412,12 @@ impl IcebergStore {
             if self.catalog.table_exists(&ident).await.unwrap_or(false) {
                 return Ok(());
             }
-            return Err(error)
-                .with_context(|| format!("failed to create Iceberg table {NAMESPACE}.{name}"));
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create Iceberg table {}.{name}",
+                    self.namespace_display()
+                )
+            });
         }
         Ok(())
     }
@@ -2177,10 +1734,15 @@ impl IcebergStore {
         state.table_factories_mut().insert(
             "ICEBERG".to_string(),
             Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
-                Arc::new(LocalFsStorageFactory),
+                self.iceberg_storage_factory(),
             )),
         );
         let ctx = SessionContext::new_with_state(state);
+        // S3 Tables keeps metadata and data files in the same AWS-managed
+        // bucket, so registering the object store for the metadata location's
+        // bucket lets DataFusion resolve the `s3://` data-file paths the Iceberg
+        // provider hands it during the scan.
+        self.register_object_stores_for_paths(&ctx, std::iter::once(&metadata_location))?;
         let sql = format!(
             "CREATE EXTERNAL TABLE {table} STORED AS ICEBERG LOCATION '{}'",
             metadata_location.replace('\'', "''")
@@ -2200,9 +1762,13 @@ impl IcebergStore {
     ) -> Result<DataFrame> {
         let paths = file_paths
             .into_iter()
-            .map(|path| local_path_from_iceberg_file_path(path))
+            .map(|path| warehouse_file_path(path))
             .collect::<Result<Vec<_>>>()?;
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        // Register an S3 object store for each distinct bucket in the pruned
+        // file list before reading; S3 Tables data files live under an
+        // AWS-managed bucket whose name is discovered from these paths.
+        self.register_object_stores_for_paths(&ctx, paths.iter())?;
         Ok(ctx
             .read_parquet(paths, ParquetReadOptions::default())
             .await?)
@@ -2389,27 +1955,144 @@ impl IcebergStore {
     fn ident(&self, name: &str) -> TableIdent {
         TableIdent::new(self.namespace.clone(), name.into())
     }
-}
 
-fn path_to_file_uri(path: &Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    Ok(format!("file://{}", absolute.display()))
-}
-
-fn local_path_from_iceberg_file_path(file_path: &str) -> Result<String> {
-    if let Some(path) = file_path.strip_prefix("file://") {
-        return Ok(path.to_string());
+    /// The configured namespace rendered for diagnostics, e.g. `lean`.
+    fn namespace_display(&self) -> String {
+        self.namespace.as_ref().join(".")
     }
-    if Path::new(file_path).is_absolute() {
-        return Ok(file_path.to_string());
+}
+
+/// Translate an Iceberg data-file path into a path DataFusion's `read_parquet`
+/// can open. For the REST/S3 warehouse this is an `s3://<bucket>/<key>` URL,
+/// returned unchanged (an S3 object store must be registered on the reading
+/// context for its bucket, via
+/// [`IcebergStore::register_object_stores_for_paths`]). Any other scheme is an
+/// error — the store speaks only to an S3-backed REST catalog.
+fn warehouse_file_path(iceberg_path: &str) -> Result<String> {
+    if iceberg_path.starts_with("s3://") || iceberg_path.starts_with("s3a://") {
+        return Ok(iceberg_path.to_string());
     }
     Err(anyhow!(
-        "market partition index returned non-local Iceberg file path: {file_path}"
+        "expected an s3:// Iceberg data-file path, got: {iceberg_path}"
     ))
+}
+
+/// The bucket portion of an `s3://<bucket>/<key>` (or `s3a://`) path, if any.
+fn s3_bucket_from_path(path: &str) -> Option<String> {
+    let rest = path
+        .strip_prefix("s3://")
+        .or_else(|| path.strip_prefix("s3a://"))?;
+    let bucket = rest.split('/').next().unwrap_or("");
+    if bucket.is_empty() {
+        None
+    } else {
+        Some(bucket.to_string())
+    }
+}
+
+/// Resolve a shared AWS credentials provider from the ambient credential chain,
+/// scoped to `region`. The `DefaultCredentialsChain` reads the SSO/login cache,
+/// which `object_store`'s native providers do not.
+async fn shared_aws_credentials(region: &str) -> Result<SharedCredentialsProvider> {
+    let chain = DefaultCredentialsChain::builder()
+        .region(Region::new(region.to_string()))
+        .build()
+        .await;
+    Ok(SharedCredentialsProvider::new(chain))
+}
+
+/// Resolve the concrete temporary credentials once, to feed explicitly into the
+/// S3 FileIO props and DataFusion object stores. Credential material is never
+/// logged.
+async fn resolve_s3_credentials(
+    region: &str,
+    provider: &SharedCredentialsProvider,
+) -> Result<ResolvedS3Credentials> {
+    let credentials = provider
+        .provide_credentials()
+        .await
+        .context("failed to resolve AWS credentials from the default chain")?;
+    Ok(ResolvedS3Credentials {
+        region: region.to_string(),
+        access_key_id: credentials.access_key_id().to_string(),
+        secret_access_key: credentials.secret_access_key().to_string(),
+        session_token: credentials.session_token().map(|token| token.to_string()),
+    })
+}
+
+/// Load the Iceberg REST catalog, merging `storage_props` into the catalog
+/// `load()` props so they reach the FileIO the catalog builds for every table
+/// (`iceberg-catalog-rest` 0.9.1 forwards catalog props into
+/// `FileIOBuilder::with_props`). The initial `namespace_exists` probe in
+/// [`IcebergStore::ensure_tables`] surfaces an unreachable catalog as a hard
+/// error.
+async fn build_rest_catalog(
+    uri: &str,
+    warehouse: &str,
+    storage_factory: Arc<dyn StorageFactory>,
+    storage_props: HashMap<String, String>,
+) -> Result<impl Catalog> {
+    let mut props = storage_props;
+    props.insert(REST_CATALOG_PROP_URI.to_string(), uri.to_string());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+    RestCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
+        .load(CATALOG_NAME, props)
+        .await
+        .with_context(|| {
+            format!("failed to load Iceberg REST catalog at {uri} (warehouse '{warehouse}')")
+        })
+}
+
+/// Storage factory that carries the S3 connection properties itself.
+///
+/// `iceberg-catalog-rest` 0.9.1 builds its `FileIO` from the catalog props plus
+/// whatever storage config the catalog vends. This wrapper additionally merges
+/// the configured S3 props into whatever config it is handed before delegating
+/// to the OpenDAL S3 factory, so the resolved region/credentials and
+/// `s3.path-style-access=false` are always present even if the vended config
+/// omits or differs on them. The same applies to the DataFusion
+/// `IcebergTableProviderFactory` FileIO path.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct S3ConfiguredStorageFactory {
+    props: HashMap<String, String>,
+}
+
+#[typetag::serde]
+impl StorageFactory for S3ConfiguredStorageFactory {
+    fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        let mut props = self.props.clone();
+        props.extend(config.props().clone());
+        let inner = OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        };
+        inner.build(&StorageConfig::from_props(props))
+    }
+}
+
+/// The S3 FileIO property map the OpenDAL storage factory reads from the
+/// catalog's props. Uses the resolved (temporary) credentials; virtual-host
+/// addressing (path-style FALSE) is required for AWS S3 Tables.
+fn s3_file_io_props(resolved: &ResolvedS3Credentials) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    props.insert("s3.region".to_string(), resolved.region.clone());
+    props.insert(
+        "s3.access-key-id".to_string(),
+        resolved.access_key_id.clone(),
+    );
+    props.insert(
+        "s3.secret-access-key".to_string(),
+        resolved.secret_access_key.clone(),
+    );
+    if let Some(token) = &resolved.session_token {
+        props.insert("s3.session-token".to_string(), token.clone());
+    }
+    props.insert("s3.path-style-access".to_string(), "false".to_string());
+    props
 }
 
 fn partition_spec(schema: Schema, columns: &[&str]) -> Result<PartitionSpec> {
@@ -3577,127 +3260,6 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-
-    #[tokio::test]
-    async fn active_run_registry_tracks_self_and_others() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
-
-        // No markers yet -> nobody else active, and compaction is allowed.
-        assert!(store.other_active_run_pids().is_empty());
-
-        // Our own marker never counts as "another" active user.
-        let guard = store.register_active_run("backtest");
-        assert!(store.other_active_run_pids().is_empty());
-
-        // A live marker from a different, real, alive process (this test process,
-        // under a pid that is not our own) is detected as an active user.
-        let other_pid = std::process::id() + 1_000_000; // certainly dead
-        let dir = store.active_runs_dir();
-        std::fs::write(
-            dir.join(format!("{other_pid}.json")),
-            format!("{{\"pid\":{other_pid},\"kind\":\"live\"}}"),
-        )
-        .unwrap();
-        // The other pid is dead, so it is pruned rather than reported.
-        assert!(store.other_active_run_pids().is_empty());
-        assert!(
-            !dir.join(format!("{other_pid}.json")).exists(),
-            "a stale (dead-pid) marker must be pruned"
-        );
-
-        // Dropping the guard removes our marker.
-        let self_marker = dir.join(format!("{}.json", std::process::id()));
-        assert!(self_marker.exists());
-        drop(guard);
-        assert!(!self_marker.exists());
-    }
-
-    #[tokio::test]
-    async fn compact_skipped_when_another_run_is_active() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
-        // Plant a marker under pid 1 (launchd/init) — always alive and never our
-        // own pid — so the sole-user gate sees a live concurrent user and refuses
-        // to compact.
-        let dir = store.active_runs_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("1.json"), "{\"pid\":1,\"kind\":\"live\"}").unwrap();
-        assert_eq!(store.other_active_run_pids(), vec![1]);
-        let compacted = store.compact_bloated_if_sole_user(1).await;
-        assert!(
-            compacted.is_empty(),
-            "compaction must be skipped while another run is active"
-        );
-    }
-
-    /// A bloated cache table (hundreds of thousands of tiny data files, one per
-    /// append commit) exhausted the file-descriptor table when the staging scan
-    /// handed every path to a single `read_parquet` call ("Too many open files",
-    /// os error 23, on the real 772k-file `market_trade_bars`). The scan now
-    /// reads the sorted file list in bounded batches; this drives that
-    /// multi-batch path with a scan batch far smaller than the file count and
-    /// verifies every row survives with the file count collapsed.
-    #[tokio::test]
-    async fn compact_scans_input_in_bounded_file_batches() {
-        use chrono::NaiveDate;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let store = IcebergStore::connect_local(tmp.path()).await.unwrap();
-
-        // One append == one commit == one data file. Distinct dates under a
-        // single (market, ticker) partition, so nothing is deduped or merged:
-        // the table ends up with `file_count` tiny single-row files.
-        let file_count = 41usize;
-        let base = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-        for i in 0..file_count {
-            let date = base + chrono::Duration::days(i as i64);
-            store
-                .append_factor_file(
-                    "usa",
-                    "spy",
-                    &[FactorFileEntry {
-                        date,
-                        price_factor: 1.0,
-                        split_factor: 1.0,
-                        reference_price: 100.0 + i as f64,
-                    }],
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(store.count_rows(FACTOR_FILES).await.unwrap(), file_count);
-
-        // A scan batch of 8 forces ceil(41/8) = 6 sequential read_parquet calls,
-        // so at most 8 input files are handed to DataFusion at once — the
-        // property that keeps the real pass under the fd limit.
-        let stats = store
-            .compact_table_with_scan_batch(FACTOR_FILES, 8)
-            .await
-            .unwrap();
-
-        assert_eq!(stats.files_before, file_count);
-        assert_eq!(stats.rows, file_count, "staging must see every row once");
-        assert!(
-            stats.appends >= 1,
-            "compaction must write at least one append"
-        );
-
-        // Rows preserved exactly across the batched scan + rewrite, and the
-        // rewritten table holds far fewer data files than it had commits.
-        assert_eq!(
-            store.count_rows(FACTOR_FILES).await.unwrap(),
-            file_count,
-            "compaction must preserve every row"
-        );
-        let entries = store.scan_factor_file("usa", "spy").await.unwrap();
-        assert_eq!(entries.len(), file_count);
-        assert_eq!(entries.first().unwrap().date, base);
-        assert_eq!(
-            entries.last().unwrap().date,
-            base + chrono::Duration::days(file_count as i64 - 1)
-        );
-    }
 
     #[test]
     fn custom_projected_fields_includes_requested_and_filter_columns() {

@@ -184,9 +184,7 @@ mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
     use lean_core::{Market, OptionRight, OptionStyle, Resolution, SymbolOptionsExt, TimeSpan};
     use lean_data::{TradeBar, TradeBarData};
-    use lean_storage::IcebergStore;
     use rust_decimal_macros::dec;
-    use std::sync::Arc;
 
     fn dt(date: NaiveDate, hour: u32, minute: u32) -> lean_core::DateTime {
         lean_core::DateTime::from(
@@ -195,9 +193,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn selected_option_contract_history_uses_subscription_streams() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let underlying = lean_core::Symbol::create_equity("SPY", &Market::usa());
         let expiry = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
         let contract = lean_core::Symbol::create_option_osi(

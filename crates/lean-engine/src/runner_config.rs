@@ -51,38 +51,6 @@ pub struct BacktestRunConfig {
     pub progress: Option<Arc<dyn Fn(BacktestProgress) + Send + Sync>>,
 }
 
-impl Default for BacktestRunConfig {
-    fn default() -> Self {
-        BacktestRunConfig {
-            data_root: PathBuf::from("data"),
-            data_store: Arc::new(block_connect_store(PathBuf::from("data"))),
-            _compression_level: 3,
-            history_provider: None,
-            start_date_override: None,
-            end_date_override: None,
-            parameters: HashMap::new(),
-            custom_data_sources: vec![],
-            data_feed_options: DataFeedOptions::default(),
-            output_dir: None,
-            artifact_sink: None,
-            progress: None,
-        }
-    }
-}
-
-fn block_connect_store(data_root: PathBuf) -> IcebergStore {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runner config runtime")
-            .block_on(IcebergStore::connect_local(data_root))
-            .expect("failed to connect Iceberg store")
-    })
-    .join()
-    .expect("runner config store worker panicked")
-}
-
 pub struct LiveRunConfig {
     pub data_root: PathBuf,
     pub data_store: Arc<IcebergStore>,

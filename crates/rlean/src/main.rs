@@ -34,6 +34,7 @@ mod backtest;
 mod cli;
 mod config;
 mod config_cmd;
+mod data_store_config;
 mod init;
 mod live;
 mod live_deployments;

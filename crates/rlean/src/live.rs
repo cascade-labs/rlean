@@ -57,17 +57,14 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
+    // CLI --data-* flags win over env and config for the catalog connection.
+    args.apply_data_catalog_overrides();
     let global_config = config::GlobalConfig::load()?;
     let strategy_path = args.strategy.clone();
     resolve_configured_data_folder(&strategy_path, &mut args.data, &global_config)?;
-    let datastore = resolve_datastore_for_data_root(&args.data, &global_config)?;
+    let datastore = resolve_datastore_for_data_root(&args.data, &global_config).await?;
     args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
-
-    // Announce the live trader in the warehouse active-run registry so any
-    // concurrent backtest's end-of-run compaction detects it and refuses the
-    // unsafe drop+recreate rewrite (issue #26). Held for the whole live session.
-    let _warehouse_run = datastore.store.register_active_run("live");
 
     let live_provider_names = args
         .data_provider_live
@@ -95,7 +92,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
-    let provider_args = provider_args(args.data.clone(), Some(datastore.store.clone()));
+    let provider_args = provider_args(args.data.clone(), datastore.store.clone());
     let live_data_queue =
         providers::build_live_data_queue(live_provider_names, provider_args.clone())?;
     let brokerage = if requested_paper_brokerage {

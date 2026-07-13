@@ -51,10 +51,11 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
     let global_config = config::GlobalConfig::load()?;
     let strategy_path = run_args.strategy.clone();
     resolve_configured_data_folder(&strategy_path, &mut run_args.data, &global_config)?;
-    if global_config.datastore != "s3" {
-        if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
-            run_args.data = canonical;
-        }
+    // The data root is a filesystem path (custom-data plugins, provider folders,
+    // output). Canonicalise it best-effort so the detached child sees a stable
+    // absolute path.
+    if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
+        run_args.data = canonical;
     }
     let requested_brokerage = run_args
         .brokerage
@@ -465,6 +466,23 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
         args.data.to_string_lossy().to_string(),
     ];
 
+    // Propagate the REST catalog flags so the detached child connects to the
+    // same market-data catalog the launcher was told to use.
+    if let Some(value) = &args.data_catalog {
+        values.extend(["--data-catalog".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.data_warehouse {
+        values.extend(["--data-warehouse".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.data_sigv4_region {
+        values.extend(["--data-sigv4-region".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.data_sigv4_name {
+        values.extend(["--data-sigv4-name".to_string(), value.clone()]);
+    }
+    if let Some(value) = &args.data_namespace {
+        values.extend(["--data-namespace".to_string(), value.clone()]);
+    }
     if let Some(value) = &args.data_provider_historical {
         values.extend(["--data-provider-historical".to_string(), value.clone()]);
     }
@@ -1014,6 +1032,11 @@ mod tests {
             strategy: PathBuf::from("/tmp/strategy/main.py"),
             runtime: RuntimeArgs {
                 data: PathBuf::from("/tmp/data"),
+                data_catalog: None,
+                data_warehouse: None,
+                data_sigv4_region: None,
+                data_sigv4_name: None,
+                data_namespace: None,
                 data_provider_historical: Some("hyperliquid".to_string()),
                 data_provider_live: Some("hyperliquid".to_string()),
                 brokerage: Some("hyperliquid".to_string()),

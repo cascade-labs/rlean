@@ -33,10 +33,12 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
     // Apply configured data-folder when --data was not explicitly provided.
     // Workspace rlean.json takes precedence over ~/.rlean/config, and relative
     // workspace paths are resolved from the directory containing rlean.json.
+    // CLI --data-* flags win over env and config for the catalog connection.
+    args.apply_data_catalog_overrides();
     let global_config = config::GlobalConfig::load()?;
     let strategy_path = args.strategy.clone();
     resolve_configured_data_folder(&strategy_path, &mut args.data, &global_config)?;
-    let datastore = resolve_datastore_for_data_root(&args.data, &global_config)?;
+    let datastore = resolve_datastore_for_data_root(&args.data, &global_config).await?;
     args.data = datastore.data_root.clone();
     tracing::info!("Data folder: {}", args.data.display());
 
@@ -67,12 +69,6 @@ async fn run_strategy_backtest(
         pyo3::append_to_inittab!(AlgorithmImports);
         pyo3::Python::initialize();
     }
-
-    // Announce this run in the warehouse active-run registry for the whole
-    // backtest. Held until the function returns so the post-run compaction below
-    // sees no *other* active user before it rewrites shared cache tables, and so
-    // any concurrent run's compaction sees us. Dropped on every exit path.
-    let _warehouse_run = datastore.store.register_active_run("backtest");
 
     let parse_date = |s: &str| -> Result<chrono::NaiveDate> {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -320,14 +316,6 @@ async fn run_strategy_backtest(
         }
     }
 
-    // Results are on disk; now (best-effort) collapse the snapshot/manifest
-    // bloat that the run's appends left in the cache so the next backtest plans
-    // quickly. Runs after all reporting so a slow/interrupted compaction never
-    // costs the just-computed results. The #63 sole-user gate inside
-    // `compact_cache_after_backtest` skips (with a log) when another run shares
-    // the warehouse, so this is always safe to invoke unconditionally.
-    compact_cache_after_backtest(&datastore.store).await;
-
     Ok(())
 }
 
@@ -338,39 +326,6 @@ fn s3_bucket_display(config: &crate::artifacts_config::ArtifactConfig) -> String
         .as_ref()
         .map(|s| s.bucket.clone())
         .unwrap_or_default()
-}
-
-/// Minimum per-table metadata-version count before the post-backtest pass
-/// bothers rewriting a cache table.
-///
-/// Planning across a few hundred snapshots is still sub-second; the pathology
-/// that stalls a backtest is tens of thousands. This threshold therefore only
-/// fires on genuinely bloated tables, which keeps a large table (e.g. the
-/// multi-GB `custom_points`) from being rewritten for trivial bloat. Compaction
-/// resets a table's version count to a handful, so a table must re-accumulate
-/// this many appends before it is rewritten again — bounding overhead to at
-/// most one rewrite per ~this-many appends.
-const COMPACT_MIN_METADATA_VERSIONS: usize = 256;
-
-async fn compact_cache_after_backtest(store: &lean_storage::IcebergStore) {
-    // Sole-user gate: compaction rewrites tables via drop+recreate and is unsafe
-    // while another backtest or the live trader is active on the same warehouse
-    // (issue #26). When others are active this skips with a log and leaves the
-    // rewrite to `iceberg_maintenance compact`.
-    let compacted = store
-        .compact_bloated_if_sole_user(COMPACT_MIN_METADATA_VERSIONS)
-        .await;
-    if compacted.is_empty() {
-        return;
-    }
-    let rows: usize = compacted.iter().map(|s| s.rows).sum();
-    let tables: Vec<&str> = compacted.iter().map(|s| s.table.as_str()).collect();
-    println!(
-        "Compacted {} cache table(s) ({} rows): {}",
-        compacted.len(),
-        rows,
-        tables.join(", ")
-    );
 }
 
 fn load_native_strategy_bridge(strategy_path: &Path) -> Result<Box<dyn lean_sdk::AlgorithmBridge>> {
