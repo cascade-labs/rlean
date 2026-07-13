@@ -48,7 +48,8 @@ use lean_data::{
     CustomDataPoint, CustomDataQuery, MarginInterestRate, PerpetualContext, QuoteBar, Tick,
     TradeBar,
 };
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AwsCredential};
+use object_store::CredentialProvider;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
@@ -143,9 +144,11 @@ pub struct SigV4Config {
 }
 
 /// The temporary AWS credentials resolved once at [`IcebergStore::connect`]
-/// time and fed explicitly into the iceberg S3 FileIO props and the DataFusion
-/// object store. `object_store`'s native AWS providers cannot read the local
-/// SSO/login cache, so the resolved keys must be passed in directly.
+/// time and fed explicitly into the iceberg S3 FileIO props. `object_store`'s
+/// native AWS providers cannot read the local SSO/login cache, so the resolved
+/// keys must be passed in directly. The DataFusion object store does NOT use
+/// this snapshot — it uses [`RefreshingS3CredentialProvider`] so it can outlive
+/// the vend TTL (see below).
 #[derive(Clone)]
 struct ResolvedS3Credentials {
     region: String,
@@ -154,13 +157,61 @@ struct ResolvedS3Credentials {
     session_token: Option<String>,
 }
 
+/// An `object_store` credential provider that re-resolves AWS credentials from
+/// the ambient credential chain on every call, so a long-running backtest keeps
+/// signing S3 requests with fresh credentials.
+///
+/// The DataFusion object stores registered for `s3://` data-file buckets must
+/// stay valid for the whole run. AWS S3 Tables (and any SSO/`credential_process`
+/// profile) vends *temporary* credentials with a short TTL — commonly 15 minutes
+/// to an hour. If the object store is built with a one-time static snapshot of
+/// those keys (as `AmazonS3Builder::with_access_key_id` does), every S3 `HEAD`
+/// and `GET` after the TTL is rejected (`400 Bad Request` / `ExpiredToken`),
+/// killing data-heavy backtests part-way through while light ones that finish
+/// inside the TTL pass.
+///
+/// The ambient [`SharedCredentialsProvider`] caches credentials and refreshes
+/// them before they expire, so resolving through it on each request yields
+/// valid credentials for the store's lifetime. This mirrors what the SigV4
+/// signing proxy already does for catalog requests.
+#[derive(Debug)]
+struct RefreshingS3CredentialProvider {
+    provider: SharedCredentialsProvider,
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for RefreshingS3CredentialProvider {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let credentials = self
+            .provider
+            .provide_credentials()
+            .await
+            .map_err(|source| object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(source),
+            })?;
+        Ok(Arc::new(AwsCredential {
+            key_id: credentials.access_key_id().to_string(),
+            secret_key: credentials.secret_access_key().to_string(),
+            token: credentials.session_token().map(str::to_string),
+        }))
+    }
+}
+
 #[derive(Clone)]
 pub struct IcebergStore {
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
-    /// Resolved S3 credentials for registering DataFusion object stores against
-    /// `s3://` data-file buckets. `None` for a non-AWS (unsigned) REST catalog.
+    /// Resolved S3 credentials for the iceberg FileIO props (catalog + manifest
+    /// reads). `None` for a non-AWS (unsigned) REST catalog.
     s3_credentials: Option<ResolvedS3Credentials>,
+    /// Ambient AWS credential provider used to build a refreshing credential
+    /// provider for the DataFusion `s3://` data-file object stores. Held so the
+    /// object stores can re-resolve credentials on every request and survive the
+    /// vend TTL. `None` for a non-AWS (unsigned) REST catalog.
+    s3_credentials_provider: Option<SharedCredentialsProvider>,
     /// Held purely to keep the SigV4 signing proxy (and its localhost listener)
     /// alive for the store's lifetime; the proxy aborts its task on drop. The
     /// leading underscore marks it as an RAII guard that is never read directly.
@@ -318,15 +369,22 @@ impl IcebergStore {
     /// When `config.sigv4` is set, temporary AWS credentials are resolved from
     /// the ambient credential chain (which reads the SSO/login cache) and an
     /// in-process SigV4 signing proxy is started; the REST catalog is pointed at
-    /// the proxy so every catalog request is signed. Those same resolved
-    /// credentials are pushed into the S3 FileIO props and reused when
-    /// registering DataFusion object stores for `s3://` data files. When
+    /// the proxy so every catalog request is signed. The ambient credential
+    /// provider is also kept on the store so DataFusion object stores for
+    /// `s3://` data files can re-resolve credentials on every request and
+    /// survive the vend TTL. A one-time snapshot of the credentials is pushed
+    /// into the S3 FileIO props (catalog + manifest reads only). When
     /// `config.sigv4` is `None`, the catalog is used unsigned and no S3
     /// credentials are attached.
     pub async fn connect(config: RestCatalogConfig) -> Result<Self> {
-        let (catalog_uri, s3_credentials, proxy_guard, purge_dropper, storage_props) = match &config
-            .sigv4
-        {
+        let (
+            catalog_uri,
+            s3_credentials,
+            s3_credentials_provider,
+            proxy_guard,
+            purge_dropper,
+            storage_props,
+        ) = match &config.sigv4 {
             Some(sigv4) => {
                 let region = sigv4.region.clone();
                 let credentials_provider = shared_aws_credentials(&region).await?;
@@ -335,7 +393,7 @@ impl IcebergStore {
                     &config.uri,
                     &region,
                     &sigv4.signing_name,
-                    credentials_provider,
+                    credentials_provider.clone(),
                 )
                 .await?;
                 // Resolve the purge-drop endpoint through the same signing
@@ -346,17 +404,19 @@ impl IcebergStore {
                 (
                     proxy.local_uri().to_string(),
                     Some(resolved),
+                    Some(credentials_provider),
                     Some(Arc::new(proxy)),
                     Some(purge_dropper),
                     props,
                 )
             }
-            None => (config.uri.clone(), None, None, None, HashMap::new()),
+            None => (config.uri.clone(), None, None, None, None, HashMap::new()),
         };
 
         let storage_factory: Arc<dyn StorageFactory> = if s3_credentials.is_some() {
             Arc::new(S3ConfiguredStorageFactory {
                 props: storage_props.clone(),
+                credentials_provider: s3_credentials_provider.clone(),
             })
         } else {
             Arc::new(iceberg::io::LocalFsStorageFactory)
@@ -374,6 +434,7 @@ impl IcebergStore {
             catalog: Arc::new(catalog),
             namespace: NamespaceIdent::new(config.namespace.clone()),
             s3_credentials,
+            s3_credentials_provider,
             _sigv4_proxy: proxy_guard,
             purge_dropper,
             data_refresh: Duration::from_secs(config.data_refresh_secs),
@@ -392,26 +453,38 @@ impl IcebergStore {
         match &self.s3_credentials {
             Some(resolved) => Arc::new(S3ConfiguredStorageFactory {
                 props: s3_file_io_props(resolved),
+                credentials_provider: self.s3_credentials_provider.clone(),
             }),
             None => Arc::new(iceberg::io::LocalFsStorageFactory),
         }
     }
 
     /// Register an S3 object store on `ctx` for every distinct `s3://<bucket>`
-    /// referenced by `paths`, using this store's resolved credentials.
+    /// referenced by `paths`, using a credential provider that re-resolves the
+    /// ambient AWS credentials on every request.
     ///
     /// S3 Tables data files live under an AWS-managed bucket whose name is not
     /// the warehouse ARN, so the bucket is parsed from each data-file path
     /// returned by the catalog rather than known ahead of time. A no-op when the
     /// store has no S3 credentials (unsigned catalog).
+    ///
+    /// The object store is built with a [`RefreshingS3CredentialProvider`]
+    /// rather than a static key snapshot: a cached context's object store, and
+    /// any object store registered here, must keep working past the vend TTL of
+    /// the temporary S3 Tables credentials, which a static snapshot cannot.
     fn register_object_stores_for_paths<'a>(
         &self,
         ctx: &SessionContext,
         paths: impl IntoIterator<Item = &'a String>,
     ) -> Result<()> {
-        let Some(resolved) = &self.s3_credentials else {
+        let (Some(resolved), Some(provider)) =
+            (&self.s3_credentials, &self.s3_credentials_provider)
+        else {
             return Ok(());
         };
+        let credential_provider = Arc::new(RefreshingS3CredentialProvider {
+            provider: provider.clone(),
+        });
         let mut registered: HashSet<String> = HashSet::new();
         for path in paths {
             let Some(bucket) = s3_bucket_from_path(path) else {
@@ -420,18 +493,15 @@ impl IcebergStore {
             if !registered.insert(bucket.clone()) {
                 continue;
             }
-            let mut builder = AmazonS3Builder::new()
+            let store = AmazonS3Builder::new()
                 .with_bucket_name(&bucket)
                 .with_region(&resolved.region)
-                .with_access_key_id(&resolved.access_key_id)
-                .with_secret_access_key(&resolved.secret_access_key)
-                .with_virtual_hosted_style_request(true);
-            if let Some(token) = &resolved.session_token {
-                builder = builder.with_token(token);
-            }
-            let store = builder.build().with_context(|| {
-                format!("failed to build S3 object store for bucket '{bucket}'")
-            })?;
+                .with_credentials(credential_provider.clone())
+                .with_virtual_hosted_style_request(true)
+                .build()
+                .with_context(|| {
+                    format!("failed to build S3 object store for bucket '{bucket}'")
+                })?;
             let url = Url::parse(&format!("s3://{bucket}"))
                 .with_context(|| format!("invalid s3 bucket url for '{bucket}'"))?;
             ctx.register_object_store(&url, Arc::new(store));
@@ -2343,17 +2413,140 @@ fn s3_bucket_from_path(path: &str) -> Option<String> {
 /// Resolve a shared AWS credentials provider from the ambient credential chain,
 /// scoped to `region`. The `DefaultCredentialsChain` reads the SSO/login cache,
 /// which `object_store`'s native providers do not.
+///
+/// The chain is wrapped in [`CachedChainCredentials`]: `DefaultCredentialsChain`
+/// has no internal cache, so a bare chain re-runs full resolution — including
+/// spawning any `credential_process` — on every `provide_credentials` call.
+/// Every consumer of this provider (the SigV4 proxy, the DataFusion object
+/// stores, the OpenDAL FileIO loader) resolves per request, so without the
+/// cache a data-heavy backtest spawns hundreds of concurrent subprocesses and
+/// eventually dies with "an error occurred while loading credentials".
 async fn shared_aws_credentials(region: &str) -> Result<SharedCredentialsProvider> {
     let chain = DefaultCredentialsChain::builder()
         .region(Region::new(region.to_string()))
         .build()
         .await;
-    Ok(SharedCredentialsProvider::new(chain))
+    Ok(SharedCredentialsProvider::new(CachedChainCredentials::new(
+        SharedCredentialsProvider::new(chain),
+    )))
+}
+
+/// How long before a credential's stated expiry the cache starts trying to
+/// replace it.
+const CREDENTIAL_REFRESH_BUFFER: Duration = Duration::from_secs(60);
+
+/// Minimum spacing between chain hits while inside the refresh buffer, so a
+/// credential source that keeps returning the same about-to-expire credential
+/// (the AWS CLI serves its cached session until hard expiry) is not hammered
+/// once per S3 request.
+const CREDENTIAL_RETRY_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Expiry-aware, single-flight cache over the ambient AWS credential chain.
+///
+/// Serves the cached credential until it is within
+/// [`CREDENTIAL_REFRESH_BUFFER`] of its expiry, then re-resolves through the
+/// chain (at most once per [`CREDENTIAL_RETRY_MIN_INTERVAL`]). The `Mutex`
+/// makes refreshes single-flight: concurrent callers wait for one resolution
+/// instead of each spawning their own `credential_process`. Credentials with
+/// no expiry (static keys) are resolved once and reused forever. If a refresh
+/// fails while the cached credential is still valid, the cached credential
+/// keeps being served.
+#[derive(Debug)]
+struct CachedChainCredentials {
+    chain: SharedCredentialsProvider,
+    refresh_buffer: Duration,
+    retry_min_interval: Duration,
+    state: tokio::sync::Mutex<CachedCredentialState>,
+}
+
+#[derive(Debug, Default)]
+struct CachedCredentialState {
+    credentials: Option<aws_credential_types::Credentials>,
+    /// When the chain was last hit, successfully or not. Throttles refresh
+    /// attempts inside the buffer window.
+    last_resolved: Option<Instant>,
+}
+
+impl CachedChainCredentials {
+    fn new(chain: SharedCredentialsProvider) -> Self {
+        Self::with_intervals(
+            chain,
+            CREDENTIAL_REFRESH_BUFFER,
+            CREDENTIAL_RETRY_MIN_INTERVAL,
+        )
+    }
+
+    fn with_intervals(
+        chain: SharedCredentialsProvider,
+        refresh_buffer: Duration,
+        retry_min_interval: Duration,
+    ) -> Self {
+        Self {
+            chain,
+            refresh_buffer,
+            retry_min_interval,
+            state: tokio::sync::Mutex::new(CachedCredentialState::default()),
+        }
+    }
+
+    async fn resolve(&self) -> aws_credential_types::provider::Result {
+        let mut state = self.state.lock().await;
+        if let Some(credentials) = &state.credentials {
+            let now = std::time::SystemTime::now();
+            let fresh = match credentials.expiry() {
+                // Static keys never expire.
+                None => true,
+                Some(expiry) => now + self.refresh_buffer < expiry,
+            };
+            // The throttle may only serve credentials that are still hard-valid;
+            // once the actual expiry passes, every caller goes to the chain.
+            let hard_valid = credentials.expiry().is_none_or(|expiry| now < expiry);
+            let recently_tried = state
+                .last_resolved
+                .is_some_and(|at| at.elapsed() < self.retry_min_interval);
+            if fresh || (recently_tried && hard_valid) {
+                return Ok(credentials.clone());
+            }
+        }
+        let attempt = self.chain.provide_credentials().await;
+        state.last_resolved = Some(Instant::now());
+        match attempt {
+            Ok(credentials) => {
+                state.credentials = Some(credentials.clone());
+                Ok(credentials)
+            }
+            Err(error) => {
+                // Serve the cached credential through transient chain failures
+                // as long as it has not actually expired.
+                if let Some(credentials) = &state.credentials {
+                    let still_valid = credentials
+                        .expiry()
+                        .is_none_or(|expiry| std::time::SystemTime::now() < expiry);
+                    if still_valid {
+                        return Ok(credentials.clone());
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ProvideCredentials for CachedChainCredentials {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::new(self.resolve())
+    }
 }
 
 /// Resolve the concrete temporary credentials once, to feed explicitly into the
-/// S3 FileIO props and DataFusion object stores. Credential material is never
-/// logged.
+/// S3 FileIO props (catalog + manifest reads). The DataFusion object stores use
+/// [`RefreshingS3CredentialProvider`] instead of this snapshot. Credential
+/// material is never logged.
 async fn resolve_s3_credentials(
     region: &str,
     provider: &SharedCredentialsProvider,
@@ -2406,9 +2599,21 @@ async fn build_rest_catalog(
 /// `s3.path-style-access=false` are always present even if the vended config
 /// omits or differs on them. The same applies to the DataFusion
 /// `IcebergTableProviderFactory` FileIO path.
+///
+/// The FileIO built here reads Iceberg metadata and manifests from S3 whenever
+/// a table is (re)loaded — including mid-run rebuilds after another process
+/// commits — so it must survive the vend TTL of temporary credentials just
+/// like the data-plane object stores. When `credentials_provider` is set, the
+/// OpenDAL S3 backend loads credentials through it (reqsign re-invokes the
+/// loader shortly before the current credential expires) instead of pinning
+/// the connect-time keys from `props`. The provider is `#[serde(skip)]`
+/// because live credential chains cannot be serialized; a deserialized factory
+/// falls back to the static props.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct S3ConfiguredStorageFactory {
     props: HashMap<String, String>,
+    #[serde(skip)]
+    credentials_provider: Option<SharedCredentialsProvider>,
 }
 
 #[typetag::serde]
@@ -2418,9 +2623,44 @@ impl StorageFactory for S3ConfiguredStorageFactory {
         props.extend(config.props().clone());
         let inner = OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
-            customized_credential_load: None,
+            customized_credential_load: self.credentials_provider.clone().map(|provider| {
+                iceberg_storage_opendal::CustomAwsCredentialLoader::new(Arc::new(
+                    RefreshingOpendalCredentialLoader { provider },
+                ))
+            }),
         };
         inner.build(&StorageConfig::from_props(props))
+    }
+}
+
+/// [`iceberg_storage_opendal::AwsCredentialLoad`] implementation over the
+/// ambient AWS credential chain, mirroring [`RefreshingS3CredentialProvider`]
+/// for the OpenDAL FileIO path. `expires_in` is forwarded from the resolved
+/// credential so reqsign reloads shortly before expiry.
+#[derive(Debug)]
+struct RefreshingOpendalCredentialLoader {
+    provider: SharedCredentialsProvider,
+}
+
+#[async_trait::async_trait]
+impl iceberg_storage_opendal::AwsCredentialLoad for RefreshingOpendalCredentialLoader {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<iceberg_storage_opendal::AwsCredential>> {
+        let credentials = self
+            .provider
+            .provide_credentials()
+            .await
+            .context("failed to resolve AWS credentials for the S3 FileIO")?;
+        Ok(Some(iceberg_storage_opendal::AwsCredential {
+            access_key_id: credentials.access_key_id().to_string(),
+            secret_access_key: credentials.secret_access_key().to_string(),
+            session_token: credentials.session_token().map(str::to_string),
+            expires_in: credentials
+                .expiry()
+                .map(chrono::DateTime::<chrono::Utc>::from),
+        }))
     }
 }
 
@@ -3632,5 +3872,109 @@ mod tests {
         assert!(out[0].fields.contains_key("usymbol"));
         assert!(!out[0].fields.contains_key("norm_edge"));
         assert!(!out[0].fields.contains_key("unused_payload"));
+    }
+
+    /// A credential source whose keys rotate on every resolve, standing in for
+    /// the ambient AWS chain vending a fresh temporary credential after the
+    /// previous one expired. `ttl` sets each vended credential's expiry
+    /// relative to now (`None` => never expires).
+    #[derive(Debug)]
+    struct RotatingCredentials {
+        next: std::sync::atomic::AtomicUsize,
+        ttl: Option<std::time::Duration>,
+    }
+
+    impl RotatingCredentials {
+        fn shared(ttl: Option<std::time::Duration>) -> SharedCredentialsProvider {
+            SharedCredentialsProvider::new(Self {
+                next: std::sync::atomic::AtomicUsize::new(0),
+                ttl,
+            })
+        }
+    }
+
+    impl aws_credential_types::provider::ProvideCredentials for RotatingCredentials {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            aws_credential_types::provider::future::ProvideCredentials::ready(Ok(
+                aws_credential_types::Credentials::new(
+                    format!("AKID{seq}"),
+                    format!("SECRET{seq}"),
+                    Some(format!("TOKEN{seq}")),
+                    self.ttl.map(|ttl| std::time::SystemTime::now() + ttl),
+                    "rotating-test",
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshing_provider_reresolves_on_every_call() {
+        let provider = RefreshingS3CredentialProvider {
+            provider: RotatingCredentials::shared(None),
+        };
+
+        let first = provider.get_credential().await.expect("first credential");
+        assert_eq!(first.key_id, "AKID0");
+        assert_eq!(first.secret_key, "SECRET0");
+        assert_eq!(first.token.as_deref(), Some("TOKEN0"));
+
+        // A second call must re-resolve through the given provider rather than
+        // return the first snapshot, so an expired credential is replaced by a
+        // freshly vended one for the next S3 request.
+        let second = provider.get_credential().await.expect("second credential");
+        assert_eq!(second.key_id, "AKID1");
+        assert_eq!(second.secret_key, "SECRET1");
+        assert_eq!(second.token.as_deref(), Some("TOKEN1"));
+    }
+
+    #[tokio::test]
+    async fn cached_chain_serves_unexpired_credentials_without_rehitting_the_chain() {
+        // Credentials valid for an hour: every resolve inside the refresh
+        // buffer must come from the cache, not spawn another chain resolution.
+        let cached = CachedChainCredentials::new(RotatingCredentials::shared(Some(
+            std::time::Duration::from_secs(3600),
+        )));
+
+        let first = cached.resolve().await.expect("first credential");
+        let second = cached.resolve().await.expect("second credential");
+        assert_eq!(first.access_key_id(), "AKID0");
+        assert_eq!(second.access_key_id(), "AKID0");
+    }
+
+    #[tokio::test]
+    async fn cached_chain_refreshes_credentials_inside_the_expiry_buffer() {
+        // Credentials that are already inside the refresh buffer (1s TTL vs
+        // 60s buffer) must be replaced on the next resolve. A zero retry
+        // interval disables the throttle so the test does not sleep.
+        let cached = CachedChainCredentials::with_intervals(
+            RotatingCredentials::shared(Some(std::time::Duration::from_secs(1))),
+            CREDENTIAL_REFRESH_BUFFER,
+            Duration::ZERO,
+        );
+
+        let first = cached.resolve().await.expect("first credential");
+        let second = cached.resolve().await.expect("second credential");
+        assert_eq!(first.access_key_id(), "AKID0");
+        assert_eq!(second.access_key_id(), "AKID1");
+    }
+
+    #[tokio::test]
+    async fn cached_chain_never_expiring_credentials_are_resolved_once() {
+        let cached = CachedChainCredentials::with_intervals(
+            RotatingCredentials::shared(None),
+            CREDENTIAL_REFRESH_BUFFER,
+            Duration::ZERO,
+        );
+
+        let first = cached.resolve().await.expect("first credential");
+        let second = cached.resolve().await.expect("second credential");
+        assert_eq!(first.access_key_id(), "AKID0");
+        assert_eq!(second.access_key_id(), "AKID0");
     }
 }

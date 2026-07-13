@@ -27,6 +27,7 @@ aws-config = { workspace = true }
 aws-credential-types = { workspace = true }
 aws-sigv4 = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
+async-trait = { workspace = true }
 typetag = { workspace = true }
 url = { workspace = true }
 hyper = { workspace = true }
