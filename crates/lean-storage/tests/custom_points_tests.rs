@@ -186,6 +186,78 @@ async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
     );
 }
 
+/// Freshness regression for issue #32: a long-lived reader must observe rows a
+/// *different* process appended after the reader first cached the table's
+/// snapshot. Two separate `IcebergStore` instances stand in for two processes
+/// sharing the warehouse.
+///
+/// Uses a short recheck TTL (2s) so the test exercises the real
+/// throttle-then-recheck path: within the window the reader trusts its cached
+/// (empty) snapshot; after the window it re-reads the catalog, sees the moved
+/// metadata location, and rebuilds — surfacing the writer's rows.
+#[tokio::test]
+#[ignore = "needs a live REST Iceberg catalog; set RLEAN_TEST_CATALOG"]
+async fn reader_sees_other_process_append_after_refresh_ttl() {
+    const TTL_SECS: u64 = 2;
+    let Some(reader) = connect_test_store_with_refresh(TTL_SECS).await else {
+        return;
+    };
+    // Second instance = second "process" sharing the same scratch warehouse.
+    let writer = connect_test_store_with_refresh(TTL_SECS)
+        .await
+        .expect("writer connects when reader did");
+
+    // Start from a known-empty table (scratch namespace persists across runs).
+    reader.reset_table(CUSTOM_POINTS).await.unwrap();
+    let day = NaiveDate::from_ymd_opt(2024, 3, 4).unwrap();
+
+    // Reader caches the empty snapshot (both the scan context and the partition
+    // index) by reading before any rows exist.
+    let before = reader
+        .scan_custom_points_range("fresh", "SYM", day, day)
+        .await
+        .unwrap();
+    assert!(
+        before.is_empty(),
+        "table should start empty, got {} rows",
+        before.len()
+    );
+
+    // The other process appends a row.
+    writer
+        .append_custom_points("fresh", "SYM", &[point(day, 42, Some("sym"))])
+        .await
+        .unwrap();
+
+    // Immediately (inside the TTL window) the reader still trusts its cached
+    // empty snapshot — this is the throttle, not the bug.
+    let within_window = reader
+        .scan_custom_points_range("fresh", "SYM", day, day)
+        .await
+        .unwrap();
+    assert!(
+        within_window.is_empty(),
+        "reader should still see the cached empty snapshot inside the TTL window"
+    );
+
+    // After the TTL elapses, the next read rechecks the catalog, sees the moved
+    // snapshot, and surfaces the appended row. This is the fix.
+    tokio::time::sleep(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+    let after = reader
+        .scan_custom_points_range("fresh", "SYM", day, day)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "reader must observe the other process's appended row after the refresh TTL"
+    );
+    assert_eq!(after[0].symbol.as_deref(), Some("SYM"));
+
+    // Leave the scratch table empty for the next run.
+    reader.reset_table(CUSTOM_POINTS).await.unwrap();
+}
+
 /// Connect to a REST Iceberg catalog for integration testing.
 ///
 /// These tests need a live REST catalog (e.g. AWS S3 Tables): they are marked
@@ -201,6 +273,13 @@ async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
 /// on a table's full contents resets that table (drop + recreate) after
 /// connecting to start from a known-empty state.
 async fn connect_test_store() -> Option<IcebergStore> {
+    // Most tests recheck on every read so appends made by the same instance are
+    // seen immediately; the cross-process freshness test opts into a short TTL.
+    connect_test_store_with_refresh(0).await
+}
+
+/// Connect a test store with an explicit snapshot-recheck TTL (seconds).
+async fn connect_test_store_with_refresh(data_refresh_secs: u64) -> Option<IcebergStore> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()
         .filter(|v| !v.is_empty())?;
@@ -228,6 +307,7 @@ async fn connect_test_store() -> Option<IcebergStore> {
             warehouse,
             sigv4,
             namespace,
+            data_refresh_secs,
         })
         .await
         .expect("failed to connect to the test REST catalog"),

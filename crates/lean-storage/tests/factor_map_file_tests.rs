@@ -170,6 +170,7 @@ async fn connect_test_store() -> Option<IcebergStore> {
             warehouse,
             sigv4,
             namespace,
+            data_refresh_secs: 0,
         })
         .await
         .expect("failed to connect to the test REST catalog"),

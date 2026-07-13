@@ -16,7 +16,7 @@
 //! file. See `cli::apply_data_catalog_overrides`.
 
 use anyhow::Result;
-use lean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_NAMESPACE};
+use lean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE};
 
 use crate::config::GlobalConfig;
 
@@ -69,11 +69,17 @@ pub(crate) fn resolve(config: &GlobalConfig) -> Result<RestCatalogConfig> {
         .or_else(|| config.data_namespace.clone())
         .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
 
+    let data_refresh_secs = env("RLEAN_DATA_REFRESH_SECS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(config.data_refresh_secs)
+        .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
+
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
+        data_refresh_secs,
     })
 }
 
@@ -95,6 +101,7 @@ mod tests {
             "RLEAN_DATA_SIGV4_REGION",
             "RLEAN_DATA_SIGV4_NAME",
             "RLEAN_DATA_NAMESPACE",
+            "RLEAN_DATA_REFRESH_SECS",
         ] {
             std::env::remove_var(key);
         }
@@ -208,5 +215,33 @@ mod tests {
         let ns = resolve(&cfg).unwrap().namespace;
         clear_env();
         assert_eq!(ns, "scratch");
+    }
+
+    #[test]
+    fn data_refresh_secs_defaults_when_unset() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = config_with_catalog("http://c/catalog", "wh");
+        assert_eq!(
+            resolve(&cfg).unwrap().data_refresh_secs,
+            lean_storage::DEFAULT_DATA_REFRESH_SECS
+        );
+    }
+
+    #[test]
+    fn data_refresh_secs_env_overrides_config() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_refresh_secs: Some(15),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        // Config value applies when the env var is unset.
+        assert_eq!(resolve(&cfg).unwrap().data_refresh_secs, 15);
+        // Env var wins, including 0 (recheck every read).
+        std::env::set_var("RLEAN_DATA_REFRESH_SECS", "0");
+        let secs = resolve(&cfg).unwrap().data_refresh_secs;
+        clear_env();
+        assert_eq!(secs, 0);
     }
 }
