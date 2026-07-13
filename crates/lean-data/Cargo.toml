@@ -2,9 +2,14 @@
 name = "lean-data"
 version.workspace = true
 edition.workspace = true
+description = "Market data types for rlean: Slice, bar/quote types, and the historical data provider trait."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core = { path = "../lean-core" }
+lean-core = { path = "../lean-core", version = "0.1.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

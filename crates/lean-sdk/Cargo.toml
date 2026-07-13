@@ -2,18 +2,23 @@
 name = "lean-sdk"
 version.workspace = true
 edition.workspace = true
+description = "Strategy-authoring surface for rlean: the types a Rust or Python algorithm builds against."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core = { path = "../lean-core" }
-lean-data = { path = "../lean-data" }
-lean-algorithm = { path = "../lean-algorithm" }
-lean-orders = { path = "../lean-orders" }
-lean-options = { path = "../lean-options" }
-lean-alpha = { path = "../lean-alpha" }
-lean-execution = { path = "../lean-execution" }
-lean-portfolio-construction = { path = "../lean-portfolio-construction" }
-lean-risk = { path = "../lean-risk" }
-lean-indicators = { path = "../lean-indicators" }
+lean-core = { path = "../lean-core", version = "0.1.1" }
+lean-data = { path = "../lean-data", version = "0.1.1" }
+lean-algorithm = { path = "../lean-algorithm", version = "0.1.1" }
+lean-orders = { path = "../lean-orders", version = "0.1.1" }
+lean-options = { path = "../lean-options", version = "0.1.1" }
+lean-alpha = { path = "../lean-alpha", version = "0.1.1" }
+lean-execution = { path = "../lean-execution", version = "0.1.1" }
+lean-portfolio-construction = { path = "../lean-portfolio-construction", version = "0.1.1" }
+lean-risk = { path = "../lean-risk", version = "0.1.1" }
+lean-indicators = { path = "../lean-indicators", version = "0.1.1" }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }

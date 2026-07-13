@@ -2,10 +2,15 @@
 name = "lean-execution"
 version.workspace = true
 edition.workspace = true
+description = "Order routing and execution models for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core    = { path = "../lean-core" }
-lean-orders  = { path = "../lean-orders" }
+lean-core    = { path = "../lean-core", version = "0.1.1" }
+lean-orders  = { path = "../lean-orders", version = "0.1.1" }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde        = { workspace = true }

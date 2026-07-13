@@ -2,6 +2,11 @@
 name = "lean-core"
 version.workspace = true
 edition.workspace = true
+description = "Shared core types for rlean (a Rust engine with QuantConnect LEAN API parity): Symbol, DateTime, Resolution, Market."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true }

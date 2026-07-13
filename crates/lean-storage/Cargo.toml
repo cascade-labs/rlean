@@ -2,10 +2,15 @@
 name = "lean-storage"
 version.workspace = true
 edition.workspace = true
+description = "Parquet/Iceberg storage layer for rlean: trade bars, factor files, map files, and option chains."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core = { path = "../lean-core" }
-lean-data = { path = "../lean-data" }
+lean-core = { path = "../lean-core", version = "0.1.1" }
+lean-data = { path = "../lean-data", version = "0.1.1" }
 
 arrow = { workspace = true }
 arrow-array = { workspace = true }

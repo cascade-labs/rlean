@@ -36,6 +36,11 @@ edition = "2021"
 rust-version = "1.92"
 authors = ["Cascade Labs"]
 license = "Apache-2.0"
+repository = "https://github.com/cascade-labs/rlean"
+homepage = "https://github.com/cascade-labs/rlean"
+documentation = "https://docs.rs/rlean"
+keywords = ["trading", "backtesting", "quant", "finance", "lean"]
+categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 # Arrow / Parquet

@@ -3,11 +3,15 @@ name = "lean-data-providers"
 version.workspace = true
 edition.workspace = true
 description = "Data provider traits and registry — Rust equivalent of QuantConnect.Interfaces"
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core    = { path = "../lean-core" }
-lean-data    = { path = "../lean-data" }
-lean-storage = { path = "../lean-storage" }
+lean-core    = { path = "../lean-core", version = "0.1.1" }
+lean-data    = { path = "../lean-data", version = "0.1.1" }
+lean-storage = { path = "../lean-storage", version = "0.1.1" }
 
 anyhow       = { workspace = true }
 tokio        = { workspace = true }

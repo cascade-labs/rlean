@@ -2,24 +2,29 @@
 name = "lean-engine"
 version.workspace = true
 edition.workspace = true
+description = "Backtest and live execution engine for rlean, with API parity to QuantConnect LEAN."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core = { path = "../lean-core" }
-lean-data = { path = "../lean-data" }
-lean-storage = { path = "../lean-storage" }
-lean-sdk = { path = "../lean-sdk" }
-lean-options = { path = "../lean-options" }
-lean-orders = { path = "../lean-orders" }
-lean-algorithm = { path = "../lean-algorithm" }
-lean-statistics = { path = "../lean-statistics" }
-lean-data-providers = { path = "../lean-data-providers" }
-lean-alpha = { path = "../lean-alpha" }
-lean-risk = { path = "../lean-risk" }
-lean-execution = { path = "../lean-execution" }
-lean-portfolio-construction = { path = "../lean-portfolio-construction" }
-lean-universe = { path = "../lean-universe" }
-lean-scheduling = { path = "../lean-scheduling" }
-lean-live = { path = "../lean-live" }
+lean-core = { path = "../lean-core", version = "0.1.1" }
+lean-data = { path = "../lean-data", version = "0.1.1" }
+lean-storage = { path = "../lean-storage", version = "0.1.1" }
+lean-sdk = { path = "../lean-sdk", version = "0.1.1" }
+lean-options = { path = "../lean-options", version = "0.1.1" }
+lean-orders = { path = "../lean-orders", version = "0.1.1" }
+lean-algorithm = { path = "../lean-algorithm", version = "0.1.1" }
+lean-statistics = { path = "../lean-statistics", version = "0.1.1" }
+lean-data-providers = { path = "../lean-data-providers", version = "0.1.1" }
+lean-alpha = { path = "../lean-alpha", version = "0.1.1" }
+lean-risk = { path = "../lean-risk", version = "0.1.1" }
+lean-execution = { path = "../lean-execution", version = "0.1.1" }
+lean-portfolio-construction = { path = "../lean-portfolio-construction", version = "0.1.1" }
+lean-universe = { path = "../lean-universe", version = "0.1.1" }
+lean-scheduling = { path = "../lean-scheduling", version = "0.1.1" }
+lean-live = { path = "../lean-live", version = "0.1.1" }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -40,8 +45,8 @@ dashmap = { workspace = true }
 crossbeam-channel = { workspace = true }
 rayon = { workspace = true }
 num_cpus = { workspace = true }
-lean-brokerages = { path = "../lean-brokerages" }
-lean-indicators = { path = "../lean-indicators" }
+lean-brokerages = { path = "../lean-brokerages", version = "0.1.1" }
+lean-indicators = { path = "../lean-indicators", version = "0.1.1" }
 object_store = { workspace = true }
 tempfile = { workspace = true }
 

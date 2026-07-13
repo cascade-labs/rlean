@@ -2,10 +2,15 @@
 name = "lean-optimization"
 version.workspace = true
 edition.workspace = true
+description = "Parameter optimization framework for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core       = { path = "../lean-core" }
-lean-statistics = { path = "../lean-statistics" }
+lean-core       = { path = "../lean-core", version = "0.1.1" }
+lean-statistics = { path = "../lean-statistics", version = "0.1.1" }
 rust_decimal    = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde           = { workspace = true }

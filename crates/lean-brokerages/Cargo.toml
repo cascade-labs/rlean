@@ -2,12 +2,17 @@
 name = "lean-brokerages"
 version.workspace = true
 edition.workspace = true
+description = "Built-in brokerage models for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
-lean-core = { path = "../lean-core" }
-lean-data = { path = "../lean-data" }
-lean-orders = { path = "../lean-orders" }
-lean-algorithm = { path = "../lean-algorithm" }
+lean-core = { path = "../lean-core", version = "0.1.1" }
+lean-data = { path = "../lean-data", version = "0.1.1" }
+lean-orders = { path = "../lean-orders", version = "0.1.1" }
+lean-algorithm = { path = "../lean-algorithm", version = "0.1.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
