@@ -328,6 +328,7 @@ mod provider_tests {
                 sigv4,
                 namespace,
                 data_refresh_secs: 0,
+                data_endpoint: None,
             })
             .await
             .expect("failed to connect to the test REST catalog"),

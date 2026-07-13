@@ -16,7 +16,10 @@
 //! file. See `cli::apply_data_catalog_overrides`.
 
 use anyhow::Result;
-use lean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE};
+use lean_storage::{
+    DataEndpointOverride, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
+    DEFAULT_NAMESPACE,
+};
 
 use crate::config::GlobalConfig;
 
@@ -74,12 +77,36 @@ pub(crate) fn resolve(config: &GlobalConfig) -> Result<RestCatalogConfig> {
         .or(config.data_refresh_secs)
         .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
 
+    // Optional data-plane S3 endpoint override (e.g. a local Verglas cache).
+    // Active only when the endpoint and both endpoint keys resolve; a missing
+    // key leaves it off (data files read directly from AWS). Catalog traffic is
+    // never affected by this.
+    let data_endpoint = resolve_data_endpoint(config);
+
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs,
+        data_endpoint,
+    })
+}
+
+/// Resolve the optional data-plane S3 endpoint override (endpoint + endpoint
+/// keys), each with env-over-config precedence. Returns `None` unless the
+/// endpoint and both keys are present, so the default (direct AWS) path is the
+/// safe fallback.
+fn resolve_data_endpoint(config: &GlobalConfig) -> Option<DataEndpointOverride> {
+    let endpoint = env("RLEAN_DATA_S3_ENDPOINT").or_else(|| config.data_s3_endpoint.clone())?;
+    let access_key_id =
+        env("RLEAN_DATA_S3_ACCESS_KEY_ID").or_else(|| config.data_s3_access_key_id.clone())?;
+    let secret_access_key = env("RLEAN_DATA_S3_SECRET_ACCESS_KEY")
+        .or_else(|| config.data_s3_secret_access_key.clone())?;
+    Some(DataEndpointOverride {
+        endpoint,
+        access_key_id,
+        secret_access_key,
     })
 }
 
@@ -102,6 +129,9 @@ mod tests {
             "RLEAN_DATA_SIGV4_NAME",
             "RLEAN_DATA_NAMESPACE",
             "RLEAN_DATA_REFRESH_SECS",
+            "RLEAN_DATA_S3_ENDPOINT",
+            "RLEAN_DATA_S3_ACCESS_KEY_ID",
+            "RLEAN_DATA_S3_SECRET_ACCESS_KEY",
         ] {
             std::env::remove_var(key);
         }
@@ -226,6 +256,63 @@ mod tests {
             resolve(&cfg).unwrap().data_refresh_secs,
             lean_storage::DEFAULT_DATA_REFRESH_SECS
         );
+    }
+
+    #[test]
+    fn data_endpoint_absent_by_default() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = config_with_catalog("http://c/catalog", "wh");
+        // No endpoint configured => data files read directly from AWS (default).
+        assert!(resolve(&cfg).unwrap().data_endpoint.is_none());
+    }
+
+    #[test]
+    fn data_endpoint_from_config_when_all_three_present() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            data_s3_access_key_id: Some("VG_KEY".to_string()),
+            data_s3_secret_access_key: Some("VG_SECRET".to_string()),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        let endpoint = resolve(&cfg).unwrap().data_endpoint.expect("endpoint set");
+        assert_eq!(endpoint.endpoint, "http://127.0.0.1:8333");
+        assert_eq!(endpoint.access_key_id, "VG_KEY");
+        assert_eq!(endpoint.secret_access_key, "VG_SECRET");
+    }
+
+    #[test]
+    fn data_endpoint_absent_when_keys_missing() {
+        let _guard = env_lock();
+        clear_env();
+        // Endpoint set but keys missing => override stays off (safe fallback).
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        assert!(resolve(&cfg).unwrap().data_endpoint.is_none());
+    }
+
+    #[test]
+    fn data_endpoint_env_overrides_config() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://config-endpoint:8333".to_string()),
+            data_s3_access_key_id: Some("CFG_KEY".to_string()),
+            data_s3_secret_access_key: Some("CFG_SECRET".to_string()),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        std::env::set_var("RLEAN_DATA_S3_ENDPOINT", "http://env-endpoint:8333");
+        std::env::set_var("RLEAN_DATA_S3_ACCESS_KEY_ID", "ENV_KEY");
+        let endpoint = resolve(&cfg).unwrap().data_endpoint.expect("endpoint set");
+        clear_env();
+        // Env wins per key; the unset secret falls back to config.
+        assert_eq!(endpoint.endpoint, "http://env-endpoint:8333");
+        assert_eq!(endpoint.access_key_id, "ENV_KEY");
+        assert_eq!(endpoint.secret_access_key, "CFG_SECRET");
     }
 
     #[test]

@@ -11,7 +11,8 @@ mod sigv4_proxy;
 pub use cache::DataCache;
 pub use custom_ingest::provider_parquet_bytes_to_custom_points;
 pub use iceberg_store::{
-    IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
+    DataEndpointOverride, IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
+    DEFAULT_NAMESPACE,
 };
 pub use map_file_resolver::{MapFile, MapFileResolver};
 pub use partition_index::{MarketPartitionDayQuery, MarketPartitionIndex, MarketPartitionKey};

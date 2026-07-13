@@ -119,6 +119,14 @@ pub struct RestCatalogConfig {
     /// catalog for commits made by other processes. See
     /// [`DEFAULT_DATA_REFRESH_SECS`]. `0` rechecks on every read.
     pub data_refresh_secs: u64,
+    /// Optional data-plane S3 endpoint override. When `Some`, Iceberg
+    /// **data-file** reads (FileIO + every DataFusion object store) are pointed
+    /// at this endpoint with its own keys and path-style addressing — e.g. a
+    /// local Verglas read-through cache daemon. The catalog transport and its
+    /// AWS credential resolution are unaffected: catalog requests still go
+    /// (signed) to AWS. `None` => data files are read directly from AWS S3, the
+    /// production default.
+    pub data_endpoint: Option<DataEndpointOverride>,
 }
 
 impl Default for RestCatalogConfig {
@@ -129,8 +137,26 @@ impl Default for RestCatalogConfig {
             sigv4: None,
             namespace: DEFAULT_NAMESPACE.to_string(),
             data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
+            data_endpoint: None,
         }
     }
+}
+
+/// Data-plane S3 endpoint override for Iceberg **data-file** I/O only.
+///
+/// When set on [`RestCatalogConfig`], data-file reads are redirected to
+/// `endpoint` using `access_key_id` / `secret_access_key` (endpoint-issued
+/// keys, NOT AWS keys) with path-style addressing and plain HTTP allowed (the
+/// endpoint is expected to be loopback, e.g. `http://127.0.0.1:8333`). The
+/// catalog (SigV4 proxy) and its AWS credential resolution are untouched.
+#[derive(Clone, Debug)]
+pub struct DataEndpointOverride {
+    /// Data-plane S3 endpoint, e.g. `http://127.0.0.1:8333`.
+    pub endpoint: String,
+    /// Endpoint access key id (cache-endpoint key, not an AWS key).
+    pub access_key_id: String,
+    /// Endpoint secret access key (cache-endpoint key, not an AWS key).
+    pub secret_access_key: String,
 }
 
 /// SigV4 signing settings for an AWS-backed REST catalog.
@@ -161,6 +187,11 @@ pub struct IcebergStore {
     /// Resolved S3 credentials for registering DataFusion object stores against
     /// `s3://` data-file buckets. `None` for a non-AWS (unsigned) REST catalog.
     s3_credentials: Option<ResolvedS3Credentials>,
+    /// Optional data-plane S3 endpoint override (e.g. a local Verglas cache).
+    /// When set, every data-file FileIO / object store is pointed here with the
+    /// override keys and path-style addressing, replacing the resolved AWS
+    /// credentials for data-file I/O only. The catalog transport is unchanged.
+    data_endpoint: Option<DataEndpointOverride>,
     /// Held purely to keep the SigV4 signing proxy (and its localhost listener)
     /// alive for the store's lifetime; the proxy aborts its task on drop. The
     /// leading underscore marks it as an RAII guard that is never read directly.
@@ -342,7 +373,7 @@ impl IcebergStore {
                 // proxy so drops carry `purgeRequested=true` (required by S3
                 // Tables).
                 let purge_dropper = PurgeDropper::new(proxy.local_uri(), &config.warehouse).await?;
-                let props = s3_file_io_props(&resolved);
+                let props = s3_file_io_props(&resolved, config.data_endpoint.as_ref());
                 (
                     proxy.local_uri().to_string(),
                     Some(resolved),
@@ -374,6 +405,7 @@ impl IcebergStore {
             catalog: Arc::new(catalog),
             namespace: NamespaceIdent::new(config.namespace.clone()),
             s3_credentials,
+            data_endpoint: config.data_endpoint.clone(),
             _sigv4_proxy: proxy_guard,
             purge_dropper,
             data_refresh: Duration::from_secs(config.data_refresh_secs),
@@ -391,7 +423,7 @@ impl IcebergStore {
     fn iceberg_storage_factory(&self) -> Arc<dyn StorageFactory> {
         match &self.s3_credentials {
             Some(resolved) => Arc::new(S3ConfiguredStorageFactory {
-                props: s3_file_io_props(resolved),
+                props: s3_file_io_props(resolved, self.data_endpoint.as_ref()),
             }),
             None => Arc::new(iceberg::io::LocalFsStorageFactory),
         }
@@ -422,12 +454,26 @@ impl IcebergStore {
             }
             let mut builder = AmazonS3Builder::new()
                 .with_bucket_name(&bucket)
-                .with_region(&resolved.region)
-                .with_access_key_id(&resolved.access_key_id)
-                .with_secret_access_key(&resolved.secret_access_key)
-                .with_virtual_hosted_style_request(true);
-            if let Some(token) = &resolved.session_token {
-                builder = builder.with_token(token);
+                .with_region(&resolved.region);
+            if let Some(endpoint) = &self.data_endpoint {
+                // Redirect this data-file bucket to the override endpoint (e.g.
+                // a local Verglas cache): its own keys, path-style addressing,
+                // and plain HTTP (the endpoint is loopback). No AWS session
+                // token — the endpoint authenticates with the override keys.
+                builder = builder
+                    .with_endpoint(&endpoint.endpoint)
+                    .with_access_key_id(&endpoint.access_key_id)
+                    .with_secret_access_key(&endpoint.secret_access_key)
+                    .with_virtual_hosted_style_request(false)
+                    .with_allow_http(true);
+            } else {
+                builder = builder
+                    .with_access_key_id(&resolved.access_key_id)
+                    .with_secret_access_key(&resolved.secret_access_key)
+                    .with_virtual_hosted_style_request(true);
+                if let Some(token) = &resolved.session_token {
+                    builder = builder.with_token(token);
+                }
             }
             let store = builder.build().with_context(|| {
                 format!("failed to build S3 object store for bucket '{bucket}'")
@@ -2425,23 +2471,53 @@ impl StorageFactory for S3ConfiguredStorageFactory {
 }
 
 /// The S3 FileIO property map the OpenDAL storage factory reads from the
-/// catalog's props. Uses the resolved (temporary) credentials; virtual-host
-/// addressing (path-style FALSE) is required for AWS S3 Tables.
-fn s3_file_io_props(resolved: &ResolvedS3Credentials) -> HashMap<String, String> {
+/// catalog's props.
+///
+/// Without an endpoint override this uses the resolved (temporary) AWS
+/// credentials and virtual-host addressing (path-style FALSE), as required by
+/// AWS S3 Tables. With an override (`data_endpoint`) — a local Verglas cache —
+/// data-file I/O is instead pointed at the override endpoint with its own keys,
+/// path-style addressing (TRUE), and plain HTTP allowed; the AWS session token
+/// is dropped since the endpoint authenticates with the override keys. Only
+/// data-file reads are affected; the catalog transport is separate.
+fn s3_file_io_props(
+    resolved: &ResolvedS3Credentials,
+    data_endpoint: Option<&DataEndpointOverride>,
+) -> HashMap<String, String> {
     let mut props = HashMap::new();
     props.insert("s3.region".to_string(), resolved.region.clone());
-    props.insert(
-        "s3.access-key-id".to_string(),
-        resolved.access_key_id.clone(),
-    );
-    props.insert(
-        "s3.secret-access-key".to_string(),
-        resolved.secret_access_key.clone(),
-    );
-    if let Some(token) = &resolved.session_token {
-        props.insert("s3.session-token".to_string(), token.clone());
+    match data_endpoint {
+        Some(endpoint) => {
+            props.insert("s3.endpoint".to_string(), endpoint.endpoint.clone());
+            props.insert(
+                "s3.access-key-id".to_string(),
+                endpoint.access_key_id.clone(),
+            );
+            props.insert(
+                "s3.secret-access-key".to_string(),
+                endpoint.secret_access_key.clone(),
+            );
+            props.insert("s3.path-style-access".to_string(), "true".to_string());
+            props.insert(
+                "s3.allow-http".to_string(),
+                endpoint.endpoint.starts_with("http://").to_string(),
+            );
+        }
+        None => {
+            props.insert(
+                "s3.access-key-id".to_string(),
+                resolved.access_key_id.clone(),
+            );
+            props.insert(
+                "s3.secret-access-key".to_string(),
+                resolved.secret_access_key.clone(),
+            );
+            if let Some(token) = &resolved.session_token {
+                props.insert("s3.session-token".to_string(), token.clone());
+            }
+            props.insert("s3.path-style-access".to_string(), "false".to_string());
+        }
     }
-    props.insert("s3.path-style-access".to_string(), "false".to_string());
     props
 }
 
@@ -3632,5 +3708,66 @@ mod tests {
         assert!(out[0].fields.contains_key("usymbol"));
         assert!(!out[0].fields.contains_key("norm_edge"));
         assert!(!out[0].fields.contains_key("unused_payload"));
+    }
+
+    fn sample_resolved() -> ResolvedS3Credentials {
+        ResolvedS3Credentials {
+            region: "us-west-2".to_string(),
+            access_key_id: "AWS_AKID".to_string(),
+            secret_access_key: "AWS_SECRET".to_string(),
+            session_token: Some("AWS_TOKEN".to_string()),
+        }
+    }
+
+    /// Without an endpoint override the FileIO props carry the resolved AWS
+    /// credentials + session token and virtual-host addressing — the production
+    /// default, provably unchanged.
+    #[test]
+    fn s3_file_io_props_without_override_uses_aws_credentials() {
+        let props = s3_file_io_props(&sample_resolved(), None);
+        assert_eq!(props.get("s3.region").unwrap(), "us-west-2");
+        assert_eq!(props.get("s3.access-key-id").unwrap(), "AWS_AKID");
+        assert_eq!(props.get("s3.secret-access-key").unwrap(), "AWS_SECRET");
+        assert_eq!(props.get("s3.session-token").unwrap(), "AWS_TOKEN");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "false");
+        assert!(!props.contains_key("s3.endpoint"));
+        assert!(!props.contains_key("s3.allow-http"));
+    }
+
+    /// With an http (loopback) override the FileIO props point at the endpoint
+    /// with the override keys, path-style TRUE, http allowed, and NO AWS session
+    /// token — data-file I/O is redirected to the cache; the region is retained.
+    #[test]
+    fn s3_file_io_props_with_http_override_redirects_to_endpoint() {
+        let endpoint = DataEndpointOverride {
+            endpoint: "http://127.0.0.1:8333".to_string(),
+            access_key_id: "VG_KEY".to_string(),
+            secret_access_key: "VG_SECRET".to_string(),
+        };
+        let props = s3_file_io_props(&sample_resolved(), Some(&endpoint));
+        assert_eq!(props.get("s3.region").unwrap(), "us-west-2");
+        assert_eq!(props.get("s3.endpoint").unwrap(), "http://127.0.0.1:8333");
+        assert_eq!(props.get("s3.access-key-id").unwrap(), "VG_KEY");
+        assert_eq!(props.get("s3.secret-access-key").unwrap(), "VG_SECRET");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "true");
+        assert_eq!(props.get("s3.allow-http").unwrap(), "true");
+        // The AWS session token must not leak into the override path.
+        assert!(!props.contains_key("s3.session-token"));
+    }
+
+    /// An https override still redirects but does not allow plain http.
+    #[test]
+    fn s3_file_io_props_with_https_override_disallows_http() {
+        let endpoint = DataEndpointOverride {
+            endpoint: "https://cache.internal:8333".to_string(),
+            access_key_id: "VG_KEY".to_string(),
+            secret_access_key: "VG_SECRET".to_string(),
+        };
+        let props = s3_file_io_props(&sample_resolved(), Some(&endpoint));
+        assert_eq!(props.get("s3.allow-http").unwrap(), "false");
+        assert_eq!(
+            props.get("s3.endpoint").unwrap(),
+            "https://cache.internal:8333"
+        );
     }
 }

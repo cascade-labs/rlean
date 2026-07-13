@@ -16,6 +16,9 @@ matching CLI flag. Precedence is **CLI flag > env var > config file**.
 | `data_sigv4_region` | `RLEAN_DATA_SIGV4_REGION` | `--data-sigv4-region` | no       | SigV4 signing region (turns on signing) |
 | `data_sigv4_name`   | `RLEAN_DATA_SIGV4_NAME`   | `--data-sigv4-name`   | no       | SigV4 signing name (default `s3tables`) |
 | `data_namespace`    | `RLEAN_DATA_NAMESPACE`    | `--data-namespace`    | no       | Iceberg namespace (default `lean`) |
+| `data_s3_endpoint`  | `RLEAN_DATA_S3_ENDPOINT`  | `--data-s3-endpoint`  | no       | Data-plane S3 endpoint for data-file reads (e.g. a local Verglas cache `http://127.0.0.1:8333`). Catalog traffic still goes to AWS |
+| `data_s3_access_key_id`     | `RLEAN_DATA_S3_ACCESS_KEY_ID`     | —  | no | Access key id for `data_s3_endpoint` (endpoint-issued key, NOT an AWS key) |
+| `data_s3_secret_access_key` | `RLEAN_DATA_S3_SECRET_ACCESS_KEY` | —  | no | Secret access key for `data_s3_endpoint` (endpoint-issued key, NOT an AWS key) |
 
 When `data_sigv4_region` is unset the catalog is used unsigned (plain / OAuth
 REST catalog, e.g. a local mock). When it is set, catalog requests are signed
@@ -60,6 +63,32 @@ by setting `RLEAN_TEST_CATALOG` (+ `RLEAN_TEST_WAREHOUSE`, optional
 selects the namespace and defaults to `lean_dev` — an isolated scratch namespace
 that never touches the production `lean` tables.
 
-## Future work
+## Local Verglas cache (data-file read-through)
 
-Verglas read-through caching for the catalog is a planned follow-up (#49).
+Data files (the Parquet the catalog points at) can be read through a local
+[Verglas](https://github.com/cascade-labs/verglas) read-through cache instead of
+straight from AWS S3. Set `data_s3_endpoint` to the daemon's S3 endpoint plus
+the two endpoint keys it issued:
+
+```
+data_s3_endpoint=http://127.0.0.1:8333
+data_s3_access_key_id=<verglas endpoint access key id>
+data_s3_secret_access_key=<verglas endpoint secret>
+```
+
+The endpoint keys are Verglas-issued loopback keys, not AWS credentials. When
+the endpoint is set, rlean points **data-file I/O only** at it — the Iceberg S3
+FileIO and every DataFusion object store get the endpoint, the endpoint keys,
+path-style addressing, and (for an `http://` loopback endpoint) plain HTTP —
+while catalog requests keep going, SigV4-signed, to AWS S3 Tables through the
+in-process proxy. The catalog's AWS credential resolution is unchanged.
+
+The override is host-local: it is deliberately **not** propagated to remote
+nodes by `rlean cloud install` (a node's loopback is a different machine with no
+such cache), so fleet nodes read data files directly from AWS.
+
+When `data_s3_endpoint` is unset (the production default) behavior is identical
+to reading data files directly from AWS. Precedence for all three keys is the
+usual **CLI flag > env var > config file** (only the endpoint has a CLI flag;
+the keys are env/config only). The override activates only when the endpoint and
+both keys resolve; a missing key leaves it off.

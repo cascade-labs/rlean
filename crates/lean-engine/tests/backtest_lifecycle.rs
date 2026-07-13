@@ -58,6 +58,7 @@ async fn connect_test_store() -> Option<Arc<IcebergStore>> {
             sigv4,
             namespace,
             data_refresh_secs: 0,
+            data_endpoint: None,
         })
         .await
         .expect("failed to connect to the test REST catalog"),

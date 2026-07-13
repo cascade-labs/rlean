@@ -88,6 +88,36 @@ pub struct GlobalConfig {
     )]
     pub data_refresh_secs: Option<u64>,
 
+    /// Optional data-plane S3 endpoint for Iceberg **data-file** reads, e.g. a
+    /// local Verglas read-through cache (`http://127.0.0.1:8333`). When set,
+    /// data-file I/O is routed here with `data_s3_access_key_id` /
+    /// `data_s3_secret_access_key`; catalog traffic still goes (signed) to AWS.
+    /// Unset => data files are read directly from AWS S3 (production default).
+    #[serde(
+        default,
+        rename = "data_s3_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_endpoint: Option<String>,
+
+    /// Access key id for `data_s3_endpoint` (a cache-endpoint key, NOT an AWS
+    /// key). Only used when `data_s3_endpoint` is set.
+    #[serde(
+        default,
+        rename = "data_s3_access_key_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_access_key_id: Option<String>,
+
+    /// Secret access key for `data_s3_endpoint` (a cache-endpoint key, NOT an
+    /// AWS key). Only used when `data_s3_endpoint` is set.
+    #[serde(
+        default,
+        rename = "data_s3_secret_access_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_secret_access_key: Option<String>,
+
     #[serde(
         default,
         rename = "s3_access_key",

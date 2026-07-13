@@ -5,8 +5,8 @@ use lean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi,
 pub use lean_sdk::research::IndicatorResult;
 use lean_sdk::research::{date_str_from_ns, ResearchBackend};
 use lean_storage::{
-    IcebergStore, QueryParams, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
-    DEFAULT_NAMESPACE,
+    DataEndpointOverride, IcebergStore, QueryParams, RestCatalogConfig, SigV4Config,
+    DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -79,12 +79,27 @@ fn catalog_config_from_env() -> anyhow::Result<RestCatalogConfig> {
     let data_refresh_secs = env_var("RLEAN_DATA_REFRESH_SECS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
+    let data_endpoint = match (
+        env_var("RLEAN_DATA_S3_ENDPOINT"),
+        env_var("RLEAN_DATA_S3_ACCESS_KEY_ID"),
+        env_var("RLEAN_DATA_S3_SECRET_ACCESS_KEY"),
+    ) {
+        (Some(endpoint), Some(access_key_id), Some(secret_access_key)) => {
+            Some(DataEndpointOverride {
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            })
+        }
+        _ => None,
+    };
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs,
+        data_endpoint,
     })
 }
 

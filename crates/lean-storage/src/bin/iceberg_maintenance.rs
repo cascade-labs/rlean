@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lean_storage::{
-    IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
+    DataEndpointOverride, IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
+    DEFAULT_NAMESPACE,
 };
 
 #[derive(Parser)]
@@ -66,6 +67,10 @@ const DEFAULT_TABLES: &[&str] = &[
 ///   region is set)
 /// - `RLEAN_DATA_NAMESPACE`   Iceberg namespace holding the cache tables
 ///   (defaults to `lean`)
+/// - `RLEAN_DATA_S3_ENDPOINT` optional data-plane S3 endpoint override for
+///   data-file reads (e.g. a local Verglas cache `http://127.0.0.1:8333`);
+///   requires `RLEAN_DATA_S3_ACCESS_KEY_ID` + `RLEAN_DATA_S3_SECRET_ACCESS_KEY`
+///   (endpoint keys, not AWS keys). Catalog traffic is unaffected.
 fn config_from_env() -> Result<RestCatalogConfig> {
     let uri = std::env::var("RLEAN_DATA_CATALOG")
         .context("RLEAN_DATA_CATALOG must be set to the REST catalog base URI")?;
@@ -88,12 +93,31 @@ fn config_from_env() -> Result<RestCatalogConfig> {
         }
         _ => None,
     };
+    let data_endpoint = data_endpoint_from_env();
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
+        data_endpoint,
+    })
+}
+
+/// Read the optional data-plane S3 endpoint override from the environment. The
+/// override is active only when the endpoint and both endpoint keys are set;
+/// missing keys leave it off (data files read directly from AWS).
+fn data_endpoint_from_env() -> Option<DataEndpointOverride> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    Some(DataEndpointOverride {
+        endpoint: read("RLEAN_DATA_S3_ENDPOINT")?,
+        access_key_id: read("RLEAN_DATA_S3_ACCESS_KEY_ID")?,
+        secret_access_key: read("RLEAN_DATA_S3_SECRET_ACCESS_KEY")?,
     })
 }
 

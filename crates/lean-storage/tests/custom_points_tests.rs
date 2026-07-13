@@ -311,6 +311,7 @@ async fn connect_test_store_with_refresh(data_refresh_secs: u64) -> Option<Icebe
             sigv4,
             namespace,
             data_refresh_secs,
+            data_endpoint: None,
         })
         .await
         .expect("failed to connect to the test REST catalog"),
