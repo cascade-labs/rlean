@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lean_storage::{IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_NAMESPACE};
+use lean_storage::{
+    IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
+};
 
 #[derive(Parser)]
 #[command(about = "Inspect and maintain rlean Iceberg cache tables (REST catalog)")]
@@ -91,6 +93,7 @@ fn config_from_env() -> Result<RestCatalogConfig> {
         warehouse,
         sigv4,
         namespace,
+        data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
     })
 }
 

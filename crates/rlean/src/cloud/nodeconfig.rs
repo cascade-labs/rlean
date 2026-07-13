@@ -42,6 +42,9 @@ pub(crate) fn node_config_from_local(
         data_sigv4_region: local.data_sigv4_region.clone(),
         data_sigv4_name: local.data_sigv4_name.clone(),
         data_namespace: local.data_namespace.clone(),
+        // Carry the snapshot-refresh interval so fleet nodes see cross-process
+        // commits on the same cadence as the control machine.
+        data_refresh_secs: local.data_refresh_secs,
         // Local `s3_*` connection settings are the control machine's; the node
         // relays via `artifact_s3*`, so leave the plain `s3_*` block empty.
         s3_access_key: None,
@@ -74,6 +77,7 @@ mod tests {
             data_sigv4_region: Some("us-west-2".to_string()),
             data_sigv4_name: None,
             data_namespace: None,
+            data_refresh_secs: Some(45),
             s3_access_key: Some("LOCALKEY".to_string()),
             s3_secret_key: Some("LOCALSECRET".to_string()),
             s3_bucket: Some("local-bucket".to_string()),
@@ -100,6 +104,8 @@ mod tests {
             Some("https://s3tables.us-west-2.amazonaws.com/iceberg")
         );
         assert_eq!(node.data_sigv4_region.as_deref(), Some("us-west-2"));
+        // The snapshot-refresh interval is shared fleet-wide.
+        assert_eq!(node.data_refresh_secs, Some(45));
         assert_eq!(node.artifact_store.as_deref(), Some("mirror"));
         assert_eq!(
             node.data_folder.as_deref(),

@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use arrow::compute;
@@ -71,6 +72,15 @@ const CATALOG_NAME: &str = "rlean";
 /// want the default.
 pub const DEFAULT_NAMESPACE: &str = "lean";
 
+/// Default staleness recheck interval for cached table snapshots, in seconds.
+///
+/// Before reusing a cached DataFusion context or partition index, the store
+/// re-reads the table's current metadata location from the catalog and rebuilds
+/// if another process committed. To avoid a catalog round-trip on every scan,
+/// that check runs at most once per this many seconds per table; within the
+/// window the cached snapshot is trusted. `0` rechecks on every read.
+pub const DEFAULT_DATA_REFRESH_SECS: u64 = 30;
+
 pub const MARKET_TRADE_BARS: &str = "market_trade_bars";
 pub const MARKET_QUOTE_BARS: &str = "market_quote_bars";
 pub const MARKET_TICKS: &str = "market_ticks";
@@ -105,6 +115,10 @@ pub struct RestCatalogConfig {
     /// tests and scratch environments point this at an isolated namespace so
     /// they never touch the production tables.
     pub namespace: String,
+    /// How often (seconds) a cached table snapshot is rechecked against the
+    /// catalog for commits made by other processes. See
+    /// [`DEFAULT_DATA_REFRESH_SECS`]. `0` rechecks on every read.
+    pub data_refresh_secs: u64,
 }
 
 impl Default for RestCatalogConfig {
@@ -114,6 +128,7 @@ impl Default for RestCatalogConfig {
             warehouse: String::new(),
             sigv4: None,
             namespace: DEFAULT_NAMESPACE.to_string(),
+            data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
         }
     }
 }
@@ -159,14 +174,43 @@ pub struct IcebergStore {
     /// `None` for a non-AWS (unsigned) REST catalog, where the trait
     /// `drop_table` works.
     purge_dropper: Option<PurgeDropper>,
+    /// Staleness recheck interval for cached table snapshots. See
+    /// [`RestCatalogConfig::data_refresh_secs`].
+    data_refresh: Duration,
     table_contexts: Arc<Mutex<HashMap<String, Arc<IcebergTableContext>>>>,
-    partition_indexes: Arc<Mutex<HashMap<String, Arc<MarketPartitionIndex>>>>,
-    custom_partition_indexes: Arc<Mutex<HashMap<String, Arc<CustomPartitionIndex>>>>,
+    partition_indexes: Arc<Mutex<HashMap<String, CachedMarketIndex>>>,
+    custom_partition_indexes: Arc<Mutex<HashMap<String, CachedCustomIndex>>>,
     table_write_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 struct IcebergTableContext {
     ctx: SessionContext,
+    /// Catalog metadata location this context's external table was built from.
+    /// A cached context is reused only while the catalog still reports this same
+    /// location; a different location means another process committed and the
+    /// context is rebuilt.
+    metadata_location: String,
+    /// Last time this entry's `metadata_location` was checked against the
+    /// catalog. Throttles the staleness recheck to at most once per
+    /// [`IcebergStore::data_refresh`] window. `Mutex` so the throttle timestamp
+    /// can be bumped through the `Arc`-shared cached context without rebuilding.
+    last_checked: Mutex<Instant>,
+}
+
+/// A cached [`MarketPartitionIndex`] plus the metadata location it was built
+/// from and the last time that location was rechecked against the catalog.
+struct CachedMarketIndex {
+    index: Arc<MarketPartitionIndex>,
+    metadata_location: String,
+    last_checked: Instant,
+}
+
+/// A cached [`CustomPartitionIndex`] plus its build-time metadata location and
+/// last recheck instant.
+struct CachedCustomIndex {
+    index: Arc<CustomPartitionIndex>,
+    metadata_location: String,
+    last_checked: Instant,
 }
 
 /// Issues purge-enabled table drops against an AWS S3 Tables REST catalog.
@@ -332,6 +376,7 @@ impl IcebergStore {
             s3_credentials,
             _sigv4_proxy: proxy_guard,
             purge_dropper,
+            data_refresh: Duration::from_secs(config.data_refresh_secs),
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
             partition_indexes: Arc::new(Mutex::new(HashMap::new())),
             custom_partition_indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -647,24 +692,9 @@ impl IcebergStore {
         &self,
         query: MarketPartitionDayQuery<'_>,
     ) -> Result<BTreeSet<i32>> {
-        let cached_index = {
-            let indexes = self
-                .partition_indexes
-                .lock()
-                .expect("iceberg partition index cache poisoned");
-            indexes.get(query.table).cloned()
-        };
-        if let Some(index) = cached_index {
-            return Ok(index.days_for(
-                query.security_type,
-                query.market,
-                query.resolution,
-                query.symbol_sid,
-                query.day_range.start,
-                query.day_range.end,
-            ));
-        }
-
+        // Route through `market_partition_index` so the staleness recheck runs;
+        // it returns the cached index cheaply inside the TTL window and rebuilds
+        // when another process has committed.
         let index = self.market_partition_index(query.table).await?;
         Ok(index.days_for(
             query.security_type,
@@ -1860,6 +1890,13 @@ impl IcebergStore {
             .clone()
     }
 
+    /// Whether a cached entry last checked at `last_checked` is still inside the
+    /// staleness recheck window and may be trusted without a catalog round-trip.
+    /// A zero `data_refresh` always forces a recheck.
+    fn within_refresh_window(&self, last_checked: Instant) -> bool {
+        !self.data_refresh.is_zero() && last_checked.elapsed() < self.data_refresh
+    }
+
     async fn table_df(&self, table: &str) -> Result<DataFrame> {
         let cached_context = {
             let contexts = self
@@ -1869,7 +1906,34 @@ impl IcebergStore {
             contexts.get(table).cloned()
         };
         if let Some(cached) = cached_context {
-            return Ok(cached.ctx.table(table).await?);
+            // Within the TTL window the cached snapshot is trusted outright.
+            // Copy the timestamp out and drop the guard before any `.await` so
+            // the future stays `Send`.
+            let last_checked = *cached
+                .last_checked
+                .lock()
+                .expect("iceberg table context timestamp poisoned");
+            if self.within_refresh_window(last_checked) {
+                return Ok(cached.ctx.table(table).await?);
+            }
+            // TTL elapsed: recheck the catalog. Unchanged metadata location means
+            // no other process committed, so bump the timestamp and reuse the
+            // cached context; a changed location falls through to a rebuild.
+            let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+            let metadata_location = catalog_table
+                .metadata_location_result()
+                .map_err(|err| anyhow!(err))?
+                .to_string();
+            if metadata_location == cached.metadata_location {
+                *cached
+                    .last_checked
+                    .lock()
+                    .expect("iceberg table context timestamp poisoned") = Instant::now();
+                return Ok(cached.ctx.table(table).await?);
+            }
+            return self
+                .build_and_cache_table_context(table, metadata_location)
+                .await;
         }
 
         let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
@@ -1877,6 +1941,18 @@ impl IcebergStore {
             .metadata_location_result()
             .map_err(|err| anyhow!(err))?
             .to_string();
+        self.build_and_cache_table_context(table, metadata_location)
+            .await
+    }
+
+    /// Build a fresh DataFusion external table at `metadata_location`, cache it
+    /// keyed by `table`, and return a `DataFrame` for it. Called on a cold cache
+    /// and when a staleness recheck finds the catalog moved to a new snapshot.
+    async fn build_and_cache_table_context(
+        &self,
+        table: &str,
+        metadata_location: String,
+    ) -> Result<DataFrame> {
         let mut state = SessionStateBuilder::new().with_default_features().build();
         state.table_factories_mut().insert(
             "ICEBERG".to_string(),
@@ -1895,7 +1971,11 @@ impl IcebergStore {
             metadata_location.replace('\'', "''")
         );
         ctx.sql(&sql).await?.collect().await?;
-        let cached = Arc::new(IcebergTableContext { ctx });
+        let cached = Arc::new(IcebergTableContext {
+            ctx,
+            metadata_location,
+            last_checked: Mutex::new(Instant::now()),
+        });
         self.table_contexts
             .lock()
             .expect("iceberg table context cache poisoned")
@@ -1922,18 +2002,67 @@ impl IcebergStore {
     }
 
     async fn market_partition_index(&self, table: &str) -> Result<Arc<MarketPartitionIndex>> {
-        let cached_index = {
+        let cached = {
             let indexes = self
                 .partition_indexes
                 .lock()
                 .expect("iceberg partition index cache poisoned");
-            indexes.get(table).cloned()
+            indexes.get(table).map(|entry| {
+                (
+                    entry.index.clone(),
+                    entry.metadata_location.clone(),
+                    entry.last_checked,
+                )
+            })
         };
-        if let Some(cached) = cached_index {
-            return Ok(cached);
+        if let Some((index, metadata_location, last_checked)) = cached {
+            // Trust the cached index inside the TTL window.
+            if self.within_refresh_window(last_checked) {
+                return Ok(index);
+            }
+            // TTL elapsed: recheck the catalog. An unchanged metadata location
+            // means the index is still current, so bump the timestamp and reuse
+            // it; a moved snapshot forces a full rebuild below.
+            let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+            let current_location = catalog_table
+                .metadata_location_result()
+                .map_err(|err| anyhow!(err))?
+                .to_string();
+            if current_location == metadata_location {
+                let mut indexes = self
+                    .partition_indexes
+                    .lock()
+                    .expect("iceberg partition index cache poisoned");
+                if let Some(entry) = indexes.get_mut(table) {
+                    entry.last_checked = Instant::now();
+                }
+                return Ok(index);
+            }
+            return self
+                .build_and_cache_market_index(table, catalog_table, current_location)
+                .await;
         }
 
         let catalog_table = self.catalog.load_table(&self.ident(table)).await?;
+        let metadata_location = catalog_table
+            .metadata_location_result()
+            .map_err(|err| anyhow!(err))?
+            .to_string();
+        self.build_and_cache_market_index(table, catalog_table, metadata_location)
+            .await
+    }
+
+    /// Fully rebuild the market partition index for `table` from the loaded
+    /// catalog snapshot and cache it with `metadata_location`. Called on a cold
+    /// cache and when a staleness recheck finds the snapshot moved. A full
+    /// rebuild (re-planning every file) keeps correctness simple; see the PR
+    /// note on an incremental follow-up for the large market tables.
+    async fn build_and_cache_market_index(
+        &self,
+        table: &str,
+        catalog_table: iceberg::table::Table,
+        metadata_location: String,
+    ) -> Result<Arc<MarketPartitionIndex>> {
         let snapshot_id = catalog_table.metadata().current_snapshot_id();
         let mut index = MarketPartitionIndex::new(snapshot_id);
         let default_spec = catalog_table
@@ -1950,23 +2079,71 @@ impl IcebergStore {
         self.partition_indexes
             .lock()
             .expect("iceberg partition index cache poisoned")
-            .insert(table.to_string(), index.clone());
+            .insert(
+                table.to_string(),
+                CachedMarketIndex {
+                    index: index.clone(),
+                    metadata_location,
+                    last_checked: Instant::now(),
+                },
+            );
         Ok(index)
     }
 
     async fn custom_partition_index(&self) -> Result<Arc<CustomPartitionIndex>> {
-        let cached_index = {
+        let cached = {
             let indexes = self
                 .custom_partition_indexes
                 .lock()
                 .expect("iceberg custom partition index cache poisoned");
-            indexes.get(CUSTOM_POINTS).cloned()
+            indexes.get(CUSTOM_POINTS).map(|entry| {
+                (
+                    entry.index.clone(),
+                    entry.metadata_location.clone(),
+                    entry.last_checked,
+                )
+            })
         };
-        if let Some(cached) = cached_index {
-            return Ok(cached);
+        if let Some((index, metadata_location, last_checked)) = cached {
+            if self.within_refresh_window(last_checked) {
+                return Ok(index);
+            }
+            let catalog_table = self.catalog.load_table(&self.ident(CUSTOM_POINTS)).await?;
+            let current_location = catalog_table
+                .metadata_location_result()
+                .map_err(|err| anyhow!(err))?
+                .to_string();
+            if current_location == metadata_location {
+                let mut indexes = self
+                    .custom_partition_indexes
+                    .lock()
+                    .expect("iceberg custom partition index cache poisoned");
+                if let Some(entry) = indexes.get_mut(CUSTOM_POINTS) {
+                    entry.last_checked = Instant::now();
+                }
+                return Ok(index);
+            }
+            return self
+                .build_and_cache_custom_index(catalog_table, current_location)
+                .await;
         }
 
         let catalog_table = self.catalog.load_table(&self.ident(CUSTOM_POINTS)).await?;
+        let metadata_location = catalog_table
+            .metadata_location_result()
+            .map_err(|err| anyhow!(err))?
+            .to_string();
+        self.build_and_cache_custom_index(catalog_table, metadata_location)
+            .await
+    }
+
+    /// Fully rebuild the custom-points partition index from the loaded catalog
+    /// snapshot and cache it with `metadata_location`.
+    async fn build_and_cache_custom_index(
+        &self,
+        catalog_table: iceberg::table::Table,
+        metadata_location: String,
+    ) -> Result<Arc<CustomPartitionIndex>> {
         let snapshot_id = catalog_table.metadata().current_snapshot_id();
         let mut index = CustomPartitionIndex::new(snapshot_id);
         let default_spec = catalog_table
@@ -1983,7 +2160,14 @@ impl IcebergStore {
         self.custom_partition_indexes
             .lock()
             .expect("iceberg custom partition index cache poisoned")
-            .insert(CUSTOM_POINTS.to_string(), index.clone());
+            .insert(
+                CUSTOM_POINTS.to_string(),
+                CachedCustomIndex {
+                    index: index.clone(),
+                    metadata_location,
+                    last_checked: Instant::now(),
+                },
+            );
         Ok(index)
     }
 
@@ -2039,6 +2223,10 @@ impl IcebergStore {
             return Ok(());
         }
         let table_ref = self.catalog.load_table(&self.ident(table)).await?;
+        let metadata_location = table_ref
+            .metadata_location_result()
+            .map_err(|err| anyhow!(err))?
+            .to_string();
         let metadata = table_ref.metadata();
         let snapshot_id = metadata.current_snapshot_id();
         let spec = metadata.default_partition_spec().as_ref().clone();
@@ -2047,12 +2235,19 @@ impl IcebergStore {
             .lock()
             .expect("iceberg partition index cache poisoned");
         if let Some(existing) = indexes.get(table) {
-            let mut updated = existing.as_ref().clone();
+            let mut updated = existing.index.as_ref().clone();
             updated.snapshot_id = snapshot_id;
             for data_file in data_files {
                 updated.insert_data_file(data_file, &spec)?;
             }
-            indexes.insert(table.to_string(), Arc::new(updated));
+            indexes.insert(
+                table.to_string(),
+                CachedMarketIndex {
+                    index: Arc::new(updated),
+                    metadata_location,
+                    last_checked: Instant::now(),
+                },
+            );
         }
         Ok(())
     }
@@ -2066,6 +2261,10 @@ impl IcebergStore {
             return Ok(());
         }
         let table_ref = self.catalog.load_table(&self.ident(table)).await?;
+        let metadata_location = table_ref
+            .metadata_location_result()
+            .map_err(|err| anyhow!(err))?
+            .to_string();
         let metadata = table_ref.metadata();
         let snapshot_id = metadata.current_snapshot_id();
         let spec = metadata.default_partition_spec().as_ref().clone();
@@ -2074,12 +2273,19 @@ impl IcebergStore {
             .lock()
             .expect("iceberg custom partition index cache poisoned");
         if let Some(existing) = indexes.get(table) {
-            let mut updated = existing.as_ref().clone();
+            let mut updated = existing.index.as_ref().clone();
             updated.snapshot_id = snapshot_id;
             for data_file in data_files {
                 updated.insert_data_file(data_file, &spec)?;
             }
-            indexes.insert(table.to_string(), Arc::new(updated));
+            indexes.insert(
+                table.to_string(),
+                CachedCustomIndex {
+                    index: Arc::new(updated),
+                    metadata_location,
+                    last_checked: Instant::now(),
+                },
+            );
         }
         Ok(())
     }

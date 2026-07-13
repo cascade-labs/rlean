@@ -10,6 +10,7 @@
 ///   data_sigv4_region           SigV4 signing region (e.g. us-west-2)
 ///   data_sigv4_name             SigV4 signing name (default s3tables)
 ///   data_namespace              Iceberg namespace for cache tables (default lean)
+///   data_refresh_secs           Snapshot recheck interval, seconds (default 30, 0 = every read)
 ///   data-folder                 Parquet data root (relative to rlean.json)
 ///   s3_access_key               S3-compatible access key
 ///   s3_secret_key               S3-compatible secret key
@@ -116,6 +117,18 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             cfg.save()?;
             println!("Set {key} = {value} in ~/.rlean/config");
         }
+        "data_refresh_secs" => {
+            let parsed: u64 = value.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "data_refresh_secs must be a non-negative integer number of seconds \
+                     (0 rechecks every read), got '{value}'"
+                )
+            })?;
+            let mut cfg = GlobalConfig::load()?;
+            cfg.data_refresh_secs = Some(parsed);
+            cfg.save()?;
+            println!("Set data_refresh_secs = {parsed} in ~/.rlean/config");
+        }
         "artifact_store" => {
             if lean_engine::ArtifactStoreMode::parse(value).is_none() {
                 bail!(
@@ -179,6 +192,13 @@ fn cmd_get(key: &str) -> Result<()> {
                 None => println!("(not set)"),
             }
         }
+        "data_refresh_secs" => {
+            let cfg = GlobalConfig::load()?;
+            match cfg.data_refresh_secs {
+                Some(value) => println!("{value}"),
+                None => println!("(not set)"),
+            }
+        }
         "artifact_store" => {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
@@ -225,6 +245,9 @@ fn cmd_list() -> Result<()> {
         if let Some(value) = get_catalog_key(&global, key)? {
             println!("{:<30} {}", key, value);
         }
+    }
+    if let Some(secs) = global.data_refresh_secs {
+        println!("{:<30} {}", "data_refresh_secs", secs);
     }
     println!("{:<30} {}", "data-folder", data_folder);
     if let Some(mode) = &global.artifact_store {
@@ -299,7 +322,7 @@ fn effective_data_folder_display(start: &Path) -> Result<String> {
 fn unknown_key_message(key: &str) -> String {
     format!(
         "Unknown key '{key}'. Known keys: default-language, data_catalog, data_warehouse, \
-         data_sigv4_region, data_sigv4_name, data_namespace, data-folder, \
+         data_sigv4_region, data_sigv4_name, data_namespace, data_refresh_secs, data-folder, \
          s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
          artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
          artifact_s3_access_key, artifact_s3_secret_key. \

@@ -4,7 +4,10 @@ use lean_data::TradeBar;
 use lean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi, Sma};
 pub use lean_sdk::research::IndicatorResult;
 use lean_sdk::research::{date_str_from_ns, ResearchBackend};
-use lean_storage::{IcebergStore, QueryParams, RestCatalogConfig, SigV4Config, DEFAULT_NAMESPACE};
+use lean_storage::{
+    IcebergStore, QueryParams, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
+    DEFAULT_NAMESPACE,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -73,11 +76,15 @@ fn catalog_config_from_env() -> anyhow::Result<RestCatalogConfig> {
     });
     let namespace =
         env_var("RLEAN_DATA_NAMESPACE").unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+    let data_refresh_secs = env_var("RLEAN_DATA_REFRESH_SECS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
+        data_refresh_secs,
     })
 }
 
