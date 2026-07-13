@@ -2217,7 +2217,8 @@ impl SubscriptionProducerState {
             let kept: Vec<CustomDataPoint> = points
                 .into_iter()
                 .filter(|point| {
-                    point.time >= self.start.date_utc() && point.time <= self.end.date_utc()
+                    let day = point.time.date_utc();
+                    day >= self.start.date_utc() && day <= self.end.date_utc()
                 })
                 .collect();
             tracing::info!(
@@ -2622,13 +2623,8 @@ fn custom_data_http_client() -> reqwest::Client {
 }
 
 fn custom_data_frontier(point: &CustomDataPoint) -> DateTime {
-    point.end_time.unwrap_or_else(|| {
-        point
-            .time
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is valid")
-            .into()
-    })
+    // LEAN gates custom-data emission on `EndTime` (`EmitTimeUtc`), never null.
+    point.end_time
 }
 
 fn custom_point_in_date_window(
@@ -3049,8 +3045,8 @@ mod tests {
         ) -> Option<Result<Vec<CustomDataPoint>, String>> {
             let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
             Some(Ok(vec![CustomDataPoint::empty(
-                day,
-                Some(dt(day, 16, 0)),
+                dt(day, 16, 0),
+                dt(day, 16, 0),
                 dec!(42),
             )]))
         }
@@ -3609,12 +3605,12 @@ mod tests {
         let first = SubscriptionDataPoint::CustomData {
             symbol: symbol.clone(),
             ticker: "SNAPSHOT".to_string(),
-            point: CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(1)),
+            point: CustomDataPoint::empty(dt(day, 16, 0), dt(day, 16, 0), dec!(1)),
         };
         let second = SubscriptionDataPoint::CustomData {
             symbol,
             ticker: "SNAPSHOT".to_string(),
-            point: CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(2)),
+            point: CustomDataPoint::empty(dt(day, 16, 0), dt(day, 16, 0), dec!(2)),
         };
 
         stream.stage_loaded_points(vec![first, second]);
@@ -4050,8 +4046,8 @@ mod tests {
                 "fixture",
                 "ALT",
                 &[
-                    CustomDataPoint::empty(first_day, Some(dt(first_day, 16, 0)), dec!(10)),
-                    CustomDataPoint::empty(second_day, Some(dt(second_day, 16, 0)), dec!(11)),
+                    CustomDataPoint::empty(dt(first_day, 16, 0), dt(first_day, 16, 0), dec!(10)),
+                    CustomDataPoint::empty(dt(second_day, 16, 0), dt(second_day, 16, 0), dec!(11)),
                 ],
             )
             .await
@@ -4105,7 +4101,11 @@ mod tests {
             .append_custom_points(
                 "fixture",
                 "ALT",
-                &[CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(10))],
+                &[CustomDataPoint::empty(
+                    dt(day, 16, 0),
+                    dt(day, 16, 0),
+                    dec!(10),
+                )],
             )
             .await
             .unwrap();
@@ -4167,7 +4167,7 @@ mod tests {
                 "fixture",
                 "ALT",
                 &[
-                    CustomDataPoint::new(day, Some(dt(day, 16, 0)), dec!(10), fields)
+                    CustomDataPoint::new(dt(day, 16, 0), dt(day, 16, 0), dec!(10), fields)
                         .with_symbol(Some("AAPL".to_string())),
                 ],
             )
@@ -4801,8 +4801,8 @@ mod tests {
     fn custom_point_matches_query_filters_on_point_symbol() {
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let point = CustomDataPoint::new(
-            day,
-            Some(dt(day, 16, 0)),
+            dt(day, 16, 0),
+            dt(day, 16, 0),
             dec!(1),
             std::collections::HashMap::new(),
         )
@@ -4822,8 +4822,8 @@ mod tests {
 
         // A point without a canonical symbol never matches a symbol filter.
         let symbolless = CustomDataPoint::new(
-            day,
-            Some(dt(day, 16, 0)),
+            dt(day, 16, 0),
+            dt(day, 16, 0),
             dec!(1),
             std::collections::HashMap::new(),
         );

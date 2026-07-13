@@ -166,15 +166,8 @@ impl CustomDataHistoryColumns {
             .collect();
 
         Self {
-            time: points.iter().map(|p| p.time.to_string()).collect(),
-            end_time: points
-                .iter()
-                .map(|p| {
-                    p.end_time
-                        .map(iso_string)
-                        .unwrap_or_else(|| p.time.to_string())
-                })
-                .collect(),
+            time: points.iter().map(|p| iso_string(p.time)).collect(),
+            end_time: points.iter().map(|p| iso_string(p.end_time)).collect(),
             value: points
                 .iter()
                 .map(|p| p.value.to_f64().unwrap_or(0.0))
@@ -205,10 +198,7 @@ pub fn date_to_datetime(date: NaiveDate, h: u32, m: u32, s: u32) -> DateTime {
 }
 
 fn custom_point_sort_key(point: &CustomDataPoint) -> i64 {
-    point
-        .end_time
-        .map(|t| t.0)
-        .unwrap_or_else(|| date_to_datetime(point.time, 0, 0, 0).0)
+    point.end_time.0
 }
 
 pub fn filter_custom_points_by_last_dates(
@@ -221,7 +211,7 @@ pub fn filter_custom_points_by_last_dates(
 
     let mut dates: Vec<NaiveDate> = points
         .iter()
-        .map(|p| p.end_time.map(|t| t.date_utc()).unwrap_or(p.time))
+        .map(|p| p.end_time.date_utc())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -233,7 +223,7 @@ pub fn filter_custom_points_by_last_dates(
     let keep: BTreeSet<NaiveDate> = dates.into_iter().collect();
     points
         .into_iter()
-        .filter(|p| keep.contains(&p.end_time.map(|t| t.date_utc()).unwrap_or(p.time)))
+        .filter(|p| keep.contains(&p.end_time.date_utc()))
         .collect()
 }
 
@@ -265,9 +255,10 @@ mod tests {
     }
 
     fn point(day: u32, value: i64, fields: HashMap<String, serde_json::Value>) -> CustomDataPoint {
+        let end_time = date_to_datetime(date(2024, 1, day), 16, 0, 0);
         CustomDataPoint {
-            time: date(2024, 1, day),
-            end_time: Some(date_to_datetime(date(2024, 1, day), 16, 0, 0)),
+            time: end_time,
+            end_time,
             value: Decimal::from(value),
             symbol: None,
             fields: Arc::new(fields),
@@ -305,7 +296,11 @@ mod tests {
             None,
         );
 
-        assert_eq!(columns.time, vec!["2024-01-01", "2024-01-02"]);
+        // `time` is now a full LEAN timestamp (BaseData.Time), not a bare date.
+        assert_eq!(
+            columns.time,
+            vec!["2024-01-01T16:00:00", "2024-01-02T16:00:00"]
+        );
         assert_eq!(columns.value, vec![10.0, 20.0]);
         assert_eq!(columns.fields[0].0, "alpha");
         assert_eq!(columns.fields[0].1, vec![Some(json!("a")), None]);
@@ -325,9 +320,9 @@ mod tests {
         let kept = filter_custom_points_by_last_dates(points, 2);
 
         assert_eq!(kept.len(), 3);
-        assert_eq!(kept[0].time, date(2024, 1, 2));
-        assert_eq!(kept[1].time, date(2024, 1, 2));
-        assert_eq!(kept[2].time, date(2024, 1, 3));
+        assert_eq!(kept[0].time.date_utc(), date(2024, 1, 2));
+        assert_eq!(kept[1].time.date_utc(), date(2024, 1, 2));
+        assert_eq!(kept[2].time.date_utc(), date(2024, 1, 3));
         assert!(filter_custom_points_by_last_dates(kept, 0).is_empty());
     }
 }

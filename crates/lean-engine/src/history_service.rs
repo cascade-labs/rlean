@@ -201,7 +201,7 @@ impl HistoryService {
         if let Some(custom_config) = configs.iter().find(|config| config.custom.is_some()) {
             let mut points =
                 self.load_custom_history_between_blocking(custom_config, start, end)?;
-            points.sort_by_key(|point| point.end_time.map(|time| time.0).unwrap_or_default());
+            points.sort_by_key(|point| point.end_time.0);
             if points.len() > periods {
                 points = points[points.len() - periods..].to_vec();
             }
@@ -310,13 +310,11 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
         columns
             .get_mut("time")
             .unwrap()
-            .push(point.time.to_string());
-        columns.get_mut("end_time").unwrap().push(
-            point
-                .end_time
-                .map(|time| time.to_utc().to_rfc3339())
-                .unwrap_or_else(|| point.time.to_string()),
-        );
+            .push(point.time.to_utc().to_rfc3339());
+        columns
+            .get_mut("end_time")
+            .unwrap()
+            .push(point.end_time.to_utc().to_rfc3339());
         columns
             .get_mut("value")
             .unwrap()
@@ -550,7 +548,11 @@ mod tests {
             date: NaiveDate,
             _config: &CustomDataConfig,
         ) -> Option<CustomDataPoint> {
-            Some(CustomDataPoint::empty(date, Some(dt(date, 16, 0)), dec!(7)))
+            Some(CustomDataPoint::empty(
+                dt(date, 16, 0),
+                dt(date, 16, 0),
+                dec!(7),
+            ))
         }
     }
 
@@ -701,12 +703,21 @@ mod tests {
 
     #[test]
     fn custom_history_count_is_sorted_by_end_time_like_lean() {
-        let first =
-            CustomDataPoint::empty(day(2024, 9, 27), Some(dt(day(2024, 9, 27), 10, 0)), dec!(1));
-        let second =
-            CustomDataPoint::empty(day(2024, 9, 30), Some(dt(day(2024, 9, 30), 11, 0)), dec!(2));
-        let third =
-            CustomDataPoint::empty(day(2024, 10, 1), Some(dt(day(2024, 10, 1), 17, 0)), dec!(3));
+        let first = CustomDataPoint::empty(
+            dt(day(2024, 9, 27), 10, 0),
+            dt(day(2024, 9, 27), 10, 0),
+            dec!(1),
+        );
+        let second = CustomDataPoint::empty(
+            dt(day(2024, 9, 30), 11, 0),
+            dt(day(2024, 9, 30), 11, 0),
+            dec!(2),
+        );
+        let third = CustomDataPoint::empty(
+            dt(day(2024, 10, 1), 17, 0),
+            dt(day(2024, 10, 1), 17, 0),
+            dec!(3),
+        );
         let columns = custom_points_to_columns(&[first, second, third]);
 
         assert_eq!(

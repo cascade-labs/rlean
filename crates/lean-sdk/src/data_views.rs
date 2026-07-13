@@ -483,18 +483,16 @@ impl CustomDataPointView {
     pub fn value(&self) -> f64 {
         decimal_to_f64(self.point.value)
     }
-    pub fn time(&self) -> chrono::NaiveDate {
-        self.point.time
+    /// Period start (LEAN `BaseData.Time`) in exchange-local time.
+    pub fn time(&self) -> chrono::NaiveDateTime {
+        ns_to_exchange_naive(self.point.time.0)
     }
-    pub fn end_time_ns(&self) -> Option<i64> {
-        self.point.end_time.map(|time| time.0)
+    pub fn end_time_ns(&self) -> i64 {
+        self.point.end_time.0
     }
-    /// Emission/end time in exchange-local time. Falls back to midnight of the
-    /// point's date when no explicit end time is present.
+    /// Emission/end time (LEAN `BaseData.EndTime`) in exchange-local time.
     pub fn end_time(&self) -> chrono::NaiveDateTime {
-        self.end_time_ns()
-            .map(ns_to_exchange_naive)
-            .unwrap_or_else(|| self.time().and_hms_opt(0, 0, 0).unwrap_or_default())
+        ns_to_exchange_naive(self.end_time_ns())
     }
     pub fn fields(&self) -> &HashMap<String, serde_json::Value> {
         &self.point.fields
@@ -710,16 +708,17 @@ mod tests {
     #[test]
     fn custom_data_view_normalizes_keys_and_returns_latest() {
         let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 3).unwrap();
+        let stamp = lean_core::DateTime::from(date.and_hms_opt(16, 0, 0).unwrap());
         let first = CustomDataPoint {
-            time: date,
-            end_time: None,
+            time: stamp,
+            end_time: stamp,
             value: dec!(1),
             symbol: None,
             fields: Arc::new(HashMap::new()),
         };
         let second = CustomDataPoint {
-            time: date,
-            end_time: None,
+            time: stamp,
+            end_time: stamp,
             value: dec!(2),
             symbol: None,
             fields: Arc::new(HashMap::new()),
@@ -793,28 +792,45 @@ mod tests {
     }
 
     #[test]
-    fn custom_data_point_view_end_time_falls_back_to_midnight() {
+    fn custom_data_point_view_exposes_time_and_end_time_in_exchange_local() {
+        // 2025-09-03 20:00 UTC == 16:00 US/Eastern (EDT). `time` and `end_time`
+        // are both the real LEAN timestamps — no midnight fallback (#31/#81).
         let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 3).unwrap();
+        let time = lean_core::DateTime::from(date.and_hms_opt(20, 0, 0).unwrap());
+        let end_time = time + lean_core::TimeSpan::from_days(1);
         let point = CustomDataPoint {
-            time: date,
-            end_time: None,
+            time,
+            end_time,
             value: dec!(1),
             symbol: None,
             fields: Arc::new(HashMap::new()),
         };
         let view = CustomDataPointView::new(point);
-        assert_eq!(view.end_time(), date.and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(
+            view.time(),
+            date.and_hms_opt(16, 0, 0).unwrap(),
+            "time is exchange-local period start"
+        );
+        assert_eq!(
+            view.end_time(),
+            chrono::NaiveDate::from_ymd_opt(2025, 9, 4)
+                .unwrap()
+                .and_hms_opt(16, 0, 0)
+                .unwrap(),
+            "end_time is exchange-local emission gate (time + 1 day)"
+        );
     }
 
     #[test]
     fn slice_view_has_data_includes_custom_data() {
         let date = chrono::NaiveDate::from_ymd_opt(2025, 9, 3).unwrap();
         let mut slice = Slice::new(lean_core::DateTime::EPOCH);
+        let stamp = lean_core::DateTime::from(date.and_hms_opt(16, 0, 0).unwrap());
         slice.custom_data.insert(
             "macro".to_string(),
             vec![CustomDataPoint {
-                time: date,
-                end_time: None,
+                time: stamp,
+                end_time: stamp,
                 value: dec!(1),
                 symbol: None,
                 fields: Arc::new(HashMap::new()),

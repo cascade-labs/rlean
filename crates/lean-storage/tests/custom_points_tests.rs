@@ -32,7 +32,8 @@ fn point(date: NaiveDate, value: i64, symbol: Option<&str>) -> CustomDataPoint {
             serde_json::Value::String(symbol.to_string()),
         );
     }
-    CustomDataPoint::new(date, Some(end_time(date)), Decimal::from(value), fields)
+    let stamp = end_time(date);
+    CustomDataPoint::new(stamp, stamp, Decimal::from(value), fields)
         .with_symbol(symbol.map(str::to_string))
 }
 
@@ -104,7 +105,8 @@ fn snapshot_row(date: NaiveDate, symbol: &str) -> CustomDataPoint {
         "usymbol".to_string(),
         serde_json::Value::String(symbol.to_string()),
     );
-    CustomDataPoint::new(date, Some(end_time(date)), Decimal::from(1), fields)
+    let stamp = end_time(date);
+    CustomDataPoint::new(stamp, stamp, Decimal::from(1), fields)
         .with_symbol(Some(symbol.to_string()))
 }
 
@@ -166,7 +168,8 @@ async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
                 "usymbol".to_string(),
                 serde_json::Value::String(sym.to_string()),
             );
-            CustomDataPoint::new(date, Some(end_time(date)), Decimal::from(1), fields)
+            let stamp = end_time(date);
+            CustomDataPoint::new(stamp, stamp, Decimal::from(1), fields)
                 .with_symbol(Some(sym.to_string()))
         })
         .collect();

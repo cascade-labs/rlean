@@ -115,13 +115,7 @@ impl LiveDataItem {
             Self::MarginInterestRate(rate) => rate.time,
             Self::PerpetualContext(context) => context.time,
             Self::OrderBook(book) => book.time,
-            Self::CustomData { point, .. } => point.end_time.unwrap_or_else(|| {
-                point
-                    .time
-                    .and_hms_opt(0, 0, 0)
-                    .expect("midnight is valid")
-                    .into()
-            }),
+            Self::CustomData { point, .. } => point.time,
             Self::UniverseData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }
@@ -135,13 +129,7 @@ impl LiveDataItem {
             Self::MarginInterestRate(rate) => rate.time,
             Self::PerpetualContext(context) => context.end_time,
             Self::OrderBook(book) => book.time,
-            Self::CustomData { point, .. } => point.end_time.unwrap_or_else(|| {
-                point
-                    .time
-                    .and_hms_opt(0, 0, 0)
-                    .expect("midnight is valid")
-                    .into()
-            }),
+            Self::CustomData { point, .. } => point.end_time,
             Self::UniverseData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }

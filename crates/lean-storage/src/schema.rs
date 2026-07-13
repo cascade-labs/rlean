@@ -241,16 +241,18 @@ pub struct OptionUniverseRow {
 
 /// Arrow schema for custom data point Parquet cache files.
 ///
-/// Layout: `{root}/custom/{source_type}/{ticker_lower}/{YYYYMMDD}.parquet`
+/// Layout: `{root}/custom/{provider}/{feed_lower}/{YYYYMMDD}.parquet`
 ///
-/// Columns:
-/// - `date_ns`    — nanoseconds since Unix epoch (midnight UTC) for the data point date
-/// - `value`      — primary scalar value (Float64)
-/// - `fields_json`— JSON-encoded extra fields map (Utf8)
-/// - `symbol`     — canonical UPPERCASE underlying ticker (Utf8, nullable)
+/// Columns (mirroring LEAN `BaseData`'s two time fields):
+/// - `time_ns` — ns since Unix epoch (UTC) for the period **start** (LEAN `BaseData.Time`)
+/// - `end_time_ns` — ns since Unix epoch (UTC) for the period **end** / emission gate (LEAN `BaseData.EndTime`); NOT NULL, so a point is never surfaced before this instant
+/// - `value` — primary scalar value (Float64)
+/// - `fields_json` — JSON-encoded extra fields map (Utf8)
+/// - `symbol` — canonical UPPERCASE underlying ticker (Utf8, nullable)
 pub fn custom_data_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("date_ns", DataType::Int64, false),
+        Field::new("time_ns", DataType::Int64, false),
+        Field::new("end_time_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("fields_json", DataType::Utf8, false),
         Field::new("symbol", DataType::Utf8, true),
