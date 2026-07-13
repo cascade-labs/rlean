@@ -27,11 +27,25 @@
 //!   [`CHECKPOINT_INTERVAL`] so a long run does not hammer S3, and
 //!   [`RunArtifactSink::flush_all`] on completion uploads the final state. A run
 //!   that dies mid-way therefore leaves its last checkpoint in S3.
-//! - **Live** calls [`RunArtifactSink::mirror`] on every snapshot. Each upload
-//!   runs as its own short-lived task on a dedicated runtime, bounded by
-//!   [`LIVE_QUEUE_CAPACITY`] in-flight slots and capped at [`UPLOAD_TIMEOUT`]
-//!   per upload; when every slot is taken (S3 slow or down) further uploads
-//!   are dropped with a WARN — the live loop never blocks on S3.
+//! - **Live**: the deployment writer calls [`RunArtifactSink::mirror`] only on
+//!   state changes (fills, trades, insight events — debounced), at process
+//!   start, at calendar-day rollover, and via `flush_all` on clean shutdown —
+//!   not on every snapshot (see `MirrorPolicy` in `live::deployment_writer`),
+//!   so a quiet live instance enqueues nothing. Beneath that, uploads are
+//!   **latest-wins per file**: at most one upload is ever in flight for a given
+//!   file name, plus at most one pending "dirty" flag. `mirror` on a file that
+//!   is already uploading just sets the dirty flag and returns (coalescing) —
+//!   it never blocks the live loop. When an in-flight upload finishes (success,
+//!   error, or [`UPLOAD_TIMEOUT`]), if the file was marked dirty it re-reads the
+//!   file and uploads the newest contents, so the mirror always converges to the
+//!   latest state of every file once the endpoint is healthy. A separate bound
+//!   ([`LIVE_QUEUE_CAPACITY`] distinct in-flight files) stops hundreds of
+//!   *distinct* files from stampeding. Per-event drop/failure/timeout logs are
+//!   emitted at `debug`; a periodic INFO summary (at most once per
+//!   [`LIVE_SUMMARY_INTERVAL`]) reports succeeded / failed / timed-out /
+//!   coalesced counts since the last summary, and a one-line INFO announces
+//!   recovery on the first success after any failure — so an unhealthy-then-
+//!   healed endpoint tells a clear story in live.log without per-event spam.
 //!   [`RunArtifactSink::flush_all`] on clean shutdown waits (bounded) for
 //!   in-flight uploads and then uploads the final state of every file.
 //!
@@ -62,15 +76,24 @@ use object_store::{ObjectStore, PutPayload};
 /// throttled to this cadence. `flush_all` on completion bypasses the throttle.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Bound on concurrent in-flight live uploads. When every slot is taken,
-/// further mirror requests are dropped with a WARN rather than blocking the
-/// live loop.
+/// Bound on the number of *distinct* files that may have an upload in flight
+/// at once. Live uploads are latest-wins per file (at most one in-flight upload
+/// plus one dirty flag per file), so duplicates of the same file can never
+/// stampede; this cap only stops hundreds of *distinct* files from doing so.
+/// When it is reached a further first-touch of a new file is dropped at `debug`
+/// (and counted) rather than blocking the live loop.
 pub const LIVE_QUEUE_CAPACITY: usize = 256;
 
 /// Upper bound on a single live artifact upload. A hung endpoint (stalled
 /// connection, aggressive retry loop) releases its in-flight slot after this
-/// long and logs a WARN instead of silently wedging the pipeline.
+/// long and logs at `debug` instead of silently wedging the pipeline.
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum spacing between periodic INFO summaries of live upload health. Rather
+/// than a WARN per dropped/failed upload, the live sink accumulates counts and
+/// emits at most one summary line per interval (plus an immediate recovery line
+/// on the first success after any failure).
+pub const LIVE_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Credentials / endpoint for an S3-compatible object store. Works against AWS
 /// and any S3-compatible endpoint (OCI, MinIO, etc.) via a custom endpoint URL.
@@ -132,10 +155,9 @@ struct S3Relay {
     store: Arc<dyn ObjectStore>,
     /// `<prefix>/<project>/<backtests|live>/<run-id>` — files are appended.
     key_base: String,
-    /// Present for live sinks: bounds concurrent background uploads. Each
-    /// upload runs as its own short-lived task on the upload runtime, so a
-    /// single hung upload can never stall the others.
-    live_inflight: Option<Arc<tokio::sync::Semaphore>>,
+    /// Present for live sinks: latest-wins per-file upload accounting shared
+    /// with the background upload tasks.
+    live: Option<Arc<LiveMirror>>,
 }
 
 impl S3Relay {
@@ -149,6 +171,216 @@ impl S3Relay {
         let path = ObjectPath::from(key.to_string());
         self.store.put(&path, PutPayload::from(bytes)).await?;
         Ok(())
+    }
+}
+
+/// Per-file upload state under the live mirror lock.
+#[derive(Default)]
+struct FileUploadState {
+    /// An upload task for this file is currently running.
+    in_flight: bool,
+    /// The file changed while an upload was in flight; re-upload the newest
+    /// contents when the current upload finishes. At most one pending flag.
+    dirty: bool,
+}
+
+/// Counters accumulated between periodic summaries. Reset each time a summary
+/// is emitted.
+#[derive(Default)]
+struct LiveStats {
+    succeeded: u64,
+    failed: u64,
+    timed_out: u64,
+    coalesced: u64,
+    dropped: u64,
+}
+
+impl LiveStats {
+    fn any_activity(&self) -> bool {
+        self.succeeded != 0
+            || self.failed != 0
+            || self.timed_out != 0
+            || self.coalesced != 0
+            || self.dropped != 0
+    }
+
+    fn any_trouble(&self) -> bool {
+        self.failed != 0 || self.timed_out != 0 || self.dropped != 0
+    }
+}
+
+/// Mutable state shared between `mirror_live` and the background upload tasks.
+struct LiveState {
+    /// Per-file in-flight / dirty accounting.
+    files: std::collections::HashMap<String, FileUploadState>,
+    /// Number of distinct files with an upload in flight, bounded by
+    /// [`LIVE_QUEUE_CAPACITY`].
+    inflight_files: usize,
+    /// Counters since the last summary.
+    stats: LiveStats,
+    /// Consecutive upload failures (error or timeout) not yet followed by a
+    /// success. Non-zero means the endpoint is currently unhealthy; the next
+    /// success emits a recovery line.
+    failures_since_success: u64,
+    /// When the last periodic summary was emitted.
+    last_summary: Instant,
+}
+
+impl Default for LiveState {
+    fn default() -> Self {
+        Self {
+            files: std::collections::HashMap::new(),
+            inflight_files: 0,
+            stats: LiveStats::default(),
+            failures_since_success: 0,
+            last_summary: Instant::now(),
+        }
+    }
+}
+
+/// Latest-wins per-file live upload coordinator. Holds the shared state behind
+/// a mutex so `mirror_live` and finishing upload tasks agree on what is in
+/// flight and what still needs uploading.
+struct LiveMirror {
+    state: Mutex<LiveState>,
+}
+
+/// Outcome of a single live upload attempt, used to update stats/health.
+enum UploadOutcome {
+    Ok,
+    Failed,
+    TimedOut,
+}
+
+impl LiveMirror {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LiveState::default()),
+        }
+    }
+
+    /// Try to begin an upload for `file_name`. Returns `true` if the caller now
+    /// owns the (single) in-flight slot for this file and must drive an upload;
+    /// `false` if it coalesced into an already-running upload or was dropped
+    /// because the distinct-file cap is full.
+    fn begin(&self, file_name: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.files.get_mut(file_name) {
+            if entry.in_flight {
+                // Already uploading: mark dirty (idempotent) and coalesce.
+                if !entry.dirty {
+                    entry.dirty = true;
+                }
+                state.stats.coalesced += 1;
+                return false;
+            }
+        }
+        if state.inflight_files >= LIVE_QUEUE_CAPACITY {
+            // Too many *distinct* files in flight. Drop this first-touch rather
+            // than block the live loop.
+            state.stats.dropped += 1;
+            return false;
+        }
+        let entry = state.files.entry(file_name.to_string()).or_default();
+        entry.in_flight = true;
+        entry.dirty = false;
+        state.inflight_files += 1;
+        true
+    }
+
+    /// Record an upload result and decide whether this file needs another pass
+    /// (because it was marked dirty mid-flight). Returns `true` if the caller
+    /// should immediately re-upload the newest contents of `file_name` while
+    /// keeping the in-flight slot; `false` if the slot is now released.
+    fn finish(&self, file_name: &str, outcome: UploadOutcome) -> bool {
+        let mut recovery: Option<String> = None;
+        let requeue;
+        let summary;
+        {
+            let mut state = self.state.lock().unwrap();
+            match outcome {
+                UploadOutcome::Ok => {
+                    state.stats.succeeded += 1;
+                    if state.failures_since_success != 0 {
+                        recovery = Some(format!(
+                            "live artifact S3 mirror recovered after {} failed upload(s)",
+                            state.failures_since_success
+                        ));
+                        state.failures_since_success = 0;
+                    }
+                }
+                UploadOutcome::Failed => {
+                    state.stats.failed += 1;
+                    state.failures_since_success += 1;
+                }
+                UploadOutcome::TimedOut => {
+                    state.stats.timed_out += 1;
+                    state.failures_since_success += 1;
+                }
+            }
+
+            let dirty = state.files.get(file_name).map(|e| e.dirty).unwrap_or(false);
+            if dirty {
+                // Keep the in-flight slot; re-upload the newest contents.
+                if let Some(entry) = state.files.get_mut(file_name) {
+                    entry.dirty = false;
+                    entry.in_flight = true;
+                }
+                requeue = true;
+            } else {
+                if let Some(entry) = state.files.get_mut(file_name) {
+                    entry.in_flight = false;
+                }
+                state.inflight_files = state.inflight_files.saturating_sub(1);
+                requeue = false;
+            }
+
+            summary = Self::maybe_take_summary(&mut state);
+        }
+        if let Some(line) = recovery {
+            tracing::info!("{line}");
+        }
+        if let Some(line) = summary {
+            tracing::info!("{line}");
+        }
+        requeue
+    }
+
+    /// If enough time has passed since the last summary and there was activity,
+    /// format the summary line and reset the counters. Returns the line to log
+    /// (outside the lock).
+    fn maybe_take_summary(state: &mut LiveState) -> Option<String> {
+        if state.last_summary.elapsed() < LIVE_SUMMARY_INTERVAL {
+            return None;
+        }
+        if !state.stats.any_activity() {
+            state.last_summary = Instant::now();
+            return None;
+        }
+        let s = &state.stats;
+        let line = format!(
+            "live artifact S3 mirror: {} succeeded, {} failed, {} timed out, {} coalesced, {} dropped in the last {:?}{}",
+            s.succeeded,
+            s.failed,
+            s.timed_out,
+            s.coalesced,
+            s.dropped,
+            LIVE_SUMMARY_INTERVAL,
+            if state.stats.any_trouble() && state.failures_since_success != 0 {
+                " (endpoint still degraded)"
+            } else {
+                ""
+            }
+        );
+        state.stats = LiveStats::default();
+        state.last_summary = Instant::now();
+        Some(line)
+    }
+
+    /// True when no uploads are in flight — used by `flush_all` to wait for the
+    /// mirror to quiesce.
+    fn is_idle(&self) -> bool {
+        self.state.lock().unwrap().inflight_files == 0
     }
 }
 
@@ -255,16 +487,15 @@ impl RunArtifactSink {
         // exist before the first mirror call.
         let _ = upload_runtime();
 
-        // Live sinks bound concurrent background uploads with a semaphore.
-        // Each upload is its own short-lived task (matching the backtest
-        // checkpoint path), so a hung upload only wedges its own slot.
-        let live_inflight = (kind == RunKind::Live)
-            .then(|| Arc::new(tokio::sync::Semaphore::new(LIVE_QUEUE_CAPACITY)));
+        // Live sinks coordinate latest-wins per-file uploads: at most one
+        // upload in flight per file plus one pending dirty flag, so duplicate
+        // snapshots of the same file coalesce instead of stampeding the queue.
+        let live = (kind == RunKind::Live).then(|| Arc::new(LiveMirror::new()));
 
         let relay = Arc::new(S3Relay {
             store,
             key_base,
-            live_inflight,
+            live,
         });
         tracing::info!(
             "artifact S3 mirroring active: mode={:?} kind={:?} key_base={}",
@@ -311,13 +542,15 @@ impl RunArtifactSink {
     /// - Local mode: no-op.
     /// - Backtest (Mirror/S3): throttled — uploads at most once per
     ///   [`CHECKPOINT_INTERVAL`] per file. Reads the current file contents.
-    /// - Live (Mirror/S3): spawns a bounded background upload of the current
-    ///   file contents; drops with a WARN if all in-flight slots are taken.
+    /// - Live (Mirror/S3): latest-wins. If no upload is in flight for this file
+    ///   it spawns a background upload of the current contents; if one is
+    ///   already running it just marks the file dirty and returns (the finishing
+    ///   task re-uploads the newest contents). Never blocks the caller.
     pub fn mirror(&self, file_name: &str) {
         let Some(relay) = self.relay.as_ref() else {
             return;
         };
-        if relay.live_inflight.is_some() {
+        if relay.live.is_some() {
             self.mirror_live(relay, file_name);
         } else {
             self.mirror_checkpoint(relay, file_name);
@@ -325,32 +558,52 @@ impl RunArtifactSink {
     }
 
     fn mirror_live(&self, relay: &Arc<S3Relay>, file_name: &str) {
-        let Some(semaphore) = relay.live_inflight.clone() else {
+        let Some(live) = relay.live.clone() else {
             return;
         };
-        let key = relay.key_for(file_name);
-        // Bounded and non-blocking: if too many uploads are already in flight
-        // (S3 slow or down), drop this snapshot and warn. The live loop must
-        // never wait on S3.
-        let Ok(permit) = semaphore.try_acquire_owned() else {
-            tracing::warn!("live artifact S3 queue full; dropping upload of {key}");
+        // Latest-wins accounting: if an upload is already in flight for this
+        // file we only mark it dirty (coalesce) and return; otherwise we claim
+        // the single in-flight slot for this file and drive the upload. Either
+        // way the live loop never waits on S3.
+        if !live.begin(file_name) {
             return;
-        };
-        let Some(bytes) = self.read_working_file(file_name) else {
-            return;
-        };
+        }
         let relay = relay.clone();
+        let working_dir = self.working_dir.clone();
+        let file_name = file_name.to_string();
         upload_runtime().spawn(async move {
-            let _permit = permit;
-            match tokio::time::timeout(UPLOAD_TIMEOUT, relay.put(&key, bytes)).await {
-                Ok(Ok(())) => tracing::debug!("live artifact uploaded: {key}"),
-                Ok(Err(err)) => {
-                    tracing::warn!("live artifact S3 upload failed for {key}: {err}");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "live artifact S3 upload timed out for {key} after {UPLOAD_TIMEOUT:?}"
-                    );
+            // Loop so a file marked dirty mid-flight is re-uploaded with its
+            // newest contents without releasing the in-flight slot.
+            loop {
+                let key = relay.key_for(&file_name);
+                // Read the latest contents at upload time (not enqueue time).
+                let Some(bytes) = std::fs::read(working_dir.join(&file_name)).ok() else {
+                    // File vanished; treat as a completed (no-op) upload so the
+                    // slot is released and any dirty flag re-evaluated.
+                    if live.finish(&file_name, UploadOutcome::Ok) {
+                        continue;
+                    }
+                    break;
+                };
+                let outcome =
+                    match tokio::time::timeout(UPLOAD_TIMEOUT, relay.put(&key, bytes)).await {
+                        Ok(Ok(())) => {
+                            tracing::debug!("live artifact uploaded: {key}");
+                            UploadOutcome::Ok
+                        }
+                        Ok(Err(err)) => {
+                            tracing::debug!("live artifact S3 upload failed for {key}: {err}");
+                            UploadOutcome::Failed
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                            "live artifact S3 upload timed out for {key} after {UPLOAD_TIMEOUT:?}"
+                        );
+                            UploadOutcome::TimedOut
+                        }
+                    };
+                if !live.finish(&file_name, outcome) {
+                    break;
                 }
             }
         });
@@ -387,15 +640,16 @@ impl RunArtifactSink {
         };
 
         // Let in-flight live uploads finish first so they cannot race (and
-        // overwrite) the final full upload below. Bounded wait: a wedged
-        // upload times out on its own and must not hang shutdown.
-        if let Some(semaphore) = relay.live_inflight.clone() {
-            let _ = run_blocking(async move {
-                tokio::time::timeout(
-                    UPLOAD_TIMEOUT,
-                    semaphore.acquire_many_owned(LIVE_QUEUE_CAPACITY as u32),
-                )
-                .await
+        // overwrite) the final full upload below. Bounded wait: a wedged upload
+        // times out on its own (UPLOAD_TIMEOUT) and must not hang shutdown, so
+        // we poll for the mirror to go idle up to one timeout's worth plus a
+        // small margin, then proceed regardless.
+        if let Some(live) = relay.live.clone() {
+            run_blocking(async move {
+                let deadline = Instant::now() + UPLOAD_TIMEOUT + Duration::from_secs(1);
+                while !live.is_idle() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
             });
         }
 
@@ -752,91 +1006,127 @@ mod tests {
         );
     }
 
+    /// A gated, optionally-failing object store used to drive the live upload
+    /// path deterministically. `put`s block on `gate` (a semaphore that starts
+    /// with zero permits) so a test can hold uploads in flight, count how many
+    /// PUTs were accepted, and inspect the payload of the last accepted PUT.
+    /// When `fail` is set, `put`s return an error instead of storing.
+    #[derive(Debug)]
+    struct GatedStore {
+        gate: Arc<tokio::sync::Semaphore>,
+        /// Incremented when a put *reaches* the store, before waiting on the
+        /// gate — counts distinct in-flight uploads even while they block.
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        /// Incremented when a put gets past the gate (i.e. actually completes).
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+        last_body: Arc<Mutex<Option<String>>>,
+    }
+
+    impl GatedStore {
+        fn new(gate: Arc<tokio::sync::Semaphore>) -> Self {
+            Self {
+                gate,
+                started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                accepted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_body: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl std::fmt::Display for GatedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GatedStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for GatedStore {
+        async fn put_opts(
+            &self,
+            _location: &ObjectPath,
+            payload: PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            use std::sync::atomic::Ordering;
+            self.started.fetch_add(1, Ordering::SeqCst);
+            // Wait for a permit so the test controls when a put completes. A
+            // closed gate returns Err and lets the put proceed (drain mode).
+            let _ = self.gate.acquire().await;
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "GatedStore",
+                    source: "injected failure".into(),
+                });
+            }
+            let bytes = payload.iter().flat_map(|b| b.to_vec()).collect::<Vec<u8>>();
+            *self.last_body.lock().unwrap() = Some(String::from_utf8(bytes).unwrap());
+            Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+        async fn put_multipart_opts(
+            &self,
+            _location: &ObjectPath,
+            _opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+        async fn get_opts(
+            &self,
+            _location: &ObjectPath,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+        async fn delete(&self, _location: &ObjectPath) -> object_store::Result<()> {
+            unimplemented!()
+        }
+        fn list(
+            &self,
+            _prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            futures::stream::empty().boxed()
+        }
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unimplemented!()
+        }
+        async fn copy(&self, _from: &ObjectPath, _to: &ObjectPath) -> object_store::Result<()> {
+            unimplemented!()
+        }
+        async fn copy_if_not_exists(
+            &self,
+            _from: &ObjectPath,
+            _to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn live_bounded_queue_drops_when_full() {
-        // A blocking store makes every upload hang so the queue fills up. The
-        // sink must drop excess mirror requests and never block the caller.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Debug)]
-        struct BlockingStore {
-            gate: Arc<tokio::sync::Semaphore>,
-            accepted: Arc<AtomicUsize>,
-        }
-
-        impl std::fmt::Display for BlockingStore {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "BlockingStore")
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl ObjectStore for BlockingStore {
-            async fn put_opts(
-                &self,
-                _location: &ObjectPath,
-                _payload: PutPayload,
-                _opts: object_store::PutOptions,
-            ) -> object_store::Result<object_store::PutResult> {
-                self.accepted.fetch_add(1, Ordering::SeqCst);
-                // Hang until the semaphore is closed — simulates a stalled S3.
-                let _ = self.gate.acquire().await;
-                Ok(object_store::PutResult {
-                    e_tag: None,
-                    version: None,
-                })
-            }
-            async fn put_multipart_opts(
-                &self,
-                _location: &ObjectPath,
-                _opts: object_store::PutMultipartOpts,
-            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-                unimplemented!()
-            }
-            async fn get_opts(
-                &self,
-                _location: &ObjectPath,
-                _options: object_store::GetOptions,
-            ) -> object_store::Result<object_store::GetResult> {
-                unimplemented!()
-            }
-            async fn delete(&self, _location: &ObjectPath) -> object_store::Result<()> {
-                unimplemented!()
-            }
-            fn list(
-                &self,
-                _prefix: Option<&ObjectPath>,
-            ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
-            {
-                futures::stream::empty().boxed()
-            }
-            async fn list_with_delimiter(
-                &self,
-                _prefix: Option<&ObjectPath>,
-            ) -> object_store::Result<object_store::ListResult> {
-                unimplemented!()
-            }
-            async fn copy(&self, _from: &ObjectPath, _to: &ObjectPath) -> object_store::Result<()> {
-                unimplemented!()
-            }
-            async fn copy_if_not_exists(
-                &self,
-                _from: &ObjectPath,
-                _to: &ObjectPath,
-            ) -> object_store::Result<()> {
-                unimplemented!()
-            }
-        }
+    async fn live_same_file_coalesces_and_converges_to_latest() {
+        // Many rapid mirrors of the SAME file against a gated (slow) store must
+        // produce only a bounded number of PUTs — one in flight plus a single
+        // coalesced dirty retry — never one per call. The caller never blocks,
+        // and once the store is released the final stored contents equal the
+        // LAST written version (latest-wins convergence).
+        use std::sync::atomic::Ordering;
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("live").join("deploy1");
         std::fs::create_dir_all(&dir).unwrap();
+        // Zero permits: the first put blocks until we release the gate.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let store = Arc::new(BlockingStore {
-            gate: gate.clone(),
-            accepted: accepted.clone(),
-        });
+        let store = Arc::new(GatedStore::new(gate.clone()));
+        let accepted = store.accepted.clone();
+        let last_body = store.last_body.clone();
         let sink = RunArtifactSink::with_store(
             ArtifactStoreMode::Mirror,
             RunKind::Live,
@@ -846,31 +1136,140 @@ mod tests {
             "runs",
             store,
         );
-        write_file(&dir, "portfolio.json", "snap");
 
-        // Fire many more mirrors than there are in-flight slots. Each call must
-        // return promptly (the loop finishing at all proves it never blocked).
-        for _ in 0..(LIVE_QUEUE_CAPACITY + 50) {
+        // Fire many mirrors of the same file. Each rewrites the file first.
+        for i in 0..500u32 {
+            write_file(&dir, "portfolio.json", &format!("v{i}"));
             sink.mirror("portfolio.json");
         }
-        // Exactly LIVE_QUEUE_CAPACITY uploads may start (each hangs on the
-        // gate); everything beyond was dropped without blocking. Wait for the
-        // spawned tasks to reach the store.
+        // The loop finishing at all proves the caller never blocked. With the
+        // gate closed (zero permits), exactly one put is in flight and blocked;
+        // all 499 further calls coalesced into a single dirty flag.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "no put should have completed while the gate is closed"
+        );
+
+        // Write the definitive last version, then release uploads. The in-flight
+        // upload completes (put #1), sees the dirty flag, and re-uploads the
+        // newest contents (put #2). Nowhere near 500 PUTs.
+        write_file(&dir, "portfolio.json", "final");
+        gate.add_permits(1000);
+        sink.flush_all();
+
+        let puts = accepted.load(Ordering::SeqCst);
+        assert!(
+            puts <= 4,
+            "expected a small bounded number of PUTs (1 in-flight + dirty retry + flush), got {puts}"
+        );
+        assert_eq!(last_body.lock().unwrap().clone(), Some("final".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_error_burst_then_heal_converges() {
+        // The store fails puts for a while, then heals. The mirror must keep
+        // accepting mirrors (no wedge, no per-event WARN) and converge to the
+        // latest contents once puts succeed again.
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("live").join("deploy1");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Plenty of permits so puts run immediately; they just fail at first.
+        let gate = Arc::new(tokio::sync::Semaphore::new(usize::MAX >> 4));
+        let store = Arc::new(GatedStore::new(gate.clone()));
+        let fail = store.fail.clone();
+        let accepted = store.accepted.clone();
+        let last_body = store.last_body.clone();
+        fail.store(true, Ordering::SeqCst);
+        let sink = RunArtifactSink::with_store(
+            ArtifactStoreMode::Mirror,
+            RunKind::Live,
+            dir.clone(),
+            "proj",
+            "deploy1",
+            "runs",
+            store,
+        );
+
+        // Burst of mirrors while the store is failing.
+        for i in 0..50u32 {
+            write_file(&dir, "portfolio.json", &format!("bad{i}"));
+            sink.mirror("portfolio.json");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Some puts were attempted and failed; the sink is not wedged.
         for _ in 0..200 {
-            if accepted.load(Ordering::SeqCst) >= LIVE_QUEUE_CAPACITY {
+            if accepted.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(accepted.load(Ordering::SeqCst) > 0, "puts were attempted");
+
+        // Heal the store and write the definitive latest contents, then mirror.
+        fail.store(false, Ordering::SeqCst);
+        write_file(&dir, "portfolio.json", "healed");
+        sink.mirror("portfolio.json");
+        sink.flush_all();
+
+        // Poll for convergence to the latest contents.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if last_body.lock().unwrap().clone() == Some("healed".to_string()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mirror never converged to latest contents after heal: {:?}",
+                last_body.lock().unwrap().clone()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_distinct_file_cap_drops_without_blocking() {
+        // Hundreds of DISTINCT files against a gated store fill the distinct-file
+        // cap. Beyond it, first-touches of new files are dropped (counted, not
+        // WARNed) and the caller never blocks.
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("live").join("deploy1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let store = Arc::new(GatedStore::new(gate.clone()));
+        let started = store.started.clone();
+        let sink = RunArtifactSink::with_store(
+            ArtifactStoreMode::Mirror,
+            RunKind::Live,
+            dir.clone(),
+            "proj",
+            "deploy1",
+            "runs",
+            store,
+        );
+
+        // Fire more distinct files than the cap; each blocks on the gate.
+        for i in 0..(LIVE_QUEUE_CAPACITY + 50) {
+            let name = format!("file{i}.json");
+            write_file(&dir, &name, "x");
+            sink.mirror(&name);
+        }
+        // At most LIVE_QUEUE_CAPACITY distinct uploads reach the store (each
+        // blocks on the gate); the rest were dropped without blocking the caller
+        // (the loop completing at all proves it).
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) >= LIVE_QUEUE_CAPACITY {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(accepted.load(Ordering::SeqCst), LIVE_QUEUE_CAPACITY);
+        assert_eq!(started.load(Ordering::SeqCst), LIVE_QUEUE_CAPACITY);
 
-        // With all slots wedged, another mirror is dropped immediately and
-        // never reaches the store.
-        sink.mirror("portfolio.json");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(accepted.load(Ordering::SeqCst), LIVE_QUEUE_CAPACITY);
-
-        // Release the gate so every wedged put completes, then flush.
         gate.close();
         sink.flush_all();
     }

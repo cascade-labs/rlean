@@ -9,6 +9,7 @@ use lean_orders::order_processor::OrderProcessor;
 use lean_orders::OrderEvent;
 use lean_statistics::Trade;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,47 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 pub const LIVE_INSIGHTS_SCHEMA_VERSION: u32 = 1;
+
+/// Debounce for state-change S3 mirrors. A burst of fills (or insight events)
+/// inside this window coalesces into one upload after the burst quiesces; the
+/// dirty files are uploaded by the first snapshot pass that runs after the
+/// window (the live loop polls every ~250ms, snapshots per data slice).
+pub const MIRROR_DEBOUNCE: Duration = Duration::from_secs(3);
+
+/// Restart-recovery artifacts mirrored when order events / trades changed
+/// since the last mirror (debounced by [`MIRROR_DEBOUNCE`]).
+const ORDER_STATE_FILES: [&str; 3] = ["orders.json", "order-events.jsonl", "trades.jsonl"];
+
+/// Insight-derived artifacts mirrored when the insight set changed — i.e. the
+/// framework drained insight events (emit/expire/close/restore) — debounced by
+/// [`MIRROR_DEBOUNCE`]. alpha-analytics.json belongs here: it is computed from
+/// closed insights, so it only changes when the insight set does.
+const INSIGHT_STATE_FILES: [&str; 3] = [
+    "insights.json",
+    "insight-events.jsonl",
+    "alpha-analytics.json",
+];
+
+/// PnL/status artifacts mirrored once at process start, once at each calendar
+/// day rollover (first snapshot of a new day, by slice time), and by the clean
+/// shutdown flush — never per slice.
+const EOD_FILES: [&str; 3] = ["portfolio.json", "progress.json", "heartbeat.log"];
+
+/// Tracks what has been mirrored so `record_snapshot` only enqueues S3 uploads
+/// on state changes, day rollover, and process start — a quiet live instance
+/// enqueues nothing.
+struct MirrorPolicy {
+    /// Order-event / trade counts as of the last time the order artifacts were
+    /// marked for upload.
+    order_events_seen: usize,
+    trades_seen: usize,
+    /// Calendar day (from slice time) of the last EOD-bucket mirror. `None`
+    /// until the process-start snapshot, which mirrors immediately.
+    last_eod_day: Option<chrono::NaiveDate>,
+    /// Files awaiting a debounced upload, keyed by name, with the time of the
+    /// most recent change (trailing debounce: new changes push the upload out).
+    dirty: HashMap<&'static str, Instant>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LiveInsightSnapshot {
@@ -51,10 +93,13 @@ pub struct LiveDeploymentWriter {
     heartbeat_path: PathBuf,
     started_at: chrono::DateTime<chrono::Utc>,
     last_heartbeat: Mutex<Instant>,
-    /// Optional artifact sink. When set, each snapshot write is mirrored to S3
-    /// asynchronously through the sink's bounded queue (drop-and-warn if S3 is
-    /// slow, so the live loop never blocks).
+    /// Optional artifact sink. When set, snapshot writes are mirrored to S3
+    /// asynchronously per [`MirrorPolicy`]: order/insight artifacts on state
+    /// change (debounced), PnL/status artifacts at start / day rollover /
+    /// shutdown. Local file writes are unconditional; only the S3 enqueue is
+    /// gated, and the sink itself never blocks the live loop.
     sink: Option<Arc<crate::artifacts::RunArtifactSink>>,
+    mirror_policy: Mutex<MirrorPolicy>,
 }
 
 impl LiveDeploymentWriter {
@@ -84,6 +129,12 @@ impl LiveDeploymentWriter {
             started_at: chrono::Utc::now(),
             last_heartbeat: Mutex::new(Instant::now() - Duration::from_secs(60)),
             sink: Some(sink),
+            mirror_policy: Mutex::new(MirrorPolicy {
+                order_events_seen: 0,
+                trades_seen: 0,
+                last_eod_day: None,
+                dirty: HashMap::new(),
+            }),
         };
         let ensure_exists = |path: &Path| {
             let _ = std::fs::OpenOptions::new()
@@ -201,7 +252,7 @@ impl LiveDeploymentWriter {
             "output": self.dir,
         });
         write_json_pretty_atomic(&self.progress_path, &progress_payload);
-        self.record_insight_snapshot(framework);
+        let insights_changed = self.record_insight_snapshot(framework);
         self.append_heartbeat(
             time,
             portfolio,
@@ -210,23 +261,71 @@ impl LiveDeploymentWriter {
             counts.trades,
         );
 
-        // Mirror this snapshot to S3 (no-op in local mode). Each mirror enqueues
-        // the current file on the sink's bounded queue; a slow/down S3 drops
-        // with a WARN rather than stalling the live loop.
-        self.mirror("portfolio.json");
-        self.mirror("orders.json");
-        self.mirror("progress.json");
-        self.mirror("order-events.jsonl");
-        self.mirror("trades.jsonl");
-        self.mirror("heartbeat.log");
+        // Local writes above are unconditional; S3 mirroring is gated so a
+        // quiet live instance enqueues nothing (see MirrorPolicy).
+        self.apply_mirror_policy(time, &counts, insights_changed);
     }
 
-    fn record_insight_snapshot(&self, framework: Option<&Arc<Mutex<FrameworkState>>>) {
-        let Some(framework) = framework else {
+    /// Decide which of this snapshot's files to enqueue for S3 upload.
+    ///
+    /// - Order/trade or insight state changes mark their file buckets dirty;
+    ///   dirty files upload once the change has quiesced for [`MIRROR_DEBOUNCE`]
+    ///   (checked on each snapshot pass, so a fill burst becomes one upload).
+    /// - The PnL/status bucket uploads immediately on the first snapshot of a
+    ///   new calendar day (slice time) and on the very first snapshot (process
+    ///   start). Clean shutdown uploads everything via `flush`.
+    fn apply_mirror_policy(
+        &self,
+        time: DateTime,
+        counts: &LiveSnapshotCounts,
+        insights_changed: bool,
+    ) {
+        let Ok(mut policy) = self.mirror_policy.lock() else {
             return;
         };
+        let now = Instant::now();
+
+        if counts.order_events != policy.order_events_seen || counts.trades != policy.trades_seen {
+            policy.order_events_seen = counts.order_events;
+            policy.trades_seen = counts.trades;
+            for file in ORDER_STATE_FILES {
+                policy.dirty.insert(file, now);
+            }
+        }
+        if insights_changed {
+            for file in INSIGHT_STATE_FILES {
+                policy.dirty.insert(file, now);
+            }
+        }
+
+        let day = time.date_utc();
+        if policy.last_eod_day != Some(day) {
+            policy.last_eod_day = Some(day);
+            for file in EOD_FILES {
+                self.mirror(file);
+            }
+        }
+
+        policy.dirty.retain(|file, changed_at| {
+            if changed_at.elapsed() >= MIRROR_DEBOUNCE {
+                self.mirror(file);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Write the insight snapshot files. Returns true when the insight set
+    /// changed since the last snapshot — the framework drained insight events
+    /// (emitted/expired/closed/restored). Per-slice re-scoring of active
+    /// insights emits no events, so a quiet market reports no change.
+    fn record_insight_snapshot(&self, framework: Option<&Arc<Mutex<FrameworkState>>>) -> bool {
+        let Some(framework) = framework else {
+            return false;
+        };
         let Ok(mut fw) = framework.lock() else {
-            return;
+            return false;
         };
         let payload = LiveInsightSnapshot {
             schema_version: LIVE_INSIGHTS_SCHEMA_VERSION,
@@ -238,10 +337,9 @@ impl LiveDeploymentWriter {
         let analytics = fw.compute_alpha_analytics();
         write_json_pretty_atomic(&self.alpha_analytics_path, &analytics);
         let events = fw.take_insight_events();
+        let changed = !events.is_empty();
         append_json_lines(&self.insight_events_path, &events);
-        self.mirror("insights.json");
-        self.mirror("alpha-analytics.json");
-        self.mirror("insight-events.jsonl");
+        changed
     }
 
     fn append_heartbeat(
