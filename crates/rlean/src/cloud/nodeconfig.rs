@@ -13,7 +13,8 @@ use crate::config::GlobalConfig;
 ///
 /// - `data_folder`   → `<node_home>/rlean-cloud/data`
 /// - `workspace`     → `<node_home>/rlean-cloud/workspace`
-/// - `datastore`     → `"file"`
+/// - `data_catalog*` → copied verbatim (every node talks to the same REST
+///   Iceberg catalog as the control machine — there is no local data store)
 /// - `artifact_store`→ `"mirror"` (overrides the local, typically `"local"`)
 /// - `artifact_s3*`  → copied verbatim from the local config (operator creds),
 ///   except the endpoint, which `artifact_endpoint` overrides when given — a
@@ -35,7 +36,12 @@ pub(crate) fn node_config_from_local(
     let node_home = node_home.trim_end_matches('/');
     GlobalConfig {
         default_language: local.default_language.clone(),
-        datastore: "file".to_string(),
+        // The market-data REST catalog connection is shared fleet-wide.
+        data_catalog: local.data_catalog.clone(),
+        data_warehouse: local.data_warehouse.clone(),
+        data_sigv4_region: local.data_sigv4_region.clone(),
+        data_sigv4_name: local.data_sigv4_name.clone(),
+        data_namespace: local.data_namespace.clone(),
         // Local `s3_*` connection settings are the control machine's; the node
         // relays via `artifact_s3*`, so leave the plain `s3_*` block empty.
         s3_access_key: None,
@@ -63,7 +69,11 @@ mod tests {
     fn local_with_artifacts() -> GlobalConfig {
         GlobalConfig {
             default_language: "python".to_string(),
-            datastore: "file".to_string(),
+            data_catalog: Some("https://s3tables.us-west-2.amazonaws.com/iceberg".to_string()),
+            data_warehouse: Some("arn:aws:s3tables:us-west-2:1:bucket/x".to_string()),
+            data_sigv4_region: Some("us-west-2".to_string()),
+            data_sigv4_name: None,
+            data_namespace: None,
             s3_access_key: Some("LOCALKEY".to_string()),
             s3_secret_key: Some("LOCALSECRET".to_string()),
             s3_bucket: Some("local-bucket".to_string()),
@@ -85,7 +95,11 @@ mod tests {
     fn node_config_overrides_store_and_paths() {
         let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
-        assert_eq!(node.datastore, "file");
+        assert_eq!(
+            node.data_catalog.as_deref(),
+            Some("https://s3tables.us-west-2.amazonaws.com/iceberg")
+        );
+        assert_eq!(node.data_sigv4_region.as_deref(), Some("us-west-2"));
         assert_eq!(node.artifact_store.as_deref(), Some("mirror"));
         assert_eq!(
             node.data_folder.as_deref(),
@@ -146,7 +160,7 @@ mod tests {
         // The struct uses kebab-case for un-renamed fields but keeps an explicit
         // `artifact_store` rename; the node must parse this exact shape back.
         assert!(json.contains("\"artifact_store\": \"mirror\""));
-        assert!(json.contains("\"datastore\": \"file\""));
+        assert!(json.contains("\"data_catalog\""));
         assert!(json.contains("\"data-folder\": \"/home/opc/rlean-cloud/data\""));
         assert!(json.contains("\"default-language\": \"python\""));
         // No local-only s3_* keys leak in. Match the JSON key form precisely so
@@ -159,7 +173,6 @@ mod tests {
         // Round-trips back through GlobalConfig identically.
         let reparsed: GlobalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(reparsed.artifact_store.as_deref(), Some("mirror"));
-        assert_eq!(reparsed.datastore, "file");
         assert_eq!(
             reparsed.data_folder.as_deref(),
             Some("/home/opc/rlean-cloud/data")

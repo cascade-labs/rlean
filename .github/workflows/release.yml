@@ -20,10 +20,11 @@ name: Release
 #     mac binary links. darwin artifacts therefore require Homebrew python@3.14 to be
 #     installed on the target mac.
 
+# Releases start ONLY from the auto-tag workflow's explicit dispatch (which
+# fires solely when the workspace version changes on main) or a manual
+# workflow_dispatch re-run for an EXISTING tag. A hand-pushed tag does not
+# start a release.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -35,7 +36,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -91,14 +92,13 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
 
+      # Build the tagged commit — not the default branch — so a manual
+      # re-run months later still reproduces the release.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Mark workspace safe for git
         shell: bash
@@ -239,18 +239,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    steps:
+        steps:
       - name: Resolve release tag
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           FULL="${TAG#v}"
           echo "version=${FULL}" >> "$GITHUB_OUTPUT"
           # Any prerelease suffix (-rc/-alpha/-beta/...) publishes as a prerelease.

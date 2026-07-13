@@ -21,7 +21,7 @@ use super::remote::{scp_to, RemoteExec};
 use crate::config::{atomic_write, plugin_configs_path, GlobalConfig};
 
 /// Default release tag for cloud bundles. A `const` so it is easy to bump.
-pub(crate) const DEFAULT_RELEASE_TAG: &str = "v0.1.1-rc2";
+pub(crate) const DEFAULT_RELEASE_TAG: &str = "v0.1.1";
 
 /// The rlean bundle source repository.
 const RLEAN_REPO: &str = "cascade-labs/rlean";
