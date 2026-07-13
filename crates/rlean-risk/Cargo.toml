@@ -1,0 +1,17 @@
+[package]
+name = "rlean-risk"
+version.workspace = true
+edition.workspace = true
+description = "Risk management framework for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }

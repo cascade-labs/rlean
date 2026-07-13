@@ -1,0 +1,17 @@
+[package]
+name = "rlean-indicators"
+version.workspace = true
+edition.workspace = true
+description = "Technical indicators for rlean: SMA, EMA, RSI, Bollinger Bands, and more."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+rlean-data = { path = "../rlean-data", version = "0.1.1" }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }

@@ -80,7 +80,7 @@ pub struct GlobalConfig {
     /// How often (seconds) a long-running process rechecks the catalog for table
     /// snapshots committed by other processes before reusing a cached read
     /// context. Defaults to 30s when unset; `0` rechecks on every read. See
-    /// `lean_storage::DEFAULT_DATA_REFRESH_SECS`.
+    /// `rlean_storage::DEFAULT_DATA_REFRESH_SECS`.
     #[serde(
         default,
         rename = "data_refresh_secs",
