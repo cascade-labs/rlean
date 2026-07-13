@@ -22,7 +22,7 @@ use lean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use lean_algorithm::portfolio::SecurityPortfolioManager;
 use lean_brokerages::Brokerage;
 use lean_core::{DateTime, Price, Quantity};
-use lean_orders::{Order, OrderEvent, OrderStatus, TransactionManager};
+use lean_orders::{Order, OrderEvent, OrderStatus, OrderType, TransactionManager};
 use lean_statistics::{Trade, TradeBuilder};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -57,6 +57,12 @@ pub(crate) enum BrokerageEvent {
     },
     /// Submission was rejected by the brokerage.
     Invalid { order_id: i64, message: String },
+    /// Submission failed with a transport/transient error (the plugin returned
+    /// `Err`). Distinct from `Invalid`: a `false`/`Ok(None)` return means the
+    /// brokerage explicitly declined and is terminal, whereas an `Err` is a
+    /// submission failure that gets a bounded number of retries (see
+    /// `SUBMIT_BACKOFF`) before the order is finally marked `Invalid`.
+    SubmitFailed { order_id: i64, message: String },
     /// A status/fill update polled from the brokerage. `cumulative_filled` is the
     /// signed total filled quantity the brokerage reports for the order. `symbol`
     /// is the symbol the brokerage reports for the polled order; the loop verifies
@@ -71,6 +77,21 @@ pub(crate) enum BrokerageEvent {
         commission: Option<Price>,
     },
 }
+
+/// Backoff schedule for retrying a failed order submission. Its length + 1 is
+/// the total number of submission attempts: with two delays the order is tried
+/// up to three times (initial submit, then a retry 5s later, then 15s later).
+/// A submission that still fails after the last delay goes terminally `Invalid`.
+///
+/// The delays are deliberately short and few: an `Err` from the plugin is most
+/// often a transient transport hiccup (e.g. a response-decode failure), so a
+/// couple of spaced-out retries recover it, while a genuine rejection surfaced
+/// as `Err` just fails a couple more times and reaches the same terminal state
+/// a few seconds later.
+const SUBMIT_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+];
 
 /// State the worker tracks per order it has seen from the brokerage, so it only
 /// emits an event when something actually changed.
@@ -96,11 +117,36 @@ pub struct LiveBrokerageRouter {
     /// Cumulative filled quantity already applied to the portfolio per order, so
     /// polled snapshots only apply the incremental delta.
     applied_filled: HashMap<i64, Quantity>,
+    /// Backoff schedule between submission retries. Kept as a field (rather than a
+    /// bare const) so tests can inject a fast schedule without sleeping seconds.
+    /// `submit_backoff.len() + 1` is the total number of submission attempts.
+    submit_backoff: Vec<std::time::Duration>,
+    /// Number of submission attempts already dispatched per order id, so a failed
+    /// submit is retried only up to `submit_backoff.len() + 1` times.
+    submit_attempts: HashMap<i64, u32>,
+    /// Earliest instant a failed order may be resubmitted. `dispatch_pending`
+    /// skips a `New` order whose entry here is still in the future, so the retry
+    /// wait never blocks the worker or busy-waits.
+    retry_not_before: HashMap<i64, std::time::Instant>,
+    /// Market-on-open orders already logged as deferred, so holding an order
+    /// across a closed market logs once instead of once per live iteration.
+    moo_deferred_logged: std::collections::HashSet<i64>,
 }
 
 impl LiveBrokerageRouter {
-    /// Spawn the worker thread and hand ownership of the brokerage to it.
+    /// Spawn the worker thread and hand ownership of the brokerage to it, using
+    /// the default `SUBMIT_BACKOFF` retry schedule.
     pub fn spawn(brokerage: Box<dyn Brokerage>) -> Self {
+        Self::spawn_with_backoff(brokerage, SUBMIT_BACKOFF.to_vec())
+    }
+
+    /// Spawn with an explicit submission-retry backoff schedule. Tests use this
+    /// to inject a fast (near-zero) schedule so retry behavior can be exercised
+    /// without sleeping the production 5s/15s delays.
+    pub fn spawn_with_backoff(
+        brokerage: Box<dyn Brokerage>,
+        submit_backoff: Vec<std::time::Duration>,
+    ) -> Self {
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<BrokerageRequest>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<BrokerageEvent>();
         let worker = std::thread::Builder::new()
@@ -115,17 +161,39 @@ impl LiveBrokerageRouter {
             cancel_forwarded: std::collections::HashSet::new(),
             update_forwarded: std::collections::HashSet::new(),
             applied_filled: HashMap::new(),
+            submit_backoff,
+            submit_attempts: HashMap::new(),
+            retry_not_before: HashMap::new(),
+            moo_deferred_logged: std::collections::HashSet::new(),
         }
     }
 
     /// Forward any `New` orders in the transaction manager to the brokerage, and
     /// forward pending cancel/update requests. Called once per live iteration on
-    /// the loop thread; never blocks on the brokerage.
+    /// the loop thread; never blocks on the brokerage. Evaluates market hours at
+    /// the current wall-clock time.
     pub fn dispatch_pending(&mut self, transactions: &Arc<TransactionManager>) {
+        self.dispatch_pending_at(transactions, DateTime::now());
+    }
+
+    /// `dispatch_pending` with an explicit market-hours evaluation time, so tests
+    /// can drive closed-market (weekend) and open-market dispatch deterministically.
+    pub fn dispatch_pending_at(&mut self, transactions: &Arc<TransactionManager>, now: DateTime) {
+        let now_instant = std::time::Instant::now();
         for order in transactions.get_open_orders() {
             match order.status {
-                OrderStatus::New if self.submitted_ids.insert(order.id) => {
-                    let _ = self.request_tx.send(BrokerageRequest::Submit(order));
+                // A `New` order that is not already in flight is (re)submitted
+                // once its retry backoff (if any) has elapsed. A first submit has
+                // no `retry_not_before` entry, so it dispatches immediately; a
+                // failed submit sets one and this skips it until it is due.
+                OrderStatus::New
+                    if !self.submitted_ids.contains(&order.id)
+                        && self
+                            .retry_not_before
+                            .get(&order.id)
+                            .is_none_or(|not_before| now_instant >= *not_before) =>
+                {
+                    self.dispatch_new_order(order, transactions, now);
                 }
                 OrderStatus::CancelPending
                     if !order.brokerage_id.is_empty() && self.cancel_forwarded.insert(order.id) =>
@@ -140,6 +208,86 @@ impl LiveBrokerageRouter {
                 _ => {}
             }
         }
+    }
+
+    /// Dispatch a single `New` order whose backoff (if any) has elapsed,
+    /// respecting market hours:
+    ///
+    /// * A `MarketOnOpen` order is engine-held while its exchange is closed and
+    ///   released only once the exchange is open. Brokerage plugins have no
+    ///   native market-on-open type, so the released submission goes out as a
+    ///   plain market order — the engine-side hold is what provides LEAN's
+    ///   "fill at the next market open" semantics.
+    /// * A retried order (a previous submit failed) whose exchange has closed
+    ///   between attempts is converted to a held `MarketOnOpen` order instead of
+    ///   being retried into a closed market. Futures and future options are
+    ///   exempt (they trade extended hours), mirroring C# LEAN
+    ///   `QCAlgorithm.Trading.cs` `MarketOrder` and
+    ///   `DefaultBrokerageModel.CanSubmitOrder`.
+    fn dispatch_new_order(
+        &mut self,
+        order: Order,
+        transactions: &Arc<TransactionManager>,
+        now: DateTime,
+    ) {
+        let order_id = order.id;
+        let moo_exempt = matches!(
+            order.symbol.security_type(),
+            lean_core::SecurityType::Future | lean_core::SecurityType::FutureOption
+        );
+        let exchange_open = lean_core::MarketHoursDatabase::global()
+            .exchange_hours(&order.symbol)
+            .is_open_at(now);
+
+        if order.order_type == OrderType::MarketOnOpen {
+            if !exchange_open {
+                if self.moo_deferred_logged.insert(order.id) {
+                    tracing::info!(
+                        "order {} ({}) market closed; holding as market-on-open until next open",
+                        order.id,
+                        order.symbol.value,
+                    );
+                }
+                return;
+            }
+            self.moo_deferred_logged.remove(&order.id);
+            tracing::info!(
+                "order {} ({}) market open; releasing held market-on-open order",
+                order.id,
+                order.symbol.value,
+            );
+        } else if !exchange_open
+            && !moo_exempt
+            && self.submit_attempts.get(&order.id).copied().unwrap_or(0) > 0
+        {
+            // The market closed between submission attempts: do not retry into a
+            // closed market. Convert to a held market-on-open order; the release
+            // above submits it at the next open.
+            tracing::info!(
+                "order {} ({}) market closed before retry; converting to market-on-open \
+                 and holding until next open",
+                order.id,
+                order.symbol.value,
+            );
+            let mut held = order;
+            held.order_type = OrderType::MarketOnOpen;
+            transactions.add_or_update_order(held);
+            self.submit_attempts.remove(&order_id);
+            self.retry_not_before.remove(&order_id);
+            return;
+        }
+
+        self.retry_not_before.remove(&order_id);
+        self.submitted_ids.insert(order_id);
+        *self.submit_attempts.entry(order_id).or_default() += 1;
+        // Plugins only translate market/limit/stop types, so a released
+        // market-on-open order crosses the wire as a market order; the engine
+        // order keeps its MarketOnOpen type for the audit trail.
+        let mut wire_order = order;
+        if wire_order.order_type == OrderType::MarketOnOpen {
+            wire_order.order_type = OrderType::Market;
+        }
+        let _ = self.request_tx.send(BrokerageRequest::Submit(wire_order));
     }
 
     /// Drain brokerage events and apply their portfolio/algorithm effects.
@@ -198,6 +346,11 @@ impl LiveBrokerageRouter {
                 order.brokerage_id = brokerage_ids;
                 order.status = OrderStatus::Submitted;
                 transactions.add_or_update_order(order.clone());
+                // The order left the submission-retry state machine; drop its
+                // per-order retry/hold bookkeeping.
+                self.submit_attempts.remove(&order_id);
+                self.retry_not_before.remove(&order_id);
+                self.moo_deferred_logged.remove(&order_id);
 
                 let mut order_event = OrderEvent::new(
                     order.id,
@@ -219,8 +372,18 @@ impl LiveBrokerageRouter {
                 let Some(mut order) = transactions.get_order(order_id) else {
                     return;
                 };
+                // Loud in live.log: ANY terminal invalid order (broker rejection or
+                // exhausted submission retries) is surfaced as an error, matching
+                // C# LEAN's `_algorithm.Error(...)` on the submit-failure path.
+                tracing::error!(
+                    "order {order_id} ({}) invalid: {message}",
+                    order.symbol.value
+                );
                 order.status = OrderStatus::Invalid;
                 transactions.add_or_update_order(order.clone());
+                self.submit_attempts.remove(&order_id);
+                self.retry_not_before.remove(&order_id);
+                self.moo_deferred_logged.remove(&order_id);
                 let order_event =
                     OrderEvent::invalid(order.id, order.symbol.clone(), DateTime::now(), message);
                 self.emit(
@@ -230,6 +393,50 @@ impl LiveBrokerageRouter {
                     transactions,
                     all_order_events,
                 );
+            }
+            BrokerageEvent::SubmitFailed { order_id, message } => {
+                let Some(order) = transactions.get_order(order_id) else {
+                    return;
+                };
+                // The submit attempt just finished, so it is no longer in flight.
+                self.submitted_ids.remove(&order_id);
+                let attempts = self.submit_attempts.get(&order_id).copied().unwrap_or(0);
+                let max_attempts = self.submit_backoff.len() as u32 + 1;
+                // `attempts` is the count already dispatched (incremented in
+                // `dispatch_pending`). The delay before attempt N+1 is the Nth
+                // backoff entry.
+                if let Some(delay) = self.submit_backoff.get(attempts.saturating_sub(1) as usize) {
+                    tracing::warn!(
+                        "order {order_id} ({}) submission failed (attempt {attempts}/{max_attempts}), \
+                         retrying in {}s: {message}",
+                        order.symbol.value,
+                        delay.as_secs(),
+                    );
+                    // Schedule the resubmission for a future iteration of
+                    // `dispatch_pending`; the worker is free to service other
+                    // orders in the meantime.
+                    self.retry_not_before
+                        .insert(order_id, std::time::Instant::now() + *delay);
+                } else {
+                    // Attempts exhausted: go terminally Invalid, reusing the same
+                    // Invalid handling so the order event/log path is identical.
+                    let final_message = format!(
+                        "Brokerage order submission failed after {attempts} attempts: {message}"
+                    );
+                    self.apply_event(
+                        BrokerageEvent::Invalid {
+                            order_id,
+                            message: final_message,
+                        },
+                        algorithm_manager,
+                        services,
+                        transactions,
+                        portfolio,
+                        all_order_events,
+                        trade_builder,
+                        completed_trades,
+                    );
+                }
             }
             BrokerageEvent::Status {
                 order_id,
@@ -465,8 +672,12 @@ fn handle_submit(
                 message: "Brokerage rejected order submission (no reason reported)".to_string(),
             });
         }
+        // An `Err` is a transport/transient submission failure (the plugin could
+        // not complete the request), NOT a broker rejection. Report it as a
+        // retryable `SubmitFailed`; the router retries a bounded number of times
+        // before marking the order `Invalid`.
         Err(error) => {
-            let _ = event_tx.send(BrokerageEvent::Invalid {
+            let _ = event_tx.send(BrokerageEvent::SubmitFailed {
                 order_id,
                 message: format!("Brokerage order submission failed: {error}"),
             });
@@ -615,12 +826,16 @@ pub(crate) mod test_support {
     /// Deterministic mock brokerage for router/startup-sync tests.
     ///
     /// `submit_should_fail` makes `place_order_with_brokerage_ids` return `None`
-    /// (rejection). `account_orders` is what the poll returns; tests mutate it to
-    /// simulate a fill after submission.
+    /// (terminal rejection). `submit_err_count` makes it return `Err` (a
+    /// transient submission failure) that many times, decrementing on each call,
+    /// then succeed — used to exercise the bounded submission retry.
+    /// `account_orders` is what the poll returns; tests mutate it to simulate a
+    /// fill after submission.
     #[derive(Default)]
     pub struct MockBrokerage {
         pub connected: bool,
         pub submit_should_fail: bool,
+        pub submit_err_count: Arc<PlMutex<u32>>,
         pub next_brokerage_id: PlMutex<i64>,
         pub submitted: Arc<PlMutex<Vec<Order>>>,
         pub account_orders: Arc<PlMutex<Vec<Order>>>,
@@ -662,6 +877,17 @@ pub(crate) mod test_support {
             &mut self,
             order: Order,
         ) -> LeanResult<Option<Vec<String>>> {
+            // A pending transient-failure budget returns `Err` (a submission
+            // failure that the router retries), decrementing each call.
+            {
+                let mut remaining = self.submit_err_count.lock();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(lean_core::LeanError::BrokerageError(
+                        "transient submit failure".to_string(),
+                    ));
+                }
+            }
             if self.submit_should_fail {
                 return Ok(None);
             }

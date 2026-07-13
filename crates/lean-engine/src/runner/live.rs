@@ -228,6 +228,7 @@ where
                 transactions.as_ref(),
                 &sync.holdings,
                 &mut router,
+                lean_core::DateTime::now(),
             );
             brokerage_router = Some(router);
         }
@@ -735,11 +736,22 @@ fn is_restorable_security_type(security_type: lean_core::SecurityType) -> bool {
 /// liquidation's fill be applied to a different framework order (different
 /// symbol/quantity) — the production incident in issue #33. Using the algorithm
 /// counter guarantees liquidation and framework orders never share an id.
+///
+/// Market-hours aware (issue #86): if a holding's exchange is closed at `now`
+/// (e.g. a weekend restart), the liquidation is registered as a `MarketOnOpen`
+/// order that the router holds and releases at the next open, instead of a
+/// market order that would be submitted into a closed market. Futures and
+/// future options are exempt (extended-hours trading), mirroring C# LEAN
+/// `QCAlgorithm.Trading.cs` `MarketOrder`, which converts closed-market market
+/// orders to MarketOnOpen for every other security type. `now` is a parameter
+/// so tests can simulate weekend/weekday times; production passes the wall
+/// clock.
 fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     algorithm_manager: &AlgorithmManager<B>,
     transactions: Option<&Arc<lean_orders::TransactionManager>>,
     holdings: &[lean_brokerages::BrokerageHolding],
     router: &mut crate::live::transaction_handler::LiveBrokerageRouter,
+    now: lean_core::DateTime,
 ) {
     let Some(transactions) = transactions else {
         tracing::warn!(
@@ -791,13 +803,33 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
                 continue;
             }
         };
-        let order = lean_orders::Order::market(
+        let mut order = lean_orders::Order::market(
             order_id,
             holding.symbol.clone(),
             quantity,
-            lean_core::DateTime::now(),
+            now,
             "Liquidate unmanaged holding",
         );
+        // Closed exchange (weekend/overnight restart): register as MarketOnOpen
+        // so the router holds it until the next open instead of submitting into
+        // a closed market. Futures/FOPs trade extended hours and stay market
+        // orders, mirroring LEAN.
+        let moo_exempt = matches!(
+            holding.symbol.security_type(),
+            lean_core::SecurityType::Future | lean_core::SecurityType::FutureOption
+        );
+        if !moo_exempt
+            && !lean_core::MarketHoursDatabase::global()
+                .exchange_hours(&holding.symbol)
+                .is_open_at(now)
+        {
+            order.order_type = lean_orders::OrderType::MarketOnOpen;
+            tracing::info!(
+                "liquidation for {} (order_id={order_id}) created while market closed; \
+                 registering as market-on-open to fill at the next open",
+                holding.symbol.value,
+            );
+        }
         transactions.add_or_update_order(order);
         liquidated += 1;
         tracing::info!(
@@ -812,7 +844,9 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     if liquidated > 0 {
         // Reuse the router's existing submission path; the New orders just
         // registered flow to the brokerage and reconcile on the poll path.
-        router.dispatch_pending(transactions);
+        // Market-on-open registrations are held by the router until their
+        // exchange opens.
+        router.dispatch_pending_at(transactions, now);
     }
 }
 
@@ -1428,9 +1462,21 @@ mod tests {
         live_data_channel, DataQueueHandler, LiveDataItem, LiveDataSubscriptionConfig, TradeBar,
         TradeBarData,
     };
-    use lean_orders::{Order, OrderEvent, TransactionManager};
+    use lean_orders::{Order, OrderEvent, OrderType, TransactionManager};
     use rust_decimal_macros::dec;
     use std::sync::{Arc, Mutex};
+
+    /// Monday 2026-01-05 10:00 ET (15:00 UTC): US equity market open. Fixed so
+    /// market-hours-gated router tests are deterministic regardless of when the
+    /// test suite actually runs (nights/weekends).
+    fn market_open_time() -> DateTime {
+        DateTime::from(Utc.with_ymd_and_hms(2026, 1, 5, 15, 0, 0).unwrap())
+    }
+
+    /// Saturday 2026-01-03 12:00 ET (17:00 UTC): US equity market closed all day.
+    fn market_closed_time() -> DateTime {
+        DateTime::from(Utc.with_ymd_and_hms(2026, 1, 3, 17, 0, 0).unwrap())
+    }
 
     #[derive(Clone, Default)]
     struct EventLog(Arc<Mutex<Vec<String>>>);
@@ -2288,6 +2334,42 @@ mod tests {
         }
     }
 
+    /// Like `drain_until` but also calls `dispatch_pending_at` (with a fixed
+    /// open-market time) each iteration, so a scheduled submission retry (which
+    /// re-dispatches a `New` order once its backoff elapses) is actually driven —
+    /// mirroring the live loop, which calls both `drain_events` and
+    /// `dispatch_pending` per iteration.
+    #[allow(clippy::too_many_arguments)]
+    fn drain_and_dispatch_until<B: AlgorithmBridge, F: Fn() -> bool>(
+        router: &mut LiveBrokerageRouter,
+        manager: &mut AlgorithmManager<B>,
+        services: &mut crate::EngineAlgorithmServices,
+        transactions: &Arc<TransactionManager>,
+        portfolio: &Arc<lean_algorithm::portfolio::SecurityPortfolioManager>,
+        events: &mut Vec<OrderEvent>,
+        trade_builder: &mut TradeBuilder,
+        completed_trades: &mut Vec<Trade>,
+        done: F,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            router.drain_events(
+                manager,
+                services,
+                transactions,
+                Some(portfolio),
+                events,
+                trade_builder,
+                completed_trades,
+            );
+            router.dispatch_pending_at(transactions, market_open_time());
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn router_submits_new_order_and_records_brokerage_id() {
         let symbol = spy();
@@ -2988,7 +3070,13 @@ mod tests {
         let submitted = mock.submitted.clone();
         let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
 
-        liquidate_unmanaged_holdings(&manager, Some(&transactions), &holdings, &mut router);
+        liquidate_unmanaged_holdings(
+            &manager,
+            Some(&transactions),
+            &holdings,
+            &mut router,
+            market_open_time(),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && submitted.lock().is_empty() {
@@ -3036,7 +3124,13 @@ mod tests {
         let holdings = vec![holding(a.clone(), dec!(16269))];
 
         let mut router = LiveBrokerageRouter::spawn(Box::new(MockBrokerage::new()));
-        liquidate_unmanaged_holdings(&manager, Some(&transactions), &holdings, &mut router);
+        liquidate_unmanaged_holdings(
+            &manager,
+            Some(&transactions),
+            &holdings,
+            &mut router,
+            market_open_time(),
+        );
 
         // The framework/algorithm now places its own order (e.g. an SPSC sell) — it
         // must NOT reuse the liquidation's id.
@@ -3151,6 +3245,385 @@ mod tests {
         router.shutdown();
     }
 
+    /// Issue #86: a submission that fails transiently (plugin returns `Err`) is
+    /// retried, not abandoned. The mock fails the first submit with `Err`, then
+    /// succeeds; the order ends up Submitted with NO Invalid event emitted. A
+    /// near-zero backoff keeps the test fast.
+    #[test]
+    fn router_retries_transient_submit_failure_then_submits() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage::new();
+        // Fail the first submit attempt with `Err`, then succeed.
+        *mock.submit_err_count.lock() = 1;
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending_at(&transactions, market_open_time());
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Submitted)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Submitted,
+            "order recovers to Submitted after a transient failure"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == OrderStatus::Invalid),
+            "a retried transient failure must not emit an Invalid event"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a submission that fails on every attempt goes Invalid only after
+    /// the attempts are exhausted (initial + two backoff retries = 3), and emits
+    /// exactly one Invalid order event.
+    #[test]
+    fn router_marks_invalid_after_exhausting_submit_retries() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage::new();
+        // Fail more times than the total attempt budget so every attempt errors.
+        *mock.submit_err_count.lock() = 10;
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending_at(&transactions, market_open_time());
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Invalid)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Invalid,
+            "order goes Invalid once submission retries are exhausted"
+        );
+        let invalid_events = events
+            .iter()
+            .filter(|event| event.status == OrderStatus::Invalid)
+            .count();
+        assert_eq!(invalid_events, 1, "exactly one Invalid event is emitted");
+        router.shutdown();
+    }
+
+    /// Issue #86: `Ok(None)` (the brokerage explicitly declined) is terminal — the
+    /// order goes Invalid immediately with no retries.
+    #[test]
+    fn router_ok_none_is_terminal_invalid_without_retry() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage {
+            submit_should_fail: true,
+            ..MockBrokerage::new()
+        };
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending_at(&transactions, market_open_time());
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Invalid)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Invalid,
+            "Ok(None) is a terminal rejection"
+        );
+        // No submit ever succeeded, so nothing was recorded as submitted, and the
+        // order was never resubmitted after the first decline.
+        assert!(
+            submitted.lock().is_empty(),
+            "declined order is not retried/submitted"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a startup liquidation order whose first submit fails transiently
+    /// is retried and eventually submitted — the retry benefits the liquidation
+    /// path automatically because it flows through the same router dispatch.
+    #[test]
+    fn liquidation_transient_submit_failure_is_retried() {
+        let a = Symbol::create_equity("AAA", &Market::usa());
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let (mut manager, context) = framework_manager(state.clone());
+        let mut services = crate::EngineAlgorithmServices::new(DateTime::now(), context.clone());
+        let transactions = state.lock().unwrap().transactions.clone();
+        let portfolio = state.lock().unwrap().portfolio.clone();
+        let holdings = vec![holding(a.clone(), dec!(7))];
+
+        let mock = MockBrokerage::new();
+        // First submit of the liquidation errors transiently, then succeeds.
+        *mock.submit_err_count.lock() = 1;
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+
+        // The liquidation registers a New order and does the first dispatch.
+        liquidate_unmanaged_holdings(
+            &manager,
+            Some(&transactions),
+            &holdings,
+            &mut router,
+            market_open_time(),
+        );
+
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+        // Drive the router the way the live loop does; the first submit's
+        // SubmitFailed schedules a retry that a later dispatch_pending resubmits.
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || !submitted.lock().is_empty(),
+        );
+
+        let submitted_orders = submitted.lock().clone();
+        assert_eq!(
+            submitted_orders.len(),
+            1,
+            "liquidation is retried and submitted after a transient failure"
+        );
+        assert_eq!(submitted_orders[0].symbol, a);
+        assert_eq!(submitted_orders[0].quantity, dec!(-7));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == OrderStatus::Invalid),
+            "retried liquidation must not go Invalid"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a liquidation initiated while the exchange is closed (the
+    /// weekend-restart scenario) is registered as a MarketOnOpen order and
+    /// engine-held: repeated dispatch passes with closed-market times submit
+    /// NOTHING to the brokerage, and a dispatch at the next open releases
+    /// exactly ONE submission (as a market order, since plugins have no native
+    /// market-on-open type).
+    #[test]
+    fn liquidation_while_market_closed_is_held_as_market_on_open_until_open() {
+        let a = Symbol::create_equity("AAA", &Market::usa());
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let (manager, _context) = framework_manager(state.clone());
+        let transactions = state.lock().unwrap().transactions.clone();
+        let holdings = vec![holding(a.clone(), dec!(7))];
+
+        let mock = MockBrokerage::new();
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
+
+        // Saturday: the liquidation is registered as market-on-open, not sent.
+        liquidate_unmanaged_holdings(
+            &manager,
+            Some(&transactions),
+            &holdings,
+            &mut router,
+            market_closed_time(),
+        );
+        let held = transactions.get_order(1).expect("liquidation registered");
+        assert_eq!(
+            held.order_type,
+            OrderType::MarketOnOpen,
+            "closed-market liquidation is registered as market-on-open"
+        );
+        assert_eq!(held.status, OrderStatus::New);
+
+        // Several closed-market dispatch passes (Saturday afternoon, Sunday,
+        // Monday pre-open): the held order must never reach the brokerage.
+        let closed_times = [
+            market_closed_time(),
+            DateTime::from(Utc.with_ymd_and_hms(2026, 1, 4, 17, 0, 0).unwrap()), // Sunday
+            DateTime::from(Utc.with_ymd_and_hms(2026, 1, 5, 13, 0, 0).unwrap()), // Monday 08:00 ET
+        ];
+        for t in closed_times {
+            router.dispatch_pending_at(&transactions, t);
+        }
+        // Give the worker time to process anything that (incorrectly) got through.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            submitted.lock().is_empty(),
+            "zero brokerage submissions while the market is closed"
+        );
+
+        // Monday 10:00 ET: the held order is released exactly once.
+        router.dispatch_pending_at(&transactions, market_open_time());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && submitted.lock().is_empty() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let submitted_orders = submitted.lock().clone();
+        assert_eq!(
+            submitted_orders.len(),
+            1,
+            "exactly one submission at the open"
+        );
+        assert_eq!(submitted_orders[0].symbol, a);
+        assert_eq!(submitted_orders[0].quantity, dec!(-7));
+        assert_eq!(
+            submitted_orders[0].order_type,
+            OrderType::Market,
+            "released market-on-open order crosses the plugin ABI as a market order"
+        );
+
+        // Further open-market dispatches do not double-submit the released order.
+        router.dispatch_pending_at(&transactions, market_open_time());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(submitted.lock().len(), 1, "no duplicate submission");
+        router.shutdown();
+    }
+
+    /// Issue #86: a failed submission is NOT blindly retried into a closed
+    /// market. If the exchange closes between the failure and the retry, the
+    /// order converts to an engine-held MarketOnOpen order and is submitted at
+    /// the next open instead.
+    #[test]
+    fn retrying_order_converts_to_market_on_open_when_market_closes() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage::new();
+        // First (open-market) submit fails transiently; any later one succeeds.
+        *mock.submit_err_count.lock() = 1;
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        // Submit while the market is open; the attempt fails.
+        router.dispatch_pending_at(&transactions, market_open_time());
+
+        // Drain the failure and drive dispatch with a CLOSED-market time: once
+        // the backoff elapses the retry must convert to a held market-on-open
+        // order instead of resubmitting.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            router.drain_events(
+                &mut manager,
+                &mut services,
+                &transactions,
+                Some(&portfolio),
+                &mut events,
+                &mut trade_builder,
+                &mut trades,
+            );
+            router.dispatch_pending_at(&transactions, market_closed_time());
+            if transactions.get_order(1).unwrap().order_type == OrderType::MarketOnOpen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            transactions.get_order(1).unwrap().order_type,
+            OrderType::MarketOnOpen,
+            "failed retry with a closed market converts to market-on-open"
+        );
+        assert!(
+            submitted.lock().is_empty(),
+            "nothing submitted while the market is closed"
+        );
+
+        // The next open releases the held order; the brokerage now accepts it.
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Submitted)
+                    .unwrap_or(false)
+            },
+        );
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Submitted,
+            "held order is submitted at the next open"
+        );
+        assert_eq!(submitted.lock().len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == OrderStatus::Invalid),
+            "market-closed conversion must not go Invalid"
+        );
+        router.shutdown();
+    }
+
     /// Feature B is gated on real brokerage routing. Under local paper mode (a
     /// brokerage that opts into local paper fills, or no brokerage at all), the
     /// runner never enters the routing block, so unmanaged holdings are never
@@ -3180,7 +3653,13 @@ mod tests {
         let mut router = LiveBrokerageRouter::spawn(Box::new(MockBrokerage::new()));
         // Mirror the runner's `if real_routing { ... liquidate ... }` gate.
         if real_routing(Some(&paper)) {
-            liquidate_unmanaged_holdings(&manager, Some(&transactions), &holdings, &mut router);
+            liquidate_unmanaged_holdings(
+                &manager,
+                Some(&transactions),
+                &holdings,
+                &mut router,
+                market_open_time(),
+            );
         }
         router.shutdown();
 
