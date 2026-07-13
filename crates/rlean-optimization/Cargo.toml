@@ -1,0 +1,22 @@
+[package]
+name = "rlean-optimization"
+version.workspace = true
+edition.workspace = true
+description = "Parameter optimization framework for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core       = { path = "../rlean-core", version = "0.1.1" }
+rlean-statistics = { path = "../rlean-statistics", version = "0.1.1" }
+rust_decimal    = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde           = { workspace = true }
+tracing         = { workspace = true }
+chrono          = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
+chrono = { workspace = true }

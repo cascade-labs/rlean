@@ -16,7 +16,7 @@
 //! file. See `cli::apply_data_catalog_overrides`.
 
 use anyhow::Result;
-use lean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE};
+use rlean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE};
 
 use crate::config::GlobalConfig;
 
@@ -224,7 +224,7 @@ mod tests {
         let cfg = config_with_catalog("http://c/catalog", "wh");
         assert_eq!(
             resolve(&cfg).unwrap().data_refresh_secs,
-            lean_storage::DEFAULT_DATA_REFRESH_SECS
+            rlean_storage::DEFAULT_DATA_REFRESH_SECS
         );
     }
 

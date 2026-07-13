@@ -921,7 +921,7 @@ fn rlean_workspace_root() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .context("Could not derive rlean workspace root from CARGO_MANIFEST_DIR")?;
 
-    if root.join("Cargo.toml").exists() && root.join("crates").join("lean-plugin").exists() {
+    if root.join("Cargo.toml").exists() && root.join("crates").join("rlean-plugin").exists() {
         return root
             .canonicalize()
             .with_context(|| format!("Failed to canonicalize {}", root.display()));

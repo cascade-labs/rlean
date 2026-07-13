@@ -130,7 +130,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set data_refresh_secs = {parsed} in ~/.rlean/config");
         }
         "artifact_store" => {
-            if lean_engine::ArtifactStoreMode::parse(value).is_none() {
+            if rlean_engine::ArtifactStoreMode::parse(value).is_none() {
                 bail!(
                     "artifact_store must be local, s3, or mirror, got '{}'",
                     value

@@ -1,31 +1,31 @@
 [workspace]
 members = [
-    "crates/lean-core",
-    "crates/lean-data",
-    "crates/lean-storage",
-    "crates/lean-engine",
-    "crates/lean-sdk",
-    "crates/lean-algorithm",
-    "crates/lean-indicators",
-    "crates/lean-brokerages",
-    "crates/lean-orders",
-    "crates/lean-risk",
-    "crates/lean-portfolio-construction",
-    "crates/lean-universe",
-    "crates/lean-consolidators",
-    "crates/lean-alpha",
-    "crates/lean-scheduling",
-    "crates/lean-statistics",
-    "crates/lean-python-runtime",
-    "crates/lean-data-providers",
-    "crates/lean-options",
-    "crates/lean-execution",
-    "crates/lean-optimization",
-    "crates/lean-live",
-    "crates/lean-forex",
-    "crates/lean-crypto",
-    "crates/lean-futures",
-    "crates/lean-plugin",
+    "crates/rlean-core",
+    "crates/rlean-data",
+    "crates/rlean-storage",
+    "crates/rlean-engine",
+    "crates/rlean-sdk",
+    "crates/rlean-algorithm",
+    "crates/rlean-indicators",
+    "crates/rlean-brokerages",
+    "crates/rlean-orders",
+    "crates/rlean-risk",
+    "crates/rlean-portfolio-construction",
+    "crates/rlean-universe",
+    "crates/rlean-consolidators",
+    "crates/rlean-alpha",
+    "crates/rlean-scheduling",
+    "crates/rlean-statistics",
+    "crates/rlean-python-runtime",
+    "crates/rlean-data-providers",
+    "crates/rlean-options",
+    "crates/rlean-execution",
+    "crates/rlean-optimization",
+    "crates/rlean-live",
+    "crates/rlean-forex",
+    "crates/rlean-crypto",
+    "crates/rlean-futures",
+    "crates/rlean-plugin",
     "crates/rlean",
 ]
 resolver = "2"
@@ -113,7 +113,7 @@ zip    = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 libloading = "0.8"
-lean-plugin            = { path = "crates/lean-plugin" }
+rlean-plugin            = { path = "crates/rlean-plugin" }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
@@ -130,11 +130,11 @@ http-body-util = "0.1"
 http = "1"
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
-lean-core           = { path = "crates/lean-core" }
-lean-data           = { path = "crates/lean-data" }
-lean-storage        = { path = "crates/lean-storage" }
-lean-data-providers = { path = "crates/lean-data-providers" }
-lean-plugin         = { path = "crates/lean-plugin" }
+rlean-core           = { path = "crates/rlean-core" }
+rlean-data           = { path = "crates/rlean-data" }
+rlean-storage        = { path = "crates/rlean-storage" }
+rlean-data-providers = { path = "crates/rlean-data-providers" }
+rlean-plugin         = { path = "crates/rlean-plugin" }
 
 [profile.release]
 opt-level = 3

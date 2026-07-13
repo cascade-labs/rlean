@@ -1,0 +1,72 @@
+[package]
+name = "rlean-storage"
+version.workspace = true
+edition.workspace = true
+description = "Parquet/Iceberg storage layer for rlean: trade bars, factor files, map files, and option chains."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+rlean-data = { path = "../rlean-data", version = "0.1.1" }
+
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-data = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+parquet = { workspace = true }
+datafusion = { workspace = true }
+# Match the object_store version DataFusion 52 re-exports (0.12) so the built
+# `AmazonS3` implements DataFusion's `ObjectStore` trait; the `aws` feature is
+# additive. rlean-engine pins 0.11 via the workspace for its own use — these
+# coexist as distinct semver-incompatible versions.
+object_store = { version = "0.12", features = ["aws"] }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-datafusion = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+typetag = { workspace = true }
+url = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+itertools = { workspace = true }
+rayon = { workspace = true }
+num_cpus = { workspace = true }
+glob = { workspace = true }
+dashmap = { workspace = true }
+zip = { workspace = true }
+fs2 = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+
+
+[features]
+fixture-bin = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

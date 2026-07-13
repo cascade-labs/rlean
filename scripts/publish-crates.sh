@@ -11,7 +11,7 @@
 #   scripts/publish-crates.sh --dry-run    # dry-run only; no upload
 #
 # In --dry-run mode only the crates with no internal path dependencies
-# (lean-core, lean-plugin) can be fully verified, because cargo cannot resolve an
+# (rlean-core, rlean-plugin) can be fully verified, because cargo cannot resolve an
 # unpublished workspace sibling from the registry during a dry run. Those two are a
 # meaningful smoke test that packaging + metadata are valid end to end.
 set -euo pipefail
@@ -26,38 +26,38 @@ cd "$(dirname "$0")/.."
 # Dependency-ordered publish list. Regenerate with:
 #   cargo metadata --format-version 1 --no-deps | scripts/publish-order.py
 ORDER=(
-  lean-core
-  lean-plugin
-  lean-data
-  lean-scheduling
-  lean-statistics
-  lean-consolidators
-  lean-indicators
-  lean-optimization
-  lean-orders
-  lean-storage
-  lean-universe
-  lean-alpha
-  lean-crypto
-  lean-data-providers
-  lean-execution
-  lean-forex
-  lean-futures
-  lean-options
-  lean-portfolio-construction
-  lean-risk
-  lean-algorithm
-  lean-brokerages
-  lean-sdk
-  lean-live
-  lean-engine
-  lean-python-runtime
+  rlean-core
+  rlean-plugin
+  rlean-data
+  rlean-scheduling
+  rlean-statistics
+  rlean-consolidators
+  rlean-indicators
+  rlean-optimization
+  rlean-orders
+  rlean-storage
+  rlean-universe
+  rlean-alpha
+  rlean-crypto
+  rlean-data-providers
+  rlean-execution
+  rlean-forex
+  rlean-futures
+  rlean-options
+  rlean-portfolio-construction
+  rlean-risk
+  rlean-algorithm
+  rlean-brokerages
+  rlean-sdk
+  rlean-live
+  rlean-engine
+  rlean-python-runtime
   rlean
 )
 
 # Crates that have no internal (workspace) path dependencies and can therefore be
 # fully dry-run-verified against the registry on their own.
-LEAF_CRATES=" lean-core lean-plugin "
+LEAF_CRATES=" rlean-core rlean-plugin "
 
 version() {
   awk '
