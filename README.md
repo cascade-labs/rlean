@@ -288,6 +288,23 @@ Factor and map files are used for split/dividend adjustment, exactly as in LEAN.
 
 ---
 
+## Releases
+
+Cutting a release is script-driven:
+
+1. `./scripts/bump-version.sh [patch|minor|major]` (default `patch`) bumps the
+   workspace version and opens a `Release v<version>` PR against `main`.
+2. Merge the release PR.
+
+Merging auto-tags `v<version>` and fires the universal multi-platform release
+automatically. One semver tag produces a GitHub Release with a
+`rlean-<version>-<triple>.tar.gz` for every supported platform
+(`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`)
+plus a top-level `manifest.json` describing the release. Prerelease tags
+(`v<version>-rc1`, `-alpha`, `-beta`, …) publish as GitHub prereleases.
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
