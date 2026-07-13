@@ -1,0 +1,27 @@
+[package]
+name = "rlean-python-runtime"
+version.workspace = true
+edition.workspace = true
+description = "PyO3 runtime that embeds Python QCAlgorithm strategies inside an rlean process."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
+rlean-alpha = { path = "../rlean-alpha", version = "0.1.1" }
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+rlean-data = { path = "../rlean-data", version = "0.1.1" }
+rlean-engine = { path = "../rlean-engine", version = "0.1.1" }
+rlean-execution = { path = "../rlean-execution", version = "0.1.1" }
+rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
+rlean-options = { path = "../rlean-options", version = "0.1.1" }
+rlean-sdk = { path = "../rlean-sdk", version = "0.1.1", features = ["python"] }
+chrono = { workspace = true }
+pyo3 = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"

@@ -80,7 +80,7 @@ pub struct GlobalConfig {
     /// How often (seconds) a long-running process rechecks the catalog for table
     /// snapshots committed by other processes before reusing a cached read
     /// context. Defaults to 30s when unset; `0` rechecks on every read. See
-    /// `lean_storage::DEFAULT_DATA_REFRESH_SECS`.
+    /// `rlean_storage::DEFAULT_DATA_REFRESH_SECS`.
     #[serde(
         default,
         rename = "data_refresh_secs",
@@ -88,11 +88,9 @@ pub struct GlobalConfig {
     )]
     pub data_refresh_secs: Option<u64>,
 
-    /// Optional data-plane S3 endpoint for Iceberg **data-file** reads, e.g. a
-    /// local Verglas read-through cache (`http://127.0.0.1:8333`). When set,
-    /// data-file I/O is routed here with `data_s3_access_key_id` /
-    /// `data_s3_secret_access_key`; catalog traffic still goes (signed) to AWS.
-    /// Unset => data files are read directly from AWS S3 (production default).
+    /// Required data-plane S3 endpoint for Iceberg metadata, manifests, and
+    /// data files, e.g. a local Verglas cache (`http://127.0.0.1:8333`). rlean
+    /// never infers an AWS endpoint when this setting is absent.
     #[serde(
         default,
         rename = "data_s3_endpoint",
@@ -100,8 +98,15 @@ pub struct GlobalConfig {
     )]
     pub data_s3_endpoint: Option<String>,
 
-    /// Access key id for `data_s3_endpoint` (a cache-endpoint key, NOT an AWS
-    /// key). Only used when `data_s3_endpoint` is set.
+    /// Required region used to sign requests to `data_s3_endpoint`.
+    #[serde(
+        default,
+        rename = "data_s3_region",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_region: Option<String>,
+
+    /// Required access key id issued by `data_s3_endpoint`.
     #[serde(
         default,
         rename = "data_s3_access_key_id",
@@ -109,8 +114,7 @@ pub struct GlobalConfig {
     )]
     pub data_s3_access_key_id: Option<String>,
 
-    /// Secret access key for `data_s3_endpoint` (a cache-endpoint key, NOT an
-    /// AWS key). Only used when `data_s3_endpoint` is set.
+    /// Required secret access key issued by `data_s3_endpoint`.
     #[serde(
         default,
         rename = "data_s3_secret_access_key",

@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ProjectConfig;
+use crate::config::{GlobalConfig, ProjectConfig};
+use crate::data_store_config;
 use crate::project::research_notebook;
 use crate::research_daemon::sock_path;
 
@@ -460,10 +461,39 @@ fn ensure_alive(sock: &Path, session: &str) -> Result<()> {
 
 fn spawn_daemon(session: &str, project: &Path, data_folder: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe().context("Cannot determine current exe path")?;
+    // The research kernel is a separate process, so pass it the fully-resolved
+    // catalog and data-S3 configuration rather than making it rediscover a
+    // partial environment. This also makes `rlean research` fail up front when
+    // the required market-data cache configuration has not been set.
+    let catalog = data_store_config::resolve(&GlobalConfig::load()?)?;
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["__research-daemon", "--session", session]);
     cmd.args(["--project", &project.to_string_lossy()]);
+    cmd.env("RLEAN_DATA_CATALOG", &catalog.uri)
+        .env("RLEAN_DATA_WAREHOUSE", &catalog.warehouse)
+        .env("RLEAN_DATA_NAMESPACE", &catalog.namespace)
+        .env(
+            "RLEAN_DATA_REFRESH_SECS",
+            catalog.data_refresh_secs.to_string(),
+        )
+        .env("RLEAN_DATA_S3_ENDPOINT", &catalog.data_s3.endpoint)
+        .env("RLEAN_DATA_S3_REGION", &catalog.data_s3.region)
+        .env(
+            "RLEAN_DATA_S3_ACCESS_KEY_ID",
+            &catalog.data_s3.access_key_id,
+        )
+        .env(
+            "RLEAN_DATA_S3_SECRET_ACCESS_KEY",
+            &catalog.data_s3.secret_access_key,
+        );
+    if let Some(sigv4) = catalog.sigv4 {
+        cmd.env("RLEAN_DATA_SIGV4_REGION", sigv4.region)
+            .env("RLEAN_DATA_SIGV4_NAME", sigv4.signing_name);
+    } else {
+        cmd.env_remove("RLEAN_DATA_SIGV4_REGION")
+            .env_remove("RLEAN_DATA_SIGV4_NAME");
+    }
     if let Some(df) = data_folder {
         cmd.args(["--data-folder", &df.to_string_lossy()]);
     }

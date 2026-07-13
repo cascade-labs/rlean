@@ -1037,7 +1037,6 @@ mod tests {
                 data_sigv4_region: None,
                 data_sigv4_name: None,
                 data_namespace: None,
-                data_s3_endpoint: None,
                 data_provider_historical: Some("hyperliquid".to_string()),
                 data_provider_live: Some("hyperliquid".to_string()),
                 brokerage: Some("hyperliquid".to_string()),

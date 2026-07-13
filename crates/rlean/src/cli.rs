@@ -101,13 +101,6 @@ pub(crate) struct RuntimeArgs {
     #[arg(long)]
     pub(crate) data_namespace: Option<String>,
 
-    /// Data-plane S3 endpoint for Iceberg data-file reads, e.g. a local Verglas
-    /// cache (http://127.0.0.1:8333). Catalog traffic still goes to AWS. The
-    /// endpoint keys are set via config/env (data_s3_access_key_id /
-    /// data_s3_secret_access_key). Overrides RLEAN_DATA_S3_ENDPOINT and config.
-    #[arg(long)]
-    pub(crate) data_s3_endpoint: Option<String>,
-
     /// Comma-separated provider priority list (e.g. thetadata,polygon)
     #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
     pub(crate) data_provider_historical: Option<String>,
@@ -297,7 +290,6 @@ impl RuntimeArgs {
             ("RLEAN_DATA_SIGV4_REGION", self.data_sigv4_region.as_deref()),
             ("RLEAN_DATA_SIGV4_NAME", self.data_sigv4_name.as_deref()),
             ("RLEAN_DATA_NAMESPACE", self.data_namespace.as_deref()),
-            ("RLEAN_DATA_S3_ENDPOINT", self.data_s3_endpoint.as_deref()),
         ];
         for (var, value) in overrides {
             if let Some(value) = value {

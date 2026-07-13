@@ -6,31 +6,31 @@ Rust rewrite of QuantConnect LEAN. Targets the same `QCAlgorithm` Python strateg
 
 ```
 crates/
-  lean-core          # Shared types: Symbol, DateTime, Resolution, Market
-  lean-algorithm     # IAlgorithm trait, QcAlgorithm base, portfolio
-  lean-engine        # BacktestEngine, EngineConfig, runner
-  lean-data          # Slice, bar types, IHistoricalDataProvider
-  lean-storage       # Parquet reader/writer — trade bars, factor files, map files, option chains
-  lean-options       # Option chain, greeks, exercise models, PyOptionChain/PyOptionContract
-  lean-python        # PyO3 bindings — embeds Python strategies in a Rust process
-  lean-indicators    # SMA, EMA, RSI, Bollinger Bands, etc.
-  lean-orders        # Order types, fills, fee models
-  lean-live          # Live execution infrastructure
-  lean-plugin        # Plugin ABI: PluginDescriptor, PluginKind, factory function contracts
-  lean-brokerages    # Built-in brokerage models
-  lean-data-providers# Built-in data provider interfaces
-  lean-scheduling    # Scheduled events
-  lean-statistics    # Backtest result stats
-  lean-universe      # Universe selection
-  lean-execution     # Order routing / execution models
-  lean-risk          # Risk management framework
-  lean-consolidators # Data consolidators
-  lean-alpha         # Alpha model framework
-  lean-portfolio-construction
-  lean-optimization
-  lean-forex
-  lean-futures
-  lean-crypto
+  rlean-core          # Shared types: Symbol, DateTime, Resolution, Market
+  rlean-algorithm     # IAlgorithm trait, QcAlgorithm base, portfolio
+  rlean-engine        # BacktestEngine, EngineConfig, runner
+  rlean-data          # Slice, bar types, IHistoricalDataProvider
+  rlean-storage       # Parquet reader/writer — trade bars, factor files, map files, option chains
+  rlean-options       # Option chain, greeks, exercise models, PyOptionChain/PyOptionContract
+  rlean-python-runtime # PyO3 bindings — embeds Python strategies in a Rust process
+  rlean-indicators    # SMA, EMA, RSI, Bollinger Bands, etc.
+  rlean-orders        # Order types, fills, fee models
+  rlean-live          # Live execution infrastructure
+  rlean-plugin        # Plugin ABI: PluginDescriptor, PluginKind, factory function contracts
+  rlean-brokerages    # Built-in brokerage models
+  rlean-data-providers# Built-in data provider interfaces
+  rlean-scheduling    # Scheduled events
+  rlean-statistics    # Backtest result stats
+  rlean-universe      # Universe selection
+  rlean-execution     # Order routing / execution models
+  rlean-risk          # Risk management framework
+  rlean-consolidators # Data consolidators
+  rlean-alpha         # Alpha model framework
+  rlean-portfolio-construction
+  rlean-optimization
+  rlean-forex
+  rlean-futures
+  rlean-crypto
   rlean              # CLI binary (backtest, live, init, create-project, plugin, config)
 ```
 
@@ -53,12 +53,12 @@ data/
     chains/spy/20240115.parquet # per-date option universe
 ```
 
-- `lean-storage` owns all persisted data I/O through `IcebergStore`. Providers only return rows to the engine; they must not write files or query local storage.
-- If adding a new data type: define a Parquet schema in `lean-storage`, never CSV.
+- `rlean-storage` owns all persisted data I/O through `IcebergStore`. Providers only return rows to the engine; they must not write files or query local storage.
+- If adding a new data type: define a Parquet schema in `rlean-storage`, never CSV.
 
 ## Plugin System
 
-Brokerages and data providers are runtime `cdylib` plugins loaded from `~/.rlean/plugins/`. The `lean-plugin` crate defines the ABI.
+Brokerages and data providers are runtime `cdylib` plugins loaded from `~/.rlean/plugins/`. The `rlean-plugin` crate defines the ABI.
 
 Every plugin must export:
 ```rust

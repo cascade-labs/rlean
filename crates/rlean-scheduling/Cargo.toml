@@ -1,0 +1,16 @@
+[package]
+name = "rlean-scheduling"
+version.workspace = true
+edition.workspace = true
+description = "Scheduled events for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }

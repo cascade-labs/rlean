@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use lean_data_providers::IHistoryProvider;
-use lean_storage::IcebergStore;
+use rlean_data_providers::IHistoryProvider;
+use rlean_storage::IcebergStore;
 
 use crate::cli::RunArgs;
 use crate::{config, data_store_config, providers};

@@ -76,9 +76,9 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if verbose {
             EnvFilter::new(
-                "info,rlean=debug,lean_algorithm=debug,lean_core=debug,lean_data=debug,\
-                 lean_data_providers=debug,lean_engine=debug,lean_python=debug,\
-                 lean_storage=debug",
+                "info,rlean=debug,rlean_algorithm=debug,rlean_core=debug,rlean_data=debug,\
+                 rlean_data_providers=debug,rlean_engine=debug,lean_python=debug,\
+                 rlean_storage=debug",
             )
         } else {
             EnvFilter::new("info")

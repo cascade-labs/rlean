@@ -17,14 +17,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
-use lean_core::{DateTime, Resolution};
-use lean_data::DataQueueHandler;
-use lean_data::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource};
-use lean_data_providers::{
+use rlean_core::{DateTime, Resolution};
+use rlean_data::DataQueueHandler;
+use rlean_data::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomDataSource};
+use rlean_data_providers::{
     CustomDataContext, IHistoryProvider, LocalHistoryProvider, StackedHistoryProvider,
 };
-use lean_live::DataQueueHandlerManager;
-use lean_storage::IcebergStore;
+use rlean_live::DataQueueHandlerManager;
+use rlean_storage::IcebergStore;
 
 /// A lazy wrapper around a named plugin provider.
 ///
@@ -40,7 +40,7 @@ struct LazyCustomDataSource {
     path: PathBuf,
     data_root: PathBuf,
     plugin_config: serde_json::Map<String, serde_json::Value>,
-    inner: OnceLock<Result<Arc<dyn lean_data_providers::ICustomDataSource>, String>>,
+    inner: OnceLock<Result<Arc<dyn rlean_data_providers::ICustomDataSource>, String>>,
 }
 
 impl LazyCustomDataSource {
@@ -59,7 +59,7 @@ impl LazyCustomDataSource {
         }
     }
 
-    fn get(&self) -> anyhow::Result<Arc<dyn lean_data_providers::ICustomDataSource>> {
+    fn get(&self) -> anyhow::Result<Arc<dyn rlean_data_providers::ICustomDataSource>> {
         self.inner
             .get_or_init(|| {
                 load_custom_data_source(
@@ -75,7 +75,7 @@ impl LazyCustomDataSource {
     }
 }
 
-impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
+impl rlean_data_providers::ICustomDataSource for LazyCustomDataSource {
     fn name(&self) -> &str {
         &self.name
     }
@@ -97,7 +97,7 @@ impl lean_data_providers::ICustomDataSource for LazyCustomDataSource {
         utc_time: DateTime,
         config: &CustomDataConfig,
         query: &CustomDataQuery,
-    ) -> Option<Vec<lean_data::CustomDataPoint>> {
+    ) -> Option<Vec<rlean_data::CustomDataPoint>> {
         self.get()
             .ok()
             .and_then(|source| source.get_live_points(ticker, utc_time, config, query))
@@ -215,64 +215,64 @@ impl IHistoryProvider for LazyPluginProvider {
 
     async fn get_history(
         &self,
-        request: &lean_data_providers::HistoryRequest,
-    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+        request: &rlean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<rlean_data::TradeBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_history(request).await
     }
 
     async fn get_quote_bars(
         &self,
-        request: &lean_data_providers::HistoryRequest,
-    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+        request: &rlean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<rlean_data::QuoteBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_quote_bars(request).await
     }
 
     async fn get_ticks(
         &self,
-        request: &lean_data_providers::HistoryRequest,
-    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+        request: &rlean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<rlean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_ticks(request).await
     }
 
     async fn get_margin_interest_rates(
         &self,
-        request: &lean_data_providers::HistoryRequest,
-    ) -> anyhow::Result<Vec<lean_data::MarginInterestRate>> {
+        request: &rlean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<rlean_data::MarginInterestRate>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_margin_interest_rates(request).await
     }
 
     async fn get_factor_file(
         &self,
-        symbol: &lean_core::Symbol,
-    ) -> anyhow::Result<Vec<lean_storage::FactorFileEntry>> {
+        symbol: &rlean_core::Symbol,
+    ) -> anyhow::Result<Vec<rlean_storage::FactorFileEntry>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_factor_file(symbol).await
     }
 
     async fn get_map_file(
         &self,
-        symbol: &lean_core::Symbol,
-    ) -> anyhow::Result<Vec<lean_storage::MapFileEntry>> {
+        symbol: &rlean_core::Symbol,
+    ) -> anyhow::Result<Vec<rlean_storage::MapFileEntry>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_map_file(symbol).await
     }
 
     async fn get_history_batch(
         &self,
-        request: &lean_data_providers::HistoryBatchRequest,
-    ) -> anyhow::Result<lean_data_providers::MarketDataBatch> {
+        request: &rlean_data_providers::HistoryBatchRequest,
+    ) -> anyhow::Result<rlean_data_providers::MarketDataBatch> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_history_batch(request).await
     }
 
     async fn get_option_history_batch(
         &self,
-        request: &lean_data_providers::OptionHistoryBatchRequest,
-    ) -> anyhow::Result<lean_data_providers::OptionMarketDataBatch> {
+        request: &rlean_data_providers::OptionHistoryBatchRequest,
+    ) -> anyhow::Result<rlean_data_providers::OptionMarketDataBatch> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_option_history_batch(request).await
     }
@@ -281,7 +281,7 @@ impl IHistoryProvider for LazyPluginProvider {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<lean_storage::OptionEodBar>> {
+    ) -> anyhow::Result<Vec<rlean_storage::OptionEodBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_option_eod_bars(ticker, date).await
     }
@@ -290,7 +290,7 @@ impl IHistoryProvider for LazyPluginProvider {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<lean_storage::OptionUniverseRow>> {
+    ) -> anyhow::Result<Vec<rlean_storage::OptionUniverseRow>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_option_universe(ticker, date).await
     }
@@ -298,9 +298,9 @@ impl IHistoryProvider for LazyPluginProvider {
     async fn get_option_trade_bars(
         &self,
         ticker: &str,
-        resolution: lean_core::Resolution,
+        resolution: rlean_core::Resolution,
         date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+    ) -> anyhow::Result<Vec<rlean_data::TradeBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_trade_bars(ticker, resolution, date)
@@ -310,10 +310,10 @@ impl IHistoryProvider for LazyPluginProvider {
     async fn get_option_trade_bars_filtered(
         &self,
         ticker: &str,
-        resolution: lean_core::Resolution,
+        resolution: rlean_core::Resolution,
         date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<lean_data::TradeBar>> {
+        contracts: &[rlean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<rlean_data::TradeBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_trade_bars_filtered(ticker, resolution, date, contracts)
@@ -323,9 +323,9 @@ impl IHistoryProvider for LazyPluginProvider {
     async fn get_option_quote_bars(
         &self,
         ticker: &str,
-        resolution: lean_core::Resolution,
+        resolution: rlean_core::Resolution,
         date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+    ) -> anyhow::Result<Vec<rlean_data::QuoteBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_quote_bars(ticker, resolution, date)
@@ -335,10 +335,10 @@ impl IHistoryProvider for LazyPluginProvider {
     async fn get_option_quote_bars_filtered(
         &self,
         ticker: &str,
-        resolution: lean_core::Resolution,
+        resolution: rlean_core::Resolution,
         date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<lean_data::QuoteBar>> {
+        contracts: &[rlean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<rlean_data::QuoteBar>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_quote_bars_filtered(ticker, resolution, date, contracts)
@@ -349,7 +349,7 @@ impl IHistoryProvider for LazyPluginProvider {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+    ) -> anyhow::Result<Vec<rlean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider.get_option_ticks(ticker, date).await
     }
@@ -358,8 +358,8 @@ impl IHistoryProvider for LazyPluginProvider {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<Vec<lean_data::Tick>> {
+        contracts: &[rlean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<Vec<rlean_data::Tick>> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .get_option_ticks_filtered(ticker, date, contracts)
@@ -370,8 +370,8 @@ impl IHistoryProvider for LazyPluginProvider {
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
-        contracts: &[lean_storage::OptionUniverseRow],
-    ) -> anyhow::Result<lean_data_providers::TickStream> {
+        contracts: &[rlean_storage::OptionUniverseRow],
+    ) -> anyhow::Result<rlean_data_providers::TickStream> {
         let provider = self.get().map_err(|e| anyhow::anyhow!("{e}"))?;
         provider
             .stream_option_ticks_filtered(ticker, date, contracts)
@@ -479,12 +479,12 @@ pub fn build_live_data_queue(names: &str, args: ProviderArgs) -> Result<DataQueu
 
 /// Load a brokerage plugin from an installed dylib.
 ///
-/// Paper brokerage is built into `lean-brokerages`; this loader is for
+/// Paper brokerage is built into `rlean-brokerages`; this loader is for
 /// real-money brokerage plugins that export `rlean_create_brokerage`.
 pub fn load_brokerage_plugin(
     name: &str,
     args: &ProviderArgs,
-) -> Result<Box<dyn lean_brokerages::Brokerage>> {
+) -> Result<Box<dyn rlean_brokerages::Brokerage>> {
     use libloading::{Library, Symbol};
 
     let lib_name = format!("librlean_plugin_{}.{}", name.replace('-', "_"), dylib_ext());
@@ -503,7 +503,7 @@ pub fn load_brokerage_plugin(
             .with_context(|| format!("Failed to load plugin library: {}", plugin_path.display()))?,
     ));
     initialize_plugin_library(lib, name);
-    let create: Symbol<lean_plugin::CreateBrokerageFn> = unsafe {
+    let create: Symbol<rlean_plugin::CreateBrokerageFn> = unsafe {
         lib.get(b"rlean_create_brokerage\0")
     }
     .map_err(|_| anyhow::anyhow!("Plugin '{}' does not export rlean_create_brokerage", name))?;
@@ -517,8 +517,8 @@ pub fn load_brokerage_plugin(
         );
     }
 
-    let brokerage: Box<dyn lean_brokerages::Brokerage> =
-        unsafe { *Box::from_raw(raw as *mut Box<dyn lean_brokerages::Brokerage>) };
+    let brokerage: Box<dyn rlean_brokerages::Brokerage> =
+        unsafe { *Box::from_raw(raw as *mut Box<dyn rlean_brokerages::Brokerage>) };
     Ok(brokerage)
 }
 
@@ -549,7 +549,7 @@ fn build_single_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHis
 /// Load a history provider from an installed plugin dylib.
 ///
 /// The plugin is expected to export `rlean_create_history_provider` with the
-/// signature defined in `lean_plugin::CreateHistoryProviderFn`.
+/// signature defined in `rlean_plugin::CreateHistoryProviderFn`.
 fn load_plugin_provider(name: &str, args: &ProviderArgs) -> Result<Arc<dyn IHistoryProvider>> {
     use libloading::{Library, Symbol};
 
@@ -622,7 +622,7 @@ fn load_plugin_live_data_provider(
     ));
     initialize_plugin_library(lib, name);
 
-    let create: Symbol<lean_plugin::CreateLiveDataProviderFn> =
+    let create: Symbol<rlean_plugin::CreateLiveDataProviderFn> =
         unsafe { lib.get(b"rlean_create_live_data_provider\0") }.map_err(|_| {
             anyhow::anyhow!(
                 "Plugin '{}' does not export rlean_create_live_data_provider",
@@ -661,7 +661,7 @@ fn plugin_config_json(name: &str, args: &ProviderArgs) -> Result<String> {
 /// strategy subscribes to that source type.
 pub fn load_custom_data_plugins(
     data_root: &std::path::Path,
-) -> Vec<Arc<dyn lean_data_providers::ICustomDataSource>> {
+) -> Vec<Arc<dyn rlean_data_providers::ICustomDataSource>> {
     let plugins_dir = match home_dir() {
         Ok(h) => h.join(".rlean").join("plugins"),
         Err(_) => return vec![],
@@ -674,7 +674,7 @@ pub fn load_custom_data_plugins(
     let pattern = plugins_dir.join(format!("*.{}", dylib_ext()));
     let glob_pattern = pattern.to_string_lossy().to_string();
 
-    let mut sources: Vec<Arc<dyn lean_data_providers::ICustomDataSource>> = Vec::new();
+    let mut sources: Vec<Arc<dyn rlean_data_providers::ICustomDataSource>> = Vec::new();
     let plugin_configs = crate::config::PluginConfigs::load().unwrap_or_default();
 
     let paths: Vec<_> = match glob::glob(&glob_pattern) {
@@ -713,7 +713,7 @@ fn load_custom_data_source(
     expected_name: &str,
     data_root: &std::path::Path,
     plugin_config: serde_json::Map<String, serde_json::Value>,
-) -> Result<Arc<dyn lean_data_providers::ICustomDataSource>> {
+) -> Result<Arc<dyn rlean_data_providers::ICustomDataSource>> {
     use libloading::{Library, Symbol};
 
     let lib = Box::leak(Box::new(unsafe { Library::new(path) }.with_context(
@@ -737,8 +737,8 @@ fn load_custom_data_source(
         );
     }
 
-    let mut source_box: Box<dyn lean_data_providers::ICustomDataSource> =
-        unsafe { *Box::from_raw(raw as *mut Box<dyn lean_data_providers::ICustomDataSource>) };
+    let mut source_box: Box<dyn rlean_data_providers::ICustomDataSource> =
+        unsafe { *Box::from_raw(raw as *mut Box<dyn rlean_data_providers::ICustomDataSource>) };
     let source_name = source_box.name().to_string();
     if !source_name.eq_ignore_ascii_case(expected_name) {
         tracing::warn!(
@@ -759,8 +759,8 @@ fn initialize_plugin_library(lib: &libloading::Library, requested_plugin: &str) 
 fn plugin_descriptor(
     lib: &libloading::Library,
     requested_plugin: &str,
-) -> Option<lean_plugin::PluginDescriptor> {
-    type DescriptorFn = unsafe extern "C" fn() -> lean_plugin::PluginDescriptor;
+) -> Option<rlean_plugin::PluginDescriptor> {
+    type DescriptorFn = unsafe extern "C" fn() -> rlean_plugin::PluginDescriptor;
 
     let descriptor: libloading::Symbol<DescriptorFn> =
         match unsafe { lib.get(b"rlean_plugin_descriptor\0") } {

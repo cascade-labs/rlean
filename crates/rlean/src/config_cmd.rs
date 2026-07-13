@@ -11,9 +11,10 @@
 ///   data_sigv4_name             SigV4 signing name (default s3tables)
 ///   data_namespace              Iceberg namespace for cache tables (default lean)
 ///   data_refresh_secs           Snapshot recheck interval, seconds (default 30, 0 = every read)
-///   data_s3_endpoint            Data-plane S3 endpoint for data-file reads (e.g. local Verglas cache)
-///   data_s3_access_key_id       Access key id for data_s3_endpoint (endpoint key, not AWS)
-///   data_s3_secret_access_key   Secret access key for data_s3_endpoint (endpoint key, not AWS)
+///   data_s3_endpoint            Required S3 endpoint for Iceberg data-file I/O
+///   data_s3_region              Required region for the configured data S3 endpoint
+///   data_s3_access_key_id       Required access key id for the configured data endpoint
+///   data_s3_secret_access_key   Required secret access key for the configured data endpoint
 ///   data-folder                 Parquet data root (relative to rlean.json)
 ///   s3_access_key               S3-compatible access key
 ///   s3_secret_key               S3-compatible secret key
@@ -133,7 +134,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set data_refresh_secs = {parsed} in ~/.rlean/config");
         }
         "artifact_store" => {
-            if lean_engine::ArtifactStoreMode::parse(value).is_none() {
+            if rlean_engine::ArtifactStoreMode::parse(value).is_none() {
                 bail!(
                     "artifact_store must be local, s3, or mirror, got '{}'",
                     value
@@ -145,6 +146,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             println!("Set artifact_store = {value} in ~/.rlean/config");
         }
         "data_s3_endpoint"
+        | "data_s3_region"
         | "data_s3_access_key_id"
         | "data_s3_secret_access_key"
         | "s3_access_key"
@@ -210,6 +212,7 @@ fn cmd_get(key: &str) -> Result<()> {
             println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
         }
         "data_s3_endpoint"
+        | "data_s3_region"
         | "data_s3_access_key_id"
         | "data_s3_secret_access_key"
         | "s3_access_key"
@@ -264,6 +267,7 @@ fn cmd_list() -> Result<()> {
     }
     for key in [
         "data_s3_endpoint",
+        "data_s3_region",
         "data_s3_access_key_id",
         "data_s3_secret_access_key",
         "s3_access_key",
@@ -335,7 +339,8 @@ fn unknown_key_message(key: &str) -> String {
     format!(
         "Unknown key '{key}'. Known keys: default-language, data_catalog, data_warehouse, \
          data_sigv4_region, data_sigv4_name, data_namespace, data_refresh_secs, \
-         data_s3_endpoint, data_s3_access_key_id, data_s3_secret_access_key, data-folder, \
+         data_s3_endpoint, data_s3_region, data_s3_access_key_id, data_s3_secret_access_key, \
+         data-folder, \
          s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
          artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
          artifact_s3_access_key, artifact_s3_secret_key. \
@@ -369,6 +374,7 @@ fn get_catalog_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a st
 fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
     match key {
         "data_s3_endpoint" => cfg.data_s3_endpoint = Some(value),
+        "data_s3_region" => cfg.data_s3_region = Some(value),
         "data_s3_access_key_id" => cfg.data_s3_access_key_id = Some(value),
         "data_s3_secret_access_key" => cfg.data_s3_secret_access_key = Some(value),
         "s3_access_key" => cfg.s3_access_key = Some(value),
@@ -389,6 +395,7 @@ fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
 fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
     match key {
         "data_s3_endpoint" => Ok(cfg.data_s3_endpoint.as_deref()),
+        "data_s3_region" => Ok(cfg.data_s3_region.as_deref()),
         "data_s3_access_key_id" => Ok(cfg.data_s3_access_key_id.as_deref()),
         "data_s3_secret_access_key" => Ok(cfg.data_s3_secret_access_key.as_deref()),
         "s3_access_key" => Ok(cfg.s3_access_key.as_deref()),

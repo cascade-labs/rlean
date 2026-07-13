@@ -14,7 +14,7 @@
 //! Default is local-only. Nothing changes for users who do not opt in.
 
 use anyhow::{bail, Result};
-use lean_engine::{ArtifactStoreMode, S3Settings};
+use rlean_engine::{ArtifactStoreMode, S3Settings};
 
 use crate::config::GlobalConfig;
 

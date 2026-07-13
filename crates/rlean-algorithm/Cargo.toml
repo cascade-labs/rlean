@@ -1,0 +1,36 @@
+[package]
+name = "rlean-algorithm"
+version.workspace = true
+edition.workspace = true
+description = "Algorithm framework for rlean: the IAlgorithm trait, QcAlgorithm base, and portfolio model."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+rlean-data = { path = "../rlean-data", version = "0.1.1" }
+rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
+rlean-indicators = { path = "../rlean-indicators", version = "0.1.1" }
+rlean-options = { path = "../rlean-options", version = "0.1.1" }
+rlean-risk = { path = "../rlean-risk", version = "0.1.1" }
+rlean-execution = { path = "../rlean-execution", version = "0.1.1" }
+rlean-universe = { path = "../rlean-universe", version = "0.1.1" }
+rlean-scheduling = { path = "../rlean-scheduling", version = "0.1.1" }
+rlean-statistics = { path = "../rlean-statistics", version = "0.1.1" }
+rlean-alpha = { path = "../rlean-alpha", version = "0.1.1" }
+rlean-portfolio-construction = { path = "../rlean-portfolio-construction", version = "0.1.1" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+indexmap = { workspace = true }
