@@ -168,9 +168,23 @@ impl AlgorithmHistoryService for HistoryService {
             Some(resolution),
             DataNormalizationMode::Adjusted,
         );
-        let bars = self
-            .load_last_known_trade_bar(symbol, resolution, as_of, normalization)
-            .ok()?;
+        let bars = match self.load_last_known_trade_bar(symbol, resolution, as_of, normalization) {
+            Ok(bars) => bars,
+            Err(error) => {
+                // A failed seeding read leaves the security's price at zero,
+                // which silently disqualifies it from trading (strategies guard
+                // on price > 0). Surface it loudly instead of returning None
+                // without a trace.
+                tracing::error!(
+                    symbol = %symbol,
+                    %error,
+                    "get_last_known_prices: history read for price seeding failed; \
+                     the security keeps a zero price and will be skipped by \
+                     price-guarded strategies"
+                );
+                return None;
+            }
+        };
         bars.last()
             .and_then(|bar| bar.close.to_f64())
             .filter(|price| *price > 0.0 && price.is_finite())
