@@ -2288,6 +2288,41 @@ mod tests {
         }
     }
 
+    /// Like `drain_until` but also calls `dispatch_pending` each iteration, so a
+    /// scheduled submission retry (which re-dispatches a `New` order once its
+    /// backoff elapses) is actually driven — mirroring the live loop, which calls
+    /// both `drain_events` and `dispatch_pending` per iteration.
+    #[allow(clippy::too_many_arguments)]
+    fn drain_and_dispatch_until<B: AlgorithmBridge, F: Fn() -> bool>(
+        router: &mut LiveBrokerageRouter,
+        manager: &mut AlgorithmManager<B>,
+        services: &mut crate::EngineAlgorithmServices,
+        transactions: &Arc<TransactionManager>,
+        portfolio: &Arc<lean_algorithm::portfolio::SecurityPortfolioManager>,
+        events: &mut Vec<OrderEvent>,
+        trade_builder: &mut TradeBuilder,
+        completed_trades: &mut Vec<Trade>,
+        done: F,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            router.drain_events(
+                manager,
+                services,
+                transactions,
+                Some(portfolio),
+                events,
+                trade_builder,
+                completed_trades,
+            );
+            router.dispatch_pending(transactions);
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn router_submits_new_order_and_records_brokerage_id() {
         let symbol = spy();
@@ -3147,6 +3182,216 @@ mod tests {
             portfolio.get_holding(&spsc).quantity,
             dec!(10),
             "matched SPSC fill applies normally"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a submission that fails transiently (plugin returns `Err`) is
+    /// retried, not abandoned. The mock fails the first submit with `Err`, then
+    /// succeeds; the order ends up Submitted with NO Invalid event emitted. A
+    /// near-zero backoff keeps the test fast.
+    #[test]
+    fn router_retries_transient_submit_failure_then_submits() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage::new();
+        // Fail the first submit attempt with `Err`, then succeed.
+        *mock.submit_err_count.lock() = 1;
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending(&transactions);
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Submitted)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Submitted,
+            "order recovers to Submitted after a transient failure"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == OrderStatus::Invalid),
+            "a retried transient failure must not emit an Invalid event"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a submission that fails on every attempt goes Invalid only after
+    /// the attempts are exhausted (initial + two backoff retries = 3), and emits
+    /// exactly one Invalid order event.
+    #[test]
+    fn router_marks_invalid_after_exhausting_submit_retries() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage::new();
+        // Fail more times than the total attempt budget so every attempt errors.
+        *mock.submit_err_count.lock() = 10;
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending(&transactions);
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Invalid)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Invalid,
+            "order goes Invalid once submission retries are exhausted"
+        );
+        let invalid_events = events
+            .iter()
+            .filter(|event| event.status == OrderStatus::Invalid)
+            .count();
+        assert_eq!(invalid_events, 1, "exactly one Invalid event is emitted");
+        router.shutdown();
+    }
+
+    /// Issue #86: `Ok(None)` (the brokerage explicitly declined) is terminal — the
+    /// order goes Invalid immediately with no retries.
+    #[test]
+    fn router_ok_none_is_terminal_invalid_without_retry() {
+        let symbol = spy();
+        let (mut manager, mut services, transactions, portfolio) = manager_with_order_state(symbol);
+        let mock = MockBrokerage {
+            submit_should_fail: true,
+            ..MockBrokerage::new()
+        };
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+
+        router.dispatch_pending(&transactions);
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || {
+                transactions
+                    .get_order(1)
+                    .map(|order| order.status == OrderStatus::Invalid)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(
+            transactions.get_order(1).unwrap().status,
+            OrderStatus::Invalid,
+            "Ok(None) is a terminal rejection"
+        );
+        // No submit ever succeeded, so nothing was recorded as submitted, and the
+        // order was never resubmitted after the first decline.
+        assert!(
+            submitted.lock().is_empty(),
+            "declined order is not retried/submitted"
+        );
+        router.shutdown();
+    }
+
+    /// Issue #86: a startup liquidation order whose first submit fails transiently
+    /// is retried and eventually submitted — the retry benefits the liquidation
+    /// path automatically because it flows through the same router dispatch.
+    #[test]
+    fn liquidation_transient_submit_failure_is_retried() {
+        let a = Symbol::create_equity("AAA", &Market::usa());
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("test", dec!(100000))));
+        let (mut manager, context) = framework_manager(state.clone());
+        let mut services = crate::EngineAlgorithmServices::new(DateTime::now(), context.clone());
+        let transactions = state.lock().unwrap().transactions.clone();
+        let portfolio = state.lock().unwrap().portfolio.clone();
+        let holdings = vec![holding(a.clone(), dec!(7))];
+
+        let mock = MockBrokerage::new();
+        // First submit of the liquidation errors transiently, then succeeds.
+        *mock.submit_err_count.lock() = 1;
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn_with_backoff(
+            Box::new(mock),
+            vec![Duration::from_millis(10), Duration::from_millis(10)],
+        );
+
+        // The liquidation registers a New order and does the first dispatch.
+        liquidate_unmanaged_holdings(&manager, Some(&transactions), &holdings, &mut router);
+
+        let mut events = Vec::new();
+        let mut trade_builder = TradeBuilder::new();
+        let mut trades = Vec::new();
+        // Drive the router the way the live loop does; the first submit's
+        // SubmitFailed schedules a retry that a later dispatch_pending resubmits.
+        drain_and_dispatch_until(
+            &mut router,
+            &mut manager,
+            &mut services,
+            &transactions,
+            &portfolio,
+            &mut events,
+            &mut trade_builder,
+            &mut trades,
+            || !submitted.lock().is_empty(),
+        );
+
+        let submitted_orders = submitted.lock().clone();
+        assert_eq!(
+            submitted_orders.len(),
+            1,
+            "liquidation is retried and submitted after a transient failure"
+        );
+        assert_eq!(submitted_orders[0].symbol, a);
+        assert_eq!(submitted_orders[0].quantity, dec!(-7));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == OrderStatus::Invalid),
+            "retried liquidation must not go Invalid"
         );
         router.shutdown();
     }
