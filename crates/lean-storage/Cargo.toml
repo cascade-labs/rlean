@@ -14,11 +14,26 @@ arrow-schema = { workspace = true }
 arrow-cast = { workspace = true }
 parquet = { workspace = true }
 datafusion = { workspace = true }
-object_store = { workspace = true }
+# Match the object_store version DataFusion 52 re-exports (0.12) so the built
+# `AmazonS3` implements DataFusion's `ObjectStore` trait; the `aws` feature is
+# additive. lean-engine pins 0.11 via the workspace for its own use — these
+# coexist as distinct semver-incompatible versions.
+object_store = { version = "0.12", features = ["aws"] }
 iceberg = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
-sqlx = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+typetag = { workspace = true }
+url = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -43,7 +58,6 @@ zip = { workspace = true }
 fs2 = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
-libc = "0.2"
 
 
 [features]

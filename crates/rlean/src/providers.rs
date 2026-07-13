@@ -389,10 +389,12 @@ impl IHistoryProvider for LazyPluginProvider {
 ///
 /// Plugin-specific config (API keys, URLs, rate limits, etc.) lives in
 /// ~/.rlean/plugin-configs.json and is loaded separately in `load_plugin_provider`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProviderArgs {
     pub data_root: std::path::PathBuf,
-    pub data_store: Option<Arc<IcebergStore>>,
+    /// The market-data store, always the REST Iceberg catalog. Required: every
+    /// run resolves the catalog before building providers.
+    pub data_store: Arc<IcebergStore>,
 }
 
 /// Build a historical data provider from a (possibly comma-separated) name
@@ -453,12 +455,7 @@ fn build_local_history_provider_with_strict_coverage(
     args: &ProviderArgs,
     strict: bool,
 ) -> Arc<dyn IHistoryProvider> {
-    match &args.data_store {
-        Some(store) => {
-            Arc::new(LocalHistoryProvider::from_store(store.clone()).with_strict_coverage(strict))
-        }
-        None => Arc::new(LocalHistoryProvider::new(&args.data_root).with_strict_coverage(strict)),
-    }
+    Arc::new(LocalHistoryProvider::from_store(args.data_store.clone()).with_strict_coverage(strict))
 }
 
 /// Build the stacked live data queue handler set for a live deployment.

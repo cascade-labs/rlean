@@ -1878,15 +1878,10 @@ mod tests {
         out
     }
 
-    async fn live_config(log: EventLog, items: Vec<LiveDataItem>) -> LiveRunConfig {
-        let tmp = tempfile::tempdir().unwrap().keep();
-        let store = Arc::new(
-            lean_storage::IcebergStore::connect_local(&tmp)
-                .await
-                .unwrap(),
-        );
-        LiveRunConfig {
-            data_root: tmp,
+    async fn live_config(log: EventLog, items: Vec<LiveDataItem>) -> Option<LiveRunConfig> {
+        let store = crate::test_support::connect_test_store().await?;
+        Some(LiveRunConfig {
+            data_root: std::path::PathBuf::from("data"),
             data_store: store,
             history_provider: None,
             parameters: HashMap::new(),
@@ -1901,7 +1896,7 @@ mod tests {
             max_runtime: Some(Duration::from_millis(50)),
             output_dir: None,
             artifact_sink: None,
-        }
+        })
     }
 
     #[test]
@@ -1939,16 +1934,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_invokes_initialize_prepare_warmup_before_subscribing() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         run_live(bridge, config).await.unwrap();
 
@@ -1962,16 +1961,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_delivers_on_data_then_framework_then_end_time_step_per_slice() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         let result = run_live(bridge, config).await.unwrap();
 
@@ -1980,16 +1983,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_calls_warmup_finished_once_before_first_data() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         run_live(bridge, config).await.unwrap();
 
@@ -1998,20 +2005,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_calls_end_of_day_on_day_transition_and_final_finish() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let first_day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let second_day = NaiveDate::from_ymd_opt(2024, 1, 18).unwrap();
-        let mut config = live_config(
+        let Some(mut config) = live_config(
             log.clone(),
             emit_ready(vec![
                 trade_bar_item(symbol.clone(), first_day, 0),
                 trade_bar_item(symbol, second_day, 0),
             ]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
         config.max_slices = Some(2);
 
         run_live(bridge, config).await.unwrap();
@@ -2021,19 +2032,23 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_calls_on_end_of_algorithm_even_when_stopped_by_max_slices() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![
                 trade_bar_item(symbol.clone(), day, 0),
                 trade_bar_item(symbol, day, 1),
             ]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         let result = run_live(bridge, config).await.unwrap();
 
@@ -2043,16 +2058,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_unsubscribes_all_after_finish() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         run_live(bridge, config).await.unwrap();
 
@@ -2061,6 +2080,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_syncs_dynamic_subscriptions_after_universe_changes() {
         let log = EventLog::default();
         let symbol = spy();
@@ -2075,11 +2095,14 @@ mod tests {
             },
         );
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol.clone(), day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         run_live(bridge, config).await.unwrap();
 
@@ -2091,17 +2114,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_processes_order_events_before_on_data() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge =
             RecordingBridge::new(log.clone(), symbol.clone()).with_order_state(symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         let result = run_live(bridge, config).await.unwrap();
 
@@ -2111,18 +2138,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_ignores_empty_slices_without_callbacks() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol);
-        let config = live_config(
+        let Some(config) = live_config(
             log.clone(),
             vec![
                 LiveDataItem::Heartbeat(DateTime::EPOCH),
                 LiveDataItem::Heartbeat(DateTime::EPOCH + TimeSpan::from_mins(1)),
             ],
         )
-        .await;
+        .await
+        else {
+            return;
+        };
 
         let result = run_live(bridge, config).await.unwrap();
 
@@ -2133,20 +2164,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_stops_on_algorithm_terminal_status() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone())
             .with_terminal_status_after_data(AlgorithmStatus::Stopped);
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let mut config = live_config(
+        let Some(mut config) = live_config(
             log.clone(),
             emit_ready(vec![
                 trade_bar_item(symbol.clone(), day, 0),
                 trade_bar_item(symbol, day, 1),
             ]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
         config.max_slices = Some(10);
 
         let result = run_live(bridge, config).await.unwrap();
@@ -2157,20 +2192,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_stops_on_runtime_error_handler_signal() {
         let log = EventLog::default();
         let symbol = spy();
         let bridge = RecordingBridge::new(log.clone(), symbol.clone())
             .with_runtime_error_after_data("fatal result handler error");
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let mut config = live_config(
+        let Some(mut config) = live_config(
             log.clone(),
             emit_ready(vec![
                 trade_bar_item(symbol.clone(), day, 0),
                 trade_bar_item(symbol, day, 1),
             ]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
         config.max_slices = Some(10);
 
         let result = run_live(bridge, config).await.unwrap();
@@ -2396,6 +2435,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn live_run_uses_local_paper_path_when_uses_local_paper_fills() {
         // A brokerage that opts into local paper fills must not activate real
         // routing: the local ImmediateFillModel fills the order, exactly as when
@@ -2405,11 +2445,14 @@ mod tests {
         let bridge =
             RecordingBridge::new(log.clone(), symbol.clone()).with_order_state(symbol.clone());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let mut config = live_config(
+        let Some(mut config) = live_config(
             log.clone(),
             emit_ready(vec![trade_bar_item(symbol, day, 0)]),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
         config.brokerage = Some(Box::new(PaperFillMock));
         config.paper_trading = false;
 

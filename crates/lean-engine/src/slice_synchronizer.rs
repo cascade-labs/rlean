@@ -127,7 +127,6 @@ mod tests {
     use lean_data::{SubscriptionDataConfig, TradeBar, TradeBarData};
     use lean_storage::IcebergStore;
     use rust_decimal_macros::dec;
-    use std::sync::Arc;
 
     fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
         DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()))
@@ -147,9 +146,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn synchronizer_emits_all_intraday_bars() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bars = vec![

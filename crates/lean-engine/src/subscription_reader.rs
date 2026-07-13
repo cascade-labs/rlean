@@ -3339,13 +3339,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn expected_cacheable_dates_excludes_dates_before_provider_start() {
         // Window reaches before the provider's earliest available data. The
         // pre-history dates can never be fetched or cached, so they must be
         // excluded from `expected` — otherwise coverage stays permanently
         // unsatisfied and the window is re-fetched on every run.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let provider_start = NaiveDate::from_ymd_opt(2018, 1, 2).unwrap();
         let context = context(store)
             .with_history_provider(Some(Arc::new(EarliestDateProvider(provider_start))));
@@ -3378,12 +3380,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn cache_fill_window_start_respects_provider_earliest_date() {
         // The fetch window (used for both the coverage check and the outgoing
         // history request) must not begin before the provider's data start, so
         // we never issue a read for dates the provider will only clip away.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let provider_start = NaiveDate::from_ymd_opt(2018, 1, 1).unwrap();
         let context = context(store)
             .with_history_provider(Some(Arc::new(EarliestDateProvider(provider_start))));
@@ -3412,13 +3416,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn uncached_days_filter_drops_already_cached_rows() {
         // A partial-coverage fetch (a symbol's uncached warm-up head in front of
         // its already-cached body) must persist ONLY the uncached days. Re-buffering
         // the cached days is the redundant-write bug: cached data must produce zero
         // writes even when the surrounding fetch window straddles the gap.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let config = SubscriptionDataConfig::new_equity(
             symbol.clone(),
@@ -3485,6 +3491,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn producer_construction_does_not_starve_async_workers() {
         // Regression for the backtest hang: `SubscriptionProducerState::new`
         // performs *blocking* work — a plugin `dlopen` behind
@@ -3493,8 +3500,9 @@ mod tests {
         // that would unblock construction can never be polled. Building the
         // state on the blocking pool keeps the async worker free to drive it to
         // completion. This test deadlocks (times out) if the fix regresses.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let provider = Arc::new(RuntimeGatedProvider {
             gate: std::sync::Mutex::new(Some(rx)),
@@ -3530,9 +3538,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn stage_loaded_points_keeps_full_partition_within_safety_valve() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let context = context(store);
         context
             .active_subscription_count
@@ -3572,9 +3582,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn stage_loaded_points_allows_same_frontier_custom_rows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol =
             Symbol::create_with_security_type("SNAPSHOT", SecurityType::Base, Some(Market::usa()));
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
@@ -3612,14 +3624,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_prefetch_uses_wide_window_regardless_of_universe_size() {
         // The daily load window must stay wide even for large universes so a warm
         // Iceberg cache can satisfy reads in bulk. Shrinking it fragmented reads
         // into per-day queries that missed the cache and forced live provider
         // re-fetches (a large throughput regression). Memory is bounded by the
         // producer→consumer channel, not by this window.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let context = context(store);
         context
             .active_subscription_count
@@ -3643,9 +3657,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn prefetch_does_not_make_future_frontier_visible() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bars = [
@@ -3690,14 +3706,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn clamp_fetch_window_skips_remote_fetch_beyond_horizon() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(IcebergStore::connect_local(tmp.path()))
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let context = context(store);
         context
             .active_subscription_count
@@ -3733,14 +3751,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn partition_beyond_horizon_only_when_past_ceiling() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(IcebergStore::connect_local(tmp.path()))
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let context = context(store);
         context
             .active_subscription_count
@@ -3768,9 +3788,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn intraday_local_market_window_uses_partition_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day1 = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -3807,9 +3829,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn partial_daily_local_market_window_skips_remote_refetch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day1 = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let day4 = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
@@ -3847,9 +3871,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn fill_forward_stages_missing_non_tick_interval() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let first = trade_bar(symbol.clone(), day, 15, 0, 10);
@@ -3892,9 +3918,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_stream_loads_start_dated_cache_rows_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bar = daily_trade_bar_start_dated(symbol.clone(), day, 10);
@@ -3927,9 +3955,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_stream_does_not_emit_previous_source_dated_row_for_next_day() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let previous_day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let next_day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -3964,9 +3994,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_stream_batches_cached_window_and_advances_partition() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let first_day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let second_day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -4005,9 +4037,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn custom_stream_batches_cached_window_and_advances_partition() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let first_day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let second_day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -4060,9 +4094,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn custom_stream_uses_cached_iceberg_rows_before_provider() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         store
@@ -4114,9 +4150,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn custom_stream_zero_query_matches_still_count_as_cache_hit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let mut fields = std::collections::HashMap::new();
@@ -4176,9 +4214,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn custom_stream_fetches_provider_history_and_persists_to_iceberg_on_miss() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let custom_config = CustomDataConfig {
@@ -4211,9 +4251,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn custom_full_history_source_emits_through_background_channel_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let custom_config = CustomDataConfig {
@@ -4245,9 +4287,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn provider_fetch_errors_remain_nonfatal_cache_misses() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let config = SubscriptionDataConfig::new_equity(
@@ -4265,9 +4309,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn provider_overload_splits_window_and_recovers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let start = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let end = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -4300,9 +4346,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn provider_retry_uses_existing_fetch_semaphore() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let provider = Arc::new(RetryThenSucceedProvider {
@@ -4349,9 +4397,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn corporate_action_fetch_retries_after_transient_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let provider = Arc::new(FlakyCorporateActionProvider {
             factor_calls: AtomicUsize::new(0),
@@ -4374,14 +4424,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn resolution_persists_factor_rows_eagerly_without_end_of_run_flush() {
         // Issue #30: a ticker whose bars are already cached still resolves its
         // corporate actions at subscription time, and the fetched rows must land
         // in Iceberg *eagerly* — not only at an end-of-run flush that a killed
         // long run never reaches. Prove the rows are queryable straight after
         // resolution, with no explicit flush call.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         // A provider whose *second* call returns rows (first errors), matching the
         // generic retry path; the point is that resolution persists eagerly.
@@ -4404,13 +4456,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn empty_factor_file_returns_unavailable_and_is_not_cached() {
         // An empty provider result must NOT be persisted as a durable "0 rows"
         // marker (issue #27): nothing is written and the next run retries. The
         // per-run resolution cache means the retry happens on the *next run*
         // (a fresh context), not on a repeat resolution within the same run.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("DPST", &Market::usa());
         let factor_calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(EmptyFactorProvider {
@@ -4446,13 +4500,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn per_run_cache_prevents_repeat_fetch_within_a_run() {
         // Within a single run, a ticker resolved once — including resolved as
         // absent — must not re-hit the provider on repeat subscriptions
         // (universe churn / re-adds), mirroring LEAN's per-process factor-file
         // cache. This is what bounds the fetch load and dedups the WARN.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("DPST", &Market::usa());
         let factor_calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(EmptyFactorProvider {
@@ -4472,9 +4528,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn factor_fetch_error_reports_unavailable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("WAL", &Market::usa());
         let context =
             context(store.clone()).with_history_provider(Some(Arc::new(FactorErrorProvider)));
@@ -4493,12 +4551,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn map_fetch_error_persists_nothing_and_retries_next_run() {
         // Issue #29: a failed map fetch (e.g. the ticker-events call errored)
         // must persist nothing, so the next run retries instead of durably
         // caching a wrong/default map. Same rule the factor path follows.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         // FB is the canonical rename case (FB -> META): a poisoned default map
         // would erase that rename history forever.
         let symbol = Symbol::create_equity("FB", &Market::usa());
@@ -4526,12 +4586,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn empty_map_file_is_not_cached_and_retries_next_run() {
         // An empty map result (default trait behavior for providers with no
         // ticker-detail source) must not be persisted as a durable empty
         // marker: nothing is written and the next run retries.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let map_calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(EmptyMapProvider {
@@ -4557,9 +4619,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn unadjusted_equity_collector_records_and_drains() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let context = context(store);
         context.record_unadjusted_equity("DPST");
         context.record_unadjusted_equity("SMCI");
@@ -4572,9 +4636,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn provider_midnight_daily_bar_emits_on_source_session_frontier() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let bar = TradeBar::new(
@@ -4596,9 +4662,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn cache_miss_producers_fetch_different_subscriptions_concurrently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let provider = Arc::new(SlowConcurrentHistoryProvider::new());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let spy = Symbol::create_equity("SPY", &Market::usa());
@@ -4627,9 +4695,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn dropping_subscription_stream_aborts_background_producer() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let provider = Arc::new(SlowConcurrentHistoryProvider::new());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let symbol = Symbol::create_equity("SPY", &Market::usa());
@@ -4661,9 +4731,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_stream_moves_closed_end_date_to_source_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let friday = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
         let bar = daily_trade_bar_start_dated(symbol.clone(), friday, 10);
@@ -4693,9 +4765,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn daily_fill_forward_skips_closed_equity_dates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(IcebergStore::connect_local(tmp.path()).await.unwrap());
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let friday = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
         let last = TradeBar::new(

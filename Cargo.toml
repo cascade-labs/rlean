@@ -110,9 +110,19 @@ clap = { version = "4", features = ["derive", "env"] }
 libloading = "0.8"
 lean-plugin            = { path = "crates/lean-plugin" }
 iceberg = "0.9.1"
-iceberg-catalog-sql = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+iceberg-storage-opendal = "0.9.1"
+aws-config = { version = "1", features = ["behavior-version-latest", "credentials-login"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sigv4 = "1"
+aws-smithy-runtime-api = "1"
+typetag = "0.2"
+url = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+http = "1"
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
 lean-core           = { path = "crates/lean-core" }

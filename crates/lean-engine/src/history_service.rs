@@ -415,13 +415,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn history_uses_subscription_daily_frontier_semantics() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_root = tmp.path().to_path_buf();
-        let store = Arc::new(
-            block_on_background(async move { IcebergStore::connect_local(data_root).await })
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let start_day = day(2024, 1, 16);
         let end_day = day(2024, 1, 17);
@@ -431,20 +434,16 @@ mod tests {
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
         );
-        block_on_background({
-            let store = store.clone();
-            let symbol = symbol.clone();
-            async move {
-                store
-                    .append_trade_bars(
-                        &[bar],
-                        symbol.security_type(),
-                        symbol.market().as_str(),
-                        Resolution::Daily,
-                        lean_core::TickType::Trade,
-                    )
-                    .await
-            }
+        rt.block_on(async {
+            store
+                .append_trade_bars(
+                    &[bar],
+                    symbol.security_type(),
+                    symbol.market().as_str(),
+                    Resolution::Daily,
+                    lean_core::TickType::Trade,
+                )
+                .await
         })
         .unwrap();
 
@@ -465,13 +464,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn last_known_price_uses_subscription_history() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_root = tmp.path().to_path_buf();
-        let store = Arc::new(
-            block_on_background(async move { IcebergStore::connect_local(data_root).await })
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let first_day = day(2024, 1, 16);
         let second_day = day(2024, 1, 17);
@@ -489,20 +491,16 @@ mod tests {
                 TradeBarData::new(dec!(110), dec!(110), dec!(110), dec!(110), dec!(1000)),
             ),
         ];
-        block_on_background({
-            let store = store.clone();
-            let symbol = symbol.clone();
-            async move {
-                store
-                    .append_trade_bars(
-                        &bars,
-                        symbol.security_type(),
-                        symbol.market().as_str(),
-                        Resolution::Daily,
-                        lean_core::TickType::Trade,
-                    )
-                    .await
-            }
+        rt.block_on(async {
+            store
+                .append_trade_bars(
+                    &bars,
+                    symbol.security_type(),
+                    symbol.market().as_str(),
+                    Resolution::Daily,
+                    lean_core::TickType::Trade,
+                )
+                .await
         })
         .unwrap();
 
@@ -557,15 +555,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn custom_history_uses_subscription_fetch_and_reader() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture_path = tmp.path().join("fixture.csv");
         std::fs::write(&fixture_path, "row\n").unwrap();
-        let data_root = tmp.path().to_path_buf();
-        let store = Arc::new(
-            block_on_background(async move { IcebergStore::connect_local(data_root).await })
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let custom_config = CustomDataConfig {
             ticker: "ALT".to_string(),
@@ -597,13 +599,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn history_count_returns_exact_requested_count_like_lean() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_root = tmp.path().to_path_buf();
-        let store = Arc::new(
-            block_on_background(async move { IcebergStore::connect_local(data_root).await })
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let bars = (0..5)
             .map(|idx| {
@@ -617,21 +622,16 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        block_on_background({
-            let store = store.clone();
-            let symbol = symbol.clone();
-            let bars = bars.clone();
-            async move {
-                store
-                    .append_trade_bars(
-                        &bars,
-                        symbol.security_type(),
-                        symbol.market().as_str(),
-                        Resolution::Daily,
-                        lean_core::TickType::Trade,
-                    )
-                    .await
-            }
+        rt.block_on(async {
+            store
+                .append_trade_bars(
+                    &bars,
+                    symbol.security_type(),
+                    symbol.market().as_str(),
+                    Resolution::Daily,
+                    lean_core::TickType::Trade,
+                )
+                .await
         })
         .unwrap();
         let service = HistoryService::new(context(store));
@@ -653,13 +653,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn initialize_time_history_uses_start_date_when_frontier_is_epoch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_root = tmp.path().to_path_buf();
-        let store = Arc::new(
-            block_on_background(async move { IcebergStore::connect_local(data_root).await })
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let bar = TradeBar::new(
             symbol.clone(),
@@ -667,20 +670,16 @@ mod tests {
             TimeSpan::ONE_DAY,
             TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
         );
-        block_on_background({
-            let store = store.clone();
-            let symbol = symbol.clone();
-            async move {
-                store
-                    .append_trade_bars(
-                        &[bar],
-                        symbol.security_type(),
-                        symbol.market().as_str(),
-                        Resolution::Daily,
-                        lean_core::TickType::Trade,
-                    )
-                    .await
-            }
+        rt.block_on(async {
+            store
+                .append_trade_bars(
+                    &[bar],
+                    symbol.security_type(),
+                    symbol.market().as_str(),
+                    Resolution::Daily,
+                    lean_core::TickType::Trade,
+                )
+                .await
         })
         .unwrap();
         let service = HistoryService::new(context(store));

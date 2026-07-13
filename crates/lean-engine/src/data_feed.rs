@@ -1217,14 +1217,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn prefetch_ceiling_tracks_consumer_frontier() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(IcebergStore::connect_local(tmp.path()))
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let ctx = DataFeedContext::new(store);
         // No frontier yet → no ceiling (warm-up proceeds unthrottled).
         assert!(ctx.prefetch_ceiling_date().is_none());
@@ -1241,16 +1243,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     fn frontier_notifier_wakes_on_advancing_frontier_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(IcebergStore::connect_local(tmp.path()))
-                .unwrap(),
-        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
+            return;
+        };
         let ctx = DataFeedContext::new(store);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let day = chrono::NaiveDate::from_ymd_opt(2022, 1, 5).unwrap();
             let notified = ctx.frontier_advanced();

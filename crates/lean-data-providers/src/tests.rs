@@ -209,7 +209,9 @@ mod provider_tests {
         Market, NanosecondTimestamp, Resolution, SecurityIdentifier, Symbol, TickType, TimeSpan,
     };
     use lean_data::{TradeBar, TradeBarData};
-    use lean_storage::{IcebergStore, OptionEodBar, OptionUniverseRow};
+    use lean_storage::{
+        IcebergStore, OptionEodBar, OptionUniverseRow, RestCatalogConfig, SigV4Config,
+    };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -291,11 +293,51 @@ mod provider_tests {
         )
     }
 
-    async fn local_provider_with_store(
-        root: &std::path::Path,
-    ) -> (LocalHistoryProvider, Arc<IcebergStore>) {
-        let store = Arc::new(IcebergStore::connect_local(root).await.unwrap());
-        (LocalHistoryProvider::from_store(store.clone()), store)
+    /// Connect to the test REST Iceberg catalog, or return `None` when it is not
+    /// configured (so the caller skips). There is no local/filesystem catalog
+    /// anymore; these tests need a live REST catalog.
+    ///
+    /// Reads `RLEAN_TEST_CATALOG` (base URI; unset => skip), `RLEAN_TEST_WAREHOUSE`,
+    /// optional `RLEAN_TEST_SIGV4_REGION` (+ `RLEAN_TEST_SIGV4_NAME`, default
+    /// `s3tables`) and `RLEAN_TEST_NAMESPACE` (default `lean_dev`, an isolated
+    /// scratch namespace).
+    async fn connect_test_store() -> Option<Arc<IcebergStore>> {
+        let uri = std::env::var("RLEAN_TEST_CATALOG")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let warehouse = std::env::var("RLEAN_TEST_WAREHOUSE")
+            .expect("RLEAN_TEST_WAREHOUSE must be set when RLEAN_TEST_CATALOG is");
+        let sigv4 = std::env::var("RLEAN_TEST_SIGV4_REGION")
+            .ok()
+            .filter(|region| !region.is_empty())
+            .map(|region| SigV4Config {
+                region,
+                signing_name: std::env::var("RLEAN_TEST_SIGV4_NAME")
+                    .ok()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "s3tables".to_string()),
+            });
+        let namespace = std::env::var("RLEAN_TEST_NAMESPACE")
+            .ok()
+            .filter(|ns| !ns.is_empty())
+            .unwrap_or_else(|| "lean_dev".to_string());
+        Some(Arc::new(
+            IcebergStore::connect(RestCatalogConfig {
+                uri,
+                warehouse,
+                sigv4,
+                namespace,
+            })
+            .await
+            .expect("failed to connect to the test REST catalog"),
+        ))
+    }
+
+    /// Build a `LocalHistoryProvider` over the test catalog store, or `None`
+    /// when the catalog is not configured.
+    async fn local_provider_with_store() -> Option<(LocalHistoryProvider, Arc<IcebergStore>)> {
+        let store = connect_test_store().await?;
+        Some((LocalHistoryProvider::from_store(store.clone()), store))
     }
 
     fn make_option_universe_row(
@@ -654,9 +696,11 @@ mod provider_tests {
     // ── LocalHistoryProvider — no data file ───────────────────────────────────
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_returns_empty_when_no_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, _store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, _store)) = local_provider_with_store().await else {
+            return;
+        };
 
         let request = make_history_request();
         let bars = provider.get_history(&request).await.unwrap();
@@ -669,9 +713,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_returns_partial_daily_coverage() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, store)) = local_provider_with_store().await else {
+            return;
+        };
         write_daily_bars(
             &store,
             &[
@@ -695,9 +741,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn stacked_provider_uses_partial_local_without_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let (local, store) = local_provider_with_store(dir.path()).await;
+        let Some((local, store)) = local_provider_with_store().await else {
+            return;
+        };
         write_daily_bars(
             &store,
             &[
@@ -732,9 +780,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_returns_data_for_complete_daily_coverage() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, store)) = local_provider_with_store().await else {
+            return;
+        };
         write_daily_bars(
             &store,
             &[
@@ -756,9 +806,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_daily_coverage_uses_partition_date_not_bar_timestamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, store)) = local_provider_with_store().await else {
+            return;
+        };
         let symbol = make_symbol();
         let request_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let request_end = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
@@ -781,9 +833,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_daily_coverage_accepts_start_dated_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, store)) = local_provider_with_store().await else {
+            return;
+        };
         let symbol = make_symbol();
         let request_start = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         let request_end = NaiveDate::from_ymd_opt(2024, 1, 5).unwrap();
@@ -805,9 +859,11 @@ mod provider_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn local_provider_batches_option_universe_by_underlying() {
-        let dir = tempfile::tempdir().unwrap();
-        let (provider, store) = local_provider_with_store(dir.path()).await;
+        let Some((provider, store)) = local_provider_with_store().await else {
+            return;
+        };
         let date = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
         store
             .append_option_universe(&[
@@ -838,18 +894,5 @@ mod provider_tests {
         assert_eq!(req.symbol.permtick.as_ref(), "SPY");
         assert_eq!(req.resolution, Resolution::Daily);
         assert_eq!(req.data_type, DataType::TradeBar);
-    }
-
-    // ── Unknown provider name (via providers module in rlean) — tested here
-    //    by calling LocalHistoryProvider directly ───────────────────────────────
-
-    #[tokio::test]
-    async fn local_provider_handles_non_existent_dir_gracefully() {
-        // A data root that doesn't exist should return empty rather than error.
-        let provider = LocalHistoryProvider::new("/tmp/rlean-nonexistent-path-to-data");
-        let request = make_history_request();
-        let result = provider.get_history(&request).await;
-        // Either Ok(empty) or we accept errors — the key property is no panic.
-        let _ = result; // result can be Ok([]) or Err — both are acceptable
     }
 }

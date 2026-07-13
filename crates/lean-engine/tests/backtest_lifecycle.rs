@@ -23,10 +23,45 @@ use lean_orders::{
 };
 use lean_orders::{Order, OrderEvent, TransactionManager};
 use lean_statistics::TradeBuilder;
-use lean_storage::IcebergStore;
+use lean_storage::{IcebergStore, RestCatalogConfig, SigV4Config};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Connect to the test REST Iceberg catalog, or return `None` when it is not
+/// configured. Integration tests cannot reach the crate-private
+/// `crate::test_support`, so this mirrors that helper.
+async fn connect_test_store() -> Option<Arc<IcebergStore>> {
+    let uri = std::env::var("RLEAN_TEST_CATALOG")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let warehouse = std::env::var("RLEAN_TEST_WAREHOUSE")
+        .expect("RLEAN_TEST_WAREHOUSE must be set when RLEAN_TEST_CATALOG is");
+    let sigv4 = std::env::var("RLEAN_TEST_SIGV4_REGION")
+        .ok()
+        .filter(|region| !region.is_empty())
+        .map(|region| SigV4Config {
+            region,
+            signing_name: std::env::var("RLEAN_TEST_SIGV4_NAME")
+                .ok()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "s3tables".to_string()),
+        });
+    let namespace = std::env::var("RLEAN_TEST_NAMESPACE")
+        .ok()
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or_else(|| "lean_dev".to_string());
+    Some(Arc::new(
+        IcebergStore::connect(RestCatalogConfig {
+            uri,
+            warehouse,
+            sigv4,
+            namespace,
+        })
+        .await
+        .expect("failed to connect to the test REST catalog"),
+    ))
+}
 
 fn test_runtime_context() -> AlgorithmRuntimeContext {
     AlgorithmRuntimeContext::with_history_service(
@@ -346,16 +381,14 @@ impl AlgorithmBridge for RecordingBacktestAlgorithm {
 }
 
 #[tokio::test]
+#[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
 async fn backtest_runner_delivers_lifecycle_callbacks_to_sdk_bridge() {
     // Mirrors the C# LEAN AlgorithmManagerTests style: run the real manager loop
     // against a small data feed and assert lifecycle callbacks reach the
     // algorithm boundary in order.
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        IcebergStore::connect_local(tmp.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
+    let Some(store) = connect_test_store().await else {
+        return;
+    };
     let symbol = Symbol::create_equity("SPY", &Market::usa());
     let universe_symbol = Symbol::create_equity("AAPL", &Market::usa());
     let algorithm = RecordingBacktestAlgorithm::new(symbol, universe_symbol.clone());
@@ -373,12 +406,18 @@ async fn backtest_runner_delivers_lifecycle_callbacks_to_sdk_bridge() {
     let result = run_backtest(
         algorithm,
         BacktestRunConfig {
-            data_root: tmp.path().to_path_buf(),
+            data_root: std::path::PathBuf::from("data"),
             data_store: store,
+            _compression_level: 3,
             history_provider: Some(Arc::new(OneBarHistoryProvider { bar })),
             start_date_override: Some(date),
             end_date_override: Some(date),
-            ..BacktestRunConfig::default()
+            parameters: HashMap::new(),
+            custom_data_sources: Vec::new(),
+            data_feed_options: lean_engine::data_feed::DataFeedOptions::default(),
+            output_dir: None,
+            artifact_sink: None,
+            progress: None,
         },
     )
     .await
@@ -413,13 +452,11 @@ async fn backtest_runner_delivers_lifecycle_callbacks_to_sdk_bridge() {
 }
 
 #[tokio::test]
+#[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
 async fn backtest_runner_replays_warmup_before_warmup_finished() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        IcebergStore::connect_local(tmp.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
+    let Some(store) = connect_test_store().await else {
+        return;
+    };
     let symbol = Symbol::create_equity("SPY", &Market::usa());
     let universe_symbol = Symbol::create_equity("AAPL", &Market::usa());
     let algorithm = RecordingBacktestAlgorithm::new(symbol, universe_symbol);
@@ -461,11 +498,18 @@ async fn backtest_runner_replays_warmup_before_warmup_finished() {
     run_backtest(
         algorithm,
         BacktestRunConfig {
-            data_root: tmp.path().to_path_buf(),
+            data_root: std::path::PathBuf::from("data"),
             data_store: store,
+            _compression_level: 3,
+            history_provider: None,
             start_date_override: Some(date),
             end_date_override: Some(date),
-            ..BacktestRunConfig::default()
+            parameters: HashMap::new(),
+            custom_data_sources: Vec::new(),
+            data_feed_options: lean_engine::data_feed::DataFeedOptions::default(),
+            output_dir: None,
+            artifact_sink: None,
+            progress: None,
         },
     )
     .await

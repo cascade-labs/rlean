@@ -8,7 +8,6 @@ use lean_data_providers::ICustomDataSource;
 use lean_storage::iceberg_store::{MARKET_QUOTE_BARS, MARKET_TICKS, MARKET_TRADE_BARS};
 use lean_storage::IcebergStore;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::debug;
@@ -23,20 +22,6 @@ pub struct DataManager {
 }
 
 impl DataManager {
-    pub fn new(data_root: PathBuf) -> Self {
-        Self::from_store(block_connect_store(data_root))
-    }
-
-    pub fn with_custom_data_sources(
-        data_root: PathBuf,
-        custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
-    ) -> Self {
-        Self::with_custom_data_sources_from_store(
-            block_connect_store(data_root),
-            custom_data_sources,
-        )
-    }
-
     pub fn from_store(store: Arc<IcebergStore>) -> Self {
         Self::from_context(DataFeedContext::new(store))
     }
@@ -266,21 +251,6 @@ fn market_partition_tables(configs: &[SubscriptionDataConfig]) -> Vec<&'static s
     tables.into_iter().collect()
 }
 
-fn block_connect_store(data_root: PathBuf) -> Arc<IcebergStore> {
-    Arc::new(
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("data manager runtime")
-                .block_on(IcebergStore::connect_local(data_root))
-                .expect("failed to connect Iceberg data store")
-        })
-        .join()
-        .expect("data manager store worker panicked"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::DataManager;
@@ -309,8 +279,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_skips_missing_daily_partitions_without_error() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day1 = NaiveDate::from_ymd_opt(2018, 6, 18).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2018, 6, 19).unwrap();
@@ -328,7 +301,7 @@ mod tests {
             Resolution::Daily,
             DataNormalizationMode::Adjusted,
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -354,8 +327,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_emits_cross_midnight_daily_bar_on_session_frontier() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day1 = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
@@ -372,7 +348,7 @@ mod tests {
             Resolution::Daily,
             DataNormalizationMode::Adjusted,
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -425,14 +401,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_emits_prefetched_daily_option_chain_with_greeks() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let underlying = Symbol::create_equity("SPY", &Market::usa());
         let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let expiry = NaiveDate::from_ymd_opt(2024, 2, 16).unwrap();
 
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -529,8 +508,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_emits_all_hourly_bars_in_partition() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let bars = vec![
@@ -553,7 +535,7 @@ mod tests {
             Resolution::Hour,
             DataNormalizationMode::Raw,
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -584,8 +566,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_emits_tick_partition_rows() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         let ticks = vec![
@@ -599,7 +584,7 @@ mod tests {
             DataNormalizationMode::Raw,
         );
         config.fill_data_forward = false;
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_ticks(
@@ -626,11 +611,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_emits_custom_data_from_subscription_config() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_custom_points(
@@ -704,7 +692,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_fetches_custom_data_on_cache_miss() {
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let tmp = tempfile::tempdir().unwrap();
         let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
@@ -725,8 +717,8 @@ mod tests {
             SubscriptionDataConfig::new_custom(symbol.clone(), Resolution::Daily, metadata);
         let fixture_path = tmp.path().join("fixture.csv");
         std::fs::write(&fixture_path, "row\n").unwrap();
-        let mut manager = DataManager::with_custom_data_sources(
-            tmp.path().to_path_buf(),
+        let mut manager = DataManager::with_custom_data_sources_from_store(
+            store,
             vec![Arc::new(FixtureCustomSource { path: fixture_path })],
         );
 
@@ -770,8 +762,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_fetches_market_data_on_cache_miss() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let config = SubscriptionDataConfig::new_equity(
@@ -779,12 +774,8 @@ mod tests {
             Resolution::Daily,
             DataNormalizationMode::Raw,
         );
-        let context = crate::data_feed::DataFeedContext::new(Arc::new(
-            lean_storage::IcebergStore::connect_local(tmp.path())
-                .await
-                .unwrap(),
-        ))
-        .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
+        let context = crate::data_feed::DataFeedContext::new(store)
+            .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
         let mut manager = DataManager::from_context(context);
 
         manager
@@ -798,8 +789,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_uses_local_cache_before_stacked_history_providers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let local_bar = TradeBar::new(
@@ -813,9 +807,6 @@ mod tests {
             Resolution::Daily,
             DataNormalizationMode::Raw,
         );
-        let store = lean_storage::IcebergStore::connect_local(tmp.path())
-            .await
-            .unwrap();
         store
             .append_trade_bars(
                 &[local_bar],
@@ -840,8 +831,8 @@ mod tests {
                 bars: Vec::new(),
             }),
         ]));
-        let context = crate::data_feed::DataFeedContext::new(Arc::new(store))
-            .with_history_provider(Some(provider));
+        let context =
+            crate::data_feed::DataFeedContext::new(store).with_history_provider(Some(provider));
         let mut manager = DataManager::from_context(context);
 
         manager
@@ -856,8 +847,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_falls_through_stacked_history_providers_on_cache_miss() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
         let remote_bar = TradeBar::new(
@@ -884,12 +878,8 @@ mod tests {
                 bars: vec![remote_bar],
             }),
         ]));
-        let context = crate::data_feed::DataFeedContext::new(Arc::new(
-            lean_storage::IcebergStore::connect_local(tmp.path())
-                .await
-                .unwrap(),
-        ))
-        .with_history_provider(Some(provider));
+        let context =
+            crate::data_feed::DataFeedContext::new(store).with_history_provider(Some(provider));
         let mut manager = DataManager::from_context(context);
 
         manager
@@ -904,8 +894,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn feed_fetches_source_dated_daily_market_data_across_multiple_cache_misses() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let start_day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let end_day = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
@@ -914,12 +907,8 @@ mod tests {
             Resolution::Daily,
             DataNormalizationMode::Raw,
         );
-        let context = crate::data_feed::DataFeedContext::new(Arc::new(
-            lean_storage::IcebergStore::connect_local(tmp.path())
-                .await
-                .unwrap(),
-        ))
-        .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
+        let context = crate::data_feed::DataFeedContext::new(store)
+            .with_history_provider(Some(Arc::new(SourceDatedDailyHistoryProvider)));
         let mut manager = DataManager::from_context(context);
 
         manager
@@ -938,8 +927,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn add_subscription_emits_only_from_add_time() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let spy = Symbol::create_equity("SPY", &Market::usa());
         let qqq = Symbol::create_equity("QQQ", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
@@ -961,7 +953,7 @@ mod tests {
             TimeSpan::ONE_MINUTE,
             TradeBarData::new(dec!(3), dec!(3), dec!(3), dec!(3), dec!(100)),
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -1002,8 +994,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn empty_minute_custom_subscription_does_not_block_market_slice() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let spy = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bar = TradeBar::new(
@@ -1012,7 +1007,7 @@ mod tests {
             TimeSpan::ONE_MINUTE,
             TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -1067,8 +1062,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn unset_minute_custom_subscription_does_not_block_market_slice() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let spy = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bar = TradeBar::new(
@@ -1077,7 +1075,7 @@ mod tests {
             TimeSpan::ONE_MINUTE,
             TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
         );
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
@@ -1129,8 +1127,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
     async fn remove_subscription_stops_future_emissions() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(store) = crate::test_support::connect_test_store().await else {
+            return;
+        };
         let spy = Symbol::create_equity("SPY", &Market::usa());
         let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
         let bars = vec![
@@ -1147,7 +1148,7 @@ mod tests {
                 TradeBarData::new(dec!(2), dec!(2), dec!(2), dec!(2), dec!(100)),
             ),
         ];
-        let mut manager = DataManager::new(tmp.path().to_path_buf());
+        let mut manager = DataManager::from_store(store);
         manager
             .store()
             .append_trade_bars(
