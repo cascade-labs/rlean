@@ -413,10 +413,23 @@ pub(crate) fn cmd_install(
         "install rlean binary",
     )?;
 
-    // 5b. Ship each plugin `.so`.
+    // 5b. Ship each plugin atomically (temp name → mv), like the binary.
+    // scp'ing straight over the destination truncates the file in place; a
+    // running rlean has these libraries dlopen'd, and rewriting a mapped .so
+    // corrupts its text pages and crashes the process (observed as a core
+    // dump inside librlean_plugin_tradier.so during a node upgrade). rename()
+    // swaps the directory entry while the old inode lives on for any process
+    // that already mapped it.
     for (plugin, so) in &plugins {
         let dest = format!("~/.rlean/plugins/{}", plugin.lib);
-        scp_to(ssh, so, &dest)?;
+        let dest_tmp = format!("{dest}.new");
+        scp_to(ssh, so, &dest_tmp)?;
+        ssh_ok(
+            exec,
+            ssh,
+            &["mv", "-f", &dest_tmp, &dest],
+            "install plugin library",
+        )?;
     }
 
     // 6. Generate the node config locally, ship it, chmod 0600.
