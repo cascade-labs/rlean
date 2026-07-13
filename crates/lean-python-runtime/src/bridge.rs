@@ -785,20 +785,21 @@ class UniverseAlgorithm(QCAlgorithm):
             "usymbol".to_string(),
             serde_json::Value::String("SPY".to_string()),
         );
+        let stamp = lean_core::DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+                .unwrap()
+                .and_hms_opt(16, 0, 0)
+                .unwrap(),
+        );
         let point = CustomDataPoint {
-            time: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-            end_time: Some(lean_core::DateTime::from(
-                chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
-                    .unwrap()
-                    .and_hms_opt(16, 0, 0)
-                    .unwrap(),
-            )),
+            time: stamp,
+            end_time: stamp,
             value: dec!(1),
             symbol: None,
             fields: Arc::new(fields),
         };
         let changes = bridge.select_custom_universe_changes(
-            point.end_time.unwrap().0,
+            point.end_time.0,
             Resolution::Daily,
             &HashMap::from([("SNAPSHOT".to_string(), vec![point])]),
             &mut services,
@@ -859,20 +860,21 @@ class UniverseAlgorithm(QCAlgorithm):
             serde_json::Value::String("SPY".to_string()),
         );
         fields.insert("score".to_string(), serde_json::json!(1.25));
+        let stamp = lean_core::DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+                .unwrap()
+                .and_hms_opt(16, 0, 0)
+                .unwrap(),
+        );
         let point = CustomDataPoint {
-            time: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-            end_time: Some(lean_core::DateTime::from(
-                chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
-                    .unwrap()
-                    .and_hms_opt(16, 0, 0)
-                    .unwrap(),
-            )),
+            time: stamp,
+            end_time: stamp,
             value: dec!(1),
             symbol: Some("SPY".to_string()),
             fields: Arc::new(fields),
         };
         let changes = bridge.select_custom_universe_changes(
-            point.end_time.unwrap().0,
+            point.end_time.0,
             Resolution::Daily,
             &HashMap::from([("SNAPSHOT".to_string(), vec![point])]),
             &mut services,

@@ -10,7 +10,6 @@ mod custom_data_tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     /// A minimal mock custom data source for testing.
     struct MockVixSource;
@@ -68,13 +67,9 @@ mod custom_data_tests {
             fields.insert("open".to_string(), serde_json::json!(open.to_string()));
             fields.insert("high".to_string(), serde_json::json!(high.to_string()));
             fields.insert("low".to_string(), serde_json::json!(low.to_string()));
-            Some(CustomDataPoint {
-                time: date,
-                end_time: None,
-                value: close,
-                symbol: None,
-                fields: Arc::new(fields),
-            })
+            // Daily EOD feed: LEAN idiom end_time = time + 1 day.
+            let time = lean_core::DateTime::from(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+            Some(CustomDataPoint::daily_eod(time, close, fields))
         }
 
         fn default_resolution(&self) -> Resolution {
@@ -170,7 +165,12 @@ mod custom_data_tests {
         assert!(result.is_some(), "valid data line should parse");
 
         let point = result.unwrap();
-        assert_eq!(point.time, date);
+        assert_eq!(point.time.date_utc(), date);
+        // Daily EOD idiom: end_time is one day after the period start.
+        assert_eq!(
+            point.end_time,
+            point.time + lean_core::TimeSpan::from_days(1)
+        );
         assert_eq!(point.value, dec!(13.85), "value should be close price");
         assert!(
             point.fields.contains_key("open"),

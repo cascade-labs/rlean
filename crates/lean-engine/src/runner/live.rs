@@ -1408,10 +1408,7 @@ async fn sleep_until_stop_or_delay(delay: Duration, stop: &AtomicBool) {
 }
 
 fn custom_point_key(point: &CustomDataPoint) -> String {
-    let time = point
-        .end_time
-        .map(|time| time.0.to_string())
-        .unwrap_or_else(|| point.time.to_string());
+    let time = point.end_time.0;
     let fields = serde_json::to_string(&point.fields).unwrap_or_default();
     format!("{time}:{fields}")
 }

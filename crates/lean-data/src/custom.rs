@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use lean_core::{DateTime, Resolution};
+use lean_core::{DateTime, Resolution, TimeSpan};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -229,14 +229,28 @@ pub struct CustomParquetSource {
 
 /// A single data point returned by a custom data source.
 ///
-/// Mirrors LEAN C#'s `BaseData` with `Time` + `Value` + extra fields.
+/// Mirrors LEAN C#'s `BaseData`, which carries exactly two time fields:
+///
+/// - [`time`](Self::time) — `BaseData.Time`, the start of the period the point
+///   covers (a full UTC timestamp, not a bare date).
+/// - [`end_time`](Self::end_time) — `BaseData.EndTime`, the end of the period.
+///   This is the *emission gate*: LEAN sets `EmitTimeUtc = ConvertToUtc(EndTime)`
+///   and the synchronizer only surfaces a point once the frontier reaches it,
+///   which is what "ensures no look-ahead bias." It is never null in LEAN, so it
+///   is a required field here — a point that could not be gated on a real
+///   availability time cannot be placed on the timeline at all.
+///
+/// Both fields are always populated. Construct points through [`new`](Self::new)
+/// (both times explicit), [`daily_eod`](Self::daily_eod) (the canonical daily
+/// idiom: `end_time = time + 1 day`), or [`with_lean_defaulting`](Self::with_lean_defaulting)
+/// (applies LEAN's `Time`/`EndTime` defaulting when only one of the two is known).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomDataPoint {
-    /// The date/time this point applies to (start of the period).
-    pub time: NaiveDate,
-    /// UTC emission/end time. Mirrors LEAN `BaseData.EndTime`.
-    #[serde(default)]
-    pub end_time: Option<DateTime>,
+    /// Start of the period this point covers, in UTC. Mirrors LEAN `BaseData.Time`.
+    pub time: DateTime,
+    /// UTC end-of-period / emission gate. Mirrors LEAN `BaseData.EndTime`.
+    /// Always populated — a point is never visible before this instant.
+    pub end_time: DateTime,
     /// Primary scalar value (equivalent to LEAN's `BaseData.Value`).
     pub value: Decimal,
     /// Canonical UPPERCASE underlying ticker this point pertains to, if any.
@@ -251,9 +265,13 @@ pub struct CustomDataPoint {
 }
 
 impl CustomDataPoint {
+    /// Construct a point with both `time` (period start) and `end_time` (the
+    /// emission gate) explicit. Callers that only know one of the two should use
+    /// [`with_lean_defaulting`](Self::with_lean_defaulting) or
+    /// [`daily_eod`](Self::daily_eod) instead so LEAN's defaulting is applied.
     pub fn new(
-        time: NaiveDate,
-        end_time: Option<DateTime>,
+        time: DateTime,
+        end_time: DateTime,
         value: Decimal,
         fields: HashMap<String, serde_json::Value>,
     ) -> Self {
@@ -266,13 +284,55 @@ impl CustomDataPoint {
         }
     }
 
+    /// The canonical LEAN daily EOD idiom (`CustomDataBitcoinAlgorithm.py`):
+    /// a point stamped at period start `time` with `end_time = time + 1 day`.
+    /// Use for daily/EOD feeds (FRED, CBOE VIX, GDPNow) where the underlying
+    /// data has no intraday timestamp.
+    pub fn daily_eod(
+        time: DateTime,
+        value: Decimal,
+        fields: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self::new(time, time + TimeSpan::from_days(1), value, fields)
+    }
+
+    /// Apply LEAN's `Time`/`EndTime` defaulting rules (`BaseData.cs`,
+    /// `PythonData.cs`) to whatever the provider supplied:
+    ///
+    /// - both set → used as-is;
+    /// - only `time` set → `end_time = time` (instantaneous point);
+    /// - only `end_time` set → `time = end_time`;
+    /// - neither set → not representable — returns `None`, because a point with
+    ///   no availability time cannot be safely placed on the timeline (issue #31:
+    ///   never guess midnight).
+    pub fn with_lean_defaulting(
+        time: Option<DateTime>,
+        end_time: Option<DateTime>,
+        value: Decimal,
+        fields: HashMap<String, serde_json::Value>,
+    ) -> Option<Self> {
+        let (time, end_time) = match (time, end_time) {
+            (Some(time), Some(end_time)) => (time, end_time),
+            (Some(time), None) => (time, time),
+            (None, Some(end_time)) => (end_time, end_time),
+            (None, None) => return None,
+        };
+        Some(Self::new(time, end_time, value, fields))
+    }
+
     /// Builder that sets the canonical underlying symbol (uppercased).
     pub fn with_symbol(mut self, symbol: Option<String>) -> Self {
         self.symbol = symbol.map(|value| value.trim().to_ascii_uppercase());
         self
     }
 
-    pub fn empty(time: NaiveDate, end_time: Option<DateTime>, value: Decimal) -> Self {
+    /// UTC calendar date of the period start (`time`). Convenience for callers
+    /// that still reason in whole days (partition math, day-window filters).
+    pub fn time_date(&self) -> NaiveDate {
+        self.time.date_utc()
+    }
+
+    pub fn empty(time: DateTime, end_time: DateTime, value: Decimal) -> Self {
         Self::new(time, end_time, value, HashMap::new())
     }
 }
@@ -284,7 +344,14 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn point_with_symbol(symbol: Option<&str>) -> CustomDataPoint {
-        CustomDataPoint::empty(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(), None, dec!(1))
+        let time = DateTime::from(
+            NaiveDate::from_ymd_opt(2026, 7, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        CustomDataPoint::daily_eod(time, dec!(1), HashMap::new())
             .with_symbol(symbol.map(str::to_string))
     }
 
@@ -316,5 +383,46 @@ mod tests {
         let query = CustomDataQuery::default();
         assert!(query.matches_point(&point_with_symbol(Some("ANYTHING"))));
         assert!(query.matches_point(&point_with_symbol(None)));
+    }
+
+    fn dt(ns: i64) -> DateTime {
+        lean_core::NanosecondTimestamp(ns)
+    }
+
+    #[test]
+    fn daily_eod_sets_end_time_one_day_after_time() {
+        let time = dt(1_704_067_200_000_000_000); // 2024-01-01 00:00:00 UTC
+        let point = CustomDataPoint::daily_eod(time, dec!(1), HashMap::new());
+        assert_eq!(point.time, time);
+        assert_eq!(point.end_time, time + TimeSpan::from_days(1));
+        assert_eq!(point.end_time.0 - point.time.0, 86_400 * 1_000_000_000);
+    }
+
+    #[test]
+    fn lean_defaulting_only_time_sets_end_time_equal() {
+        let time = dt(1_704_067_200_000_000_000);
+        let point =
+            CustomDataPoint::with_lean_defaulting(Some(time), None, dec!(1), HashMap::new())
+                .unwrap();
+        assert_eq!(point.time, time);
+        assert_eq!(point.end_time, time);
+    }
+
+    #[test]
+    fn lean_defaulting_only_end_time_sets_time_equal() {
+        let end = dt(1_704_067_200_000_000_000);
+        let point = CustomDataPoint::with_lean_defaulting(None, Some(end), dec!(1), HashMap::new())
+            .unwrap();
+        assert_eq!(point.time, end);
+        assert_eq!(point.end_time, end);
+    }
+
+    #[test]
+    fn lean_defaulting_neither_time_is_unrepresentable() {
+        // Issue #31: a point with no availability time must not be placed on the
+        // timeline (never guess midnight). Defaulting refuses it.
+        assert!(
+            CustomDataPoint::with_lean_defaulting(None, None, dec!(1), HashMap::new()).is_none()
+        );
     }
 }

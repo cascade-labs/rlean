@@ -44,12 +44,17 @@ fn append_batch_custom_points(
 ) {
     for row in 0..batch.num_rows() {
         let fields = row_fields(batch, row);
-        let end_time = point_end_time(source_date, source_uri, &fields);
+        // Provider parquet feeds routed through this decoder are intraday event
+        // feeds (TradeAlert sweeps/snapshot, Unusual Whales flow_alerts): each
+        // row is an instantaneous event, so LEAN `Time` == `EndTime` == the
+        // event's own timestamp. `point_event_time` derives that instant from
+        // the row's timestamp fields (falling back to file/eastern-close time).
+        let event_time = point_event_time(source_date, source_uri, &fields);
         let symbol = symbol_column.and_then(|column| point_symbol(&fields, column));
         out.push(
             CustomDataPoint::new(
-                end_time.date_utc(),
-                Some(end_time),
+                event_time,
+                event_time,
                 point_value(&fields, value_columns),
                 fields,
             )
@@ -152,7 +157,14 @@ fn point_value(fields: &HashMap<String, serde_json::Value>, value_columns: &[&st
     Decimal::ZERO
 }
 
-fn point_end_time(
+/// Derive the instantaneous event time (LEAN `Time` == `EndTime`) for an
+/// intraday custom-data row, from its own timestamp fields. Preference order:
+/// explicit epoch `end_time`/`start_time` columns, then textual event-time
+/// columns (`time`/`bar_time`/`datetime`), then the file's `HHMM` name, then the
+/// source date at the US-Eastern market close. Used both when decoding provider
+/// parquet at ingest and when backfilling `time_ns`/`end_time_ns` during the
+/// #81 in-place migration of intraday feeds.
+pub fn point_event_time(
     source_date: NaiveDate,
     source_uri: &str,
     fields: &HashMap<String, serde_json::Value>,
@@ -214,7 +226,7 @@ fn json_timestamp(value: &serde_json::Value) -> Option<DateTime> {
 /// already ns" check at a single threshold like 1e15 misclassifies both
 /// second-epoch and microsecond-epoch inputs — see the regression this
 /// replaces.)
-pub(crate) fn epoch_value_to_ns(raw: i64) -> i64 {
+pub fn epoch_value_to_ns(raw: i64) -> i64 {
     match raw.unsigned_abs() {
         magnitude if magnitude < 100_000_000_000 => raw.saturating_mul(1_000_000_000), // seconds
         magnitude if magnitude < 100_000_000_000_000 => raw.saturating_mul(1_000_000), // millis
@@ -306,7 +318,7 @@ mod tests {
             serde_json::Value::String("2026-04-01 09:30:07:650".into()),
         );
         let source_date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
-        let end_time = point_end_time(source_date, "0931.parquet", &fields);
+        let end_time = point_event_time(source_date, "0931.parquet", &fields);
         assert_eq!(end_time.date_utc(), source_date);
     }
 
@@ -322,7 +334,7 @@ mod tests {
             serde_json::Value::from(1_775_050_200_971_i64),
         );
         let source_date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
-        let end_time = point_end_time(source_date, "0931.parquet", &fields);
+        let end_time = point_event_time(source_date, "0931.parquet", &fields);
         assert_eq!(end_time.date_utc(), source_date);
     }
 
@@ -334,7 +346,7 @@ mod tests {
             serde_json::Value::String("2026-06-14 18:47:31".into()),
         );
         let source_date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
-        let end_time = point_end_time(source_date, "0931.parquet", &fields);
+        let end_time = point_event_time(source_date, "0931.parquet", &fields);
         assert_eq!(end_time.date_utc(), source_date);
     }
 

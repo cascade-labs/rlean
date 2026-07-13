@@ -583,8 +583,8 @@ impl CustomPartitionFields {
     pub fn from_spec(spec: &PartitionSpec) -> Result<Self> {
         Ok(Self {
             len: spec.fields().len(),
-            source_type: custom_field_index(spec, "source_type")?,
-            ticker: custom_field_index(spec, "ticker")?,
+            source_type: custom_field_index(spec, "provider")?,
+            ticker: custom_field_index(spec, "feed")?,
             day: spec.fields().iter().position(|field| field.name == "day"),
         })
     }

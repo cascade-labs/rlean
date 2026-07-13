@@ -889,17 +889,14 @@ impl CustomDataPointView {
     pub fn value_pascal(&self) -> f64 {
         self.value()
     }
-    pub fn time(&self) -> chrono::NaiveDate {
-        self.point.time
+    pub fn time(&self) -> chrono::NaiveDateTime {
+        ns_to_exchange_naive(self.point.time.0)
     }
-    pub fn time_pascal(&self) -> chrono::NaiveDate {
+    pub fn time_pascal(&self) -> chrono::NaiveDateTime {
         self.time()
     }
     pub fn end_time(&self) -> chrono::NaiveDateTime {
-        self.point
-            .end_time
-            .map(|time| ns_to_exchange_naive(time.0))
-            .unwrap_or_else(|| self.point.time.and_hms_opt(0, 0, 0).unwrap_or_default())
+        ns_to_exchange_naive(self.point.end_time.0)
     }
     pub fn end_time_pascal(&self) -> chrono::NaiveDateTime {
         self.end_time()
@@ -1038,7 +1035,7 @@ impl CustomDataPointView {
     }
 
     #[getter(time)]
-    fn py_time(&self) -> chrono::NaiveDate {
+    fn py_time(&self) -> chrono::NaiveDateTime {
         self.time()
     }
 
@@ -1105,22 +1102,21 @@ mod tests {
         let frame = SharedSliceFrame::new();
         let view = SliceView::new(frame.clone());
         let day = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
-        let mut slice = Slice::new(lean_core::DateTime::from(
-            day.and_hms_opt(16, 0, 0).unwrap(),
-        ));
+        let stamp = lean_core::DateTime::from(day.and_hms_opt(16, 0, 0).unwrap());
+        let mut slice = Slice::new(stamp);
         slice.custom_data.insert(
             "VIX".to_string(),
             vec![
                 CustomDataPoint {
-                    time: day,
-                    end_time: None,
+                    time: stamp,
+                    end_time: stamp,
                     value: dec!(13.5),
                     symbol: None,
                     fields: Arc::new(HashMap::new()),
                 },
                 CustomDataPoint {
-                    time: day,
-                    end_time: None,
+                    time: stamp,
+                    end_time: stamp,
                     value: dec!(14.25),
                     symbol: Some("SPY".to_string()),
                     fields: Arc::new(HashMap::from([

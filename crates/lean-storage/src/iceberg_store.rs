@@ -570,7 +570,7 @@ impl IcebergStore {
             &["security_type", "market", "day"],
         )
         .await?;
-        self.ensure_table(CUSTOM_POINTS, custom_schema(), &["source_type", "ticker"])
+        self.ensure_table(CUSTOM_POINTS, custom_schema(), &["provider", "feed"])
             .await?;
         self.ensure_table(FACTOR_FILES, factor_schema(), &["market", "ticker"])
             .await?;
@@ -1165,12 +1165,7 @@ impl IcebergStore {
         for batch in &batches {
             append_custom_batch_points(batch, &mut out, projected_fields.as_ref())?;
         }
-        out.sort_by_key(|point| {
-            point
-                .end_time
-                .map(|dt| dt.0)
-                .unwrap_or_else(|| schema::date_to_ns(point.time))
-        });
+        out.sort_by_key(|point| point.end_time.0);
         Ok(out)
     }
 
@@ -1308,9 +1303,11 @@ impl IcebergStore {
         points: &[CustomDataPoint],
     ) -> Result<Vec<CustomDataPoint>> {
         let mut existing = HashSet::new();
+        // Rows partition by their emission gate (`end_time`), and `custom_point_key`
+        // keys on it too, so the dedupe scan window is over end_time dates.
         if let (Some(start), Some(end)) = (
-            points.iter().map(|point| point.time).min(),
-            points.iter().map(|point| point.time).max(),
+            points.iter().map(|point| point.end_time.date_utc()).min(),
+            points.iter().map(|point| point.end_time.date_utc()).max(),
         ) {
             for point in self
                 .scan_custom_points_range(source_type, ticker, start, end)
@@ -2191,8 +2188,8 @@ impl IcebergStore {
         for attempt in 0..MAX_ATTEMPTS {
             let mut df = self.market_files_df(pruned_file_paths.iter()).await?;
             df = df
-                .filter(col("source_type").eq(lit(source_type.clone())))?
-                .filter(col("ticker").eq(lit(ticker.clone())))?
+                .filter(col("provider").eq(lit(source_type.clone())))?
+                .filter(col("feed").eq(lit(ticker.clone())))?
                 .filter(col("day").gt_eq(lit(start_day)))?
                 .filter(col("day").lt_eq(lit(end_day)))?;
             if let Some(query) = query {
@@ -2476,8 +2473,8 @@ fn custom_schema() -> Schema {
     iceberg_schema_from_arrow(
         schema::custom_data_schema(),
         &[
-            ("source_type", PrimitiveType::String, false),
-            ("ticker", PrimitiveType::String, false),
+            ("provider", PrimitiveType::String, false),
+            ("feed", PrimitiveType::String, false),
             ("day", PrimitiveType::Date, false),
         ],
     )
@@ -2833,18 +2830,12 @@ fn estimated_json_value_len(value: &serde_json::Value) -> usize {
 }
 
 fn custom_points_to_record_batch(
-    source_type: &str,
-    ticker: &str,
+    provider: &str,
+    feed: &str,
     points: &[CustomDataPoint],
 ) -> Result<RecordBatch> {
-    let date_ns: Vec<i64> = points
-        .iter()
-        .map(|p| {
-            p.end_time
-                .map(|time| time.0)
-                .unwrap_or_else(|| schema::date_to_ns(p.time))
-        })
-        .collect();
+    let time_ns: Vec<i64> = points.iter().map(|p| p.time.0).collect();
+    let end_time_ns: Vec<i64> = points.iter().map(|p| p.end_time.0).collect();
     let value: Vec<f64> = points
         .iter()
         .map(|p| p.value.to_f64().unwrap_or(0.0))
@@ -2857,36 +2848,39 @@ fn custom_points_to_record_batch(
         .iter()
         .map(|p| p.symbol.as_ref().map(|s| s.to_ascii_uppercase()))
         .collect();
-    let day: Vec<i32> = date_ns.iter().map(|ns| days_since_epoch(*ns)).collect();
+    // The `day` partition tracks the emission gate (`end_time_ns`): window scans
+    // prune on it, and the engine only surfaces a point once the frontier reaches
+    // its end_time, so a point must be reachable in the day partition of the date
+    // it becomes visible.
+    let day: Vec<i32> = end_time_ns.iter().map(|ns| days_since_epoch(*ns)).collect();
     let rows = points.len();
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("date_ns", DataType::Int64, false),
+        Field::new("time_ns", DataType::Int64, false),
+        Field::new("end_time_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("fields_json", DataType::Utf8, false),
         Field::new("symbol", DataType::Utf8, true),
-        Field::new("source_type", DataType::Utf8, false),
-        Field::new("ticker", DataType::Utf8, false),
+        Field::new("provider", DataType::Utf8, false),
+        Field::new("feed", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
     ]));
     Ok(RecordBatch::try_new(
         arrow_schema,
         vec![
-            Arc::new(Int64Array::from(date_ns)),
+            Arc::new(Int64Array::from(time_ns)),
+            Arc::new(Int64Array::from(end_time_ns)),
             Arc::new(Float64Array::from(value)),
             Arc::new(StringArray::from(fields_json)),
             Arc::new(StringArray::from(symbol)),
-            Arc::new(StringArray::from(vec![source_type.to_lowercase(); rows])),
-            Arc::new(StringArray::from(vec![ticker.to_lowercase(); rows])),
+            Arc::new(StringArray::from(vec![provider.to_lowercase(); rows])),
+            Arc::new(StringArray::from(vec![feed.to_lowercase(); rows])),
             Arc::new(arrow_array::Date32Array::from(day)),
         ],
     )?)
 }
 
 fn custom_point_key(point: &CustomDataPoint) -> (i64, String, String) {
-    let time = point
-        .end_time
-        .map(|time| time.0)
-        .unwrap_or_else(|| schema::date_to_ns(point.time));
+    let time = point.end_time.0;
     // Distinct events can share a timestamp: two Unusual Whales alerts in the
     // same millisecond, or an EOD snapshot where every ticker's row carries
     // the same 16:00 stamp. The provider row id disambiguates events when
@@ -2900,16 +2894,6 @@ fn custom_point_key(point: &CustomDataPoint) -> (i64, String, String) {
     let symbol = point.symbol.clone().unwrap_or_default();
     (time, id, symbol)
 }
-
-/// Maximum tolerated distance between a cached row's `date_ns` (which drives
-/// the Iceberg `day` partition) and the event time re-derived from its own
-/// fields. Rows beyond this are mis-partitioned: an older decoder stamped them
-/// with fetch/file-metadata time (e.g. a whole backfill object cached under
-/// its upload date), so day-pruned window scans can never surface them at
-/// their true event time. Dropping them at read makes the cache report those
-/// windows as missing, letting the provider refetch land correctly-partitioned
-/// replacements instead of being deduped against unreachable rows.
-const CUSTOM_POINT_MAX_PARTITION_SKEW_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 fn option_universe_key(
     row: &OptionUniverseRow,
@@ -2953,31 +2937,27 @@ fn with_option_partitions(batch: RecordBatch) -> Result<RecordBatch> {
     )
 }
 
-fn with_custom_partitions(
-    batch: RecordBatch,
-    source_type: &str,
-    ticker: &str,
-) -> Result<RecordBatch> {
+fn with_custom_partitions(batch: RecordBatch, provider: &str, feed: &str) -> Result<RecordBatch> {
     let rows = batch.num_rows();
     let day_values = batch
-        .column_by_name("date_ns")
-        .ok_or_else(|| anyhow!("date_ns column missing"))?
+        .column_by_name("end_time_ns")
+        .ok_or_else(|| anyhow!("end_time_ns column missing"))?
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("date_ns must be int64"))?;
+        .ok_or_else(|| anyhow!("end_time_ns must be int64"))?;
     let day: Vec<i32> = (0..rows)
         .map(|row| days_since_epoch(day_values.value(row)))
         .collect();
     append_columns(
         batch,
         &[
-            Field::new("source_type", DataType::Utf8, false),
-            Field::new("ticker", DataType::Utf8, false),
+            Field::new("provider", DataType::Utf8, false),
+            Field::new("feed", DataType::Utf8, false),
             Field::new("day", DataType::Date32, false),
         ],
         vec![
-            Arc::new(StringArray::from(vec![source_type.to_lowercase(); rows])),
-            Arc::new(StringArray::from(vec![ticker.to_lowercase(); rows])),
+            Arc::new(StringArray::from(vec![provider.to_lowercase(); rows])),
+            Arc::new(StringArray::from(vec![feed.to_lowercase(); rows])),
             Arc::new(arrow_array::Date32Array::from(day)),
         ],
     )
@@ -2988,12 +2968,18 @@ fn append_custom_batch_points(
     out: &mut Vec<CustomDataPoint>,
     projected_fields: Option<&HashSet<String>>,
 ) -> Result<()> {
-    let date_ns = batch
-        .column_by_name("date_ns")
-        .ok_or_else(|| anyhow!("date_ns column missing"))?
+    let time_ns = batch
+        .column_by_name("time_ns")
+        .ok_or_else(|| anyhow!("time_ns column missing"))?
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("date_ns must be int64"))?;
+        .ok_or_else(|| anyhow!("time_ns must be int64"))?;
+    let end_time_ns = batch
+        .column_by_name("end_time_ns")
+        .ok_or_else(|| anyhow!("end_time_ns column missing"))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("end_time_ns must be int64"))?;
     let value = batch
         .column_by_name("value")
         .ok_or_else(|| anyhow!("value column missing"))?
@@ -3011,11 +2997,8 @@ fn append_custom_batch_points(
                 None => HashMap::new(),
                 Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             };
-        let date_ns = date_ns.value(row);
-        let end_time_ns = custom_point_end_time(&fields, date_ns).unwrap_or(date_ns);
-        if (end_time_ns - date_ns).abs() > CUSTOM_POINT_MAX_PARTITION_SKEW_NS {
-            continue;
-        }
+        let time_ns = time_ns.value(row);
+        let end_time_ns = end_time_ns.value(row);
         if let Some(projected_fields) = projected_fields {
             fields.retain(|key, _| projected_fields.contains(key));
         }
@@ -3025,8 +3008,8 @@ fn append_custom_batch_points(
             .filter(|value| !value.is_empty());
         out.push(
             CustomDataPoint::new(
-                schema::ns_to_date(end_time_ns),
-                Some(lean_core::NanosecondTimestamp(end_time_ns)),
+                lean_core::NanosecondTimestamp(time_ns),
+                lean_core::NanosecondTimestamp(end_time_ns),
                 rust_decimal::Decimal::from_f64(value.value(row)).unwrap_or_default(),
                 fields,
             )
@@ -3165,36 +3148,6 @@ fn escape_like_value(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
-}
-
-fn custom_point_end_time(fields: &HashMap<String, serde_json::Value>, date_ns: i64) -> Option<i64> {
-    for key in ["end_time_ns", "time_ns", "timestamp_ns"] {
-        if let Some(ns) = fields.get(key).and_then(json_i64) {
-            return Some(ns);
-        }
-    }
-    for key in ["end_time", "start_time"] {
-        if let Some(raw) = fields.get(key).and_then(json_i64) {
-            return Some(crate::custom_ingest::epoch_value_to_ns(raw));
-        }
-    }
-    let fallback_date = schema::ns_to_date(date_ns);
-    for key in ["time", "bar_time", "datetime"] {
-        if let Some(text) = fields.get(key).and_then(|value| value.as_str()) {
-            if let Some(end_time) =
-                crate::custom_ingest::parse_tradealert_timestamp(text, fallback_date)
-            {
-                return Some(end_time.0);
-            }
-        }
-    }
-    None
-}
-
-fn json_i64(value: &serde_json::Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
 }
 
 fn market_day_values(batch: &RecordBatch, resolution: Resolution) -> Result<Vec<i32>> {
@@ -3648,15 +3601,18 @@ mod tests {
     #[test]
     fn append_custom_batch_points_retains_only_projected_fields() {
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("date_ns", DataType::Int64, false),
+            Field::new("time_ns", DataType::Int64, false),
+            Field::new("end_time_ns", DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
             Field::new("fields_json", DataType::Utf8, false),
         ]));
-        let date_ns = schema::date_to_ns(chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap());
+        let time_ns = schema::date_to_ns(chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap());
+        let end_time_ns = time_ns + 86_400 * 1_000_000_000;
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from(vec![date_ns])),
+                Arc::new(Int64Array::from(vec![time_ns])),
+                Arc::new(Int64Array::from(vec![end_time_ns])),
                 Arc::new(Float64Array::from(vec![42.0])),
                 Arc::new(StringArray::from(vec![serde_json::json!({
                     "usymbol": "SPY",

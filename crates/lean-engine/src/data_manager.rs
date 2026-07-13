@@ -624,7 +624,11 @@ mod tests {
             .append_custom_points(
                 "fixture",
                 "ALT",
-                &[CustomDataPoint::empty(day, Some(dt(day, 16, 0)), dec!(42))],
+                &[CustomDataPoint::empty(
+                    dt(day, 16, 0),
+                    dt(day, 16, 0),
+                    dec!(42),
+                )],
             )
             .await
             .unwrap();
@@ -687,7 +691,11 @@ mod tests {
             date: NaiveDate,
             _config: &CustomDataConfig,
         ) -> Option<CustomDataPoint> {
-            Some(CustomDataPoint::empty(date, Some(dt(date, 16, 0)), dec!(7)))
+            Some(CustomDataPoint::empty(
+                dt(date, 16, 0),
+                dt(date, 16, 0),
+                dec!(7),
+            ))
         }
     }
 

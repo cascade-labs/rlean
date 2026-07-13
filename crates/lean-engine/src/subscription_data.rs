@@ -31,15 +31,12 @@ impl SubscriptionDataPoint {
             SubscriptionDataPoint::QuoteBar(bar) => bar.end_time,
             SubscriptionDataPoint::Tick(tick) => tick.time,
             SubscriptionDataPoint::OptionChain { frontier_time, .. } => *frontier_time,
-            SubscriptionDataPoint::CustomData { point, .. } => {
-                point.end_time.unwrap_or_else(|| {
-                    point
-                        .time
-                        .and_hms_opt(0, 0, 0)
-                        .expect("midnight is valid")
-                        .into()
-                })
-            }
+            // LEAN gates custom-data emission on `EndTime` (the frontier only
+            // surfaces a point once it reaches `EmitTimeUtc = EndTime`), which is
+            // never null. `end_time` is now a required field, so the point is
+            // structurally unable to surface before its availability time — the
+            // midnight fallback (and its look-ahead, #31) is gone.
+            SubscriptionDataPoint::CustomData { point, .. } => point.end_time,
         }
     }
 
