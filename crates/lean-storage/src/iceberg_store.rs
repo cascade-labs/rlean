@@ -151,6 +151,14 @@ pub struct IcebergStore {
     /// leading underscore marks it as an RAII guard that is never read directly.
     /// `None` when no signing was requested.
     _sigv4_proxy: Option<Arc<SigV4Proxy>>,
+    /// Purge-drop endpoint for AWS S3 Tables. `iceberg-catalog-rest`'s
+    /// `drop_table` sends a plain `DELETE` with no `purgeRequested` flag, which
+    /// S3 Tables rejects ("S3 Tables only supports dropping tables with purge
+    /// enabled"). When SigV4 signing is on, [`reset_table`] instead issues a
+    /// signed `DELETE .../tables/{name}?purgeRequested=true` through the proxy.
+    /// `None` for a non-AWS (unsigned) REST catalog, where the trait
+    /// `drop_table` works.
+    purge_dropper: Option<PurgeDropper>,
     table_contexts: Arc<Mutex<HashMap<String, Arc<IcebergTableContext>>>>,
     partition_indexes: Arc<Mutex<HashMap<String, Arc<MarketPartitionIndex>>>>,
     custom_partition_indexes: Arc<Mutex<HashMap<String, Arc<CustomPartitionIndex>>>>,
@@ -159,6 +167,95 @@ pub struct IcebergStore {
 
 struct IcebergTableContext {
     ctx: SessionContext,
+}
+
+/// Issues purge-enabled table drops against an AWS S3 Tables REST catalog.
+///
+/// The store points this at the SigV4 signing proxy's local base URI, so a
+/// plain `reqwest` request here is transparently signed and forwarded to the
+/// real catalog. `prefix` is the catalog's `overrides.prefix` from `/v1/config`
+/// (S3 Tables scopes every path under the warehouse), captured once at connect.
+#[derive(Clone)]
+struct PurgeDropper {
+    /// Signing-proxy base URI, already including the catalog path prefix, e.g.
+    /// `http://127.0.0.1:<port>/iceberg`.
+    proxy_base: String,
+    /// Catalog request prefix from `/v1/config` `overrides.prefix`; empty when
+    /// the catalog vends none.
+    prefix: String,
+}
+
+impl PurgeDropper {
+    /// Resolve the catalog request prefix by calling
+    /// `/v1/config?warehouse=<warehouse>` through the signing proxy, mirroring
+    /// how `iceberg-catalog-rest` bootstraps its own request prefix. The prefix
+    /// comes from `defaults.prefix`, with `overrides.prefix` taking precedence
+    /// (the same merge the crate applies). For S3 Tables it is the
+    /// percent-encoded warehouse ARN and is inserted into request paths verbatim
+    /// (already URL-encoded).
+    async fn new(proxy_base: &str, warehouse: &str) -> Result<Self> {
+        let config_url = format!("{proxy_base}/v1/config");
+        let response = reqwest::Client::new()
+            .get(&config_url)
+            .query(&[("warehouse", warehouse)])
+            .send()
+            .await
+            .with_context(|| format!("failed to GET catalog config at {config_url}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read catalog config response body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "catalog config request to {config_url} failed: {status}: {body}"
+            ));
+        }
+        let config: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("catalog config response was not JSON: {body}"))?;
+        let prefix_from = |section: &str| {
+            config
+                .get(section)
+                .and_then(|section| section.get("prefix"))
+                .and_then(|prefix| prefix.as_str())
+                .map(str::to_string)
+        };
+        let prefix = prefix_from("overrides")
+            .or_else(|| prefix_from("defaults"))
+            .unwrap_or_default();
+        Ok(Self {
+            proxy_base: proxy_base.to_string(),
+            prefix,
+        })
+    }
+
+    /// Signed `DELETE .../namespaces/{ns}/tables/{name}?purgeRequested=true`.
+    async fn purge_drop(&self, namespace: &NamespaceIdent, name: &str) -> Result<()> {
+        let mut segments = vec![self.proxy_base.trim_end_matches('/').to_string()];
+        segments.push("v1".to_string());
+        if !self.prefix.is_empty() {
+            segments.push(self.prefix.clone());
+        }
+        segments.push("namespaces".to_string());
+        segments.push(namespace.to_url_string());
+        segments.push("tables".to_string());
+        segments.push(name.to_string());
+        let url = segments.join("/");
+        let response = reqwest::Client::new()
+            .delete(&url)
+            .query(&[("purgeRequested", "true")])
+            .send()
+            .await
+            .with_context(|| format!("failed to send purge drop DELETE to {url}"))?;
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow!(
+            "purge drop DELETE to {url} failed: {status}: {body}"
+        ))
+    }
 }
 
 fn is_catalog_commit_conflict(err: &anyhow::Error) -> bool {
@@ -183,7 +280,9 @@ impl IcebergStore {
     /// `config.sigv4` is `None`, the catalog is used unsigned and no S3
     /// credentials are attached.
     pub async fn connect(config: RestCatalogConfig) -> Result<Self> {
-        let (catalog_uri, s3_credentials, proxy_guard, storage_props) = match &config.sigv4 {
+        let (catalog_uri, s3_credentials, proxy_guard, purge_dropper, storage_props) = match &config
+            .sigv4
+        {
             Some(sigv4) => {
                 let region = sigv4.region.clone();
                 let credentials_provider = shared_aws_credentials(&region).await?;
@@ -195,15 +294,20 @@ impl IcebergStore {
                     credentials_provider,
                 )
                 .await?;
+                // Resolve the purge-drop endpoint through the same signing
+                // proxy so drops carry `purgeRequested=true` (required by S3
+                // Tables).
+                let purge_dropper = PurgeDropper::new(proxy.local_uri(), &config.warehouse).await?;
                 let props = s3_file_io_props(&resolved);
                 (
                     proxy.local_uri().to_string(),
                     Some(resolved),
                     Some(Arc::new(proxy)),
+                    Some(purge_dropper),
                     props,
                 )
             }
-            None => (config.uri.clone(), None, None, HashMap::new()),
+            None => (config.uri.clone(), None, None, None, HashMap::new()),
         };
 
         let storage_factory: Arc<dyn StorageFactory> = if s3_credentials.is_some() {
@@ -227,6 +331,7 @@ impl IcebergStore {
             namespace: NamespaceIdent::new(config.namespace.clone()),
             s3_credentials,
             _sigv4_proxy: proxy_guard,
+            purge_dropper,
             table_contexts: Arc::new(Mutex::new(HashMap::new())),
             partition_indexes: Arc::new(Mutex::new(HashMap::new())),
             custom_partition_indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -316,24 +421,66 @@ impl IcebergStore {
     pub async fn reset_table(&self, name: &str) -> Result<()> {
         let ident = self.ident(name);
         if self.catalog.table_exists(&ident).await? {
-            self.catalog.drop_table(&ident).await.with_context(|| {
-                format!(
-                    "failed to drop Iceberg table {}.{name}",
-                    self.namespace_display()
-                )
-            })?;
+            // S3 Tables rejects a plain drop ("only supports dropping tables
+            // with purge enabled"), and `iceberg-catalog-rest`'s `drop_table`
+            // sends no purge flag. On the signed (AWS) path issue a purge-drop
+            // through the proxy; on an unsigned catalog the trait drop is fine.
+            match &self.purge_dropper {
+                Some(dropper) => dropper.purge_drop(&self.namespace, name).await?,
+                None => self.catalog.drop_table(&ident).await.with_context(|| {
+                    format!(
+                        "failed to drop Iceberg table {}.{name}",
+                        self.namespace_display()
+                    )
+                })?,
+            }
+            // S3 Tables processes the drop asynchronously: the DELETE returns
+            // success while the table lingers briefly. If `ensure_tables` runs
+            // its `table_exists` check before the drop settles it sees the old
+            // table, skips the create, and leaves the stale rows in place. Wait
+            // for the table to actually disappear before recreating.
+            self.await_table_absent(&ident, name).await?;
         }
 
         self.invalidate_table_context(name);
         self.ensure_tables().await
     }
 
+    /// Poll the catalog until `ident` no longer exists, so a following
+    /// `create_table` starts from a clean slate. S3 Tables drops settle within a
+    /// few catalog round-trips.
+    async fn await_table_absent(&self, ident: &TableIdent, name: &str) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 40;
+        for attempt in 0..MAX_ATTEMPTS {
+            if !self.catalog.table_exists(ident).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                250 * (attempt as u64 + 1).min(4),
+            ))
+            .await;
+        }
+        Err(anyhow!(
+            "table {}.{name} still exists after purge drop; catalog did not settle",
+            self.namespace_display()
+        ))
+    }
+
     pub async fn ensure_tables(&self) -> Result<()> {
         if !self.catalog.namespace_exists(&self.namespace).await? {
-            self.catalog
+            if let Err(error) = self
+                .catalog
                 .create_namespace(&self.namespace, HashMap::new())
                 .await
-                .context("failed to create lean Iceberg namespace")?;
+            {
+                // Two concurrent connects race between the existence check and
+                // the create; the catalog enforces uniqueness so the loser sees
+                // "already exists". Losing that race is success as long as the
+                // namespace now exists.
+                if !self.catalog.namespace_exists(&self.namespace).await? {
+                    return Err(error).context("failed to create lean Iceberg namespace");
+                }
+            }
         }
 
         self.ensure_table(

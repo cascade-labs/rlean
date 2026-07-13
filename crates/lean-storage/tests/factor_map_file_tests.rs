@@ -1,4 +1,5 @@
 use chrono::NaiveDate;
+use lean_storage::iceberg_store::{FACTOR_FILES, MAP_FILES};
 use lean_storage::{FactorFileEntry, IcebergStore, MapFile, MapFileEntry, MapFileResolver};
 use lean_storage::{RestCatalogConfig, SigV4Config};
 
@@ -12,6 +13,8 @@ async fn factor_file_round_trip_through_iceberg() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(FACTOR_FILES).await.unwrap();
     let entries = vec![
         FactorFileEntry {
             date: date(2024, 1, 1),
@@ -45,6 +48,8 @@ async fn map_file_round_trip_through_iceberg() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(MAP_FILES).await.unwrap();
     let entries = vec![
         MapFileEntry {
             date: date(1993, 1, 29),
@@ -133,6 +138,10 @@ fn map_file_resolver_uses_next_row_then_last_row_like_lean_binary_search() {
 /// `RLEAN_TEST_NAMESPACE` selects the Iceberg namespace (default `lean_dev`, an
 /// isolated scratch namespace that never touches the production `lean` tables).
 /// When `RLEAN_TEST_CATALOG` is unset the helper returns `None` and the test skips.
+///
+/// The scratch namespace persists across runs, so each gated test that asserts
+/// on a table's full contents resets that table (drop + recreate) after
+/// connecting to start from a known-empty state.
 async fn connect_test_store() -> Option<IcebergStore> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()

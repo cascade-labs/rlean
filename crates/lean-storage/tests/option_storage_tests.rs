@@ -1,4 +1,5 @@
 use chrono::NaiveDate;
+use lean_storage::iceberg_store::{OPTION_EOD_BARS, OPTION_UNIVERSE};
 use lean_storage::schema::{OptionEodBar, OptionUniverseRow};
 use lean_storage::IcebergStore;
 use lean_storage::{RestCatalogConfig, SigV4Config};
@@ -45,6 +46,8 @@ async fn option_eod_bars_round_trip_through_iceberg() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(OPTION_EOD_BARS).await.unwrap();
     let expiry = date(2021, 4, 30);
     let bars = vec![
         sample_eod_bar("SPY", "SPY210430P00480000", expiry, "P"),
@@ -93,6 +96,8 @@ async fn option_universe_round_trip_through_iceberg() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(OPTION_UNIVERSE).await.unwrap();
     let expiry = date(2021, 4, 16);
     let rows = vec![
         sample_universe_row("SPY", "SPY210416P00400000", expiry),
@@ -127,6 +132,8 @@ async fn option_tables_filter_by_underlying() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(OPTION_UNIVERSE).await.unwrap();
     let expiry = date(2021, 4, 16);
     let rows = vec![
         sample_universe_row("SPY", "SPY210416P00480000", expiry),
@@ -156,6 +163,10 @@ async fn option_tables_filter_by_underlying() {
 /// `RLEAN_TEST_NAMESPACE` selects the Iceberg namespace (default `lean_dev`, an
 /// isolated scratch namespace that never touches the production `lean` tables).
 /// When `RLEAN_TEST_CATALOG` is unset the helper returns `None` and the test skips.
+///
+/// The scratch namespace persists across runs, so each gated test that asserts
+/// on a table's full contents resets that table (drop + recreate) after
+/// connecting to start from a known-empty state.
 async fn connect_test_store() -> Option<IcebergStore> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 use lean_core::{DateTime, NanosecondTimestamp};
 use lean_data::{CustomDataPoint, CustomDataQuery};
+use lean_storage::iceberg_store::CUSTOM_POINTS;
 use lean_storage::IcebergStore;
 use lean_storage::{RestCatalogConfig, SigV4Config};
 use rust_decimal::Decimal;
@@ -41,6 +42,8 @@ async fn custom_point_symbol_round_trips_through_iceberg() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(CUSTOM_POINTS).await.unwrap();
     let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
 
     store
@@ -68,6 +71,8 @@ async fn custom_query_symbols_filter_matches_point_symbol() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(CUSTOM_POINTS).await.unwrap();
     let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
 
     store
@@ -109,6 +114,8 @@ async fn same_timestamp_idless_rows_keep_all_symbols_and_stay_idempotent() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(CUSTOM_POINTS).await.unwrap();
     let day = NaiveDate::from_ymd_opt(2024, 1, 16).unwrap();
 
     let rows: Vec<CustomDataPoint> = ["AAPL", "MSFT", "OMI", "SPY"]
@@ -148,6 +155,8 @@ async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(CUSTOM_POINTS).await.unwrap();
     let date = NaiveDate::from_ymd_opt(2021, 6, 1).unwrap();
     let points: Vec<CustomDataPoint> = ["OMI", "GDDY", "ASR"]
         .iter()
@@ -187,6 +196,10 @@ async fn same_timestamp_no_id_points_dedupe_by_symbol_not_time() {
 /// `RLEAN_TEST_NAMESPACE` selects the Iceberg namespace (default `lean_dev`, an
 /// isolated scratch namespace that never touches the production `lean` tables).
 /// When `RLEAN_TEST_CATALOG` is unset the helper returns `None` and the test skips.
+///
+/// The scratch namespace persists across runs, so each gated test that asserts
+/// on a table's full contents resets that table (drop + recreate) after
+/// connecting to start from a known-empty state.
 async fn connect_test_store() -> Option<IcebergStore> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()

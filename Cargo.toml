@@ -112,7 +112,7 @@ iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-config = { version = "1", features = ["behavior-version-latest", "credentials-login"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-sigv4 = "1"
 aws-smithy-runtime-api = "1"

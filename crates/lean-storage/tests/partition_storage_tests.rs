@@ -32,6 +32,8 @@ async fn iceberg_trade_bar_scan_returns_chronological_rows_by_symbol() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(MARKET_TRADE_BARS).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let qqq = Symbol::create_equity("QQQ", &market);
@@ -102,6 +104,10 @@ async fn market_partition_days_tracks_appended_market_partitions() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs; the test asserts on the trade
+    // and quote partition days, so start both tables empty.
+    store.reset_table(MARKET_TRADE_BARS).await.unwrap();
+    store.reset_table(MARKET_QUOTE_BARS).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let day1 = date(2022, 5, 3);
@@ -211,6 +217,8 @@ async fn warmed_market_partition_index_tracks_appends() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(MARKET_TRADE_BARS).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let day1 = date(2022, 5, 3);
@@ -280,6 +288,8 @@ async fn daily_trade_bar_is_partitioned_by_end_time_day() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(MARKET_TRADE_BARS).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let start_day = date(2024, 1, 16);
@@ -328,6 +338,8 @@ async fn appending_same_trade_bar_twice_does_not_duplicate_key() {
     let Some(store) = connect_test_store().await else {
         return;
     };
+    // The scratch namespace persists across runs, so start from an empty table.
+    store.reset_table(MARKET_TRADE_BARS).await.unwrap();
     let market = Market::usa();
     let spy = Symbol::create_equity("SPY", &market);
     let day = date(2024, 1, 16);
@@ -385,6 +397,10 @@ async fn appending_same_trade_bar_twice_does_not_duplicate_key() {
 /// `RLEAN_TEST_NAMESPACE` selects the Iceberg namespace (default `lean_dev`, an
 /// isolated scratch namespace that never touches the production `lean` tables).
 /// When `RLEAN_TEST_CATALOG` is unset the helper returns `None` and the test skips.
+///
+/// The scratch namespace persists across runs, so each gated test that asserts
+/// on a table's full contents resets that table (drop + recreate) after
+/// connecting to start from a known-empty state.
 async fn connect_test_store() -> Option<IcebergStore> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()
