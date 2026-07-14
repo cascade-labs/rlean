@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rlean_storage::{
-    IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
+    DataS3Config, IcebergStore, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
+    DEFAULT_NAMESPACE,
 };
 
 #[derive(Parser)]
@@ -66,6 +67,10 @@ const DEFAULT_TABLES: &[&str] = &[
 ///   region is set)
 /// - `RLEAN_DATA_NAMESPACE`   Iceberg namespace holding the cache tables
 ///   (defaults to `lean`)
+/// - `RLEAN_DATA_S3_ENDPOINT` required S3 endpoint for all Iceberg data I/O
+/// - `RLEAN_DATA_S3_REGION` required region for that endpoint
+/// - `RLEAN_DATA_S3_ACCESS_KEY_ID` and `RLEAN_DATA_S3_SECRET_ACCESS_KEY`
+///   required credentials issued by that endpoint
 fn config_from_env() -> Result<RestCatalogConfig> {
     let uri = std::env::var("RLEAN_DATA_CATALOG")
         .context("RLEAN_DATA_CATALOG must be set to the REST catalog base URI")?;
@@ -88,12 +93,32 @@ fn config_from_env() -> Result<RestCatalogConfig> {
         }
         _ => None,
     };
+    let data_s3 = data_s3_from_env()?;
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
+        data_s3,
+    })
+}
+
+/// Read the required S3 configuration used for all Iceberg data-file I/O.
+fn data_s3_from_env() -> Result<DataS3Config> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let required =
+        |name: &str| read(name).with_context(|| format!("{name} must be set for Iceberg data I/O"));
+    Ok(DataS3Config {
+        endpoint: required("RLEAN_DATA_S3_ENDPOINT")?,
+        region: required("RLEAN_DATA_S3_REGION")?,
+        access_key_id: required("RLEAN_DATA_S3_ACCESS_KEY_ID")?,
+        secret_access_key: required("RLEAN_DATA_S3_SECRET_ACCESS_KEY")?,
     })
 }
 

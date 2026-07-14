@@ -61,7 +61,11 @@ All market data is Apache Parquet stored in [Apache Iceberg](https://iceberg.apa
 
 ### Catalog config
 
-Set these in `~/.rlean/config` with `rlean config set <key> <value>`, or pass the matching `--data-*` flag / `RLEAN_DATA_*` env var to `rlean backtest` / `rlean live`. The authoritative set lives in `crates/rlean/src/config.rs`.
+Set these in `~/.rlean/config` with `rlean config set <key> <value>`. The
+catalog, warehouse, and all four `data_s3_*` settings are required before rlean
+can read or cache market data. Environment variables can override them for one
+process; catalog flags are available for one-off catalog overrides. The
+authoritative set lives in `crates/rlean/src/config.rs`.
 
 | Key | Meaning |
 |---|---|
@@ -71,8 +75,16 @@ Set these in `~/.rlean/config` with `rlean config set <key> <value>`, or pass th
 | `data_sigv4_name` | SigV4 signing name / service. Defaults to `s3tables` when a region is set but the name is not. |
 | `data_namespace` | Iceberg namespace holding the tables. Defaults to `lean`. |
 | `data_refresh_secs` | How often (seconds) a long-running process rechecks the catalog for snapshots committed by other processes. Defaults to 30; `0` rechecks on every read. |
+| `data_s3_endpoint` | Required S3-compatible endpoint for every Iceberg metadata, manifest, and Parquet request, e.g. `http://127.0.0.1:8333`. |
+| `data_s3_region` | Required region expected when signing requests to `data_s3_endpoint`. |
+| `data_s3_access_key_id` | Required access key issued by `data_s3_endpoint`. |
+| `data_s3_secret_access_key` | Required secret issued by `data_s3_endpoint`. |
 
-An optional data-plane cache (`data_s3_endpoint` and its access keys) can route Iceberg data-file reads through a local read-through cache while catalog traffic still goes to AWS. Leave it unset to read data files directly from S3.
+The catalog and data endpoint are different things. The catalog identifies
+Iceberg tables; the data endpoint serves the metadata, manifests, and Parquet
+objects those tables reference. rlean does not derive an AWS endpoint from a
+bucket name or use one as a fallback. Catalog SigV4 credentials are only for
+catalog requests; data endpoint credentials are the explicit `data_s3_*` pair.
 
 ## Tables
 
@@ -191,13 +203,23 @@ The release workflow builds one `rlean-<version>-<triple>.tar.gz` per supported 
 
 ### 1. Configure the data catalog
 
-A backtest reads market data from the Iceberg catalog, so set it up first:
+A backtest reads and caches market data through both an Iceberg catalog and a
+configured S3-compatible data endpoint. Set both up first. The example uses
+AWS S3 Tables for the catalog and a local Verglas endpoint for data I/O; use
+the endpoint URL, signing region, and credentials supplied by your provider.
 
 ```sh
-rlean config set data_catalog     https://s3tables.us-west-2.amazonaws.com/iceberg
-rlean config set data_warehouse   arn:aws:s3tables:us-west-2:<acct>:bucket/<name>
+rlean config set data_catalog https://s3tables.us-west-2.amazonaws.com/iceberg
+rlean config set data_warehouse arn:aws:s3tables:us-west-2:<acct>:bucket/<name>
 rlean config set data_sigv4_region us-west-2
+rlean config set data_s3_endpoint http://127.0.0.1:8333
+rlean config set data_s3_region us-west-2
+rlean config set data_s3_access_key_id <endpoint-access-key>
+rlean config set data_s3_secret_access_key <endpoint-secret>
 ```
+
+Without this configuration, rlean refuses to start market-data reads and has
+no data-caching mode.
 
 ### 2. Create a workspace and project
 

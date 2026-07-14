@@ -25,9 +25,9 @@ use crate::config::GlobalConfig;
 /// - `default_language` → copied from local (already defaults to `"python"`)
 ///
 /// The local `data_folder` (a control-machine path such as `/Volumes/...`) is
-/// deliberately dropped; the local `s3_*` fields are left untouched on the
-/// local config and are NOT copied into the node config (only the `artifact_s3*`
-/// fields are, matching how the artifact relay reads its credentials).
+/// deliberately dropped. The legacy `s3_*` artifact fields are not copied;
+/// market data uses the explicit `data_s3_*` fields above and artifacts use the
+/// separate `artifact_s3*` fields below.
 pub(crate) fn node_config_from_local(
     local: &GlobalConfig,
     node_home: &str,
@@ -42,6 +42,14 @@ pub(crate) fn node_config_from_local(
         data_sigv4_region: local.data_sigv4_region.clone(),
         data_sigv4_name: local.data_sigv4_name.clone(),
         data_namespace: local.data_namespace.clone(),
+        // Iceberg data I/O has no AWS fallback. Carry the configured endpoint
+        // and credentials so a node cannot silently read a different store.
+        // Operators using a loopback cache must configure a reachable endpoint
+        // for that node before installation.
+        data_s3_endpoint: local.data_s3_endpoint.clone(),
+        data_s3_region: local.data_s3_region.clone(),
+        data_s3_access_key_id: local.data_s3_access_key_id.clone(),
+        data_s3_secret_access_key: local.data_s3_secret_access_key.clone(),
         // Carry the snapshot-refresh interval so fleet nodes see cross-process
         // commits on the same cadence as the control machine.
         data_refresh_secs: local.data_refresh_secs,
@@ -77,6 +85,10 @@ mod tests {
             data_sigv4_region: Some("us-west-2".to_string()),
             data_sigv4_name: None,
             data_namespace: None,
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            data_s3_region: Some("us-east-1".to_string()),
+            data_s3_access_key_id: Some("DATAKEY".to_string()),
+            data_s3_secret_access_key: Some("DATASECRET".to_string()),
             data_refresh_secs: Some(45),
             s3_access_key: Some("LOCALKEY".to_string()),
             s3_secret_key: Some("LOCALSECRET".to_string()),
@@ -120,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn node_config_copies_artifact_creds_only() {
+    fn node_config_copies_explicit_data_and_artifact_credentials() {
         let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
         assert_eq!(node.artifact_s3.as_deref(), Some("s3://runs-bucket/rlean"));
@@ -132,7 +144,18 @@ mod tests {
         assert_eq!(node.artifact_s3_access_key.as_deref(), Some("AKIA_ART"));
         assert_eq!(node.artifact_s3_secret_key.as_deref(), Some("SECRET_ART"));
 
-        // The plain s3_* block is NOT carried over to the node config.
+        // Required data-S3 configuration is carried over; the unrelated plain
+        // s3_* artifact-legacy block is not.
+        assert_eq!(
+            node.data_s3_endpoint.as_deref(),
+            Some("http://127.0.0.1:8333")
+        );
+        assert_eq!(node.data_s3_region.as_deref(), Some("us-east-1"));
+        assert_eq!(node.data_s3_access_key_id.as_deref(), Some("DATAKEY"));
+        assert_eq!(
+            node.data_s3_secret_access_key.as_deref(),
+            Some("DATASECRET")
+        );
         assert!(node.s3_access_key.is_none());
         assert!(node.s3_secret_key.is_none());
         assert!(node.s3_bucket.is_none());

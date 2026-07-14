@@ -18,9 +18,9 @@ warehouse. In production the catalog is AWS S3 Tables.
 
 ### Configuration
 
-Set these with `rlean config set <key> <value>`, or the matching environment
-variable, or the matching CLI flag. Precedence is **CLI flag > env var > config
-file**.
+Set these with `rlean config set <key> <value>`. Environment variables can
+override a setting for one process. The catalog and all four data-S3 values are
+required: without them rlean has no market-data caching mode.
 
 | Config key          | Env var                   | CLI flag              | Required | Meaning |
 |---------------------|---------------------------|-----------------------|----------|---------|
@@ -29,7 +29,10 @@ file**.
 | `data_sigv4_region` | `RLEAN_DATA_SIGV4_REGION` | `--data-sigv4-region` | no       | SigV4 signing region (turns on signing) |
 | `data_sigv4_name`   | `RLEAN_DATA_SIGV4_NAME`   | `--data-sigv4-name`   | no       | SigV4 signing name (default `s3tables`) |
 | `data_namespace`    | `RLEAN_DATA_NAMESPACE`    | `--data-namespace`    | no       | Iceberg namespace (default `lean`) |
-| `data_s3_endpoint`  | `RLEAN_DATA_S3_ENDPOINT`  | `--data-s3-endpoint`  | no       | Data-plane S3 endpoint for data-file reads (e.g. a local Verglas cache). Catalog traffic still goes to AWS |
+| `data_s3_endpoint`  | `RLEAN_DATA_S3_ENDPOINT`  | —                     | yes      | S3-compatible endpoint for all Iceberg metadata, manifests, and Parquet files |
+| `data_s3_region`    | `RLEAN_DATA_S3_REGION`    | —                     | yes      | Region expected when signing requests to the data endpoint |
+| `data_s3_access_key_id` | `RLEAN_DATA_S3_ACCESS_KEY_ID` | —                 | yes      | Access key issued by the data endpoint |
+| `data_s3_secret_access_key` | `RLEAN_DATA_S3_SECRET_ACCESS_KEY` | —             | yes      | Secret issued by the data endpoint |
 
 When `data_sigv4_region` is unset the catalog is used unsigned (plain / OAuth
 REST catalog, e.g. a local mock). When it is set, catalog requests are signed
@@ -46,20 +49,20 @@ data_sigv4_name=s3tables
 
 ### AWS credentials
 
-Credentials come from the ambient AWS credential chain, resolved in-process at
-connect time (`aws-config`). This includes AWS SSO / `aws sso login` sessions.
-You do not need to export static keys — `aws sso login` (or any provider the
-default chain understands) is enough. Because `iceberg-catalog-rest` has no
-per-request signing hook, rlean starts an in-process localhost SigV4 proxy that
-signs each catalog request and forwards it to the real endpoint.
+Credentials for the AWS catalog come from the ambient AWS credential chain,
+resolved in-process at connect time (`aws-config`). This includes AWS SSO / `aws
+sso login` sessions. They are used only for catalog traffic. Because
+`iceberg-catalog-rest` has no per-request signing hook, rlean starts an
+in-process localhost SigV4 proxy that signs each catalog request and forwards
+it to the real endpoint.
 
 ### Maintenance and compaction
 
 Compaction and snapshot expiry are **AWS-managed** (S3 Tables managed
 maintenance); rlean does not run end-of-run compaction. The
-`iceberg_maintenance` binary in `lean-storage` can `report`, `count`, `query`,
-and `reset` tables. It reads the same `RLEAN_DATA_*` environment (including
-`RLEAN_DATA_NAMESPACE`, default `lean`).
+`iceberg_maintenance` binary in `rlean-storage` can `report`, `count`, `query`,
+and `reset` tables. It requires the same catalog and four `RLEAN_DATA_S3_*`
+environment values (with `RLEAN_DATA_NAMESPACE` defaulting to `lean`).
 
 ## Tables
 
@@ -175,13 +178,12 @@ Factor and map files drive split/dividend adjustment, exactly as in LEAN.
 | `date_ns` | int64 |
 | `ticker` | utf8 |
 
-## Local read-through cache
+## Data S3 endpoint
 
-Data files (the Parquet the catalog points at) can be read through a local
-[Verglas](https://github.com/cascade-labs/verglas) read-through cache instead of
-straight from AWS S3. Set `data_s3_endpoint` (plus the two endpoint-issued keys
-`data_s3_access_key_id` / `data_s3_secret_access_key`) to the daemon's S3
-endpoint. When set, rlean points **data-file I/O only** at that endpoint while
-catalog requests keep going, SigV4-signed, to AWS S3 Tables. When
-`data_s3_endpoint` is unset (the production default), data files are read
-directly from AWS.
+The configured endpoint serves all Iceberg metadata, manifests, and Parquet
+files. It may be a local [Verglas](https://github.com/cascade-labs/verglas)
+endpoint or another compatible service, but it must be configured explicitly
+with `data_s3_endpoint`, `data_s3_region`, and its access-key pair. rlean routes
+both Iceberg FileIO and DataFusion through that endpoint using path-style
+addressing; it never derives an AWS endpoint from the bucket name or falls back
+to direct AWS reads. Use a loopback endpoint only on a machine that runs it.

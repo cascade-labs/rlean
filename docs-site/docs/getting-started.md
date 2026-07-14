@@ -48,37 +48,39 @@ This creates:
 ```
 my-strategies/
   rlean.json      # workspace config (data root, default language)
-  data/           # Parquet data directory
+  data/           # workspace scratch directory; not the market-data cache
 ```
 
-Global config lives in `~/.rlean/config`. The `datastore` setting defaults to
-`file`; set it to `s3` only when using an S3-backed data store. With
-`datastore=s3`, `data-folder` is interpreted as the path prefix inside the
-bucket, and rlean keeps a local cache under `~/.rlean/cache/s3/`.
+## 2. Configure Iceberg and the data endpoint
 
-```json
-{
-  "default-language": "python",
-  "datastore": "s3",
-  "data-folder": "lean/data",
-  "s3_access_key": "...",
-  "s3_secret_key": "...",
-  "s3_bucket": "my-bucket",
-  "s3_endpoint": "https://s3-compatible-endpoint.example.com",
-  "s3_region": "us-east-1"
-}
+Market data and its cache always use an Iceberg REST catalog plus an explicit
+S3-compatible endpoint. Set both before running a backtest, live deployment,
+or research session. This example uses AWS S3 Tables for the catalog and a
+local Verglas endpoint for data I/O. Replace the endpoint URL, signing region,
+and credentials with the values from your provider.
+
+```sh
+rlean config set data_catalog https://s3tables.us-west-2.amazonaws.com/iceberg
+rlean config set data_warehouse arn:aws:s3tables:us-west-2:<acct>:bucket/<name>
+rlean config set data_sigv4_region us-west-2
+rlean config set data_s3_endpoint http://127.0.0.1:8333
+rlean config set data_s3_region us-west-2
+rlean config set data_s3_access_key_id <endpoint-access-key>
+rlean config set data_s3_secret_access_key <endpoint-secret>
 ```
 
-See [Data Backend](./data-backend.md) for the REST Iceberg catalog (AWS S3
-Tables) configuration keys.
+`data_catalog` identifies the Iceberg tables. `data_s3_endpoint` serves their
+metadata, manifests, and Parquet files. rlean will not infer an AWS endpoint or
+use a hidden local store when these are absent; it stops with a configuration
+error instead. See [Data Backend](./data-backend.md) for every setting.
 
-## 2. Create a project
+## 3. Create a project
 
 ```sh
 rlean create-project my_first_strategy
 ```
 
-## 3. Write a strategy
+## 4. Write a strategy
 
 ### Python (`my_first_strategy/main.py`)
 
@@ -132,13 +134,13 @@ impl IAlgorithm for MyStrategy {
 }
 ```
 
-## 4. Run a backtest
+## 5. Run a backtest
 
 ```sh
 rlean backtest my_first_strategy/main.py
 ```
 
-## 5. Configure data providers and API keys
+## 6. Configure data providers and API keys
 
 ```sh
 rlean config set thetadata.api_key  <your-key>

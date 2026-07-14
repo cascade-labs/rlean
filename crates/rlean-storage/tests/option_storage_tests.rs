@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use rlean_storage::iceberg_store::{OPTION_EOD_BARS, OPTION_UNIVERSE};
 use rlean_storage::schema::{OptionEodBar, OptionUniverseRow};
 use rlean_storage::IcebergStore;
-use rlean_storage::{RestCatalogConfig, SigV4Config};
+use rlean_storage::{DataS3Config, RestCatalogConfig, SigV4Config};
 use rust_decimal_macros::dec;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -189,6 +189,20 @@ async fn connect_test_store() -> Option<IcebergStore> {
         .ok()
         .filter(|ns| !ns.is_empty())
         .unwrap_or_else(|| "lean_dev".to_string());
+    let data_s3 = DataS3Config {
+        endpoint: std::env::var("RLEAN_TEST_S3_ENDPOINT")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        region: std::env::var("RLEAN_TEST_S3_REGION")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        access_key_id: std::env::var("RLEAN_TEST_S3_ACCESS_KEY_ID")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        secret_access_key: std::env::var("RLEAN_TEST_S3_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+    };
     Some(
         IcebergStore::connect(RestCatalogConfig {
             uri,
@@ -196,6 +210,7 @@ async fn connect_test_store() -> Option<IcebergStore> {
             sigv4,
             namespace,
             data_refresh_secs: 0,
+            data_s3,
         })
         .await
         .expect("failed to connect to the test REST catalog"),

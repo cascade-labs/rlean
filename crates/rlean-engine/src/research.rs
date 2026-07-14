@@ -5,8 +5,8 @@ use rlean_indicators::{indicator::Indicator, Atr, BollingerBands, Ema, Macd, Rsi
 pub use rlean_sdk::research::IndicatorResult;
 use rlean_sdk::research::{date_str_from_ns, ResearchBackend};
 use rlean_storage::{
-    IcebergStore, QueryParams, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS,
-    DEFAULT_NAMESPACE,
+    DataS3Config, IcebergStore, QueryParams, RestCatalogConfig, SigV4Config,
+    DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -79,12 +79,22 @@ fn catalog_config_from_env() -> anyhow::Result<RestCatalogConfig> {
     let data_refresh_secs = env_var("RLEAN_DATA_REFRESH_SECS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
+    let required_data_s3 = |name: &str| {
+        env_var(name).ok_or_else(|| anyhow::anyhow!("{name} must be set for Iceberg data I/O"))
+    };
+    let data_s3 = DataS3Config {
+        endpoint: required_data_s3("RLEAN_DATA_S3_ENDPOINT")?,
+        region: required_data_s3("RLEAN_DATA_S3_REGION")?,
+        access_key_id: required_data_s3("RLEAN_DATA_S3_ACCESS_KEY_ID")?,
+        secret_access_key: required_data_s3("RLEAN_DATA_S3_SECRET_ACCESS_KEY")?,
+    };
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs,
+        data_s3,
     })
 }
 

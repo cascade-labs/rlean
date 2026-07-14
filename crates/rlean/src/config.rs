@@ -88,6 +88,40 @@ pub struct GlobalConfig {
     )]
     pub data_refresh_secs: Option<u64>,
 
+    /// Required data-plane S3 endpoint for Iceberg metadata, manifests, and
+    /// data files, e.g. a local Verglas cache (`http://127.0.0.1:8333`). rlean
+    /// never infers an AWS endpoint when this setting is absent.
+    #[serde(
+        default,
+        rename = "data_s3_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_endpoint: Option<String>,
+
+    /// Required region used to sign requests to `data_s3_endpoint`.
+    #[serde(
+        default,
+        rename = "data_s3_region",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_region: Option<String>,
+
+    /// Required access key id issued by `data_s3_endpoint`.
+    #[serde(
+        default,
+        rename = "data_s3_access_key_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_access_key_id: Option<String>,
+
+    /// Required secret access key issued by `data_s3_endpoint`.
+    #[serde(
+        default,
+        rename = "data_s3_secret_access_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_s3_secret_access_key: Option<String>,
+
     #[serde(
         default,
         rename = "s3_access_key",

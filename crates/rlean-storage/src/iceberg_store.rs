@@ -43,8 +43,7 @@ use iceberg_catalog_rest::{
 };
 use iceberg_datafusion::IcebergTableProviderFactory;
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use object_store::aws::{AmazonS3Builder, AwsCredential};
-use object_store::CredentialProvider;
+use object_store::aws::AmazonS3Builder;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rlean_core::{Resolution, SecurityType, Symbol, TickType};
 use rlean_data::{
@@ -111,27 +110,34 @@ pub struct RestCatalogConfig {
     /// SigV4 signing settings. `Some` => sign catalog requests with SigV4
     /// (AWS S3 Tables / Glue). `None` => no signing (plain / OAuth REST catalogs).
     pub sigv4: Option<SigV4Config>,
-    /// Iceberg namespace that holds rlean's cache tables. Defaults to
-    /// [`DEFAULT_NAMESPACE`] (`"lean"`) via [`RestCatalogConfig::default`];
-    /// tests and scratch environments point this at an isolated namespace so
-    /// they never touch the production tables.
+    /// Iceberg namespace that holds rlean's cache tables. Callers usually use
+    /// [`DEFAULT_NAMESPACE`] (`"lean"`); tests and scratch environments point
+    /// this at an isolated namespace so they never touch production tables.
     pub namespace: String,
     /// How often (seconds) a cached table snapshot is rechecked against the
     /// catalog for commits made by other processes. See
     /// [`DEFAULT_DATA_REFRESH_SECS`]. `0` rechecks on every read.
     pub data_refresh_secs: u64,
+    /// Required S3-compatible endpoint and credentials for all Iceberg FileIO
+    /// and DataFusion data-file access. rlean never guesses an AWS endpoint.
+    pub data_s3: DataS3Config,
 }
 
-impl Default for RestCatalogConfig {
-    fn default() -> Self {
-        Self {
-            uri: String::new(),
-            warehouse: String::new(),
-            sigv4: None,
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            data_refresh_secs: DEFAULT_DATA_REFRESH_SECS,
-        }
-    }
+/// Explicit S3 configuration for every Iceberg data-file operation.
+///
+/// This is deliberately separate from [`SigV4Config`]: SigV4 signs REST
+/// catalog requests, while this endpoint serves Iceberg metadata, manifests,
+/// and Parquet data. There is no direct-AWS fallback.
+#[derive(Clone, Debug)]
+pub struct DataS3Config {
+    /// S3-compatible data endpoint, e.g. `http://127.0.0.1:8333`.
+    pub endpoint: String,
+    /// Region used when signing requests to the endpoint.
+    pub region: String,
+    /// Access key id issued by the configured endpoint.
+    pub access_key_id: String,
+    /// Secret access key issued by the configured endpoint.
+    pub secret_access_key: String,
 }
 
 /// SigV4 signing settings for an AWS-backed REST catalog.
@@ -143,75 +149,12 @@ pub struct SigV4Config {
     pub signing_name: String,
 }
 
-/// The temporary AWS credentials resolved once at [`IcebergStore::connect`]
-/// time and fed explicitly into the iceberg S3 FileIO props. `object_store`'s
-/// native AWS providers cannot read the local SSO/login cache, so the resolved
-/// keys must be passed in directly. The DataFusion object store does NOT use
-/// this snapshot — it uses [`RefreshingS3CredentialProvider`] so it can outlive
-/// the vend TTL (see below).
-#[derive(Clone)]
-struct ResolvedS3Credentials {
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-}
-
-/// An `object_store` credential provider that re-resolves AWS credentials from
-/// the ambient credential chain on every call, so a long-running backtest keeps
-/// signing S3 requests with fresh credentials.
-///
-/// The DataFusion object stores registered for `s3://` data-file buckets must
-/// stay valid for the whole run. AWS S3 Tables (and any SSO/`credential_process`
-/// profile) vends *temporary* credentials with a short TTL — commonly 15 minutes
-/// to an hour. If the object store is built with a one-time static snapshot of
-/// those keys (as `AmazonS3Builder::with_access_key_id` does), every S3 `HEAD`
-/// and `GET` after the TTL is rejected (`400 Bad Request` / `ExpiredToken`),
-/// killing data-heavy backtests part-way through while light ones that finish
-/// inside the TTL pass.
-///
-/// The ambient [`SharedCredentialsProvider`] caches credentials and refreshes
-/// them before they expire, so resolving through it on each request yields
-/// valid credentials for the store's lifetime. This mirrors what the SigV4
-/// signing proxy already does for catalog requests.
-#[derive(Debug)]
-struct RefreshingS3CredentialProvider {
-    provider: SharedCredentialsProvider,
-}
-
-#[async_trait::async_trait]
-impl CredentialProvider for RefreshingS3CredentialProvider {
-    type Credential = AwsCredential;
-
-    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
-        let credentials = self
-            .provider
-            .provide_credentials()
-            .await
-            .map_err(|source| object_store::Error::Generic {
-                store: "S3",
-                source: Box::new(source),
-            })?;
-        Ok(Arc::new(AwsCredential {
-            key_id: credentials.access_key_id().to_string(),
-            secret_key: credentials.secret_access_key().to_string(),
-            token: credentials.session_token().map(str::to_string),
-        }))
-    }
-}
-
 #[derive(Clone)]
 pub struct IcebergStore {
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
-    /// Resolved S3 credentials for the iceberg FileIO props (catalog + manifest
-    /// reads). `None` for a non-AWS (unsigned) REST catalog.
-    s3_credentials: Option<ResolvedS3Credentials>,
-    /// Ambient AWS credential provider used to build a refreshing credential
-    /// provider for the DataFusion `s3://` data-file object stores. Held so the
-    /// object stores can re-resolve credentials on every request and survive the
-    /// vend TTL. `None` for a non-AWS (unsigned) REST catalog.
-    s3_credentials_provider: Option<SharedCredentialsProvider>,
+    /// Required endpoint configuration for all Iceberg data-file access.
+    data_s3: DataS3Config,
     /// Held purely to keep the SigV4 signing proxy (and its localhost listener)
     /// alive for the store's lifetime; the proxy aborts its task on drop. The
     /// leading underscore marks it as an RAII guard that is never read directly.
@@ -366,29 +309,14 @@ fn is_catalog_commit_conflict(err: &anyhow::Error) -> bool {
 impl IcebergStore {
     /// Connect to a REST Iceberg catalog. This is the single constructor.
     ///
-    /// When `config.sigv4` is set, temporary AWS credentials are resolved from
-    /// the ambient credential chain (which reads the SSO/login cache) and an
-    /// in-process SigV4 signing proxy is started; the REST catalog is pointed at
-    /// the proxy so every catalog request is signed. The ambient credential
-    /// provider is also kept on the store so DataFusion object stores for
-    /// `s3://` data files can re-resolve credentials on every request and
-    /// survive the vend TTL. A one-time snapshot of the credentials is pushed
-    /// into the S3 FileIO props (catalog + manifest reads only). When
-    /// `config.sigv4` is `None`, the catalog is used unsigned and no S3
-    /// credentials are attached.
+    /// When `config.sigv4` is set, an in-process SigV4 signing proxy is started
+    /// for catalog traffic. The required [`DataS3Config`] is used separately
+    /// for every Iceberg metadata, manifest, and data-file operation.
     pub async fn connect(config: RestCatalogConfig) -> Result<Self> {
-        let (
-            catalog_uri,
-            s3_credentials,
-            s3_credentials_provider,
-            proxy_guard,
-            purge_dropper,
-            storage_props,
-        ) = match &config.sigv4 {
+        let (catalog_uri, proxy_guard, purge_dropper) = match &config.sigv4 {
             Some(sigv4) => {
                 let region = sigv4.region.clone();
                 let credentials_provider = shared_aws_credentials(&region).await?;
-                let resolved = resolve_s3_credentials(&region, &credentials_provider).await?;
                 let proxy = SigV4Proxy::start(
                     &config.uri,
                     &region,
@@ -400,27 +328,19 @@ impl IcebergStore {
                 // proxy so drops carry `purgeRequested=true` (required by S3
                 // Tables).
                 let purge_dropper = PurgeDropper::new(proxy.local_uri(), &config.warehouse).await?;
-                let props = s3_file_io_props(&resolved);
                 (
                     proxy.local_uri().to_string(),
-                    Some(resolved),
-                    Some(credentials_provider),
                     Some(Arc::new(proxy)),
                     Some(purge_dropper),
-                    props,
                 )
             }
-            None => (config.uri.clone(), None, None, None, None, HashMap::new()),
+            None => (config.uri.clone(), None, None),
         };
 
-        let storage_factory: Arc<dyn StorageFactory> = if s3_credentials.is_some() {
-            Arc::new(S3ConfiguredStorageFactory {
-                props: storage_props.clone(),
-                credentials_provider: s3_credentials_provider.clone(),
-            })
-        } else {
-            Arc::new(iceberg::io::LocalFsStorageFactory)
-        };
+        let storage_props = s3_file_io_props(&config.data_s3);
+        let storage_factory: Arc<dyn StorageFactory> = Arc::new(S3ConfiguredStorageFactory {
+            props: storage_props.clone(),
+        });
 
         let catalog = build_rest_catalog(
             &catalog_uri,
@@ -433,8 +353,7 @@ impl IcebergStore {
         let store = Self {
             catalog: Arc::new(catalog),
             namespace: NamespaceIdent::new(config.namespace.clone()),
-            s3_credentials,
-            s3_credentials_provider,
+            data_s3: config.data_s3.clone(),
             _sigv4_proxy: proxy_guard,
             purge_dropper,
             data_refresh: Duration::from_secs(config.data_refresh_secs),
@@ -450,41 +369,24 @@ impl IcebergStore {
     /// The iceberg storage factory matching this store's backend, used when the
     /// DataFusion `IcebergTableProviderFactory` builds a FileIO for a table.
     fn iceberg_storage_factory(&self) -> Arc<dyn StorageFactory> {
-        match &self.s3_credentials {
-            Some(resolved) => Arc::new(S3ConfiguredStorageFactory {
-                props: s3_file_io_props(resolved),
-                credentials_provider: self.s3_credentials_provider.clone(),
-            }),
-            None => Arc::new(iceberg::io::LocalFsStorageFactory),
-        }
+        Arc::new(S3ConfiguredStorageFactory {
+            props: s3_file_io_props(&self.data_s3),
+        })
     }
 
     /// Register an S3 object store on `ctx` for every distinct `s3://<bucket>`
-    /// referenced by `paths`, using a credential provider that re-resolves the
-    /// ambient AWS credentials on every request.
+    /// referenced by `paths`, using the explicitly configured endpoint.
     ///
     /// S3 Tables data files live under an AWS-managed bucket whose name is not
     /// the warehouse ARN, so the bucket is parsed from each data-file path
-    /// returned by the catalog rather than known ahead of time. A no-op when the
-    /// store has no S3 credentials (unsigned catalog).
-    ///
-    /// The object store is built with a [`RefreshingS3CredentialProvider`]
-    /// rather than a static key snapshot: a cached context's object store, and
-    /// any object store registered here, must keep working past the vend TTL of
-    /// the temporary S3 Tables credentials, which a static snapshot cannot.
+    /// returned by the catalog rather than known ahead of time. Every store is
+    /// routed to [`DataS3Config::endpoint`]; rlean never synthesizes an AWS
+    /// endpoint from the bucket and region.
     fn register_object_stores_for_paths<'a>(
         &self,
         ctx: &SessionContext,
         paths: impl IntoIterator<Item = &'a String>,
     ) -> Result<()> {
-        let (Some(resolved), Some(provider)) =
-            (&self.s3_credentials, &self.s3_credentials_provider)
-        else {
-            return Ok(());
-        };
-        let credential_provider = Arc::new(RefreshingS3CredentialProvider {
-            provider: provider.clone(),
-        });
         let mut registered: HashSet<String> = HashSet::new();
         for path in paths {
             let Some(bucket) = s3_bucket_from_path(path) else {
@@ -495,9 +397,12 @@ impl IcebergStore {
             }
             let store = AmazonS3Builder::new()
                 .with_bucket_name(&bucket)
-                .with_region(&resolved.region)
-                .with_credentials(credential_provider.clone())
-                .with_virtual_hosted_style_request(true)
+                .with_region(&self.data_s3.region)
+                .with_endpoint(&self.data_s3.endpoint)
+                .with_access_key_id(&self.data_s3.access_key_id)
+                .with_secret_access_key(&self.data_s3.secret_access_key)
+                .with_virtual_hosted_style_request(false)
+                .with_allow_http(self.data_s3.endpoint.starts_with("http://"))
                 .build()
                 .with_context(|| {
                     format!("failed to build S3 object store for bucket '{bucket}'")
@@ -2417,10 +2322,9 @@ fn s3_bucket_from_path(path: &str) -> Option<String> {
 /// The chain is wrapped in [`CachedChainCredentials`]: `DefaultCredentialsChain`
 /// has no internal cache, so a bare chain re-runs full resolution — including
 /// spawning any `credential_process` — on every `provide_credentials` call.
-/// Every consumer of this provider (the SigV4 proxy, the DataFusion object
-/// stores, the OpenDAL FileIO loader) resolves per request, so without the
-/// cache a data-heavy backtest spawns hundreds of concurrent subprocesses and
-/// eventually dies with "an error occurred while loading credentials".
+/// The SigV4 catalog proxy signs requests through this provider, so caching
+/// avoids repeatedly resolving AWS credentials during a data-heavy run. Data
+/// files use the separate explicit [`DataS3Config`] instead.
 async fn shared_aws_credentials(region: &str) -> Result<SharedCredentialsProvider> {
     let chain = DefaultCredentialsChain::builder()
         .region(Region::new(region.to_string()))
@@ -2543,26 +2447,6 @@ impl ProvideCredentials for CachedChainCredentials {
     }
 }
 
-/// Resolve the concrete temporary credentials once, to feed explicitly into the
-/// S3 FileIO props (catalog + manifest reads). The DataFusion object stores use
-/// [`RefreshingS3CredentialProvider`] instead of this snapshot. Credential
-/// material is never logged.
-async fn resolve_s3_credentials(
-    region: &str,
-    provider: &SharedCredentialsProvider,
-) -> Result<ResolvedS3Credentials> {
-    let credentials = provider
-        .provide_credentials()
-        .await
-        .context("failed to resolve AWS credentials from the default chain")?;
-    Ok(ResolvedS3Credentials {
-        region: region.to_string(),
-        access_key_id: credentials.access_key_id().to_string(),
-        secret_access_key: credentials.secret_access_key().to_string(),
-        session_token: credentials.session_token().map(|token| token.to_string()),
-    })
-}
-
 /// Load the Iceberg REST catalog, merging `storage_props` into the catalog
 /// `load()` props so they reach the FileIO the catalog builds for every table
 /// (`iceberg-catalog-rest` 0.9.1 forwards catalog props into
@@ -2593,95 +2477,48 @@ async fn build_rest_catalog(
 /// Storage factory that carries the S3 connection properties itself.
 ///
 /// `iceberg-catalog-rest` 0.9.1 builds its `FileIO` from the catalog props plus
-/// whatever storage config the catalog vends. This wrapper additionally merges
-/// the configured S3 props into whatever config it is handed before delegating
-/// to the OpenDAL S3 factory, so the resolved region/credentials and
-/// `s3.path-style-access=false` are always present even if the vended config
-/// omits or differs on them. The same applies to the DataFusion
-/// `IcebergTableProviderFactory` FileIO path.
-///
-/// The FileIO built here reads Iceberg metadata and manifests from S3 whenever
-/// a table is (re)loaded — including mid-run rebuilds after another process
-/// commits — so it must survive the vend TTL of temporary credentials just
-/// like the data-plane object stores. When `credentials_provider` is set, the
-/// OpenDAL S3 backend loads credentials through it (reqsign re-invokes the
-/// loader shortly before the current credential expires) instead of pinning
-/// the connect-time keys from `props`. The provider is `#[serde(skip)]`
-/// because live credential chains cannot be serialized; a deserialized factory
-/// falls back to the static props.
+/// whatever storage config the catalog vends. This wrapper makes the configured
+/// S3 endpoint win over catalog-vended storage properties, so every FileIO
+/// operation uses the operator-supplied endpoint rather than an implicit AWS
+/// default. The same applies to the DataFusion `IcebergTableProviderFactory`
+/// FileIO path.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct S3ConfiguredStorageFactory {
     props: HashMap<String, String>,
-    #[serde(skip)]
-    credentials_provider: Option<SharedCredentialsProvider>,
 }
 
 #[typetag::serde]
 impl StorageFactory for S3ConfiguredStorageFactory {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
-        let mut props = self.props.clone();
-        props.extend(config.props().clone());
+        let mut props = config.props().clone();
+        props.extend(self.props.clone());
         let inner = OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
-            customized_credential_load: self.credentials_provider.clone().map(|provider| {
-                iceberg_storage_opendal::CustomAwsCredentialLoader::new(Arc::new(
-                    RefreshingOpendalCredentialLoader { provider },
-                ))
-            }),
+            customized_credential_load: None,
         };
         inner.build(&StorageConfig::from_props(props))
     }
 }
 
-/// [`iceberg_storage_opendal::AwsCredentialLoad`] implementation over the
-/// ambient AWS credential chain, mirroring [`RefreshingS3CredentialProvider`]
-/// for the OpenDAL FileIO path. `expires_in` is forwarded from the resolved
-/// credential so reqsign reloads shortly before expiry.
-#[derive(Debug)]
-struct RefreshingOpendalCredentialLoader {
-    provider: SharedCredentialsProvider,
-}
-
-#[async_trait::async_trait]
-impl iceberg_storage_opendal::AwsCredentialLoad for RefreshingOpendalCredentialLoader {
-    async fn load_credential(
-        &self,
-        _client: reqwest::Client,
-    ) -> anyhow::Result<Option<iceberg_storage_opendal::AwsCredential>> {
-        let credentials = self
-            .provider
-            .provide_credentials()
-            .await
-            .context("failed to resolve AWS credentials for the S3 FileIO")?;
-        Ok(Some(iceberg_storage_opendal::AwsCredential {
-            access_key_id: credentials.access_key_id().to_string(),
-            secret_access_key: credentials.secret_access_key().to_string(),
-            session_token: credentials.session_token().map(str::to_string),
-            expires_in: credentials
-                .expiry()
-                .map(chrono::DateTime::<chrono::Utc>::from),
-        }))
-    }
-}
-
-/// The S3 FileIO property map the OpenDAL storage factory reads from the
-/// catalog's props. Uses the resolved (temporary) credentials; virtual-host
-/// addressing (path-style FALSE) is required for AWS S3 Tables.
-fn s3_file_io_props(resolved: &ResolvedS3Credentials) -> HashMap<String, String> {
+/// The S3 FileIO property map used for Iceberg metadata, manifests, reads, and
+/// writes. Every value comes from the required [`DataS3Config`].
+fn s3_file_io_props(data_s3: &DataS3Config) -> HashMap<String, String> {
     let mut props = HashMap::new();
-    props.insert("s3.region".to_string(), resolved.region.clone());
+    props.insert("s3.region".to_string(), data_s3.region.clone());
+    props.insert("s3.endpoint".to_string(), data_s3.endpoint.clone());
     props.insert(
         "s3.access-key-id".to_string(),
-        resolved.access_key_id.clone(),
+        data_s3.access_key_id.clone(),
     );
     props.insert(
         "s3.secret-access-key".to_string(),
-        resolved.secret_access_key.clone(),
+        data_s3.secret_access_key.clone(),
     );
-    if let Some(token) = &resolved.session_token {
-        props.insert("s3.session-token".to_string(), token.clone());
-    }
-    props.insert("s3.path-style-access".to_string(), "false".to_string());
+    props.insert("s3.path-style-access".to_string(), "true".to_string());
+    props.insert(
+        "s3.allow-http".to_string(),
+        data_s3.endpoint.starts_with("http://").to_string(),
+    );
     props
 }
 
@@ -3874,6 +3711,33 @@ mod tests {
         assert!(!out[0].fields.contains_key("unused_payload"));
     }
 
+    fn sample_data_s3(endpoint: &str) -> DataS3Config {
+        DataS3Config {
+            endpoint: endpoint.to_string(),
+            region: "us-west-2".to_string(),
+            access_key_id: "DATA_KEY".to_string(),
+            secret_access_key: "DATA_SECRET".to_string(),
+        }
+    }
+
+    #[test]
+    fn s3_file_io_props_always_use_the_explicit_http_endpoint() {
+        let props = s3_file_io_props(&sample_data_s3("http://127.0.0.1:8333"));
+        assert_eq!(props.get("s3.region").unwrap(), "us-west-2");
+        assert_eq!(props.get("s3.endpoint").unwrap(), "http://127.0.0.1:8333");
+        assert_eq!(props.get("s3.access-key-id").unwrap(), "DATA_KEY");
+        assert_eq!(props.get("s3.secret-access-key").unwrap(), "DATA_SECRET");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "true");
+        assert_eq!(props.get("s3.allow-http").unwrap(), "true");
+        assert!(!props.contains_key("s3.session-token"));
+    }
+
+    #[test]
+    fn s3_file_io_props_disallow_plain_http_for_an_https_endpoint() {
+        let props = s3_file_io_props(&sample_data_s3("https://cache.internal:8333"));
+        assert_eq!(props.get("s3.allow-http").unwrap(), "false");
+    }
+
     /// A credential source whose keys rotate on every resolve, standing in for
     /// the ambient AWS chain vending a fresh temporary credential after the
     /// previous one expired. `ttl` sets each vended credential's expiry
@@ -3911,26 +3775,6 @@ mod tests {
                 ),
             ))
         }
-    }
-
-    #[tokio::test]
-    async fn refreshing_provider_reresolves_on_every_call() {
-        let provider = RefreshingS3CredentialProvider {
-            provider: RotatingCredentials::shared(None),
-        };
-
-        let first = provider.get_credential().await.expect("first credential");
-        assert_eq!(first.key_id, "AKID0");
-        assert_eq!(first.secret_key, "SECRET0");
-        assert_eq!(first.token.as_deref(), Some("TOKEN0"));
-
-        // A second call must re-resolve through the given provider rather than
-        // return the first snapshot, so an expired credential is replaced by a
-        // freshly vended one for the next S3 request.
-        let second = provider.get_credential().await.expect("second credential");
-        assert_eq!(second.key_id, "AKID1");
-        assert_eq!(second.secret_key, "SECRET1");
-        assert_eq!(second.token.as_deref(), Some("TOKEN1"));
     }
 
     #[tokio::test]

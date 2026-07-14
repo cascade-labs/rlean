@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rlean_storage::{IcebergStore, RestCatalogConfig, SigV4Config};
+use rlean_storage::{DataS3Config, IcebergStore, RestCatalogConfig, SigV4Config};
 
 /// Connect to the test REST Iceberg catalog, or return `None` when it is not
 /// configured.
@@ -21,6 +21,9 @@ use rlean_storage::{IcebergStore, RestCatalogConfig, SigV4Config};
 /// - `RLEAN_TEST_SIGV4_NAME`   SigV4 signing name (default `s3tables`)
 /// - `RLEAN_TEST_NAMESPACE`    Iceberg namespace (default `lean_dev`, an isolated
 ///   scratch namespace so gated tests never touch the production `lean` tables)
+/// - `RLEAN_TEST_S3_ENDPOINT`, `RLEAN_TEST_S3_REGION`,
+///   `RLEAN_TEST_S3_ACCESS_KEY_ID`, `RLEAN_TEST_S3_SECRET_ACCESS_KEY`: the
+///   required S3-compatible endpoint used for Iceberg data I/O
 pub(crate) async fn connect_test_store() -> Option<Arc<IcebergStore>> {
     let uri = std::env::var("RLEAN_TEST_CATALOG")
         .ok()
@@ -41,6 +44,20 @@ pub(crate) async fn connect_test_store() -> Option<Arc<IcebergStore>> {
         .ok()
         .filter(|ns| !ns.is_empty())
         .unwrap_or_else(|| "lean_dev".to_string());
+    let data_s3 = DataS3Config {
+        endpoint: std::env::var("RLEAN_TEST_S3_ENDPOINT")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        region: std::env::var("RLEAN_TEST_S3_REGION")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        access_key_id: std::env::var("RLEAN_TEST_S3_ACCESS_KEY_ID")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        secret_access_key: std::env::var("RLEAN_TEST_S3_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+    };
     Some(Arc::new(
         IcebergStore::connect(RestCatalogConfig {
             uri,
@@ -48,6 +65,7 @@ pub(crate) async fn connect_test_store() -> Option<Arc<IcebergStore>> {
             sigv4,
             namespace,
             data_refresh_secs: 0,
+            data_s3,
         })
         .await
         .expect("failed to connect to the test REST catalog"),

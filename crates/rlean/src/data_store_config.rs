@@ -6,9 +6,12 @@
 //!
 //! Precedence (highest first):
 //! 1. Env vars (`RLEAN_DATA_CATALOG`, `RLEAN_DATA_WAREHOUSE`,
-//!    `RLEAN_DATA_SIGV4_REGION`, `RLEAN_DATA_SIGV4_NAME`, `RLEAN_DATA_NAMESPACE`)
+//!    `RLEAN_DATA_SIGV4_REGION`, `RLEAN_DATA_SIGV4_NAME`, `RLEAN_DATA_NAMESPACE`,
+//!    `RLEAN_DATA_S3_ENDPOINT`, `RLEAN_DATA_S3_REGION`,
+//!    `RLEAN_DATA_S3_ACCESS_KEY_ID`, `RLEAN_DATA_S3_SECRET_ACCESS_KEY`)
 //! 2. `~/.rlean/config` (`data_catalog`, `data_warehouse`, `data_sigv4_region`,
-//!    `data_sigv4_name`, `data_namespace`)
+//!    `data_sigv4_name`, `data_namespace`, `data_s3_endpoint`, `data_s3_region`,
+//!    `data_s3_access_key_id`, `data_s3_secret_access_key`)
 //!
 //! CLI flags take precedence over both: `main` copies any provided `--data-*`
 //! flag into the loaded [`GlobalConfig`] before calling [`resolve`], so a set
@@ -16,7 +19,9 @@
 //! file. See `cli::apply_data_catalog_overrides`.
 
 use anyhow::Result;
-use rlean_storage::{RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE};
+use rlean_storage::{
+    DataS3Config, RestCatalogConfig, SigV4Config, DEFAULT_DATA_REFRESH_SECS, DEFAULT_NAMESPACE,
+};
 
 use crate::config::GlobalConfig;
 
@@ -30,8 +35,8 @@ fn env(name: &str) -> Option<String> {
 
 /// Resolve the REST Iceberg catalog connection for a run.
 ///
-/// Hard-errors (no fallback, no local mode) when the catalog URI or warehouse
-/// is missing.
+/// Hard-errors when any required catalog or S3 data-plane setting is missing.
+/// There is no local store and no implicit AWS endpoint fallback.
 pub(crate) fn resolve(config: &GlobalConfig) -> Result<RestCatalogConfig> {
     let uri = env("RLEAN_DATA_CATALOG")
         .or_else(|| config.data_catalog.clone())
@@ -74,12 +79,55 @@ pub(crate) fn resolve(config: &GlobalConfig) -> Result<RestCatalogConfig> {
         .or(config.data_refresh_secs)
         .unwrap_or(DEFAULT_DATA_REFRESH_SECS);
 
+    let data_s3 = resolve_data_s3(config)?;
+
     Ok(RestCatalogConfig {
         uri,
         warehouse,
         sigv4,
         namespace,
         data_refresh_secs,
+        data_s3,
+    })
+}
+
+/// Resolve the required S3-compatible data endpoint and its credentials. These
+/// settings govern Iceberg metadata, manifest, and Parquet I/O; they are not
+/// inferred from the catalog region or bucket name.
+fn resolve_data_s3(config: &GlobalConfig) -> Result<DataS3Config> {
+    let required = |env_name: &str, configured: Option<String>, config_key: &str| {
+        env(env_name).or(configured).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no Iceberg data S3 configuration for {config_key}. Set it with \
+                 `rlean config set {config_key} <value>` (or {env_name})."
+            )
+        })
+    };
+    let endpoint = required(
+        "RLEAN_DATA_S3_ENDPOINT",
+        config.data_s3_endpoint.clone(),
+        "data_s3_endpoint",
+    )?;
+    let region = required(
+        "RLEAN_DATA_S3_REGION",
+        config.data_s3_region.clone(),
+        "data_s3_region",
+    )?;
+    let access_key_id = required(
+        "RLEAN_DATA_S3_ACCESS_KEY_ID",
+        config.data_s3_access_key_id.clone(),
+        "data_s3_access_key_id",
+    )?;
+    let secret_access_key = required(
+        "RLEAN_DATA_S3_SECRET_ACCESS_KEY",
+        config.data_s3_secret_access_key.clone(),
+        "data_s3_secret_access_key",
+    )?;
+    Ok(DataS3Config {
+        endpoint,
+        region,
+        access_key_id,
+        secret_access_key,
     })
 }
 
@@ -102,6 +150,10 @@ mod tests {
             "RLEAN_DATA_SIGV4_NAME",
             "RLEAN_DATA_NAMESPACE",
             "RLEAN_DATA_REFRESH_SECS",
+            "RLEAN_DATA_S3_ENDPOINT",
+            "RLEAN_DATA_S3_REGION",
+            "RLEAN_DATA_S3_ACCESS_KEY_ID",
+            "RLEAN_DATA_S3_SECRET_ACCESS_KEY",
         ] {
             std::env::remove_var(key);
         }
@@ -115,12 +167,16 @@ mod tests {
         assert!(resolve(&cfg).is_err());
     }
 
-    /// A config with `data_catalog` + `data_warehouse` set and everything else
-    /// defaulted.
+    /// A complete data-store configuration with the usual optional catalog
+    /// settings left at their defaults.
     fn config_with_catalog(uri: &str, warehouse: &str) -> GlobalConfig {
         GlobalConfig {
             data_catalog: Some(uri.to_string()),
             data_warehouse: Some(warehouse.to_string()),
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            data_s3_region: Some("us-east-1".to_string()),
+            data_s3_access_key_id: Some("TEST_KEY".to_string()),
+            data_s3_secret_access_key: Some("TEST_SECRET".to_string()),
             ..GlobalConfig::default()
         }
     }
@@ -226,6 +282,87 @@ mod tests {
             resolve(&cfg).unwrap().data_refresh_secs,
             rlean_storage::DEFAULT_DATA_REFRESH_SECS
         );
+    }
+
+    #[test]
+    fn missing_data_s3_endpoint_errors() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_catalog: Some("http://c/catalog".to_string()),
+            data_warehouse: Some("wh".to_string()),
+            ..GlobalConfig::default()
+        };
+        let error = resolve(&cfg).unwrap_err().to_string();
+        assert!(error.contains("data_s3_endpoint"));
+    }
+
+    #[test]
+    fn missing_data_s3_region_errors() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_region: None,
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        let error = resolve(&cfg).unwrap_err().to_string();
+        assert!(error.contains("data_s3_region"));
+    }
+
+    #[test]
+    fn data_s3_config_from_config_is_required_and_complete() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            data_s3_region: Some("us-east-1".to_string()),
+            data_s3_access_key_id: Some("VG_KEY".to_string()),
+            data_s3_secret_access_key: Some("VG_SECRET".to_string()),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        let data_s3 = resolve(&cfg).unwrap().data_s3;
+        assert_eq!(data_s3.endpoint, "http://127.0.0.1:8333");
+        assert_eq!(data_s3.region, "us-east-1");
+        assert_eq!(data_s3.access_key_id, "VG_KEY");
+        assert_eq!(data_s3.secret_access_key, "VG_SECRET");
+    }
+
+    #[test]
+    fn missing_data_s3_credentials_error() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
+            data_s3_region: Some("us-east-1".to_string()),
+            data_s3_access_key_id: None,
+            data_s3_secret_access_key: None,
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        let error = resolve(&cfg).unwrap_err().to_string();
+        assert!(error.contains("data_s3_access_key_id"));
+    }
+
+    #[test]
+    fn data_s3_env_overrides_config() {
+        let _guard = env_lock();
+        clear_env();
+        let cfg = GlobalConfig {
+            data_s3_endpoint: Some("http://config-endpoint:8333".to_string()),
+            data_s3_region: Some("config-region".to_string()),
+            data_s3_access_key_id: Some("CFG_KEY".to_string()),
+            data_s3_secret_access_key: Some("CFG_SECRET".to_string()),
+            ..config_with_catalog("http://c/catalog", "wh")
+        };
+        std::env::set_var("RLEAN_DATA_S3_ENDPOINT", "http://env-endpoint:8333");
+        std::env::set_var("RLEAN_DATA_S3_REGION", "env-region");
+        std::env::set_var("RLEAN_DATA_S3_ACCESS_KEY_ID", "ENV_KEY");
+        let data_s3 = resolve(&cfg).unwrap().data_s3;
+        clear_env();
+        // Env wins per key; the unset secret falls back to config.
+        assert_eq!(data_s3.endpoint, "http://env-endpoint:8333");
+        assert_eq!(data_s3.region, "env-region");
+        assert_eq!(data_s3.access_key_id, "ENV_KEY");
+        assert_eq!(data_s3.secret_access_key, "CFG_SECRET");
     }
 
     #[test]

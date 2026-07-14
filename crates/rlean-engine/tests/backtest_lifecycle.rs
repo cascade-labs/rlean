@@ -23,7 +23,7 @@ use rlean_orders::{
 };
 use rlean_orders::{Order, OrderEvent, TransactionManager};
 use rlean_statistics::TradeBuilder;
-use rlean_storage::{IcebergStore, RestCatalogConfig, SigV4Config};
+use rlean_storage::{DataS3Config, IcebergStore, RestCatalogConfig, SigV4Config};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,20 @@ async fn connect_test_store() -> Option<Arc<IcebergStore>> {
         .ok()
         .filter(|ns| !ns.is_empty())
         .unwrap_or_else(|| "lean_dev".to_string());
+    let data_s3 = DataS3Config {
+        endpoint: std::env::var("RLEAN_TEST_S3_ENDPOINT")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        region: std::env::var("RLEAN_TEST_S3_REGION")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        access_key_id: std::env::var("RLEAN_TEST_S3_ACCESS_KEY_ID")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+        secret_access_key: std::env::var("RLEAN_TEST_S3_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())?,
+    };
     Some(Arc::new(
         IcebergStore::connect(RestCatalogConfig {
             uri,
@@ -58,6 +72,7 @@ async fn connect_test_store() -> Option<Arc<IcebergStore>> {
             sigv4,
             namespace,
             data_refresh_secs: 0,
+            data_s3,
         })
         .await
         .expect("failed to connect to the test REST catalog"),
