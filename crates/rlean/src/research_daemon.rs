@@ -19,7 +19,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pyo3::prelude::*;
@@ -30,17 +30,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(clap::Args)]
 pub struct ResearchDaemonArgs {
-    /// Session name — used for socket/PID paths under ~/.lean-research/sessions/
+    /// Session name — used for socket/PID paths under ~/.rlean-research/sessions/
     #[arg(long)]
     pub session: String,
 
     /// Absolute path to the project directory
     #[arg(long)]
     pub project: PathBuf,
-
-    /// Root data folder passed to QuantBook.set_data_folder
-    #[arg(long)]
-    pub data_folder: Option<PathBuf>,
 }
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
@@ -96,7 +92,7 @@ pub fn session_dir(name: &str) -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .context("HOME not set")?;
-    let dir = home.join(".lean-research").join("sessions").join(name);
+    let dir = home.join(".rlean-research").join("sessions").join(name);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create session dir: {}", dir.display()))?;
     Ok(dir)
@@ -108,15 +104,9 @@ pub fn sock_path(session: &str) -> Result<PathBuf> {
 
 // ── Python startup code ───────────────────────────────────────────────────────
 
-fn startup_code(data_folder: Option<&Path>) -> String {
-    let set_data = match data_folder {
-        Some(p) => format!(r#"qb.set_data_folder(r"{}")"#, p.display()),
-        None => String::new(),
-    };
-
+fn startup_code() -> String {
     // NOTE: All private names use _-prefix so they don't pollute `vars` output.
-    format!(
-        r#"
+    r#"
 import sys as _sys
 import io as _io
 
@@ -132,11 +122,10 @@ try:
     import numpy as np
     import pandas as pd
     qb = QuantBook()
-    {set_data}
     _sys.__stdout__.write("Research kernel ready.  Available: qb, QuantBook, Resolution, np, pd, plt\n")
     _sys.__stdout__.flush()
 except ImportError as _e:
-    _sys.__stderr__.write(f"Warning: could not import AlgorithmImports: {{_e}}\n")
+    _sys.__stderr__.write(f"Warning: could not import AlgorithmImports: {_e}\n")
     _sys.__stderr__.flush()
     qb = None
     Resolution = None
@@ -171,7 +160,7 @@ def _rlean_exec_capture(_code_str, _glb):
 
     return _buf_out.getvalue(), _buf_err.getvalue(), _figs
 "#
-    )
+    .to_string()
 }
 
 // ── Vars inspection code ──────────────────────────────────────────────────────
@@ -220,7 +209,7 @@ pub fn run_daemon(args: ResearchDaemonArgs) -> Result<()> {
     // Create persistent globals dict and run startup.
     let globals: Py<PyDict> = Python::attach(|py| {
         let d = PyDict::new(py);
-        let code = startup_code(args.data_folder.as_deref());
+        let code = startup_code();
         let builtins = PyModule::import(py, "builtins")?;
         let exec_fn = builtins.getattr("exec")?;
         exec_fn.call1((&code as &str, &d))?;

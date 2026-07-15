@@ -9,10 +9,6 @@ pub struct InitArgs {
     /// Default strategy language
     #[arg(long, default_value = "python", value_parser = ["python", "csharp"])]
     pub language: String,
-
-    /// Path to the historical data provider to use by default
-    #[arg(long, value_parser = ["polygon", "thetadata", "local"])]
-    pub data_provider: Option<String>,
 }
 
 pub fn run_init(args: InitArgs) -> Result<()> {
@@ -26,18 +22,10 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         println!("rlean.json already exists — skipping");
     } else {
         let ws_config = WorkspaceConfig {
-            data_folder: "data".to_string(),
             default_language: args.language.clone(),
         };
         ws_config.save(&workspace)?;
         println!("Created rlean.json");
-    }
-
-    // ── data/ ─────────────────────────────────────────────────────────────────
-    let data_dir = workspace.join("data");
-    if !data_dir.exists() {
-        std::fs::create_dir_all(&data_dir)?;
-        println!("Created data/");
     }
 
     // ── ~/.rlean/config ───────────────────────────────────────────────────────
@@ -135,10 +123,6 @@ pub(crate) fn ensure_gitignore(workspace: &Path) -> Result<()> {
 
     let sections: &[(&str, &[&str])] = &[
         ("# rlean workspace — host-specific config", &["rlean.json"]),
-        (
-            "# Data files — fetched from provider, not strategy code",
-            &["data/"],
-        ),
         ("# Generated output", &["**/backtests/", "**/live/"]),
         ("# Python artifacts", &["__pycache__/", "*.pyc", "*.pyo"]),
         ("# macOS", &[".DS_Store"]),

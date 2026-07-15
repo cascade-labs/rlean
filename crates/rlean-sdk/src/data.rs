@@ -5,8 +5,10 @@
 //! stable objects while accessors read current Rust data.
 
 use crate::options::OptionChainView;
+use crate::securities::SymbolHandle;
 use rlean_core::{Symbol, TickType};
-use rlean_data::{CustomDataPoint, QuoteBar, Slice};
+use rlean_data::{FundamentalData, Slice};
+use rlean_data_tables::{CustomDataPoint, QuoteBar};
 use rlean_options::OptionChain;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
@@ -251,6 +253,11 @@ impl TradeBarView {
         crate::securities::SymbolHandle::new(self.symbol().clone())
     }
 
+    #[getter(venue)]
+    fn py_venue(&self) -> Option<String> {
+        self.venue().map(str::to_string)
+    }
+
     #[getter(open)]
     fn py_open(&self) -> f64 {
         self.open()
@@ -370,7 +377,7 @@ impl TradeBarView {
         Self { slice, sid }
     }
 
-    fn bar(&self) -> &rlean_data::TradeBar {
+    fn bar(&self) -> &rlean_data_tables::TradeBar {
         self.slice
             .bars
             .get(&self.sid)
@@ -378,6 +385,9 @@ impl TradeBarView {
     }
     pub fn symbol(&self) -> &Symbol {
         &self.bar().symbol
+    }
+    pub fn venue(&self) -> Option<&str> {
+        self.bar().venue.as_deref()
     }
     pub fn open(&self) -> f64 {
         decimal_to_f64(self.bar().open)
@@ -529,6 +539,9 @@ impl QuoteBarView {
     pub fn symbol(&self) -> &Symbol {
         &self.bar().symbol
     }
+    pub fn venue(&self) -> Option<&str> {
+        self.bar().venue.as_deref()
+    }
     pub fn bid(&self) -> Option<BarView> {
         self.bid_bar()
     }
@@ -561,6 +574,11 @@ impl QuoteBarView {
     #[getter(symbol)]
     fn py_symbol(&self) -> crate::securities::SymbolHandle {
         crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(venue)]
+    fn py_venue(&self) -> Option<String> {
+        self.venue().map(str::to_string)
     }
 
     #[getter(bid)]
@@ -694,7 +712,7 @@ impl TickView {
         Self { slice, sid, index }
     }
 
-    fn tick(&self) -> &rlean_data::Tick {
+    fn tick(&self) -> &rlean_data_tables::Tick {
         self.slice
             .ticks
             .get(&self.sid)
@@ -703,6 +721,9 @@ impl TickView {
     }
     pub fn symbol(&self) -> &Symbol {
         &self.tick().symbol
+    }
+    pub fn venue(&self) -> Option<&str> {
+        self.tick().venue.as_deref()
     }
     pub fn time(&self) -> chrono::NaiveDateTime {
         ns_to_exchange_naive(self.tick().time.0)
@@ -741,6 +762,11 @@ impl TickView {
     #[getter(symbol)]
     fn py_symbol(&self) -> crate::securities::SymbolHandle {
         crate::securities::SymbolHandle::new(self.symbol().clone())
+    }
+
+    #[getter(venue)]
+    fn py_venue(&self) -> Option<String> {
+        self.venue().map(str::to_string)
     }
 
     #[getter(time)]
@@ -886,6 +912,9 @@ impl CustomDataPointView {
     pub fn value(&self) -> f64 {
         decimal_to_f64(self.point.value)
     }
+    pub fn venue(&self) -> Option<String> {
+        self.point.venue.clone()
+    }
     pub fn value_pascal(&self) -> f64 {
         self.value()
     }
@@ -914,6 +943,36 @@ impl CustomDataPointView {
     /// Canonical UPPERCASE underlying symbol, if the provider declared one.
     pub fn symbol(&self) -> Option<String> {
         self.point.symbol.clone()
+    }
+}
+
+/// Minimal point-in-time liquidity row delivered to
+/// `QCAlgorithm.add_universe(selector)`.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "Fundamental"))]
+pub struct FundamentalDataView {
+    data: FundamentalData,
+}
+
+impl FundamentalDataView {
+    pub fn new(data: FundamentalData) -> Self {
+        Self { data }
+    }
+
+    pub fn symbol(&self) -> SymbolHandle {
+        SymbolHandle::new(self.data.symbol.clone())
+    }
+
+    pub fn volume(&self) -> Option<f64> {
+        self.data.volume.map(decimal_to_f64)
+    }
+
+    pub fn dollar_volume(&self) -> Option<f64> {
+        self.data.dollar_volume.map(decimal_to_f64)
+    }
+
+    pub fn market_cap(&self) -> Option<f64> {
+        self.data.market_cap.map(decimal_to_f64)
     }
 }
 
@@ -1029,6 +1088,11 @@ impl CustomDataPointView {
         self.symbol()
     }
 
+    #[getter(venue)]
+    fn py_venue(&self) -> Option<String> {
+        self.venue()
+    }
+
     #[getter(value)]
     fn py_value(&self) -> f64 {
         self.value()
@@ -1045,11 +1109,35 @@ impl CustomDataPointView {
     }
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl FundamentalDataView {
+    #[getter(symbol)]
+    fn py_symbol(&self) -> SymbolHandle {
+        self.symbol()
+    }
+
+    #[getter(volume)]
+    fn py_volume(&self) -> Option<f64> {
+        self.volume()
+    }
+
+    #[getter(dollar_volume)]
+    fn py_dollar_volume(&self) -> Option<f64> {
+        self.dollar_volume()
+    }
+
+    #[getter(market_cap)]
+    fn py_market_cap(&self) -> Option<f64> {
+        self.market_cap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rlean_core::{Market, SymbolOptionsExt, TimeSpan};
-    use rlean_data::{TradeBar, TradeBarData};
+    use rlean_data_tables::{TradeBar, TradeBarData};
     use rlean_options::OptionChain;
     use rust_decimal_macros::dec;
     use std::collections::HashSet;
@@ -1083,11 +1171,11 @@ mod tests {
                 .and_hms_opt(16, 0, 0)
                 .unwrap(),
         ));
-        slice.add_bar(rlean_data::TradeBar::new(
+        slice.add_bar(rlean_data_tables::TradeBar::new(
             symbol.clone(),
             slice.time,
             rlean_core::TimeSpan::ONE_DAY,
-            rlean_data::TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
+            rlean_data_tables::TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(100)),
         ));
         frame.set_current(Arc::new(slice));
 
@@ -1112,6 +1200,7 @@ mod tests {
                     end_time: stamp,
                     value: dec!(13.5),
                     symbol: None,
+                    venue: None,
                     fields: Arc::new(HashMap::new()),
                 },
                 CustomDataPoint {
@@ -1119,6 +1208,7 @@ mod tests {
                     end_time: stamp,
                     value: dec!(14.25),
                     symbol: Some("SPY".to_string()),
+                    venue: None,
                     fields: Arc::new(HashMap::from([
                         ("usymbol".to_string(), serde_json::json!("SPY")),
                         ("indicative_borrow".to_string(), serde_json::json!(1.25)),

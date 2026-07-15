@@ -5,21 +5,17 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use rlean_algorithm::lifecycle::{AlgorithmHistoryService, HistoryColumns};
 use rlean_algorithm::qc_algorithm::QcAlgorithm;
 use rlean_core::{DataNormalizationMode, DateTime, NanosecondTimestamp, Resolution, Symbol};
-use rlean_data::{CustomDataPoint, SubscriptionDataConfig, TradeBar};
-use rlean_data_providers::{DataType, HistoryRequest, ICustomDataSource, IHistoryProvider};
-use rlean_storage::IcebergStore;
+use rlean_data::SubscriptionDataConfig;
+use rlean_data_sidecar::DataSidecarClient;
+use rlean_data_tables::{CustomDataPoint, TradeBar};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AlgorithmHistoryContext {
-    pub data_root: PathBuf,
-    pub data_store: Arc<IcebergStore>,
-    pub history_provider: Option<Arc<dyn IHistoryProvider>>,
-    pub custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
+    pub data_sidecar: Arc<DataSidecarClient>,
 }
 
 #[derive(Clone)]
@@ -57,18 +53,11 @@ impl HistoryService {
         end: DateTime,
         normalization_mode: DataNormalizationMode,
     ) -> Result<Vec<TradeBar>> {
-        let request = HistoryRequest {
-            symbol: symbol.clone(),
-            resolution,
-            start,
-            end,
-            data_type: DataType::TradeBar,
-        };
-
         let provider = self.subscription_history_provider();
+        let symbol = symbol.clone();
         let bars = block_on_background(async move {
             provider
-                .get_trade_bars(&request, normalization_mode)
+                .get_trade_bars(symbol, resolution, start, end, normalization_mode)
                 .await
                 .map_err(|error| anyhow!(error.to_string()))
         })?;
@@ -127,9 +116,7 @@ impl HistoryService {
     }
 
     fn subscription_history_provider(&self) -> SubscriptionHistoryProvider {
-        let mut context = DataFeedContext::new(self.context.data_store.clone())
-            .with_custom_data_sources(self.context.custom_data_sources.clone());
-        context = context.with_history_provider(self.context.history_provider.clone());
+        let context = DataFeedContext::new(self.context.data_sidecar.clone());
         SubscriptionHistoryProvider::new(context)
     }
 }
@@ -286,6 +273,7 @@ fn trade_bars_to_columns(bars: &[TradeBar]) -> HistoryColumns {
     let mut columns = HistoryColumns::new();
     columns.insert("time".to_string(), Vec::with_capacity(bars.len()));
     columns.insert("end_time".to_string(), Vec::with_capacity(bars.len()));
+    columns.insert("venue".to_string(), Vec::with_capacity(bars.len()));
     columns.insert("open".to_string(), Vec::with_capacity(bars.len()));
     columns.insert("high".to_string(), Vec::with_capacity(bars.len()));
     columns.insert("low".to_string(), Vec::with_capacity(bars.len()));
@@ -300,6 +288,10 @@ fn trade_bars_to_columns(bars: &[TradeBar]) -> HistoryColumns {
             .get_mut("end_time")
             .unwrap()
             .push(bar.end_time.to_utc().to_rfc3339());
+        columns
+            .get_mut("venue")
+            .unwrap()
+            .push(bar.venue.clone().unwrap_or_default());
         columns.get_mut("open").unwrap().push(bar.open.to_string());
         columns.get_mut("high").unwrap().push(bar.high.to_string());
         columns.get_mut("low").unwrap().push(bar.low.to_string());
@@ -320,6 +312,7 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
     columns.insert("time".to_string(), Vec::with_capacity(points.len()));
     columns.insert("end_time".to_string(), Vec::with_capacity(points.len()));
     columns.insert("value".to_string(), Vec::with_capacity(points.len()));
+    columns.insert("venue".to_string(), Vec::with_capacity(points.len()));
     for point in points {
         columns
             .get_mut("time")
@@ -333,6 +326,10 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
             .get_mut("value")
             .unwrap()
             .push(point.value.to_string());
+        columns
+            .get_mut("venue")
+            .unwrap()
+            .push(point.venue.clone().unwrap_or_default());
     }
     columns
 }
@@ -395,353 +392,4 @@ where
     handle
         .join()
         .map_err(|_| anyhow!("history worker panicked"))?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rlean_core::{Market, TimeSpan};
-    use rlean_data::{
-        CustomDataConfig, CustomDataFormat, CustomDataQuery, CustomDataSource, CustomDataTransport,
-        CustomSubscriptionMetadata, TradeBar, TradeBarData,
-    };
-    use rlean_data_providers::{CustomDataContext, ICustomDataSource};
-    use rust_decimal_macros::dec;
-    use std::collections::HashMap;
-
-    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
-    }
-
-    fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime {
-        date_to_datetime(date, hour, minute, 0)
-    }
-
-    fn context(store: Arc<IcebergStore>) -> AlgorithmHistoryContext {
-        AlgorithmHistoryContext {
-            data_root: PathBuf::new(),
-            data_store: store,
-            history_provider: None,
-            custom_data_sources: Vec::new(),
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    fn history_uses_subscription_daily_frontier_semantics() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
-            return;
-        };
-        let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let start_day = day(2024, 1, 16);
-        let end_day = day(2024, 1, 17);
-        let bar = TradeBar::new(
-            symbol.clone(),
-            dt(start_day, 20, 0),
-            TimeSpan::ONE_DAY,
-            TradeBarData::new(dec!(100), dec!(101), dec!(99), dec!(100), dec!(1000)),
-        );
-        rt.block_on(async {
-            store
-                .append_trade_bars(
-                    &[bar],
-                    symbol.security_type(),
-                    symbol.market().as_str(),
-                    Resolution::Daily,
-                    rlean_core::TickType::Trade,
-                )
-                .await
-        })
-        .unwrap();
-
-        let service = HistoryService::new(context(store));
-        let bars = service
-            .load_trade_bars_between_blocking_with_normalization(
-                &symbol,
-                Resolution::Daily,
-                dt(end_day, 0, 0),
-                dt(end_day, 23, 59),
-                DataNormalizationMode::Raw,
-            )
-            .unwrap();
-
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].time.date_utc(), start_day);
-        assert_eq!(bars[0].end_time.date_utc(), end_day);
-    }
-
-    #[test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    fn last_known_price_uses_subscription_history() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
-            return;
-        };
-        let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let first_day = day(2024, 1, 16);
-        let second_day = day(2024, 1, 17);
-        let bars = vec![
-            TradeBar::new(
-                symbol.clone(),
-                dt(first_day - chrono::Duration::days(1), 20, 0),
-                TimeSpan::ONE_DAY,
-                TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
-            ),
-            TradeBar::new(
-                symbol.clone(),
-                dt(second_day - chrono::Duration::days(1), 20, 0),
-                TimeSpan::ONE_DAY,
-                TradeBarData::new(dec!(110), dec!(110), dec!(110), dec!(110), dec!(1000)),
-            ),
-        ];
-        rt.block_on(async {
-            store
-                .append_trade_bars(
-                    &bars,
-                    symbol.security_type(),
-                    symbol.market().as_str(),
-                    Resolution::Daily,
-                    rlean_core::TickType::Trade,
-                )
-                .await
-        })
-        .unwrap();
-
-        let service = HistoryService::new(context(store));
-        let latest = service
-            .load_last_known_trade_bar(
-                &symbol,
-                Resolution::Daily,
-                dt(second_day + chrono::Duration::days(1), 0, 0),
-                DataNormalizationMode::Raw,
-            )
-            .unwrap();
-
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].close, dec!(110));
-    }
-
-    struct FixtureCustomSource {
-        path: PathBuf,
-    }
-
-    impl ICustomDataSource for FixtureCustomSource {
-        fn initialize(&mut self, _context: &CustomDataContext) {}
-
-        fn name(&self) -> &str {
-            "fixture"
-        }
-
-        fn get_source(
-            &self,
-            _ticker: &str,
-            _date: NaiveDate,
-            _config: &CustomDataConfig,
-        ) -> Option<CustomDataSource> {
-            Some(CustomDataSource {
-                uri: self.path.to_string_lossy().into_owned(),
-                transport: CustomDataTransport::LocalFile,
-                format: CustomDataFormat::Csv,
-                headers: HashMap::new(),
-                symbol_column: None,
-            })
-        }
-
-        fn reader(
-            &self,
-            _line: &str,
-            date: NaiveDate,
-            _config: &CustomDataConfig,
-        ) -> Option<CustomDataPoint> {
-            Some(CustomDataPoint::empty(
-                dt(date, 16, 0),
-                dt(date, 16, 0),
-                dec!(7),
-            ))
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    fn custom_history_uses_subscription_fetch_and_reader() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fixture_path = tmp.path().join("fixture.csv");
-        std::fs::write(&fixture_path, "row\n").unwrap();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
-            return;
-        };
-        let symbol = Symbol::create_base("fixture", "ALT", &Market::usa());
-        let custom_config = CustomDataConfig {
-            ticker: "ALT".to_string(),
-            source_type: "fixture".to_string(),
-            resolution: Resolution::Daily,
-            properties: std::collections::HashMap::new(),
-            query: CustomDataQuery::default(),
-        };
-        let metadata = CustomSubscriptionMetadata {
-            source_type: "fixture".to_string(),
-            ticker: "ALT".to_string(),
-            config: custom_config,
-            dynamic_query: CustomDataQuery::default(),
-        };
-        let subscription = SubscriptionDataConfig::new_custom(symbol, Resolution::Daily, metadata);
-        let service = HistoryService::new(AlgorithmHistoryContext {
-            data_root: PathBuf::new(),
-            data_store: store,
-            history_provider: None,
-            custom_data_sources: vec![Arc::new(FixtureCustomSource { path: fixture_path })],
-        });
-
-        let points = service
-            .load_custom_history_blocking(&subscription, day(2024, 1, 17), day(2024, 1, 17))
-            .unwrap();
-
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].value, dec!(7));
-    }
-
-    #[test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    fn history_count_returns_exact_requested_count_like_lean() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
-            return;
-        };
-        let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let bars = (0..5)
-            .map(|idx| {
-                let date = day(2024, 1, 8 + idx);
-                let price = dec!(100) + rust_decimal::Decimal::from(idx);
-                TradeBar::new(
-                    symbol.clone(),
-                    dt(date, 20, 0),
-                    TimeSpan::ONE_DAY,
-                    TradeBarData::new(price, price, price, price, dec!(1000)),
-                )
-            })
-            .collect::<Vec<_>>();
-        rt.block_on(async {
-            store
-                .append_trade_bars(
-                    &bars,
-                    symbol.security_type(),
-                    symbol.market().as_str(),
-                    Resolution::Daily,
-                    rlean_core::TickType::Trade,
-                )
-                .await
-        })
-        .unwrap();
-        let service = HistoryService::new(context(store));
-        let mut algorithm = QcAlgorithm::new("test", dec!(100_000));
-        algorithm.utc_time = dt(day(2024, 1, 15), 0, 0);
-        algorithm.start_date = algorithm.utc_time;
-        algorithm
-            .subscription_manager
-            .add(SubscriptionDataConfig::new_equity(
-                symbol.clone(),
-                Resolution::Daily,
-                DataNormalizationMode::Raw,
-            ));
-
-        let history = service.history(&algorithm, &symbol, 3, Resolution::Daily);
-
-        assert_eq!(history["close"].len(), 3);
-        assert_eq!(history["close"], vec!["102", "103", "104"]);
-    }
-
-    #[test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    fn initialize_time_history_uses_start_date_when_frontier_is_epoch() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let Some(store) = rt.block_on(crate::test_support::connect_test_store()) else {
-            return;
-        };
-        let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let bar = TradeBar::new(
-            symbol.clone(),
-            dt(day(2024, 1, 12), 20, 0),
-            TimeSpan::ONE_DAY,
-            TradeBarData::new(dec!(100), dec!(100), dec!(100), dec!(100), dec!(1000)),
-        );
-        rt.block_on(async {
-            store
-                .append_trade_bars(
-                    &[bar],
-                    symbol.security_type(),
-                    symbol.market().as_str(),
-                    Resolution::Daily,
-                    rlean_core::TickType::Trade,
-                )
-                .await
-        })
-        .unwrap();
-        let service = HistoryService::new(context(store));
-        let mut algorithm = QcAlgorithm::new("test", dec!(100_000));
-        algorithm.start_date = dt(day(2024, 1, 16), 0, 0);
-        assert_eq!(algorithm.utc_time, DateTime::EPOCH);
-        algorithm
-            .subscription_manager
-            .add(SubscriptionDataConfig::new_equity(
-                symbol.clone(),
-                Resolution::Daily,
-                DataNormalizationMode::Raw,
-            ));
-
-        let history = service.history(&algorithm, &symbol, 1, Resolution::Daily);
-
-        assert_eq!(history["close"], vec!["100"]);
-    }
-
-    #[test]
-    fn custom_history_count_is_sorted_by_end_time_like_lean() {
-        let first = CustomDataPoint::empty(
-            dt(day(2024, 9, 27), 10, 0),
-            dt(day(2024, 9, 27), 10, 0),
-            dec!(1),
-        );
-        let second = CustomDataPoint::empty(
-            dt(day(2024, 9, 30), 11, 0),
-            dt(day(2024, 9, 30), 11, 0),
-            dec!(2),
-        );
-        let third = CustomDataPoint::empty(
-            dt(day(2024, 10, 1), 17, 0),
-            dt(day(2024, 10, 1), 17, 0),
-            dec!(3),
-        );
-        let columns = custom_points_to_columns(&[first, second, third]);
-
-        assert_eq!(
-            columns["end_time"],
-            vec![
-                "2024-09-27T10:00:00+00:00",
-                "2024-09-30T11:00:00+00:00",
-                "2024-10-01T17:00:00+00:00"
-            ]
-        );
-        assert_eq!(columns["value"], vec!["1", "2", "3"]);
-    }
 }

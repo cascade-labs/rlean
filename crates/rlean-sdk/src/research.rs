@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 use rlean_core::{Market, OptionRight, OptionStyle, Resolution, Symbol};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -153,9 +153,6 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> f64 {
 pub trait ResearchBackend: Send {
     fn set_start_date(&mut self, year: i32, month: u32, day: u32);
     fn set_end_date(&mut self, year: i32, month: u32, day: u32);
-    fn set_data_folder(&mut self, path: &str);
-    fn set_thetadata_provider(&mut self, api_token: &str);
-    fn set_polygon_provider(&mut self, api_key: &str);
     fn add_equity(&mut self, ticker: &str) -> Symbol;
     fn add_option(&mut self, ticker: &str) -> Symbol;
     fn add_future(&mut self, ticker: &str) -> Symbol;
@@ -214,21 +211,6 @@ impl ResearchBook {
 
     pub fn set_end_date(&self, year: i32, month: u32, day: u32) {
         self.backend.lock().unwrap().set_end_date(year, month, day);
-    }
-
-    pub fn set_data_folder(&self, path: &str) {
-        self.backend.lock().unwrap().set_data_folder(path);
-    }
-
-    pub fn set_thetadata_provider(&self, api_token: &str) {
-        self.backend
-            .lock()
-            .unwrap()
-            .set_thetadata_provider(api_token);
-    }
-
-    pub fn set_polygon_provider(&self, api_key: &str) {
-        self.backend.lock().unwrap().set_polygon_provider(api_key);
     }
 
     pub fn add_equity(&self, ticker: &str) -> Symbol {
@@ -555,12 +537,6 @@ impl ResearchBackend for EmptyResearchBackend {
         }
     }
 
-    fn set_data_folder(&mut self, _path: &str) {}
-
-    fn set_thetadata_provider(&mut self, _api_token: &str) {}
-
-    fn set_polygon_provider(&mut self, _api_key: &str) {}
-
     fn add_equity(&mut self, ticker: &str) -> Symbol {
         self.symbol_for_ticker(ticker)
     }
@@ -648,7 +624,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rlean_core::{DateTime, Market, OptionRight, OptionStyle, TimeSpan};
-    use rlean_data::TradeBarData;
+    use rlean_data_tables::TradeBarData;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -695,10 +671,6 @@ mod tests {
         fn set_end_date(&mut self, year: i32, month: u32, day: u32) {
             self.end = date(year, month, day);
         }
-
-        fn set_data_folder(&mut self, _path: &str) {}
-        fn set_thetadata_provider(&mut self, _api_token: &str) {}
-        fn set_polygon_provider(&mut self, _api_key: &str) {}
 
         fn add_equity(&mut self, ticker: &str) -> Symbol {
             self.symbol = Symbol::create_equity(ticker, &Market::usa());

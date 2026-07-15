@@ -10,6 +10,9 @@ pub enum SubscriptionDataKind {
     Market,
     Custom,
     Universe,
+    /// A point-in-time, all-equity fundamental snapshot. Unlike a custom
+    /// universe, every row belongs to the same selection event.
+    FundamentalUniverse,
     Option,
 }
 
@@ -19,6 +22,14 @@ pub struct CustomSubscriptionMetadata {
     pub ticker: String,
     pub config: CustomDataConfig,
     pub dynamic_query: CustomDataQuery,
+}
+
+/// Provider metadata for the canonical daily fundamental universe snapshot.
+/// The ticker is deliberately not a security ticker: it identifies the
+/// provider-wide equity universe requested by the engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundamentalUniverseSubscriptionMetadata {
+    pub source_type: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,15 +52,17 @@ pub struct OptionChainSubscriptionMetadata {
 /// `unique_id()` SipHashes several identity fields. Because it is called
 /// thousands of times per simulated day by the subscription-sync logic (issue
 /// #39), the result is memoized in `cached_unique_id` and computed at most once
-/// per config value. The two identity fields that are ever mutated after
-/// construction (`tick_type`, `data_kind`) must be changed through
-/// [`SubscriptionDataConfig::set_tick_type`] / [`set_data_kind`], which clear
-/// the cache. Direct writes to the other identity fields do not occur anywhere
+/// per config value. The identity fields that are ever mutated after
+/// construction (`tick_type`, `data_kind`, and `venue`) must be changed through
+/// their setters, which clear the cache. Direct writes to the other identity fields do not occur anywhere
 /// in the codebase. Cloning starts with an empty cache (see the manual `Clone`
 /// impl) so a clone can never inherit a stale id.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubscriptionDataConfig {
     pub symbol: Symbol,
+    /// Physical venue requested from the sidecar. `market` remains encoded in
+    /// the symbol/SID and is not interchangeable with this value.
+    pub venue: String,
     pub resolution: Resolution,
     pub tick_type: TickType,
     pub normalization_mode: DataNormalizationMode,
@@ -61,6 +74,7 @@ pub struct SubscriptionDataConfig {
     pub exchange_time_zone: String,
     pub data_kind: SubscriptionDataKind,
     pub custom: Option<CustomSubscriptionMetadata>,
+    pub fundamental_universe: Option<FundamentalUniverseSubscriptionMetadata>,
     pub option_chain: Option<OptionChainSubscriptionMetadata>,
     /// Memoized `unique_id()`. Not serialized; never contributes to identity.
     #[serde(skip)]
@@ -74,6 +88,7 @@ impl Clone for SubscriptionDataConfig {
         // if the clone's identity fields are subsequently mutated.
         SubscriptionDataConfig {
             symbol: self.symbol.clone(),
+            venue: self.venue.clone(),
             resolution: self.resolution,
             tick_type: self.tick_type,
             normalization_mode: self.normalization_mode,
@@ -85,6 +100,7 @@ impl Clone for SubscriptionDataConfig {
             exchange_time_zone: self.exchange_time_zone.clone(),
             data_kind: self.data_kind,
             custom: self.custom.clone(),
+            fundamental_universe: self.fundamental_universe.clone(),
             option_chain: self.option_chain.clone(),
             cached_unique_id: OnceLock::new(),
         }
@@ -97,8 +113,10 @@ impl SubscriptionDataConfig {
         resolution: Resolution,
         normalization_mode: DataNormalizationMode,
     ) -> Self {
+        let venue = symbol.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode,
@@ -110,6 +128,7 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "America/New_York".into(),
             data_kind: SubscriptionDataKind::Market,
             custom: None,
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
@@ -118,8 +137,10 @@ impl SubscriptionDataConfig {
     /// Option subscriptions are always Raw — matches C# Lean's `Option`
     /// constructor and `DataManager.Add` forcing for option/index symbols.
     pub fn new_option(symbol: Symbol, resolution: Resolution) -> Self {
+        let venue = symbol.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode: DataNormalizationMode::Raw,
@@ -131,14 +152,17 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "America/New_York".into(),
             data_kind: SubscriptionDataKind::Market,
             custom: None,
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
     }
 
     pub fn new_forex(symbol: Symbol, resolution: Resolution) -> Self {
+        let venue = symbol.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Quote,
             normalization_mode: DataNormalizationMode::Raw,
@@ -150,14 +174,17 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "UTC".into(),
             data_kind: SubscriptionDataKind::Market,
             custom: None,
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
     }
 
     pub fn new_crypto(symbol: Symbol, resolution: Resolution) -> Self {
+        let venue = symbol.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode: DataNormalizationMode::Raw,
@@ -169,14 +196,17 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "UTC".into(),
             data_kind: SubscriptionDataKind::Market,
             custom: None,
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
     }
 
     pub fn new_crypto_future(symbol: Symbol, resolution: Resolution) -> Self {
+        let venue = symbol.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode: DataNormalizationMode::Raw,
@@ -188,6 +218,7 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "UTC".into(),
             data_kind: SubscriptionDataKind::Market,
             custom: None,
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
@@ -198,8 +229,16 @@ impl SubscriptionDataConfig {
         resolution: Resolution,
         metadata: CustomSubscriptionMetadata,
     ) -> Self {
+        let venue = metadata
+            .config
+            .properties
+            .get("venue")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| metadata.source_type.trim().to_ascii_lowercase());
         SubscriptionDataConfig {
             symbol,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode: DataNormalizationMode::Raw,
@@ -211,6 +250,7 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "America/New_York".into(),
             data_kind: SubscriptionDataKind::Custom,
             custom: Some(metadata),
+            fundamental_universe: None,
             option_chain: None,
             cached_unique_id: OnceLock::new(),
         }
@@ -227,13 +267,44 @@ impl SubscriptionDataConfig {
         config
     }
 
+    /// An internal, daily, whole-market fundamental snapshot subscription.
+    /// `symbol` is a stable internal base symbol; individual equity symbols
+    /// are carried by the rows returned by the sidecar.
+    pub fn new_fundamental_universe(
+        symbol: Symbol,
+        resolution: Resolution,
+        metadata: FundamentalUniverseSubscriptionMetadata,
+    ) -> Self {
+        let venue = metadata.source_type.trim().to_ascii_lowercase();
+        SubscriptionDataConfig {
+            symbol,
+            venue,
+            resolution,
+            tick_type: TickType::Trade,
+            normalization_mode: DataNormalizationMode::Raw,
+            fill_data_forward: false,
+            extended_market_hours: false,
+            is_internal_feed: true,
+            is_filtered_subscription: true,
+            data_time_zone: "America/New_York".into(),
+            exchange_time_zone: "America/New_York".into(),
+            data_kind: SubscriptionDataKind::FundamentalUniverse,
+            custom: None,
+            fundamental_universe: Some(metadata),
+            option_chain: None,
+            cached_unique_id: OnceLock::new(),
+        }
+    }
+
     pub fn new_option_chain(
         canonical: Symbol,
         resolution: Resolution,
         metadata: OptionChainSubscriptionMetadata,
     ) -> Self {
+        let venue = canonical.market().as_str().to_ascii_lowercase();
         SubscriptionDataConfig {
             symbol: canonical,
+            venue,
             resolution,
             tick_type: TickType::Trade,
             normalization_mode: DataNormalizationMode::Raw,
@@ -245,6 +316,7 @@ impl SubscriptionDataConfig {
             exchange_time_zone: "America/New_York".into(),
             data_kind: SubscriptionDataKind::Option,
             custom: None,
+            fundamental_universe: None,
             option_chain: Some(metadata),
             cached_unique_id: OnceLock::new(),
         }
@@ -255,7 +327,10 @@ impl SubscriptionDataConfig {
     }
 
     pub fn is_universe_data(&self) -> bool {
-        self.data_kind == SubscriptionDataKind::Universe
+        matches!(
+            self.data_kind,
+            SubscriptionDataKind::Universe | SubscriptionDataKind::FundamentalUniverse
+        )
     }
 
     /// Stable identity hash. Memoized after the first call — this is invoked
@@ -272,12 +347,16 @@ impl SubscriptionDataConfig {
         use std::hash::Hash;
         let mut h = DefaultHasher::new();
         self.symbol.id.sid.hash(&mut h);
+        self.venue.hash(&mut h);
         (self.resolution as u8).hash(&mut h);
         (self.tick_type as u8).hash(&mut h);
         self.data_kind.hash(&mut h);
         if let Some(custom) = &self.custom {
             custom.source_type.to_ascii_lowercase().hash(&mut h);
             custom.ticker.to_ascii_uppercase().hash(&mut h);
+        }
+        if let Some(fundamental) = &self.fundamental_universe {
+            fundamental.source_type.to_ascii_lowercase().hash(&mut h);
         }
         if let Some(option_chain) = &self.option_chain {
             option_chain.canonical_permtick.hash(&mut h);
@@ -299,6 +378,12 @@ impl SubscriptionDataConfig {
         self.cached_unique_id = OnceLock::new();
     }
 
+    /// Set the physical venue and invalidate the memoized subscription id.
+    pub fn set_venue(&mut self, venue: impl Into<String>) {
+        self.venue = venue.into().trim().to_ascii_lowercase();
+        self.cached_unique_id = OnceLock::new();
+    }
+
     /// Whether the `unique_id` has been memoized yet. Test-only; lets tests
     /// assert memoization without a process-global counter.
     #[cfg(test)]
@@ -315,7 +400,7 @@ impl SubscriptionDataConfig {
 /// subscription-sync loop runs on every slice; comparing the stamp against the
 /// last-synced value lets it skip the whole diff walk when nothing changed
 /// (issue #64). The stamp lives on the manager itself, which never crosses the
-/// plugin ABI, so this adds no plugin-rebuild requirement.
+/// sidecar protocol, so it does not change the wire contract.
 #[derive(Debug, Default)]
 pub struct SubscriptionManager {
     state: RwLock<SubscriptionState>,
@@ -647,6 +732,16 @@ mod tests {
         let market_id = config.unique_id();
         config.set_data_kind(SubscriptionDataKind::Universe);
         assert_ne!(market_id, config.unique_id());
+    }
+
+    #[test]
+    fn venue_is_part_of_subscription_identity() {
+        let mut config = equity_config("SPY");
+        let usa = config.unique_id();
+        config.set_venue("arcx");
+
+        assert_eq!(config.venue, "arcx");
+        assert_ne!(config.unique_id(), usa);
     }
 
     #[test]

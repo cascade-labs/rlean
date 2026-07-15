@@ -1,4 +1,4 @@
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 
 /// Called when a consolidated bar is ready.
 pub type ConsolidatedHandler = Box<dyn FnMut(TradeBar) + Send + Sync>;

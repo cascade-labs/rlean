@@ -11,6 +11,7 @@ license.workspace = true
 [dependencies]
 rlean-core = { path = "../rlean-core", version = "0.1.1" }
 rlean-data = { path = "../rlean-data", version = "0.1.1" }
+rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }
 serde = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }

@@ -9,15 +9,16 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow = { workspace = true }
 rlean-core = { path = "../rlean-core", version = "0.1.1" }
 rlean-data = { path = "../rlean-data", version = "0.1.1" }
-rlean-storage = { path = "../rlean-storage", version = "0.1.1" }
+rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }
+rlean-data-sidecar = { path = "../rlean-data-sidecar", version = "0.1.1" }
 rlean-sdk = { path = "../rlean-sdk", version = "0.1.1" }
 rlean-options = { path = "../rlean-options", version = "0.1.1" }
 rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
 rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
 rlean-statistics = { path = "../rlean-statistics", version = "0.1.1" }
-rlean-data-providers = { path = "../rlean-data-providers", version = "0.1.1" }
 rlean-alpha = { path = "../rlean-alpha", version = "0.1.1" }
 rlean-risk = { path = "../rlean-risk", version = "0.1.1" }
 rlean-execution = { path = "../rlean-execution", version = "0.1.1" }

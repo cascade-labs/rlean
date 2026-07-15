@@ -59,7 +59,7 @@ impl Indicator for Vwap {
         self.current.clone()
     }
 
-    fn update_bar(&mut self, bar: &rlean_data::TradeBar) -> IndicatorResult {
+    fn update_bar(&mut self, bar: &rlean_data_tables::TradeBar) -> IndicatorResult {
         self.samples += 1;
         let typical = (bar.high + bar.low + bar.close) / dec!(3);
         self.cumulative_pv += typical * bar.volume;

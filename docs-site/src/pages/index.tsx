@@ -23,14 +23,14 @@ const FEATURES: FeatureItem[] = [
       'Implement the IAlgorithm trait in Rust for zero-overhead backtests and live execution.',
   },
   {
-    title: 'Parquet data layer',
+    title: 'Provider-neutral data plane',
     description:
-      'Trade bars, factor files, map files, and option chains are all stored in Apache Parquet. No CSV.',
+      'Trade bars, quotes, ticks, auxiliary files, universes, and custom data use canonical Arrow schemas.',
   },
   {
-    title: 'Plugin system',
+    title: 'Flight data sidecar',
     description:
-      'Brokerages and data providers are runtime plugins, installed and managed via rlean plugin.',
+      'Backtest queries and pushed live data share one persistent, versioned Arrow Flight subscription session.',
   },
 ];
 

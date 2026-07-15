@@ -1,5 +1,5 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::{Bar, QuoteBar, TradeBar, TradeBarData};
+use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
 use rlean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
     Order, OrderType, TransactionManager,

@@ -12,8 +12,8 @@ interface — the goal is for existing `QCAlgorithm`-based Python strategies to 
 with little or no modification — while adding a native Rust library for writing
 high-performance strategies directly.
 
-All market data is backed by [Apache Parquet](https://parquet.apache.org/), in
-place of LEAN's CSV-based data layer.
+All market and custom data enters the engine through a versioned Apache Arrow
+Flight sidecar contract.
 
 ## Features
 
@@ -22,10 +22,12 @@ place of LEAN's CSV-based data layer.
   modification.
 - **Rust strategy library** — implement `IAlgorithm` in Rust for zero-overhead
   backtests and live execution.
-- **Parquet data layer** — trade bars, factor files, map files, and option
-  chains are all stored in Parquet. No CSV.
-- **Plugin system** — brokerages and data providers are runtime plugins,
-  installed and managed via `rlean plugin`.
+- **Provider-neutral data plane** — trade bars, quotes, ticks, auxiliary files,
+  universes, and custom data use canonical Arrow schemas.
+- **Sidecar data plane** — backtest queries and pushed live data share a
+  persistent, versioned Arrow Flight subscription session.
+- **Sidecar integrations** — market data and brokerages run out of process over
+  the Arrow Flight contract.
 - **Research mode** — launches a Jupyter environment wired to the same engine
   used in backtests.
 
@@ -35,26 +37,27 @@ rlean is a Cargo workspace. The crates you are most likely to use as a library:
 
 | Crate | Purpose |
 |---|---|
-| `lean-core` | Shared types: `Symbol`, `DateTime`, `Resolution`, `Market` |
-| `lean-algorithm` | `IAlgorithm` trait, `QcAlgorithm` base, portfolio |
-| `lean-engine` | `BacktestEngine`, `EngineConfig`, runner |
-| `lean-data` | `Slice`, bar types, `IHistoricalDataProvider` |
-| `lean-storage` | Parquet reader/writer for trade bars, factor files, option chains |
-| `lean-options` | Option chain, greeks, exercise models |
-| `lean-python` | PyO3 bindings — embed Python strategies in a Rust process |
-| `lean-indicators` | SMA, EMA, RSI, Bollinger Bands, and more |
-| `lean-orders` | Order types, fills, fee models |
-| `lean-plugin` | Plugin ABI: descriptor, kind, factory function contracts |
+| `rlean-core` | Shared types: `Symbol`, `DateTime`, `Resolution`, `Market` |
+| `rlean-algorithm` | `IAlgorithm` trait, `QcAlgorithm` base, portfolio |
+| `rlean-engine` | Backtest/live runners and subscription flow control |
+| `rlean-data` | `Slice` and subscription definitions |
+| `rlean-data-tables` | Canonical provider-neutral Arrow row and table contracts |
+| `rlean-data-sidecar` | Versioned Arrow Flight protocol and client |
+| `rlean-options` | Option chain, greeks, exercise models |
+| `rlean-python-runtime` | PyO3 bindings — embed Python strategies in a Rust process |
+| `rlean-indicators` | SMA, EMA, RSI, Bollinger Bands, and more |
+| `rlean-orders` | Order types, fills, fee models |
 
 The `rlean` crate is the CLI binary (`backtest`, `live`, `init`,
-`create-project`, `plugin`, `config`, `cloud`).
+`create-project`, `config`, `cloud`).
 
 ## Where to go next
 
 - [Getting Started](./getting-started.md) — install the CLI, create a workspace,
   write and run your first strategy.
-- [Data Backend](./data-backend.md) — the Iceberg / REST catalog data store.
+- [Sidecar Data Plane](./sidecar-data-plane.md) — subscriptions, bounded
+  backtest pulls, pushed live batches, integrations, and relays.
+- [Data Contract and Sidecar](./data-backend.md) — canonical tables, discovery,
+  and bounded queries.
 - [Python Strategy API](./python-strategy-api.md) — the `QCAlgorithm` surface.
 - [Live Trading](./live-trading.md) — live deployments and the cloud fleet.
-- [Plugin Development](./plugin-development.md) — write a brokerage or data
-  provider plugin.

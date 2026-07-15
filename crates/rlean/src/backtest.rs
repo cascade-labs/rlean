@@ -1,17 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use rlean_data_providers::IHistoryProvider;
+use rlean_data_sidecar::DataSidecarClient;
 
 use crate::cli::RunArgs;
+use crate::config;
 use crate::runtime::{
-    backtest_progress_bar, build_providers, ensure_python_baseline_packages,
-    parse_algorithm_parameters_for_strategy, reserve_backtest_dir, resolve_configured_data_folder,
-    resolve_datastore_for_data_root, strategy_name_from_path, update_backtests_latest_symlink,
-    validate_strategy_path, ResolvedDataStore,
+    backtest_progress_bar, connect_data_sidecar, ensure_python_baseline_packages,
+    parse_algorithm_parameters_for_strategy, reserve_backtest_dir, strategy_name_from_path,
+    update_backtests_latest_symlink, validate_strategy_path,
 };
-use crate::{config, providers};
 
 pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
     // If the user passed a directory, look for main.py inside it.
@@ -30,28 +29,15 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
-    // Apply configured data-folder when --data was not explicitly provided.
-    // Workspace rlean.json takes precedence over ~/.rlean/config, and relative
-    // workspace paths are resolved from the directory containing rlean.json.
-    // CLI --data-* flags win over env and config for the catalog connection.
-    args.apply_data_catalog_overrides();
     let global_config = config::GlobalConfig::load()?;
-    let strategy_path = args.strategy.clone();
-    resolve_configured_data_folder(&strategy_path, &mut args.data, &global_config)?;
-    let datastore = resolve_datastore_for_data_root(&args.data, &global_config).await?;
-    args.data = datastore.data_root.clone();
-    tracing::info!("Data folder: {}", args.data.display());
+    let data_sidecar = connect_data_sidecar(&args, &global_config)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("backtests require --data-sidecar"))?;
 
-    let history_provider = build_providers(&args, datastore.store.clone())?;
-
-    run_strategy_backtest(args, history_provider, datastore).await
+    run_strategy_backtest(args, data_sidecar).await
 }
 
-async fn run_strategy_backtest(
-    args: RunArgs,
-    history_provider: Option<Arc<dyn IHistoryProvider>>,
-    datastore: ResolvedDataStore,
-) -> Result<()> {
+async fn run_strategy_backtest(args: RunArgs, data_sidecar: Arc<DataSidecarClient>) -> Result<()> {
     use rlean_engine::report::{
         write_data_request_files, write_log_txt, write_order_events_json, write_orders_json,
         write_report, write_results_json, write_summary_json,
@@ -138,7 +124,6 @@ async fn run_strategy_backtest(
         }
     }
 
-    let custom_data_sources = providers::load_custom_data_plugins(&args.data);
     let progress_bar = backtest_progress_bar();
     progress_bar.set_position(0);
     progress_bar.set_message("initializing | value $100000.00 | 0 trading days");
@@ -167,19 +152,13 @@ async fn run_strategy_backtest(
             }
         })
     };
-    let data_feed_options = rlean_engine::data_feed::DataFeedOptions {
-        fetch_missing_custom_data: args.data_provider_historical.is_some(),
-        ..Default::default()
-    };
+    let data_feed_options = rlean_engine::data_feed::DataFeedOptions::default();
     let config = rlean_engine::BacktestRunConfig {
-        data_root: datastore.data_root.clone(),
-        data_store: datastore.store.clone(),
+        data_sidecar,
         _compression_level: 3,
-        history_provider,
         start_date_override,
         end_date_override,
         parameters,
-        custom_data_sources,
         data_feed_options,
         output_dir: Some(backtest_dir.clone()),
         artifact_sink: Some(sink.clone()),
@@ -187,10 +166,7 @@ async fn run_strategy_backtest(
     };
 
     let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
-        config.data_root.clone(),
-        config.data_store.clone(),
-        config.history_provider.clone(),
-        config.custom_data_sources.clone(),
+        config.data_sidecar.clone(),
         config.parameters.clone(),
     );
 
@@ -212,11 +188,7 @@ async fn run_strategy_backtest(
                 rlean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
             Box::new(adapter)
         }
-        "so" | "dylib" => load_native_strategy_bridge(&args.strategy)?,
-        other => bail!(
-            "Unknown strategy extension '.{}'. Expected .py, .so, or .dylib",
-            other
-        ),
+        other => bail!("Unknown strategy extension '.{}'. Expected .py", other),
     };
 
     let results = match rlean_engine::runner::backtest::run_backtest_with_runtime(
@@ -326,26 +298,4 @@ fn s3_bucket_display(config: &crate::artifacts_config::ArtifactConfig) -> String
         .as_ref()
         .map(|s| s.bucket.clone())
         .unwrap_or_default()
-}
-
-fn load_native_strategy_bridge(
-    strategy_path: &Path,
-) -> Result<Box<dyn rlean_sdk::AlgorithmBridge>> {
-    use libloading::{Library, Symbol};
-    use rlean_algorithm::algorithm::QcAlgorithmStrategy;
-
-    // Safety: the plugin must export `create_algorithm` with C ABI.
-    let lib = unsafe { Library::new(strategy_path) }
-        .map_err(|e| anyhow::anyhow!("Failed to load plugin '{}': {e}", strategy_path.display()))?;
-
-    let lib = Box::leak(Box::new(lib));
-    let create: Symbol<unsafe extern "C" fn() -> Box<dyn QcAlgorithmStrategy>> =
-        unsafe { lib.get(b"create_algorithm\0") }
-            .map_err(|_| anyhow::anyhow!(
-                "Plugin does not export `create_algorithm`. \
-                 Add `#[no_mangle] pub extern \"C\" fn create_algorithm() -> Box<dyn QcAlgorithmStrategy>` to your strategy crate."
-            ))?;
-
-    let strategy = unsafe { create() };
-    Ok(Box::new(rlean_sdk::QcAlgorithmNativeBridge::new(strategy)))
 }

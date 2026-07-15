@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use rlean_core::{
     DateTime, Market, NanosecondTimestamp, Price, Quantity, SecurityType, Symbol, SymbolOptionsExt,
 };
-use rlean_data::MarginInterestRate;
+use rlean_data_tables::MarginInterestRate;
 use rlean_orders::Order;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;

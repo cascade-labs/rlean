@@ -82,15 +82,4 @@ impl Resolution {
             Resolution::Daily => Some(crate::TimeSpan::from_nanos(86_400_000_000_000)),
         }
     }
-
-    /// LEAN's canonical data folder name for this resolution.
-    pub fn folder_name(&self) -> &'static str {
-        match self {
-            Resolution::Tick => "tick",
-            Resolution::Second => "second",
-            Resolution::Minute => "minute",
-            Resolution::Hour => "hour",
-            Resolution::Daily => "daily",
-        }
-    }
 }

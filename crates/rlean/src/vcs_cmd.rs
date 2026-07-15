@@ -202,7 +202,7 @@ fn push_to_origin(workspace: &Path) -> Result<()> {
     }
 }
 
-/// Regenerate rlean.json and data/ when absent (e.g. after a fresh clone + pull).
+/// Regenerate rlean.json when absent (e.g. after a fresh clone + pull).
 fn ensure_rlean_json(workspace: &Path) -> Result<()> {
     if workspace.join("rlean.json").exists() {
         return Ok(());
@@ -211,11 +211,9 @@ fn ensure_rlean_json(workspace: &Path) -> Result<()> {
         .map(|c| c.default_language)
         .unwrap_or_else(|_| "python".to_string());
     let ws_config = crate::config::WorkspaceConfig {
-        data_folder: "data".to_string(),
         default_language: lang,
     };
     ws_config.save(workspace)?;
-    std::fs::create_dir_all(workspace.join("data"))?;
     println!("Regenerated rlean.json");
     Ok(())
 }

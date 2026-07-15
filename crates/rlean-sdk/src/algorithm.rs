@@ -16,6 +16,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "python")]
+use pyo3::types::{PyAnyMethods, PyTupleMethods};
+
 use crate::data::ns_to_exchange_naive;
 use crate::indicators::{
     AverageTrueRange, BollingerBandsIndicator, ExponentialMovingAverage, IdentityIndicator,
@@ -1330,29 +1333,44 @@ impl AlgorithmHandle {
         self.universe_settings()
     }
 
-    #[pyo3(name = "add_universe")]
+    #[pyo3(name = "add_universe", signature = (*args))]
     fn py_add_universe(
         &self,
         py: pyo3::Python<'_>,
-        source_type: String,
-        ticker: String,
-        resolution: crate::types::Resolution,
-        selector: pyo3::Py<pyo3::PyAny>,
+        args: &pyo3::Bound<'_, pyo3::types::PyTuple>,
     ) -> pyo3::PyResult<()> {
-        tracing::debug!(
-            "QCAlgorithm.add_universe called for {}:{} at {:?}",
-            source_type,
-            ticker,
-            resolution
-        );
-        crate::python_framework::register_custom_universe(
-            py,
-            self,
-            source_type,
-            ticker,
-            resolution.into(),
-            selector,
-        )
+        match args.len() {
+            // Modern LEAN overload: AddUniverse(fundamental_selector).
+            1 => crate::python_framework::register_fundamental_universe(
+                py,
+                self,
+                args.get_item(0)?.extract::<pyo3::Py<pyo3::PyAny>>()?,
+            ),
+            // Existing rlean custom-universe overload is retained unchanged.
+            4 => {
+                let source_type = args.get_item(0)?.extract::<String>()?;
+                let ticker = args.get_item(1)?.extract::<String>()?;
+                let resolution = args.get_item(2)?.extract::<crate::types::Resolution>()?;
+                let selector = args.get_item(3)?.extract::<pyo3::Py<pyo3::PyAny>>()?;
+                tracing::debug!(
+                    "QCAlgorithm.add_universe called for {}:{} at {:?}",
+                    source_type,
+                    ticker,
+                    resolution
+                );
+                crate::python_framework::register_custom_universe(
+                    py,
+                    self,
+                    source_type,
+                    ticker,
+                    resolution.into(),
+                    selector,
+                )
+            }
+            _ => Err(pyo3::exceptions::PyTypeError::new_err(
+                "add_universe expects selector or source_type, ticker, resolution, selector",
+            )),
+        }
     }
 
     #[pyo3(name = "set_custom_data_symbols")]
@@ -1589,6 +1607,15 @@ impl<'a> AlgorithmApi<'a> {
             .add_custom_universe_data(source_type, ticker, resolution, properties)
     }
 
+    pub fn add_fundamental_universe_data(
+        &mut self,
+        source_type: &str,
+        resolution: Resolution,
+    ) -> Symbol {
+        self.algorithm
+            .add_fundamental_universe_data(source_type, resolution)
+    }
+
     pub fn add_custom_subscription(
         &mut self,
         source_type: &str,
@@ -1603,6 +1630,9 @@ impl<'a> AlgorithmApi<'a> {
             }
             SubscriptionDataKind::Universe => {
                 self.add_custom_universe_data(source_type, ticker, resolution, properties)
+            }
+            SubscriptionDataKind::FundamentalUniverse => {
+                self.add_fundamental_universe_data(source_type, resolution)
             }
             SubscriptionDataKind::Market | SubscriptionDataKind::Option => {
                 panic!("custom data registration requires custom or universe kind")
@@ -1716,7 +1746,7 @@ pub fn matching_normalization_mode(
 mod tests {
     use super::*;
     use rlean_algorithm::lifecycle::{AlgorithmHistoryService, HistoryColumns};
-    use rlean_data::{TradeBar, TradeBarData};
+    use rlean_data_tables::{TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
     use std::sync::RwLock;

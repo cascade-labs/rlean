@@ -26,7 +26,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GlobalConfig, ProjectConfig};
-use crate::data_store_config;
 use crate::project::research_notebook;
 use crate::research_daemon::sock_path;
 
@@ -163,10 +162,8 @@ fn kernel_start(project_dir: &Path, session: &str, sock: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let data_folder = find_data_folder(project_dir);
-
     println!("Starting research kernel for session '{session}'...");
-    spawn_daemon(session, project_dir, data_folder.as_deref())?;
+    spawn_daemon(session, project_dir)?;
     wait_for_daemon(sock, 60)?;
 
     println!("Kernel ready.  Session: {session}");
@@ -459,43 +456,19 @@ fn ensure_alive(sock: &Path, session: &str) -> Result<()> {
     Ok(())
 }
 
-fn spawn_daemon(session: &str, project: &Path, data_folder: Option<&Path>) -> Result<()> {
+fn spawn_daemon(session: &str, project: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("Cannot determine current exe path")?;
-    // The research kernel is a separate process, so pass it the fully-resolved
-    // catalog and data-S3 configuration rather than making it rediscover a
-    // partial environment. This also makes `rlean research` fail up front when
-    // the required market-data cache configuration has not been set.
-    let catalog = data_store_config::resolve(&GlobalConfig::load()?)?;
+    let config = GlobalConfig::load()?;
+    let sidecar = config.data_sidecar.context(
+        "research requires data_sidecar; set it with `rlean config set data_sidecar grpc://host:port`",
+    )?;
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["__research-daemon", "--session", session]);
     cmd.args(["--project", &project.to_string_lossy()]);
-    cmd.env("RLEAN_DATA_CATALOG", &catalog.uri)
-        .env("RLEAN_DATA_WAREHOUSE", &catalog.warehouse)
-        .env("RLEAN_DATA_NAMESPACE", &catalog.namespace)
-        .env(
-            "RLEAN_DATA_REFRESH_SECS",
-            catalog.data_refresh_secs.to_string(),
-        )
-        .env("RLEAN_DATA_S3_ENDPOINT", &catalog.data_s3.endpoint)
-        .env("RLEAN_DATA_S3_REGION", &catalog.data_s3.region)
-        .env(
-            "RLEAN_DATA_S3_ACCESS_KEY_ID",
-            &catalog.data_s3.access_key_id,
-        )
-        .env(
-            "RLEAN_DATA_S3_SECRET_ACCESS_KEY",
-            &catalog.data_s3.secret_access_key,
-        );
-    if let Some(sigv4) = catalog.sigv4 {
-        cmd.env("RLEAN_DATA_SIGV4_REGION", sigv4.region)
-            .env("RLEAN_DATA_SIGV4_NAME", sigv4.signing_name);
-    } else {
-        cmd.env_remove("RLEAN_DATA_SIGV4_REGION")
-            .env_remove("RLEAN_DATA_SIGV4_NAME");
-    }
-    if let Some(df) = data_folder {
-        cmd.args(["--data-folder", &df.to_string_lossy()]);
+    cmd.env("RLEAN_DATA_SIDECAR", sidecar);
+    if let Some(token) = config.data_sidecar_token {
+        cmd.env("RLEAN_DATA_SIDECAR_TOKEN", token);
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -547,32 +520,6 @@ fn session_name(project_dir: &Path) -> String {
         .into_owned()
 }
 
-/// Walk up from `project_dir` looking for `rlean.json`; return the resolved
-/// absolute path of the configured `data-folder`.
-fn find_data_folder(project_dir: &Path) -> Option<PathBuf> {
-    let mut dir = project_dir.to_path_buf();
-    loop {
-        let cfg = dir.join("rlean.json");
-        if cfg.exists() {
-            if let Ok(text) = std::fs::read_to_string(&cfg) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(df) = v["data-folder"].as_str() {
-                        let candidate = dir.join(df);
-                        if candidate.is_dir() {
-                            return Some(candidate.canonicalize().unwrap_or(candidate));
-                        }
-                    }
-                }
-            }
-        }
-        match dir.parent() {
-            Some(p) if p != dir => dir = p.to_path_buf(),
-            _ => break,
-        }
-    }
-    None
-}
-
 /// Decode base64 PNG figures and save to the session plots directory.
 fn save_figures(session: &str, figures: &[String]) -> Result<Vec<PathBuf>> {
     if figures.is_empty() {
@@ -586,7 +533,7 @@ fn save_figures(session: &str, figures: &[String]) -> Result<Vec<PathBuf>> {
         .map(PathBuf::from)
         .context("HOME not set")?;
     let plots_dir = home
-        .join(".lean-research")
+        .join(".rlean-research")
         .join("sessions")
         .join(session)
         .join("plots");

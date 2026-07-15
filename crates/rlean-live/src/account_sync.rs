@@ -1,8 +1,7 @@
-use rlean_brokerages::{Brokerage, BrokerageHolding};
-use rlean_orders::order::Order;
+use rlean_brokerages::BrokerageHolding;
+use rlean_orders::Order;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use tracing::info;
 
 /// Currencies treated as settlement cash (USD and USD-pegged stablecoins).
 pub fn is_cash_currency(currency: &str) -> bool {
@@ -30,71 +29,16 @@ pub fn settlement_cash(cash_balances: &[(String, Decimal)]) -> Decimal {
     }
 }
 
+/// Provider-neutral account snapshot used for deployment persistence and
+/// restart recovery. Acquisition now comes from the sidecar protocol.
 #[derive(Debug, Clone)]
 pub struct AccountState {
-    /// Total USD cash balance.
     pub cash: Decimal,
-    /// All currency balances keyed by currency code (e.g. "USD").
     pub cash_balances: Vec<(String, Decimal)>,
-    /// Ticker → quantity for all held positions.
     pub positions: HashMap<String, Decimal>,
-    /// Detailed symbol holdings, including average price when the brokerage exposes it.
     pub holdings: Vec<BrokerageHolding>,
     pub open_orders: Vec<Order>,
     pub last_sync_time: chrono::DateTime<chrono::Utc>,
-}
-
-/// Periodically syncs account state from a brokerage.
-pub struct AccountSynchronizer {
-    pub sync_interval_secs: u64,
-}
-
-impl AccountSynchronizer {
-    pub fn new(sync_interval_secs: u64) -> Self {
-        Self { sync_interval_secs }
-    }
-
-    /// Fetch current account state from the brokerage (synchronous).
-    /// In an async context use `tokio::task::block_in_place(|| self.sync_blocking(brokerage))`.
-    pub fn sync_blocking(&self, brokerage: &dyn Brokerage) -> anyhow::Result<AccountState> {
-        info!("AccountSynchronizer: syncing account state");
-
-        let cash_balances = brokerage.get_cash_balance();
-
-        // Aggregate the settlement-cash figure. USD and USD-pegged stablecoins
-        // (USDC/USDT/etc.) are all treated as the account's cash balance so
-        // non-USD brokerages like Hyperliquid (USDC) reconcile correctly. When
-        // no cash-currency balance is present but a single currency is reported,
-        // fall back to that balance.
-        let cash: Decimal = settlement_cash(&cash_balances);
-
-        let holdings = brokerage.get_account_detailed_holdings();
-        let open_orders = brokerage.get_open_orders();
-
-        let positions: HashMap<String, Decimal> = holdings
-            .iter()
-            .map(|holding| (holding.symbol.id.ticker.clone(), holding.quantity))
-            .collect();
-
-        Ok(AccountState {
-            cash,
-            cash_balances,
-            positions,
-            holdings,
-            open_orders,
-            last_sync_time: chrono::Utc::now(),
-        })
-    }
-
-    /// Async helper — runs `sync_blocking` on the tokio blocking thread pool.
-    /// Requires the brokerage to be wrapped in an `Arc<Mutex<_>>` or similar
-    /// so ownership can be moved into the blocking task.
-    pub async fn sync_with_blocking<F>(&self, fetch: F) -> anyhow::Result<AccountState>
-    where
-        F: FnOnce() -> anyhow::Result<AccountState> + Send + 'static,
-    {
-        tokio::task::spawn_blocking(fetch).await?
-    }
 }
 
 #[cfg(test)]

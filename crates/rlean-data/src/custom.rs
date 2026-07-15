@@ -1,21 +1,17 @@
 use chrono::NaiveDate;
-use rlean_core::{DateTime, Resolution, TimeSpan};
-use rust_decimal::Decimal;
+use rlean_core::{DateTime, Resolution};
+use rlean_data_tables::CustomDataPoint;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Generic query hints for custom data providers.
 ///
 /// Providers may use these to push filtering/projection into their native
-/// storage layer. The runner also uses them for parquet-capable providers.
+/// canonical sidecar contract. The runner forwards them with subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CustomDataQuery {
-    /// Provider-neutral symbol filter. Matched against the canonical
-    /// [`CustomDataPoint::symbol`], which providers populate by declaring a
-    /// `symbol_column` on their [`CustomDataSource`] (the engine copies that
-    /// column's value, uppercased, into the point). Matching is
-    /// case-insensitive.
+    /// Provider-neutral symbol filter matched against the canonical
+    /// [`CustomDataPoint::symbol`] case-insensitively.
     pub symbols: Option<Vec<String>>,
     /// Provider field projection. Providers should include any required time,
     /// value, and symbol columns even if omitted here.
@@ -32,12 +28,53 @@ pub struct CustomDataQuery {
     pub numeric_max: HashMap<String, f64>,
     /// Provider-specific settings not covered by the generic fields.
     ///
-    /// The parquet reader also recognizes comma-separated `not_null` and
+    /// Sidecars may also recognize comma-separated `not_null` and
     /// `required_columns` values here as opt-in non-null row filters.
     pub properties: HashMap<String, String>,
 }
 
 impl CustomDataQuery {
+    /// Build the provider-neutral query represented by strategy `AddData`
+    /// properties. Filter prefixes are part of the rlean data contract, so
+    /// parsing them here keeps Rust and Python subscription paths identical.
+    pub fn from_properties(properties: &HashMap<String, String>) -> Self {
+        fn split_csv(value: &str) -> Vec<String> {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        }
+
+        let mut query = Self::default();
+        if let Some(symbols) = properties.get("symbols") {
+            query.symbols = Some(split_csv(symbols));
+        }
+        if let Some(columns) = properties.get("columns") {
+            query.columns = Some(split_csv(columns));
+        }
+        for (key, value) in properties {
+            if let Some(column) = key.strip_prefix("eq_") {
+                query
+                    .string_equals
+                    .insert(column.to_string(), value.clone());
+            } else if let Some(column) = key.strip_prefix("in_") {
+                query.string_in.insert(column.to_string(), split_csv(value));
+            } else if let Some(column) = key.strip_prefix("min_") {
+                if let Ok(value) = value.parse::<f64>() {
+                    query.numeric_min.insert(column.to_string(), value);
+                }
+            } else if let Some(column) = key.strip_prefix("max_") {
+                if let Ok(value) = value.parse::<f64>() {
+                    query.numeric_max.insert(column.to_string(), value);
+                }
+            }
+        }
+        query.properties = properties.clone();
+        query
+    }
+
     pub fn merge(&self, overlay: &CustomDataQuery) -> CustomDataQuery {
         let mut merged = self.clone();
         if overlay.symbols.is_some() {
@@ -86,12 +123,12 @@ impl CustomDataQuery {
     }
 
     /// Whether a decoded point satisfies this query's symbol, string, and numeric
-    /// filters. Both the historical (Iceberg/parquet) reader and the live poller
+    /// filters. Historical queries and live delivery
     /// use this so live custom data is filtered identically to backtests.
     ///
     /// Symbol matching is case-insensitive against [`CustomDataPoint::symbol`],
     /// which providers populate directly (live) or the engine copies from the
-    /// declared `symbol_column` (historical parquet).
+    /// declared `symbol_column`.
     pub fn matches_point(&self, point: &CustomDataPoint) -> bool {
         if let Some(symbols) = &self.symbols {
             let Some(point_symbol) = point.symbol.as_deref() else {
@@ -164,183 +201,19 @@ fn json_number(value: &serde_json::Value) -> Option<f64> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomDataConfig {
     pub ticker: String,
-    /// Unique name matching the plugin registry entry (e.g. "fred", "cboe_vix").
+    /// Unique sidecar series identifier (e.g. "fred", "cboe_vix").
     pub source_type: String,
     pub resolution: Resolution,
-    /// Arbitrary string properties passed to the plugin (API keys, etc.).
+    /// Arbitrary string properties passed to the sidecar integration.
     pub properties: HashMap<String, String>,
     pub query: CustomDataQuery,
-}
-
-/// Transport mechanism for fetching custom data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CustomDataTransport {
-    LocalFile,
-    Http,
-}
-
-/// Wire format of the fetched data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CustomDataFormat {
-    Csv,
-    Json,
-    Parquet,
-}
-
-/// Describes where to fetch custom data for a given ticker + date.
-///
-/// Returned by `ICustomDataSource::get_source` — mirrors LEAN's
-/// `BaseData.GetSource` return value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomDataSource {
-    /// URL (HTTP) or file path (LocalFile).
-    pub uri: String,
-    pub transport: CustomDataTransport,
-    pub format: CustomDataFormat,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    /// Name of the decoded column carrying the underlying symbol. When set, the
-    /// engine copies that column's value (uppercased) into
-    /// [`CustomDataPoint::symbol`] so `CustomDataQuery::symbols` can filter on
-    /// it. `None` leaves the point's symbol unset.
-    #[serde(default)]
-    pub symbol_column: Option<String>,
-}
-
-/// Native Parquet custom-data source returned directly by plugins.
-///
-/// This avoids forcing parquet-native providers to pretend each local file or
-/// fetched object is a text/HTTP source. The engine owns decoding into
-/// `CustomDataPoint`s.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CustomParquetSource {
-    pub paths: Vec<String>,
-    #[serde(default)]
-    pub buffers: Vec<Vec<u8>>,
-    pub time_column: Option<String>,
-    pub time_format: Option<String>,
-    pub time_zone: Option<String>,
-    pub end_time_column: Option<String>,
-    pub end_time_offset_nanos: Option<i64>,
-    pub symbol_column: Option<String>,
-    pub value_column: Option<String>,
-    pub value_columns: Vec<String>,
-}
-
-/// A single data point returned by a custom data source.
-///
-/// Mirrors LEAN C#'s `BaseData`, which carries exactly two time fields:
-///
-/// - [`time`](Self::time) — `BaseData.Time`, the start of the period the point
-///   covers (a full UTC timestamp, not a bare date).
-/// - [`end_time`](Self::end_time) — `BaseData.EndTime`, the end of the period.
-///   This is the *emission gate*: LEAN sets `EmitTimeUtc = ConvertToUtc(EndTime)`
-///   and the synchronizer only surfaces a point once the frontier reaches it,
-///   which is what "ensures no look-ahead bias." It is never null in LEAN, so it
-///   is a required field here — a point that could not be gated on a real
-///   availability time cannot be placed on the timeline at all.
-///
-/// Both fields are always populated. Construct points through [`new`](Self::new)
-/// (both times explicit), [`daily_eod`](Self::daily_eod) (the canonical daily
-/// idiom: `end_time = time + 1 day`), or [`with_lean_defaulting`](Self::with_lean_defaulting)
-/// (applies LEAN's `Time`/`EndTime` defaulting when only one of the two is known).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomDataPoint {
-    /// Start of the period this point covers, in UTC. Mirrors LEAN `BaseData.Time`.
-    pub time: DateTime,
-    /// UTC end-of-period / emission gate. Mirrors LEAN `BaseData.EndTime`.
-    /// Always populated — a point is never visible before this instant.
-    pub end_time: DateTime,
-    /// Primary scalar value (equivalent to LEAN's `BaseData.Value`).
-    pub value: Decimal,
-    /// Canonical UPPERCASE underlying ticker this point pertains to, if any.
-    ///
-    /// Providers declare which decoded column carries it via
-    /// [`CustomDataSource::symbol_column`]; the engine uppercases and stores it
-    /// here. `CustomDataQuery::symbols` filtering matches against this field.
-    #[serde(default)]
-    pub symbol: Option<String>,
-    /// Additional named fields (e.g. open/high/low/close for VIX).
-    pub fields: Arc<HashMap<String, serde_json::Value>>,
-}
-
-impl CustomDataPoint {
-    /// Construct a point with both `time` (period start) and `end_time` (the
-    /// emission gate) explicit. Callers that only know one of the two should use
-    /// [`with_lean_defaulting`](Self::with_lean_defaulting) or
-    /// [`daily_eod`](Self::daily_eod) instead so LEAN's defaulting is applied.
-    pub fn new(
-        time: DateTime,
-        end_time: DateTime,
-        value: Decimal,
-        fields: HashMap<String, serde_json::Value>,
-    ) -> Self {
-        Self {
-            time,
-            end_time,
-            value,
-            symbol: None,
-            fields: Arc::new(fields),
-        }
-    }
-
-    /// The canonical LEAN daily EOD idiom (`CustomDataBitcoinAlgorithm.py`):
-    /// a point stamped at period start `time` with `end_time = time + 1 day`.
-    /// Use for daily/EOD feeds (FRED, CBOE VIX, GDPNow) where the underlying
-    /// data has no intraday timestamp.
-    pub fn daily_eod(
-        time: DateTime,
-        value: Decimal,
-        fields: HashMap<String, serde_json::Value>,
-    ) -> Self {
-        Self::new(time, time + TimeSpan::from_days(1), value, fields)
-    }
-
-    /// Apply LEAN's `Time`/`EndTime` defaulting rules (`BaseData.cs`,
-    /// `PythonData.cs`) to whatever the provider supplied:
-    ///
-    /// - both set → used as-is;
-    /// - only `time` set → `end_time = time` (instantaneous point);
-    /// - only `end_time` set → `time = end_time`;
-    /// - neither set → not representable — returns `None`, because a point with
-    ///   no availability time cannot be safely placed on the timeline (issue #31:
-    ///   never guess midnight).
-    pub fn with_lean_defaulting(
-        time: Option<DateTime>,
-        end_time: Option<DateTime>,
-        value: Decimal,
-        fields: HashMap<String, serde_json::Value>,
-    ) -> Option<Self> {
-        let (time, end_time) = match (time, end_time) {
-            (Some(time), Some(end_time)) => (time, end_time),
-            (Some(time), None) => (time, time),
-            (None, Some(end_time)) => (end_time, end_time),
-            (None, None) => return None,
-        };
-        Some(Self::new(time, end_time, value, fields))
-    }
-
-    /// Builder that sets the canonical underlying symbol (uppercased).
-    pub fn with_symbol(mut self, symbol: Option<String>) -> Self {
-        self.symbol = symbol.map(|value| value.trim().to_ascii_uppercase());
-        self
-    }
-
-    /// UTC calendar date of the period start (`time`). Convenience for callers
-    /// that still reason in whole days (partition math, day-window filters).
-    pub fn time_date(&self) -> NaiveDate {
-        self.time.date_utc()
-    }
-
-    pub fn empty(time: DateTime, end_time: DateTime, value: Decimal) -> Self {
-        Self::new(time, end_time, value, HashMap::new())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use rlean_core::TimeSpan;
     use rust_decimal_macros::dec;
 
     fn point_with_symbol(symbol: Option<&str>) -> CustomDataPoint {
@@ -353,6 +226,32 @@ mod tests {
         );
         CustomDataPoint::daily_eod(time, dec!(1), HashMap::new())
             .with_symbol(symbol.map(str::to_string))
+    }
+
+    #[test]
+    fn from_properties_maps_strategy_filter_prefixes() {
+        let properties = HashMap::from([
+            ("symbols".to_string(), "SPY, AAPL".to_string()),
+            ("eq_side".to_string(), "ask".to_string()),
+            ("in_type".to_string(), "call, put".to_string()),
+            ("min_norm_mid_edge".to_string(), "500".to_string()),
+            ("max_size".to_string(), "bad".to_string()),
+        ]);
+
+        let query = CustomDataQuery::from_properties(&properties);
+
+        assert_eq!(
+            query.symbols,
+            Some(vec!["SPY".to_string(), "AAPL".to_string()])
+        );
+        assert_eq!(query.string_equals.get("side"), Some(&"ask".to_string()));
+        assert_eq!(
+            query.string_in.get("type"),
+            Some(&vec!["call".to_string(), "put".to_string()])
+        );
+        assert_eq!(query.numeric_min.get("norm_mid_edge"), Some(&500.0));
+        assert!(!query.numeric_max.contains_key("size"));
+        assert_eq!(query.properties, properties);
     }
 
     #[test]
@@ -374,7 +273,7 @@ mod tests {
             ..Default::default()
         };
         // Live providers must populate point.symbol; an unset symbol is dropped
-        // when a symbol filter is active (mirrors the historical parquet path).
+        // when a symbol filter is active (mirrors historical sidecar queries).
         assert!(!query.matches_point(&point_with_symbol(None)));
     }
 

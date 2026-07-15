@@ -1,5 +1,5 @@
-use crate::base_data::{BaseData, BaseDataType};
 use rlean_core::{DateTime, Price, Symbol, TimeSpan};
+use rlean_data_tables::{BaseData, BaseDataType};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct FundamentalData {
     pub symbol: Symbol,
     pub time: DateTime,
+    /// The first frontier on which the values may be used for selection.
+    pub end_time: DateTime,
+    pub volume: Option<Decimal>,
+    pub dollar_volume: Option<Decimal>,
+    pub market_cap: Option<Decimal>,
     pub company_reference: CompanyReference,
     pub earnings_ratios: EarningsRatios,
     pub valuation_ratios: ValuationRatios,
@@ -78,6 +83,10 @@ impl FundamentalData {
         FundamentalData {
             symbol,
             time,
+            end_time: time + TimeSpan::ONE_DAY,
+            volume: None,
+            dollar_volume: None,
+            market_cap: None,
             company_reference: Default::default(),
             earnings_ratios: Default::default(),
             valuation_ratios: Default::default(),
@@ -98,7 +107,7 @@ impl BaseData for FundamentalData {
         self.time
     }
     fn end_time(&self) -> DateTime {
-        self.time + TimeSpan::ONE_DAY
+        self.end_time
     }
     fn price(&self) -> Price {
         dec!(0)

@@ -5,7 +5,8 @@ use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubscription};
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{DateTime, MarketHoursDatabase, Resolution, TimeSpan};
-use rlean_data::{Bar, QuoteBar, Slice, SubscriptionDataConfig, TradeBar, TradeBarData};
+use rlean_data::{Slice, SubscriptionDataConfig};
+use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
 use rlean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
 use rlean_orders::{order_processor::OrderProcessor, OrderEvent};
 use rlean_statistics::{Trade, TradeBuilder};
@@ -223,6 +224,30 @@ where
                         selection.changes,
                         selection.resolution,
                         &slice.custom_data,
+                    );
+                } else {
+                    changes.added.extend(selection.changes.added);
+                    changes.removed.extend(selection.changes.removed);
+                }
+            }
+        }
+        if !slice.fundamentals.is_empty() {
+            for selection in self.algorithm.select_fundamental_universe_changes(
+                slice.time.0,
+                resolution,
+                &slice.fundamentals,
+                services,
+            ) {
+                if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                    let mut algorithm = algorithm_state.lock().unwrap();
+                    // The fundamental selector uses the normal equity
+                    // subscription path; unlike custom universes it has no
+                    // per-symbol metadata to attach.
+                    crate::algorithm_services::apply_universe_changes(
+                        &mut algorithm,
+                        &mut changes,
+                        selection.changes,
+                        selection.resolution,
                     );
                 } else {
                     changes.added.extend(selection.changes.added);

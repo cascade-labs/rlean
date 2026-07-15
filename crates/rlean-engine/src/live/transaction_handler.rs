@@ -1,15 +1,12 @@
 //! Engine-owned live transaction handler.
 //!
-//! Modeled on C# LEAN's `BrokerageTransactionHandler`. When a real brokerage is
-//! attached and it does not use local paper fills, new orders created by the
-//! algorithm/framework are submitted to the brokerage and fills/status changes
-//! are detected by polling the brokerage — instead of being filled locally by
-//! the `ImmediateFillModel`.
+//! Modeled on C# LEAN's `BrokerageTransactionHandler`. With a sidecar execution
+//! connection, new orders are sent over the persistent Flight exchange and
+//! fills/status changes are pushed back by the sidecar instead of being filled
+//! locally by the `ImmediateFillModel`.
 //!
-//! Threading model mirrors `LiveCustomSubscriptionSet`: the `Box<dyn Brokerage>`
-//! is owned by a dedicated worker thread (with its own current-thread tokio
-//! runtime, since brokerage adapters `block_on` internally). The live loop
-//! communicates with the worker over two crossbeam channels:
+//! A dedicated worker owns the sidecar event stream. The live loop communicates
+//! with it over two crossbeam channels:
 //!
 //!   * request channel (loop -> worker): submit/cancel/update/stop.
 //!   * event channel (worker -> loop): status + fill notifications.
@@ -17,11 +14,16 @@
 //! Portfolio, `TransactionManager` and algorithm callbacks are only ever touched
 //! on the live-loop thread. The worker only talks to the brokerage.
 
+use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
+#[cfg(test)]
 use rlean_brokerages::Brokerage;
 use rlean_core::{DateTime, Price, Quantity};
+use rlean_data_sidecar::{
+    order_status_from_wire, symbol_from_wire, BrokerageEvent as SidecarBrokerageEvent,
+};
 use rlean_orders::{Order, OrderEvent, OrderStatus, OrderType, TransactionManager};
 use rlean_statistics::{Trade, TradeBuilder};
 use rust_decimal::Decimal;
@@ -57,15 +59,13 @@ pub(crate) enum BrokerageEvent {
     },
     /// Submission was rejected by the brokerage.
     Invalid { order_id: i64, message: String },
-    /// Submission failed with a transport/transient error (the plugin returned
-    /// `Err`). Distinct from `Invalid`: a `false`/`Ok(None)` return means the
-    /// brokerage explicitly declined and is terminal, whereas an `Err` is a
-    /// submission failure that gets a bounded number of retries (see
-    /// `SUBMIT_BACKOFF`) before the order is finally marked `Invalid`.
+    /// Submission failed with a transport/transient error. Distinct from
+    /// `Invalid`: a broker rejection is terminal, while this failure gets a
+    /// bounded number of retries before the order is finally marked `Invalid`.
     SubmitFailed { order_id: i64, message: String },
-    /// A status/fill update polled from the brokerage. `cumulative_filled` is the
+    /// A pushed status/fill update. `cumulative_filled` is the
     /// signed total filled quantity the brokerage reports for the order. `symbol`
-    /// is the symbol the brokerage reports for the polled order; the loop verifies
+    /// is the symbol the brokerage reports; the loop verifies
     /// it matches the engine order's symbol before applying any effect, so a
     /// mis-resolved id can never apply a fill across symbols (issue #33).
     Status {
@@ -83,8 +83,8 @@ pub(crate) enum BrokerageEvent {
 /// up to three times (initial submit, then a retry 5s later, then 15s later).
 /// A submission that still fails after the last delay goes terminally `Invalid`.
 ///
-/// The delays are deliberately short and few: an `Err` from the plugin is most
-/// often a transient transport hiccup (e.g. a response-decode failure), so a
+/// The delays are deliberately short and few: a retryable sidecar response is
+/// most often a transient transport hiccup (e.g. a response-decode failure), so a
 /// couple of spaced-out retries recover it, while a genuine rejection surfaced
 /// as `Err` just fails a couple more times and reaches the same terminal state
 /// a few seconds later.
@@ -95,6 +95,7 @@ const SUBMIT_BACKOFF: [std::time::Duration; 2] = [
 
 /// State the worker tracks per order it has seen from the brokerage, so it only
 /// emits an event when something actually changed.
+#[cfg(test)]
 #[derive(Default, Clone)]
 struct TrackedBrokerageOrder {
     status: Option<OrderStatus>,
@@ -115,8 +116,11 @@ pub struct LiveBrokerageRouter {
     cancel_forwarded: std::collections::HashSet<i64>,
     update_forwarded: std::collections::HashSet<i64>,
     /// Cumulative filled quantity already applied to the portfolio per order, so
-    /// polled snapshots only apply the incremental delta.
+    /// repeated pushed snapshots only apply the incremental delta.
     applied_filled: HashMap<i64, Quantity>,
+    /// Cumulative brokerage fees already applied per order. Sidecar updates are
+    /// snapshots and may be repeated, so only the incremental fee is charged.
+    applied_fees: HashMap<i64, Price>,
     /// Backoff schedule between submission retries. Kept as a field (rather than a
     /// bare const) so tests can inject a fast schedule without sleeping seconds.
     /// `submit_backoff.len() + 1` is the total number of submission attempts.
@@ -136,6 +140,7 @@ pub struct LiveBrokerageRouter {
 impl LiveBrokerageRouter {
     /// Spawn the worker thread and hand ownership of the brokerage to it, using
     /// the default `SUBMIT_BACKOFF` retry schedule.
+    #[cfg(test)]
     pub fn spawn(brokerage: Box<dyn Brokerage>) -> Self {
         Self::spawn_with_backoff(brokerage, SUBMIT_BACKOFF.to_vec())
     }
@@ -143,6 +148,7 @@ impl LiveBrokerageRouter {
     /// Spawn with an explicit submission-retry backoff schedule. Tests use this
     /// to inject a fast (near-zero) schedule so retry behavior can be exercised
     /// without sleeping the production 5s/15s delays.
+    #[cfg(test)]
     pub fn spawn_with_backoff(
         brokerage: Box<dyn Brokerage>,
         submit_backoff: Vec<std::time::Duration>,
@@ -161,7 +167,34 @@ impl LiveBrokerageRouter {
             cancel_forwarded: std::collections::HashSet::new(),
             update_forwarded: std::collections::HashSet::new(),
             applied_filled: HashMap::new(),
+            applied_fees: HashMap::new(),
             submit_backoff,
+            submit_attempts: HashMap::new(),
+            retry_not_before: HashMap::new(),
+            moo_deferred_logged: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Route live orders through the authenticated sidecar execution
+    /// connection. The worker consumes pushed brokerage events; it never polls
+    /// the remote brokerage from rlean.
+    pub fn spawn_sidecar(connection: crate::runner_config::SidecarBrokerageConnection) -> Self {
+        let (request_tx, request_rx) = crossbeam_channel::unbounded::<BrokerageRequest>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<BrokerageEvent>();
+        let worker = std::thread::Builder::new()
+            .name("live-sidecar-brokerage-router".to_string())
+            .spawn(move || run_sidecar_worker(connection, request_rx, event_tx))
+            .expect("failed to spawn live sidecar brokerage router worker");
+        Self {
+            request_tx,
+            event_rx,
+            worker: Some(worker),
+            submitted_ids: std::collections::HashSet::new(),
+            cancel_forwarded: std::collections::HashSet::new(),
+            update_forwarded: std::collections::HashSet::new(),
+            applied_filled: HashMap::new(),
+            applied_fees: HashMap::new(),
+            submit_backoff: SUBMIT_BACKOFF.to_vec(),
             submit_attempts: HashMap::new(),
             retry_not_before: HashMap::new(),
             moo_deferred_logged: std::collections::HashSet::new(),
@@ -214,7 +247,7 @@ impl LiveBrokerageRouter {
     /// respecting market hours:
     ///
     /// * A `MarketOnOpen` order is engine-held while its exchange is closed and
-    ///   released only once the exchange is open. Brokerage plugins have no
+    ///   released only once the exchange is open. Sidecar adapters have no
     ///   native market-on-open type, so the released submission goes out as a
     ///   plain market order — the engine-side hold is what provides LEAN's
     ///   "fill at the next market open" semantics.
@@ -280,7 +313,7 @@ impl LiveBrokerageRouter {
         self.retry_not_before.remove(&order_id);
         self.submitted_ids.insert(order_id);
         *self.submit_attempts.entry(order_id).or_default() += 1;
-        // Plugins only translate market/limit/stop types, so a released
+        // Sidecar brokerage adapters translate market/limit/stop types, so a released
         // market-on-open order crosses the wire as a market order; the engine
         // order keeps its MarketOnOpen type for the audit trail.
         let mut wire_order = order;
@@ -450,9 +483,9 @@ impl LiveBrokerageRouter {
                     return;
                 };
                 // Defense in depth (issue #33): the brokerage-reported symbol for
-                // this polled order MUST match the engine order the id resolved
+                // this pushed order MUST match the engine order the id resolved
                 // to. If a brokerage id ever mis-resolves to the wrong engine
-                // order (id collision, map overwrite, plugin bug), applying the
+                // order (id collision, map overwrite, adapter bug), applying the
                 // fill would corrupt a different symbol's holdings. Refuse: log an
                 // ERROR with both symbols/ids and do not apply the event or touch
                 // any tracked state for this pairing. Cross-symbol application is
@@ -479,14 +512,21 @@ impl LiveBrokerageRouter {
                     .copied()
                     .unwrap_or_default();
                 let fill_delta = cumulative_filled - previously_applied;
+                let cumulative_commission = commission.unwrap_or_default();
+                let previously_applied_fee = self
+                    .applied_fees
+                    .get(&order_id)
+                    .copied()
+                    .unwrap_or_default();
+                let fee_delta = cumulative_commission - previously_applied_fee;
 
                 let mut order_event =
                     OrderEvent::new(order.id, order.symbol.clone(), DateTime::now(), status);
                 order_event.apply_order_fields(&order);
                 order_event.fill_price = fill_price;
                 order_event.fill_quantity = fill_delta;
-                if let Some(commission) = commission {
-                    order_event.order_fee = commission;
+                if fee_delta > Price::ZERO {
+                    order_event.order_fee = fee_delta;
                 }
 
                 if status.is_fill() && !fill_delta.is_zero() {
@@ -499,6 +539,7 @@ impl LiveBrokerageRouter {
                         completed_trades,
                     );
                     self.applied_filled.insert(order_id, cumulative_filled);
+                    self.applied_fees.insert(order_id, cumulative_commission);
                 } else if !status.is_fill() {
                     order_event.message = status_message(status);
                 }
@@ -590,11 +631,192 @@ fn status_message(status: OrderStatus) -> String {
 }
 
 /// Poll cadence for brokerage account-order reconciliation.
+#[cfg(test)]
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+fn run_sidecar_worker(
+    mut connection: crate::runner_config::SidecarBrokerageConnection,
+    request_rx: Receiver<BrokerageRequest>,
+    event_tx: Sender<BrokerageEvent>,
+) {
+    use futures::StreamExt;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!("live sidecar brokerage worker failed to start runtime: {error}");
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        let client = connection.client.clone();
+        let connection_id = connection.connection_id;
+        let session_id = client.session_id().to_string();
+        let mut stop = false;
+        while !stop {
+            loop {
+                match request_rx.try_recv() {
+                    Ok(BrokerageRequest::Stop) => {
+                        stop = true;
+                        break;
+                    }
+                    Ok(BrokerageRequest::Submit(order)) => {
+                        let command_id =
+                            format!("{session_id}:{connection_id}:submit:{}", order.id);
+                        let order_id = order.id;
+                        match client
+                            .submit_order(connection_id, command_id, (&order).into())
+                            .await
+                        {
+                            Ok(result) if result.accepted => {
+                                let _ = event_tx.send(BrokerageEvent::Submitted {
+                                    order_id,
+                                    brokerage_ids: result.brokerage_order_ids,
+                                });
+                            }
+                            Ok(result) if result.retryable => {
+                                let _ = event_tx.send(BrokerageEvent::SubmitFailed {
+                                    order_id,
+                                    message: result.message,
+                                });
+                            }
+                            Ok(result) => {
+                                let _ = event_tx.send(BrokerageEvent::Invalid {
+                                    order_id,
+                                    message: result.message,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(BrokerageEvent::SubmitFailed {
+                                    order_id,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(BrokerageRequest::Update(order)) => {
+                        let command_id =
+                            format!("{session_id}:{connection_id}:update:{}", order.id);
+                        match client
+                            .update_order(connection_id, command_id, (&order).into())
+                            .await
+                        {
+                            Ok(result) if result.accepted => {}
+                            Ok(result) => tracing::warn!(
+                                order_id = order.id,
+                                retryable = result.retryable,
+                                "sidecar brokerage rejected order update: {}",
+                                result.message
+                            ),
+                            Err(error) => tracing::warn!(
+                                order_id = order.id,
+                                "sidecar brokerage update failed: {error}"
+                            ),
+                        }
+                    }
+                    Ok(BrokerageRequest::Cancel(order)) => {
+                        let command_id =
+                            format!("{session_id}:{connection_id}:cancel:{}", order.id);
+                        match client
+                            .cancel_order(
+                                connection_id,
+                                command_id,
+                                order.id,
+                                order.brokerage_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(result) if result.accepted => {}
+                            Ok(result) => tracing::warn!(
+                                order_id = order.id,
+                                retryable = result.retryable,
+                                "sidecar brokerage rejected order cancellation: {}",
+                                result.message
+                            ),
+                            Err(error) => tracing::warn!(
+                                order_id = order.id,
+                                "sidecar brokerage cancellation failed: {error}"
+                            ),
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+
+            tokio::select! {
+                event = connection.events.next() => {
+                    match event {
+                        Some(Ok(SidecarBrokerageEvent::Order(update))) => {
+                            let parsed = (|| -> anyhow::Result<BrokerageEvent> {
+                                let symbol = symbol_from_wire(
+                                    update.symbol.context("brokerage order update is missing symbol")?
+                                )?;
+                                let status = order_status_from_wire(update.status)?;
+                                let cumulative_filled = update.cumulative_filled_quantity.parse()
+                                    .context("invalid cumulative brokerage fill quantity")?;
+                                let fill_price = update.average_fill_price.parse()
+                                    .context("invalid brokerage average fill price")?;
+                                let commission = update.cumulative_fee
+                                    .as_deref()
+                                    .map(str::parse)
+                                    .transpose()
+                                    .context("invalid cumulative brokerage fee")?;
+                                Ok(BrokerageEvent::Status {
+                                    order_id: update.engine_order_id,
+                                    symbol,
+                                    status,
+                                    fill_price,
+                                    cumulative_filled,
+                                    commission,
+                                })
+                            })();
+                            match parsed {
+                                Ok(event) => { let _ = event_tx.send(event); }
+                                Err(error) => tracing::error!("invalid sidecar brokerage update: {error}"),
+                            }
+                        }
+                        Some(Ok(SidecarBrokerageEvent::Connection(state))) => {
+                            if !state.connected {
+                                tracing::error!(
+                                    brokerage = %connection.name,
+                                    "sidecar brokerage disconnected: {}",
+                                    state.message
+                                );
+                            }
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!("sidecar brokerage event stream failed: {error}");
+                            break;
+                        }
+                        None => {
+                            tracing::error!("sidecar brokerage event stream closed");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
+        }
+        if let Err(error) = client.close_brokerage(connection_id).await {
+            tracing::warn!("failed to close sidecar brokerage connection: {error}");
+        }
+    });
+}
 
 /// Worker loop: owns the brokerage, services submission/cancel/update requests,
 /// and polls order state. Runs on its own thread with a current-thread tokio
 /// runtime so brokerage adapters that `block_on` internally work correctly.
+#[cfg(test)]
 fn run_worker(
     mut brokerage: Box<dyn Brokerage>,
     request_rx: Receiver<BrokerageRequest>,
@@ -646,6 +868,7 @@ fn run_worker(
     }
 }
 
+#[cfg(test)]
 fn handle_submit(
     brokerage: &mut dyn Brokerage,
     order: Order,
@@ -672,7 +895,7 @@ fn handle_submit(
                 message: "Brokerage rejected order submission (no reason reported)".to_string(),
             });
         }
-        // An `Err` is a transport/transient submission failure (the plugin could
+        // An `Err` is a transport/transient submission failure (the adapter could
         // not complete the request), NOT a broker rejection. Report it as a
         // retryable `SubmitFailed`; the router retries a bounded number of times
         // before marking the order `Invalid`.
@@ -687,6 +910,7 @@ fn handle_submit(
 
 /// Poll the brokerage for all account orders and emit an event for any that
 /// changed status or accumulated additional fills.
+#[cfg(test)]
 fn poll_account_orders(
     brokerage: &dyn Brokerage,
     event_tx: &Sender<BrokerageEvent>,
@@ -725,6 +949,7 @@ fn poll_account_orders(
 /// Map a polled account order back to the engine order id. Uses the brokerage-id
 /// map first, then falls back to the engine order id carried on the order when
 /// the brokerage echoes it.
+#[cfg(test)]
 fn resolve_engine_order_id(
     order: &Order,
     brokerage_to_engine: &HashMap<String, i64>,
@@ -734,7 +959,7 @@ fn resolve_engine_order_id(
             return Some(*engine_id);
         }
     }
-    // Some plugins reuse the engine order id as the order id (e.g. paper
+    // Some brokerages reuse the engine order id as the order id (e.g. paper
     // adapters); only honor that when it is a known engine order in the map's
     // value set, otherwise ignore unknown externally-created orders.
     if order.id > 0 && brokerage_to_engine.values().any(|id| *id == order.id) {
@@ -752,11 +977,109 @@ pub struct StartupAccountSync {
     pub open_orders: Vec<Order>,
 }
 
+/// Pull the initial account snapshot through the already-authenticated sidecar
+/// brokerage connection and seed the engine-owned portfolio/order state.
+pub async fn startup_sidecar_account_sync(
+    connection: &crate::runner_config::SidecarBrokerageConnection,
+    portfolio: Option<&Arc<SecurityPortfolioManager>>,
+    transactions: Option<&Arc<TransactionManager>>,
+) -> anyhow::Result<StartupAccountSync> {
+    let snapshot = connection
+        .client
+        .brokerage_snapshot(connection.connection_id)
+        .await?;
+    let cash_balances = snapshot
+        .cash
+        .into_iter()
+        .map(|balance| {
+            Ok((
+                balance.currency,
+                balance.amount.parse().with_context(|| {
+                    format!("invalid brokerage cash amount '{}'", balance.amount)
+                })?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let holdings = snapshot
+        .holdings
+        .into_iter()
+        .map(|holding| {
+            Ok(rlean_brokerages::BrokerageHolding {
+                symbol: symbol_from_wire(
+                    holding
+                        .symbol
+                        .context("brokerage holding is missing its symbol")?,
+                )?,
+                quantity: holding
+                    .quantity
+                    .parse()
+                    .context("invalid brokerage holding quantity")?,
+                average_price: holding
+                    .average_price
+                    .parse()
+                    .context("invalid brokerage holding average price")?,
+                market_price: holding
+                    .market_price
+                    .parse()
+                    .context("invalid brokerage holding market price")?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let open_orders = snapshot
+        .open_orders
+        .into_iter()
+        .map(Order::try_from)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let cash = rlean_live::account_sync::settlement_cash(&cash_balances);
+
+    if let Some(portfolio) = portfolio {
+        if !cash_balances.is_empty() {
+            *portfolio.cash.write() = cash;
+        }
+        for holding in &holdings {
+            if holding.quantity.is_zero() {
+                continue;
+            }
+            let multiplier = rlean_algorithm::portfolio::SecurityHolding::infer_contract_multiplier(
+                &holding.symbol,
+            );
+            portfolio.set_holdings(
+                &holding.symbol,
+                holding.average_price,
+                holding.quantity,
+                multiplier,
+            );
+            if holding.market_price > Decimal::ZERO {
+                portfolio.update_prices(&holding.symbol, holding.market_price);
+            }
+        }
+    }
+    if let Some(transactions) = transactions {
+        for order in &open_orders {
+            transactions.add_or_update_order(order.clone());
+        }
+    }
+    tracing::info!(
+        "Brokerage account sync: brokerage={} cash={cash} currencies={} holdings={} open_orders={}",
+        connection.name,
+        cash_balances.len(),
+        holdings.len(),
+        open_orders.len(),
+    );
+    Ok(StartupAccountSync {
+        cash,
+        cash_balances,
+        holdings,
+        open_orders,
+    })
+}
+
 /// Connect the brokerage and pull cash, holdings and open orders, seeding the
 /// portfolio and transaction manager. Mirrors C# `BrokerageSetupHandler`.
 ///
 /// Runs the blocking brokerage calls on a dedicated thread so we do not stall
 /// the async runtime, matching the worker's isolation model.
+#[cfg(test)]
 pub fn startup_account_sync(
     brokerage: &mut Box<dyn Brokerage>,
     portfolio: Option<&Arc<SecurityPortfolioManager>>,

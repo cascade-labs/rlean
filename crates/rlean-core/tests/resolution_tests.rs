@@ -59,15 +59,6 @@ fn intraday_flag() {
 }
 
 #[test]
-fn folder_names() {
-    assert_eq!(Resolution::Tick.folder_name(), "tick");
-    assert_eq!(Resolution::Second.folder_name(), "second");
-    assert_eq!(Resolution::Minute.folder_name(), "minute");
-    assert_eq!(Resolution::Hour.folder_name(), "hour");
-    assert_eq!(Resolution::Daily.folder_name(), "daily");
-}
-
-#[test]
 fn resolution_ordering() {
     assert!(Resolution::Tick < Resolution::Second);
     assert!(Resolution::Second < Resolution::Minute);

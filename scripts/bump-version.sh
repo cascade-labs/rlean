@@ -96,9 +96,8 @@ if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
   # Bump the workspace-member entries textually: each member package block is
   #   name = "<crate>"
   #   version = "<old>"
-  # Bumping the line after a matching name avoids a network `cargo update` (the
-  # plugin repos' git deps would try to fetch ssh://.../rlean, which is not
-  # available from the release worktree).
+  # Bumping the line after a matching name avoids requiring network access from
+  # the release worktree.
   # Collect member crate names from the workspace Cargo.tomls.
   crate_names=""
   while IFS= read -r member_toml; do

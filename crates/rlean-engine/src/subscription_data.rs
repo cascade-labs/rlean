@@ -1,6 +1,7 @@
 use rlean_core::DateTime;
 use rlean_core::Symbol;
-use rlean_data::{CustomDataPoint, QuoteBar, Slice, Tick, TradeBar};
+use rlean_data::{FundamentalData, Slice};
+use rlean_data_tables::{CustomDataPoint, QuoteBar, Tick, TradeBar};
 use rlean_options::OptionChain;
 use std::sync::Arc;
 
@@ -14,6 +15,13 @@ pub enum SubscriptionDataPoint {
         symbol: Symbol,
         ticker: String,
         point: CustomDataPoint,
+    },
+    /// One complete daily selection snapshot. Keeping rows together is
+    /// essential: a selector must never see a partial cross-section merely
+    /// because Arrow split a Flight response into record batches.
+    FundamentalUniverse {
+        data: Vec<FundamentalData>,
+        frontier_time: DateTime,
     },
     OptionChain {
         canonical_permtick: String,
@@ -31,6 +39,7 @@ impl SubscriptionDataPoint {
             SubscriptionDataPoint::QuoteBar(bar) => bar.end_time,
             SubscriptionDataPoint::Tick(tick) => tick.time,
             SubscriptionDataPoint::OptionChain { frontier_time, .. } => *frontier_time,
+            SubscriptionDataPoint::FundamentalUniverse { frontier_time, .. } => *frontier_time,
             // LEAN gates custom-data emission on `EndTime` (the frontier only
             // surfaces a point once it reaches `EmitTimeUtc = EndTime`), which is
             // never null. `end_time` is now a required field, so the point is
@@ -50,6 +59,9 @@ impl SubscriptionDataPoint {
                 ticker,
                 point,
             } => slice.add_custom_data_for_symbol(symbol.clone(), ticker.clone(), point.clone()),
+            SubscriptionDataPoint::FundamentalUniverse { data, .. } => {
+                slice.add_fundamentals(data.clone())
+            }
             SubscriptionDataPoint::OptionChain {
                 canonical_permtick,
                 chain,

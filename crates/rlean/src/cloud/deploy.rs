@@ -1,12 +1,9 @@
 //! `rlean cloud deploy` and the `status` / `logs` / `portfolio` monitors.
 //!
 //! Deploy snapshots a local strategy working tree to a node with rsync, then
-//! launches `rlean live --foreground` on the node in a way that survives the
-//! controlling ssh session closing. The remote run directory + `deployment.json`
-//! that `rlean live` writes make the deployment fully recoverable, so we launch
-//! with `nohup setsid ... </dev/null >> nohup.out 2>&1 &` rather than depending
-//! on systemd --user (an OL9 node may not have lingering enabled). See
-//! `remote_launch_command` for the exact shape.
+//! submits the deployment to the node's persistent `rleand` supervisor. The
+//! remote run directory + `deployment.json` remain the durable strategy state;
+//! rleand owns process restart and reboot recovery.
 
 use std::path::{Path, PathBuf};
 
@@ -16,34 +13,21 @@ use super::deployments::{CloudDeployment, CloudDeploymentRegistry};
 use super::registry::{Node, NodeRegistry};
 use super::remote::{rsync_to, RemoteExec};
 
-/// Defaults for the `uw_control` fleet.
-const DEFAULT_BROKERAGE: &str = "tradier";
-const DEFAULT_DATA_PROVIDER_LIVE: &str = "tradier";
-const DEFAULT_DATA_PROVIDER_HISTORICAL: &str = "thetadata,massive";
-
 /// Subdirs excluded from the working-tree rsync (heavy / irrelevant / secret).
 const RSYNC_EXCLUDES: &[&str] = &["backtests/", "live/", "__pycache__/", ".git/", "*.bak"];
 
-/// Options for a deploy launch (the tunable brokerage / data-provider flags).
+/// Options for a deploy launch.
 #[derive(Debug, Clone)]
 pub(crate) struct DeployOptions {
     pub brokerage: String,
-    pub data_provider_live: String,
-    pub data_provider_historical: String,
+    pub live_data_feed: String,
 }
 
 impl DeployOptions {
-    pub(crate) fn from_cli(
-        brokerage: Option<String>,
-        data_provider_live: Option<String>,
-        data_provider_historical: Option<String>,
-    ) -> Self {
+    pub(crate) fn from_cli(brokerage: String, live_data_feed: String) -> Self {
         Self {
-            brokerage: brokerage.unwrap_or_else(|| DEFAULT_BROKERAGE.to_string()),
-            data_provider_live: data_provider_live
-                .unwrap_or_else(|| DEFAULT_DATA_PROVIDER_LIVE.to_string()),
-            data_provider_historical: data_provider_historical
-                .unwrap_or_else(|| DEFAULT_DATA_PROVIDER_HISTORICAL.to_string()),
+            brokerage,
+            live_data_feed,
         }
     }
 }
@@ -64,7 +48,6 @@ pub(crate) fn strategy_name_from_dir(strategy_dir: &Path) -> String {
 /// node's own `rlean live` launcher under `<strategy_dir>/live/<deploy-id>`).
 pub(crate) struct NodePaths {
     pub strategy_dir: String,
-    pub data_dir: String,
     pub main_py: String,
 }
 
@@ -73,7 +56,6 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
     let strategy_dir = format!("{node_home}/rlean-cloud/workspace/{strategy_name}");
     NodePaths {
         main_py: format!("{strategy_dir}/main.py"),
-        data_dir: format!("{node_home}/rlean-cloud/data"),
         strategy_dir,
     }
 }
@@ -81,11 +63,9 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
 /// Build the shell command run on the node to launch the deployment.
 ///
 /// This invokes the node's own `rlean live` launcher (NOT `--foreground`):
-/// exactly what a local deploy does. The launcher reserves the deploy dir
-/// under `<strategy>/live/`, snapshots the code, writes `deployment.json` and
-/// the pid file, registers the deployment for `rlean live list/status`, and
-/// spawns the engine as a `setsid` child with SIGHUP ignored — so the run
-/// survives the ssh session ending and is natively monitorable on the node.
+/// exactly what a local deploy does. The launcher reserves the deploy dir,
+/// snapshots the code, writes `deployment.json`, and submits the foreground
+/// engine command to rleand, so the run survives SSH disconnects and reboots.
 /// The launcher exits after confirming startup, printing
 /// `Live deployment started: deploy_id=<id> pid=<pid> ...`, which
 /// [`parse_launch_line`] consumes.
@@ -94,15 +74,11 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
 pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> String {
     format!(
         "cd {strategy} && rlean live {main} \
-         --data {data} \
-         --data-provider-historical {hist} \
-         --data-provider-live {live} \
+         --live-data-feed {feed} \
          --brokerage {brok}",
         strategy = paths.strategy_dir,
         main = paths.main_py,
-        data = paths.data_dir,
-        hist = opts.data_provider_historical,
-        live = opts.data_provider_live,
+        feed = opts.live_data_feed,
         brok = opts.brokerage,
     )
 }
@@ -198,7 +174,7 @@ pub(crate) fn cmd_deploy(
     rsync_to(ssh, local_strategy_dir, &paths.strategy_dir, RSYNC_EXCLUDES)?;
 
     // 2. Launch via the node's own `rlean live` launcher; it reserves the
-    // deploy dir, writes deployment.json, and spawns the setsid'd engine.
+    // deploy dir, writes deployment.json, and submits the engine to rleand.
     // The compound command is passed as a SINGLE argv element: OpenSSH joins
     // remote argv with spaces (no quoting), so a ["sh","-c",cmd] triple would
     // arrive as `sh -c cd ...` and `sh -c` would receive only `cd` — the rest
@@ -479,7 +455,6 @@ mod tests {
     fn node_paths_are_absolute_and_nested() {
         let p = node_paths("/home/opc/", "uw_control");
         assert_eq!(p.strategy_dir, "/home/opc/rlean-cloud/workspace/uw_control");
-        assert_eq!(p.data_dir, "/home/opc/rlean-cloud/data");
         assert_eq!(
             p.main_py,
             "/home/opc/rlean-cloud/workspace/uw_control/main.py"
@@ -491,8 +466,7 @@ mod tests {
         let p = node_paths("/home/opc", "uw_control");
         let opts = DeployOptions {
             brokerage: "tradier".to_string(),
-            data_provider_live: "tradier".to_string(),
-            data_provider_historical: "thetadata,massive".to_string(),
+            live_data_feed: "tradier".to_string(),
         };
         let cmd = remote_launch_command(&p, &opts);
         // The node's own launcher owns detachment (setsid + SIGHUP ignore) and
@@ -502,9 +476,9 @@ mod tests {
         assert!(!cmd.contains("--live-deploy-dir"));
         assert!(cmd.contains(" /home/opc/rlean-cloud/workspace/uw_control/main.py"));
         assert!(cmd.contains("--brokerage tradier"));
-        assert!(cmd.contains("--data-provider-historical thetadata,massive"));
-        assert!(cmd.contains("--data-provider-live tradier"));
-        assert!(cmd.contains("--data /home/opc/rlean-cloud/data"));
+        assert!(cmd.contains("--live-data-feed tradier"));
+        assert!(!cmd.contains("--data-provider"));
+        assert!(!cmd.contains("--data "));
     }
 
     #[test]
@@ -515,10 +489,9 @@ mod tests {
 
     #[test]
     fn deploy_options_apply_uw_defaults() {
-        let opts = DeployOptions::from_cli(None, None, None);
+        let opts = DeployOptions::from_cli("tradier".to_string(), "tradier".to_string());
         assert_eq!(opts.brokerage, "tradier");
-        assert_eq!(opts.data_provider_live, "tradier");
-        assert_eq!(opts.data_provider_historical, "thetadata,massive");
+        assert_eq!(opts.live_data_feed, "tradier");
     }
 
     #[test]
@@ -536,7 +509,7 @@ mod tests {
         };
         let now = Utc.with_ymd_and_hms(2026, 7, 10, 14, 30, 5).unwrap();
         let id = "2026-07-10_143005_uw_control";
-        let opts = DeployOptions::from_cli(None, None, None);
+        let opts = DeployOptions::from_cli("tradier".to_string(), "tradier".to_string());
         let paths = node_paths("/home/opc", "uw_control");
 
         let mut fake = FakeExec::new();

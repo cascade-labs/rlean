@@ -12,12 +12,13 @@ license.workspace = true
 rlean-core     = { path = "../rlean-core", version = "0.1.1" }
 rlean-data     = { path = "../rlean-data", version = "0.1.1" }
 rlean-orders   = { path = "../rlean-orders", version = "0.1.1" }
-rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
 rlean-brokerages = { path = "../rlean-brokerages", version = "0.1.1" }
 rust_decimal  = { workspace = true }
 rust_decimal_macros = { workspace = true }
 chrono        = { workspace = true }
-serde         = { workspace = true }
 tracing       = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
+
+[dev-dependencies]
+rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }

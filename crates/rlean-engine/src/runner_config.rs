@@ -3,12 +3,9 @@ use crate::data_feed::DataFeedOptions;
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::qc_algorithm::BrokerageName;
 use rlean_alpha::AlphaAnalytics;
-use rlean_brokerages::Brokerage;
-use rlean_data_providers::{ICustomDataSource, IHistoryProvider};
-use rlean_live::DataQueueHandlerManager;
+use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
 use rlean_orders::{Order, OrderEvent};
 use rlean_statistics::PortfolioStatistics;
-use rlean_storage::IcebergStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,21 +21,14 @@ pub struct BacktestProgress {
 }
 
 pub struct BacktestRunConfig {
-    pub data_root: PathBuf,
-    pub data_store: Arc<IcebergStore>,
+    pub data_sidecar: Arc<DataSidecarClient>,
     pub _compression_level: i32,
-    /// Raw stacked provider for DataType-specific requests (e.g. FactorFile).
-    /// Providers that don't support a DataType return NotImplemented and the
-    /// next provider in the stack is tried.
-    pub history_provider: Option<Arc<dyn IHistoryProvider>>,
     /// Override the strategy's set_start_date (YYYY-MM-DD).
     pub start_date_override: Option<chrono::NaiveDate>,
     /// Override the strategy's set_end_date (YYYY-MM-DD).
     pub end_date_override: Option<chrono::NaiveDate>,
     /// Algorithm parameters available through QCAlgorithm.get_parameter().
     pub parameters: HashMap<String, String>,
-    /// Custom data source plugins loaded from `~/.rlean/plugins/` or set explicitly.
-    pub custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
     /// Subscription feed caching/prefetch behavior.
     pub data_feed_options: DataFeedOptions,
     /// Optional backtest output directory. When set, progress/order/trade sidecar
@@ -52,17 +42,15 @@ pub struct BacktestRunConfig {
 }
 
 pub struct LiveRunConfig {
-    pub data_root: PathBuf,
-    pub data_store: Arc<IcebergStore>,
-    pub history_provider: Option<Arc<dyn IHistoryProvider>>,
+    pub data_sidecar: Arc<DataSidecarClient>,
+    /// Session-scoped live feed selected by deployment configuration. Strategy
+    /// SDK calls create the actual subscriptions beneath this connection.
+    pub live_data_feed_connection_id: u64,
     pub parameters: HashMap<String, String>,
-    pub custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
-    pub live_data_queue: DataQueueHandlerManager,
-    /// Optional real brokerage adapter. With `paper_trading=true`, the
-    /// brokerage is connected and synced while orders are locally acknowledged
-    /// and filled by the paper fill model. With `paper_trading=false`, new
-    /// orders are submitted to the brokerage before fill events are processed.
-    pub brokerage: Option<Box<dyn Brokerage>>,
+    /// Optional authenticated sidecar execution connection. Market-data
+    /// subscriptions do not reference this connection and may use a completely
+    /// different provider. `None` keeps execution in rlean's paper path.
+    pub brokerage: Option<SidecarBrokerageConnection>,
     /// Optional brokerage model selected by the live CLI. This is applied
     /// before Initialize(), so user code can still override it explicitly.
     pub brokerage_model: Option<BrokerageName>,
@@ -79,6 +67,13 @@ pub struct LiveRunConfig {
     /// Optional artifact sink. When set, snapshots are written into the sink's
     /// working dir and mirrored to S3 asynchronously per the sink's mode.
     pub artifact_sink: Option<Arc<RunArtifactSink>>,
+}
+
+pub struct SidecarBrokerageConnection {
+    pub client: Arc<DataSidecarClient>,
+    pub connection_id: u64,
+    pub name: String,
+    pub events: BrokerageEventStream,
 }
 
 pub struct LiveRunResult {
@@ -114,7 +109,7 @@ pub struct BacktestRunResult {
     pub order_events: Vec<OrderEvent>,
     /// Final order states from the backtest run.
     pub orders: Vec<Order>,
-    /// Symbols/dates for which data was found in the Parquet store.
+    /// Symbols/dates for which the sidecar returned data.
     pub succeeded_data_requests: Vec<String>,
     /// Symbols/dates for which no data was found.
     pub failed_data_requests: Vec<String>,

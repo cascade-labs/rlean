@@ -1,5 +1,6 @@
 use rlean_core::{DateTime, Market, Resolution, Symbol, TimeSpan};
-use rlean_data::{LiveDataItem, Slice, SubscriptionDataConfig, TradeBar, TradeBarData};
+use rlean_data::{LiveDataItem, Slice, SubscriptionDataConfig};
+use rlean_data_tables::{TradeBar, TradeBarData};
 use rlean_live::LiveSliceAssembler;
 use rust_decimal_macros::dec;
 

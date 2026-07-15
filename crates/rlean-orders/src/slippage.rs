@@ -1,6 +1,6 @@
 use crate::order::Order;
 use rlean_core::Price;
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 

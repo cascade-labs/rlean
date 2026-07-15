@@ -3,7 +3,7 @@ use crate::{
     window::RollingWindow,
 };
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 

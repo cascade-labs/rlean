@@ -9,7 +9,8 @@ use rlean_core::{
     TimeSpan,
 };
 use rlean_data::{
-    subscription::CustomSubscriptionMetadata, SubscriptionDataConfig, SubscriptionManager,
+    subscription::{CustomSubscriptionMetadata, FundamentalUniverseSubscriptionMetadata},
+    SubscriptionDataConfig, SubscriptionManager,
 };
 use rlean_options::OptionChain;
 use rlean_orders::{
@@ -465,19 +466,19 @@ impl QcAlgorithm {
     ) -> Symbol {
         let market = Market::usa();
         let symbol = Symbol::create_base(source_type, ticker, &market);
-        let query = rlean_data::CustomDataQuery::default();
+        let query = rlean_data::CustomDataQuery::from_properties(&properties);
         let config = rlean_data::CustomDataConfig {
             ticker: ticker.to_string(),
             source_type: source_type.to_string(),
             resolution,
             properties,
-            query,
+            query: query.clone(),
         };
         let metadata = CustomSubscriptionMetadata {
             source_type: source_type.to_string(),
             ticker: ticker.to_string(),
             config,
-            dynamic_query: rlean_data::CustomDataQuery::default(),
+            dynamic_query: query,
         };
         self.subscription_manager
             .add(SubscriptionDataConfig::new_custom(
@@ -497,25 +498,46 @@ impl QcAlgorithm {
     ) -> Symbol {
         let market = Market::usa();
         let symbol = Symbol::create_base(source_type, ticker, &market);
-        let query = rlean_data::CustomDataQuery::default();
+        let query = rlean_data::CustomDataQuery::from_properties(&properties);
         let config = rlean_data::CustomDataConfig {
             ticker: ticker.to_string(),
             source_type: source_type.to_string(),
             resolution,
             properties,
-            query,
+            query: query.clone(),
         };
         let metadata = CustomSubscriptionMetadata {
             source_type: source_type.to_string(),
             ticker: ticker.to_string(),
             config,
-            dynamic_query: rlean_data::CustomDataQuery::default(),
+            dynamic_query: query,
         };
         self.subscription_manager
             .add(SubscriptionDataConfig::new_custom_universe(
                 symbol.clone(),
                 resolution,
                 metadata,
+            ));
+        self.ensure_base_security(symbol, resolution)
+    }
+
+    /// Register the provider-wide point-in-time fundamental cross-section used
+    /// by the daily `AddUniverse(selector)` API. This is an internal feed: the
+    /// selected equity subscriptions are added separately by universe changes.
+    pub fn add_fundamental_universe_data(
+        &mut self,
+        source_type: &str,
+        resolution: Resolution,
+    ) -> Symbol {
+        let market = Market::usa();
+        let symbol = Symbol::create_base("fundamental_universe", source_type, &market);
+        self.subscription_manager
+            .add(SubscriptionDataConfig::new_fundamental_universe(
+                symbol.clone(),
+                resolution,
+                FundamentalUniverseSubscriptionMetadata {
+                    source_type: source_type.to_string(),
+                },
             ));
         self.ensure_base_security(symbol, resolution)
     }

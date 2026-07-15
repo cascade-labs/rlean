@@ -1,0 +1,18 @@
+[package]
+name = "rlean-data-tables"
+version.workspace = true
+edition.workspace = true
+description = "Canonical data types and provider-neutral Arrow table contracts for rlean."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+rlean-core = { path = "../rlean-core", version = "0.1.1" }
+arrow-schema = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -12,18 +12,20 @@ license.workspace = true
 name = "rlean"
 path = "src/main.rs"
 
+[[bin]]
+name = "rleand"
+path = "src/rleand_main.rs"
+
 [dependencies]
 rlean-core           = { path = "../rlean-core", version = "0.1.1" }
-rlean-plugin         = { path = "../rlean-plugin", version = "0.1.1" }
 rlean-data           = { path = "../rlean-data", version = "0.1.1" }
-rlean-data-providers = { path = "../rlean-data-providers", version = "0.1.1" }
+rlean-data-tables    = { path = "../rlean-data-tables", version = "0.1.1" }
+rlean-data-sidecar   = { path = "../rlean-data-sidecar", version = "0.1.1" }
 rlean-engine         = { path = "../rlean-engine", version = "0.1.1" }
 rlean-sdk            = { path = "../rlean-sdk", version = "0.1.1" }
 rlean-algorithm      = { path = "../rlean-algorithm", version = "0.1.1" }
-rlean-brokerages     = { path = "../rlean-brokerages", version = "0.1.1" }
 rlean-live           = { path = "../rlean-live", version = "0.1.1" }
 rlean-python-runtime = { path = "../rlean-python-runtime", version = "0.1.1" }
-rlean-storage        = { path = "../rlean-storage", version = "0.1.1" }
 
 clap               = { workspace = true }
 tokio              = { workspace = true }
@@ -35,11 +37,10 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 chrono             = { workspace = true }
 rust_decimal       = { workspace = true }
-parquet            = { workspace = true }
 arrow              = { workspace = true }
 arrow-array        = { workspace = true }
+futures            = { workspace = true }
 pyo3               = { workspace = true }
-libloading         = { workspace = true }
 glob               = { workspace = true }
 base64             = { workspace = true }
 libc               = "0.2"

@@ -1,6 +1,6 @@
 use crate::{order::Order, order_event::OrderEvent, slippage::SlippageModel};
 use rlean_core::{DateTime, Price};
-use rlean_data::{QuoteBar, TradeBar, TradeBarData};
+use rlean_data_tables::{QuoteBar, TradeBar, TradeBarData};
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
@@ -1153,7 +1153,7 @@ mod tests {
     use super::*;
     use crate::slippage::NullSlippageModel;
     use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-    use rlean_data::Bar;
+    use rlean_data_tables::Bar;
 
     fn ts(i: i64) -> DateTime {
         NanosecondTimestamp::from_secs(i * 86400)

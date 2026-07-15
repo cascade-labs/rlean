@@ -1,19 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rlean_algorithm::qc_algorithm::BrokerageName;
 
 use crate::cli::LiveArgs;
+use crate::config;
 use crate::live_deployments::{
     launch_live_detached, run_live_control, update_live_deployment_status,
 };
 use crate::runtime::{
-    build_providers, ensure_python_baseline_packages, parse_algorithm_parameters_for_strategy,
-    provider_args, resolve_configured_data_folder, resolve_datastore_for_data_root,
-    resolve_strategy_file, validate_strategy_path,
+    connect_data_sidecar, ensure_python_baseline_packages, integration_config_json,
+    parse_algorithm_parameters_for_strategy, resolve_strategy_file, validate_strategy_path,
 };
-use crate::{config, providers};
 
 pub(crate) async fn run(args: LiveArgs) -> Result<()> {
     if let Some(command) = args.command.clone() {
@@ -57,33 +56,29 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
-    // CLI --data-* flags win over env and config for the catalog connection.
-    args.apply_data_catalog_overrides();
     let global_config = config::GlobalConfig::load()?;
-    let strategy_path = args.strategy.clone();
-    resolve_configured_data_folder(&strategy_path, &mut args.data, &global_config)?;
-    let datastore = resolve_datastore_for_data_root(&args.data, &global_config).await?;
-    args.data = datastore.data_root.clone();
-    tracing::info!("Data folder: {}", args.data.display());
+    let data_sidecar = connect_data_sidecar(&args, &global_config)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --data-sidecar"))?;
 
-    let live_provider_names = args
-        .data_provider_live
+    let live_data_feed = args
+        .live_data_feed
         .as_deref()
-        .or(args.data_provider_historical.as_deref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "live trading requires --data-provider-live, for example --data-provider-live tradier"
-            )
-        })?;
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
+    let live_data_feed_connection_id = data_sidecar
+        .open_live_data_feed(live_data_feed, integration_config_json(live_data_feed)?)
+        .await
+        .with_context(|| format!("failed to open live data feed '{live_data_feed}'"))?;
+
     let requested_brokerage = args
         .brokerage
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "live mode requires --brokerage paper or a live brokerage plugin, for example --brokerage tradier"
-            )
+            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
         })?;
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
 
@@ -92,34 +87,32 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
-    let provider_args = provider_args(args.data.clone(), datastore.store.clone());
-    let live_data_queue =
-        providers::build_live_data_queue(live_provider_names, provider_args.clone())?;
     let brokerage = if requested_paper_brokerage {
         None
     } else {
-        Some(providers::load_brokerage_plugin(
-            requested_brokerage,
-            &provider_args,
-        )?)
+        let (connection_id, events) = data_sidecar
+            .open_brokerage(
+                requested_brokerage,
+                integration_config_json(requested_brokerage)?,
+            )
+            .await
+            .with_context(|| format!("failed to open sidecar brokerage '{requested_brokerage}'"))?;
+        Some(rlean_engine::SidecarBrokerageConnection {
+            client: data_sidecar.clone(),
+            connection_id,
+            name: requested_brokerage.to_string(),
+            events,
+        })
     };
-    let paper_trading = requested_paper_brokerage
-        || brokerage
-            .as_ref()
-            .map(|brokerage| brokerage.uses_local_paper_fills())
-            .unwrap_or(false);
+    let paper_trading = requested_paper_brokerage;
     let brokerage_name = if requested_paper_brokerage {
         Some("Paper".to_string())
     } else {
-        brokerage
-            .as_ref()
-            .map(|brokerage| brokerage.name().to_string())
+        Some(requested_brokerage.to_string())
     };
     let brokerage_model = live_brokerage_model_for_name(requested_brokerage);
 
-    let history_provider = build_providers(&args, datastore.store.clone())?;
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
-    let custom_data_sources = providers::load_custom_data_plugins(&args.data);
 
     let ext = args
         .strategy
@@ -137,12 +130,9 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     let strategy_path = args.strategy.clone();
     let live_config = rlean_engine::LiveRunConfig {
-        data_root: datastore.data_root.clone(),
-        data_store: datastore.store.clone(),
-        history_provider,
+        data_sidecar,
+        live_data_feed_connection_id,
         parameters,
-        custom_data_sources,
-        live_data_queue,
         brokerage,
         brokerage_model,
         paper_trading,
@@ -161,10 +151,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         ),
     ));
     let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
-        live_config.data_root.clone(),
-        live_config.data_store.clone(),
-        live_config.history_provider.clone(),
-        live_config.custom_data_sources.clone(),
+        live_config.data_sidecar.clone(),
         live_config.parameters.clone(),
     );
     let context = rlean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(

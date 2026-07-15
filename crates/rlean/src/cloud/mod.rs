@@ -6,11 +6,11 @@
 //!
 //! Usage:
 //!   rlean cloud add-node <ssh-alias> [--name N] [--role live,backtest]
-//!   rlean cloud list [--probe]
+//!   rlean cloud list [--offline]
 //!   rlean cloud remove <name>
 //!   rlean cloud exec <name> -- <command...>
-//!   rlean cloud install <name> [--release-tag T] [--plugin N...] [--plugin-repo owner/repo:tag...]
-//!   rlean cloud deploy <name> <strategy-dir> [--brokerage B] [--data-provider-live L] [--data-provider-historical H]
+//!   rlean cloud install <name> [--release-tag T]
+//!   rlean cloud deploy <name> <strategy-dir> [--brokerage B]
 //!   rlean cloud status [<name>] [--deploy-id ID]
 //!   rlean cloud logs <name> [--deploy-id ID] [--lines N]
 //!   rlean cloud portfolio <name> [--deploy-id ID]
@@ -59,9 +59,9 @@ pub enum CloudCommand {
     },
     /// List registered nodes
     List {
-        /// Probe each node for reachability and installed rlean version
+        /// Show only the cached node registry without checking rlean or rleand
         #[arg(long)]
-        probe: bool,
+        offline: bool,
     },
     /// Remove a node from the registry (does not touch the node)
     Remove {
@@ -76,40 +76,31 @@ pub enum CloudCommand {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Install rlean + plugins + `~/.rlean` subset onto a node
+    /// Install rlean, rleand, and configuration onto a node
     Install {
         /// Node name
         name: String,
         /// Release tag for the bundles (defaults to the cloud RC tag)
         #[arg(long)]
         release_tag: Option<String>,
-        /// Restrict the default plugin set to these names (repeatable)
-        #[arg(long = "plugin")]
-        plugin: Vec<String>,
-        /// Add a plugin from an explicit `owner/repo[:tag][#name]` (repeatable)
-        #[arg(long = "plugin-repo")]
-        plugin_repo: Vec<String>,
         /// Override the artifact S3 endpoint written into the node config
         /// (for nodes that reach the object store via a different route than
         /// the control machine)
         #[arg(long)]
         artifact_s3_endpoint: Option<String>,
     },
-    /// Snapshot a strategy to a node and launch `rlean live` there
+    /// Snapshot a strategy to a node and submit it to the node's rleand
     Deploy {
         /// Node name
         name: String,
         /// Local strategy directory (or path to its main.py)
         strategy_dir: PathBuf,
-        /// Live brokerage (default: tradier)
+        /// Live brokerage used for order execution
         #[arg(long)]
-        brokerage: Option<String>,
-        /// Live data provider (default: tradier)
+        brokerage: String,
+        /// Live market-data integration serving strategy market subscriptions
         #[arg(long)]
-        data_provider_live: Option<String>,
-        /// Historical data provider(s) (default: thetadata,massive)
-        #[arg(long)]
-        data_provider_historical: Option<String>,
+        live_data_feed: String,
     },
     /// Show live deployment status (one node, or aggregated across all nodes)
     Status {
@@ -161,8 +152,9 @@ pub fn run(args: CloudArgs) -> Result<()> {
             );
             Ok(())
         }
-        CloudCommand::List { probe } => {
+        CloudCommand::List { offline } => {
             let mut reg = NodeRegistry::load()?;
+            let probe = !offline;
             let rows = cmd_list(&exec, &mut reg, probe)?;
             if probe {
                 reg.save()?;
@@ -188,21 +180,11 @@ pub fn run(args: CloudArgs) -> Result<()> {
         CloudCommand::Install {
             name,
             release_tag,
-            plugin,
-            plugin_repo,
             artifact_s3_endpoint,
         } => {
             let reg = NodeRegistry::load()?;
             let tag = release_tag.as_deref().unwrap_or(DEFAULT_RELEASE_TAG);
-            let summary = cmd_install(
-                &exec,
-                &reg,
-                &name,
-                tag,
-                &plugin,
-                &plugin_repo,
-                artifact_s3_endpoint.as_deref(),
-            )?;
+            let summary = cmd_install(&exec, &reg, &name, tag, artifact_s3_endpoint.as_deref())?;
             print_install_summary(&summary);
             Ok(())
         }
@@ -210,8 +192,7 @@ pub fn run(args: CloudArgs) -> Result<()> {
             name,
             strategy_dir,
             brokerage,
-            data_provider_live,
-            data_provider_historical,
+            live_data_feed,
         } => {
             let node_reg = NodeRegistry::load()?;
             let node = node_reg
@@ -219,8 +200,7 @@ pub fn run(args: CloudArgs) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("unknown node '{name}' — run `rlean cloud list`"))?
                 .clone();
             let (local_dir, strategy_name) = deploy::resolve_local_strategy(&strategy_dir)?;
-            let opts =
-                DeployOptions::from_cli(brokerage, data_provider_live, data_provider_historical);
+            let opts = DeployOptions::from_cli(brokerage, live_data_feed);
             let node_home = probe_node_home(&exec, &node.ssh_dest)?;
 
             let mut deploy_reg = CloudDeploymentRegistry::load()?;
@@ -349,13 +329,7 @@ fn print_install_summary(summary: &install::InstallSummary) {
         summary.rlean_version, summary.node
     );
     println!("  version : {}", summary.version_output);
-    println!("  plugins :");
-    for (name, sha) in &summary.plugins {
-        println!("    - {name} ({sha})");
-    }
-    println!(
-        "  node dirs: ~/.local/bin, ~/.rlean/plugins, ~/rlean-cloud/data, ~/rlean-cloud/workspace"
-    );
+    println!("  node dirs: ~/.local/bin, ~/rlean-cloud/data, ~/rlean-cloud/workspace");
 }
 
 // ── Command logic (testable with any RemoteExec) ──────────────────────────────
@@ -426,8 +400,10 @@ struct ListRow {
     platform: String,
     roles: String,
     last_seen: String,
-    /// Probe result: reachability + version, or `None` when not probed.
-    status: Option<String>,
+    /// Installed rlean version/reachability, or `None` when not probed.
+    rlean_status: Option<String>,
+    /// rleand service/control-socket health, or `None` when not probed.
+    daemon_status: Option<String>,
 }
 
 /// Build list rows, probing each node when requested.
@@ -448,14 +424,26 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
             )
         };
 
-        let status = if probe {
+        let rlean_status = if probe {
             Some(probe_node(exec, &ssh_dest))
+        } else {
+            None
+        };
+        let daemon_status = if probe
+            && rlean_status
+                .as_deref()
+                .map(rlean_is_available)
+                .unwrap_or(false)
+        {
+            Some(probe_daemon(exec, &ssh_dest))
+        } else if probe {
+            Some("unknown".to_owned())
         } else {
             None
         };
 
         // Refresh last_seen on a reachable probe.
-        let last_seen = if probe && status.as_deref().map(is_reachable).unwrap_or(false) {
+        let last_seen = if probe && rlean_status.as_deref().map(is_reachable).unwrap_or(false) {
             let now = Utc::now().to_rfc3339();
             if let Some(node) = reg.get_mut(&name) {
                 node.last_seen = now.clone();
@@ -471,7 +459,8 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
             platform,
             roles,
             last_seen,
-            status,
+            rlean_status,
+            daemon_status,
         });
     }
     Ok(rows)
@@ -480,6 +469,10 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
 /// Whether a probe status string represents a reachable node.
 fn is_reachable(status: &str) -> bool {
     status != "unreachable"
+}
+
+fn rlean_is_available(status: &str) -> bool {
+    is_reachable(status) && status != "rlean not installed"
 }
 
 /// Probe a single node: run `rlean --version` and classify the result.
@@ -507,6 +500,26 @@ fn probe_node(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
     }
 }
 
+/// Probe rleand through the same public control path users invoke locally.
+fn probe_daemon(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
+    match exec.run(ssh_dest, &["rlean", "daemon", "status"]) {
+        Ok(out) if out.status == 0 && out.stdout.contains("control: reachable") => {
+            "running".to_owned()
+        }
+        Ok(out) if out.status == 0 => "unhealthy".to_owned(),
+        Ok(out)
+            if out.status == 127
+                || out.stderr.contains("unrecognized subcommand 'daemon'")
+                || out.stderr.contains("unrecognized subcommand `daemon`")
+                || out.stderr.contains("not found")
+                || out.stderr.contains("No such file") =>
+        {
+            "not installed".to_owned()
+        }
+        Ok(_) | Err(_) => "unreachable".to_owned(),
+    }
+}
+
 /// Run a command on a registered node, streaming stdout/stderr and propagating
 /// a non-zero remote exit status as an error.
 fn cmd_exec(exec: &dyn RemoteExec, reg: &NodeRegistry, name: &str, cmd: &[String]) -> Result<()> {
@@ -531,8 +544,8 @@ fn cmd_exec(exec: &dyn RemoteExec, reg: &NodeRegistry, name: &str, cmd: &[String
 fn print_list(rows: &[ListRow], probe: bool) {
     if probe {
         println!(
-            "{:<16} {:<20} {:<28} {:<16} {:<26} STATUS",
-            "NAME", "SSH_DEST", "PLATFORM", "ROLES", "LAST_SEEN"
+            "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} RLEAND",
+            "NAME", "SSH_DEST", "PLATFORM", "ROLES", "LAST_SEEN", "RLEAN"
         );
     } else {
         println!(
@@ -543,13 +556,14 @@ fn print_list(rows: &[ListRow], probe: bool) {
     for r in rows {
         if probe {
             println!(
-                "{:<16} {:<20} {:<28} {:<16} {:<26} {}",
+                "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} {}",
                 r.name,
                 r.ssh_dest,
                 r.platform,
                 r.roles,
                 r.last_seen,
-                r.status.as_deref().unwrap_or("")
+                r.rlean_status.as_deref().unwrap_or(""),
+                r.daemon_status.as_deref().unwrap_or("")
             );
         } else {
             println!(
@@ -688,10 +702,16 @@ mod tests {
         reg.get_mut("box").unwrap().last_seen = "1970-01-01T00:00:00+00:00".to_string();
 
         fake.set("box", &["rlean", "--version"], ok("rlean 0.1.0\n"));
+        fake.set(
+            "box",
+            &["rlean", "daemon", "status"],
+            ok("service: active\ncontrol: reachable pid=42\n"),
+        );
 
         let rows = cmd_list(&fake, &mut reg, true).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status.as_deref(), Some("rlean 0.1.0"));
+        assert_eq!(rows[0].rlean_status.as_deref(), Some("rlean 0.1.0"));
+        assert_eq!(rows[0].daemon_status.as_deref(), Some("running"));
         // last_seen advanced past the epoch sentinel.
         assert_ne!(
             reg.get("box").unwrap().last_seen,
@@ -720,7 +740,32 @@ mod tests {
         );
 
         let rows = cmd_list(&fake, &mut reg, true).unwrap();
-        assert_eq!(rows[0].status.as_deref(), Some("rlean not installed"));
+        assert_eq!(rows[0].rlean_status.as_deref(), Some("rlean not installed"));
+        assert_eq!(rows[0].daemon_status.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn list_probe_reports_missing_daemon() {
+        let mut fake = FakeExec::new();
+        fake.set("box", &["true"], ok(""));
+        fake.set("box", &["uname", "-s", "-m"], ok("Linux x86_64\n"));
+        fake.set("box", &["uname", "-a"], ok("Linux box 6.1.0 x86_64\n"));
+
+        let mut reg = NodeRegistry::default();
+        cmd_add_node(&fake, &mut reg, "box", None, vec![]).unwrap();
+        fake.set("box", &["rlean", "--version"], ok("rlean 0.1.1\n"));
+        fake.set(
+            "box",
+            &["rlean", "daemon", "status"],
+            RemoteOutput {
+                status: 2,
+                stdout: String::new(),
+                stderr: "error: unrecognized subcommand 'daemon'\n".to_owned(),
+            },
+        );
+
+        let rows = cmd_list(&fake, &mut reg, true).unwrap();
+        assert_eq!(rows[0].daemon_status.as_deref(), Some("not installed"));
     }
 
     #[test]

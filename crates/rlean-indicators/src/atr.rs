@@ -70,7 +70,7 @@ impl Indicator for Atr {
         self.current.clone()
     }
 
-    fn update_bar(&mut self, bar: &rlean_data::TradeBar) -> IndicatorResult {
+    fn update_bar(&mut self, bar: &rlean_data_tables::TradeBar) -> IndicatorResult {
         self.samples += 1;
         let tr = self.true_range(bar.high, bar.low, self.prev_close);
         self.prev_close = Some(bar.close);

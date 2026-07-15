@@ -6,10 +6,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::cloud::CloudArgs;
 use crate::config_cmd::ConfigArgs;
+use crate::daemon_cmd::DaemonArgs;
+use crate::data_cmd::DataArgs;
 use crate::init::InitArgs;
-use crate::plugin_cmd::PluginArgs;
 use crate::project::CreateProjectArgs;
-use crate::registry_cmd::RegistryArgs;
 use crate::research::ResearchArgs;
 use crate::research_daemon::ResearchDaemonArgs;
 use crate::stubs_cmd::StubsArgs;
@@ -28,21 +28,18 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Bootstrap a Lean workspace in the current directory (creates rlean.json and data/)
+    /// Bootstrap a Lean workspace in the current directory
     Init(InitArgs),
 
     /// Scaffold a new strategy project
     #[command(name = "create-project")]
     CreateProject(CreateProjectArgs),
 
-    /// Get, set, or list configuration values (API keys, language, data catalog, data-folder)
+    /// Get, set, or list runtime and sidecar integration configuration
     Config(ConfigArgs),
 
-    /// Manage rlean plugins (brokerages, data providers, AI skills, custom data)
-    Plugin(PluginArgs),
-
-    /// Manage plugin registries (add, remove, list)
-    Registry(RegistryArgs),
+    /// Inspect the canonical sidecar data contract
+    Data(DataArgs),
 
     /// Run a backtest
     Backtest(RunArgs),
@@ -62,6 +59,9 @@ pub(crate) enum Command {
     /// Manage a fleet of remote nodes reachable over SSH
     Cloud(CloudArgs),
 
+    /// Install and control the persistent live-deployment supervisor
+    Daemon(DaemonArgs),
+
     /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
     #[command(name = "__research-daemon", hide = true)]
     ResearchDaemon(ResearchDaemonArgs),
@@ -70,47 +70,23 @@ pub(crate) enum Command {
 #[derive(clap::Args, Clone)]
 pub(crate) struct RuntimeArgs {
     // ── Data ─────────────────────────────────────────────────────────────────
-    /// Parquet data root directory
-    #[arg(long, default_value = "data", env = "RLEAN_DATA")]
-    pub(crate) data: PathBuf,
+    /// Apache Arrow Flight data sidecar endpoint. Examples:
+    /// grpc://127.0.0.1:7410, grpc+tls://data.example.com:443.
+    #[arg(long, env = "RLEAN_DATA_SIDECAR")]
+    pub(crate) data_sidecar: Option<String>,
 
-    /// REST Iceberg catalog base URI (e.g.
-    /// https://s3tables.us-west-2.amazonaws.com/iceberg). Overrides
-    /// RLEAN_DATA_CATALOG and the config file. Env is read inside resolve, so
-    /// this flag is only set when explicitly passed.
-    #[arg(long)]
-    pub(crate) data_catalog: Option<String>,
+    /// Optional bearer token sent to the data sidecar.
+    #[arg(long, env = "RLEAN_DATA_SIDECAR_TOKEN", hide_env_values = true)]
+    pub(crate) data_sidecar_token: Option<String>,
 
-    /// Warehouse identifier / S3 Tables table-bucket ARN. Overrides
-    /// RLEAN_DATA_WAREHOUSE and the config file.
-    #[arg(long)]
-    pub(crate) data_warehouse: Option<String>,
+    /// Sidecar live market-data provider. Symbols and resolutions remain
+    /// strategy SDK subscriptions; this selects the integration serving them.
+    #[arg(long, env = "RLEAN_LIVE_DATA_FEED")]
+    pub(crate) live_data_feed: Option<String>,
 
-    /// SigV4 signing region for the REST catalog (e.g. us-west-2). Overrides
-    /// RLEAN_DATA_SIGV4_REGION and the config file.
-    #[arg(long)]
-    pub(crate) data_sigv4_region: Option<String>,
-
-    /// SigV4 signing name for the REST catalog (e.g. s3tables). Overrides
-    /// RLEAN_DATA_SIGV4_NAME and the config file.
-    #[arg(long)]
-    pub(crate) data_sigv4_name: Option<String>,
-
-    /// Iceberg namespace holding the cache tables (default lean). Overrides
-    /// RLEAN_DATA_NAMESPACE and the config file.
-    #[arg(long)]
-    pub(crate) data_namespace: Option<String>,
-
-    /// Comma-separated provider priority list (e.g. thetadata,polygon)
-    #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
-    pub(crate) data_provider_historical: Option<String>,
-
-    /// Live data provider plugin(s), comma-separated for stacked live feeds
-    #[arg(long, env = "RLEAN_DATA_PROVIDER_LIVE")]
-    pub(crate) data_provider_live: Option<String>,
-
-    /// Brokerage for live runs. Use "paper" for simulated fills, or a real
-    /// brokerage plugin name such as "tradier" or "hyperliquid" for live orders.
+    /// Execution brokerage for live runs. Use "paper" for local simulated
+    /// fills, or a sidecar brokerage such as "robinhood" for live orders. This
+    /// is independent from --live-data-feed.
     #[arg(long, env = "RLEAN_BROKERAGE")]
     pub(crate) brokerage: Option<String>,
 
@@ -157,7 +133,7 @@ pub(crate) struct LiveLimitArgs {
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct RunArgs {
-    /// Path to the strategy file (.py) or compiled plugin (.so/.dylib)
+    /// Path to the Python strategy file (.py)
     pub(crate) strategy: PathBuf,
 
     #[command(flatten)]
@@ -240,6 +216,7 @@ pub(crate) enum LiveSubcommand {
 #[clap(rename_all = "kebab-case")]
 pub(crate) enum LiveStatusFilter {
     Running,
+    Restarting,
     Paused,
     Stopped,
     RuntimeError,
@@ -271,31 +248,6 @@ impl Deref for LiveArgs {
 impl DerefMut for LiveArgs {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runtime
-    }
-}
-
-impl RuntimeArgs {
-    /// Apply the `--data-*` catalog flags so they win over the environment and
-    /// the config file.
-    ///
-    /// Precedence is **CLI flag > env var > config file**. `data_store_config::
-    /// resolve` reads the env var (falling back to the config file) for each
-    /// key, so to make a CLI flag beat an inherited env var we overwrite the
-    /// process env var with the flag value here. When a flag is absent the env
-    /// var / config file are left to decide, preserving env > config.
-    pub(crate) fn apply_data_catalog_overrides(&self) {
-        let overrides = [
-            ("RLEAN_DATA_CATALOG", self.data_catalog.as_deref()),
-            ("RLEAN_DATA_WAREHOUSE", self.data_warehouse.as_deref()),
-            ("RLEAN_DATA_SIGV4_REGION", self.data_sigv4_region.as_deref()),
-            ("RLEAN_DATA_SIGV4_NAME", self.data_sigv4_name.as_deref()),
-            ("RLEAN_DATA_NAMESPACE", self.data_namespace.as_deref()),
-        ];
-        for (var, value) in overrides {
-            if let Some(value) = value {
-                std::env::set_var(var, value);
-            }
-        }
     }
 }
 

@@ -53,12 +53,21 @@ impl UniverseSelectionState {
     }
 
     pub fn should_trigger_custom_data(&self, utc_ns: i64, resolution: Resolution) -> bool {
-        self.descriptor.is_custom_data()
-            && self.descriptor.trigger_resolution == resolution
-            && self.last_custom_trigger != Some(custom_trigger_key(utc_ns, resolution))
+        self.descriptor.is_custom_data() && self.should_trigger_data(utc_ns, resolution)
     }
 
     pub fn mark_custom_data_triggered(&mut self, utc_ns: i64, resolution: Resolution) {
+        self.mark_data_triggered(utc_ns, resolution);
+    }
+
+    /// Data-driven selector cadence shared by custom and fundamental universe
+    /// feeds. The producer's availability frontier is the timing authority.
+    pub fn should_trigger_data(&self, utc_ns: i64, resolution: Resolution) -> bool {
+        self.descriptor.trigger_resolution == resolution
+            && self.last_custom_trigger != Some(custom_trigger_key(utc_ns, resolution))
+    }
+
+    pub fn mark_data_triggered(&mut self, utc_ns: i64, resolution: Resolution) {
         self.last_custom_trigger = Some(custom_trigger_key(utc_ns, resolution));
     }
 

@@ -4,7 +4,7 @@
 Reads a gzipped ``profile.json.gz`` produced by ``samply record`` and prints:
   * total CPU-time and per-thread breakdown
   * self-time grouped by shared library (where CPU actually burns)
-  * self-time grouped by subsystem (iceberg / tokio / python / clones / ...)
+  * self-time grouped by subsystem (Arrow / tokio / python / clones / ...)
   * top self functions and top inclusive functions, symbolicated via ``atos``
 
 Native (Rust) frames in the target binary are stored as raw file offsets in the
@@ -41,20 +41,12 @@ def get_strings(thread: dict) -> list | None:
 
 def categorize(name: str) -> str:
     n = name.lower()
-    if "iceberg" in n:
-        return "iceberg (scan/manifest planning)"
-    if "parquet" in n:
-        return "parquet decode"
     if "arrow" in n:
         return "arrow"
-    if "datafusion" in n:
-        return "datafusion"
     if "tokio" in n or "futures" in n:
         return "tokio/futures runtime"
     if "pyo3" in n or "python" in n or "lean_python" in n:
         return "python bridge"
-    if "rlean_storage" in n:
-        return "rlean-storage"
     if "rlean_engine" in n:
         return "rlean-engine"
     if "rlean_data" in n:

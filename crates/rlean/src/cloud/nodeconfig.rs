@@ -2,8 +2,8 @@
 //!
 //! Produces the `~/.rlean/config` written on a remote node from the operator's
 //! local `GlobalConfig`. The local config is READ ONLY — never modified. The
-//! node runs with `artifact_store = "mirror"` and node-local data/workspace
-//! paths so live runs mirror artifacts to the same S3 the operator uses while
+//! node runs with `artifact_store = "mirror"` and a node-local workspace path
+//! so live runs mirror artifacts to the same S3 the operator uses while
 //! keeping a working local copy on the node.
 
 use crate::config::GlobalConfig;
@@ -11,10 +11,8 @@ use crate::config::GlobalConfig;
 /// Build the node `GlobalConfig` from the operator's local config plus the
 /// node's absolute `$HOME`.
 ///
-/// - `data_folder`   → `<node_home>/rlean-cloud/data`
 /// - `workspace`     → `<node_home>/rlean-cloud/workspace`
-/// - `data_catalog*` → copied verbatim (every node talks to the same REST
-///   Iceberg catalog as the control machine — there is no local data store)
+/// - `data_sidecar*` → copied verbatim
 /// - `artifact_store`→ `"mirror"` (overrides the local, typically `"local"`)
 /// - `artifact_s3*`  → copied verbatim from the local config (operator creds),
 ///   except the endpoint, which `artifact_endpoint` overrides when given — a
@@ -24,10 +22,6 @@ use crate::config::GlobalConfig;
 ///   form of the same endpoint is).
 /// - `default_language` → copied from local (already defaults to `"python"`)
 ///
-/// The local `data_folder` (a control-machine path such as `/Volumes/...`) is
-/// deliberately dropped. The legacy `s3_*` artifact fields are not copied;
-/// market data uses the explicit `data_s3_*` fields above and artifacts use the
-/// separate `artifact_s3*` fields below.
 pub(crate) fn node_config_from_local(
     local: &GlobalConfig,
     node_home: &str,
@@ -36,30 +30,8 @@ pub(crate) fn node_config_from_local(
     let node_home = node_home.trim_end_matches('/');
     GlobalConfig {
         default_language: local.default_language.clone(),
-        // The market-data REST catalog connection is shared fleet-wide.
-        data_catalog: local.data_catalog.clone(),
-        data_warehouse: local.data_warehouse.clone(),
-        data_sigv4_region: local.data_sigv4_region.clone(),
-        data_sigv4_name: local.data_sigv4_name.clone(),
-        data_namespace: local.data_namespace.clone(),
-        // Iceberg data I/O has no AWS fallback. Carry the configured endpoint
-        // and credentials so a node cannot silently read a different store.
-        // Operators using a loopback cache must configure a reachable endpoint
-        // for that node before installation.
-        data_s3_endpoint: local.data_s3_endpoint.clone(),
-        data_s3_region: local.data_s3_region.clone(),
-        data_s3_access_key_id: local.data_s3_access_key_id.clone(),
-        data_s3_secret_access_key: local.data_s3_secret_access_key.clone(),
-        // Carry the snapshot-refresh interval so fleet nodes see cross-process
-        // commits on the same cadence as the control machine.
-        data_refresh_secs: local.data_refresh_secs,
-        // Local `s3_*` connection settings are the control machine's; the node
-        // relays via `artifact_s3*`, so leave the plain `s3_*` block empty.
-        s3_access_key: None,
-        s3_secret_key: None,
-        s3_bucket: None,
-        s3_endpoint: None,
-        s3_region: None,
+        data_sidecar: local.data_sidecar.clone(),
+        data_sidecar_token: local.data_sidecar_token.clone(),
         artifact_store: Some("mirror".to_string()),
         artifact_s3: local.artifact_s3.clone(),
         artifact_s3_endpoint: artifact_endpoint
@@ -68,7 +40,6 @@ pub(crate) fn node_config_from_local(
         artifact_s3_region: local.artifact_s3_region.clone(),
         artifact_s3_access_key: local.artifact_s3_access_key.clone(),
         artifact_s3_secret_key: local.artifact_s3_secret_key.clone(),
-        data_folder: Some(format!("{node_home}/rlean-cloud/data")),
         workspace: Some(format!("{node_home}/rlean-cloud/workspace")),
     }
 }
@@ -80,21 +51,8 @@ mod tests {
     fn local_with_artifacts() -> GlobalConfig {
         GlobalConfig {
             default_language: "python".to_string(),
-            data_catalog: Some("https://s3tables.us-west-2.amazonaws.com/iceberg".to_string()),
-            data_warehouse: Some("arn:aws:s3tables:us-west-2:1:bucket/x".to_string()),
-            data_sigv4_region: Some("us-west-2".to_string()),
-            data_sigv4_name: None,
-            data_namespace: None,
-            data_s3_endpoint: Some("http://127.0.0.1:8333".to_string()),
-            data_s3_region: Some("us-east-1".to_string()),
-            data_s3_access_key_id: Some("DATAKEY".to_string()),
-            data_s3_secret_access_key: Some("DATASECRET".to_string()),
-            data_refresh_secs: Some(45),
-            s3_access_key: Some("LOCALKEY".to_string()),
-            s3_secret_key: Some("LOCALSECRET".to_string()),
-            s3_bucket: Some("local-bucket".to_string()),
-            s3_endpoint: Some("https://local.example".to_string()),
-            s3_region: Some("us-west-2".to_string()),
+            data_sidecar: None,
+            data_sidecar_token: None,
             // Local operator runs artifact_store=local but supplies artifact creds.
             artifact_store: Some("local".to_string()),
             artifact_s3: Some("s3://runs-bucket/rlean".to_string()),
@@ -102,37 +60,23 @@ mod tests {
             artifact_s3_region: Some("us-east-1".to_string()),
             artifact_s3_access_key: Some("AKIA_ART".to_string()),
             artifact_s3_secret_key: Some("SECRET_ART".to_string()),
-            data_folder: Some("/Volumes/mac-data".to_string()),
             workspace: Some("/Users/op/strategies".to_string()),
         }
     }
 
     #[test]
-    fn node_config_overrides_store_and_paths() {
+    fn node_config_overrides_artifact_store_and_workspace() {
         let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
-        assert_eq!(
-            node.data_catalog.as_deref(),
-            Some("https://s3tables.us-west-2.amazonaws.com/iceberg")
-        );
-        assert_eq!(node.data_sigv4_region.as_deref(), Some("us-west-2"));
-        // The snapshot-refresh interval is shared fleet-wide.
-        assert_eq!(node.data_refresh_secs, Some(45));
         assert_eq!(node.artifact_store.as_deref(), Some("mirror"));
-        assert_eq!(
-            node.data_folder.as_deref(),
-            Some("/home/opc/rlean-cloud/data")
-        );
         assert_eq!(
             node.workspace.as_deref(),
             Some("/home/opc/rlean-cloud/workspace")
         );
-        // The mac data folder is never leaked.
-        assert_ne!(node.data_folder.as_deref(), Some("/Volumes/mac-data"));
     }
 
     #[test]
-    fn node_config_copies_explicit_data_and_artifact_credentials() {
+    fn node_config_copies_explicit_artifact_credentials() {
         let node = node_config_from_local(&local_with_artifacts(), "/home/opc", None);
 
         assert_eq!(node.artifact_s3.as_deref(), Some("s3://runs-bucket/rlean"));
@@ -143,24 +87,6 @@ mod tests {
         assert_eq!(node.artifact_s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(node.artifact_s3_access_key.as_deref(), Some("AKIA_ART"));
         assert_eq!(node.artifact_s3_secret_key.as_deref(), Some("SECRET_ART"));
-
-        // Required data-S3 configuration is carried over; the unrelated plain
-        // s3_* artifact-legacy block is not.
-        assert_eq!(
-            node.data_s3_endpoint.as_deref(),
-            Some("http://127.0.0.1:8333")
-        );
-        assert_eq!(node.data_s3_region.as_deref(), Some("us-east-1"));
-        assert_eq!(node.data_s3_access_key_id.as_deref(), Some("DATAKEY"));
-        assert_eq!(
-            node.data_s3_secret_access_key.as_deref(),
-            Some("DATASECRET")
-        );
-        assert!(node.s3_access_key.is_none());
-        assert!(node.s3_secret_key.is_none());
-        assert!(node.s3_bucket.is_none());
-        assert!(node.s3_endpoint.is_none());
-        assert!(node.s3_region.is_none());
     }
 
     #[test]
@@ -175,10 +101,9 @@ mod tests {
         assert_eq!(node.default_language, "csharp");
         // Missing artifact creds stay missing — we never invent values.
         assert!(node.artifact_s3.is_none());
-        // Trailing slash on node_home is normalized.
         assert_eq!(
-            node.data_folder.as_deref(),
-            Some("/home/opc/rlean-cloud/data")
+            node.workspace.as_deref(),
+            Some("/home/opc/rlean-cloud/workspace")
         );
     }
 
@@ -189,11 +114,10 @@ mod tests {
         // The struct uses kebab-case for un-renamed fields but keeps an explicit
         // `artifact_store` rename; the node must parse this exact shape back.
         assert!(json.contains("\"artifact_store\": \"mirror\""));
-        assert!(json.contains("\"data_catalog\""));
-        assert!(json.contains("\"data-folder\": \"/home/opc/rlean-cloud/data\""));
+        assert!(!json.contains("data_catalog"));
+        assert!(!json.contains("data-folder"));
         assert!(json.contains("\"default-language\": \"python\""));
-        // No local-only s3_* keys leak in. Match the JSON key form precisely so
-        // the `artifact_s3_access_key` credential key isn't a false positive.
+        // No legacy generic S3 keys exist in the client config.
         assert!(!json.contains("\"s3_access_key\""));
         assert!(!json.contains("\"s3_bucket\""));
         assert!(!json.contains("\"s3_endpoint\""));
@@ -203,8 +127,8 @@ mod tests {
         let reparsed: GlobalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(reparsed.artifact_store.as_deref(), Some("mirror"));
         assert_eq!(
-            reparsed.data_folder.as_deref(),
-            Some("/home/opc/rlean-cloud/data")
+            reparsed.workspace.as_deref(),
+            Some("/home/opc/rlean-cloud/workspace")
         );
     }
 

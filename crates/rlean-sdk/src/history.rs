@@ -2,7 +2,7 @@
 
 use chrono::{NaiveDate, TimeZone, Utc};
 use rlean_core::{DateTime, Resolution, Symbol, TickType};
-use rlean_data::{CustomDataPoint, TradeBar};
+use rlean_data_tables::{CustomDataPoint, TradeBar};
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeSet;
 
@@ -94,6 +94,7 @@ impl AlgorithmHistoryRange {
 #[derive(Debug, Clone, Default)]
 pub struct TradeBarHistoryColumns {
     pub time: Vec<String>,
+    pub venue: Vec<Option<String>>,
     pub open: Vec<f64>,
     pub high: Vec<f64>,
     pub low: Vec<f64>,
@@ -111,6 +112,7 @@ impl TradeBarHistoryColumns {
         }
         Self {
             time: bars.iter().map(|b| date_string(b.time)).collect(),
+            venue: bars.iter().map(|b| b.venue.clone()).collect(),
             open: bars
                 .iter()
                 .map(|b| b.open.to_f64().unwrap_or(0.0))
@@ -137,6 +139,7 @@ pub struct CustomDataHistoryColumns {
     pub time: Vec<String>,
     pub end_time: Vec<String>,
     pub value: Vec<f64>,
+    pub venue: Vec<Option<String>>,
     pub fields: Vec<(String, Vec<Option<serde_json::Value>>)>,
 }
 
@@ -172,6 +175,7 @@ impl CustomDataHistoryColumns {
                 .iter()
                 .map(|p| p.value.to_f64().unwrap_or(0.0))
                 .collect(),
+            venue: points.iter().map(|point| point.venue.clone()).collect(),
             fields,
         }
     }
@@ -232,7 +236,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rlean_core::{Market, Symbol, TimeSpan};
-    use rlean_data::TradeBarData;
+    use rlean_data_tables::TradeBarData;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -261,6 +265,7 @@ mod tests {
             end_time,
             value: Decimal::from(value),
             symbol: None,
+            venue: None,
             fields: Arc::new(fields),
         }
     }

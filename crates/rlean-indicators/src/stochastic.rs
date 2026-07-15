@@ -65,7 +65,7 @@ impl Indicator for Stochastic {
         self.current.clone()
     }
 
-    fn update_bar(&mut self, bar: &rlean_data::TradeBar) -> IndicatorResult {
+    fn update_bar(&mut self, bar: &rlean_data_tables::TradeBar) -> IndicatorResult {
         self.samples += 1;
         self.window.push((bar.high, bar.low, bar.close));
 

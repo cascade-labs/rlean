@@ -1,5 +1,5 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 /// Comprehensive indicator tests — mirrors LEAN C# unit test suite.
 ///
 /// Covers: ADX, Stochastic, ROC, CCI, WilliamsR, DonchianChannel,
@@ -32,6 +32,7 @@ fn make_bar(
 ) -> TradeBar {
     TradeBar {
         symbol: spy(),
+        venue: None,
         time: ts(i),
         end_time: ts(i + 1),
         open,

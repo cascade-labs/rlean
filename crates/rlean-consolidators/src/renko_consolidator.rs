@@ -1,5 +1,5 @@
 use rlean_core::{DateTime, Symbol, TimeSpan};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -30,6 +30,7 @@ pub struct RenkoConsolidator {
     last_brick_direction: Option<i8>, // 1 = rising, -1 = falling
     /// Symbol from the first bar seen.
     symbol: Option<Symbol>,
+    venue: Option<String>,
     /// Pending consolidated bars (may emit multiple per update).
     pending: Vec<TradeBar>,
 }
@@ -49,6 +50,7 @@ impl RenkoConsolidator {
             last_brick_open: None,
             last_brick_direction: None,
             symbol: None,
+            venue: None,
             pending: Vec::new(),
         }
     }
@@ -134,6 +136,7 @@ impl RenkoConsolidator {
         let period_nanos = (close_on.0 - open_on.0).max(0);
         TradeBar {
             symbol: symbol.clone(),
+            venue: self.venue.clone(),
             time: open_on,
             end_time: close_on,
             open: open_price,
@@ -157,6 +160,9 @@ impl IConsolidator for RenkoConsolidator {
 
         if self.symbol.is_none() {
             self.symbol = Some(symbol.clone());
+        }
+        if self.venue.is_none() {
+            self.venue = bar.venue.clone();
         }
 
         if self.first_tick {
@@ -260,6 +266,7 @@ impl IConsolidator for RenkoConsolidator {
         self.last_brick_open = None;
         self.last_brick_direction = None;
         self.symbol = None;
+        self.venue = None;
         self.pending.clear();
     }
 

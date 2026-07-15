@@ -1,4 +1,4 @@
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -56,6 +56,7 @@ impl IConsolidator for HeikinAshiConsolidator {
 
         Some(TradeBar {
             symbol: bar.symbol.clone(),
+            venue: bar.venue.clone(),
             time: bar.time,
             end_time: bar.end_time,
             open: ha_open,

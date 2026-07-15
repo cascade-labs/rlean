@@ -752,13 +752,6 @@ fn execution_security_data_from_slice(
         end_time = Some(book.time);
     }
 
-    if let Some(context) = slice.perpetual_contexts.get(&sid) {
-        if context.mark_px > Decimal::ZERO {
-            price = context.mark_px;
-        }
-        end_time = Some(context.time);
-    }
-
     SecurityData {
         symbol,
         price,

@@ -11,6 +11,7 @@ license.workspace = true
 [dependencies]
 rlean-core = { path = "../rlean-core", version = "0.1.1" }
 rlean-data = { path = "../rlean-data", version = "0.1.1" }
+rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }
 rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
 rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
 rlean-options = { path = "../rlean-options", version = "0.1.1" }

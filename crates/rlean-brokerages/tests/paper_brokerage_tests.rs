@@ -1,7 +1,8 @@
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
 use rlean_brokerages::{Brokerage, PaperBrokerage};
 use rlean_core::{DateTime, Market, Symbol, TimeSpan};
-use rlean_data::{Slice, TradeBar, TradeBarData};
+use rlean_data::Slice;
+use rlean_data_tables::{TradeBar, TradeBarData};
 use rlean_orders::{Order, OrderStatus, TransactionManager};
 use rust_decimal_macros::dec;
 use std::sync::Arc;

@@ -51,7 +51,7 @@ pub trait Indicator: Send + Sync {
     fn update_price(&mut self, time: DateTime, value: Price) -> IndicatorResult;
 
     /// Update with a full trade bar.
-    fn update_bar(&mut self, bar: &rlean_data::TradeBar) -> IndicatorResult {
+    fn update_bar(&mut self, bar: &rlean_data_tables::TradeBar) -> IndicatorResult {
         self.update_price(bar.time, bar.close)
     }
 }
