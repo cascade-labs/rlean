@@ -200,6 +200,19 @@ configuration and `integration-configs.json` are copied with mode `0600`, and
 the node's user `rleand` service is installed/started. `rlean live upgrade`, by
 contrast, only refreshes a paused/stopped deployment's strategy snapshot.
 
+The repository Justfile exposes local development and macOS daemon deployment:
+
+```sh
+just format        # apply rustfmt
+just lint          # run the PR formatting, check, and clippy gates
+just test          # run all workspace tests
+just ci            # run every PR gate
+just deploy-local  # validate, install rlean+rleand, and restart launchd
+```
+
+Cloud upgrades remain first-class rlean operations and are intentionally not
+wrapped by Just: `rlean cloud install <name> --release-tag <tag>`.
+
 ## Build and install
 
 Requires a Rust toolchain and Python 3.10+ (for Python strategies).
