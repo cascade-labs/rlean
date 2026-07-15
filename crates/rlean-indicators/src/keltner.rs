@@ -65,7 +65,7 @@ impl Indicator for KeltnerChannel {
         self.current.clone()
     }
 
-    fn update_bar(&mut self, bar: &rlean_data::TradeBar) -> IndicatorResult {
+    fn update_bar(&mut self, bar: &rlean_data_tables::TradeBar) -> IndicatorResult {
         self.samples += 1;
         let ema_r = self.ema.update_price(bar.time, bar.close);
         let atr_r = self.atr.update_bar(bar);

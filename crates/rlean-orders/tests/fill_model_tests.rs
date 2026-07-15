@@ -1,5 +1,5 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rlean_orders::{
     fill_model::{FillModel, ImmediateFillModel},
     slippage::ConstantSlippageModel,
@@ -19,6 +19,7 @@ fn make_bar(open: f64, high: f64, low: f64, close: f64) -> TradeBar {
     use std::str::FromStr;
     TradeBar {
         symbol: spy(),
+        venue: None,
         time: ts(0),
         end_time: ts(1),
         open: Decimal::from_str(&open.to_string()).unwrap(),

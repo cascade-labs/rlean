@@ -1,25 +1,8 @@
-use crate::{
-    CustomDataPoint, MarginInterestRate, OrderBook, PerpetualContext, QuoteBar, Slice,
-    SubscriptionDataConfig, Tick, TradeBar,
-};
+use crate::{FundamentalData, OrderBook, Slice, SubscriptionDataConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use rlean_core::{DateTime, LeanError, Resolution, Result, Symbol};
-use serde::{Deserialize, Serialize};
+use rlean_core::{DateTime, Resolution, Result, Symbol};
+use rlean_data_tables::{CustomDataPoint, MarginInterestRate, QuoteBar, Tick, TradeBar};
 use std::collections::HashMap;
-
-/// Live packet metadata supplied to data queue handlers at deployment startup.
-///
-/// This mirrors LEAN's `LiveNodePacket` in the parts the queue layer needs:
-/// provider stack, brokerage name, arbitrary brokerage/provider settings, and
-/// the paper/live execution flag.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LiveNodePacket {
-    pub brokerage: String,
-    pub data_queue_handlers: Vec<String>,
-    pub brokerage_data: HashMap<String, String>,
-    pub parameters: HashMap<String, String>,
-    pub paper_trading: bool,
-}
 
 #[derive(Debug, Clone)]
 pub enum LiveDataSubscriptionConfig {
@@ -59,11 +42,7 @@ pub struct LiveUniverseSubscriptionConfig {
     pub properties: HashMap<String, String>,
 }
 
-/// One provider-owned live subscription stream.
-///
-/// This is the Rust equivalent of the C# `IDataQueueHandler.Subscribe(...)`
-/// enumerator: the handler owns the streaming work and returns a receiver for
-/// engine consumption.
+/// One sidecar-backed live subscription stream consumed by the engine.
 pub struct LiveDataSubscription {
     pub config: LiveDataSubscriptionConfig,
     pub receiver: Receiver<Result<LiveDataItem>>,
@@ -88,7 +67,6 @@ pub enum LiveDataItem {
     QuoteBar(QuoteBar),
     Tick(Tick),
     MarginInterestRate(MarginInterestRate),
-    PerpetualContext(PerpetualContext),
     OrderBook(OrderBook),
     CustomData {
         symbol: Symbol,
@@ -103,6 +81,11 @@ pub enum LiveDataItem {
         time: DateTime,
         data: Vec<CustomDataPoint>,
     },
+    FundamentalUniverseData {
+        /// Availability frontier of the whole point-in-time snapshot.
+        time: DateTime,
+        data: Vec<FundamentalData>,
+    },
     Heartbeat(DateTime),
 }
 
@@ -113,10 +96,10 @@ impl LiveDataItem {
             Self::QuoteBar(bar) => bar.time,
             Self::Tick(tick) => tick.time,
             Self::MarginInterestRate(rate) => rate.time,
-            Self::PerpetualContext(context) => context.time,
             Self::OrderBook(book) => book.time,
             Self::CustomData { point, .. } => point.time,
             Self::UniverseData { time, .. } => *time,
+            Self::FundamentalUniverseData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }
     }
@@ -127,10 +110,10 @@ impl LiveDataItem {
             Self::QuoteBar(bar) => bar.end_time,
             Self::Tick(tick) => tick.time,
             Self::MarginInterestRate(rate) => rate.time,
-            Self::PerpetualContext(context) => context.end_time,
             Self::OrderBook(book) => book.time,
             Self::CustomData { point, .. } => point.end_time,
             Self::UniverseData { time, .. } => *time,
+            Self::FundamentalUniverseData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }
     }
@@ -141,10 +124,11 @@ impl LiveDataItem {
             Self::QuoteBar(bar) => Some(&bar.symbol),
             Self::Tick(tick) => Some(&tick.symbol),
             Self::MarginInterestRate(rate) => Some(&rate.symbol),
-            Self::PerpetualContext(context) => Some(&context.symbol),
             Self::OrderBook(book) => Some(&book.symbol),
             Self::CustomData { symbol, .. } => Some(symbol),
-            Self::UniverseData { .. } | Self::Heartbeat(_) => None,
+            Self::UniverseData { .. }
+            | Self::FundamentalUniverseData { .. }
+            | Self::Heartbeat(_) => None,
         }
     }
 
@@ -154,7 +138,6 @@ impl LiveDataItem {
             Self::QuoteBar(bar) => slice.add_quote_bar(bar),
             Self::Tick(tick) => slice.add_tick(tick),
             Self::MarginInterestRate(rate) => slice.add_margin_interest_rate(rate),
-            Self::PerpetualContext(context) => slice.add_perpetual_context(context),
             Self::OrderBook(book) => slice.add_order_book(book),
             Self::CustomData {
                 symbol,
@@ -166,6 +149,7 @@ impl LiveDataItem {
                 slice.add_custom_data_for_symbol(symbol, ticker, point)
             }
             Self::UniverseData { .. } => {}
+            Self::FundamentalUniverseData { data, .. } => slice.add_fundamentals(data),
             Self::Heartbeat(_) => {}
         }
     }
@@ -173,44 +157,4 @@ impl LiveDataItem {
 
 pub fn live_data_channel() -> (Sender<Result<LiveDataItem>>, Receiver<Result<LiveDataItem>>) {
     bounded(100_000)
-}
-
-/// Trait for live data queue handlers, matching LEAN's `IDataQueueHandler`.
-///
-/// Handlers should return one receiver per accepted subscription. Returning
-/// `LeanError::Unsupported` lets `DataQueueHandlerManager` try the next handler
-/// in a stacked deployment.
-pub trait DataQueueHandler: Send + Sync {
-    fn set_job(&mut self, _job: &LiveNodePacket) -> Result<()> {
-        Ok(())
-    }
-
-    fn subscribe(&mut self, config: &SubscriptionDataConfig) -> Result<LiveDataSubscription>;
-
-    fn subscribe_universe(
-        &mut self,
-        subscription: &LiveUniverseSubscriptionConfig,
-    ) -> Result<LiveDataSubscription> {
-        Err(LeanError::Unsupported(format!(
-            "{} does not support live universe subscriptions for {}:{}",
-            self.name(),
-            subscription.source_type,
-            subscription.ticker
-        )))
-    }
-
-    fn unsubscribe(&mut self, config: &SubscriptionDataConfig) -> Result<()>;
-
-    fn unsubscribe_universe(
-        &mut self,
-        _subscription: &LiveUniverseSubscriptionConfig,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_connected(&self) -> bool;
-
-    fn name(&self) -> &str {
-        "DataQueueHandler"
-    }
 }

@@ -8,7 +8,8 @@
 use rlean_algorithm::algorithm::SecurityChanges;
 use rlean_algorithm::qc_algorithm::QcAlgorithm;
 use rlean_core::{DateTime, Market, Resolution, SecurityType, Symbol};
-use rlean_data::{CustomDataPoint, Slice};
+use rlean_data::Slice;
+use rlean_data_tables::CustomDataPoint;
 use rlean_execution::{ExecutionOrderType, OrderRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -14,6 +14,7 @@ rlean-algorithm = { path = "../rlean-algorithm", version = "0.1.1" }
 rlean-alpha = { path = "../rlean-alpha", version = "0.1.1" }
 rlean-core = { path = "../rlean-core", version = "0.1.1" }
 rlean-data = { path = "../rlean-data", version = "0.1.1" }
+rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }
 rlean-engine = { path = "../rlean-engine", version = "0.1.1" }
 rlean-execution = { path = "../rlean-execution", version = "0.1.1" }
 rlean-orders = { path = "../rlean-orders", version = "0.1.1" }

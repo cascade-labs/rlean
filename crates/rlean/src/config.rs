@@ -30,124 +30,22 @@ pub struct GlobalConfig {
     #[serde(default = "default_language")]
     pub default_language: String,
 
-    // ── Market-data REST Iceberg catalog (AWS S3 Tables) ──────────────────────
-    /// REST catalog base URI, e.g.
-    /// `https://s3tables.us-west-2.amazonaws.com/iceberg`. Required at run time;
-    /// there is no local/filesystem data store.
+    /// Apache Arrow Flight endpoint used for all market and custom data.
     #[serde(
         default,
-        rename = "data_catalog",
+        rename = "data_sidecar",
         skip_serializing_if = "Option::is_none"
     )]
-    pub data_catalog: Option<String>,
+    pub data_sidecar: Option<String>,
 
-    /// Warehouse identifier. For S3 Tables this is the table-bucket ARN, e.g.
-    /// `arn:aws:s3tables:us-west-2:<acct>:bucket/<name>`. Required at run time.
+    /// Optional sidecar bearer token. Environment/CLI configuration is
+    /// preferred for deployed credentials.
     #[serde(
         default,
-        rename = "data_warehouse",
+        rename = "data_sidecar_token",
         skip_serializing_if = "Option::is_none"
     )]
-    pub data_warehouse: Option<String>,
-
-    /// SigV4 signing region for the REST catalog (e.g. `us-west-2`). When set,
-    /// catalog requests are signed with SigV4; when unset the catalog is used
-    /// unsigned (plain / OAuth REST catalog).
-    #[serde(
-        default,
-        rename = "data_sigv4_region",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_sigv4_region: Option<String>,
-
-    /// SigV4 signing name / service (e.g. `s3tables`). Defaults to `s3tables`
-    /// when a region is set but the name is unset.
-    #[serde(
-        default,
-        rename = "data_sigv4_name",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_sigv4_name: Option<String>,
-
-    /// Iceberg namespace holding the cache tables. Defaults to `lean` when unset.
-    #[serde(
-        default,
-        rename = "data_namespace",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_namespace: Option<String>,
-
-    /// How often (seconds) a long-running process rechecks the catalog for table
-    /// snapshots committed by other processes before reusing a cached read
-    /// context. Defaults to 30s when unset; `0` rechecks on every read. See
-    /// `rlean_storage::DEFAULT_DATA_REFRESH_SECS`.
-    #[serde(
-        default,
-        rename = "data_refresh_secs",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_refresh_secs: Option<u64>,
-
-    /// Required data-plane S3 endpoint for Iceberg metadata, manifests, and
-    /// data files, e.g. a local Verglas cache (`http://127.0.0.1:8333`). rlean
-    /// never infers an AWS endpoint when this setting is absent.
-    #[serde(
-        default,
-        rename = "data_s3_endpoint",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_s3_endpoint: Option<String>,
-
-    /// Required region used to sign requests to `data_s3_endpoint`.
-    #[serde(
-        default,
-        rename = "data_s3_region",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_s3_region: Option<String>,
-
-    /// Required access key id issued by `data_s3_endpoint`.
-    #[serde(
-        default,
-        rename = "data_s3_access_key_id",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_s3_access_key_id: Option<String>,
-
-    /// Required secret access key issued by `data_s3_endpoint`.
-    #[serde(
-        default,
-        rename = "data_s3_secret_access_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_s3_secret_access_key: Option<String>,
-
-    #[serde(
-        default,
-        rename = "s3_access_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub s3_access_key: Option<String>,
-
-    #[serde(
-        default,
-        rename = "s3_secret_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub s3_secret_key: Option<String>,
-
-    #[serde(default, rename = "s3_bucket", skip_serializing_if = "Option::is_none")]
-    pub s3_bucket: Option<String>,
-
-    #[serde(
-        default,
-        rename = "s3_endpoint",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub s3_endpoint: Option<String>,
-
-    #[serde(default, rename = "s3_region", skip_serializing_if = "Option::is_none")]
-    pub s3_region: Option<String>,
+    pub data_sidecar_token: Option<String>,
 
     // ── Run artifact relay (backtest/live run dirs → S3) ──────────────────────
     /// Where run artifacts are written: `local` (default), `s3`, or `mirror`.
@@ -166,7 +64,7 @@ pub struct GlobalConfig {
     )]
     pub artifact_s3: Option<String>,
 
-    /// Artifact store endpoint URL. Falls back to `s3_endpoint` when unset.
+    /// Artifact store endpoint URL.
     #[serde(
         default,
         rename = "artifact_s3_endpoint",
@@ -174,7 +72,7 @@ pub struct GlobalConfig {
     )]
     pub artifact_s3_endpoint: Option<String>,
 
-    /// Artifact store region. Falls back to `s3_region` when unset.
+    /// Artifact store region.
     #[serde(
         default,
         rename = "artifact_s3_region",
@@ -182,7 +80,7 @@ pub struct GlobalConfig {
     )]
     pub artifact_s3_region: Option<String>,
 
-    /// Artifact store access key. Falls back to `s3_access_key` when unset.
+    /// Artifact store access key.
     #[serde(
         default,
         rename = "artifact_s3_access_key",
@@ -190,17 +88,13 @@ pub struct GlobalConfig {
     )]
     pub artifact_s3_access_key: Option<String>,
 
-    /// Artifact store secret key. Falls back to `s3_secret_key` when unset.
+    /// Artifact store secret key.
     #[serde(
         default,
         rename = "artifact_s3_secret_key",
         skip_serializing_if = "Option::is_none"
     )]
     pub artifact_s3_secret_key: Option<String>,
-
-    /// Global Parquet data root directory
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data_folder: Option<String>,
 
     /// Last workspace initialised with `rlean init`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,21 +132,13 @@ impl GlobalConfig {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct WorkspaceConfig {
-    #[serde(default = "default_data_folder")]
-    pub data_folder: String,
-
     #[serde(default = "default_language")]
     pub default_language: String,
-}
-
-fn default_data_folder() -> String {
-    "data".to_string()
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            data_folder: default_data_folder(),
             default_language: default_language(),
         }
     }
@@ -274,56 +160,6 @@ impl WorkspaceConfig {
         let text = serde_json::to_string_pretty(self)?;
         atomic_write(&path, &text)
     }
-}
-
-/// Walk up from `start` looking for the nearest `rlean.json`.
-///
-/// Returns the workspace directory containing the file plus the parsed config.
-/// Relative start paths are interpreted relative to the current process
-/// directory, which matches how CLI strategy paths are resolved.
-pub fn find_workspace_config(start: &Path) -> Result<Option<(PathBuf, WorkspaceConfig)>> {
-    let current_dir = std::env::current_dir()?;
-    let mut dir = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        current_dir.join(start)
-    };
-
-    if dir.is_file() {
-        dir.pop();
-    }
-
-    loop {
-        let path = dir.join("rlean.json");
-        if path.exists() {
-            return Ok(Some((dir.clone(), WorkspaceConfig::load(&dir)?)));
-        }
-
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent.to_path_buf(),
-            _ => return Ok(None),
-        }
-    }
-}
-
-/// Resolve the effective data folder for a command whose default local folder
-/// has not been overridden by `--data`.
-///
-/// Precedence:
-/// 1. nearest workspace `rlean.json`, relative to that workspace directory
-/// 2. global `~/.rlean/config`
-/// 3. caller keeps its existing default (`data`)
-pub fn configured_data_folder(start: &Path) -> Result<Option<PathBuf>> {
-    if let Some((workspace, cfg)) = find_workspace_config(start)? {
-        let path = PathBuf::from(cfg.data_folder);
-        return Ok(Some(if path.is_absolute() {
-            path
-        } else {
-            workspace.join(path)
-        }));
-    }
-
-    Ok(GlobalConfig::load()?.data_folder.map(PathBuf::from))
 }
 
 // ── Project config (config.json) ──────────────────────────────────────────────
@@ -368,24 +204,24 @@ impl ProjectConfig {
     }
 }
 
-// ── Plugin configs (~/.rlean/plugin-configs.json) ─────────────────────────────
+// ── Sidecar integration configs ──────────────────────────────────────────────
 
-pub fn plugin_configs_path() -> Result<PathBuf> {
-    Ok(rlean_dir()?.join("plugin-configs.json"))
+pub fn integration_configs_path() -> Result<PathBuf> {
+    Ok(rlean_dir()?.join("integration-configs.json"))
 }
 
-/// Per-plugin config store (~/.rlean/plugin-configs.json).
+/// Provider-specific credentials passed opaquely to sidecar integrations.
 ///
-/// The outer map key is the plugin name (e.g. `"thetadata"`).
-/// The inner map holds arbitrary key/value pairs defined by that plugin.
+/// The outer map key is the integration name (for example `"thetadata"`).
+/// rlean never interprets the inner map.
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct PluginConfigs(
+pub struct IntegrationConfigs(
     pub std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>,
 );
 
-impl PluginConfigs {
+impl IntegrationConfigs {
     pub fn load() -> Result<Self> {
-        let path = plugin_configs_path()?;
+        let path = integration_configs_path()?;
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -395,22 +231,22 @@ impl PluginConfigs {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = plugin_configs_path()?;
+        let path = integration_configs_path()?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = serde_json::to_string_pretty(&self.0)?;
         atomic_write(&path, &text)?;
         secure_owner_read_write(&path)
     }
 
-    /// Return the stored config map for the given plugin (empty map if not set).
-    pub fn get_plugin(&self, plugin: &str) -> serde_json::Map<String, serde_json::Value> {
-        self.0.get(plugin).cloned().unwrap_or_default()
+    /// Return an integration's stored config map (empty when not configured).
+    pub fn get_integration(&self, integration: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.0.get(integration).cloned().unwrap_or_default()
     }
 
-    /// Insert or overwrite a key in the given plugin's config section.
-    pub fn set_key(&mut self, plugin: &str, key: &str, value: serde_json::Value) {
+    /// Insert or overwrite a key in the given integration's config section.
+    pub fn set_key(&mut self, integration: &str, key: &str, value: serde_json::Value) {
         self.0
-            .entry(plugin.to_string())
+            .entry(integration.to_string())
             .or_default()
             .insert(key.to_string(), value);
     }

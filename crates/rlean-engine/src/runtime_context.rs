@@ -4,18 +4,23 @@ use crate::custom_universe::{
 };
 use crate::engine_framework_registry::EngineFrameworkRegistry;
 use crate::framework::FrameworkState;
+use crate::fundamental_universe::{
+    fundamental_universe_resolution, has_fundamental_universe_selectors,
+    register_fundamental_universe_selector, run_fundamental_universe_selections,
+    FundamentalUniverseSelectorRegistry,
+};
 use crate::history_service::{AlgorithmHistoryContext, HistoryService};
 use rlean_algorithm::lifecycle::{
     AlgorithmHistoryService, AlgorithmRuntimeServices, AlgorithmServices,
-    CustomUniverseSelectorRegistrationRequest as RegistrationRequest, RegisteredIndicatorRegistry,
+    CustomUniverseSelectorRegistrationRequest as RegistrationRequest,
+    FundamentalUniverseSelectorRegistrationRequest as FundamentalRegistrationRequest,
+    RegisteredIndicatorRegistry,
 };
 use rlean_algorithm::FrameworkModelRegistry;
 use rlean_core::{DateTime, Resolution};
-use rlean_data_providers::{ICustomDataSource, IHistoryProvider};
-use rlean_storage::IcebergStore;
+use rlean_data_sidecar::DataSidecarClient;
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone)]
@@ -26,21 +31,16 @@ pub struct AlgorithmRuntimeContext {
     framework: Arc<Mutex<FrameworkState>>,
     framework_registry: Arc<EngineFrameworkRegistry>,
     custom_universe_selectors: CustomUniverseSelectorRegistry,
+    fundamental_universe_selectors: FundamentalUniverseSelectorRegistry,
 }
 
 impl AlgorithmRuntimeContext {
     pub fn new(
-        data_root: PathBuf,
-        data_store: Arc<IcebergStore>,
-        history_provider: Option<Arc<dyn IHistoryProvider>>,
-        custom_data_sources: Vec<Arc<dyn ICustomDataSource>>,
+        data_sidecar: Arc<DataSidecarClient>,
         runtime_parameters: HashMap<String, String>,
     ) -> Self {
         let history_service = Arc::new(HistoryService::new(AlgorithmHistoryContext {
-            data_root,
-            data_store,
-            history_provider,
-            custom_data_sources,
+            data_sidecar,
         }));
         Self::with_history_service(history_service, runtime_parameters)
     }
@@ -57,6 +57,7 @@ impl AlgorithmRuntimeContext {
             framework: framework.clone(),
             framework_registry: Arc::new(EngineFrameworkRegistry::new(framework)),
             custom_universe_selectors: Arc::new(Mutex::new(Vec::new())),
+            fundamental_universe_selectors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -82,6 +83,10 @@ impl AlgorithmRuntimeContext {
 
     pub fn custom_universe_selectors(&self) -> CustomUniverseSelectorRegistry {
         self.custom_universe_selectors.clone()
+    }
+
+    pub fn fundamental_universe_selectors(&self) -> FundamentalUniverseSelectorRegistry {
+        self.fundamental_universe_selectors.clone()
     }
 
     pub fn with_framework(mut self, framework: Arc<Mutex<FrameworkState>>) -> Self {
@@ -212,7 +217,7 @@ impl AlgorithmRuntimeServices for AlgorithmRuntimeContext {
         &self,
         utc_ns: i64,
         resolution: Resolution,
-        custom_data: &HashMap<String, Vec<rlean_data::CustomDataPoint>>,
+        custom_data: &HashMap<String, Vec<rlean_data_tables::CustomDataPoint>>,
     ) -> Vec<rlean_algorithm::lifecycle::UniverseSelection> {
         run_custom_universe_selections(
             &self.custom_universe_selectors,
@@ -229,6 +234,50 @@ impl AlgorithmRuntimeServices for AlgorithmRuntimeContext {
     fn custom_universe_selector_resolution(&self) -> Option<Resolution> {
         custom_universe_resolution(&self.custom_universe_selectors)
     }
+
+    fn register_fundamental_universe_selector(&self, registration: FundamentalRegistrationRequest) {
+        let settings = rlean_sdk::universe::UniverseSettings {
+            resolution: registration.settings_resolution,
+            minimum_time_in_universe_secs: registration.minimum_time_in_universe_secs,
+            ..rlean_sdk::universe::UniverseSettings::default()
+        };
+        // There is no custom-data subscription associated with this selector;
+        // the fundamental Flight feed is registered directly by QcAlgorithm.
+        let descriptor = rlean_sdk::universe::ScheduledUniverseDescriptor::user_defined(
+            registration.resolution,
+            settings,
+            rlean_core::SecurityType::Equity,
+            rlean_core::Market::usa(),
+        );
+        register_fundamental_universe_selector(
+            &self.fundamental_universe_selectors,
+            registration.resolution,
+            descriptor,
+            registration.select,
+        );
+    }
+
+    fn run_fundamental_universe_selections(
+        &self,
+        utc_ns: i64,
+        resolution: Resolution,
+        fundamentals: &[rlean_data::FundamentalData],
+    ) -> Vec<rlean_algorithm::lifecycle::UniverseSelection> {
+        run_fundamental_universe_selections(
+            &self.fundamental_universe_selectors,
+            utc_ns,
+            resolution,
+            fundamentals,
+        )
+    }
+
+    fn has_fundamental_universe_selectors(&self) -> bool {
+        has_fundamental_universe_selectors(&self.fundamental_universe_selectors)
+    }
+
+    fn fundamental_universe_selector_resolution(&self) -> Option<Resolution> {
+        fundamental_universe_resolution(&self.fundamental_universe_selectors)
+    }
 }
 
 #[cfg(test)]
@@ -237,7 +286,7 @@ mod tests {
     use rlean_algorithm::lifecycle::HistoryColumns;
     use rlean_algorithm::qc_algorithm::QcAlgorithm;
     use rlean_core::{Market, Resolution, Symbol, TimeSpan};
-    use rlean_data::{TradeBar, TradeBarData};
+    use rlean_data_tables::{TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

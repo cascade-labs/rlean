@@ -6,7 +6,7 @@
 use rlean_algorithm::algorithm::SecurityChanges;
 use rlean_algorithm::lifecycle::UniverseSelection;
 use rlean_core::{Resolution, Symbol};
-use rlean_data::CustomDataPoint;
+use rlean_data_tables::CustomDataPoint;
 use rlean_sdk::universe::ScheduledUniverseDescriptor;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

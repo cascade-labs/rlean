@@ -5,20 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rlean_data_providers::IHistoryProvider;
-use rlean_storage::IcebergStore;
+use rlean_data_sidecar::{DataSidecarClient, DataSidecarConfig};
 
 use crate::cli::RunArgs;
-use crate::{config, data_store_config, providers};
-
-#[derive(Clone)]
-pub(crate) struct ResolvedDataStore {
-    pub(crate) store: Arc<IcebergStore>,
-    /// Filesystem data root kept for non-store uses: custom-data plugins,
-    /// provider data folders, and output paths. The market-data store itself
-    /// comes from the REST catalog, not from this path.
-    pub(crate) data_root: PathBuf,
-}
+use crate::config;
 
 pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     let bar = indicatif::ProgressBar::new(100);
@@ -32,28 +22,30 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     bar
 }
 
-/// Connect the market-data store from the resolved REST catalog config and
-/// pair it with the filesystem `data_root` used for non-store paths.
-///
-/// The store is connected on the caller's tokio runtime (the engine's
-/// long-lived multi-thread runtime). This matters: `IcebergStore::connect`
-/// starts an in-process SigV4 signing proxy as a background task on the current
-/// runtime, and that task must stay alive for the whole run. Connecting here on
-/// the engine runtime — rather than on a throwaway current-thread runtime that
-/// would be dropped after `block_on` — keeps the proxy task alive for the
-/// store's lifetime.
-pub(crate) async fn resolve_datastore_for_data_root(
-    data_folder: &Path,
+pub(crate) async fn connect_data_sidecar(
+    args: &RunArgs,
     global_config: &config::GlobalConfig,
-) -> Result<ResolvedDataStore> {
-    let catalog_config = data_store_config::resolve(global_config)?;
-    let store = IcebergStore::connect(catalog_config)
-        .await
-        .context("failed to connect to the REST Iceberg catalog")?;
-    Ok(ResolvedDataStore {
-        store: Arc::new(store),
-        data_root: data_folder.to_path_buf(),
+) -> Result<Option<Arc<DataSidecarClient>>> {
+    let Some(endpoint) = args
+        .data_sidecar
+        .clone()
+        .or_else(|| global_config.data_sidecar.clone())
+    else {
+        return Ok(None);
+    };
+    let token = args
+        .data_sidecar_token
+        .clone()
+        .or_else(|| global_config.data_sidecar_token.clone());
+    let client = DataSidecarClient::connect(DataSidecarConfig {
+        endpoint: endpoint.clone(),
+        token,
+        connect_timeout_ms: 10_000,
     })
+    .await
+    .with_context(|| format!("failed to connect to data sidecar at {endpoint}"))?;
+    tracing::info!(%endpoint, "Connected to Arrow Flight data sidecar");
+    Ok(Some(Arc::new(client)))
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {
@@ -69,20 +61,6 @@ pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {
         );
     }
     Ok(path)
-}
-
-pub(crate) fn resolve_configured_data_folder(
-    strategy: &Path,
-    data: &mut PathBuf,
-    global_config: &config::GlobalConfig,
-) -> Result<()> {
-    let _ = global_config;
-    if data == Path::new("data") {
-        if let Some(folder) = config::configured_data_folder(strategy)? {
-            *data = folder;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn parse_algorithm_parameters_for_strategy(
@@ -373,28 +351,12 @@ pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn provider_args(
-    data_root: PathBuf,
-    data_store: Arc<IcebergStore>,
-) -> providers::ProviderArgs {
-    providers::ProviderArgs {
-        data_root,
-        data_store,
-    }
-}
-
-pub(crate) fn build_providers(
-    args: &RunArgs,
-    data_store: Arc<IcebergStore>,
-) -> Result<Option<Arc<dyn IHistoryProvider>>> {
-    let names = match args.data_provider_historical.as_deref() {
-        Some(n) => n,
-        None => return Ok(None),
-    };
-
-    let raw =
-        providers::build_history_provider(names, provider_args(args.data.clone(), data_store))?;
-    Ok(Some(raw))
+/// Serialize one integration's running rlean configuration as an opaque secret
+/// bundle. Only the sidecar adapter interprets provider-specific fields.
+pub(crate) fn integration_config_json(name: &str) -> Result<Vec<u8>> {
+    let configs = config::IntegrationConfigs::load()?;
+    let value = serde_json::Value::Object(configs.get_integration(name));
+    serde_json::to_vec(&value).context("failed to serialize sidecar integration configuration")
 }
 
 #[cfg(test)]
@@ -427,8 +389,8 @@ mod tests {
     }
 
     #[test]
-    fn test_strategy_name_rust_plugin() {
-        let p = Path::new("plugins/my_strategy.so");
+    fn test_strategy_name_non_main_file() {
+        let p = Path::new("strategies/my_strategy.py");
         assert_eq!(strategy_name_from_path(p), "my_strategy");
     }
 

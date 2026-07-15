@@ -11,8 +11,9 @@ use rlean_algorithm::lifecycle::{AlgorithmBridge, OptionSubscription};
 use rlean_core::{DataNormalizationMode, Market, MarketHoursDatabase, Resolution, Symbol};
 use rlean_data::{
     OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
-    SubscriptionDataKind, TradeBar,
+    SubscriptionDataKind,
 };
+use rlean_data_tables::TradeBar;
 use rlean_options::OptionChain;
 use rlean_orders::{
     fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
@@ -30,13 +31,8 @@ pub async fn run_backtest<B>(bridge: B, config: BacktestRunConfig) -> Result<Bac
 where
     B: AlgorithmBridge,
 {
-    let runtime_context = crate::AlgorithmRuntimeContext::new(
-        config.data_root.clone(),
-        config.data_store.clone(),
-        config.history_provider.clone(),
-        config.custom_data_sources.clone(),
-        config.parameters.clone(),
-    );
+    let runtime_context =
+        crate::AlgorithmRuntimeContext::new(config.data_sidecar.clone(), config.parameters.clone());
     run_backtest_with_runtime(bridge, config, runtime_context).await
 }
 
@@ -94,22 +90,9 @@ where
         last_version: None,
     };
 
-    let feed_context = DataFeedContext::new(config.data_store.clone())
-        .with_history_provider(config.history_provider.clone())
-        .with_custom_data_sources(config.custom_data_sources.clone())
+    let feed_context = DataFeedContext::new(config.data_sidecar.clone())
         .with_options(config.data_feed_options)
         .with_market_hours_database(market_hours_database.clone());
-
-    // Warm the history-provider plugin's lazy `OnceLock` exactly once, up front
-    // and on the blocking pool. The first `earliest_date()`/`get_history()`
-    // triggers a plugin `dlopen` (which pulls in Python and other heavy
-    // libraries); if that first load happens concurrently across the hundreds
-    // of subscription producers spawned by universe selection, they all
-    // serialize on the plugin `OnceLock` while occupying worker threads and
-    // deadlock the runtime. Warming it here makes that load single and cheap.
-    if let Some(provider) = config.history_provider.clone() {
-        let _ = tokio::task::spawn_blocking(move || provider.earliest_date()).await;
-    }
 
     let normal_start = rlean_core::NanosecondTimestamp::from(
         start.and_hms_opt(0, 0, 0).expect("valid start of day"),
@@ -171,8 +154,6 @@ where
                     algorithm_manager.advance_framework_warmup(slice.as_ref(), &mut services);
                     algorithm_manager.end_time_step(&mut services);
                 }
-                feed_context.flush_market_cache_writes().await?;
-                feed_context.flush_corporate_action_cache_writes().await?;
             }
         }
         algorithm_manager.warmup_finished(&mut services);
@@ -357,11 +338,6 @@ where
             }
         }
     }
-    data_manager.context().flush_market_cache_writes().await?;
-    data_manager
-        .context()
-        .flush_corporate_action_cache_writes()
-        .await?;
 
     // End-of-run summary: surface every Adjusted-mode equity that traded with no
     // factor rows, so silent unadjusted symbols (issue #27) are impossible to
@@ -430,7 +406,6 @@ fn slice_has_algorithm_data(slice: &rlean_data::Slice) -> bool {
         || !slice.ticks.is_empty()
         || !slice.custom_data.is_empty()
         || !slice.order_books.is_empty()
-        || !slice.perpetual_contexts.is_empty()
 }
 
 fn slice_has_fill_data(slice: &rlean_data::Slice) -> bool {
@@ -438,7 +413,6 @@ fn slice_has_fill_data(slice: &rlean_data::Slice) -> bool {
         || !slice.quote_bars.is_empty()
         || !slice.ticks.is_empty()
         || !slice.order_books.is_empty()
-        || !slice.perpetual_contexts.is_empty()
 }
 
 /// Backtests run the same subscription-shaped custom data flow as live mode:

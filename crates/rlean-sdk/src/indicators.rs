@@ -50,7 +50,7 @@ fn current_point<I: rlean_indicators::indicator::Indicator>(
 pub trait RegisteredIndicator: Send + Sync {
     fn update_value(&self, time: DateTime, value: Price) -> bool;
 
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         self.update_value(bar.end_time, bar.close)
     }
 }
@@ -72,7 +72,7 @@ macro_rules! impl_registered_price_indicator {
         }
 
         impl rlean_algorithm::lifecycle::RegisteredIndicatorBridge for $type_name {
-            fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+            fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
                 RegisteredIndicator::update_bar(self, bar)
             }
         }
@@ -564,7 +564,7 @@ impl RegisteredIndicator for MomentumPercentIndicator {
 }
 
 impl rlean_algorithm::lifecycle::RegisteredIndicatorBridge for MomentumPercentIndicator {
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         RegisteredIndicator::update_bar(self, bar)
     }
 }
@@ -704,7 +704,7 @@ impl RegisteredIndicator for StandardDeviationIndicator {
 }
 
 impl rlean_algorithm::lifecycle::RegisteredIndicatorBridge for StandardDeviationIndicator {
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         RegisteredIndicator::update_bar(self, bar)
     }
 }
@@ -841,7 +841,7 @@ impl RegisteredIndicator for AverageTrueRange {
         self.is_ready()
     }
 
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         self.inner
             .lock()
             .expect("indicator lock poisoned")
@@ -851,7 +851,7 @@ impl RegisteredIndicator for AverageTrueRange {
 }
 
 impl rlean_algorithm::lifecycle::RegisteredIndicatorBridge for AverageTrueRange {
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         RegisteredIndicator::update_bar(self, bar)
     }
 }
@@ -992,7 +992,7 @@ impl RegisteredIndicator for IdentityIndicator {
 }
 
 impl rlean_algorithm::lifecycle::RegisteredIndicatorBridge for IdentityIndicator {
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool {
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool {
         RegisteredIndicator::update_bar(self, bar)
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     sma::Sma,
 };
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 
 /// Average Range = SMA(High - Low, period).
 pub struct AverageRange {

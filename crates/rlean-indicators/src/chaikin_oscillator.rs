@@ -4,7 +4,7 @@ use crate::{
     indicator::{Indicator, IndicatorResult},
 };
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 
 /// Chaikin Oscillator. fast EMA(AD) - slow EMA(AD).
 pub struct ChaikinOscillator {

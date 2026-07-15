@@ -1,11 +1,8 @@
 use rlean_core::DateTime;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    /// Path to the Parquet data directory.
-    pub data_root: PathBuf,
     pub start_date: Option<DateTime>,
     pub end_date: Option<DateTime>,
     pub starting_cash: rust_decimal::Decimal,
@@ -21,7 +18,6 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
-            data_root: PathBuf::from("data"),
             start_date: None,
             end_date: None,
             starting_cash: rust_decimal_macros::dec!(100_000),

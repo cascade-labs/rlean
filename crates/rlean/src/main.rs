@@ -7,23 +7,13 @@
 //!   rlean live     <strategy> [OPTIONS]           # run live trading
 //!   rlean research <project> [OPTIONS]            # launch Jupyter research session
 //!
-//! Strategy types (auto-detected by file extension):
-//!   .py             Python strategy (AlgorithmImports / QCAlgorithm)
-//!   .so / .dylib    Compiled Rust strategy plugin (exports `create_algorithm`)
+//! Strategies are Python files using AlgorithmImports / QCAlgorithm.
 //!
 //! Examples:
 //!   rlean init
 //!   rlean create-project my_strategy
 //!   rlean backtest my_strategy/main.py --thetadata-api-key $THETADATA_API_KEY
 //!   rlean research my_strategy
-
-// NOTE: do NOT install a custom #[global_allocator] (e.g. mimalloc) in this
-// binary. Plugins are cdylibs linked against the system allocator, and owned
-// Rust types (Order, CustomDataPoint, ...) move across that boundary by value,
-// so heap data allocated on either side must be freeable by the other. A
-// mismatched allocator aborts with "pointer being freed was not allocated"
-// the first time a plugin drops an engine-allocated value (observed live via
-// Brokerage::place_order_with_brokerage_ids).
 
 use anyhow::Result;
 use clap::Parser;
@@ -35,14 +25,12 @@ mod cli;
 mod cloud;
 mod config;
 mod config_cmd;
-mod data_store_config;
+mod daemon_cmd;
+mod data_cmd;
 mod init;
 mod live;
 mod live_deployments;
-mod plugin_cmd;
 mod project;
-mod providers;
-mod registry_cmd;
 mod research;
 mod research_daemon;
 mod runtime;
@@ -51,10 +39,9 @@ mod vcs_cmd;
 
 use cli::{Cli, Command};
 use config_cmd::run_config;
+use data_cmd::run_data;
 use init::run_init;
-use plugin_cmd::run_plugin;
 use project::run_create_project;
-use registry_cmd::run_registry;
 use research::run_research;
 use research_daemon::run_daemon;
 use stubs_cmd::run_stubs;
@@ -77,8 +64,7 @@ async fn main() -> Result<()> {
         if verbose {
             EnvFilter::new(
                 "info,rlean=debug,rlean_algorithm=debug,rlean_core=debug,rlean_data=debug,\
-                 rlean_data_providers=debug,rlean_engine=debug,lean_python=debug,\
-                 rlean_storage=debug",
+                 rlean_data_sidecar=debug,rlean_engine=debug,lean_python=debug",
             )
         } else {
             EnvFilter::new("info")
@@ -91,14 +77,14 @@ async fn main() -> Result<()> {
         Command::Init(args) => run_init(args),
         Command::CreateProject(args) => run_create_project(args),
         Command::Config(args) => run_config(args),
-        Command::Plugin(args) => run_plugin(args),
-        Command::Registry(args) => run_registry(args),
+        Command::Data(args) => run_data(args).await,
         Command::Backtest(args) => backtest::run(args).await,
         Command::Live(args) => live::run(args).await,
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),
         Command::Vcs(args) => run_vcs(args),
         Command::Cloud(args) => cloud::run(args),
+        Command::Daemon(args) => daemon_cmd::run(args),
         Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
@@ -108,7 +94,7 @@ async fn main() -> Result<()> {
 ///
 /// This deliberately bypasses tokio, the `ctrlc` crate's background thread, and
 /// `std::process::exit`. Ctrl+C must kill the process no matter what any lower
-/// layer (blocking plugin threads, embedded Python, allocator locks) is doing,
+/// layer (embedded Python, allocator locks) is doing,
 /// so the handler only performs async-signal-safe work: a bare `write(2)` and
 /// `_exit(2)`. It runs no destructors and touches no allocator, so it cannot
 /// deadlock even if the signal interrupts an allocation or a foreign call.
@@ -162,15 +148,41 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
+    fn test_data_init_cli_is_removed() {
+        assert!(Cli::try_parse_from(["rlean", "data", "init"]).is_err());
+    }
+
+    #[test]
+    fn test_data_schema_cli_parse() {
+        let cli =
+            Cli::try_parse_from(["rlean", "data", "schema", "rlean.market_quote_bars"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Data(crate::data_cmd::DataArgs {
+                command: crate::data_cmd::DataCommand::Schema { table }
+            }) if table == "rlean.market_quote_bars"
+        ));
+    }
+
+    #[test]
+    fn test_data_tables_cli_parse() {
+        let cli = Cli::try_parse_from(["rlean", "data", "tables"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Data(crate::data_cmd::DataArgs {
+                command: crate::data_cmd::DataCommand::Tables
+            })
+        ));
+    }
+
+    #[test]
     fn test_live_cli_strategy_launch_parse() {
         let cli = Cli::try_parse_from([
             "rlean",
             "live",
             "main.py",
-            "--data",
-            "/data",
-            "--data-provider-live",
-            "hyperliquid",
+            "--data-sidecar",
+            "tcp://127.0.0.1:50051",
             "--brokerage",
             "hyperliquid",
         ])
@@ -180,8 +192,7 @@ mod tests {
             Command::Live(args) => {
                 assert!(args.command.is_none());
                 assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
-                assert_eq!(args.data, PathBuf::from("/data"));
-                assert_eq!(args.data_provider_live.as_deref(), Some("hyperliquid"));
+                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
                 assert_eq!(args.brokerage.as_deref(), Some("hyperliquid"));
             }
             _ => panic!("expected live command"),
@@ -189,18 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn test_live_cli_rejects_removed_live_trading_flag() {
-        assert!(Cli::try_parse_from([
-            "rlean",
-            "live",
-            "main.py",
-            "--data-provider-live",
-            "tradier",
-            "--brokerage",
-            "tradier",
-            "--live-trading",
-        ])
-        .is_err());
+    fn test_daemon_install_cli_parse() {
+        let cli = Cli::try_parse_from(["rlean", "daemon", "install"]).unwrap();
+        assert!(matches!(cli.command, Command::Daemon(_)));
     }
 
     #[test]
@@ -322,10 +324,8 @@ mod tests {
             "--live-deploy-dir",
             "/tmp/deploy",
             "/tmp/strategy/main.py",
-            "--data",
-            "/tmp/data",
-            "--data-provider-live",
-            "hyperliquid",
+            "--data-sidecar",
+            "tcp://127.0.0.1:50051",
         ])
         .unwrap();
 
@@ -337,8 +337,7 @@ mod tests {
                     args.strategy.as_deref(),
                     Some(Path::new("/tmp/strategy/main.py"))
                 );
-                assert_eq!(args.data, PathBuf::from("/tmp/data"));
-                assert_eq!(args.data_provider_live.as_deref(), Some("hyperliquid"));
+                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
             }
             _ => panic!("expected live command"),
         }

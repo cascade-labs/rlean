@@ -47,32 +47,22 @@ This creates:
 
 ```
 my-strategies/
-  rlean.json      # workspace config (data root, default language)
-  data/           # workspace scratch directory; not the market-data cache
+  rlean.json      # workspace config
 ```
 
-## 2. Configure Iceberg and the data endpoint
+## 2. Configure the sidecar endpoint
 
-Market data and its cache always use an Iceberg REST catalog plus an explicit
-S3-compatible endpoint. Set both before running a backtest, live deployment,
-or research session. This example uses AWS S3 Tables for the catalog and a
-local Verglas endpoint for data I/O. Replace the endpoint URL, signing region,
-and credentials with the values from your provider.
+Backtests, live deployments, research, and data tooling all communicate with a
+sidecar. rlean does not configure or access the sidecar's storage backend.
 
 ```sh
-rlean config set data_catalog https://s3tables.us-west-2.amazonaws.com/iceberg
-rlean config set data_warehouse arn:aws:s3tables:us-west-2:<acct>:bucket/<name>
-rlean config set data_sigv4_region us-west-2
-rlean config set data_s3_endpoint http://127.0.0.1:8333
-rlean config set data_s3_region us-west-2
-rlean config set data_s3_access_key_id <endpoint-access-key>
-rlean config set data_s3_secret_access_key <endpoint-secret>
+rlean config set data_sidecar grpc://127.0.0.1:7410
+# Only when the sidecar requires authentication:
+rlean config set data_sidecar_token <token>
 ```
 
-`data_catalog` identifies the Iceberg tables. `data_s3_endpoint` serves their
-metadata, manifests, and Parquet files. rlean will not infer an AWS endpoint or
-use a hidden local store when these are absent; it stops with a configuration
-error instead. See [Data Backend](./data-backend.md) for every setting.
+See [Data Contract and Sidecar](./data-backend.md) for the canonical tables and
+query tooling.
 
 ## 3. Create a project
 
@@ -140,12 +130,18 @@ impl IAlgorithm for MyStrategy {
 rlean backtest my_first_strategy/main.py
 ```
 
-## 6. Configure data providers and API keys
+## 6. Configure the sidecar
 
 ```sh
+rlean config set data_sidecar grpc://127.0.0.1:7410
 rlean config set thetadata.api_key  <your-key>
 rlean config set massive.api_key    <your-key>
 ```
+
+The endpoint is stored in `~/.rlean/config`. Dotted integration keys are stored
+in the owner-only `~/.rlean/integration-configs.json` and passed opaquely to the
+sidecar. Strategies still declare symbols and resolutions through calls such as
+`add_equity`; configuration only selects and authenticates integrations.
 
 ## Using rlean as a library
 
@@ -153,11 +149,11 @@ Add the crates you need to `Cargo.toml`:
 
 ```toml
 [dependencies]
-lean-core       = { git = "https://github.com/cascade-labs/rlean" }
-lean-algorithm  = { git = "https://github.com/cascade-labs/rlean" }
-lean-engine     = { git = "https://github.com/cascade-labs/rlean" }
-lean-indicators = { git = "https://github.com/cascade-labs/rlean" }
-lean-orders     = { git = "https://github.com/cascade-labs/rlean" }
-lean-data       = { git = "https://github.com/cascade-labs/rlean" }
-lean-storage    = { git = "https://github.com/cascade-labs/rlean" }
+rlean-core        = { git = "https://github.com/cascade-labs/rlean" }
+rlean-algorithm   = { git = "https://github.com/cascade-labs/rlean" }
+rlean-engine      = { git = "https://github.com/cascade-labs/rlean" }
+rlean-indicators  = { git = "https://github.com/cascade-labs/rlean" }
+rlean-orders      = { git = "https://github.com/cascade-labs/rlean" }
+rlean-data        = { git = "https://github.com/cascade-labs/rlean" }
+rlean-data-tables = { git = "https://github.com/cascade-labs/rlean" }
 ```

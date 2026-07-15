@@ -1,6 +1,6 @@
 use chrono::Datelike;
 use rlean_core::TimeSpan;
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 
 use crate::consolidator::IConsolidator;
 

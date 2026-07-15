@@ -12,8 +12,9 @@ use rlean_algorithm::qc_algorithm::QcAlgorithm;
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{DateTime, Price, Resolution, Symbol};
 use rlean_data::{
-    CustomDataPoint, Delisting, Dividend, Split, SubscriptionDataConfig, SymbolChangedEvent,
+    Delisting, Dividend, FundamentalData, Split, SubscriptionDataConfig, SymbolChangedEvent,
 };
+use rlean_data_tables::CustomDataPoint;
 use rlean_options::OptionContract;
 use rlean_orders::{Order, OrderEvent, TransactionManager};
 use rlean_sdk::algorithm::{AlgorithmConstructionContext, AlgorithmHandle};
@@ -469,6 +470,23 @@ impl LifecycleBridge for PythonAlgorithmBridge {
         runtime.run_custom_universe_selections(utc_ns, resolution, custom_data)
     }
 
+    fn select_fundamental_universe_changes(
+        &mut self,
+        utc_ns: i64,
+        resolution: Resolution,
+        fundamentals: &[FundamentalData],
+        services: &mut dyn AlgorithmServices,
+    ) -> Vec<UniverseSelection> {
+        let Some(runtime) = services.runtime_services() else {
+            return self.runtime_services.run_fundamental_universe_selections(
+                utc_ns,
+                resolution,
+                fundamentals,
+            );
+        };
+        runtime.run_fundamental_universe_selections(utc_ns, resolution, fundamentals)
+    }
+
     fn on_end_of_time_step(&mut self, _services: &mut dyn AlgorithmServices) {}
 
     fn on_brokerage_message(&mut self, _message: &str, _services: &mut dyn AlgorithmServices) {}
@@ -590,10 +608,13 @@ impl LifecycleBridge for PythonAlgorithmBridge {
 
     fn has_universes(&self) -> bool {
         self.runtime_services.has_custom_universe_selectors()
+            || self.runtime_services.has_fundamental_universe_selectors()
     }
 
     fn universe_resolution(&self) -> Option<Resolution> {
-        self.runtime_services.custom_universe_selector_resolution()
+        self.runtime_services
+            .fundamental_universe_selector_resolution()
+            .or_else(|| self.runtime_services.custom_universe_selector_resolution())
     }
 
     fn alpha_analytics(&self) -> AlphaAnalytics {
@@ -610,9 +631,9 @@ mod tests {
     use super::*;
     use crate::AlgorithmImports;
     use rlean_core::TimeSpan;
-    use rlean_data::trade_bar::TradeBarData;
     use rlean_data::Slice;
-    use rlean_data::TradeBar;
+    use rlean_data_tables::TradeBar;
+    use rlean_data_tables::TradeBarData;
     use rust_decimal_macros::dec;
     use std::fs;
     use std::sync::Once;
@@ -751,6 +772,75 @@ class UniverseAlgorithm(QCAlgorithm):
     }
 
     #[test]
+    fn python_fundamental_universe_filters_market_cap_and_liquidity() {
+        init_python();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rlean-python-fundamental-universe-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.py");
+        fs::write(
+            &path,
+            r#"
+from AlgorithmImports import QCAlgorithm, Resolution
+
+class FundamentalUniverseAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.universe_settings.resolution = Resolution.Daily
+        self.add_universe(self.select)
+
+    def select(self, fundamentals):
+        return [
+            f.symbol for f in fundamentals
+            if f.market_cap >= 100_000_000
+            and f.volume >= 1_000_000
+            and f.dollar_volume >= 10_000_000
+        ]
+"#,
+        )
+        .unwrap();
+
+        let mut bridge = load_test_strategy_bridge(&path);
+        let mut services = rlean_algorithm::lifecycle::NoopAlgorithmServices::default();
+        bridge.initialize(&mut services).unwrap();
+        assert!(bridge.has_universes());
+        assert_eq!(bridge.universe_resolution(), Some(Resolution::Daily));
+
+        let stamp = rlean_core::DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 2, 5)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+        );
+        let mut eligible = FundamentalData::new(
+            Symbol::create_equity("ABC", &rlean_core::Market::usa()),
+            stamp - TimeSpan::ONE_DAY,
+        );
+        eligible.end_time = stamp;
+        eligible.volume = Some(dec!(1250000));
+        eligible.market_cap = Some(dec!(200000000));
+        eligible.dollar_volume = Some(dec!(25000000));
+
+        let mut rejected = eligible.clone();
+        rejected.symbol = Symbol::create_equity("XYZ", &rlean_core::Market::usa());
+        rejected.volume = Some(dec!(500000));
+        let changes = bridge.select_fundamental_universe_changes(
+            stamp.0,
+            Resolution::Daily,
+            &[eligible, rejected],
+            &mut services,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].changes.added.len(), 1);
+        assert_eq!(changes[0].changes.added[0].value.as_ref(), "ABC");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn python_custom_universe_selector_returns_security_changes() {
         init_python();
 
@@ -796,6 +886,7 @@ class UniverseAlgorithm(QCAlgorithm):
             end_time: stamp,
             value: dec!(1),
             symbol: None,
+            venue: None,
             fields: Arc::new(fields),
         };
         let changes = bridge.select_custom_universe_changes(
@@ -871,6 +962,7 @@ class UniverseAlgorithm(QCAlgorithm):
             end_time: stamp,
             value: dec!(1),
             symbol: Some("SPY".to_string()),
+            venue: None,
             fields: Arc::new(fields),
         };
         let changes = bridge.select_custom_universe_changes(

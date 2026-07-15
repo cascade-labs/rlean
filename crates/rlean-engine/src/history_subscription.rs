@@ -2,8 +2,8 @@ use crate::data_feed::DataFeedContext;
 use crate::slice_synchronizer::SliceSynchronizer;
 use crate::subscription_reader::SubscriptionStream;
 use rlean_core::{DataNormalizationMode, Result as LeanResult, SecurityType, TickType};
-use rlean_data::{CustomDataPoint, QuoteBar, Slice, SubscriptionDataConfig, Tick, TradeBar};
-use rlean_data_providers::{DataType, HistoryRequest};
+use rlean_data::{Slice, SubscriptionDataConfig};
+use rlean_data_tables::{BaseDataType, CustomDataPoint, QuoteBar, Tick, TradeBar};
 
 #[derive(Clone)]
 pub struct SubscriptionHistoryProvider {
@@ -38,24 +38,53 @@ impl SubscriptionHistoryProvider {
 
     pub async fn get_trade_bars(
         &self,
-        request: &HistoryRequest,
+        symbol: rlean_core::Symbol,
+        resolution: rlean_core::Resolution,
+        start: rlean_core::DateTime,
+        end: rlean_core::DateTime,
         normalization_mode: DataNormalizationMode,
     ) -> LeanResult<Vec<TradeBar>> {
-        let config = config_from_history_request(request, normalization_mode);
-        self.get_trade_bars_for_configs(vec![config], request.start, request.end)
+        let config = config_for_history(
+            &symbol,
+            resolution,
+            BaseDataType::TradeBar,
+            normalization_mode,
+        );
+        self.get_trade_bars_for_configs(vec![config], start, end)
             .await
     }
 
-    pub async fn get_quote_bars(&self, request: &HistoryRequest) -> LeanResult<Vec<QuoteBar>> {
-        let config = config_from_history_request(request, DataNormalizationMode::Raw);
-        self.get_quote_bars_for_configs(vec![config], request.start, request.end)
+    pub async fn get_quote_bars(
+        &self,
+        symbol: rlean_core::Symbol,
+        resolution: rlean_core::Resolution,
+        start: rlean_core::DateTime,
+        end: rlean_core::DateTime,
+    ) -> LeanResult<Vec<QuoteBar>> {
+        let config = config_for_history(
+            &symbol,
+            resolution,
+            BaseDataType::QuoteBar,
+            DataNormalizationMode::Raw,
+        );
+        self.get_quote_bars_for_configs(vec![config], start, end)
             .await
     }
 
-    pub async fn get_ticks(&self, request: &HistoryRequest) -> LeanResult<Vec<Tick>> {
-        let config = config_from_history_request(request, DataNormalizationMode::Raw);
-        self.get_ticks_for_configs(vec![config], request.start, request.end)
-            .await
+    pub async fn get_ticks(
+        &self,
+        symbol: rlean_core::Symbol,
+        resolution: rlean_core::Resolution,
+        start: rlean_core::DateTime,
+        end: rlean_core::DateTime,
+    ) -> LeanResult<Vec<Tick>> {
+        let config = config_for_history(
+            &symbol,
+            resolution,
+            BaseDataType::Tick,
+            DataNormalizationMode::Raw,
+        );
+        self.get_ticks_for_configs(vec![config], start, end).await
     }
 
     pub async fn get_trade_bars_for_configs(
@@ -145,96 +174,31 @@ impl SubscriptionHistoryProvider {
     }
 }
 
-pub fn config_from_history_request(
-    request: &HistoryRequest,
+pub fn config_for_history(
+    symbol: &rlean_core::Symbol,
+    resolution: rlean_core::Resolution,
+    data_type: BaseDataType,
     normalization_mode: DataNormalizationMode,
 ) -> SubscriptionDataConfig {
-    let mut config = match request.symbol.security_type() {
-        SecurityType::Equity => SubscriptionDataConfig::new_equity(
-            request.symbol.clone(),
-            request.resolution,
-            normalization_mode,
-        ),
+    let mut config = match symbol.security_type() {
+        SecurityType::Equity => {
+            SubscriptionDataConfig::new_equity(symbol.clone(), resolution, normalization_mode)
+        }
         SecurityType::Option | SecurityType::IndexOption | SecurityType::FutureOption => {
-            SubscriptionDataConfig::new_option(request.symbol.clone(), request.resolution)
+            SubscriptionDataConfig::new_option(symbol.clone(), resolution)
         }
         SecurityType::Forex | SecurityType::Cfd => {
-            SubscriptionDataConfig::new_forex(request.symbol.clone(), request.resolution)
+            SubscriptionDataConfig::new_forex(symbol.clone(), resolution)
         }
         SecurityType::Crypto | SecurityType::CryptoFuture => {
-            SubscriptionDataConfig::new_crypto(request.symbol.clone(), request.resolution)
+            SubscriptionDataConfig::new_crypto(symbol.clone(), resolution)
         }
-        _ => SubscriptionDataConfig::new_equity(
-            request.symbol.clone(),
-            request.resolution,
-            normalization_mode,
-        ),
+        _ => SubscriptionDataConfig::new_equity(symbol.clone(), resolution, normalization_mode),
     };
-    config.set_tick_type(match request.data_type {
-        DataType::QuoteBar => TickType::Quote,
-        DataType::Tick => TickType::Trade,
+    config.set_tick_type(match data_type {
+        BaseDataType::QuoteBar => TickType::Quote,
+        BaseDataType::Tick => TickType::Trade,
         _ => TickType::Trade,
     });
     config
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::{NaiveDate, TimeZone, Utc};
-    use rlean_core::{Market, OptionRight, OptionStyle, Resolution, SymbolOptionsExt, TimeSpan};
-    use rlean_data::{TradeBar, TradeBarData};
-    use rust_decimal_macros::dec;
-
-    fn dt(date: NaiveDate, hour: u32, minute: u32) -> rlean_core::DateTime {
-        rlean_core::DateTime::from(
-            Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()),
-        )
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a REST catalog: set RLEAN_TEST_CATALOG"]
-    async fn selected_option_contract_history_uses_subscription_streams() {
-        let Some(store) = crate::test_support::connect_test_store().await else {
-            return;
-        };
-        let underlying = rlean_core::Symbol::create_equity("SPY", &Market::usa());
-        let expiry = NaiveDate::from_ymd_opt(2024, 1, 19).unwrap();
-        let contract = rlean_core::Symbol::create_option_osi(
-            underlying,
-            dec!(475),
-            expiry,
-            OptionRight::Call,
-            OptionStyle::American,
-            &Market::usa(),
-        );
-        let day = NaiveDate::from_ymd_opt(2024, 1, 17).unwrap();
-        let bar = TradeBar::new(
-            contract.clone(),
-            dt(day - chrono::Duration::days(1), 16, 0),
-            TimeSpan::ONE_DAY,
-            TradeBarData::new(dec!(5), dec!(6), dec!(4), dec!(5.5), dec!(100)),
-        );
-        store
-            .append_trade_bars(
-                &[bar],
-                contract.security_type(),
-                contract.market().as_str(),
-                Resolution::Daily,
-                TickType::Trade,
-            )
-            .await
-            .unwrap();
-
-        let provider = SubscriptionHistoryProvider::new(DataFeedContext::new(store));
-        let config = SubscriptionDataConfig::new_option(contract.clone(), Resolution::Daily);
-        let bars = provider
-            .get_trade_bars_for_configs(vec![config], dt(day, 0, 0), dt(day, 23, 59))
-            .await
-            .unwrap();
-
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].symbol, contract);
-        assert_eq!(bars[0].close, dec!(5.5));
-    }
 }

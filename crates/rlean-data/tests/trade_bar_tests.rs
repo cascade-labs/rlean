@@ -1,5 +1,5 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::{TradeBar, TradeBarData};
+use rlean_data_tables::{TradeBar, TradeBarData};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -26,7 +26,7 @@ fn make_bar(
 #[test]
 fn bar_close_is_price() {
     let bar = make_bar(dec!(100), dec!(110), dec!(95), dec!(105), dec!(1_000_000));
-    use rlean_data::base_data::BaseData;
+    use rlean_data_tables::BaseData;
     assert_eq!(bar.price(), dec!(105));
 }
 

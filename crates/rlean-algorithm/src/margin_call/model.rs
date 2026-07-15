@@ -83,8 +83,8 @@ pub struct MarginCallExecutionContext<'a> {
     pub algorithm: &'a mut crate::qc_algorithm::QcAlgorithm,
     pub order_processor: &'a rlean_orders::order_processor::OrderProcessor,
     pub time: rlean_core::DateTime,
-    pub trade_bars: &'a std::collections::HashMap<u64, rlean_data::TradeBar>,
-    pub quote_bars: &'a std::collections::HashMap<u64, rlean_data::QuoteBar>,
+    pub trade_bars: &'a std::collections::HashMap<u64, rlean_data_tables::TradeBar>,
+    pub quote_bars: &'a std::collections::HashMap<u64, rlean_data_tables::QuoteBar>,
     pub total_margin_used: rust_decimal::Decimal,
 }
 

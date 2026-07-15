@@ -50,7 +50,7 @@ pub fn is_interrupted_error(err: &anyhow::Error) -> bool {
 }
 
 /// Install a process-wide Ctrl+C handler (once). Sets the interrupt flag so
-/// Rust-only work (Parquet I/O, live synchronizer waits) can be stopped too.
+/// Rust-only work (sidecar I/O, live synchronizer waits) can be stopped too.
 pub fn ensure_ctrl_c_handler() {
     CTRL_C_HANDLER.call_once(|| {
         tokio::spawn(async {

@@ -1,6 +1,6 @@
 use crate::indicator::{Indicator, IndicatorResult};
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal::Decimal;
 
 /// True Range = max(H-L, |H-prevC|, |L-prevC|).

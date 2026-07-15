@@ -4,10 +4,8 @@
 //! so language bindings are pure structural glue a generator can emit 1:1.
 
 use rlean_core::{Symbol, TickType};
-use rlean_data::{
-    quote_bar::Bar, CustomDataPoint, Delisting, DelistingType, MarginInterestRate,
-    PerpetualContext, QuoteBar, Slice, SymbolChangedEvent, Tick, TradeBar,
-};
+use rlean_data::{Delisting, DelistingType, Slice, SymbolChangedEvent};
+use rlean_data_tables::{Bar, CustomDataPoint, MarginInterestRate, QuoteBar, Tick, TradeBar};
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 
@@ -123,6 +121,9 @@ impl TradeBarView {
     pub fn symbol(&self) -> &Symbol {
         &self.bar.symbol
     }
+    pub fn venue(&self) -> Option<&str> {
+        self.bar.venue.as_deref()
+    }
     pub fn open(&self) -> f64 {
         decimal_to_f64(self.bar.open)
     }
@@ -169,6 +170,9 @@ impl QuoteBarView {
 
     pub fn symbol(&self) -> &Symbol {
         &self.bar.symbol
+    }
+    pub fn venue(&self) -> Option<&str> {
+        self.bar.venue.as_deref()
     }
     pub fn bid(&self) -> Option<BarView> {
         self.bar.bid.clone().map(BarView::new)
@@ -269,6 +273,9 @@ impl MarginInterestRateView {
     pub fn symbol(&self) -> &Symbol {
         &self.rate.symbol
     }
+    pub fn venue(&self) -> Option<&str> {
+        self.rate.venue.as_deref()
+    }
     pub fn time_ns(&self) -> i64 {
         self.rate.time.0
     }
@@ -284,66 +291,6 @@ impl MarginInterestRateView {
 }
 
 #[derive(Debug, Clone)]
-pub struct PerpetualContextView {
-    context: PerpetualContext,
-}
-
-impl PerpetualContextView {
-    pub fn new(context: PerpetualContext) -> Self {
-        Self { context }
-    }
-
-    pub fn symbol(&self) -> &Symbol {
-        &self.context.symbol
-    }
-    pub fn time_ns(&self) -> i64 {
-        self.context.time.0
-    }
-    pub fn end_time_ns(&self) -> i64 {
-        self.context.end_time.0
-    }
-    pub fn time(&self) -> chrono::NaiveDateTime {
-        ns_to_exchange_naive(self.time_ns())
-    }
-    pub fn end_time(&self) -> chrono::NaiveDateTime {
-        ns_to_exchange_naive(self.end_time_ns())
-    }
-    pub fn funding(&self) -> f64 {
-        decimal_to_f64(self.context.funding)
-    }
-    pub fn open_interest(&self) -> f64 {
-        decimal_to_f64(self.context.open_interest)
-    }
-    pub fn prev_day_px(&self) -> f64 {
-        decimal_to_f64(self.context.prev_day_px)
-    }
-    pub fn day_ntl_vlm(&self) -> f64 {
-        decimal_to_f64(self.context.day_ntl_vlm)
-    }
-    pub fn premium(&self) -> f64 {
-        decimal_to_f64(self.context.premium)
-    }
-    pub fn oracle_px(&self) -> f64 {
-        decimal_to_f64(self.context.oracle_px)
-    }
-    pub fn mark_px(&self) -> f64 {
-        decimal_to_f64(self.context.mark_px)
-    }
-    pub fn mid_px(&self) -> f64 {
-        decimal_to_f64(self.context.mid_px)
-    }
-    pub fn impact_bid_px(&self) -> f64 {
-        decimal_to_f64(self.context.impact_bid_px)
-    }
-    pub fn impact_ask_px(&self) -> f64 {
-        decimal_to_f64(self.context.impact_ask_px)
-    }
-    pub fn value(&self) -> f64 {
-        self.mark_px()
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct TickView {
     tick: Tick,
 }
@@ -355,6 +302,9 @@ impl TickView {
 
     pub fn symbol(&self) -> &Symbol {
         &self.tick.symbol
+    }
+    pub fn venue(&self) -> Option<&str> {
+        self.tick.venue.as_deref()
     }
     pub fn time_ns(&self) -> i64 {
         self.tick.time.0
@@ -482,6 +432,9 @@ impl CustomDataPointView {
 
     pub fn value(&self) -> f64 {
         decimal_to_f64(self.point.value)
+    }
+    pub fn venue(&self) -> Option<&str> {
+        self.point.venue.as_deref()
     }
     /// Period start (LEAN `BaseData.Time`) in exchange-local time.
     pub fn time(&self) -> chrono::NaiveDateTime {
@@ -646,9 +599,8 @@ impl SliceView {
 mod tests {
     use super::*;
     use rlean_core::Market;
-    use rlean_data::quote_bar::Bar;
-    use rlean_data::trade_bar::TradeBarData;
-    use rlean_data::{CustomDataPoint, QuoteBar, TradeBar};
+    use rlean_data_tables::{Bar, TradeBarData};
+    use rlean_data_tables::{CustomDataPoint, QuoteBar, TradeBar};
     use rust_decimal_macros::dec;
     use std::sync::Arc;
 
@@ -714,6 +666,7 @@ mod tests {
             end_time: stamp,
             value: dec!(1),
             symbol: None,
+            venue: None,
             fields: Arc::new(HashMap::new()),
         };
         let second = CustomDataPoint {
@@ -721,6 +674,7 @@ mod tests {
             end_time: stamp,
             value: dec!(2),
             symbol: None,
+            venue: None,
             fields: Arc::new(HashMap::new()),
         };
         let view =
@@ -803,6 +757,7 @@ mod tests {
             end_time,
             value: dec!(1),
             symbol: None,
+            venue: None,
             fields: Arc::new(HashMap::new()),
         };
         let view = CustomDataPointView::new(point);
@@ -833,6 +788,7 @@ mod tests {
                 end_time: stamp,
                 value: dec!(1),
                 symbol: None,
+                venue: None,
                 fields: Arc::new(HashMap::new()),
             }],
         );

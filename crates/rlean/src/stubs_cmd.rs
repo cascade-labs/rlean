@@ -67,9 +67,6 @@ fn run_create(output_override: Option<PathBuf>) -> Result<()> {
         println!("Stubs written: {}", dest.display());
     }
 
-    // Scan ~/.rlean/plugins/ for installed plugins and note any stub files they provide.
-    scan_plugin_stubs(&destinations)?;
-
     println!(
         "\nAlgorithmImports.pyi installed.  \
          Add the stub location to your IDE's `python.analysis.extraPaths` \
@@ -104,57 +101,4 @@ fn site_packages_dir() -> Result<PathBuf> {
         .to_string();
 
     Ok(PathBuf::from(path))
-}
-
-/// Scan `~/.rlean/plugins/` for installed plugins and generate or copy any
-/// stub files they expose.  Currently copies `*.pyi` files found at the
-/// plugin root into each install destination directory.
-fn scan_plugin_stubs(install_dirs: &[PathBuf]) -> Result<()> {
-    let plugin_dir = dirs_home()?.join(".rlean").join("plugins");
-
-    if !plugin_dir.exists() {
-        return Ok(());
-    }
-
-    let read = std::fs::read_dir(&plugin_dir)
-        .with_context(|| format!("Cannot read plugin directory '{}'", plugin_dir.display()))?;
-
-    for entry in read.flatten() {
-        let plugin_path = entry.path();
-        if !plugin_path.is_dir() {
-            continue;
-        }
-
-        // Look for *.pyi files the plugin provides alongside its binary.
-        let Ok(files) = std::fs::read_dir(&plugin_path) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let fp = file.path();
-            if fp.extension().and_then(|e| e.to_str()) != Some("pyi") {
-                continue;
-            }
-            let stub_name = fp.file_name().unwrap_or_default().to_os_string();
-            let content = std::fs::read_to_string(&fp)
-                .with_context(|| format!("Cannot read plugin stub '{}'", fp.display()))?;
-
-            for dest_file in install_dirs {
-                let dest_dir = dest_file.parent().unwrap_or(dest_file);
-                let dest = dest_dir.join(&stub_name);
-                std::fs::write(&dest, &content)
-                    .with_context(|| format!("Cannot write plugin stub to '{}'", dest.display()))?;
-                println!("Plugin stub written: {}", dest.display());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Return the user's home directory via `$HOME`.
-fn dirs_home() -> Result<PathBuf> {
-    if let Some(h) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(h));
-    }
-    anyhow::bail!("Cannot determine home directory ($HOME is not set)")
 }

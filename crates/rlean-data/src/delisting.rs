@@ -1,5 +1,5 @@
-use crate::base_data::{BaseData, BaseDataType};
 use rlean_core::{DateTime, Price, Symbol, TimeSpan};
+use rlean_data_tables::{BaseData, BaseDataType};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

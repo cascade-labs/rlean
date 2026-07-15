@@ -1,5 +1,6 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::{Slice, Tick, TradeBar, TradeBarData};
+use rlean_data::Slice;
+use rlean_data_tables::{Tick, TradeBar, TradeBarData};
 use rust_decimal_macros::dec;
 
 fn spy() -> Symbol {

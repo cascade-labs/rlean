@@ -6,7 +6,8 @@ use rlean_alpha::{
     PearsonCorrelationPairsTradingAlphaModel,
 };
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::{Slice, TradeBar, TradeBarData};
+use rlean_data::Slice;
+use rlean_data_tables::{TradeBar, TradeBarData};
 use rust_decimal_macros::dec;
 
 // ---------------------------------------------------------------------------

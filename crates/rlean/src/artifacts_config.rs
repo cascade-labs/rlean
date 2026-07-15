@@ -89,22 +89,10 @@ pub(crate) fn resolve(
     let s3 = S3Settings {
         bucket,
         prefix,
-        region: config
-            .artifact_s3_region
-            .clone()
-            .or_else(|| config.s3_region.clone()),
-        endpoint: config
-            .artifact_s3_endpoint
-            .clone()
-            .or_else(|| config.s3_endpoint.clone()),
-        access_key: config
-            .artifact_s3_access_key
-            .clone()
-            .or_else(|| config.s3_access_key.clone()),
-        secret_key: config
-            .artifact_s3_secret_key
-            .clone()
-            .or_else(|| config.s3_secret_key.clone()),
+        region: config.artifact_s3_region.clone(),
+        endpoint: config.artifact_s3_endpoint.clone(),
+        access_key: config.artifact_s3_access_key.clone(),
+        secret_key: config.artifact_s3_secret_key.clone(),
     };
 
     Ok(ArtifactConfig { mode, s3: Some(s3) })
@@ -148,26 +136,24 @@ mod tests {
     }
 
     #[test]
-    fn cli_beats_config_and_credentials_fall_back() {
+    fn cli_beats_config() {
         let mut cfg = base_config();
         cfg.artifact_store = Some("local".to_string());
-        cfg.s3_access_key = Some("shared-key".to_string());
-        cfg.s3_region = Some("us-east-1".to_string());
+        cfg.artifact_s3_access_key = Some("artifact-key".to_string());
+        cfg.artifact_s3_region = Some("us-east-1".to_string());
         // CLI overrides the config's local mode.
         let resolved = resolve(Some("mirror"), Some("s3://bucket/prefix"), &cfg).unwrap();
         assert_eq!(resolved.mode, ArtifactStoreMode::Mirror);
         let s3 = resolved.s3.unwrap();
         assert_eq!(s3.bucket, "bucket");
         assert_eq!(s3.prefix, "prefix");
-        // Credentials fall back to the shared s3_* keys.
-        assert_eq!(s3.access_key.as_deref(), Some("shared-key"));
+        assert_eq!(s3.access_key.as_deref(), Some("artifact-key"));
         assert_eq!(s3.region.as_deref(), Some("us-east-1"));
     }
 
     #[test]
     fn artifact_specific_credentials_win() {
         let mut cfg = base_config();
-        cfg.s3_access_key = Some("shared".to_string());
         cfg.artifact_s3_access_key = Some("artifact".to_string());
         let resolved = resolve(Some("s3"), Some("s3://b/p"), &cfg).unwrap();
         assert_eq!(resolved.s3.unwrap().access_key.as_deref(), Some("artifact"));

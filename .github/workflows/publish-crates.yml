@@ -11,8 +11,8 @@ name: Publish crates
 # workflow_dispatch is available to re-run for an existing tag.
 #
 # Gating: a real publish only happens when the CARGO_REGISTRY_TOKEN repo secret is
-# present. Without it the job runs in dry-run mode, which verifies the two crates
-# that have no workspace path dependencies (rlean-core, rlean-plugin). cargo cannot
+# present. Without it the job runs in dry-run mode, which verifies the crate
+# that has no workspace path dependencies (rlean-core). cargo cannot
 # dry-run the downstream crates of an as-yet-unpublished workspace, because each
 # crate resolves its dependencies from the live registry at publish time.
 

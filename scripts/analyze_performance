@@ -11,8 +11,7 @@
 #
 # Examples:
 #   scripts/analyze_performance ~/trading/etf_commodity_blend \
-#       --data /Volumes/data_cache/lean/data \
-#       --data-provider-historical thetadata,massive
+#       --data-sidecar grpc://127.0.0.1:7410
 #
 # Environment overrides:
 #   RLEAN_PROFILE_OUT   profile output path   (default: target/profile/<name>.json.gz)

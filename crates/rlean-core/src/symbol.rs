@@ -511,6 +511,19 @@ impl Symbol {
         }))
     }
 
+    /// Return this security with the ticker mapped for a particular date while
+    /// preserving its permanent ticker and SID. This mirrors LEAN's
+    /// `Symbol.UpdateMappedSymbol`: FB and META are values of one security, not
+    /// two independent identities.
+    pub fn with_mapped_value(&self, value: &str) -> Self {
+        Self(Arc::new(SymbolInner {
+            id: self.id.clone(),
+            value: Arc::from(value),
+            permtick: self.permtick.clone(),
+            underlying: self.underlying.clone(),
+        }))
+    }
+
     pub fn has_underlying(&self) -> bool {
         self.underlying.is_some()
     }
@@ -615,6 +628,17 @@ mod tests {
         let clone = option.clone();
 
         assert!(Arc::ptr_eq(&option.0, &clone.0));
+    }
+
+    #[test]
+    fn mapped_value_preserves_permanent_identity() {
+        let symbol = Symbol::create_equity("META", &Market::usa());
+        let mapped = symbol.with_mapped_value("FB");
+
+        assert_eq!(mapped.value.as_ref(), "FB");
+        assert_eq!(mapped.permtick.as_ref(), "META");
+        assert_eq!(mapped.id.sid, symbol.id.sid);
+        assert_eq!(mapped, symbol);
     }
 
     #[test]

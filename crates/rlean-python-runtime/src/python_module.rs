@@ -46,6 +46,7 @@ fn register_data(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rlean_sdk::data::CustomDataView>()?;
     m.add_class::<rlean_sdk::data::CustomDataFieldsView>()?;
     m.add_class::<rlean_sdk::data::CustomDataPointView>()?;
+    m.add_class::<rlean_sdk::data::FundamentalDataView>()?;
     Ok(())
 }
 

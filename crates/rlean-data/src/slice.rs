@@ -1,10 +1,8 @@
 use crate::symbol_changed::SymbolChangedEvent;
 use crate::OptionChain;
-use crate::{
-    CustomDataPoint, Delisting, Dividend, MarginInterestRate, OrderBook, PerpetualContext,
-    QuoteBar, Split, Tick, TradeBar,
-};
+use crate::{Delisting, Dividend, FundamentalData, OrderBook, Split};
 use rlean_core::{DateTime, Symbol};
+use rlean_data_tables::{CustomDataPoint, MarginInterestRate, QuoteBar, Tick, TradeBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,9 +20,12 @@ pub struct Slice {
     pub delistings: HashMap<u64, Delisting>,
     pub symbol_changed_events: HashMap<u64, SymbolChangedEvent>,
     pub margin_interest_rates: HashMap<u64, MarginInterestRate>,
-    pub perpetual_contexts: HashMap<u64, PerpetualContext>,
     pub order_books: HashMap<u64, OrderBook>,
     pub option_chains: HashMap<String, Arc<OptionChain>>,
+    /// Full daily universe snapshot. It is delivered to universe selection
+    /// before regular `OnData` processing and is intentionally not keyed by an
+    /// already-subscribed security.
+    pub fundamentals: Vec<FundamentalData>,
     pub custom_data_by_sid: HashMap<u64, Vec<CustomDataPoint>>,
     pub custom_data_symbols: HashMap<u64, Symbol>,
     pub custom_data: HashMap<String, Vec<CustomDataPoint>>,
@@ -43,9 +44,9 @@ impl Slice {
             delistings: std::collections::HashMap::new(),
             symbol_changed_events: std::collections::HashMap::new(),
             margin_interest_rates: std::collections::HashMap::new(),
-            perpetual_contexts: std::collections::HashMap::new(),
             order_books: std::collections::HashMap::new(),
             option_chains: std::collections::HashMap::new(),
+            fundamentals: Vec::new(),
             custom_data_by_sid: std::collections::HashMap::new(),
             custom_data_symbols: std::collections::HashMap::new(),
             custom_data: std::collections::HashMap::new(),
@@ -93,12 +94,6 @@ impl Slice {
         self.has_data = true;
     }
 
-    pub fn add_perpetual_context(&mut self, context: PerpetualContext) {
-        self.perpetual_contexts
-            .insert(context.symbol.id.sid, context);
-        self.has_data = true;
-    }
-
     pub fn add_order_book(&mut self, book: OrderBook) {
         self.order_books.insert(book.symbol.id.sid, book);
         self.has_data = true;
@@ -107,6 +102,11 @@ impl Slice {
     pub fn add_option_chain(&mut self, canonical_permtick: String, chain: Arc<OptionChain>) {
         self.option_chains.insert(canonical_permtick, chain);
         self.has_data = true;
+    }
+
+    pub fn add_fundamentals(&mut self, fundamentals: impl IntoIterator<Item = FundamentalData>) {
+        self.fundamentals.extend(fundamentals);
+        self.has_data = !self.fundamentals.is_empty() || self.has_data;
     }
 
     pub fn add_custom_data(&mut self, source_type: String, ticker: String, point: CustomDataPoint) {
@@ -150,10 +150,6 @@ impl Slice {
 
     pub fn get_margin_interest_rate(&self, symbol: &Symbol) -> Option<&MarginInterestRate> {
         self.margin_interest_rates.get(&symbol.id.sid)
-    }
-
-    pub fn get_perpetual_context(&self, symbol: &Symbol) -> Option<&PerpetualContext> {
-        self.perpetual_contexts.get(&symbol.id.sid)
     }
 
     pub fn get_order_book(&self, symbol: &Symbol) -> Option<&OrderBook> {

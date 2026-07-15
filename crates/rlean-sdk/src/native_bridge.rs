@@ -5,9 +5,8 @@ use rlean_algorithm::lifecycle::{
 };
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{DateTime, Price, Resolution, Symbol};
-use rlean_data::{
-    CustomDataPoint, Delisting, Dividend, Split, SubscriptionDataConfig, SymbolChangedEvent,
-};
+use rlean_data::{Delisting, Dividend, Split, SubscriptionDataConfig, SymbolChangedEvent};
+use rlean_data_tables::CustomDataPoint;
 use rlean_options::OptionContract;
 use rlean_orders::{Order, OrderEvent, TransactionManager};
 use rust_decimal::Decimal;

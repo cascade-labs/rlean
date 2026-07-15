@@ -2,7 +2,7 @@ use rlean_algorithm::portfolio::{SecurityHolding, SecurityPortfolioManager};
 use rlean_algorithm::securities::Security;
 use rlean_core::exchange_hours::ExchangeHours;
 use rlean_core::{Market, NanosecondTimestamp, Resolution, Symbol, SymbolProperties};
-use rlean_data::MarginInterestRate;
+use rlean_data_tables::MarginInterestRate;
 use rlean_orders::{Order, OrderStatus};
 use rust_decimal_macros::dec;
 use std::sync::Arc;

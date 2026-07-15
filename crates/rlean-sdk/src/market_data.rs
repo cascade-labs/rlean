@@ -13,32 +13,7 @@ pub fn split_csv(s: &str) -> Vec<String> {
 }
 
 pub fn custom_query_from_properties(properties: &HashMap<String, String>) -> CustomDataQuery {
-    let mut query = CustomDataQuery::default();
-    if let Some(symbols) = properties.get("symbols") {
-        query.symbols = Some(split_csv(symbols));
-    }
-    if let Some(columns) = properties.get("columns") {
-        query.columns = Some(split_csv(columns));
-    }
-    for (key, value) in properties {
-        if let Some(column) = key.strip_prefix("eq_") {
-            query
-                .string_equals
-                .insert(column.to_string(), value.to_string());
-        } else if let Some(column) = key.strip_prefix("in_") {
-            query.string_in.insert(column.to_string(), split_csv(value));
-        } else if let Some(column) = key.strip_prefix("min_") {
-            if let Ok(v) = value.parse::<f64>() {
-                query.numeric_min.insert(column.to_string(), v);
-            }
-        } else if let Some(column) = key.strip_prefix("max_") {
-            if let Ok(v) = value.parse::<f64>() {
-                query.numeric_max.insert(column.to_string(), v);
-            }
-        }
-    }
-    query.properties = properties.clone();
-    query
+    CustomDataQuery::from_properties(properties)
 }
 
 pub fn custom_query(

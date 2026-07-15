@@ -1,22 +1,20 @@
-use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
+#[cfg(not(unix))]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use anyhow::{bail, Context, Result};
+use rlean::daemon::{self, DeploymentSpec, Request};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{LiveArgs, LiveStatusFilter, LiveSubcommand, RunArgs};
-use crate::config;
 use crate::live::is_paper_brokerage_name;
 use crate::runtime::{
-    backtest_dir_name, resolve_configured_data_folder, resolve_strategy_file,
-    strategy_name_from_path, validate_strategy_path,
+    backtest_dir_name, resolve_strategy_file, strategy_name_from_path, validate_strategy_path,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,9 +29,6 @@ struct LiveDeploymentMetadata {
     stopped: Option<String>,
     updated_at: String,
     brokerage: Option<String>,
-    data_provider_live: Option<String>,
-    data_provider_historical: Option<String>,
-    data: PathBuf,
     paper_trading: bool,
     command: Vec<String>,
     error: Option<String>,
@@ -48,24 +43,13 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
     }
     validate_strategy_path(&run_args.strategy)?;
 
-    let global_config = config::GlobalConfig::load()?;
-    let strategy_path = run_args.strategy.clone();
-    resolve_configured_data_folder(&strategy_path, &mut run_args.data, &global_config)?;
-    // The data root is a filesystem path (custom-data plugins, provider folders,
-    // output). Canonicalise it best-effort so the detached child sees a stable
-    // absolute path.
-    if let Ok(canonical) = std::fs::canonicalize(&run_args.data) {
-        run_args.data = canonical;
-    }
     let requested_brokerage = run_args
         .brokerage
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "live mode requires --brokerage paper or a live brokerage plugin, for example --brokerage tradier"
-            )
+            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
         })?;
     let paper_trading = is_paper_brokerage_name(requested_brokerage);
 
@@ -104,9 +88,6 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         stopped: None,
         updated_at: now,
         brokerage: run_args.brokerage.clone(),
-        data_provider_live: run_args.data_provider_live.clone(),
-        data_provider_historical: run_args.data_provider_historical.clone(),
-        data: run_args.data.clone(),
         paper_trading,
         command,
         error: None,
@@ -115,50 +96,35 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
     write_live_deployment_metadata(&deployment_dir, &initial_metadata)?;
 
     let log_path = deployment_dir.join("live.log");
-    let log_file = File::create(&log_path)
-        .with_context(|| format!("failed to create {}", log_path.display()))?;
-    let stderr_file = log_file
-        .try_clone()
-        .with_context(|| format!("failed to clone {}", log_path.display()))?;
-
-    let mut command = ProcessCommand::new(&exe);
-    command
-        .args(&child_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr_file));
-    if let Some(strategy_dir) = deployment_strategy.parent() {
-        command.current_dir(strategy_dir);
+    File::create(&log_path).with_context(|| format!("failed to create {}", log_path.display()))?;
+    let mut environment = BTreeMap::new();
+    if let Some(token) = &run_args.data_sidecar_token {
+        environment.insert("RLEAN_DATA_SIDECAR_TOKEN".to_owned(), token.clone());
     }
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            Ok(())
-        });
-    }
-
-    let child = command
-        .spawn()
-        .context("failed to launch detached live deployment")?;
-
-    write_pid_file(&deployment_dir, child.id())?;
-    mark_live_deployment_running(&deployment_dir, &initial_metadata, child.id())?;
     register_live_deployment(&deployment_dir);
-    confirm_live_deployment_started(
-        &deployment_dir,
-        child.id(),
-        &log_path,
-        Duration::from_secs(2),
-    )?;
+    let response = daemon::request(&Request::Start(DeploymentSpec {
+        deploy_id: deploy_id.clone(),
+        deployment_dir: deployment_dir.clone(),
+        program: exe,
+        args: child_args,
+        working_dir: deployment_strategy
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        log_path: log_path.clone(),
+        environment,
+        desired_state: "running".to_owned(),
+        restart: false,
+    }))?;
+    let pid = response
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("rleand did not return a child pid"))?;
+    confirm_live_deployment_started(&deployment_dir, pid, &log_path, Duration::from_secs(10))?;
 
     println!(
         "Live deployment started: deploy_id={} pid={} dir={} log={}",
         deploy_id,
-        child.id(),
+        pid,
         deployment_dir.display(),
         log_path.display()
     );
@@ -188,9 +154,6 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
                 "stopped": metadata.stopped,
                 "updated_at": metadata.updated_at,
                 "brokerage": metadata.brokerage,
-                "data_provider_live": metadata.data_provider_live,
-                "data_provider_historical": metadata.data_provider_historical,
-                "data": metadata.data,
                 "paper_trading": metadata.paper_trading,
                 "error": metadata.error,
                 "exit_code": metadata.exit_code,
@@ -245,16 +208,11 @@ fn pause_live_deployment(deploy_id: &str, timeout: Duration) -> Result<()> {
         bail!("live deployment {deploy_id} is not running; current status is {effective_status}");
     }
 
-    let pid = metadata
-        .pid
-        .ok_or_else(|| anyhow::anyhow!("live deployment {deploy_id} has no recorded pid"))?;
-    terminate_process(pid)?;
-    if !wait_for_process_exit(pid, timeout) {
-        bail!(
-            "timed out waiting for live deployment {deploy_id} pid {pid} to exit after {}s",
-            timeout.as_secs()
-        );
-    }
+    let pid = metadata.pid;
+    daemon::request(&Request::Stop {
+        deploy_id: metadata.deploy_id.clone(),
+        timeout_seconds: timeout.as_secs(),
+    })?;
 
     metadata.pid = None;
     metadata.status = "paused".to_string();
@@ -266,8 +224,10 @@ fn pause_live_deployment(deploy_id: &str, timeout: Duration) -> Result<()> {
     let _ = std::fs::remove_file(dir.join("pid"));
 
     println!(
-        "Live deployment paused: deploy_id={} pid={pid}",
-        metadata.deploy_id
+        "Live deployment paused: deploy_id={} pid={}",
+        metadata.deploy_id,
+        pid.map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
     );
     Ok(())
 }
@@ -284,65 +244,43 @@ fn resume_live_deployment(deploy_id: &str) -> Result<()> {
         bail!("live deployment {deploy_id} has no stored command to resume");
     }
 
-    // Deployments saved by an older rlean may carry flags this build no longer
-    // understands (e.g. `--no-compact`, removed once compaction became safe under
-    // the #63 sole-user gate). Drop them so `live resume` still starts instead of
-    // failing clap parsing with "unexpected argument".
-    strip_stale_command_flags(&mut metadata.command);
-
     let deployment_strategy = deployment_strategy_path(&metadata, &dir);
     if deployment_strategy.exists() {
         rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
     }
+    // Persist the snapshot strategy path so rleand replays the same command on
+    // every later restart.
+    write_live_deployment_metadata(&dir, &metadata)?;
 
     let exe = PathBuf::from(&metadata.command[0]);
     let child_args = metadata.command[1..].to_vec();
     let log_path = dir.join("live.log");
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open {}", log_path.display()))?;
-    let stderr_file = log_file
-        .try_clone()
-        .with_context(|| format!("failed to clone {}", log_path.display()))?;
-
-    let mut command = ProcessCommand::new(&exe);
-    command
-        .args(&child_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr_file));
-    if let Some(strategy_dir) = deployment_strategy
+    let working_dir = deployment_strategy
         .parent()
         .or_else(|| metadata.strategy.parent())
-    {
-        command.current_dir(strategy_dir);
-    }
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            Ok(())
-        });
-    }
-
-    let child = command
-        .spawn()
-        .context("failed to resume live deployment")?;
-    write_pid_file(&dir, child.id())?;
-    mark_live_deployment_running(&dir, &metadata, child.id())?;
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let response = daemon::request(&Request::Start(DeploymentSpec {
+        deploy_id: metadata.deploy_id.clone(),
+        deployment_dir: dir.clone(),
+        program: exe,
+        args: child_args,
+        working_dir,
+        log_path: log_path.clone(),
+        environment: BTreeMap::new(),
+        desired_state: "running".to_owned(),
+        restart: true,
+    }))?;
+    let pid = response
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("rleand did not return a child pid"))?;
     register_live_deployment(&dir);
-    metadata =
-        confirm_live_deployment_started(&dir, child.id(), &log_path, Duration::from_secs(2))?;
+    metadata = confirm_live_deployment_started(&dir, pid, &log_path, Duration::from_secs(10))?;
 
     println!(
         "Live deployment resumed: deploy_id={} pid={} dir={} log={}",
         metadata.deploy_id,
-        child.id(),
+        pid,
         dir.display(),
         log_path.display()
     );
@@ -354,9 +292,9 @@ fn upgrade_live_deployment(deploy_id: &str) -> Result<()> {
     let mut metadata =
         normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
     let effective_status = effective_live_status(&metadata);
-    if effective_status != "paused" {
+    if !matches!(effective_status.as_str(), "paused" | "stopped") {
         bail!(
-            "live deployment {deploy_id} must be paused before upgrade; current status is {effective_status}"
+            "live deployment {deploy_id} must be paused or stopped before upgrade; current status is {effective_status}"
         );
     }
 
@@ -383,13 +321,15 @@ fn remove_live_deployment(deploy_id: &str, force: bool) -> Result<()> {
         if !force {
             bail!("live deployment {deploy_id} is running; pause it first or pass --force");
         }
-        if let Some(pid) = metadata.pid {
-            terminate_process(pid)?;
-            if !wait_for_process_exit(pid, Duration::from_secs(30)) {
-                bail!("timed out waiting for live deployment {deploy_id} pid {pid} to exit");
-            }
-        }
+        daemon::request(&Request::Stop {
+            deploy_id: metadata.deploy_id.clone(),
+            timeout_seconds: 30,
+        })?;
     }
+
+    daemon::request(&Request::Remove {
+        deploy_id: metadata.deploy_id.clone(),
+    })?;
 
     unregister_live_deployment(&dir);
     std::fs::remove_dir_all(&dir).with_context(|| {
@@ -447,6 +387,7 @@ impl LiveStatusFilter {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             LiveStatusFilter::Running => "running",
+            LiveStatusFilter::Restarting => "restarting",
             LiveStatusFilter::Paused => "paused",
             LiveStatusFilter::Stopped => "stopped",
             LiveStatusFilter::RuntimeError => "runtime-error",
@@ -462,32 +403,13 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
         "--live-deploy-dir".to_string(),
         deployment_dir.to_string_lossy().to_string(),
         args.strategy.to_string_lossy().to_string(),
-        "--data".to_string(),
-        args.data.to_string_lossy().to_string(),
     ];
 
-    // Propagate the REST catalog flags so the detached child connects to the
-    // same market-data catalog the launcher was told to use.
-    if let Some(value) = &args.data_catalog {
-        values.extend(["--data-catalog".to_string(), value.clone()]);
+    if let Some(value) = &args.data_sidecar {
+        values.extend(["--data-sidecar".to_string(), value.clone()]);
     }
-    if let Some(value) = &args.data_warehouse {
-        values.extend(["--data-warehouse".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.data_sigv4_region {
-        values.extend(["--data-sigv4-region".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.data_sigv4_name {
-        values.extend(["--data-sigv4-name".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.data_namespace {
-        values.extend(["--data-namespace".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.data_provider_historical {
-        values.extend(["--data-provider-historical".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.data_provider_live {
-        values.extend(["--data-provider-live".to_string(), value.clone()]);
+    if let Some(value) = &args.live_data_feed {
+        values.extend(["--live-data-feed".to_string(), value.clone()]);
     }
     if let Some(value) = &args.brokerage {
         values.extend(["--brokerage".to_string(), value.clone()]);
@@ -579,20 +501,6 @@ fn deployment_strategy_path(metadata: &LiveDeploymentMetadata, dir: &Path) -> Pa
     )
 }
 
-/// Flags that older rlean builds baked into saved live-deployment commands but
-/// that this build no longer accepts. Replaying a stored command containing one
-/// of these would abort clap parsing with "unexpected argument", so they are
-/// dropped before a deployment is resumed. All entries are boolean flags (they
-/// take no value), so removing the token alone is sufficient.
-const STALE_LIVE_COMMAND_FLAGS: &[&str] = &["--no-compact"];
-
-/// Remove obsolete flags (see [`STALE_LIVE_COMMAND_FLAGS`]) from a stored
-/// live-deployment command so an old deployment resumes cleanly under the
-/// current CLI.
-fn strip_stale_command_flags(command: &mut Vec<String>) {
-    command.retain(|arg| !STALE_LIVE_COMMAND_FLAGS.contains(&arg.as_str()));
-}
-
 fn rewrite_live_command_strategy(command: &mut [String], deployment_strategy: &Path) {
     let Some(last_strategy_arg) = command
         .iter()
@@ -672,7 +580,13 @@ fn confirm_live_deployment_started(
             return Ok(metadata);
         }
 
-        if is_terminal_live_status(&metadata.status) || !process_is_alive(pid) {
+        // The daemon can return the new child pid before that child replaces a
+        // previous terminal deployment.json snapshot with `running`. Treat a
+        // terminal status as belonging to this launch only after the snapshot
+        // carries this exact pid; otherwise keep waiting while the child lives.
+        if (is_terminal_live_status(&metadata.status) && metadata.pid == Some(pid))
+            || !process_is_alive(pid)
+        {
             bail!(
                 "live deployment {} exited during startup; status={}{}{}; log={}",
                 metadata.deploy_id,
@@ -715,6 +629,11 @@ pub(crate) fn update_live_deployment_status(
     };
     metadata.status = status.to_string();
     metadata.updated_at = chrono::Utc::now().to_rfc3339();
+    if status == "running" {
+        metadata.error = None;
+        metadata.exit_code = None;
+        metadata.stopped = None;
+    }
     if let Some(error) = error {
         metadata.error = Some(error);
     }
@@ -816,45 +735,6 @@ fn process_is_alive(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-fn terminate_process(pid: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        Err(error).with_context(|| format!("failed to terminate pid {pid}"))
-    }
-    #[cfg(not(unix))]
-    {
-        let status = ProcessCommand::new("kill")
-            .arg(pid.to_string())
-            .status()
-            .with_context(|| format!("failed to invoke kill for pid {pid}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        bail!("failed to terminate pid {pid}: kill exited with {status}");
-    }
-}
-
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !process_is_alive(pid) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn register_live_deployment(dir: &Path) {
@@ -1031,14 +911,9 @@ mod tests {
         let args = RunArgs {
             strategy: PathBuf::from("/tmp/strategy/main.py"),
             runtime: RuntimeArgs {
-                data: PathBuf::from("/tmp/data"),
-                data_catalog: None,
-                data_warehouse: None,
-                data_sigv4_region: None,
-                data_sigv4_name: None,
-                data_namespace: None,
-                data_provider_historical: Some("hyperliquid".to_string()),
-                data_provider_live: Some("hyperliquid".to_string()),
+                data_sidecar: Some("tcp://127.0.0.1:50051".to_string()),
+                data_sidecar_token: None,
+                live_data_feed: Some("tradier".to_string()),
                 brokerage: Some("hyperliquid".to_string()),
                 start_date: None,
                 end_date: None,
@@ -1062,6 +937,9 @@ mod tests {
         assert!(child_args.contains(&"/tmp/strategy/live/deploy".to_string()));
         assert!(child_args.contains(&"--parameter".to_string()));
         assert!(child_args.contains(&"foo=bar".to_string()));
+        assert!(child_args.contains(&"--data-sidecar".to_string()));
+        assert!(child_args.contains(&"--live-data-feed".to_string()));
+        assert!(!child_args.contains(&"--data-sidecar-token".to_string()));
         assert!(child_args.contains(&"--verbose".to_string()));
     }
 
@@ -1074,72 +952,15 @@ mod tests {
             "--live-deploy-dir".to_string(),
             "/tmp/deploy".to_string(),
             "/tmp/source/main.py".to_string(),
-            "--data".to_string(),
-            "/tmp/data".to_string(),
+            "--parameter".to_string(),
+            "mode=review".to_string(),
             "--verbose".to_string(),
         ];
 
         rewrite_live_command_strategy(&mut command, Path::new("/tmp/deploy/code/main.py"));
 
         assert_eq!(command[5], "/tmp/deploy/code/main.py");
-        assert_eq!(command[7], "/tmp/data");
-    }
-
-    #[test]
-    fn test_strip_stale_command_flags_drops_no_compact() {
-        // A deployment saved by an older rlean carried `--no-compact`; resuming
-        // must strip it so clap does not reject the replayed command.
-        let mut command = vec![
-            "/usr/local/bin/rlean".to_string(),
-            "live".to_string(),
-            "--foreground".to_string(),
-            "--live-deploy-dir".to_string(),
-            "/tmp/deploy".to_string(),
-            "/tmp/source/main.py".to_string(),
-            "--data".to_string(),
-            "/tmp/data".to_string(),
-            "--no-compact".to_string(),
-            "--verbose".to_string(),
-        ];
-
-        strip_stale_command_flags(&mut command);
-
-        assert!(
-            !command.contains(&"--no-compact".to_string()),
-            "the stale --no-compact flag must be removed"
-        );
-        // Everything else is preserved and order is intact.
-        assert_eq!(
-            command,
-            vec![
-                "/usr/local/bin/rlean".to_string(),
-                "live".to_string(),
-                "--foreground".to_string(),
-                "--live-deploy-dir".to_string(),
-                "/tmp/deploy".to_string(),
-                "/tmp/source/main.py".to_string(),
-                "--data".to_string(),
-                "/tmp/data".to_string(),
-                "--verbose".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_strip_stale_command_flags_noop_without_stale_flags() {
-        let mut command = vec![
-            "/usr/local/bin/rlean".to_string(),
-            "live".to_string(),
-            "--foreground".to_string(),
-            "/tmp/source/main.py".to_string(),
-            "--data".to_string(),
-            "/tmp/data".to_string(),
-        ];
-        let expected = command.clone();
-
-        strip_stale_command_flags(&mut command);
-
-        assert_eq!(command, expected);
+        assert_eq!(command[7], "mode=review");
     }
 
     #[test]
@@ -1162,9 +983,6 @@ mod tests {
             stopped: Some("2026-06-22T00:01:00Z".to_string()),
             updated_at: "2026-06-22T00:01:00Z".to_string(),
             brokerage: Some("paper".to_string()),
-            data_provider_live: Some("tradier".to_string()),
-            data_provider_historical: None,
-            data: PathBuf::from("/tmp/data"),
             paper_trading: true,
             command: vec![
                 "/usr/local/bin/rlean".to_string(),

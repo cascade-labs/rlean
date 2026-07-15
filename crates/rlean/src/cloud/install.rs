@@ -1,11 +1,10 @@
-//! `rlean cloud install` — provision a runnable rlean + plugins + `~/.rlean`
-//! subset onto a registered node.
+//! `rlean cloud install` — provision rlean, rleand, and their configuration.
 //!
 //! Bundles are downloaded on the CONTROL machine with `gh release download`
 //! (the node never needs `gh` creds — the private cascadelabs repo is only
 //! reachable with the operator's local gh auth), verified against their
 //! `.sha256` sidecars, unpacked locally, then shipped to the node over
-//! scp/rsync. Secrets (`plugin-configs.json`) are transferred as FILES only,
+//! scp/rsync. Secrets (`integration-configs.json`) are transferred as files only,
 //! never as ssh argv, and chmod 0600 on the node.
 
 use std::path::{Path, PathBuf};
@@ -18,7 +17,7 @@ use sha2::{Digest, Sha256};
 use super::nodeconfig::node_config_from_local;
 use super::registry::NodeRegistry;
 use super::remote::{scp_to, RemoteExec};
-use crate::config::{atomic_write, plugin_configs_path, GlobalConfig};
+use crate::config::{atomic_write, integration_configs_path, GlobalConfig};
 
 /// Default release tag for cloud bundles. A `const` so it is easy to bump.
 pub(crate) const DEFAULT_RELEASE_TAG: &str = "v0.1.1";
@@ -29,102 +28,6 @@ const RLEAN_REPO: &str = "cascade-labs/rlean";
 /// The only node triple we ship cloud bundles for today.
 const SUPPORTED_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 
-/// A plugin to install: which repo/tag to pull it from and its plugin name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PluginSource {
-    pub repo: String,
-    pub tag: String,
-    pub name: String,
-}
-
-/// The default plugin set for a cloud deploy.
-fn default_plugin_sources(tag: &str) -> Vec<PluginSource> {
-    let plugins_repo = "cascade-labs/rlean-plugins";
-    let cascade_repo = "cascade-labs/cascadelabs-plugins";
-    vec![
-        PluginSource {
-            repo: plugins_repo.to_string(),
-            tag: tag.to_string(),
-            name: "tradier".to_string(),
-        },
-        PluginSource {
-            repo: plugins_repo.to_string(),
-            tag: tag.to_string(),
-            name: "massive".to_string(),
-        },
-        PluginSource {
-            repo: plugins_repo.to_string(),
-            tag: tag.to_string(),
-            name: "thetadata".to_string(),
-        },
-        PluginSource {
-            repo: cascade_repo.to_string(),
-            tag: tag.to_string(),
-            name: "unusual_whales".to_string(),
-        },
-    ]
-}
-
-/// Resolve the effective plugin set from the defaults, an optional name filter,
-/// and repeatable `--plugin-repo owner/repo:tag` overrides.
-///
-/// - `--plugin-repo owner/repo:tag` entries are ADDED to the set (their plugin
-///   name is derived later from the bundle manifest, so here we register them
-///   with a synthetic name of the repo's leaf when no matching default name is
-///   present). To keep name resolution deterministic we require each override
-///   to also carry a `#name` fragment OR match a default plugin by name.
-/// - When `--plugin name...` filters are given, only default plugins whose name
-///   appears in the filter survive; overrides always survive.
-pub(crate) fn resolve_plugin_sources(
-    default_tag: &str,
-    name_filters: &[String],
-    repo_overrides: &[String],
-) -> Result<Vec<PluginSource>> {
-    let mut sources: Vec<PluginSource> = if name_filters.is_empty() {
-        default_plugin_sources(default_tag)
-    } else {
-        default_plugin_sources(default_tag)
-            .into_iter()
-            .filter(|p| name_filters.iter().any(|f| f == &p.name))
-            .collect()
-    };
-
-    for raw in repo_overrides {
-        sources.push(parse_plugin_repo_override(raw, default_tag)?);
-    }
-
-    if sources.is_empty() {
-        bail!("no plugins selected — check --plugin filters against the default set");
-    }
-    Ok(sources)
-}
-
-/// Parse a `--plugin-repo owner/repo:tag[#name]` override. The tag defaults to
-/// `default_tag` when omitted; the plugin name defaults to the repo's leaf.
-fn parse_plugin_repo_override(raw: &str, default_tag: &str) -> Result<PluginSource> {
-    // Split an optional `#name` fragment first.
-    let (repo_tag, name_frag) = match raw.split_once('#') {
-        Some((rt, n)) => (rt, Some(n.to_string())),
-        None => (raw, None),
-    };
-    let (repo, tag) = match repo_tag.rsplit_once(':') {
-        Some((r, t)) if r.contains('/') => (r.to_string(), t.to_string()),
-        // No `:tag` (or the `:` was inside the owner) → use the default tag.
-        _ => (repo_tag.to_string(), default_tag.to_string()),
-    };
-    if !repo.contains('/') {
-        bail!("invalid --plugin-repo '{raw}': expected owner/repo[:tag][#name]");
-    }
-    let name = name_frag.unwrap_or_else(|| {
-        repo.rsplit('/')
-            .next()
-            .unwrap_or(&repo)
-            .trim_start_matches("rlean-plugin-")
-            .to_string()
-    });
-    Ok(PluginSource { repo, tag, name })
-}
-
 // ── Bundle manifests ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -132,24 +35,7 @@ struct RleanManifest {
     version: String,
     triple: String,
     sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PluginManifest {
-    plugin: String,
-    lib: String,
-    version: String,
-    triple: String,
-    sha256: String,
-}
-
-/// A resolved plugin bundle ready to ship: the unpacked `.so` path plus its
-/// manifest fields.
-struct UnpackedPlugin {
-    plugin: String,
-    lib: String,
-    version: String,
-    sha256_short: String,
+    rleand_sha256: String,
 }
 
 // ── sha256 verification ─────────────────────────────────────────────────────────
@@ -281,7 +167,6 @@ fn find_one(dir: &Path, predicate: impl Fn(&str) -> bool, what: &str) -> Result<
 pub(crate) struct InstallSummary {
     pub node: String,
     pub rlean_version: String,
-    pub plugins: Vec<(String, String)>, // (name, sha256 short)
     pub version_output: String,
 }
 
@@ -295,8 +180,6 @@ pub(crate) fn cmd_install(
     reg: &NodeRegistry,
     name: &str,
     release_tag: &str,
-    plugin_filters: &[String],
-    plugin_repos: &[String],
     artifact_endpoint: Option<&str>,
 ) -> Result<InstallSummary> {
     // 1. Resolve node + validate triple.
@@ -324,13 +207,6 @@ pub(crate) fn cmd_install(
         tmp_path,
     )?;
 
-    let plugin_sources = resolve_plugin_sources(release_tag, plugin_filters, plugin_repos)?;
-    for src in &plugin_sources {
-        let glob = format!("plugin-{}-*-{SUPPORTED_TRIPLE}.tar.gz", src.name);
-        gh_release_download(&src.repo, &src.tag, &glob, tmp_path)?;
-        gh_release_download(&src.repo, &src.tag, &format!("{glob}.sha256"), tmp_path)?;
-    }
-
     // 3. Verify + unpack the rlean bundle.
     let rlean_tarball = find_one(
         tmp_path,
@@ -349,38 +225,8 @@ pub(crate) fn cmd_install(
     }
     let rlean_bin = rlean_unpack.join("rlean");
     verify_inner_sha256(&rlean_bin, &rlean_manifest.sha256)?;
-
-    // 3b. Verify + unpack each plugin bundle.
-    let mut plugins = Vec::new();
-    for src in &plugin_sources {
-        let tarball = find_one(
-            tmp_path,
-            |n| n.starts_with(&format!("plugin-{}-", src.name)) && n.ends_with(".tar.gz"),
-            &format!("plugin bundle for {}", src.name),
-        )?;
-        verify_tarball_sha256(&tarball)?;
-        let unpack = tmp_path.join(format!("plugin-{}-unpack", src.name));
-        extract_tar_gz(&tarball, &unpack)?;
-        let manifest: PluginManifest = read_manifest(&unpack.join("manifest.json"))?;
-        if manifest.triple != SUPPORTED_TRIPLE {
-            bail!(
-                "plugin '{}' bundle triple '{}' does not match node platform '{SUPPORTED_TRIPLE}'",
-                src.name,
-                manifest.triple
-            );
-        }
-        let so = unpack.join(&manifest.lib);
-        verify_inner_sha256(&so, &manifest.sha256)?;
-        plugins.push((
-            UnpackedPlugin {
-                plugin: manifest.plugin,
-                lib: manifest.lib,
-                version: manifest.version,
-                sha256_short: manifest.sha256.chars().take(12).collect(),
-            },
-            so,
-        ));
-    }
+    let rleand_bin = rlean_unpack.join("rleand");
+    verify_inner_sha256(&rleand_bin, &rlean_manifest.rleand_sha256)?;
 
     // 4. Create node dirs.
     ssh_ok(
@@ -390,11 +236,24 @@ pub(crate) fn cmd_install(
             "mkdir",
             "-p",
             "~/.local/bin",
-            "~/.rlean/plugins",
             "~/rlean-cloud/data",
             "~/rlean-cloud/workspace",
         ],
         "create node directories",
+    )?;
+    let daemon_tmp = "~/.local/bin/rleand.new";
+    scp_to(ssh, &rleand_bin, daemon_tmp)?;
+    ssh_ok(
+        exec,
+        ssh,
+        &["chmod", "+x", daemon_tmp],
+        "chmod +x rleand binary",
+    )?;
+    ssh_ok(
+        exec,
+        ssh,
+        &["mv", "-f", daemon_tmp, "~/.local/bin/rleand"],
+        "install rleand binary",
     )?;
 
     // 5. Ship the rlean binary atomically (temp name → chmod → mv).
@@ -413,25 +272,6 @@ pub(crate) fn cmd_install(
         "install rlean binary",
     )?;
 
-    // 5b. Ship each plugin atomically (temp name → mv), like the binary.
-    // scp'ing straight over the destination truncates the file in place; a
-    // running rlean has these libraries dlopen'd, and rewriting a mapped .so
-    // corrupts its text pages and crashes the process (observed as a core
-    // dump inside librlean_plugin_tradier.so during a node upgrade). rename()
-    // swaps the directory entry while the old inode lives on for any process
-    // that already mapped it.
-    for (plugin, so) in &plugins {
-        let dest = format!("~/.rlean/plugins/{}", plugin.lib);
-        let dest_tmp = format!("{dest}.new");
-        scp_to(ssh, so, &dest_tmp)?;
-        ssh_ok(
-            exec,
-            ssh,
-            &["mv", "-f", &dest_tmp, &dest],
-            "install plugin library",
-        )?;
-    }
-
     // 6. Generate the node config locally, ship it, chmod 0600.
     let local_config = GlobalConfig::load().context("failed to read local ~/.rlean/config")?;
     let node_home = probe_node_home(exec, ssh)?;
@@ -447,19 +287,33 @@ pub(crate) fn cmd_install(
         "chmod config",
     )?;
 
-    // 7. Copy plugin-configs.json verbatim (secret file, never argv).
-    let local_plugin_configs = plugin_configs_path()?;
-    if local_plugin_configs.exists() {
-        scp_to(ssh, &local_plugin_configs, "~/.rlean/plugin-configs.json")?;
+    // 7. Copy integration credentials verbatim (secret file, never argv).
+    let local_integration_configs = integration_configs_path()?;
+    if local_integration_configs.exists() {
+        scp_to(
+            ssh,
+            &local_integration_configs,
+            "~/.rlean/integration-configs.json",
+        )?;
         ssh_ok(
             exec,
             ssh,
-            &["chmod", "0600", "~/.rlean/plugin-configs.json"],
-            "chmod plugin-configs.json",
+            &["chmod", "0600", "~/.rlean/integration-configs.json"],
+            "chmod integration-configs.json",
         )?;
     }
 
-    // 8. Verify by running the installed binary.
+    // 8. Install rleand as the node's persistent user service. All subsequent
+    // cloud deployments are submitted to this supervisor; no nohup/setsid
+    // process is left behind by the SSH session.
+    ssh_ok(
+        exec,
+        ssh,
+        &["~/.local/bin/rlean", "daemon", "install"],
+        "install and start rleand",
+    )?;
+
+    // 9. Verify by running the installed binary.
     let version = exec.run(ssh, &["~/.local/bin/rlean", "--version"])?;
     if version.status != 0 {
         bail!(
@@ -473,18 +327,7 @@ pub(crate) fn cmd_install(
     Ok(InstallSummary {
         node: name.to_string(),
         rlean_version: rlean_manifest.version,
-        plugins: plugins
-            .iter()
-            .map(|(p, _)| (p.plugin.clone(), p.sha256_short.clone()))
-            .collect(),
-        version_output: if version_output.is_empty() {
-            plugins
-                .first()
-                .map(|(p, _)| format!("rlean {}", p.version))
-                .unwrap_or_default()
-        } else {
-            version_output
-        },
+        version_output,
     })
 }
 
@@ -537,58 +380,6 @@ fn ssh_ok(exec: &dyn RemoteExec, ssh: &str, argv: &[&str], what: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_plugins_have_expected_repos() {
-        let set = default_plugin_sources("v1");
-        let names: Vec<&str> = set.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["tradier", "massive", "thetadata", "unusual_whales"]
-        );
-        assert_eq!(set[0].repo, "cascade-labs/rlean-plugins");
-        assert_eq!(set[3].repo, "cascade-labs/cascadelabs-plugins");
-        assert!(set.iter().all(|p| p.tag == "v1"));
-    }
-
-    #[test]
-    fn plugin_name_filter_selects_subset() {
-        let set = resolve_plugin_sources("v1", &["tradier".to_string()], &[]).unwrap();
-        assert_eq!(set.len(), 1);
-        assert_eq!(set[0].name, "tradier");
-    }
-
-    #[test]
-    fn repo_override_parsed_with_tag_and_name() {
-        let src = parse_plugin_repo_override("acme/rlean-plugin-foo:v2#foo", "v1").unwrap();
-        assert_eq!(src.repo, "acme/rlean-plugin-foo");
-        assert_eq!(src.tag, "v2");
-        assert_eq!(src.name, "foo");
-    }
-
-    #[test]
-    fn repo_override_defaults_tag_and_derives_name() {
-        let src = parse_plugin_repo_override("acme/rlean-plugin-bar", "vDEF").unwrap();
-        assert_eq!(src.tag, "vDEF");
-        assert_eq!(src.name, "bar");
-    }
-
-    #[test]
-    fn repo_override_rejects_missing_owner() {
-        assert!(parse_plugin_repo_override("noslash", "v1").is_err());
-    }
-
-    #[test]
-    fn resolve_adds_overrides_to_filtered_set() {
-        let set = resolve_plugin_sources(
-            "v1",
-            &["thetadata".to_string()],
-            &["acme/rlean-plugin-x:v9#x".to_string()],
-        )
-        .unwrap();
-        let names: Vec<&str> = set.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["thetadata", "x"]);
-    }
 
     #[test]
     fn sha256_sidecar_parses_bare_and_coreutils_forms() {

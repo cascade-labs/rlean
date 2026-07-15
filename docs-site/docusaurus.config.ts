@@ -75,7 +75,6 @@ const config: Config = {
           items: [
             {label: 'API (rustdoc)', href: '/rlean/api/'},
             {label: 'GitHub', href: 'https://github.com/cascade-labs/rlean'},
-            {label: 'Plugins', href: 'https://github.com/cascade-labs/rlean-plugins'},
           ],
         },
       ],

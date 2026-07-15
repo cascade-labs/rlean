@@ -11,9 +11,8 @@
 #   scripts/publish-crates.sh --dry-run    # dry-run only; no upload
 #
 # In --dry-run mode only the crates with no internal path dependencies
-# (rlean-core, rlean-plugin) can be fully verified, because cargo cannot resolve an
-# unpublished workspace sibling from the registry during a dry run. Those two are a
-# meaningful smoke test that packaging + metadata are valid end to end.
+# (`rlean-core`) can be fully verified, because cargo cannot resolve an
+# unpublished workspace sibling from the registry during a dry run.
 set -euo pipefail
 
 DRY_RUN=0
@@ -27,7 +26,6 @@ cd "$(dirname "$0")/.."
 #   cargo metadata --format-version 1 --no-deps | scripts/publish-order.py
 ORDER=(
   rlean-core
-  rlean-plugin
   rlean-data
   rlean-scheduling
   rlean-statistics
@@ -35,11 +33,9 @@ ORDER=(
   rlean-indicators
   rlean-optimization
   rlean-orders
-  rlean-storage
   rlean-universe
   rlean-alpha
   rlean-crypto
-  rlean-data-providers
   rlean-execution
   rlean-forex
   rlean-futures
@@ -57,7 +53,7 @@ ORDER=(
 
 # Crates that have no internal (workspace) path dependencies and can therefore be
 # fully dry-run-verified against the registry on their own.
-LEAF_CRATES=" rlean-core rlean-plugin "
+LEAF_CRATES=" rlean-core "
 
 version() {
   awk '

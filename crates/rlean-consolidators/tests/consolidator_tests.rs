@@ -8,7 +8,7 @@ use rlean_consolidators::{
     TradeBarConsolidator, VolumeConsolidator,
 };
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal_macros::dec;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ fn bar_at(
     let period = TimeSpan::ONE_MINUTE;
     TradeBar {
         symbol,
+        venue: None,
         time: ts(time_nanos),
         end_time: ts(time_nanos + period.nanos),
         open,
@@ -72,6 +73,7 @@ fn daily_bar_at(
     let period = TimeSpan::ONE_DAY;
     TradeBar {
         symbol: spy(),
+        venue: None,
         time: ts(time_nanos),
         end_time: ts(time_nanos + period.nanos),
         open,

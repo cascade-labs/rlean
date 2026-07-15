@@ -3,7 +3,7 @@ use crate::{
     sma::Sma,
 };
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal_macros::dec;
 
 /// Awesome Oscillator. SMA(midpoint,5) - SMA(midpoint,34).

@@ -3,11 +3,12 @@
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyList};
-use rlean_algorithm::lifecycle::CustomUniverseSelectFn;
+use rlean_algorithm::lifecycle::{CustomUniverseSelectFn, FundamentalUniverseSelectFn};
 use rlean_algorithm::FrameworkModelRegistry;
 use rlean_alpha::{IAlphaModel, Insight};
 use rlean_core::{DateTime, Market, Resolution, SecurityType, Symbol};
-use rlean_data::{CustomDataPoint, CustomDataQuery, Slice};
+use rlean_data::{CustomDataQuery, FundamentalData, Slice};
+use rlean_data_tables::CustomDataPoint;
 use rlean_execution::{ExecutionContext, ExecutionTarget, IExecutionModel, OrderRequest};
 use rlean_portfolio_construction::{
     IPortfolioConstructionModel, InsightForPcm, PortfolioTarget, RebalancePolicy,
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::algorithm::{AlgorithmApi, AlgorithmHandle};
-use crate::data::{CustomDataPointView, SharedSliceFrame, SliceView};
+use crate::data::{CustomDataPointView, FundamentalDataView, SharedSliceFrame, SliceView};
 use crate::framework::{
     create_immediate_execution_model, create_insight_weighting_pcm, create_max_sharpe_ratio_pcm,
     create_mean_variance_pcm, create_null_risk_management_model, insight_from_projection,
@@ -594,6 +595,61 @@ pub fn register_custom_universe(
             select,
         },
     );
+    Ok(())
+}
+
+/// Register LEAN's modern `AddUniverse(Func<IEnumerable<Fundamental>, ...>)`
+/// overload. The provider name is intentionally fixed here: a Python strategy
+/// asks for the canonical USA fundamental universe, not a vendor-specific
+/// custom-data source.
+pub fn register_fundamental_universe(
+    _py: Python<'_>,
+    handle: &AlgorithmHandle,
+    selector: Py<PyAny>,
+) -> PyResult<()> {
+    let settings = handle.universe_settings().snapshot();
+    let source_type = "massive".to_string();
+    {
+        let state = handle.inner();
+        let mut algorithm = state.lock().unwrap();
+        AlgorithmApi::new(&mut algorithm)
+            .add_fundamental_universe_data(&source_type, Resolution::Daily);
+    }
+
+    let callback = selector;
+    let selector_settings = settings.clone();
+    let select: FundamentalUniverseSelectFn =
+        Arc::new(move |fundamentals: &[FundamentalData]| {
+            Python::attach(|py| -> PyResult<Vec<Symbol>> {
+                let py_fundamentals = PyList::empty(py);
+                for fundamental in fundamentals {
+                    py_fundamentals.append(FundamentalDataView::new(fundamental.clone()))?;
+                }
+                // Fundamental selectors return actual Symbol objects in LEAN. The
+                // existing extractor accepts both symbols and ticker strings, so
+                // retain that ergonomic compatibility.
+                let descriptor = ScheduledUniverseDescriptor::user_defined(
+                    Resolution::Daily,
+                    selector_settings.clone(),
+                    SecurityType::Equity,
+                    Market::usa(),
+                );
+                let result = callback.bind(py).call1((py_fundamentals,))?;
+                extract_selector_tickers(&result, &descriptor)
+            })
+            .unwrap_or_default()
+        });
+    handle
+        .runtime_services()
+        .register_fundamental_universe_selector(
+            rlean_algorithm::lifecycle::FundamentalUniverseSelectorRegistrationRequest {
+                source_type,
+                resolution: Resolution::Daily,
+                settings_resolution: settings.resolution,
+                minimum_time_in_universe_secs: settings.minimum_time_in_universe_secs,
+                select,
+            },
+        );
     Ok(())
 }
 

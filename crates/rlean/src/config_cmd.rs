@@ -1,37 +1,21 @@
-/// `rlean config` — get/set/list workspace and plugin configuration
+use crate::config::{GlobalConfig, IntegrationConfigs, WorkspaceConfig};
+/// `rlean config` — get/set/list workspace and sidecar integration configuration
 ///
-/// Plugin config is stored per-plugin in ~/.rlean/plugin-configs.json.
+/// Integration credentials are stored in ~/.rlean/integration-configs.json.
 /// Workspace settings are stored in ~/.rlean/config and rlean.json.
 ///
 /// Known keys:
 ///   default-language            python | csharp
-///   data_catalog                REST Iceberg catalog base URI (required to run)
-///   data_warehouse              Warehouse id / S3 Tables table-bucket ARN
-///   data_sigv4_region           SigV4 signing region (e.g. us-west-2)
-///   data_sigv4_name             SigV4 signing name (default s3tables)
-///   data_namespace              Iceberg namespace for cache tables (default lean)
-///   data_refresh_secs           Snapshot recheck interval, seconds (default 30, 0 = every read)
-///   data_s3_endpoint            Required S3 endpoint for Iceberg data-file I/O
-///   data_s3_region              Required region for the configured data S3 endpoint
-///   data_s3_access_key_id       Required access key id for the configured data endpoint
-///   data_s3_secret_access_key   Required secret access key for the configured data endpoint
-///   data-folder                 Parquet data root (relative to rlean.json)
-///   s3_access_key               S3-compatible access key
-///   s3_secret_key               S3-compatible secret key
-///   s3_bucket                   S3 bucket name
-///   s3_endpoint                 S3-compatible endpoint URL
-///   s3_region                   S3 region
+///   data_sidecar                Arrow Flight sidecar endpoint (e.g. grpc://127.0.0.1:7410)
+///   data_sidecar_token          Optional sidecar authentication token
 ///   artifact_store              Run artifact relay mode: local | s3 | mirror
 ///   artifact_s3                 Artifact destination: s3://bucket/prefix
-///   artifact_s3_endpoint        Artifact endpoint URL (falls back to s3_endpoint)
-///   artifact_s3_region          Artifact region (falls back to s3_region)
-///   artifact_s3_access_key      Artifact access key (falls back to s3_access_key)
-///   artifact_s3_secret_key      Artifact secret key (falls back to s3_secret_key)
-///   <plugin>.<key>              Plugin-specific config (e.g. thetadata.api_key)
+///   artifact_s3_endpoint        Artifact endpoint URL
+///   artifact_s3_region          Artifact region
+///   artifact_s3_access_key      Artifact access key
+///   artifact_s3_secret_key      Artifact secret key
+///   <integration>.<key>         Sidecar integration config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
-use std::path::{Path, PathBuf};
-
-use crate::config::{GlobalConfig, PluginConfigs, WorkspaceConfig};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
 
@@ -45,7 +29,7 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Set a configuration value
     Set {
-        /// Config key (e.g. default-language, data_catalog, thetadata.api_key)
+        /// Config key (e.g. default-language, data_sidecar, tradier.access_token)
         key: String,
         /// Value to set
         value: String,
@@ -72,12 +56,16 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_set(key: &str, value: &str) -> Result<()> {
-    // Dotted keys are plugin config: e.g. "thetadata.api_key"
-    if let Some((plugin, subkey)) = key.split_once('.') {
-        let mut configs = PluginConfigs::load()?;
-        configs.set_key(plugin, subkey, serde_json::Value::String(value.to_string()));
+    // Dotted keys configure a named sidecar integration.
+    if let Some((integration, subkey)) = key.split_once('.') {
+        let mut configs = IntegrationConfigs::load()?;
+        configs.set_key(
+            integration,
+            subkey,
+            serde_json::Value::String(value.to_string()),
+        );
         configs.save()?;
-        println!("Set {plugin}.{subkey} in ~/.rlean/plugin-configs.json");
+        println!("Set {integration}.{subkey} in ~/.rlean/integration-configs.json");
         return Ok(());
     }
 
@@ -98,40 +86,15 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             }
             println!("Set default-language = {value}");
         }
-        "data-folder" => {
-            let cwd = std::env::current_dir()?;
-            if let Some((workspace, mut cfg)) = crate::config::find_workspace_config(&cwd)? {
-                cfg.data_folder = value.to_string();
-                cfg.save(&workspace)?;
-                println!(
-                    "Set data-folder = {value} in {}",
-                    workspace.join("rlean.json").display()
-                );
+        "data_sidecar" | "data_sidecar_token" => {
+            let mut cfg = GlobalConfig::load()?;
+            set_sidecar_key(&mut cfg, key, value.to_string())?;
+            cfg.save()?;
+            if key == "data_sidecar_token" {
+                println!("Set {key} in ~/.rlean/config");
             } else {
-                let mut cfg = GlobalConfig::load()?;
-                cfg.data_folder = Some(value.to_string());
-                cfg.save()?;
-                println!("Set data-folder = {value} in ~/.rlean/config");
+                println!("Set {key} = {value} in ~/.rlean/config");
             }
-        }
-        "data_catalog" | "data_warehouse" | "data_sigv4_region" | "data_sigv4_name"
-        | "data_namespace" => {
-            let mut cfg = GlobalConfig::load()?;
-            set_catalog_key(&mut cfg, key, value.to_string())?;
-            cfg.save()?;
-            println!("Set {key} = {value} in ~/.rlean/config");
-        }
-        "data_refresh_secs" => {
-            let parsed: u64 = value.parse().map_err(|_| {
-                anyhow::anyhow!(
-                    "data_refresh_secs must be a non-negative integer number of seconds \
-                     (0 rechecks every read), got '{value}'"
-                )
-            })?;
-            let mut cfg = GlobalConfig::load()?;
-            cfg.data_refresh_secs = Some(parsed);
-            cfg.save()?;
-            println!("Set data_refresh_secs = {parsed} in ~/.rlean/config");
         }
         "artifact_store" => {
             if rlean_engine::ArtifactStoreMode::parse(value).is_none() {
@@ -145,16 +108,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             cfg.save()?;
             println!("Set artifact_store = {value} in ~/.rlean/config");
         }
-        "data_s3_endpoint"
-        | "data_s3_region"
-        | "data_s3_access_key_id"
-        | "data_s3_secret_access_key"
-        | "s3_access_key"
-        | "s3_secret_key"
-        | "s3_bucket"
-        | "s3_endpoint"
-        | "s3_region"
-        | "artifact_s3"
+        "artifact_s3"
         | "artifact_s3_endpoint"
         | "artifact_s3_region"
         | "artifact_s3_access_key"
@@ -170,11 +124,10 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
 }
 
 fn cmd_get(key: &str) -> Result<()> {
-    // Dotted keys are plugin config: e.g. "thetadata.api_key"
-    if let Some((plugin, subkey)) = key.split_once('.') {
-        let configs = PluginConfigs::load()?;
-        let plugin_cfg = configs.get_plugin(plugin);
-        match plugin_cfg.get(subkey) {
+    if let Some((integration, subkey)) = key.split_once('.') {
+        let configs = IntegrationConfigs::load()?;
+        let integration_cfg = configs.get_integration(integration);
+        match integration_cfg.get(subkey) {
             Some(serde_json::Value::String(s)) => println!("{}", mask(s)),
             Some(v) => println!("{v}"),
             None => println!("(not set)"),
@@ -187,22 +140,10 @@ fn cmd_get(key: &str) -> Result<()> {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.default_language);
         }
-        "data-folder" => {
-            let cwd = std::env::current_dir()?;
-            let value = effective_data_folder_display(&cwd)?;
-            println!("{value}");
-        }
-        "data_catalog" | "data_warehouse" | "data_sigv4_region" | "data_sigv4_name"
-        | "data_namespace" => {
+        "data_sidecar" | "data_sidecar_token" => {
             let cfg = GlobalConfig::load()?;
-            match get_catalog_key(&cfg, key)? {
-                Some(value) => println!("{value}"),
-                None => println!("(not set)"),
-            }
-        }
-        "data_refresh_secs" => {
-            let cfg = GlobalConfig::load()?;
-            match cfg.data_refresh_secs {
+            match get_sidecar_key(&cfg, key)? {
+                Some(value) if key == "data_sidecar_token" => println!("{}", mask(value)),
                 Some(value) => println!("{value}"),
                 None => println!("(not set)"),
             }
@@ -211,16 +152,7 @@ fn cmd_get(key: &str) -> Result<()> {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
         }
-        "data_s3_endpoint"
-        | "data_s3_region"
-        | "data_s3_access_key_id"
-        | "data_s3_secret_access_key"
-        | "s3_access_key"
-        | "s3_secret_key"
-        | "s3_bucket"
-        | "s3_endpoint"
-        | "s3_region"
-        | "artifact_s3"
+        "artifact_s3"
         | "artifact_s3_endpoint"
         | "artifact_s3_region"
         | "artifact_s3_access_key"
@@ -239,42 +171,21 @@ fn cmd_get(key: &str) -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let global = GlobalConfig::load()?;
-    let plugin_cfgs = PluginConfigs::load()?;
-    let cwd = std::env::current_dir()?;
-    let data_folder = effective_data_folder_display(&cwd)?;
-
+    let integration_cfgs = IntegrationConfigs::load()?;
     println!("{:<30} VALUE", "KEY");
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
-    for key in [
-        "data_catalog",
-        "data_warehouse",
-        "data_sigv4_region",
-        "data_sigv4_name",
-        "data_namespace",
-    ] {
-        if let Some(value) = get_catalog_key(&global, key)? {
-            println!("{:<30} {}", key, value);
-        }
+    if let Some(endpoint) = global.data_sidecar.as_deref() {
+        println!("{:<30} {}", "data_sidecar", endpoint);
     }
-    if let Some(secs) = global.data_refresh_secs {
-        println!("{:<30} {}", "data_refresh_secs", secs);
+    if let Some(token) = global.data_sidecar_token.as_deref() {
+        println!("{:<30} {}", "data_sidecar_token", mask(token));
     }
-    println!("{:<30} {}", "data-folder", data_folder);
     if let Some(mode) = &global.artifact_store {
         println!("{:<30} {}", "artifact_store", mode);
     }
     for key in [
-        "data_s3_endpoint",
-        "data_s3_region",
-        "data_s3_access_key_id",
-        "data_s3_secret_access_key",
-        "s3_access_key",
-        "s3_secret_key",
-        "s3_bucket",
-        "s3_endpoint",
-        "s3_region",
         "artifact_s3",
         "artifact_s3_endpoint",
         "artifact_s3_region",
@@ -291,20 +202,19 @@ fn cmd_list() -> Result<()> {
         }
     }
 
-    // Plugin configs
-    let mut plugin_names: Vec<&str> = plugin_cfgs.0.keys().map(String::as_str).collect();
-    plugin_names.sort();
+    let mut integration_names: Vec<&str> = integration_cfgs.0.keys().map(String::as_str).collect();
+    integration_names.sort();
 
-    if !plugin_names.is_empty() {
+    if !integration_names.is_empty() {
         println!();
-        println!("Plugin configs (~/.rlean/plugin-configs.json):");
+        println!("Sidecar integration configs (~/.rlean/integration-configs.json):");
         println!("{}", "-".repeat(60));
-        for plugin in plugin_names {
-            let cfg = plugin_cfgs.get_plugin(plugin);
+        for integration in integration_names {
+            let cfg = integration_cfgs.get_integration(integration);
             let mut keys: Vec<&str> = cfg.keys().map(String::as_str).collect();
             keys.sort();
             for key in keys {
-                let display_key = format!("{plugin}.{key}");
+                let display_key = format!("{integration}.{key}");
                 let display_val = match cfg.get(key) {
                     Some(serde_json::Value::String(s)) => mask(s),
                     Some(v) => v.to_string(),
@@ -328,60 +238,34 @@ fn mask(s: &str) -> String {
     format!("{}{}", &s[..4], "*".repeat(s.len() - 4))
 }
 
-fn effective_data_folder_display(start: &Path) -> Result<String> {
-    Ok(crate::config::configured_data_folder(start)?
-        .unwrap_or_else(|| PathBuf::from("data"))
-        .display()
-        .to_string())
-}
-
 fn unknown_key_message(key: &str) -> String {
     format!(
-        "Unknown key '{key}'. Known keys: default-language, data_catalog, data_warehouse, \
-         data_sigv4_region, data_sigv4_name, data_namespace, data_refresh_secs, \
-         data_s3_endpoint, data_s3_region, data_s3_access_key_id, data_s3_secret_access_key, \
-         data-folder, \
-         s3_access_key, s3_secret_key, s3_bucket, s3_endpoint, s3_region, \
+        "Unknown key '{key}'. Known keys: default-language, data_sidecar, data_sidecar_token, \
          artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
          artifact_s3_access_key, artifact_s3_secret_key. \
-         Use <plugin>.<key> for plugin config (e.g. thetadata.api_key)."
+         Use <integration>.<key> for sidecar integration config (e.g. thetadata.api_key)."
     )
 }
 
-fn set_catalog_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
+fn set_sidecar_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
     match key {
-        "data_catalog" => cfg.data_catalog = Some(value),
-        "data_warehouse" => cfg.data_warehouse = Some(value),
-        "data_sigv4_region" => cfg.data_sigv4_region = Some(value),
-        "data_sigv4_name" => cfg.data_sigv4_name = Some(value),
-        "data_namespace" => cfg.data_namespace = Some(value),
-        _ => bail!("unknown catalog config key '{key}'"),
+        "data_sidecar" => cfg.data_sidecar = Some(value),
+        "data_sidecar_token" => cfg.data_sidecar_token = Some(value),
+        _ => bail!("unknown sidecar config key '{key}'"),
     }
     Ok(())
 }
 
-fn get_catalog_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
+fn get_sidecar_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
     match key {
-        "data_catalog" => Ok(cfg.data_catalog.as_deref()),
-        "data_warehouse" => Ok(cfg.data_warehouse.as_deref()),
-        "data_sigv4_region" => Ok(cfg.data_sigv4_region.as_deref()),
-        "data_sigv4_name" => Ok(cfg.data_sigv4_name.as_deref()),
-        "data_namespace" => Ok(cfg.data_namespace.as_deref()),
-        _ => bail!("unknown catalog config key '{key}'"),
+        "data_sidecar" => Ok(cfg.data_sidecar.as_deref()),
+        "data_sidecar_token" => Ok(cfg.data_sidecar_token.as_deref()),
+        _ => bail!("unknown sidecar config key '{key}'"),
     }
 }
 
 fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
     match key {
-        "data_s3_endpoint" => cfg.data_s3_endpoint = Some(value),
-        "data_s3_region" => cfg.data_s3_region = Some(value),
-        "data_s3_access_key_id" => cfg.data_s3_access_key_id = Some(value),
-        "data_s3_secret_access_key" => cfg.data_s3_secret_access_key = Some(value),
-        "s3_access_key" => cfg.s3_access_key = Some(value),
-        "s3_secret_key" => cfg.s3_secret_key = Some(value),
-        "s3_bucket" => cfg.s3_bucket = Some(value),
-        "s3_endpoint" => cfg.s3_endpoint = Some(value),
-        "s3_region" => cfg.s3_region = Some(value),
         "artifact_s3" => cfg.artifact_s3 = Some(value),
         "artifact_s3_endpoint" => cfg.artifact_s3_endpoint = Some(value),
         "artifact_s3_region" => cfg.artifact_s3_region = Some(value),
@@ -394,15 +278,6 @@ fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
 
 fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
     match key {
-        "data_s3_endpoint" => Ok(cfg.data_s3_endpoint.as_deref()),
-        "data_s3_region" => Ok(cfg.data_s3_region.as_deref()),
-        "data_s3_access_key_id" => Ok(cfg.data_s3_access_key_id.as_deref()),
-        "data_s3_secret_access_key" => Ok(cfg.data_s3_secret_access_key.as_deref()),
-        "s3_access_key" => Ok(cfg.s3_access_key.as_deref()),
-        "s3_secret_key" => Ok(cfg.s3_secret_key.as_deref()),
-        "s3_bucket" => Ok(cfg.s3_bucket.as_deref()),
-        "s3_endpoint" => Ok(cfg.s3_endpoint.as_deref()),
-        "s3_region" => Ok(cfg.s3_region.as_deref()),
         "artifact_s3" => Ok(cfg.artifact_s3.as_deref()),
         "artifact_s3_endpoint" => Ok(cfg.artifact_s3_endpoint.as_deref()),
         "artifact_s3_region" => Ok(cfg.artifact_s3_region.as_deref()),
@@ -413,13 +288,5 @@ fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
 }
 
 fn is_secret_key(key: &str) -> bool {
-    matches!(
-        key,
-        "s3_access_key"
-            | "s3_secret_key"
-            | "artifact_s3_access_key"
-            | "artifact_s3_secret_key"
-            | "data_s3_access_key_id"
-            | "data_s3_secret_access_key"
-    )
+    matches!(key, "artifact_s3_access_key" | "artifact_s3_secret_key")
 }

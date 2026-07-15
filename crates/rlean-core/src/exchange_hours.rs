@@ -184,8 +184,62 @@ impl MarketHoursDatabase {
 }
 
 impl ExchangeHours {
+    /// Returns the first regular-session open and last regular-session close for
+    /// `date` in UTC. Holidays and closed weekdays return `None`; late-open and
+    /// early-close overrides are applied before converting through the exchange
+    /// time zone.
+    pub fn session_bounds(
+        &self,
+        date: NaiveDate,
+    ) -> Option<(NanosecondTimestamp, NanosecondTimestamp)> {
+        if self.holidays.contains(&date) {
+            return None;
+        }
+        let schedule = &self.schedule[date.weekday().num_days_from_sunday() as usize];
+        let first = schedule.sessions.first()?;
+        let last = schedule.sessions.last()?;
+        let open = self.late_opens.get(&date).copied().unwrap_or(first.open);
+        let close = self.early_closes.get(&date).copied().unwrap_or(last.close);
+        let timezone: Tz = self.timezone.parse().ok()?;
+        let midnight = timezone
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+            .earliest()?;
+        let midnight_utc = NanosecondTimestamp::from(midnight.with_timezone(&chrono::Utc));
+        Some((midnight_utc + open, midnight_utc + close))
+    }
+
     pub fn us_equity() -> Self {
         let regular = MarketSession::new(9, 30, 16, 0);
+        let early_close = TimeSpan::from_secs(13 * 60 * 60);
+        // NYSE early closes copied from LEAN's USA Equity entry in
+        // market-hours-database.json for the calendar span supported below.
+        let early_closes = [
+            (2018, 7, 3),
+            (2019, 7, 3),
+            (2023, 7, 3),
+            (2024, 7, 3),
+            (2025, 7, 3),
+            (2018, 11, 23),
+            (2019, 11, 29),
+            (2020, 11, 27),
+            (2021, 11, 26),
+            (2022, 11, 25),
+            (2023, 11, 24),
+            (2024, 11, 29),
+            (2025, 11, 28),
+            (2026, 11, 27),
+            (2018, 12, 24),
+            (2019, 12, 24),
+            (2020, 12, 24),
+            (2024, 12, 24),
+            (2025, 12, 24),
+            (2026, 12, 24),
+        ]
+        .into_iter()
+        .filter_map(|(year, month, day)| {
+            NaiveDate::from_ymd_opt(year, month, day).map(|date| (date, early_close))
+        })
+        .collect();
         ExchangeHours {
             timezone: "America/New_York".into(),
             schedule: [
@@ -198,7 +252,7 @@ impl ExchangeHours {
                 DaySchedule::closed(),      // Saturday
             ],
             holidays: Self::us_equity_holidays(),
-            early_closes: std::collections::HashMap::new(),
+            early_closes,
             late_opens: std::collections::HashMap::new(),
         }
     }
@@ -313,6 +367,16 @@ impl ExchangeHours {
     fn us_equity_holidays() -> HashSet<NaiveDate> {
         use chrono::NaiveDate;
         let mut h = HashSet::new();
+        // 2017 NYSE holidays (needed by warmup windows for 2019 starts)
+        h.insert(NaiveDate::from_ymd_opt(2017, 1, 2).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 1, 16).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 2, 20).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 4, 14).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 5, 29).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 7, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 9, 4).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 11, 23).unwrap());
+        h.insert(NaiveDate::from_ymd_opt(2017, 12, 25).unwrap());
         // 2018 NYSE holidays
         h.insert(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap());
         h.insert(NaiveDate::from_ymd_opt(2018, 1, 15).unwrap());
@@ -457,5 +521,35 @@ mod tests {
         assert!(db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()));
         assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()));
         assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 6).unwrap()));
+    }
+
+    #[test]
+    fn session_bounds_apply_exchange_timezone_and_close_overrides() {
+        let mut hours = ExchangeHours::us_equity();
+        let date = NaiveDate::from_ymd_opt(2024, 11, 29).unwrap();
+        hours
+            .early_closes
+            .insert(date, TimeSpan::from_secs(13 * 60 * 60));
+
+        let (open, close) = hours.session_bounds(date).unwrap();
+
+        assert_eq!(
+            open,
+            NanosecondTimestamp::from(
+                chrono::Utc
+                    .with_ymd_and_hms(2024, 11, 29, 14, 30, 0)
+                    .single()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            close,
+            NanosecondTimestamp::from(
+                chrono::Utc
+                    .with_ymd_and_hms(2024, 11, 29, 18, 0, 0)
+                    .single()
+                    .unwrap()
+            )
+        );
     }
 }

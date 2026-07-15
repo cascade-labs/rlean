@@ -2,7 +2,8 @@
 members = [
     "crates/rlean-core",
     "crates/rlean-data",
-    "crates/rlean-storage",
+    "crates/rlean-data-tables",
+    "crates/rlean-data-sidecar",
     "crates/rlean-engine",
     "crates/rlean-sdk",
     "crates/rlean-algorithm",
@@ -17,7 +18,6 @@ members = [
     "crates/rlean-scheduling",
     "crates/rlean-statistics",
     "crates/rlean-python-runtime",
-    "crates/rlean-data-providers",
     "crates/rlean-options",
     "crates/rlean-execution",
     "crates/rlean-optimization",
@@ -25,7 +25,6 @@ members = [
     "crates/rlean-forex",
     "crates/rlean-crypto",
     "crates/rlean-futures",
-    "crates/rlean-plugin",
     "crates/rlean",
 ]
 resolver = "2"
@@ -43,20 +42,23 @@ keywords = ["trading", "backtesting", "quant", "finance", "lean"]
 categories = ["finance", "simulation"]
 
 [workspace.dependencies]
-# Arrow / Parquet
+# Arrow
 arrow = { version = "57.1", features = ["prettyprint"] }
 arrow-array = "57.1"
 arrow-data = "57.1"
 arrow-schema = "57.1"
 arrow-cast = "57.1"
-parquet = { version = "57.1", features = ["async", "snap"] }
-datafusion = "52.2"
+arrow-flight = { version = "57.1", features = ["tls-ring", "tls-webpki-roots"] }
+arrow-ipc = "57.1"
 object_store = { version = "0.11.2", features = ["aws"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
+prost = "0.14.1"
+tonic = { version = "0.14.1", features = ["transport", "tls-webpki-roots", "tls-ring"] }
+tower = { version = "0.5", features = ["util"] }
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
@@ -103,7 +105,7 @@ strum_macros = "0.26"
 itertools = "0.13"
 num_cpus = "1"
 glob = "0.3"
-reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "http2"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "http2"], default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
 sha2 = "0.10"
@@ -112,29 +114,14 @@ pyo3-stub-gen = "0.23"
 zip    = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-libloading = "0.8"
-rlean-plugin            = { path = "crates/rlean-plugin" }
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-datafusion = "0.9.1"
-iceberg-storage-opendal = "0.9.1"
-aws-config = { version = "1", features = ["behavior-version-latest", "credentials-login"] }
-aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
-aws-sigv4 = "1"
-aws-smithy-runtime-api = "1"
-typetag = "0.2"
 url = "2"
-hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
-http-body-util = "0.1"
-http = "1"
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
 rlean-core           = { path = "crates/rlean-core" }
 rlean-data           = { path = "crates/rlean-data" }
-rlean-storage        = { path = "crates/rlean-storage" }
-rlean-data-providers = { path = "crates/rlean-data-providers" }
-rlean-plugin         = { path = "crates/rlean-plugin" }
+rlean-data-tables    = { path = "crates/rlean-data-tables" }
+rlean-data-sidecar   = { path = "crates/rlean-data-sidecar" }
 
 [profile.release]
 opt-level = 3

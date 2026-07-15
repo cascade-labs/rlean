@@ -1,5 +1,5 @@
 use rlean_core::{Market, NanosecondTimestamp, Symbol};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rlean_indicators::{indicator::Indicator, Atr};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -11,6 +11,7 @@ fn ts(i: i64) -> NanosecondTimestamp {
 fn make_bar(i: i64, high: Decimal, low: Decimal, close: Decimal) -> TradeBar {
     TradeBar {
         symbol: Symbol::create_equity("SPY", &Market::usa()),
+        venue: None,
         time: ts(i),
         end_time: ts(i + 1),
         open: (high + low) / dec!(2),

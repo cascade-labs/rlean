@@ -3,7 +3,7 @@ use crate::{
     indicator::{Indicator, IndicatorResult},
 };
 use rlean_core::{DateTime, Price};
-use rlean_data::TradeBar;
+use rlean_data_tables::TradeBar;
 use rust_decimal_macros::dec;
 
 /// Normalized Average True Range. ATR / close * 100.

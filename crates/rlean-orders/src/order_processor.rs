@@ -5,7 +5,7 @@ use crate::{
     transaction_manager::TransactionManager,
 };
 use rlean_core::DateTime;
-use rlean_data::{QuoteBar, TradeBar};
+use rlean_data_tables::{QuoteBar, TradeBar};
 use std::sync::Arc;
 
 /// Processes pending orders against current market data.

@@ -5,8 +5,9 @@ use crate::qc_algorithm::{OptionFilter, QcAlgorithm};
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{DateTime, Price, Resolution, Symbol};
 use rlean_data::{
-    CustomDataPoint, Delisting, Dividend, Split, SubscriptionDataConfig, SymbolChangedEvent,
+    Delisting, Dividend, FundamentalData, Split, SubscriptionDataConfig, SymbolChangedEvent,
 };
+use rlean_data_tables::CustomDataPoint;
 use rlean_options::OptionContract;
 use rlean_orders::{Order, OrderEvent, TransactionManager};
 use rust_decimal::Decimal;
@@ -42,13 +43,14 @@ pub trait AlgorithmHistoryService: Send + Sync {
 }
 
 pub trait RegisteredIndicatorBridge: Send + Sync {
-    fn update_bar(&self, bar: &rlean_data::TradeBar) -> bool;
+    fn update_bar(&self, bar: &rlean_data_tables::TradeBar) -> bool;
 }
 
 pub type RegisteredIndicatorRegistry =
     Arc<Mutex<HashMap<u64, Vec<Arc<dyn RegisteredIndicatorBridge>>>>>;
 
 pub type CustomUniverseSelectFn = Arc<dyn Fn(&[CustomDataPoint]) -> Vec<Symbol> + Send + Sync>;
+pub type FundamentalUniverseSelectFn = Arc<dyn Fn(&[FundamentalData]) -> Vec<Symbol> + Send + Sync>;
 
 pub struct CustomUniverseSelectorRegistrationRequest {
     pub source_type: String,
@@ -57,6 +59,14 @@ pub struct CustomUniverseSelectorRegistrationRequest {
     pub settings_resolution: Resolution,
     pub minimum_time_in_universe_secs: f64,
     pub select: CustomUniverseSelectFn,
+}
+
+pub struct FundamentalUniverseSelectorRegistrationRequest {
+    pub source_type: String,
+    pub resolution: Resolution,
+    pub settings_resolution: Resolution,
+    pub minimum_time_in_universe_secs: f64,
+    pub select: FundamentalUniverseSelectFn,
 }
 
 pub trait AlgorithmRuntimeServices: Send + Sync {
@@ -91,6 +101,27 @@ pub trait AlgorithmRuntimeServices: Send + Sync {
         false
     }
     fn custom_universe_selector_resolution(&self) -> Option<Resolution> {
+        None
+    }
+    fn register_fundamental_universe_selector(
+        &self,
+        registration: FundamentalUniverseSelectorRegistrationRequest,
+    ) {
+        let _ = registration;
+    }
+    fn run_fundamental_universe_selections(
+        &self,
+        utc_ns: i64,
+        resolution: Resolution,
+        fundamentals: &[FundamentalData],
+    ) -> Vec<UniverseSelection> {
+        let _ = (utc_ns, resolution, fundamentals);
+        Vec::new()
+    }
+    fn has_fundamental_universe_selectors(&self) -> bool {
+        false
+    }
+    fn fundamental_universe_selector_resolution(&self) -> Option<Resolution> {
         None
     }
 }
@@ -250,6 +281,16 @@ pub trait LifecycleBridge: Send + AlgorithmStateAccess {
         custom_data: &HashMap<String, Vec<CustomDataPoint>>,
         services: &mut dyn AlgorithmServices,
     ) -> Vec<UniverseSelection>;
+    fn select_fundamental_universe_changes(
+        &mut self,
+        utc_ns: i64,
+        resolution: Resolution,
+        fundamentals: &[FundamentalData],
+        services: &mut dyn AlgorithmServices,
+    ) -> Vec<UniverseSelection> {
+        let _ = (utc_ns, resolution, fundamentals, services);
+        Vec::new()
+    }
     fn on_end_of_time_step(&mut self, services: &mut dyn AlgorithmServices);
     fn on_brokerage_message(&mut self, message: &str, services: &mut dyn AlgorithmServices);
     fn on_brokerage_disconnect(&mut self, services: &mut dyn AlgorithmServices);
@@ -418,6 +459,21 @@ where
     ) -> Vec<UniverseSelection> {
         self.as_mut()
             .select_custom_universe_changes(utc_ns, resolution, custom_data, services)
+    }
+
+    fn select_fundamental_universe_changes(
+        &mut self,
+        utc_ns: i64,
+        resolution: Resolution,
+        fundamentals: &[FundamentalData],
+        services: &mut dyn AlgorithmServices,
+    ) -> Vec<UniverseSelection> {
+        self.as_mut().select_fundamental_universe_changes(
+            utc_ns,
+            resolution,
+            fundamentals,
+            services,
+        )
     }
 
     fn on_end_of_time_step(&mut self, services: &mut dyn AlgorithmServices) {
