@@ -106,8 +106,7 @@ pub fn sock_path(session: &str) -> Result<PathBuf> {
 
 fn startup_code() -> String {
     // NOTE: All private names use _-prefix so they don't pollute `vars` output.
-    format!(
-        r#"
+    r#"
 import sys as _sys
 import io as _io
 
@@ -126,7 +125,7 @@ try:
     _sys.__stdout__.write("Research kernel ready.  Available: qb, QuantBook, Resolution, np, pd, plt\n")
     _sys.__stdout__.flush()
 except ImportError as _e:
-    _sys.__stderr__.write(f"Warning: could not import AlgorithmImports: {{_e}}\n")
+    _sys.__stderr__.write(f"Warning: could not import AlgorithmImports: {_e}\n")
     _sys.__stderr__.flush()
     qb = None
     Resolution = None
@@ -161,7 +160,7 @@ def _rlean_exec_capture(_code_str, _glb):
 
     return _buf_out.getvalue(), _buf_err.getvalue(), _figs
 "#
-    )
+    .to_string()
 }
 
 // ── Vars inspection code ──────────────────────────────────────────────────────

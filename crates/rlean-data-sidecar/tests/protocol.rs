@@ -58,12 +58,12 @@ fn relay_uses_standard_subscription_and_data_batch_messages() {
     let message = ServerMessage {
         protocol_version: PROTOCOL_VERSION,
         request_id: 0,
-        payload: Some(server_message::Payload::DataBatch(DataBatch {
+        payload: Some(server_message::Payload::DataBatch(Box::new(DataBatch {
             subscription_id: 9,
             query_id: 0,
             data_type: WireDataType::Custom as i32,
             subscription: Some(route),
-        })),
+        }))),
     };
     assert_eq!(
         ServerMessage::decode_flight_data(&message.clone().into_flight_data()).unwrap(),

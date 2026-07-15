@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 enum SubscriptionStreamMessage {
-    Point(SubscriptionDataPoint),
+    Point(Box<SubscriptionDataPoint>),
     Watermark(DateTime),
 }
 
@@ -144,7 +144,7 @@ impl SubscriptionStream {
 
     fn handle_message(&mut self, message: SubscriptionStreamMessage) {
         match message {
-            SubscriptionStreamMessage::Point(point) => self.pending.push_back(point),
+            SubscriptionStreamMessage::Point(point) => self.pending.push_back(*point),
             SubscriptionStreamMessage::Watermark(watermark) => {
                 if self
                     .watermark
@@ -332,7 +332,9 @@ async fn produce_registered(
                 send_fill_forward(config, context, previous, frontier, end, sender).await?;
             }
             if sender
-                .send(Ok(SubscriptionStreamMessage::Point(point.clone())))
+                .send(Ok(SubscriptionStreamMessage::Point(Box::new(
+                    point.clone(),
+                ))))
                 .await
                 .is_err()
             {
@@ -489,7 +491,7 @@ async fn send_fill_forward(
         if is_market_open(config, context, frontier, period) {
             if let Some(fill) = fill_forward_point(previous, frontier, period) {
                 if sender
-                    .send(Ok(SubscriptionStreamMessage::Point(fill)))
+                    .send(Ok(SubscriptionStreamMessage::Point(Box::new(fill))))
                     .await
                     .is_err()
                 {

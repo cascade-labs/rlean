@@ -37,7 +37,7 @@ pub(crate) enum DataCommand {
     },
 
     /// Query canonical data through a temporary sidecar subscription
-    Query(QueryArgs),
+    Query(Box<QueryArgs>),
 }
 
 #[derive(Args)]
@@ -105,7 +105,7 @@ pub(crate) async fn run_data(args: DataArgs) -> Result<()> {
         }
         DataCommand::Schema { table } => show_schema(&table),
         DataCommand::Manifest { json } => show_manifest(json).await,
-        DataCommand::Query(query) => run_query(query).await,
+        DataCommand::Query(query) => run_query(*query).await,
     }
 }
 
@@ -324,10 +324,10 @@ fn parse_query_time(value: &str, end_of_day: bool) -> Result<i64> {
             date.and_hms_opt(0, 0, 0)
         }
         .context("invalid query date")?;
-        return Ok(time
+        return time
             .and_utc()
             .timestamp_nanos_opt()
-            .context("query date is out of range")?);
+            .context("query date is out of range");
     }
     let time = chrono::DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("invalid time '{value}', expected YYYY-MM-DD or RFC 3339"))?;

@@ -539,6 +539,7 @@ fn write_pid_file(dir: &Path, pid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn mark_live_deployment_running(
     dir: &Path,
     fallback: &LiveDeploymentMetadata,

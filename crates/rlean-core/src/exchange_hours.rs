@@ -210,36 +210,7 @@ impl ExchangeHours {
 
     pub fn us_equity() -> Self {
         let regular = MarketSession::new(9, 30, 16, 0);
-        let early_close = TimeSpan::from_secs(13 * 60 * 60);
-        // NYSE early closes copied from LEAN's USA Equity entry in
-        // market-hours-database.json for the calendar span supported below.
-        let early_closes = [
-            (2018, 7, 3),
-            (2019, 7, 3),
-            (2023, 7, 3),
-            (2024, 7, 3),
-            (2025, 7, 3),
-            (2018, 11, 23),
-            (2019, 11, 29),
-            (2020, 11, 27),
-            (2021, 11, 26),
-            (2022, 11, 25),
-            (2023, 11, 24),
-            (2024, 11, 29),
-            (2025, 11, 28),
-            (2026, 11, 27),
-            (2018, 12, 24),
-            (2019, 12, 24),
-            (2020, 12, 24),
-            (2024, 12, 24),
-            (2025, 12, 24),
-            (2026, 12, 24),
-        ]
-        .into_iter()
-        .filter_map(|(year, month, day)| {
-            NaiveDate::from_ymd_opt(year, month, day).map(|date| (date, early_close))
-        })
-        .collect();
+        let (holidays, early_closes) = Self::us_equity_calendar();
         ExchangeHours {
             timezone: "America/New_York".into(),
             schedule: [
@@ -251,7 +222,7 @@ impl ExchangeHours {
                 DaySchedule::open(regular), // Friday
                 DaySchedule::closed(),      // Saturday
             ],
-            holidays: Self::us_equity_holidays(),
+            holidays,
             early_closes,
             late_opens: std::collections::HashMap::new(),
         }
@@ -364,117 +335,34 @@ impl ExchangeHours {
         None
     }
 
-    fn us_equity_holidays() -> HashSet<NaiveDate> {
-        use chrono::NaiveDate;
-        let mut h = HashSet::new();
-        // 2017 NYSE holidays (needed by warmup windows for 2019 starts)
-        h.insert(NaiveDate::from_ymd_opt(2017, 1, 2).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 1, 16).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 2, 20).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 4, 14).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 5, 29).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 9, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 11, 23).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2017, 12, 25).unwrap());
-        // 2018 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2018, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 1, 15).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 2, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 3, 30).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 5, 28).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 9, 3).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 11, 22).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2018, 12, 5).unwrap()); // Bush funeral
-        h.insert(NaiveDate::from_ymd_opt(2018, 12, 25).unwrap());
-        // 2019 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2019, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 1, 21).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 2, 18).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 4, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 5, 27).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 9, 2).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 11, 28).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2019, 12, 25).unwrap());
-        // 2020 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 1, 20).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 2, 17).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 4, 10).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 5, 25).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 7, 3).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 9, 7).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 11, 26).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2020, 12, 25).unwrap());
-        // 2021 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2021, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 1, 18).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 2, 15).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 4, 2).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 5, 31).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 6, 18).unwrap()); // Juneteenth observed
-        h.insert(NaiveDate::from_ymd_opt(2021, 7, 5).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 9, 6).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 11, 25).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2021, 12, 24).unwrap());
-        // 2022 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2022, 1, 17).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 2, 21).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 4, 15).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 5, 30).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 6, 20).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 9, 5).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 11, 24).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2022, 12, 26).unwrap());
-        // 2023 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2023, 1, 2).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 1, 16).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 2, 20).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 4, 7).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 5, 29).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 6, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 9, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 11, 23).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2023, 12, 25).unwrap());
-        // 2024 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 2, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 3, 29).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 5, 27).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 6, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 9, 2).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 11, 28).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2024, 12, 25).unwrap());
-        // 2025
-        h.insert(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 1, 9).unwrap()); // Carter funeral
-        h.insert(NaiveDate::from_ymd_opt(2025, 1, 20).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 2, 17).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 4, 18).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 5, 26).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 6, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 7, 4).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 9, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 11, 27).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2025, 12, 25).unwrap());
-        // 2026 NYSE holidays
-        h.insert(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 1, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 2, 16).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 4, 3).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 6, 19).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 9, 7).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap());
-        h.insert(NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
-        h
+    fn us_equity_calendar() -> (HashSet<NaiveDate>, HashMap<NaiveDate, TimeSpan>) {
+        let calendar = finance_dates::calendar_for_exchange("XNYS")
+            .expect("finance-dates must provide the XNYS exchange calendar");
+        let mut holidays = HashSet::new();
+        let mut early_closes = HashMap::new();
+
+        // Nanosecond timestamps span roughly 1678-2262. Materializing the
+        // library's rules once keeps the existing serializable ExchangeHours
+        // contract while making finance-dates the source of calendar truth.
+        for year in 1678..=2262 {
+            holidays.extend(calendar.holidays(year).iter().copied());
+            let mut date = NaiveDate::from_ymd_opt(year, 1, 1)
+                .expect("calendar materialization year must be valid");
+            while date.year() == year {
+                if let Some(close) = calendar.early_close_for(date) {
+                    early_closes.insert(
+                        date,
+                        TimeSpan::from_secs(i64::from(close.num_seconds_from_midnight())),
+                    );
+                }
+                let Some(next) = date.succ_opt() else {
+                    break;
+                };
+                date = next;
+            }
+        }
+
+        (holidays, early_closes)
     }
 }
 
@@ -521,6 +409,22 @@ mod tests {
         assert!(db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()));
         assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()));
         assert!(!db.is_open_date(&spy, chrono::NaiveDate::from_ymd_opt(2024, 1, 6).unwrap()));
+    }
+
+    #[test]
+    fn market_hours_database_uses_historical_nyse_calendar() {
+        let db = MarketHoursDatabase::from_builtin_defaults();
+        let spy = Symbol::create_equity("SPY", &Market::usa());
+
+        for date in [
+            NaiveDate::from_ymd_opt(2003, 11, 27).unwrap(),
+            NaiveDate::from_ymd_opt(2003, 12, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2004, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2004, 6, 11).unwrap(),
+            NaiveDate::from_ymd_opt(2012, 10, 29).unwrap(),
+        ] {
+            assert!(!db.is_open_date(&spy, date), "{date} must be closed");
+        }
     }
 
     #[test]

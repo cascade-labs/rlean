@@ -588,8 +588,8 @@ pub mod server_message {
         SubscriptionAdded(SubscriptionAdded),
         #[prost(message, tag = "12")]
         SubscriptionRemoved(SubscriptionRemoved),
-        #[prost(message, tag = "13")]
-        DataBatch(DataBatch),
+        #[prost(message, boxed, tag = "13")]
+        DataBatch(Box<DataBatch>),
         #[prost(message, tag = "14")]
         BacktestQueryComplete(BacktestQueryComplete),
         #[prost(message, tag = "15")]

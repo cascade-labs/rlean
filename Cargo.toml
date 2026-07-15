@@ -67,6 +67,7 @@ serde_json = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+finance-dates = "0.4"
 
 # Collections / concurrency
 dashmap = "6"
