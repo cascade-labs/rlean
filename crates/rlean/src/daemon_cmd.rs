@@ -190,6 +190,7 @@ fn wait_for_daemon() -> Result<()> {
     bail!("rleand service was installed but its control socket did not become ready")
 }
 
+#[cfg(target_os = "macos")]
 fn command_ok(program: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(program).args(args).output()?;
     if output.status.success() {
@@ -291,6 +292,7 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
+#[cfg(target_os = "macos")]
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str().context("service path is not valid UTF-8")
 }
