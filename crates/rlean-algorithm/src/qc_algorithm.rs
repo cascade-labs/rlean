@@ -178,6 +178,13 @@ pub struct QcAlgorithm {
 
     pub brokerage_name: BrokerageName,
     pub account_type: AccountType,
+    /// Fixed cash amount excluded from portfolio target sizing. When unset,
+    /// `free_portfolio_value_percentage` trails total portfolio value.
+    pub free_portfolio_value: Option<Decimal>,
+    /// C# LEAN defaults to reserving 0.25% for SetHoldings/framework targets.
+    pub free_portfolio_value_percentage: Decimal,
+    /// C# LEAN suppresses target adjustments below 0.1% of portfolio value.
+    pub minimum_order_margin_portfolio_percentage: Decimal,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     security_leverage_overrides: HashMap<u64, f64>,
 }
@@ -212,6 +219,9 @@ impl QcAlgorithm {
             benchmark_symbol: None,
             brokerage_name: BrokerageName::Default,
             account_type: AccountType::Margin,
+            free_portfolio_value: None,
+            free_portfolio_value_percentage: dec!(0.0025),
+            minimum_order_margin_portfolio_percentage: dec!(0.001),
             market_hours_database: MarketHoursDatabase::global(),
             security_leverage_overrides: HashMap::new(),
         }
@@ -219,6 +229,15 @@ impl QcAlgorithm {
 
     pub fn set_market_hours_database(&mut self, market_hours_database: Arc<MarketHoursDatabase>) {
         self.market_hours_database = market_hours_database;
+    }
+
+    /// C# LEAN `SecurityPortfolioManager.TotalPortfolioValueLessFreeBuffer`.
+    pub fn portfolio_value_less_free_buffer(&self) -> Decimal {
+        let total = self.portfolio_value();
+        let free = self
+            .free_portfolio_value
+            .unwrap_or(total * self.free_portfolio_value_percentage);
+        total - free
     }
 
     pub fn set_brokerage_model(&mut self, brokerage: BrokerageName, account_type: AccountType) {
@@ -2096,6 +2115,15 @@ mod tests {
         assert_eq!(alg.warmup_bar_count, None);
         assert_eq!(alg.warmup_resolution, None);
         assert!(!alg.is_warming_up);
+    }
+
+    #[test]
+    fn portfolio_value_less_free_buffer_matches_lean_default() {
+        let alg = QcAlgorithm::new("test", dec!(100_000));
+
+        assert_eq!(alg.free_portfolio_value_percentage, dec!(0.0025));
+        assert_eq!(alg.portfolio_value_less_free_buffer(), dec!(99_750));
+        assert_eq!(alg.minimum_order_margin_portfolio_percentage, dec!(0.001));
     }
 
     #[test]

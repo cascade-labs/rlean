@@ -467,14 +467,12 @@ mod tests {
             .unwrap()
             .quantity;
 
-        // C# uses Math.Floor; Rust PortfolioTarget uses .round().  The weight split is
-        // approximately 1/3 : 2/3.  950*1/3/10=31.67→round=32, 950*2/3/10=63.33→round=63.
-        // C# produces 31 and 63 (floor).  Both are within 1 share of each other — the OLMAR
-        // algorithm is identical; only the quantity rounding differs.
+        // The weight split is approximately 1/3 : 2/3. C# LEAN rounds long
+        // targets down so 950*1/3/10=31.67→31 and 950*2/3/10=63.33→63.
         assert_eq!(
             aapl_qty,
-            dec!(32),
-            "AAPL: expected 32 (Rust round vs C# floor=31), got {}",
+            dec!(31),
+            "AAPL: expected conservative C# LEAN quantity 31, got {}",
             aapl_qty
         );
         assert_eq!(spy_qty, dec!(63), "SPY: expected 63, got {}", spy_qty);

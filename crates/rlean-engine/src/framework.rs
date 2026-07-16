@@ -504,11 +504,14 @@ pub fn run_framework_pipeline(
         &inputs.security_data,
         &inputs.open_order_data,
         inputs.portfolio_value,
+    )
+    .with_minimum_order_margin_portfolio_percentage(
+        inputs.minimum_order_margin_portfolio_percentage,
     );
     fw.run_pipeline_from_alpha(
         slice,
         alpha_insights,
-        inputs.portfolio_value,
+        inputs.portfolio_value_less_free_buffer,
         &inputs.prices,
         &inputs.risk_context,
         &execution_context,
@@ -545,6 +548,8 @@ pub fn rearm_framework_rebalance_for_symbol(
 struct FrameworkInputs {
     prices: HashMap<u64, Decimal>,
     portfolio_value: Decimal,
+    portfolio_value_less_free_buffer: Decimal,
+    minimum_order_margin_portfolio_percentage: Decimal,
     risk_context: RiskContext,
     security_data: HashMap<u64, SecurityData>,
     open_order_data: Vec<ExecutionOpenOrder>,
@@ -594,6 +599,7 @@ fn build_framework_inputs(
         });
     }
     let portfolio_value = alg.portfolio_value();
+    let portfolio_value_less_free_buffer = alg.portfolio_value_less_free_buffer();
     let mut security_data: HashMap<u64, SecurityData> =
         HashMap::with_capacity(alg.securities.count());
     for security in alg.securities.all() {
@@ -649,6 +655,8 @@ fn build_framework_inputs(
     FrameworkInputs {
         prices,
         portfolio_value,
+        portfolio_value_less_free_buffer,
+        minimum_order_margin_portfolio_percentage: alg.minimum_order_margin_portfolio_percentage,
         risk_context,
         security_data,
         open_order_data,

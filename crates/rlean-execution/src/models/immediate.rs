@@ -60,6 +60,9 @@ impl ImmediateExecutionModel {
             if delta == Decimal::ZERO {
                 continue;
             }
+            if !context.above_minimum_order_margin_portfolio_percentage(security, delta) {
+                continue;
+            }
 
             let tag = self
                 .targets
