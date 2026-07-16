@@ -3,6 +3,8 @@
 Cargo.lock
 examples/backtests/
 examples/data/
+.runs/
+.weco/
 
 # Python caches
 __pycache__/
