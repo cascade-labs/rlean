@@ -286,10 +286,23 @@ async fn produce_registered(
     let end_date = end.date_utc();
     let mut last_point: Option<SubscriptionDataPoint> = None;
     let mut last_real_frontier: Option<DateTime> = None;
+    let mut previous_window_had_points = false;
 
     while window_start <= end_date {
-        wait_for_prefetch_horizon(context, window_start).await;
-        let window_end = backtest_window_end(config.resolution, window_start, end_date, context);
+        // An empty range consumes no channel capacity. Keep scanning through
+        // leading/pre-listing gaps instead of waiting for a consumer frontier
+        // that cannot advance until some subscription produces a point.
+        if previous_window_had_points {
+            wait_for_prefetch_horizon(context, window_start).await;
+        }
+        let window_end = if previous_window_had_points {
+            backtest_window_end(config.resolution, window_start, end_date, context)
+        } else {
+            // The consumer frontier intentionally does not constrain empty
+            // scans. Pair the ungated start with an ungated end so the stale
+            // prefetch ceiling cannot produce an inverted range.
+            backtest_window_candidate(config.resolution, window_start).min(end_date)
+        };
         let mut batches = context
             .sidecar
             .query(
@@ -310,6 +323,7 @@ async fn produce_registered(
         points = coalesce_fundamental_snapshots(points);
         points.sort_by_key(SubscriptionDataPoint::frontier_time);
         points = deduplicate_points(config, points);
+        previous_window_had_points = !points.is_empty();
 
         for point in points {
             let frontier = point.frontier_time();

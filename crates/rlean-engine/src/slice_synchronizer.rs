@@ -54,6 +54,21 @@ impl SliceSynchronizer {
                     .streams
                     .iter_mut()
                     .filter(|stream| !stream.is_exhausted())
+                    // Do not await a stream that is already ahead of the
+                    // minimum watermark. In an all-empty range that producer
+                    // is gated on the lagging streams; awaiting it first would
+                    // prevent us from consuming those lagging watermarks and
+                    // deadlock the shared prefetch frontier.
+                    .filter(|stream| {
+                        min_watermark
+                            .map(|minimum| {
+                                stream
+                                    .watermark()
+                                    .map(|watermark| watermark <= minimum)
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(true)
+                    })
                 {
                     stream.advance_until_progress().await?;
                     advanced_any = true;
