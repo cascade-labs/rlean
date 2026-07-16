@@ -27,7 +27,10 @@ impl PortfolioTarget {
     }
 
     /// Create a target from a target portfolio percentage.
-    /// Computes quantity = round(portfolio_value * pct / price).
+    ///
+    /// `portfolio_value` is expected to have LEAN's free-portfolio buffer
+    /// removed by the engine. Long targets round down and short targets round
+    /// up so the resulting position is always at or just below its allocation.
     pub fn percent(symbol: Symbol, pct: Decimal, portfolio_value: Decimal, price: Decimal) -> Self {
         Self::percent_with_tag(symbol, pct, portfolio_value, price, "")
     }
@@ -42,7 +45,12 @@ impl PortfolioTarget {
         let quantity = if price.is_zero() {
             Decimal::ZERO
         } else {
-            (portfolio_value * pct / price).round()
+            let raw = portfolio_value * pct / price;
+            if raw.is_sign_negative() {
+                raw.ceil()
+            } else {
+                raw.floor()
+            }
         };
         Self {
             symbol,

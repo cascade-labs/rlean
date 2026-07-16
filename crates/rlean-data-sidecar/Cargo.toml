@@ -31,3 +31,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+arrow-schema = { workspace = true }

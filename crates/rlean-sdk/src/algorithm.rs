@@ -298,7 +298,7 @@ impl AlgorithmHandle {
     }
 
     pub fn algorithm_settings(&self) -> AlgorithmSettingsHandle {
-        AlgorithmSettingsHandle::from_shared(self.algorithm_settings.clone())
+        AlgorithmSettingsHandle::from_shared(self.algorithm_settings.clone(), self.inner.clone())
     }
     pub fn date_rules(&self) -> DateRulesHandle {
         DateRulesHandle::new()

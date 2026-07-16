@@ -392,6 +392,18 @@ mod immediate_execution_tests {
         assert_eq!(orders[2].quantity, dec!(1));
     }
 
+    #[test]
+    fn suppresses_orders_below_minimum_portfolio_percentage() {
+        let mut model = ImmediateExecutionModel::new();
+        let securities = securities_map(vec![make_security("AAPL", 40.0, 0.0)]);
+        let context = ExecutionContext::new(DateTime::MIN, &securities, &[], dec!(57_735))
+            .with_minimum_order_margin_portfolio_percentage(dec!(0.001));
+
+        let orders = model.execute(&[make_target("AAPL", 1.0)], &context);
+
+        assert!(orders.is_empty());
+    }
+
     /// Security not present in securities map -> no execution.
     #[test]
     fn unknown_security_defers_execution() {

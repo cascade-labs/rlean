@@ -480,6 +480,17 @@ mod portfolio_target_tests {
         assert_eq!(target.percent, Some(dec!(0.10)));
     }
 
+    #[test]
+    fn target_percent_rounds_toward_zero_to_avoid_overshooting() {
+        let long =
+            PortfolioTarget::percent(make_equity("LONG"), dec!(0.20), dec!(57_735), dec!(52.58));
+        let short =
+            PortfolioTarget::percent(make_equity("SHORT"), dec!(-0.20), dec!(57_735), dec!(52.58));
+
+        assert_eq!(long.quantity, dec!(219));
+        assert_eq!(short.quantity, dec!(-219));
+    }
+
     /// Zero price should not cause a divide-by-zero panic; quantity should be 0.
     #[test]
     fn target_zero_price_returns_zero() {
@@ -600,7 +611,7 @@ mod insight_weighting_tests {
         assert_eq!(targets.len(), 1);
 
         // Equal-weight fallback: weight = 1/1 = 1.0 (full portfolio), direction = Down → short.
-        let expected_qty = -(portfolio_value / price).round();
+        let expected_qty = -(portfolio_value / price).floor();
         assert_eq!(
             targets[0].quantity, expected_qty,
             "Zero-confidence single Down insight: equal-weight fallback, full short allocation"

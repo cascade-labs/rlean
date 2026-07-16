@@ -478,9 +478,24 @@ impl SecurityManagerHandle {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AlgorithmSettings {
     values: HashMap<String, AlgorithmSettingValue>,
+}
+
+impl Default for AlgorithmSettings {
+    fn default() -> Self {
+        let mut values = HashMap::new();
+        values.insert(
+            "free_portfolio_value_percentage".to_string(),
+            AlgorithmSettingValue::Float(0.0025),
+        );
+        values.insert(
+            "minimum_order_margin_portfolio_percentage".to_string(),
+            AlgorithmSettingValue::Float(0.001),
+        );
+        Self { values }
+    }
 }
 
 impl AlgorithmSettings {
@@ -500,17 +515,25 @@ impl AlgorithmSettings {
 #[derive(Clone)]
 pub struct AlgorithmSettingsHandle {
     inner: Arc<Mutex<AlgorithmSettings>>,
+    algorithm: Option<Arc<Mutex<QcAlgorithm>>>,
 }
 
 impl AlgorithmSettingsHandle {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(AlgorithmSettings::default())),
+            algorithm: None,
         }
     }
 
-    pub fn from_shared(inner: Arc<Mutex<AlgorithmSettings>>) -> Self {
-        Self { inner }
+    pub fn from_shared(
+        inner: Arc<Mutex<AlgorithmSettings>>,
+        algorithm: Arc<Mutex<QcAlgorithm>>,
+    ) -> Self {
+        Self {
+            inner,
+            algorithm: Some(algorithm),
+        }
     }
 
     /// Value stored under `name`, defaulting to integer `0` when unset.
@@ -520,7 +543,32 @@ impl AlgorithmSettingsHandle {
 
     /// Store `value` under `name`.
     pub fn set(&self, name: impl Into<String>, value: AlgorithmSettingValue) {
-        self.inner.lock().unwrap().set(name, value);
+        let name = name.into();
+        self.inner.lock().unwrap().set(name.clone(), value.clone());
+
+        let Some(algorithm) = &self.algorithm else {
+            return;
+        };
+        let decimal = match value {
+            AlgorithmSettingValue::Integer(value) => Some(Decimal::from(value)),
+            AlgorithmSettingValue::Float(value) => Decimal::from_f64_retain(value),
+            AlgorithmSettingValue::Bool(_) | AlgorithmSettingValue::String(_) => None,
+        };
+        let Some(decimal) = decimal else {
+            return;
+        };
+        let mut algorithm = algorithm.lock().unwrap();
+        match name.as_str() {
+            "free_portfolio_value" => algorithm.free_portfolio_value = Some(decimal),
+            "free_portfolio_value_percentage" => {
+                algorithm.free_portfolio_value_percentage = decimal;
+                algorithm.free_portfolio_value = None;
+            }
+            "minimum_order_margin_portfolio_percentage" => {
+                algorithm.minimum_order_margin_portfolio_percentage = decimal;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -794,5 +842,13 @@ mod tests {
             AlgorithmSettingValue::String("bar".to_string())
         );
         assert_eq!(settings.get("missing"), AlgorithmSettingValue::Integer(0));
+        assert_eq!(
+            settings.get("free_portfolio_value_percentage"),
+            AlgorithmSettingValue::Float(0.0025)
+        );
+        assert_eq!(
+            settings.get("minimum_order_margin_portfolio_percentage"),
+            AlgorithmSettingValue::Float(0.001)
+        );
     }
 }

@@ -18,7 +18,10 @@ pub use client::{
 pub use decode::{
     decode_batch, decode_factor_file_batch, decode_map_file_batch, CanonicalDataBatch,
 };
-pub use ipc::{decode_record_batch, encode_record_batch};
+pub use ipc::{
+    decode_record_batch, encode_record_batch, encode_record_batch_chunks,
+    MAX_RECORD_BATCH_BODY_BYTES,
+};
 pub use protocol::{
     client_message, server_message, AddSubscription, BacktestQuery, BacktestQueryComplete,
     BrokerageClosed, BrokerageCommandResult, BrokerageConnectionState, BrokerageOpened,

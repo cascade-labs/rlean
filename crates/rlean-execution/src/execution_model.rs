@@ -88,6 +88,7 @@ pub struct ExecutionContext<'a> {
     pub securities: &'a HashMap<u64, SecurityData>,
     pub open_orders: &'a [ExecutionOpenOrder],
     pub portfolio_value: Decimal,
+    pub minimum_order_margin_portfolio_percentage: Decimal,
 }
 
 /// Sorts targets using the same high-level priority as C# LEAN's
@@ -165,7 +166,29 @@ impl<'a> ExecutionContext<'a> {
             securities,
             open_orders,
             portfolio_value,
+            minimum_order_margin_portfolio_percentage: Decimal::ZERO,
         }
+    }
+
+    pub fn with_minimum_order_margin_portfolio_percentage(mut self, percentage: Decimal) -> Self {
+        self.minimum_order_margin_portfolio_percentage = percentage.max(Decimal::ZERO);
+        self
+    }
+
+    /// C# LEAN `AboveMinimumOrderMarginPortfolioPercentage` guard used by
+    /// ImmediateExecutionModel to avoid tiny rebalance noise.
+    pub fn above_minimum_order_margin_portfolio_percentage(
+        &self,
+        security: &SecurityData,
+        quantity: Decimal,
+    ) -> bool {
+        if self.portfolio_value <= Decimal::ZERO
+            || self.minimum_order_margin_portfolio_percentage <= Decimal::ZERO
+        {
+            return true;
+        }
+        let order_value = (quantity * security.price).abs();
+        order_value >= self.portfolio_value * self.minimum_order_margin_portfolio_percentage
     }
 
     pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {
