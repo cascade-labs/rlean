@@ -1,4 +1,5 @@
-use rlean_algorithm::qc_algorithm::QcAlgorithm;
+use rlean_algorithm::buying_power::BuyingPowerModel;
+use rlean_algorithm::qc_algorithm::{AccountType, BrokerageName, QcAlgorithm};
 use rlean_core::{DateTime, Market, Resolution, Symbol};
 use rlean_orders::Order;
 use rust_decimal_macros::dec;
@@ -43,4 +44,53 @@ fn crypto_future_buying_power_rejects_over_margin_order() {
         .validate_order_buying_power(&invalid, dec!(100), dec!(0))
         .unwrap_err();
     assert!(error.contains("Insufficient buying power"));
+}
+
+#[test]
+fn robinhood_cash_model_initializes_equities_with_one_times_buying_power() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(100000));
+    algorithm.set_brokerage_model(BrokerageName::RobinhoodBrokerage, AccountType::Cash);
+    let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+    let security = algorithm.securities.get(&symbol).unwrap();
+
+    assert_eq!(
+        algorithm.brokerage_model.brokerage,
+        BrokerageName::RobinhoodBrokerage
+    );
+    assert_eq!(algorithm.brokerage_model.account_type, AccountType::Cash);
+    assert_eq!(security.buying_power_model(), BuyingPowerModel::Cash);
+    assert_eq!(security.leverage(), 1.0);
+}
+
+#[test]
+fn cash_buying_power_does_not_spend_unfilled_reduction_proceeds() {
+    let mut algorithm = QcAlgorithm::new("test", dec!(8226));
+    algorithm.set_brokerage_model(BrokerageName::RobinhoodBrokerage, AccountType::Cash);
+
+    for (index, ticker) in ["STIM", "EOSE", "RIOT", "AA"].into_iter().enumerate() {
+        let symbol = algorithm.add_equity(ticker, Resolution::Minute);
+        algorithm.securities.update_price(&symbol, dec!(100));
+        algorithm
+            .portfolio
+            .set_holdings(&symbol, dec!(100), dec!(200), dec!(1));
+        // These reductions are merely working orders. Like C# LEAN, their
+        // anticipated proceeds are not buying power until their fills settle.
+        algorithm.transactions.add_order(Order::market(
+            index as i64 + 1,
+            symbol,
+            dec!(-30),
+            DateTime::EPOCH,
+            "rebalance reduction",
+        ));
+    }
+
+    let replacement = algorithm.add_equity("FHN", Resolution::Minute);
+    algorithm.securities.update_price(&replacement, dec!(25.39));
+    let buy = Order::market(10, replacement, dec!(419), DateTime::EPOCH, "replacement");
+
+    let error = algorithm
+        .validate_order_submission_buying_power(&buy)
+        .unwrap_err();
+    assert!(error.contains("Insufficient buying power"));
+    assert!(error.contains("FHN"));
 }

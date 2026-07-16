@@ -131,6 +131,8 @@ pub enum BrokerageName {
     InteractiveBrokersBrokerage = 2,
     TradierBrokerage = 3,
     HyperliquidBrokerage = 4,
+    RobinhoodBrokerage = 5,
+    FidelityBrokerage = 6,
 }
 
 #[cfg_attr(feature = "python", pyo3::pyclass(name = "OrderType", eq, eq_int))]
@@ -468,6 +470,8 @@ impl From<BrokerageName> for CoreBrokerageName {
             }
             BrokerageName::TradierBrokerage => CoreBrokerageName::TradierBrokerage,
             BrokerageName::HyperliquidBrokerage => CoreBrokerageName::HyperliquidBrokerage,
+            BrokerageName::RobinhoodBrokerage => CoreBrokerageName::RobinhoodBrokerage,
+            BrokerageName::FidelityBrokerage => CoreBrokerageName::FidelityBrokerage,
         }
     }
 }
@@ -486,6 +490,8 @@ mod tests {
         assert_eq!(OptionStyle::European as i32, 1);
         assert_eq!(AccountType::Cash as i32, 1);
         assert_eq!(BrokerageName::HyperliquidBrokerage as i32, 4);
+        assert_eq!(BrokerageName::RobinhoodBrokerage as i32, 5);
+        assert_eq!(BrokerageName::FidelityBrokerage as i32, 6);
         assert_eq!(OrderType::TrailingStop as i32, 11);
         assert_eq!(OrderStatus::Canceled as i32, 5);
         assert_eq!(OrderDirection::Hold as i32, 2);

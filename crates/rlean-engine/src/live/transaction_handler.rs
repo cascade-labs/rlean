@@ -18,6 +18,7 @@ use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
+use rlean_algorithm::qc_algorithm::QcAlgorithm;
 #[cfg(test)]
 use rlean_brokerages::Brokerage;
 use rlean_core::{DateTime, Price, Quantity};
@@ -205,13 +206,23 @@ impl LiveBrokerageRouter {
     /// forward pending cancel/update requests. Called once per live iteration on
     /// the loop thread; never blocks on the brokerage. Evaluates market hours at
     /// the current wall-clock time.
-    pub fn dispatch_pending(&mut self, transactions: &Arc<TransactionManager>) {
-        self.dispatch_pending_at(transactions, DateTime::now());
+    pub fn dispatch_pending(
+        &mut self,
+        transactions: &Arc<TransactionManager>,
+        algorithm: &QcAlgorithm,
+    ) -> Vec<OrderEvent> {
+        self.dispatch_pending_at(transactions, algorithm, DateTime::now())
     }
 
     /// `dispatch_pending` with an explicit market-hours evaluation time, so tests
     /// can drive closed-market (weekend) and open-market dispatch deterministically.
-    pub fn dispatch_pending_at(&mut self, transactions: &Arc<TransactionManager>, now: DateTime) {
+    pub fn dispatch_pending_at(
+        &mut self,
+        transactions: &Arc<TransactionManager>,
+        algorithm: &QcAlgorithm,
+        now: DateTime,
+    ) -> Vec<OrderEvent> {
+        let mut invalid_events = Vec::new();
         let now_instant = std::time::Instant::now();
         for order in transactions.get_open_orders() {
             match order.status {
@@ -226,7 +237,21 @@ impl LiveBrokerageRouter {
                             .get(&order.id)
                             .is_none_or(|not_before| now_instant >= *not_before) =>
                 {
-                    self.dispatch_new_order(order, transactions, now);
+                    match algorithm.validate_order_submission_buying_power(&order) {
+                        Ok(()) => self.dispatch_new_order(order, transactions, now),
+                        Err(message) => {
+                            tracing::error!(
+                                order_id = order.id,
+                                symbol = %order.symbol.value,
+                                "live order rejected before brokerage submission: {message}"
+                            );
+                            let mut event =
+                                OrderEvent::invalid(order.id, order.symbol.clone(), now, message);
+                            event.apply_order_fields(&order);
+                            transactions.process_order_event(event.clone());
+                            invalid_events.push(event);
+                        }
+                    }
                 }
                 OrderStatus::CancelPending
                     if !order.brokerage_id.is_empty() && self.cancel_forwarded.insert(order.id) =>
@@ -241,6 +266,7 @@ impl LiveBrokerageRouter {
                 _ => {}
             }
         }
+        invalid_events
     }
 
     /// Dispatch a single `New` order whose backoff (if any) has elapsed,
@@ -1259,8 +1285,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::MockBrokerage;
     use super::*;
+    use rlean_algorithm::qc_algorithm::{AccountType, BrokerageName, QcAlgorithm};
     use rlean_brokerages::BrokerageHolding;
-    use rlean_core::{DateTime, Market, Symbol};
+    use rlean_core::{DateTime, Market, Resolution, Symbol};
     use rust_decimal_macros::dec;
 
     fn spy() -> Symbol {
@@ -1307,6 +1334,38 @@ mod tests {
         // Unknown externally-created order is ignored.
         let unknown = Order::market(5, spy(), dec!(1), DateTime::now(), "");
         assert_eq!(resolve_engine_order_id(&unknown, &map), None);
+    }
+
+    #[test]
+    fn cash_buying_power_rejection_never_crosses_brokerage_boundary() {
+        let mut algorithm = QcAlgorithm::new("test", dec!(8226));
+        algorithm.set_brokerage_model(BrokerageName::RobinhoodBrokerage, AccountType::Cash);
+
+        let existing = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm.securities.update_price(&existing, dec!(100));
+        algorithm
+            .portfolio
+            .set_holdings(&existing, dec!(100), dec!(800), dec!(1));
+
+        let replacement = algorithm.add_equity("FHN", Resolution::Minute);
+        algorithm.securities.update_price(&replacement, dec!(25.39));
+        let order = Order::market(1, replacement, dec!(419), DateTime::now(), "replacement");
+        algorithm.transactions.add_order(order);
+
+        let mock = MockBrokerage::new();
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
+        let events = router.dispatch_pending(&algorithm.transactions, &algorithm);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, OrderStatus::Invalid);
+        assert!(events[0].message.contains("Insufficient buying power"));
+        assert!(submitted.lock().is_empty());
+        assert_eq!(
+            algorithm.transactions.get_order(1).unwrap().status,
+            OrderStatus::Invalid
+        );
+        router.shutdown();
     }
 
     /// End-to-end worker test: submit an order, then flip the account view to

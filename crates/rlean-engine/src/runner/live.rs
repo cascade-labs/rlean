@@ -60,6 +60,7 @@ where
     let mut algorithm_manager = AlgorithmManager::new(bridge, runtime_context);
     let market_hours_database = MarketHoursDatabase::global();
     algorithm_manager.set_market_hours_database(market_hours_database);
+    algorithm_manager.set_brokerage_model(config.brokerage_model);
 
     // Execution is independent from the live-data feed. A sidecar brokerage
     // connection enables real routing; without one, fills remain local paper
@@ -826,7 +827,14 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
         // registered flow to the brokerage and reconcile on the poll path.
         // Market-on-open registrations are held by the router until their
         // exchange opens.
-        router.dispatch_pending_at(transactions, now);
+        match algorithm_state.lock() {
+            Ok(algorithm) => {
+                let _ = router.dispatch_pending_at(transactions, &algorithm, now);
+            }
+            Err(_) => tracing::error!(
+                "liquidate-unmanaged-holdings: algorithm lock poisoned before submission"
+            ),
+        }
     }
 }
 
@@ -935,7 +943,28 @@ async fn process_live_slice<B: AlgorithmBridge>(
     // Under real brokerage routing, forward any New orders the framework/strategy
     // just created to the brokerage worker for submission.
     if let (Some(router), Some(transactions)) = (brokerage_router.as_mut(), transactions) {
-        router.dispatch_pending(transactions);
+        let invalid_events = algorithm_manager
+            .algorithm()
+            .algorithm_state()
+            .map(|state| {
+                let algorithm = state.lock().expect("algorithm state poisoned");
+                router.dispatch_pending(transactions, &algorithm)
+            })
+            .unwrap_or_default();
+        if !invalid_events.is_empty() {
+            for event in &invalid_events {
+                algorithm_manager.algorithm.on_order_event(event, services);
+            }
+            rearm_rebalance_for_invalid_insight_orders(
+                algorithm_manager,
+                &invalid_events,
+                insight_retry_budget,
+            );
+            if let Some(writer) = live_writer {
+                writer.append_order_events(&invalid_events);
+            }
+            all_order_events.extend(invalid_events);
+        }
     }
     // Mirror the backtest runner: securities added mid-run (e.g. add_equity from
     // an alpha model or OnData) never surface through universe selection, so the
