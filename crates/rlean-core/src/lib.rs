@@ -9,6 +9,7 @@ pub mod option_style;
 pub mod options;
 pub mod period;
 pub mod resolution;
+pub mod risk_free_interest_rate_model;
 pub mod security_type;
 pub mod symbol;
 pub mod tick_type;
@@ -24,6 +25,9 @@ pub use option_style::OptionStyle;
 pub use options::{format_option_ticker, Greeks, OptionSymbolId, SettlementType, SymbolOptionsExt};
 pub use period::Period;
 pub use resolution::Resolution;
+pub use risk_free_interest_rate_model::{
+    ConstantRiskFreeInterestRateModel, DatedRiskFreeInterestRateModel, RiskFreeInterestRateModel,
+};
 pub use security_type::SecurityType;
 pub use symbol::{SecurityIdentifier, Symbol, SymbolProperties};
 pub use tick_type::TickType;

@@ -17,6 +17,7 @@ pub mod orders;
 pub mod report;
 pub mod research;
 pub mod result_handler;
+pub mod risk_free_interest_rate;
 pub mod runner;
 pub mod runner_config;
 pub mod runtime_context;

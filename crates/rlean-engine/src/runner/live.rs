@@ -2,8 +2,8 @@ use crate::{
     algorithm_manager::{AlgorithmManager, OrderEventProcessing},
     data_feed::DataFeedContext,
     runner::backtest::{
-        benchmark_subscription_for_symbol, subscriptions_with_benchmark,
-        subscriptions_with_option_chains,
+        apply_risk_free_rate_to_option_chains, benchmark_subscription_for_symbol,
+        subscriptions_with_benchmark, subscriptions_with_option_chains,
     },
     LiveRunConfig, LiveRunResult,
 };
@@ -76,6 +76,19 @@ where
     );
 
     algorithm_manager.initialize(&mut services)?;
+    let risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel> = Arc::new(
+        crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
+            &config.data_sidecar,
+            chrono::Utc::now().date_naive(),
+        )
+        .await?,
+    );
+    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+        algorithm_state
+            .lock()
+            .expect("algorithm state poisoned")
+            .set_risk_free_interest_rate_model(risk_free_interest_rate_model.clone());
+    }
 
     if let Some(dir) = config.output_dir.as_deref() {
         if let Some((active, closed)) = crate::live::deployment_writer::restore_live_insights(
@@ -301,7 +314,11 @@ where
             continue;
         };
 
-        for slice in assembler.push(item) {
+        for mut slice in assembler.push(item) {
+            apply_risk_free_rate_to_option_chains(
+                &mut slice,
+                risk_free_interest_rate_model.as_ref(),
+            );
             process_live_slice(
                 &mut algorithm_manager,
                 &mut services,
@@ -342,7 +359,11 @@ where
     if algorithm_manager.algorithm().terminal_status().is_none()
         && algorithm_manager.algorithm().runtime_error().is_none()
     {
-        if let Some(slice) = assembler.flush() {
+        if let Some(mut slice) = assembler.flush() {
+            apply_risk_free_rate_to_option_chains(
+                &mut slice,
+                risk_free_interest_rate_model.as_ref(),
+            );
             if !should_stop(
                 algorithm_manager.slices_processed() as usize,
                 config.max_slices,
@@ -1242,7 +1263,7 @@ fn live_items(
             };
             vec![LiveDataItem::FundamentalUniverseData { time, data: rows }]
         }
-        CanonicalDataBatch::RecordBatch(_) => {
+        CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
             anyhow::bail!("unsupported canonical live batch type")
         }
     })

@@ -490,6 +490,7 @@ fn generate_html(r: &BacktestResult) -> String {
       <tr><td>{benchmark_symbol} Return</td><td>{benchmark_return_pct}</td></tr>
       <tr><td>CAGR</td><td>{cagr}</td></tr>
       <tr><td>Annual Std Dev</td><td>{ann_std}</td></tr>
+      <tr><td>Avg Risk-Free Rate</td><td>{risk_free_rate}</td></tr>
       <tr><td>Max Drawdown</td><td>{drawdown}</td></tr>
       <tr><td>Total Fees</td><td>{total_fees}</td></tr>
       <tr><td>Total Funding</td><td>{total_funding}</td></tr>
@@ -607,6 +608,7 @@ new Chart(document.getElementById('ddChart'),     chartOpts('Drawdown %',      '
         total_funding = dollar(r.total_funding),
         cagr = pct(cagr),
         ann_std = pct(ann_std),
+        risk_free_rate = pct(s.risk_free_rate.to_f64().unwrap_or(0.0)),
         drawdown = pct(drawdown),
         sharpe = stable_ratio(sharpe),
         sortino = stable_ratio(sortino),

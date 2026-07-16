@@ -35,6 +35,8 @@ pub enum WireDataType {
     /// Provider-generated universe rows. This is distinct from ordinary
     /// custom data even when both use the same canonical point schema.
     Universe = 12,
+    /// Provider-neutral dated annual risk-free interest rate.
+    RiskFreeInterestRate = 13,
 }
 
 #[derive(Clone, PartialEq, Message)]

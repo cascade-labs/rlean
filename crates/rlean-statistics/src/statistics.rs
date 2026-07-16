@@ -40,6 +40,21 @@ impl Statistics {
         Decimal::from_f64_retain(annual).unwrap_or(dec!(0))
     }
 
+    /// LEAN-compatible annual performance from periodic arithmetic returns.
+    ///
+    /// C# LEAN uses `(1 + average(return)) ^ trading_days_per_year - 1` for
+    /// Sharpe, Alpha, Information Ratio, and Treynor. This intentionally differs
+    /// from CAGR, which is based on start/end equity over elapsed years.
+    pub fn annual_performance_from_returns(returns: &[Decimal]) -> Decimal {
+        if returns.is_empty() {
+            return dec!(0);
+        }
+        let mean = returns.iter().sum::<Decimal>() / Decimal::from(returns.len());
+        use rust_decimal::prelude::ToPrimitive;
+        let annual = (dec!(1) + mean).to_f64().unwrap_or(1.0).powf(252.0) - 1.0;
+        Decimal::from_f64_retain(annual).unwrap_or(dec!(0))
+    }
+
     /// Sharpe ratio from daily returns and annual risk-free rate.
     pub fn sharpe_ratio(returns: &[Decimal], risk_free_rate: Decimal) -> Decimal {
         if returns.len() < 2 {
@@ -47,7 +62,6 @@ impl Statistics {
         }
         let n = Decimal::from(returns.len());
         let mean = returns.iter().sum::<Decimal>() / n;
-        let daily_rf = risk_free_rate / dec!(252);
         let variance = returns
             .iter()
             .map(|r| (r - mean) * (r - mean))
@@ -55,13 +69,18 @@ impl Statistics {
             / (n - dec!(1));
 
         use rust_decimal::prelude::ToPrimitive;
-        let std = variance.to_f64().unwrap_or(0.0).sqrt();
-        if std == 0.0 {
+        let annual_std = variance.to_f64().unwrap_or(0.0).sqrt() * 252_f64.sqrt();
+        if annual_std == 0.0 {
             return dec!(0);
         }
 
-        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
-        Decimal::from_f64_retain(daily_excess / std * 252_f64.sqrt()).unwrap_or(dec!(0))
+        let annual_performance = Self::annual_performance_from_returns(returns)
+            .to_f64()
+            .unwrap_or(0.0);
+        Decimal::from_f64_retain(
+            (annual_performance - risk_free_rate.to_f64().unwrap_or(0.0)) / annual_std,
+        )
+        .unwrap_or(dec!(0))
     }
 
     /// Sortino ratio from daily returns and annual risk-free rate.
@@ -69,32 +88,30 @@ impl Statistics {
         if returns.len() < 2 {
             return dec!(0);
         }
-        let n = Decimal::from(returns.len());
-        let mean = returns.iter().sum::<Decimal>() / n;
-        let daily_rf = risk_free_rate / dec!(252);
-
-        let downside_sq: Decimal = returns
-            .iter()
-            .filter(|&&r| r < dec!(0))
-            .map(|r| r * r)
-            .sum();
-
-        let downside_count = returns.iter().filter(|&&r| r < dec!(0)).count();
-        if downside_count == 0 {
+        let downside: Vec<Decimal> = returns.iter().filter(|&&r| r < dec!(0)).copied().collect();
+        if downside.len() < 2 {
             return dec!(0);
         }
+        let downside_mean = downside.iter().sum::<Decimal>() / Decimal::from(downside.len());
+        let downside_variance = downside
+            .iter()
+            .map(|r| (r - downside_mean) * (r - downside_mean))
+            .sum::<Decimal>()
+            / Decimal::from(downside.len() - 1);
 
         use rust_decimal::prelude::ToPrimitive;
-        let downside_std = (downside_sq / Decimal::from(downside_count))
-            .to_f64()
-            .unwrap_or(0.0)
-            .sqrt();
+        let downside_std = downside_variance.to_f64().unwrap_or(0.0).sqrt() * 252_f64.sqrt();
         if downside_std == 0.0 {
             return dec!(0);
         }
 
-        let daily_excess = (mean - daily_rf).to_f64().unwrap_or(0.0);
-        Decimal::from_f64_retain(daily_excess / downside_std * 252_f64.sqrt()).unwrap_or(dec!(0))
+        let annual_performance = Self::annual_performance_from_returns(returns)
+            .to_f64()
+            .unwrap_or(0.0);
+        Decimal::from_f64_retain(
+            (annual_performance - risk_free_rate.to_f64().unwrap_or(0.0)) / downside_std,
+        )
+        .unwrap_or(dec!(0))
     }
 
     /// Maximum drawdown from an equity curve.
@@ -200,16 +217,9 @@ impl Statistics {
         if n < 2 {
             return dec!(0);
         }
-        let active: Vec<Decimal> = returns[..n]
-            .iter()
-            .zip(benchmark_returns[..n].iter())
-            .map(|(r, b)| r - b)
-            .collect();
-        let mean_active = active.iter().sum::<Decimal>() / Decimal::from(n);
-        use rust_decimal::prelude::ToPrimitive;
-        let ann_active = Decimal::from_f64_retain(mean_active.to_f64().unwrap_or(0.0) * 252.0)
-            .unwrap_or(dec!(0));
-        ann_active / te
+        let annual_performance = Self::annual_performance_from_returns(&returns[..n]);
+        let benchmark_annual = Self::annual_performance_from_returns(&benchmark_returns[..n]);
+        (annual_performance - benchmark_annual) / te
     }
 
     /// Return (skewness, excess_kurtosis) of a daily return series.
