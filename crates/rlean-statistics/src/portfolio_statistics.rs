@@ -28,6 +28,7 @@ pub struct PortfolioStatistics {
     pub omega_ratio: Decimal,
     pub recovery_factor: Decimal,
     pub calmar_ratio: Decimal,
+    pub risk_free_rate: Decimal,
     pub max_consecutive_wins: usize,
     pub max_consecutive_losses: usize,
     pub average_trade_duration_days: Decimal,
@@ -79,22 +80,17 @@ impl PortfolioStatistics {
             .collect();
 
         let annual_return = Statistics::annual_performance(total_return, trading_days);
+        let annual_performance = Statistics::annual_performance_from_returns(&daily_returns);
         let drawdown = Statistics::max_drawdown(equity_curve);
         let daily_rf = risk_free_rate / dec!(252);
         let sharpe = Statistics::sharpe_ratio(&daily_returns, risk_free_rate);
         let sortino = Statistics::sortino_ratio(&daily_returns, risk_free_rate);
         let beta = Statistics::beta(&daily_returns, &benchmark_returns);
-        let benchmark_total_return = if benchmark_curve.len() >= 2 && !benchmark_curve[0].is_zero()
-        {
-            (benchmark_curve[benchmark_curve.len() - 1] - benchmark_curve[0]) / benchmark_curve[0]
-        } else {
-            dec!(0)
-        };
-        let bench_annual = Statistics::annual_performance(benchmark_total_return, trading_days);
+        let bench_annual = Statistics::annual_performance_from_returns(&benchmark_returns);
         let alpha = if beta.is_zero() {
             dec!(0)
         } else {
-            Statistics::alpha(annual_return, beta, bench_annual, risk_free_rate)
+            Statistics::alpha(annual_performance, beta, bench_annual, risk_free_rate)
         };
         let tracking_error = Statistics::tracking_error(&daily_returns, &benchmark_returns);
         let information_ratio = Statistics::information_ratio(&daily_returns, &benchmark_returns);
@@ -187,12 +183,13 @@ impl PortfolioStatistics {
             treynor_ratio: if beta.is_zero() {
                 dec!(0)
             } else {
-                (annual_return - risk_free_rate) / beta
+                (annual_performance - risk_free_rate) / beta
             },
             portfolio_turnover,
             omega_ratio: omega,
             recovery_factor: recovery,
             calmar_ratio: calmar,
+            risk_free_rate,
             max_consecutive_wins: trade_stats.max_consecutive_wins,
             max_consecutive_losses: trade_stats.max_consecutive_losses,
             average_trade_duration_days: trade_stats.average_trade_duration_days,

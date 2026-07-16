@@ -441,9 +441,11 @@ fn decode_points(
                 )
                 .collect())
         }
-        CanonicalDataBatch::RecordBatch(_) => Err(LeanError::DataError(format!(
-            "sidecar data type {wire_type:?} is not consumable by a subscription"
-        ))),
+        CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
+            Err(LeanError::DataError(format!(
+                "sidecar data type {wire_type:?} is not consumable by a subscription"
+            )))
+        }
     }
 }
 

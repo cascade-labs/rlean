@@ -1,4 +1,4 @@
-use rlean_core::{DateTime, NanosecondTimestamp, Price};
+use rlean_core::{DateTime, NanosecondTimestamp, Price, RiskFreeInterestRateModel};
 use rlean_statistics::PortfolioStatistics;
 use std::collections::BTreeMap;
 
@@ -28,18 +28,48 @@ impl ResultHandler {
         trades: &[rlean_statistics::Trade],
         trading_days: i64,
         starting_cash: Price,
+        risk_free_interest_rate_model: &dyn RiskFreeInterestRateModel,
     ) {
-        let equity_vec = daily_close_values(&self.equity_curve);
-        let bench_vec = daily_close_values(&self.benchmark_curve);
+        let equity_by_date = daily_close_curve(&self.equity_curve);
+        let equity_vec = equity_by_date.values().copied().collect::<Vec<_>>();
+        let benchmark_by_date = daily_close_curve(&self.benchmark_curve);
+        let benchmark_covers_equity_start = equity_by_date
+            .keys()
+            .next()
+            .is_some_and(|date| benchmark_by_date.range(..=date).next_back().is_some());
+        let bench_vec = if benchmark_covers_equity_start {
+            equity_by_date
+                .keys()
+                .map(|date| {
+                    benchmark_by_date
+                        .range(..=date)
+                        .next_back()
+                        .expect("benchmark covers first equity date")
+                        .1
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let dates = equity_by_date
+            .keys()
+            .map(|date| {
+                DateTime::from(chrono::DateTime::from_naive_utc_and_offset(
+                    date.and_hms_opt(0, 0, 0).expect("valid equity date"),
+                    chrono::Utc,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let risk_free_rate = risk_free_interest_rate_model.get_average_interest_rate(&dates);
 
-        use rust_decimal_macros::dec;
         self.portfolio_stats = Some(PortfolioStatistics::compute(
             &equity_vec,
             &bench_vec,
             trades,
             trading_days,
             starting_cash,
-            dec!(0.04),
+            risk_free_rate,
         ));
     }
 
@@ -71,7 +101,12 @@ impl ResultHandler {
     }
 }
 
+#[cfg(test)]
 fn daily_close_values(curve: &BTreeMap<i64, Price>) -> Vec<Price> {
+    daily_close_curve(curve).values().copied().collect()
+}
+
+fn daily_close_curve(curve: &BTreeMap<i64, Price>) -> BTreeMap<chrono::NaiveDate, Price> {
     let mut last_by_date = BTreeMap::new();
 
     for (&time, &value) in curve {
@@ -79,7 +114,7 @@ fn daily_close_values(curve: &BTreeMap<i64, Price>) -> Vec<Price> {
         last_by_date.insert(date, value);
     }
 
-    last_by_date.values().copied().collect()
+    last_by_date
 }
 
 #[cfg(test)]
@@ -121,7 +156,8 @@ mod tests {
         result_handler.record_equity(timestamp(2024, 1, 5, 14), dec!(103500));
         result_handler.record_equity(timestamp(2024, 1, 5, 21), dec!(104000));
 
-        result_handler.finalize(&[], 4, dec!(100000));
+        let risk_free_model = rlean_core::ConstantRiskFreeInterestRateModel::new(dec!(0.04));
+        result_handler.finalize(&[], 4, dec!(100000), &risk_free_model);
 
         let stats = result_handler.portfolio_stats.unwrap();
         let expected = rlean_statistics::PortfolioStatistics::compute(

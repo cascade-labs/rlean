@@ -175,6 +175,8 @@ pub struct QcAlgorithm {
     /// The benchmark symbol set by the algorithm (ticker, e.g. "SPY").
     /// When None, the runner defaults to SPY automatically.
     pub benchmark_symbol: Option<String>,
+    /// Dated annual risk-free model used by statistics and option valuation.
+    pub risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel>,
 
     pub brokerage_name: BrokerageName,
     pub account_type: AccountType,
@@ -217,6 +219,9 @@ impl QcAlgorithm {
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
             benchmark_symbol: None,
+            risk_free_interest_rate_model: Arc::new(
+                rlean_core::ConstantRiskFreeInterestRateModel::new(dec!(0.01)),
+            ),
             brokerage_name: BrokerageName::Default,
             account_type: AccountType::Margin,
             free_portfolio_value: None,
@@ -308,6 +313,17 @@ impl QcAlgorithm {
     /// automatically uses SPY as the default benchmark.
     pub fn set_benchmark(&mut self, ticker: impl Into<String>) {
         self.benchmark_symbol = Some(ticker.into().to_uppercase());
+    }
+
+    pub fn set_risk_free_interest_rate_model(
+        &mut self,
+        model: Arc<dyn rlean_core::RiskFreeInterestRateModel>,
+    ) {
+        self.risk_free_interest_rate_model = model;
+    }
+
+    pub fn risk_free_interest_rate(&self, date: DateTime) -> Decimal {
+        self.risk_free_interest_rate_model.get_interest_rate(date)
     }
 
     // ─── Configuration ──────────────────────────────────────────────────────

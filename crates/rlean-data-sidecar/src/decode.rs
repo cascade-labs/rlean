@@ -9,8 +9,8 @@ use arrow_array::{
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TickType, TimeSpan};
 use rlean_data::FundamentalData;
 use rlean_data_tables::{
-    Bar, CustomDataPoint, DataMappingMode, FactorFileEntry, MapFileEntry, QuoteBar, Tick, TradeBar,
-    DECIMAL_SCALE,
+    Bar, CustomDataPoint, DataMappingMode, FactorFileEntry, MapFileEntry, QuoteBar,
+    RiskFreeInterestRate, Tick, TradeBar, DECIMAL_SCALE,
 };
 use rust_decimal::Decimal;
 
@@ -24,6 +24,7 @@ pub enum CanonicalDataBatch {
     Custom(Vec<CustomDataPoint>),
     Universe(Vec<CustomDataPoint>),
     Fundamentals(Vec<FundamentalData>),
+    RiskFreeInterestRates(Vec<RiskFreeInterestRate>),
     /// The contract remains available to callers that consume a canonical
     /// universe or auxiliary table directly.
     RecordBatch(RecordBatch),
@@ -49,8 +50,25 @@ pub fn decode_batch(
         WireDataType::FundamentalUniverse => Ok(CanonicalDataBatch::Fundamentals(
             decode_fundamentals(&batch)?,
         )),
+        WireDataType::RiskFreeInterestRate => Ok(CanonicalDataBatch::RiskFreeInterestRates(
+            decode_risk_free_interest_rates(&batch)?,
+        )),
         _ => Ok(CanonicalDataBatch::RecordBatch(batch)),
     }
+}
+
+fn decode_risk_free_interest_rates(
+    batch: &RecordBatch,
+) -> anyhow::Result<Vec<RiskFreeInterestRate>> {
+    let time = int64(batch, "time_ns")?;
+    let annual_rate = decimal(batch, "annual_rate")?;
+    Ok((0..batch.num_rows())
+        .map(|row| RiskFreeInterestRate {
+            time: NanosecondTimestamp(time.value(row)),
+            annual_rate: decimal_value(annual_rate.value(row)),
+            venue: string_at(batch, "venue", row),
+        })
+        .collect())
 }
 
 pub fn decode_factor_file_batch(batch: &RecordBatch) -> anyhow::Result<Vec<FactorFileEntry>> {

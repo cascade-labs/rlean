@@ -15,6 +15,7 @@ pub mod market_quote_bar;
 pub mod market_tick;
 pub mod market_trade_bar;
 pub mod option_universe;
+pub mod risk_free_interest;
 
 pub use base_data::{BaseData, BaseDataType};
 pub use contract::{
@@ -32,6 +33,7 @@ pub use market_quote_bar::{Bar, QuoteBar};
 pub use market_tick::Tick;
 pub use market_trade_bar::{TradeBar, TradeBarData};
 pub use option_universe::OptionUniverseRow;
+pub use risk_free_interest::RiskFreeInterestRate;
 
 /// Every table rlean knows how to initialize. Adding a new row contract only
 /// requires registering its type here; catalog-specific code remains generic.
@@ -48,6 +50,7 @@ pub fn table_definitions() -> Vec<TableDefinition> {
         EtfConstituentRow::table_definition(),
         FactorFileEntry::table_definition(),
         MapFileEntry::table_definition(),
+        RiskFreeInterestRate::table_definition(),
     ]
 }
 

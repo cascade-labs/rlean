@@ -8,7 +8,10 @@ use crate::{
 };
 use anyhow::Result;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, OptionSubscription};
-use rlean_core::{DataNormalizationMode, Market, MarketHoursDatabase, Resolution, Symbol};
+use rlean_core::{
+    DataNormalizationMode, Market, MarketHoursDatabase, Resolution, RiskFreeInterestRateModel,
+    Symbol,
+};
 use rlean_data::{
     OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
     SubscriptionDataKind,
@@ -20,6 +23,7 @@ use rlean_orders::{
     OrderEvent,
 };
 use rlean_statistics::{PortfolioStatistics, TradeBuilder};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 
@@ -59,6 +63,19 @@ where
         engine_time.date_utc(),
     )?;
     let starting_cash = algorithm_manager.starting_cash();
+    let risk_free_interest_rate_model: Arc<dyn RiskFreeInterestRateModel> = Arc::new(
+        crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
+            &config.data_sidecar,
+            end,
+        )
+        .await?,
+    );
+    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+        algorithm_state
+            .lock()
+            .expect("algorithm state poisoned")
+            .set_risk_free_interest_rate_model(risk_free_interest_rate_model.clone());
+    }
     let benchmark_symbol = algorithm_manager.benchmark_symbol();
     let benchmark_subscription =
         benchmark_subscription_for_symbol(&benchmark_symbol, algorithm_manager.subscriptions());
@@ -136,7 +153,11 @@ where
                 warmup_data_manager
                     .initialize_feed(&feed_subscriptions_owned, warmup_start, warmup_end)
                     .await?;
-                while let Some(slice) = warmup_data_manager.next_slice().await? {
+                while let Some(mut slice) = warmup_data_manager.next_slice().await? {
+                    apply_risk_free_rate_to_option_chains(
+                        &mut slice,
+                        risk_free_interest_rate_model.as_ref(),
+                    );
                     if !slice.has_data {
                         continue;
                     }
@@ -201,7 +222,8 @@ where
     let mut streamed_order_events = 0usize;
     let mut streamed_trades = 0usize;
 
-    while let Some(slice) = data_manager.next_slice().await? {
+    while let Some(mut slice) = data_manager.next_slice().await? {
+        apply_risk_free_rate_to_option_chains(&mut slice, risk_free_interest_rate_model.as_ref());
         if !slice.has_data {
             continue;
         }
@@ -219,6 +241,7 @@ where
                     &mut data_manager,
                     &mut sync_state,
                     algorithm_manager.algorithm(),
+                    benchmark_subscription.as_ref(),
                     slice.time,
                 )
                 .await?;
@@ -260,6 +283,7 @@ where
             &mut data_manager,
             &mut sync_state,
             algorithm_manager.algorithm(),
+            benchmark_subscription.as_ref(),
             slice.time,
         )
         .await?;
@@ -284,6 +308,7 @@ where
                 &mut data_manager,
                 &mut sync_state,
                 algorithm_manager.algorithm(),
+                benchmark_subscription.as_ref(),
                 slice.time,
             )
             .await?;
@@ -385,7 +410,12 @@ where
         );
     }
 
-    result_handler.finalize(&completed_trades, trading_days, starting_cash);
+    result_handler.finalize(
+        &completed_trades,
+        trading_days,
+        starting_cash,
+        risk_free_interest_rate_model.as_ref(),
+    );
     Ok(build_backtest_result(
         result_handler,
         trading_days,
@@ -398,6 +428,29 @@ where
         algorithm_manager,
         config,
     ))
+}
+
+pub(crate) fn apply_risk_free_rate_to_option_chains(
+    slice: &mut rlean_data::Slice,
+    model: &dyn RiskFreeInterestRateModel,
+) {
+    if slice.option_chains.is_empty() {
+        return;
+    }
+    let risk_free_rate = model.get_interest_rate(slice.time).to_f64().unwrap_or(0.0);
+    let price_model = rlean_options::BlackScholesPriceModel;
+    for chain in slice.option_chains.values_mut() {
+        let chain = Arc::make_mut(chain);
+        for contract in chain.contracts.values_mut() {
+            rlean_options::evaluate_contract_with_market_iv(
+                &price_model,
+                contract,
+                slice.time,
+                risk_free_rate,
+                0.0,
+            );
+        }
+    }
 }
 
 fn slice_has_algorithm_data(slice: &rlean_data::Slice) -> bool {
@@ -589,6 +642,7 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     data_manager: &mut DataManager,
     sync_state: &mut SubscriptionSyncState,
     bridge: &B,
+    benchmark_subscription: Option<&SubscriptionDataConfig>,
     start: rlean_core::DateTime,
 ) -> anyhow::Result<()> {
     // Generation short-circuit: if the bridge's subscription set has not changed
@@ -600,10 +654,7 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         return Ok(());
     }
 
-    let current_subscriptions = lean_style_active_subscriptions(&subscriptions_with_option_chains(
-        bridge.subscriptions(),
-        &bridge.option_subscriptions(),
-    ));
+    let current_subscriptions = desired_backtest_subscriptions(bridge, benchmark_subscription);
 
     let diff = compute_subscription_diff(&sync_state.active, &current_subscriptions);
 
@@ -646,6 +697,42 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
     sync_state.active = current_subscriptions;
     sync_state.last_version = Some(version);
     Ok(())
+}
+
+/// Build the complete desired feed set for every backtest subscription sync.
+///
+/// The benchmark is engine-owned and therefore absent from `bridge.subscriptions()`
+/// when the strategy has not separately subscribed to it. It must be re-added on
+/// every sync just like option-chain feeds; otherwise the first sync treats it as
+/// removed and tears down the sidecar stream.
+fn desired_backtest_subscriptions<B: AlgorithmBridge>(
+    bridge: &B,
+    benchmark_subscription: Option<&SubscriptionDataConfig>,
+) -> Vec<Arc<SubscriptionDataConfig>> {
+    desired_backtest_subscriptions_from_parts(
+        bridge.subscriptions(),
+        benchmark_subscription,
+        &bridge.option_subscriptions(),
+    )
+}
+
+fn desired_backtest_subscriptions_from_parts(
+    mut subscriptions: Vec<Arc<SubscriptionDataConfig>>,
+    benchmark_subscription: Option<&SubscriptionDataConfig>,
+    option_subscriptions: &[OptionSubscription],
+) -> Vec<Arc<SubscriptionDataConfig>> {
+    if let Some(benchmark) = benchmark_subscription {
+        if !subscriptions
+            .iter()
+            .any(|config| config.unique_id() == benchmark.unique_id())
+        {
+            subscriptions.push(Arc::new(benchmark.clone()));
+        }
+    }
+    lean_style_active_subscriptions(&subscriptions_with_option_chains(
+        subscriptions,
+        option_subscriptions,
+    ))
 }
 
 fn subscription_requires_stream_replacement(
@@ -827,8 +914,9 @@ fn build_backtest_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_subscription_diff, lean_style_active_subscriptions, resolve_backtest_dates,
-        subscription_requires_stream_replacement,
+        benchmark_subscription_for_symbol, compute_subscription_diff,
+        desired_backtest_subscriptions_from_parts, lean_style_active_subscriptions,
+        resolve_backtest_dates, subscription_requires_stream_replacement,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rlean_core::{DataNormalizationMode, DateTime, Market, Resolution, Symbol};
@@ -956,6 +1044,31 @@ mod tests {
             diff.is_empty(),
             "unchanged subscription set must diff empty"
         );
+    }
+
+    #[test]
+    fn desired_subscription_sync_preserves_engine_owned_benchmark() {
+        let strategy_subscriptions = vec![equity_config("XLK")];
+        let benchmark = benchmark_subscription_for_symbol("SPY", strategy_subscriptions.clone())
+            .expect("default SPY benchmark subscription");
+        assert!(benchmark.is_internal_feed);
+
+        let initial = desired_backtest_subscriptions_from_parts(
+            into_arcs(&strategy_subscriptions),
+            Some(&benchmark),
+            &[],
+        );
+        let synced = desired_backtest_subscriptions_from_parts(
+            into_arcs(&strategy_subscriptions),
+            Some(&benchmark),
+            &[],
+        );
+        let diff = compute_subscription_diff(&initial, &synced);
+
+        assert!(diff.is_empty(), "subscription sync must retain SPY");
+        assert!(synced
+            .iter()
+            .any(|config| config.unique_id() == benchmark.unique_id()));
     }
 
     #[test]
