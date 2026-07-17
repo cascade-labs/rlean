@@ -1,7 +1,7 @@
 use crate::artifacts::RunArtifactSink;
 use crate::data_feed::DataFeedOptions;
 use rlean_algorithm::charting::ChartCollection;
-use rlean_algorithm::qc_algorithm::BrokerageName;
+use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::AlphaAnalytics;
 use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
 use rlean_orders::{Order, OrderEvent};
@@ -51,9 +51,10 @@ pub struct LiveRunConfig {
     /// subscriptions do not reference this connection and may use a completely
     /// different provider. `None` keeps execution in rlean's paper path.
     pub brokerage: Option<SidecarBrokerageConnection>,
-    /// Optional brokerage model selected by the live CLI. This is applied
-    /// before Initialize(), so user code can still override it explicitly.
-    pub brokerage_model: Option<BrokerageName>,
+    /// Brokerage model selected by the live deployment. The execution
+    /// brokerage and account type are modeled together, matching C# LEAN's
+    /// `IBrokerageModel` boundary.
+    pub brokerage_model: BrokerageModel,
     pub paper_trading: bool,
     /// Stops after this many emitted slices. Intended for integration tests and
     /// smoke runs; `None` runs until every live subscription closes.

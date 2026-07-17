@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rlean_algorithm::qc_algorithm::BrokerageName;
+use rlean_algorithm::qc_algorithm::{AccountType, BrokerageModel, BrokerageName};
 
 use crate::cli::LiveArgs;
 use crate::config;
@@ -110,7 +110,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     } else {
         Some(requested_brokerage.to_string())
     };
-    let brokerage_model = live_brokerage_model_for_name(requested_brokerage);
+    let brokerage_model = live_brokerage_model_for_name(requested_brokerage)?;
 
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 
@@ -277,18 +277,38 @@ fn live_project_name(deploy_dir: &std::path::Path, strategy: &std::path::Path) -
     crate::runtime::strategy_name_from_path(strategy)
 }
 
-fn live_brokerage_model_for_name(name: &str) -> Option<BrokerageName> {
+fn live_brokerage_model_for_name(name: &str) -> Result<BrokerageModel> {
     let normalized = normalized_brokerage_name(name);
-    match normalized.as_str() {
-        "tradier" | "tradierbrokerage" => Some(BrokerageName::TradierBrokerage),
-        "hyperliquid" | "hyperliquidbrokerage" => Some(BrokerageName::HyperliquidBrokerage),
-        "interactivebrokers" | "interactivebrokersbrokerage" | "ib" | "ibkr" => {
-            Some(BrokerageName::InteractiveBrokersBrokerage)
+    let model = match normalized.as_str() {
+        "robinhood" | "robinhoodbrokerage" => {
+            BrokerageModel::new(BrokerageName::RobinhoodBrokerage, AccountType::Cash)
         }
-        "quantconnect" | "quantconnectbrokerage" => Some(BrokerageName::QuantConnectBrokerage),
-        "default" | "paper" | "paperbrokerage" => Some(BrokerageName::Default),
-        _ => None,
-    }
+        "fidelity" | "fidelitybrokerage" => {
+            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Margin)
+        }
+        "tradier" | "tradierbrokerage" => {
+            BrokerageModel::new(BrokerageName::TradierBrokerage, AccountType::Margin)
+        }
+        "hyperliquid" | "hyperliquidbrokerage" => {
+            BrokerageModel::new(BrokerageName::HyperliquidBrokerage, AccountType::Margin)
+        }
+        "interactivebrokers" | "interactivebrokersbrokerage" | "ib" | "ibkr" => {
+            BrokerageModel::new(
+                BrokerageName::InteractiveBrokersBrokerage,
+                AccountType::Margin,
+            )
+        }
+        "quantconnect" | "quantconnectbrokerage" => {
+            BrokerageModel::new(BrokerageName::QuantConnectBrokerage, AccountType::Margin)
+        }
+        "default" | "paper" | "paperbrokerage" => {
+            BrokerageModel::new(BrokerageName::Default, AccountType::Margin)
+        }
+        _ => bail!(
+            "execution brokerage '{name}' has no brokerage model; define its account type and order rules before using it live"
+        ),
+    };
+    Ok(model)
 }
 
 pub(crate) fn is_paper_brokerage_name(name: &str) -> bool {
@@ -311,25 +331,33 @@ mod tests {
     #[test]
     fn test_live_brokerage_model_name_mapping() {
         assert_eq!(
-            live_brokerage_model_for_name("tradier"),
-            Some(BrokerageName::TradierBrokerage)
+            live_brokerage_model_for_name("tradier").unwrap(),
+            BrokerageModel::new(BrokerageName::TradierBrokerage, AccountType::Margin)
         );
         assert_eq!(
-            live_brokerage_model_for_name("Tradier-Brokerage"),
-            Some(BrokerageName::TradierBrokerage)
+            live_brokerage_model_for_name("Tradier-Brokerage").unwrap(),
+            BrokerageModel::new(BrokerageName::TradierBrokerage, AccountType::Margin)
         );
         assert_eq!(
-            live_brokerage_model_for_name("hyperliquid"),
-            Some(BrokerageName::HyperliquidBrokerage)
+            live_brokerage_model_for_name("hyperliquid").unwrap(),
+            BrokerageModel::new(BrokerageName::HyperliquidBrokerage, AccountType::Margin)
         );
         assert_eq!(
-            live_brokerage_model_for_name("PaperBrokerage"),
-            Some(BrokerageName::Default)
+            live_brokerage_model_for_name("PaperBrokerage").unwrap(),
+            BrokerageModel::new(BrokerageName::Default, AccountType::Margin)
+        );
+        assert_eq!(
+            live_brokerage_model_for_name("robinhood").unwrap(),
+            BrokerageModel::new(BrokerageName::RobinhoodBrokerage, AccountType::Cash)
+        );
+        assert_eq!(
+            live_brokerage_model_for_name("fidelity").unwrap(),
+            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Margin)
         );
         assert!(is_paper_brokerage_name("paper"));
         assert!(is_paper_brokerage_name("PaperBrokerage"));
         assert!(!is_paper_brokerage_name("tradier"));
-        assert_eq!(live_brokerage_model_for_name("custom"), None);
+        assert!(live_brokerage_model_for_name("custom").is_err());
     }
 
     /// A deployment's strategy path is the code snapshot

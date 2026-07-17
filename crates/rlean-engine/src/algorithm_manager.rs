@@ -3,6 +3,7 @@ use crate::runtime_context::AlgorithmRuntimeContext;
 use rlean_algorithm::algorithm::{DataDeliveryPayload, SecurityChanges};
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubscription};
+use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{DateTime, MarketHoursDatabase, Resolution, TimeSpan};
 use rlean_data::{Slice, SubscriptionDataConfig};
@@ -65,6 +66,19 @@ where
                 .lock()
                 .unwrap()
                 .set_market_hours_database(market_hours_database);
+        }
+    }
+
+    /// Apply the deployment brokerage model before the strategy initializes.
+    /// This mirrors LEAN's setup-handler configuration of `IBrokerageModel`, so
+    /// securities added by `Initialize` receive the correct buying-power model
+    /// and leverage from their first initialization.
+    pub fn set_brokerage_model(&mut self, brokerage_model: BrokerageModel) {
+        if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+            algorithm_state
+                .lock()
+                .unwrap()
+                .set_brokerage_model(brokerage_model.brokerage, brokerage_model.account_type);
         }
     }
 

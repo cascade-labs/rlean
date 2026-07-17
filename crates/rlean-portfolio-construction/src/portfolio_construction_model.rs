@@ -61,6 +61,17 @@ impl RebalancePolicy {
         }
     }
 
+    /// Rebalance only when the active insight set changes.
+    ///
+    /// The scheduler deliberately returns no next time, and security changes do
+    /// not trigger target generation. New and expired insights still do. This is
+    /// the provider- and language-neutral equivalent of LEAN's nullable
+    /// rebalancing function returning `None` with
+    /// `RebalanceOnSecurityChanges = false`.
+    pub fn insight_changes_only() -> Self {
+        Self::next_time(|_| None).with_security_changes(false)
+    }
+
     pub fn from_period(period: Option<TimeSpan>) -> Self {
         period.map(Self::period).unwrap_or_else(Self::every_slice)
     }

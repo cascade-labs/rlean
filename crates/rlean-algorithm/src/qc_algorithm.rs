@@ -100,6 +100,28 @@ pub enum BrokerageName {
     InteractiveBrokersBrokerage,
     TradierBrokerage,
     HyperliquidBrokerage,
+    RobinhoodBrokerage,
+    FidelityBrokerage,
+}
+
+/// Brokerage behavior selected for an algorithm run.
+///
+/// Mirrors C# LEAN's `IBrokerageModel`: the brokerage identity and account type
+/// are one model because leverage, buying power, settlement and order rules all
+/// depend on both values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerageModel {
+    pub brokerage: BrokerageName,
+    pub account_type: AccountType,
+}
+
+impl BrokerageModel {
+    pub const fn new(brokerage: BrokerageName, account_type: AccountType) -> Self {
+        Self {
+            brokerage,
+            account_type,
+        }
+    }
 }
 
 /// Represents an open option position held by the algorithm.
@@ -178,8 +200,7 @@ pub struct QcAlgorithm {
     /// Dated annual risk-free model used by statistics and option valuation.
     pub risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel>,
 
-    pub brokerage_name: BrokerageName,
-    pub account_type: AccountType,
+    pub brokerage_model: BrokerageModel,
     /// Fixed cash amount excluded from portfolio target sizing. When unset,
     /// `free_portfolio_value_percentage` trails total portfolio value.
     pub free_portfolio_value: Option<Decimal>,
@@ -222,8 +243,7 @@ impl QcAlgorithm {
             risk_free_interest_rate_model: Arc::new(
                 rlean_core::ConstantRiskFreeInterestRateModel::new(dec!(0.01)),
             ),
-            brokerage_name: BrokerageName::Default,
-            account_type: AccountType::Margin,
+            brokerage_model: BrokerageModel::new(BrokerageName::Default, AccountType::Margin),
             free_portfolio_value: None,
             free_portfolio_value_percentage: dec!(0.0025),
             minimum_order_margin_portfolio_percentage: dec!(0.001),
@@ -249,15 +269,14 @@ impl QcAlgorithm {
         if brokerage == BrokerageName::HyperliquidBrokerage && account_type != AccountType::Margin {
             panic!("HyperliquidBrokerage only supports margin accounts");
         }
-        self.brokerage_name = brokerage;
-        self.account_type = account_type;
+        self.brokerage_model = BrokerageModel::new(brokerage, account_type);
         for security in self.securities.all() {
             self.initialize_security_models(security);
         }
     }
 
     pub fn default_market_for_security(&self, security_type: SecurityType) -> Market {
-        match (self.brokerage_name, security_type) {
+        match (self.brokerage_model.brokerage, security_type) {
             (BrokerageName::HyperliquidBrokerage, SecurityType::CryptoFuture) => {
                 Market::hyperliquid()
             }
@@ -271,7 +290,7 @@ impl QcAlgorithm {
     }
 
     pub fn default_leverage_for_security(&self, symbol: &Symbol) -> f64 {
-        if self.account_type == AccountType::Cash {
+        if self.brokerage_model.account_type == AccountType::Cash {
             return 1.0;
         }
         if let Some(leverage) = self.security_leverage_overrides.get(&symbol.id.sid) {
@@ -303,8 +322,10 @@ impl QcAlgorithm {
     }
 
     fn initialize_security_models(&self, security: &crate::securities::Security) {
-        let model =
-            BuyingPowerModel::default_for(&security.symbol, self.account_type == AccountType::Cash);
+        let model = BuyingPowerModel::default_for(
+            &security.symbol,
+            self.brokerage_model.account_type == AccountType::Cash,
+        );
         security.set_buying_power_model(model);
         security.set_leverage(self.default_leverage_for_security(&security.symbol));
     }
@@ -763,7 +784,7 @@ impl QcAlgorithm {
 
     fn fee_model_for_symbol(&self, symbol: &Symbol) -> Box<dyn FeeModel> {
         match (
-            self.brokerage_name,
+            self.brokerage_model.brokerage,
             symbol.security_type(),
             symbol.market().as_str(),
         ) {
@@ -782,6 +803,8 @@ impl QcAlgorithm {
             ) => Box::new(InteractiveBrokersFeeModel::default()),
             (BrokerageName::Default, _, _) => Box::new(FlatFeeModel::new(dec!(0))),
             (BrokerageName::TradierBrokerage, _, _) => Box::new(TradierFeeModel),
+            (BrokerageName::RobinhoodBrokerage, _, _) => Box::new(FlatFeeModel::new(dec!(0))),
+            (BrokerageName::FidelityBrokerage, _, _) => Box::new(FlatFeeModel::new(dec!(0))),
             (BrokerageName::InteractiveBrokersBrokerage, _, _) => {
                 Box::new(InteractiveBrokersFeeModel::default())
             }
@@ -945,6 +968,35 @@ impl QcAlgorithm {
         Ok(())
     }
 
+    /// Validate a new order before it crosses the live brokerage boundary.
+    ///
+    /// This is the rlean equivalent of C# LEAN's
+    /// `BrokerageTransactionHandler.HasSufficientBuyingPowerForOrders`: use the
+    /// security's brokerage-selected buying-power model and the order-type
+    /// price, including fees, before calling the external brokerage.
+    pub fn validate_order_submission_buying_power(&self, order: &Order) -> Result<(), String> {
+        let Some(security) = self.securities.get(&order.symbol) else {
+            return Err(format!(
+                "Insufficient buying power: security {} is not initialized",
+                order.symbol.value
+            ));
+        };
+        let market_price = security.current_price();
+        let order_price = match order.order_type {
+            OrderType::Limit
+            | OrderType::StopLimit
+            | OrderType::LimitIfTouched
+            | OrderType::ComboLimit
+            | OrderType::ComboLegLimit => order.limit_price.unwrap_or(market_price),
+            OrderType::StopMarket | OrderType::TrailingStop => {
+                order.stop_price.unwrap_or(market_price)
+            }
+            _ => market_price,
+        };
+        let fee = self.order_fee(order, order_price).amount;
+        self.validate_order_buying_power(order, order_price, fee)
+    }
+
     // ─── Ordering ────────────────────────────────────────────────────────────
 
     /// Allocate the next engine order id from the algorithm's single order-id
@@ -1005,7 +1057,7 @@ impl QcAlgorithm {
             );
         }
 
-        if self.brokerage_name != BrokerageName::TradierBrokerage {
+        if self.brokerage_model.brokerage != BrokerageName::TradierBrokerage {
             return None;
         }
 
@@ -1082,7 +1134,7 @@ impl QcAlgorithm {
     }
 
     fn hyperliquid_post_only_order_crosses_book(&self, order: &Order) -> bool {
-        if self.brokerage_name != BrokerageName::HyperliquidBrokerage
+        if self.brokerage_model.brokerage != BrokerageName::HyperliquidBrokerage
             && !matches!(
                 (order.symbol.security_type(), order.symbol.market().as_str()),
                 (SecurityType::CryptoFuture, Market::HYPERLIQUID)
@@ -1112,7 +1164,7 @@ impl QcAlgorithm {
     }
 
     pub fn can_execute_order_with_brokerage_model(&self, order: &Order) -> bool {
-        if self.brokerage_name != BrokerageName::TradierBrokerage {
+        if self.brokerage_model.brokerage != BrokerageName::TradierBrokerage {
             return true;
         }
 

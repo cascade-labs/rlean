@@ -100,6 +100,21 @@ mod equal_weighting_tests {
         );
     }
 
+    #[test]
+    fn insight_changes_only_has_no_schedule_or_security_trigger() {
+        let model =
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::insight_changes_only(),
+            );
+        let policy = model.rebalance_policy();
+
+        assert!(matches!(policy.cadence(), RebalanceCadence::NextTime(_)));
+        assert!(!policy.rebalance_on_security_changes());
+        assert!(policy.rebalance_on_insight_changes());
+    }
+
     /// A custom PCM that never sets a rebalancing function must rebalance on
     /// every slice, mirroring C# LEAN's base `PortfolioConstructionModel`
     /// (default `rebalancingFunc == null` -> `IsRebalanceDue` returns true every
