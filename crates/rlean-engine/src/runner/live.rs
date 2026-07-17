@@ -26,12 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Max times a single symbol's Invalid insight-backed order re-arms the
-/// framework rebalance before the runner gives up (until a natural trigger:
-/// insight change, expiry, or day boundary). Bounds retry loops against
-/// permanently-rejecting symbols (e.g. restricted tickers).
-const MAX_INSIGHT_RETRIES: u32 = 3;
-
 /// Engine-owned live runner entry point.
 ///
 /// All strategy languages enter through `rlean_algorithm::lifecycle::AlgorithmBridge`; language
@@ -113,14 +107,6 @@ where
     // failed are tracked and re-notified once live data prices them.
     let mut pending_price_restores =
         restore_securities_for_active_insights(&mut algorithm_manager, &history_service);
-
-    // Fix 3: bounded retry of failed insight-backed targets. When an order tied
-    // to a framework portfolio target comes back Invalid, re-arm the rebalance so
-    // the PCM recomputes and resubmits on the next slice (e.g. after trims free
-    // cash). Bounded per symbol so permanently-restricted symbols cannot cause a
-    // rebalance storm; exhausted symbols WARN and wait for the next natural
-    // trigger.
-    let mut insight_retry_budget: HashMap<u64, u32> = HashMap::new();
 
     let benchmark_subscription = benchmark_subscription_for_symbol(
         &algorithm_manager.benchmark_symbol(),
@@ -335,7 +321,6 @@ where
                 &mut trade_builder,
                 &mut completed_trades,
                 &mut pending_price_restores,
-                &mut insight_retry_budget,
                 &feed_context,
                 &slice,
             )
@@ -386,7 +371,6 @@ where
                     &mut trade_builder,
                     &mut completed_trades,
                     &mut pending_price_restores,
-                    &mut insight_retry_budget,
                     &feed_context,
                     &slice,
                 )
@@ -628,63 +612,6 @@ fn renotify_restored_securities_with_prices<B: AlgorithmBridge>(
     );
 }
 
-/// Fix 3: re-arm the framework rebalance for every Invalid order event in
-/// `new_events` whose symbol has an active (insight-backed) target and still has
-/// retry budget left.
-///
-/// This is the latency fix for the production incident: a rejected trim/entry no
-/// longer waits for the next insight change/expiry/day boundary — the next slice
-/// recomputes targets against corrected state (e.g. cash freed by a retried trim)
-/// and resubmits within seconds.
-///
-/// Bounded per symbol (`MAX_INSIGHT_RETRIES`): once a symbol exhausts its budget
-/// it WARNs and no longer re-triggers, so a permanently-rejecting symbol (e.g. a
-/// restricted ticker) cannot cause a rebalance storm. Liquidation orders are not
-/// insight-backed (no active insight), so `rearm_framework_rebalance_for_symbol`
-/// returns false for them and they never re-trigger.
-fn rearm_rebalance_for_invalid_insight_orders<B: AlgorithmBridge>(
-    algorithm_manager: &AlgorithmManager<B>,
-    new_events: &[OrderEvent],
-    insight_retry_budget: &mut HashMap<u64, u32>,
-) {
-    let framework = algorithm_manager.framework();
-    let mut seen_this_slice: HashSet<u64> = HashSet::new();
-    for event in new_events {
-        if event.status != rlean_orders::OrderStatus::Invalid {
-            continue;
-        }
-        let sid = event.symbol.id.sid;
-        // Only act once per symbol per slice even if several legs were rejected.
-        if !seen_this_slice.insert(sid) {
-            continue;
-        }
-        let attempts = insight_retry_budget.entry(sid).or_insert(0);
-        if *attempts >= MAX_INSIGHT_RETRIES {
-            tracing::warn!(
-                "Invalid order for {} exhausted its {MAX_INSIGHT_RETRIES}-attempt retry budget; not re-arming rebalance until the next natural trigger",
-                event.symbol.value
-            );
-            continue;
-        }
-        let now = rlean_core::DateTime::now();
-        if crate::framework::rearm_framework_rebalance_for_symbol(&framework, &event.symbol, now) {
-            *attempts += 1;
-            tracing::info!(
-                "Invalid insight-backed order for {}; re-arming framework rebalance (attempt {}/{MAX_INSIGHT_RETRIES})",
-                event.symbol.value,
-                *attempts
-            );
-        } else {
-            // Not insight-backed (e.g. a liquidation order): leave the rebalance
-            // trigger alone. Roll back the speculative counter insert so a later
-            // insight-backed rejection for the same symbol keeps its full budget.
-            if *attempts == 0 {
-                insight_retry_budget.remove(&sid);
-            }
-        }
-    }
-}
-
 /// Security types `QcAlgorithm::add_security_symbol` can register (it panics on
 /// anything else). Kept in lockstep with that method's supported arms.
 fn is_restorable_security_type(security_type: rlean_core::SecurityType) -> bool {
@@ -854,7 +781,6 @@ async fn process_live_slice<B: AlgorithmBridge>(
     trade_builder: &mut TradeBuilder,
     completed_trades: &mut Vec<Trade>,
     pending_price_restores: &mut HashMap<u64, rlean_core::Symbol>,
-    insight_retry_budget: &mut HashMap<u64, u32>,
     feed_context: &DataFeedContext,
     slice: &rlean_data::Slice,
 ) -> Result<()> {
@@ -920,16 +846,6 @@ async fn process_live_slice<B: AlgorithmBridge>(
             completed_trades,
         );
     }
-    // Fix 3: Invalid order events for insight-backed symbols re-arm the framework
-    // rebalance so run_framework below recomputes and resubmits this slice. Only
-    // examine events produced this slice, and only under real brokerage routing.
-    if brokerage_router.is_some() {
-        rearm_rebalance_for_invalid_insight_orders(
-            algorithm_manager,
-            &all_order_events[prev_order_events..],
-            insight_retry_budget,
-        );
-    }
     if let Some(writer) = live_writer {
         writer.append_order_events(&all_order_events[prev_order_events..]);
         writer.append_trades(&completed_trades[prev_trades..]);
@@ -955,11 +871,6 @@ async fn process_live_slice<B: AlgorithmBridge>(
             for event in &invalid_events {
                 algorithm_manager.algorithm.on_order_event(event, services);
             }
-            rearm_rebalance_for_invalid_insight_orders(
-                algorithm_manager,
-                &invalid_events,
-                insight_retry_budget,
-            );
             if let Some(writer) = live_writer {
                 writer.append_order_events(&invalid_events);
             }

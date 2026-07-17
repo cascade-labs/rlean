@@ -240,7 +240,7 @@ impl IPortfolioConstructionModel for PythonPortfolioConstructionModelAdapter {
                 let callable = value.clone().unbind();
                 let name = self.name.clone();
                 return Ok(Some(RebalancePolicy::next_time(move |now| {
-                    call_python_rebalance_func(&callable, &name, now)
+                    crate::framework::call_python_rebalance_func(&callable, &name, now)
                 })));
             }
             if let Ok(policy) = value.extract::<String>() {
@@ -258,24 +258,6 @@ impl IPortfolioConstructionModel for PythonPortfolioConstructionModelAdapter {
     fn name(&self) -> &str {
         &self.name
     }
-}
-
-/// Invokes a Python-side `Callable[[datetime], Optional[datetime]]` rebalancing
-/// function with the current UTC time, matching LEAN's calling convention.
-fn call_python_rebalance_func(callable: &Py<PyAny>, name: &str, now: DateTime) -> Option<DateTime> {
-    Python::attach(|py| -> PyResult<Option<DateTime>> {
-        let naive_utc = now.to_utc().naive_utc();
-        let result = callable.bind(py).call1((naive_utc,))?;
-        if result.is_none() {
-            return Ok(None);
-        }
-        let next: chrono::NaiveDateTime = result.extract()?;
-        Ok(Some(DateTime::from(next)))
-    })
-    .unwrap_or_else(|error| {
-        tracing::warn!("Python PCM {name} rebalance function failed: {error}");
-        None
-    })
 }
 
 fn rebalance_policy_from_py_str(value: &str) -> Option<RebalancePolicy> {

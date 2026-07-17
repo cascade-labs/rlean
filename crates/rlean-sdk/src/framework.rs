@@ -65,6 +65,10 @@ pub fn rebalance_policy_from_period(period: Option<TimeSpan>) -> RebalancePolicy
     RebalancePolicy::from_period(period)
 }
 
+pub fn insight_changes_only_rebalance_policy() -> RebalancePolicy {
+    RebalancePolicy::insight_changes_only()
+}
+
 pub fn portfolio_bias_from_view(bias: PortfolioBiasView) -> PortfolioBias {
     match bias {
         PortfolioBiasView::LongShort => PortfolioBias::LongShort,
@@ -104,6 +108,46 @@ pub fn parse_rebalance_arg(value: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<TimeS
         "unsupported rebalance argument type {type_name}; using model's default cadence"
     );
     None
+}
+
+#[cfg(feature = "python")]
+fn parse_rebalance_policy_arg(value: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<RebalancePolicy> {
+    use pyo3::types::PyAnyMethods;
+
+    if value.is_callable() {
+        let callable = std::sync::Arc::new(value.clone().unbind());
+        return Some(RebalancePolicy::next_time(move |now| {
+            call_python_rebalance_func(
+                callable.as_ref(),
+                "EqualWeightingPortfolioConstructionModel",
+                now,
+            )
+        }));
+    }
+    parse_rebalance_arg(value).map(RebalancePolicy::period)
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn call_python_rebalance_func(
+    callable: &pyo3::Py<pyo3::PyAny>,
+    name: &str,
+    now: DateTime,
+) -> Option<DateTime> {
+    use pyo3::types::PyAnyMethods;
+
+    pyo3::Python::attach(|py| -> pyo3::PyResult<Option<DateTime>> {
+        let naive_utc = now.to_utc().naive_utc();
+        let result = callable.bind(py).call1((naive_utc,))?;
+        if result.is_none() {
+            return Ok(None);
+        }
+        let next: chrono::NaiveDateTime = result.extract()?;
+        Ok(Some(DateTime::from(next)))
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!("Python PCM {name} rebalance function failed: {error}");
+        None
+    })
 }
 
 pub fn sanitize_positive_f64_decimal(value: Option<f64>) -> Option<Decimal> {
@@ -395,11 +439,24 @@ pub fn create_equal_weighting_pcm(
     max_weight: Option<f64>,
     rebalance_period: Option<TimeSpan>,
 ) -> Box<dyn IPortfolioConstructionModel> {
+    create_equal_weighting_pcm_with_policy(
+        portfolio_bias,
+        max_weight,
+        RebalancePolicy::from_period(rebalance_period),
+    )
+}
+
+/// Construct equal weighting with a language-neutral rebalance policy.
+pub fn create_equal_weighting_pcm_with_policy(
+    portfolio_bias: PortfolioBias,
+    max_weight: Option<f64>,
+    rebalance_policy: RebalancePolicy,
+) -> Box<dyn IPortfolioConstructionModel> {
     Box::new(
-        LeanEqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance(
+        LeanEqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
             portfolio_bias,
             sanitize_positive_f64_decimal(max_weight),
-            rebalance_period,
+            rebalance_policy,
         ),
     )
 }
@@ -691,7 +748,9 @@ impl Default for InsightWeightingPortfolioConstructionModel {
 pub struct EqualWeightingPortfolioConstructionModel {
     pub portfolio_bias: PortfolioBias,
     pub max_weight: Option<f64>,
-    pub rebalance_period: Option<TimeSpan>,
+    pub rebalance_policy: RebalancePolicy,
+    pub rebalance_on_security_changes: bool,
+    pub rebalance_on_insight_changes: bool,
 }
 
 impl EqualWeightingPortfolioConstructionModel {
@@ -699,12 +758,20 @@ impl EqualWeightingPortfolioConstructionModel {
         Self {
             portfolio_bias: PortfolioBias::LongShort,
             max_weight: None,
-            rebalance_period: default_rebalance_period(),
+            rebalance_policy: default_rebalance_policy(),
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
         }
     }
 
     pub fn into_pcm(self) -> Box<dyn IPortfolioConstructionModel> {
-        create_equal_weighting_pcm(self.portfolio_bias, self.max_weight, self.rebalance_period)
+        create_equal_weighting_pcm_with_policy(
+            self.portfolio_bias,
+            self.max_weight,
+            self.rebalance_policy
+                .with_security_changes(self.rebalance_on_security_changes)
+                .with_insight_changes(self.rebalance_on_insight_changes),
+        )
     }
 }
 
@@ -924,18 +991,40 @@ impl EqualWeightingPortfolioConstructionModel {
         portfolio_bias: Option<PortfolioBiasView>,
         max_weight: Option<f64>,
     ) -> Self {
-        let rebalance_period = rebalance
+        let rebalance_policy = rebalance
             .as_ref()
-            .and_then(parse_rebalance_arg)
-            .or_else(default_rebalance_period);
+            .and_then(parse_rebalance_policy_arg)
+            .unwrap_or_else(default_rebalance_policy);
         let portfolio_bias = portfolio_bias
             .map(portfolio_bias_from_view)
             .unwrap_or(PortfolioBias::LongShort);
         Self {
             portfolio_bias,
             max_weight,
-            rebalance_period,
+            rebalance_policy,
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
         }
+    }
+
+    #[getter]
+    fn rebalance_on_security_changes(&self) -> bool {
+        self.rebalance_on_security_changes
+    }
+
+    #[setter]
+    fn set_rebalance_on_security_changes(&mut self, enabled: bool) {
+        self.rebalance_on_security_changes = enabled;
+    }
+
+    #[getter]
+    fn rebalance_on_insight_changes(&self) -> bool {
+        self.rebalance_on_insight_changes
+    }
+
+    #[setter]
+    fn set_rebalance_on_insight_changes(&mut self, enabled: bool) {
+        self.rebalance_on_insight_changes = enabled;
     }
 }
 #[cfg(feature = "python")]
@@ -1489,6 +1578,33 @@ mod tests {
             // documented default.
             let unsupported = pyo3::types::PyList::empty(py);
             assert_eq!(parse_rebalance_arg(unsupported.as_any()), None);
+        });
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn equal_weighting_python_callback_supports_insight_only_policy() {
+        use pyo3::ffi::c_str;
+        use pyo3::Python;
+        use rlean_portfolio_construction::RebalanceCadence;
+
+        Python::attach(|py| {
+            let callback = py.eval(c_str!("lambda _: None"), None, None).unwrap();
+            let mut model = EqualWeightingPortfolioConstructionModel::py_new(
+                Some(callback),
+                Some(PortfolioBiasView::Long),
+                Some(0.2),
+            );
+            model.set_rebalance_on_security_changes(false);
+
+            assert!(!model.rebalance_on_security_changes());
+            assert!(model.rebalance_on_insight_changes());
+            match model.rebalance_policy.cadence() {
+                RebalanceCadence::NextTime(next) => {
+                    assert_eq!(next(DateTime::now()), None);
+                }
+                _ => panic!("Python callback must produce a next-time policy"),
+            }
         });
     }
 

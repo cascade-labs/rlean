@@ -355,22 +355,6 @@ impl FrameworkState {
         }
     }
 
-    /// True when the symbol has an active (unexpired) insight at `utc_now`.
-    /// Used by the live runner to decide whether an Invalid order event is tied
-    /// to a framework target (insight-backed) and should re-arm the rebalance.
-    pub fn has_active_insight(&self, symbol: &Symbol, utc_now: DateTime) -> bool {
-        self.insights.has_active(symbol, utc_now)
-    }
-
-    /// Re-arm the rebalance trigger so the next pipeline run recomputes targets,
-    /// even without a fresh insight/expiry/day boundary. Reuses the same
-    /// insight-change path `restore_insights` uses; the live runner calls this
-    /// when an insight-backed order comes back Invalid so the PCM promptly
-    /// resubmits with corrected state (e.g. cash freed by a trim).
-    pub fn rearm_rebalance(&mut self) {
-        self.restored_insight_change = true;
-    }
-
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
         if !added.is_empty() || !removed.is_empty() {
             self.pending_security_changes = true;
@@ -525,24 +509,6 @@ pub fn notify_framework_securities_changed(
 ) {
     let mut fw = framework.lock().unwrap();
     fw.on_securities_changed(added, removed);
-}
-
-/// If `symbol` has an active insight, re-arm the framework rebalance so the next
-/// pipeline run recomputes targets and resubmits. Returns `true` when the
-/// rebalance was re-armed (i.e. the symbol is insight-backed). Liquidation and
-/// other non-insight orders return `false` and never trigger a rebalance.
-pub fn rearm_framework_rebalance_for_symbol(
-    framework: &Arc<Mutex<FrameworkState>>,
-    symbol: &Symbol,
-    utc_now: DateTime,
-) -> bool {
-    let mut fw = framework.lock().unwrap();
-    if fw.has_active_insight(symbol, utc_now) {
-        fw.rearm_rebalance();
-        true
-    } else {
-        false
-    }
 }
 
 struct FrameworkInputs {
@@ -815,5 +781,23 @@ mod tests {
             next_rebalance_time(&policy, now),
             Some(now + TimeSpan::ONE_HOUR)
         );
+    }
+
+    #[test]
+    fn insight_only_policy_ignores_time_and_security_changes() {
+        let mut framework = FrameworkState::new();
+        framework.pcm = Box::new(
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                rlean_portfolio_construction::PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::insight_changes_only(),
+            ),
+        );
+        let now = dt(2026, 1, 1);
+
+        assert!(!framework.is_rebalance_due(now, false));
+        framework.pending_security_changes = true;
+        assert!(!framework.is_rebalance_due(now + TimeSpan::ONE_DAY, false));
+        assert!(framework.is_rebalance_due(now + TimeSpan::ONE_DAY, true));
     }
 }
