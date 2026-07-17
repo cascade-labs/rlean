@@ -9,6 +9,7 @@ use arrow_array::RecordBatch;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::FlightData;
 use hyper_util::rt::TokioIo;
+use rlean_core::DateTime;
 use rlean_data::SubscriptionDataConfig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -32,6 +33,12 @@ use crate::{
 pub type DataBatchStream = ReceiverStream<anyhow::Result<RecordBatch>>;
 pub type BrokerageEventStream = ReceiverStream<anyhow::Result<BrokerageEvent>>;
 pub type RelayBatchStream = ReceiverStream<anyhow::Result<RelayBatch>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionRegistration {
+    pub subscription_id: u64,
+    pub available_from: Option<DateTime>,
+}
 
 #[derive(Debug)]
 pub struct RelayBatch {
@@ -406,7 +413,7 @@ impl DataSidecarClient {
         &self,
         config: &SubscriptionDataConfig,
         mode: DeliveryMode,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<SubscriptionRegistration> {
         self.add_subscription_spec(SubscriptionSpec::from(config), mode)
             .await
     }
@@ -418,7 +425,7 @@ impl DataSidecarClient {
         &self,
         spec: SubscriptionSpec,
         mode: DeliveryMode,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<SubscriptionRegistration> {
         let subscription_id = self
             .inner
             .next_subscription_id
@@ -434,7 +441,12 @@ impl DataSidecarClient {
             Some(ServerPayload::SubscriptionAdded(added))
                 if added.subscription_id == subscription_id =>
             {
-                Ok(subscription_id)
+                Ok(SubscriptionRegistration {
+                    subscription_id,
+                    available_from: added
+                        .available_from_time_ns
+                        .map(rlean_core::NanosecondTimestamp),
+                })
             }
             _ => bail!("sidecar returned an invalid AddSubscription acknowledgement"),
         }

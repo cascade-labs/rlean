@@ -31,10 +31,11 @@ pub async fn load_risk_free_interest_rate_model(
         properties: Default::default(),
         venue: String::new(),
     };
-    let subscription_id = sidecar
+    let registration = sidecar
         .add_subscription_spec(spec, DeliveryMode::Backtest)
         .await
         .context("register canonical risk-free interest-rate subscription")?;
+    let subscription_id = registration.subscription_id;
     let start = Utc
         .with_ymd_and_hms(1998, 1, 1, 0, 0, 0)
         .single()

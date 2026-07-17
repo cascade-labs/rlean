@@ -13,7 +13,7 @@ mod protocol;
 pub use brokerage_wire::{order_status_from_wire, symbol_from_wire};
 pub use client::{
     BrokerageEvent, BrokerageEventStream, DataBatchStream, DataSidecarClient, DataSidecarConfig,
-    RelayBatch, RelayBatchStream, SidecarEndpoint,
+    RelayBatch, RelayBatchStream, SidecarEndpoint, SubscriptionRegistration,
 };
 pub use decode::{
     decode_batch, decode_factor_file_batch, decode_map_file_batch, CanonicalDataBatch,

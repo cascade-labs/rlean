@@ -412,6 +412,10 @@ pub struct Manifest {
 pub struct SubscriptionAdded {
     #[prost(uint64, tag = "1")]
     pub subscription_id: u64,
+    /// Earliest timestamp at which this dataset can produce data. The sidecar
+    /// owns this boundary because it owns provider selection and availability.
+    #[prost(sint64, optional, tag = "2")]
+    pub available_from_time_ns: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
