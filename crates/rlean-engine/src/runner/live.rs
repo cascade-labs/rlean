@@ -454,9 +454,9 @@ fn ensure_brokerage_holding_securities(
 /// subscriptions then flow through `subscriptions()` into the initial live
 /// subscription set and later syncs, so the live data feed follows automatically.
 ///
-/// It also notifies the framework of the added securities so the PCM's
-/// rebalance-on-security-changes policy fires and the alpha/PCM/execution models
-/// observe the restored universe.
+/// It also notifies the framework of the added securities. Whether that causes
+/// target creation remains entirely controlled by the PCM's configured
+/// rebalance-on-security-changes policy.
 ///
 /// Restored securities start with price 0 — live quotes arrive only seconds
 /// after startup, typically *after* the first framework run, and the PCM skips
@@ -465,7 +465,7 @@ fn ensure_brokerage_holding_securities(
 /// history provider (daily resolution; the engine-side FuncSecuritySeeder
 /// equivalent). Symbols whose history fetch yields nothing are returned in the
 /// pending map; the live loop re-notifies the framework the moment such a
-/// security gains a live price, so the PCM re-rebalances then.
+/// security gains a live price. Insight-only policies still remain no-ops.
 fn restore_securities_for_active_insights<B: AlgorithmBridge>(
     algorithm_manager: &mut AlgorithmManager<B>,
     history_service: &Arc<dyn rlean_algorithm::lifecycle::AlgorithmHistoryService>,
@@ -594,8 +594,8 @@ fn restore_securities_for_active_insights<B: AlgorithmBridge>(
 
 /// Fallback for restored-insight securities whose history seed failed (halted,
 /// IPO'd yesterday, provider gap): once such a security gains its first live
-/// price, notify the framework again so the PCM's rebalance-on-security-changes
-/// policy re-fires and the restored insight finally produces a target.
+/// price, notify the framework again. This only rebalances when the PCM enables
+/// security-change rebalancing; checkpoint restoration is not a new insight.
 fn renotify_restored_securities_with_prices<B: AlgorithmBridge>(
     algorithm_manager: &AlgorithmManager<B>,
     pending: &mut HashMap<u64, rlean_core::Symbol>,

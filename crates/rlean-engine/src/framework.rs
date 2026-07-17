@@ -57,7 +57,6 @@ pub struct FrameworkState {
     pending_flat_targets: Vec<Insight>,
     pending_insight_events: Vec<InsightEvent>,
     pending_security_changes: bool,
-    restored_insight_change: bool,
     next_rebalance_time: Option<DateTime>,
     /// Optional language-binding observer used to expose scored insights.
     observer: Option<Arc<dyn InsightObserver>>,
@@ -75,7 +74,6 @@ impl FrameworkState {
             pending_flat_targets: Vec::new(),
             pending_insight_events: Vec::new(),
             pending_security_changes: false,
-            restored_insight_change: false,
             next_rebalance_time: None,
             observer: None,
         }
@@ -191,12 +189,8 @@ impl FrameworkState {
             return orders;
         }
 
-        let restored_insight_change = self.restored_insight_change;
-        self.restored_insight_change = false;
-        let insight_changes = !alpha_insights.is_empty()
-            || expired_insight_count != 0
-            || pending_flat_count != 0
-            || restored_insight_change;
+        let insight_changes =
+            !alpha_insights.is_empty() || expired_insight_count != 0 || pending_flat_count != 0;
         if !self.is_rebalance_due(slice.time, insight_changes) {
             self.expose_insights(slice.time);
             return Vec::new();
@@ -349,7 +343,6 @@ impl FrameworkState {
             utc_now,
             restored_active.active.as_ref(),
         );
-        self.restored_insight_change = !restored_active.active.is_empty();
         if let Some(observer) = &self.observer {
             observer.on_insights(restored_active, utc_now);
         }
@@ -799,5 +792,34 @@ mod tests {
         framework.pending_security_changes = true;
         assert!(!framework.is_rebalance_due(now + TimeSpan::ONE_DAY, false));
         assert!(framework.is_rebalance_due(now + TimeSpan::ONE_DAY, true));
+    }
+
+    #[test]
+    fn insight_only_policy_does_not_treat_checkpoint_restore_as_a_new_insight() {
+        let mut framework = FrameworkState::new();
+        framework.pcm = Box::new(
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                rlean_portfolio_construction::PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::insight_changes_only(),
+            ),
+        );
+        let now = dt(2026, 1, 1);
+        let insight = Insight::up(
+            Symbol::create_equity("SPY", &rlean_core::Market::usa()),
+            TimeSpan::ONE_DAY,
+        )
+        .with_generated_time_utc(now);
+
+        framework.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![insight],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            now,
+        );
+
+        assert!(!framework.is_rebalance_due(now, false));
     }
 }
