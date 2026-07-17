@@ -164,6 +164,12 @@ where
             .await
             {
                 Ok(sync) => {
+                    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+                        let mut algorithm = algorithm_state
+                            .lock()
+                            .expect("algorithm state poisoned during brokerage account sync");
+                        ensure_brokerage_holding_securities(&mut algorithm, &sync.holdings);
+                    }
                     if let Some(portfolio) = portfolio.as_ref() {
                         crate::live::deployment_writer::set_live_starting_portfolio_value_from_synced_account(portfolio);
                     }
@@ -413,6 +419,29 @@ where
     })
 }
 
+/// C# LEAN's brokerage setup creates securities for every brokerage holding
+/// before transaction processing starts. The portfolio-only sync is not enough:
+/// buying-power validation resolves the holding's security model before it can
+/// submit a reducing order.
+fn ensure_brokerage_holding_securities(
+    algorithm: &mut rlean_algorithm::qc_algorithm::QcAlgorithm,
+    holdings: &[rlean_brokerages::BrokerageHolding],
+) {
+    for holding in holdings {
+        if !algorithm.securities.contains(&holding.symbol) {
+            algorithm.add_security_symbol(holding.symbol.clone(), rlean_core::Resolution::Minute);
+        }
+        if holding.market_price > rust_decimal::Decimal::ZERO {
+            algorithm
+                .securities
+                .update_price(&holding.symbol, holding.market_price);
+            algorithm
+                .portfolio
+                .update_prices(&holding.symbol, holding.market_price);
+        }
+    }
+}
+
 /// Feature A: register a security + subscription for every symbol referenced by a
 /// restored (persisted) active insight, so restored insights become actionable
 /// after a restart.
@@ -634,6 +663,9 @@ fn is_restorable_security_type(security_type: rlean_core::SecurityType) -> bool 
 /// manages them). For each unmanaged holding a `-quantity` market order is
 /// registered in the transaction manager and dispatched through the existing
 /// brokerage router submission path, so it reconciles via the normal poll path.
+/// Existing brokerage orders that already reduce the holding are included in
+/// the target delta. This makes startup idempotent: restarting while a closing
+/// order is queued cannot submit the full liquidation again.
 ///
 /// Order ids for these liquidations are drawn from the algorithm's single
 /// order-id authority (`QcAlgorithm::next_order_id`) — the exact same counter
@@ -697,7 +729,29 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
         }
         // Asset-agnostic: -quantity closes longs (sell) and shorts (buy-to-cover)
         // alike, and preserves fractional/options/crypto quantities unchanged.
-        let quantity = -holding.quantity;
+        let desired_quantity = -holding.quantity;
+        let already_open_quantity =
+            open_closing_quantity(transactions, holding.symbol.id.sid, desired_quantity);
+        let quantity = desired_quantity - already_open_quantity;
+        if quantity.is_zero() {
+            tracing::info!(
+                "unmanaged holding {} already has a complete closing order queued; not duplicating it",
+                holding.symbol.value
+            );
+            continue;
+        }
+        if (quantity.is_sign_positive() && desired_quantity.is_sign_negative())
+            || (quantity.is_sign_negative() && desired_quantity.is_sign_positive())
+        {
+            tracing::error!(
+                "unmanaged holding {} has over-covering open orders: holding={} desired_close={} open_close={}; refusing to submit another order",
+                holding.symbol.value,
+                holding.quantity,
+                desired_quantity,
+                already_open_quantity,
+            );
+            continue;
+        }
         // Single id authority: allocate from the algorithm's order-id counter, the
         // same sequence framework/algorithm orders draw from, so ids never collide
         // with later framework orders (issue #33).
@@ -763,6 +817,25 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
             ),
         }
     }
+}
+
+fn open_closing_quantity(
+    transactions: &rlean_orders::TransactionManager,
+    symbol_sid: u64,
+    desired_quantity: rlean_core::Quantity,
+) -> rlean_core::Quantity {
+    transactions
+        .get_open_orders()
+        .into_iter()
+        .filter(|order| {
+            order.symbol.id.sid == symbol_sid
+                && ((order.remaining_quantity().is_sign_positive()
+                    && desired_quantity.is_sign_positive())
+                    || (order.remaining_quantity().is_sign_negative()
+                        && desired_quantity.is_sign_negative()))
+        })
+        .map(|order| order.remaining_quantity())
+        .sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1207,4 +1280,64 @@ fn live_items(
             anyhow::bail!("unsupported canonical live batch type")
         }
     })
+}
+
+#[cfg(test)]
+mod unmanaged_liquidation_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn queued_closing_orders_reduce_restart_liquidation_quantity() {
+        let symbol = rlean_core::Symbol::create_equity("AA", &rlean_core::Market::usa());
+        let transactions = rlean_orders::TransactionManager::new();
+        let mut closing = rlean_orders::Order::market(
+            -1,
+            symbol.clone(),
+            dec!(-150),
+            rlean_core::DateTime::now(),
+            "existing brokerage order",
+        );
+        closing.status = rlean_orders::OrderStatus::Submitted;
+        transactions.add_order(closing);
+        let mut opposing = rlean_orders::Order::market(
+            -2,
+            symbol.clone(),
+            dec!(3),
+            rlean_core::DateTime::now(),
+            "opposing order",
+        );
+        opposing.status = rlean_orders::OrderStatus::Submitted;
+        transactions.add_order(opposing);
+
+        assert_eq!(
+            open_closing_quantity(&transactions, symbol.id.sid, dec!(-198)),
+            dec!(-150)
+        );
+        assert_eq!(dec!(-198) - dec!(-150), dec!(-48));
+    }
+
+    #[test]
+    fn brokerage_holdings_are_registered_as_securities_before_liquidation() {
+        let symbol = rlean_core::Symbol::create_equity("AA", &rlean_core::Market::usa());
+        let mut algorithm = rlean_algorithm::qc_algorithm::QcAlgorithm::new("test", dec!(10000));
+        algorithm.set_brokerage_model(
+            rlean_algorithm::qc_algorithm::BrokerageName::RobinhoodBrokerage,
+            rlean_algorithm::qc_algorithm::AccountType::Cash,
+        );
+        let holding = rlean_brokerages::BrokerageHolding {
+            symbol: symbol.clone(),
+            quantity: dec!(198),
+            average_price: dec!(46.51),
+            market_price: dec!(45.23),
+        };
+
+        ensure_brokerage_holding_securities(&mut algorithm, &[holding]);
+
+        assert!(algorithm.securities.contains(&symbol));
+        assert_eq!(
+            algorithm.securities.get(&symbol).unwrap().current_price(),
+            dec!(45.23)
+        );
+    }
 }
