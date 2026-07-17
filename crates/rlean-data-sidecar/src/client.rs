@@ -154,7 +154,9 @@ pub struct DataSidecarClient {
 impl DataSidecarClient {
     pub async fn connect(config: DataSidecarConfig) -> anyhow::Result<Self> {
         let channel = connect_channel(&config).await?;
-        let mut client = FlightServiceClient::new(channel);
+        let mut client = FlightServiceClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024)
+            .max_encoding_message_size(16 * 1024 * 1024);
         let (outbound, receiver) = mpsc::channel(256);
         let mut request = Request::new(ReceiverStream::new(receiver));
         if let Some(token) = &config.token {

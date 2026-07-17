@@ -4,10 +4,11 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 
-/// Keep Arrow IPC bodies comfortably below the Flight service's 16 MiB
-/// transport ceiling. The remaining headroom covers Flight and protobuf
-/// metadata without requiring callers to estimate their encoded size.
-pub const MAX_RECORD_BATCH_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Keep Arrow IPC bodies below tonic's conventional 4 MiB default as well as
+/// our explicit 16 MiB Flight transport ceiling. The remaining headroom covers
+/// Flight and protobuf metadata and keeps relayed batches interoperable with
+/// clients that have not yet raised their decode limit.
+pub const MAX_RECORD_BATCH_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 pub fn encode_record_batch(batch: &RecordBatch) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -84,7 +85,10 @@ mod tests {
     use arrow_array::{Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{decode_record_batch, encode_record_batch_chunks_with_limit};
+    use super::{
+        decode_record_batch, encode_record_batch_chunks, encode_record_batch_chunks_with_limit,
+        MAX_RECORD_BATCH_BODY_BYTES,
+    };
 
     fn string_batch(values: Vec<String>) -> RecordBatch {
         RecordBatch::try_new(
@@ -125,6 +129,22 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, values);
+    }
+
+    #[test]
+    fn default_limit_chunks_a_six_megabyte_custom_batch() {
+        let batch = string_batch(
+            (0..8)
+                .map(|index| format!("{index}-{}", "x".repeat(800_000)))
+                .collect(),
+        );
+
+        let chunks = encode_record_batch_chunks(&batch).unwrap();
+
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_RECORD_BATCH_BODY_BYTES));
     }
 
     #[test]
