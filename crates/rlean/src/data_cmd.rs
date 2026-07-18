@@ -149,9 +149,10 @@ async fn run_query(args: QueryArgs) -> Result<()> {
     }
 
     let client = sidecar_client().await?;
-    let subscription_id = client
+    let registration = client
         .add_subscription_spec(spec, DeliveryMode::Backtest)
         .await?;
+    let subscription_id = registration.subscription_id;
     let result = async {
         let mut stream = client
             .query(subscription_id, start_time_ns, end_time_ns)

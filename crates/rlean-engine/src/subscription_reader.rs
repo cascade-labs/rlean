@@ -172,10 +172,21 @@ async fn produce(
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
 ) -> LeanResult<()> {
     let sidecar = &context.sidecar;
-    let subscription_id = sidecar
+    let registration = sidecar
         .add_subscription(&config, DeliveryMode::Backtest)
         .await
         .map_err(data_error)?;
+    let subscription_id = registration.subscription_id;
+    let effective_start = effective_subscription_start(start, registration.available_from);
+    tracing::debug!(
+        subscription_id,
+        symbol = %config.symbol.value,
+        source = ?config.custom.as_ref().map(|custom| custom.source_type.as_str()),
+        requested_start = %start,
+        available_from = ?registration.available_from.map(|value| value.to_string()),
+        effective_start = %effective_start,
+        "registered backtest subscription"
+    );
     let factor_rows = match load_auxiliary_rows(&config, &context).await {
         Ok(rows) => rows,
         Err(error) => {
@@ -187,7 +198,7 @@ async fn produce(
         &config,
         &context,
         subscription_id,
-        start,
+        effective_start,
         end,
         &factor_rows,
         sender,
@@ -197,6 +208,12 @@ async fn produce(
         tracing::warn!(subscription_id, %error, "failed to remove sidecar subscription");
     }
     result
+}
+
+fn effective_subscription_start(start: DateTime, available_from: Option<DateTime>) -> DateTime {
+    available_from
+        .map(|available_from| start.max(available_from))
+        .unwrap_or(start)
 }
 
 async fn load_auxiliary_rows(
@@ -249,10 +266,11 @@ async fn query_auxiliary(
     spec: SubscriptionSpec,
 ) -> LeanResult<Vec<arrow::record_batch::RecordBatch>> {
     let sidecar = &context.sidecar;
-    let subscription_id = sidecar
+    let registration = sidecar
         .add_subscription_spec(spec, DeliveryMode::Backtest)
         .await
         .map_err(data_error)?;
+    let subscription_id = registration.subscription_id;
     let result = async {
         let mut stream = sidecar
             .query(subscription_id, 0, 0)
@@ -732,5 +750,17 @@ mod tests {
         );
         assert_eq!(backtest_window_candidate(Resolution::Second, start), start);
         assert_eq!(backtest_window_candidate(Resolution::Tick, start), start);
+    }
+
+    #[test]
+    fn provider_availability_clamps_subscription_start() {
+        let requested = partition_day_start(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
+        let available = partition_day_start(chrono::NaiveDate::from_ymd_opt(2023, 8, 16).unwrap());
+
+        assert_eq!(
+            effective_subscription_start(requested, Some(available)),
+            available
+        );
+        assert_eq!(effective_subscription_start(available, None), available);
     }
 }

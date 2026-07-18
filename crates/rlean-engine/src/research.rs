@@ -214,7 +214,7 @@ impl ResearchEngine {
         let client = handle.client.clone();
         let symbol = symbol.clone();
         handle.runtime.block_on(async move {
-            let subscription_id = match client
+            let registration = match client
                 .add_subscription(&config, DeliveryMode::Backtest)
                 .await
             {
@@ -224,6 +224,7 @@ impl ResearchEngine {
                     return Vec::new();
                 }
             };
+            let subscription_id = registration.subscription_id;
             let mut bars = Vec::new();
             match client.query(subscription_id, start_dt.0, end_dt.0).await {
                 Ok(mut stream) => {
