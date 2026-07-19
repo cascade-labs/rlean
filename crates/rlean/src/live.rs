@@ -284,7 +284,7 @@ fn live_brokerage_model_for_name(name: &str) -> Result<BrokerageModel> {
             BrokerageModel::new(BrokerageName::RobinhoodBrokerage, AccountType::Cash)
         }
         "fidelity" | "fidelitybrokerage" => {
-            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Margin)
+            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Cash)
         }
         "tradier" | "tradierbrokerage" => {
             BrokerageModel::new(BrokerageName::TradierBrokerage, AccountType::Margin)
@@ -352,7 +352,7 @@ mod tests {
         );
         assert_eq!(
             live_brokerage_model_for_name("fidelity").unwrap(),
-            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Margin)
+            BrokerageModel::new(BrokerageName::FidelityBrokerage, AccountType::Cash)
         );
         assert!(is_paper_brokerage_name("paper"));
         assert!(is_paper_brokerage_name("PaperBrokerage"));

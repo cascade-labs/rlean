@@ -32,7 +32,10 @@ impl AlgorithmLogging {
     pub fn log(&self, time: DateTime, message: String, level: LogLevel) {
         // Emit immediately via tracing so the message appears in real-time output.
         match level {
-            LogLevel::Debug => tracing::debug!("[Algorithm] {}", message),
+            // LEAN's Debug() is user-facing algorithm output. Do not hide it
+            // behind the process-wide tracing debug filter; strategy probes
+            // and live diagnostics must remain visible at the normal log level.
+            LogLevel::Debug => tracing::info!(target: "algorithm", "{}", message),
             LogLevel::Info => tracing::info!(target: "algorithm", "{}", message),
             LogLevel::Warning => tracing::warn!("[Algorithm] {}", message),
             LogLevel::Error => tracing::error!("[Algorithm] {}", message),

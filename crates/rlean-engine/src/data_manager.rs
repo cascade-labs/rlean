@@ -63,7 +63,8 @@ impl DataManager {
             return;
         }
         let end = self.end.unwrap_or(start);
-        let stream = SubscriptionStream::new(config.clone(), self.context.clone(), start, end);
+        let stream =
+            SubscriptionStream::new_dynamic(config.clone(), self.context.clone(), start, end);
         self.active_subscriptions.insert(id, config);
         match self.synchronizer.as_mut() {
             Some(sync) => sync.add_stream(stream),

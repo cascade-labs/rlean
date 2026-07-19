@@ -1,4 +1,4 @@
-use crate::insight::Insight;
+use crate::insight::{reserve_insight_ids_through, Insight};
 use rlean_core::{DateTime, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,15 @@ impl InsightCollection {
     }
 
     pub fn from_snapshot(snapshot: InsightCollectionSnapshot) -> Self {
+        if let Some(max_id) = snapshot
+            .active
+            .iter()
+            .chain(snapshot.closed.iter())
+            .map(|insight| insight.id)
+            .max()
+        {
+            reserve_insight_ids_through(max_id);
+        }
         let mut insights: BTreeMap<u64, Vec<Insight>> = BTreeMap::new();
         for insight in snapshot.active {
             insights

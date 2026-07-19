@@ -6,6 +6,7 @@ use rlean_core::{Price, Resolution, SecurityType, Symbol, SymbolProperties};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// A single tradeable security in the algorithm's universe.
@@ -17,7 +18,7 @@ pub struct Security {
     pub exchange_hours: Arc<ExchangeHours>,
     pub leverage: RwLock<f64>,
     pub buying_power_model: RwLock<BuyingPowerModel>,
-    pub is_tradable: bool,
+    is_tradable: AtomicBool,
     pub is_delisted: bool,
     pub price: RwLock<Price>,
     pub bid_price: RwLock<Price>,
@@ -65,7 +66,7 @@ impl Security {
             exchange_hours,
             leverage: RwLock::new(1.0),
             buying_power_model: RwLock::new(BuyingPowerModel::SecurityMargin),
-            is_tradable: true,
+            is_tradable: AtomicBool::new(true),
             is_delisted: false,
             price: RwLock::new(rust_decimal_macros::dec!(0)),
             bid_price: RwLock::new(rust_decimal_macros::dec!(0)),
@@ -92,6 +93,24 @@ impl Security {
 
     pub fn current_price(&self) -> Price {
         *self.price.read()
+    }
+
+    pub fn is_tradable(&self) -> bool {
+        self.is_tradable.load(Ordering::Acquire)
+    }
+
+    /// C# LEAN `Security.Reset()` parity for removal: the security remains in
+    /// `Securities` while liquidation/removal is pending, but user orders can
+    /// no longer be submitted against it.
+    pub fn reset(&self) {
+        self.is_tradable.store(false, Ordering::Release);
+    }
+
+    /// Re-selecting or explicitly re-adding a pending security cancels removal
+    /// and makes the existing security tradable again without losing prices or
+    /// holdings.
+    pub fn reinitialize(&self) {
+        self.is_tradable.store(true, Ordering::Release);
     }
 
     pub fn set_price(&self, price: Price) {
@@ -167,6 +186,13 @@ impl SecurityManager {
     }
 
     pub fn remove(&mut self, symbol: &Symbol) -> Option<Arc<Security>> {
+        if self
+            .securities
+            .get(&symbol.id.sid)
+            .is_some_and(|security| security.holding().is_invested())
+        {
+            return None;
+        }
         self.securities.remove(&symbol.id.sid)
     }
 

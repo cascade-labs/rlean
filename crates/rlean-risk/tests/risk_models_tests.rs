@@ -395,6 +395,36 @@ fn test_trailing_stop_long_updates_high_and_triggers_drawdown() {
 }
 
 #[test]
+fn test_trailing_stop_cancels_insights_on_drawdown() {
+    let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
+
+    model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(110))],
+        },
+    );
+
+    let result = model.manage_risk_with_context(
+        &[],
+        &RiskContext {
+            total_portfolio_value: dec!(100_000),
+            holdings: vec![holding(spy(), dec!(10), dec!(100), dec!(103))],
+        },
+    );
+    assert_eq!(result.len(), 1);
+
+    let canceled = model.canceled_insights();
+    assert_eq!(canceled.len(), 1);
+    assert_eq!(canceled[0].value.as_ref(), "SPY");
+    assert!(
+        model.canceled_insights().is_empty(),
+        "canceled insights should be drained after being read"
+    );
+}
+
+#[test]
 fn test_trailing_stop_short_updates_low_and_triggers_drawdown() {
     let mut model = TrailingStopRiskManagementModel::new(dec!(0.05));
 

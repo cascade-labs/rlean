@@ -57,6 +57,9 @@ pub struct FrameworkState {
     pending_flat_targets: Vec<Insight>,
     pending_insight_events: Vec<InsightEvent>,
     pending_security_changes: bool,
+    /// Final PCM/risk targets generated during the current pipeline pass. C#
+    /// LEAN stores these on `SecurityHolding.Target` before execution.
+    pending_target_updates: Vec<(Symbol, Decimal)>,
     next_rebalance_time: Option<DateTime>,
     /// Optional language-binding observer used to expose scored insights.
     observer: Option<Arc<dyn InsightObserver>>,
@@ -74,6 +77,7 @@ impl FrameworkState {
             pending_flat_targets: Vec::new(),
             pending_insight_events: Vec::new(),
             pending_security_changes: false,
+            pending_target_updates: Vec::new(),
             next_rebalance_time: None,
             observer: None,
         }
@@ -126,6 +130,7 @@ impl FrameworkState {
         risk_context: &RiskContext,
         execution_context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
+        self.pending_target_updates.clear();
         // Always update PCM price history so warm-up-requiring models (e.g.
         // Black-Litterman) accumulate data even when alpha is silent.
         self.pcm.update_security_prices(prices);
@@ -192,8 +197,14 @@ impl FrameworkState {
         let insight_changes =
             !alpha_insights.is_empty() || expired_insight_count != 0 || pending_flat_count != 0;
         if !self.is_rebalance_due(slice.time, insight_changes) {
+            // C# LEAN invokes the execution model on every framework time step,
+            // even when the PCM does not create new targets. Execution models
+            // such as ImmediateExecutionModel retain unfulfilled targets and
+            // must be allowed to retry them after an earlier reducing order
+            // fills and releases buying power.
+            let orders = self.exec_model.execute_with_context(&[], execution_context);
             self.expose_insights(slice.time);
-            return Vec::new();
+            return orders;
         }
 
         let mut target_insights = if self.pcm.use_all_active_insights() {
@@ -275,6 +286,14 @@ impl FrameworkState {
                     targets
                 });
 
+        // Match QCAlgorithm.ProcessInsights: PCM targets are stored on each
+        // holding and risk targets override them before execution.
+        self.pending_target_updates.extend(
+            adjusted_by_symbol
+                .values()
+                .map(|target| (target.symbol.clone(), target.quantity)),
+        );
+
         let exec_targets: Vec<ExecutionTargetRef<'_>> = adjusted_by_symbol
             .iter()
             .map(|t| ExecutionTargetRef {
@@ -330,6 +349,10 @@ impl FrameworkState {
 
     pub fn take_insight_events(&mut self) -> Vec<InsightEvent> {
         std::mem::take(&mut self.pending_insight_events)
+    }
+
+    pub fn take_target_updates(&mut self) -> Vec<(Symbol, Decimal)> {
+        std::mem::take(&mut self.pending_target_updates)
     }
 
     pub fn restore_insights(&mut self, snapshot: InsightCollectionSnapshot, utc_now: DateTime) {
@@ -485,14 +508,24 @@ pub fn run_framework_pipeline(
     .with_minimum_order_margin_portfolio_percentage(
         inputs.minimum_order_margin_portfolio_percentage,
     );
-    fw.run_pipeline_from_alpha(
+    let orders = fw.run_pipeline_from_alpha(
         slice,
         alpha_insights,
         inputs.portfolio_value_less_free_buffer,
         &inputs.prices,
         &inputs.risk_context,
         &execution_context,
-    )
+    );
+    let target_updates = fw.take_target_updates();
+    drop(fw);
+
+    if !target_updates.is_empty() {
+        let alg = algorithm.lock().unwrap();
+        for (symbol, quantity) in target_updates {
+            alg.portfolio.set_target(&symbol, quantity);
+        }
+    }
+    orders
 }
 
 pub fn notify_framework_securities_changed(
@@ -740,7 +773,9 @@ fn execution_security_data_from_slice(
 mod tests {
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};
-    use rlean_core::TimeSpan;
+    use rlean_alpha::ConstantAlphaModel;
+    use rlean_core::{Resolution, TimeSpan};
+    use rlean_execution::ExecutionTarget;
 
     fn dt(year: i32, month: u32, day: u32) -> DateTime {
         let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
@@ -821,5 +856,100 @@ mod tests {
         );
 
         assert!(!framework.is_rebalance_due(now, false));
+    }
+
+    #[test]
+    fn insight_only_policy_still_retries_retained_execution_targets_each_slice() {
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("CVX", &rlean_core::Market::usa());
+        let security = SecurityData {
+            symbol: symbol.clone(),
+            price: Decimal::from(185),
+            bid: None,
+            ask: None,
+            volume: None,
+            vwap_price: None,
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(now),
+            lot_size: Decimal::ONE,
+            minimum_price_variation: Decimal::new(1, 2),
+            current_quantity: Decimal::ZERO,
+            open_order_quantity: Decimal::ZERO,
+        };
+        let securities = HashMap::from([(symbol.id.sid, security)]);
+        let open_orders = Vec::new();
+        let execution_context =
+            ExecutionContext::new(now, &securities, &open_orders, Decimal::from(100_000));
+
+        let mut execution = ImmediateExecutionModel::new();
+        let initial = execution.execute(
+            &[ExecutionTarget {
+                symbol: symbol.clone(),
+                quantity: Decimal::from(61),
+                tag: String::new(),
+            }],
+            &execution_context,
+        );
+        assert_eq!(initial.len(), 1);
+
+        let mut framework = FrameworkState::new();
+        framework.pcm = Box::new(
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                rlean_portfolio_construction::PortfolioBias::Long,
+                Some(Decimal::new(2, 1)),
+                RebalancePolicy::insight_changes_only(),
+            ),
+        );
+        framework.exec_model = Box::new(execution);
+        framework
+            .insights
+            .add(Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now));
+
+        let slice = rlean_data::Slice::new(now + TimeSpan::ONE_MINUTE);
+        let prices = HashMap::from([(symbol.id.sid, Decimal::from(185))]);
+        let orders = framework.run_pipeline_from_alpha(
+            &slice,
+            Vec::new(),
+            Decimal::from(100_000),
+            &prices,
+            &RiskContext::default(),
+            &execution_context,
+        );
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].symbol, symbol);
+        assert_eq!(orders[0].quantity, Decimal::from(61));
+    }
+
+    #[test]
+    fn framework_targets_are_stored_on_security_holdings_like_lean() {
+        let now = dt(2026, 1, 1);
+        let mut algorithm =
+            rlean_algorithm::qc_algorithm::QcAlgorithm::new("target-test", Decimal::from(100_000));
+        let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm
+            .securities
+            .update_price(&symbol, Decimal::from(100));
+        algorithm
+            .portfolio
+            .update_prices(&symbol, Decimal::from(100));
+        let algorithm = Arc::new(Mutex::new(algorithm));
+
+        let mut state = FrameworkState::new();
+        state.alpha_models.push(Box::new(ConstantAlphaModel {
+            direction: AlphaDir::Up,
+            period: TimeSpan::ONE_DAY,
+            magnitude: None,
+        }));
+        let framework = Arc::new(Mutex::new(state));
+        let slice = rlean_data::Slice::new(now);
+
+        let orders = run_framework_pipeline(&framework, &algorithm, &slice);
+
+        assert_eq!(orders.len(), 1);
+        let holding = algorithm.lock().unwrap().portfolio.get_holding(&symbol);
+        assert_eq!(holding.target, Some(orders[0].quantity));
+        assert!(holding.has_open_target());
     }
 }

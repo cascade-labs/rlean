@@ -1,7 +1,10 @@
 use rlean_core::{DateTime, NanosecondTimestamp, Symbol, TimeSpan};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_INSIGHT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InsightType {
@@ -170,7 +173,13 @@ impl Insight {
 
 /// Generate a monotonically-increasing u64 id without external dependencies.
 fn monotonic_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    NEXT_INSIGHT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Ensure newly-created insight IDs remain above IDs restored from durable
+/// framework state. Live restart hydration preserves insight IDs, so the
+/// process-local allocator must advance past the restored high-water mark.
+pub(crate) fn reserve_insight_ids_through(restored_id: u64) {
+    let next = restored_id.saturating_add(1);
+    NEXT_INSIGHT_ID.fetch_max(next, Ordering::Relaxed);
 }

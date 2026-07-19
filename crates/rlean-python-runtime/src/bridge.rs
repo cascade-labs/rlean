@@ -332,7 +332,7 @@ impl LifecycleBridge for PythonAlgorithmBridge {
     }
 
     fn on_end_of_algorithm(&mut self, _services: &mut dyn AlgorithmServices) {
-        let _ = self.call_method0_if_present("on_end_of_algorithm");
+        let _ = self.call_method0_if_present_any(&["on_end_of_algorithm", "OnEndOfAlgorithm"]);
     }
 
     fn on_margin_call(&mut self, requests: &[Order], _services: &mut dyn AlgorithmServices) {
@@ -1059,6 +1059,50 @@ class DataAlgorithm(QCAlgorithm):
                     .unwrap(),
                 102.5
             );
+        });
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn python_lean_style_on_end_of_algorithm_is_invoked() {
+        init_python();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rlean-python-on-end-of-algorithm-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.py");
+        fs::write(
+            &path,
+            r#"
+from AlgorithmImports import QCAlgorithm
+
+class EndAlgorithm(QCAlgorithm):
+    def Initialize(self):
+        self.ended = False
+
+    def OnEndOfAlgorithm(self):
+        self.ended = True
+"#,
+        )
+        .unwrap();
+
+        let mut bridge = load_test_strategy_bridge(&path);
+        let mut services = rlean_algorithm::lifecycle::NoopAlgorithmServices::default();
+        bridge.initialize(&mut services).unwrap();
+        bridge.on_end_of_algorithm(&mut services);
+
+        Python::attach(|py| {
+            assert!(bridge
+                .strategy
+                .bind(py)
+                .getattr("ended")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
         });
 
         let _ = fs::remove_file(&path);

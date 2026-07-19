@@ -123,7 +123,10 @@ pub(crate) fn ensure_gitignore(workspace: &Path) -> Result<()> {
 
     let sections: &[(&str, &[&str])] = &[
         ("# rlean workspace — host-specific config", &["rlean.json"]),
-        ("# Generated output", &["**/backtests/", "**/live/"]),
+        (
+            "# Generated output",
+            &["**/backtests/", "**/live/", "**/.runs/", "**/.weco/"],
+        ),
         ("# Python artifacts", &["__pycache__/", "*.pyc", "*.pyo"]),
         ("# macOS", &[".DS_Store"]),
         ("# Secrets", &[".env", "*.env"]),
@@ -187,4 +190,38 @@ fn has_staged_changes(workspace: &Path) -> bool {
         .output()
         .map(|o| !o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_gitignore_adds_generated_tool_directories_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+
+        ensure_gitignore(dir.path()).unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(contents.lines().any(|line| line == "**/.runs/"));
+        assert!(contents.lines().any(|line| line == "**/.weco/"));
+    }
+
+    #[test]
+    fn ensure_gitignore_does_not_duplicate_existing_tool_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "**/.runs/\n**/.weco/\n").unwrap();
+
+        ensure_gitignore(dir.path()).unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            contents.lines().filter(|line| *line == "**/.runs/").count(),
+            1
+        );
+        assert_eq!(
+            contents.lines().filter(|line| *line == "**/.weco/").count(),
+            1
+        );
+    }
 }

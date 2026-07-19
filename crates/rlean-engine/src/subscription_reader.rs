@@ -5,12 +5,12 @@ use futures::StreamExt;
 use rlean_core::{DateTime, LeanError, Resolution, Result as LeanResult, SecurityType};
 use rlean_data::SubscriptionDataConfig;
 use rlean_data_sidecar::{
-    decode_batch, decode_factor_file_batch, decode_map_file_batch, CanonicalDataBatch,
-    DeliveryMode, SubscriptionSpec, WireDataType,
+    decode_batch, decode_factor_file_batch, CanonicalDataBatch, DeliveryMode, SubscriptionSpec,
+    WireDataType,
 };
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{BTreeMap, VecDeque};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 enum SubscriptionStreamMessage {
@@ -27,6 +27,7 @@ pub struct SubscriptionStream {
     config: SubscriptionDataConfig,
     receiver: mpsc::Receiver<LeanResult<SubscriptionStreamMessage>>,
     producer: JoinHandle<()>,
+    cancel: Option<oneshot::Sender<()>>,
     pending: VecDeque<SubscriptionDataPoint>,
     watermark: Option<DateTime>,
     exhausted: bool,
@@ -40,11 +41,50 @@ impl SubscriptionStream {
         start: DateTime,
         end: DateTime,
     ) -> Self {
-        let capacity = context.effective_buffer_policy().channel_capacity();
+        Self::new_inner(config, context, start, end, false)
+    }
+
+    /// Create a stream added while a backtest is already advancing.
+    ///
+    /// LEAN makes newly-selected securities available from the current
+    /// frontier; it does not read weeks of future data merely to establish the
+    /// current price. Keep this stream demand-driven until the frontier moves.
+    pub fn new_dynamic(
+        config: SubscriptionDataConfig,
+        context: DataFeedContext,
+        start: DateTime,
+        end: DateTime,
+    ) -> Self {
+        Self::new_inner(config, context, start, end, true)
+    }
+
+    fn new_inner(
+        config: SubscriptionDataConfig,
+        context: DataFeedContext,
+        start: DateTime,
+        end: DateTime,
+        defer_prefetch_after_first_window: bool,
+    ) -> Self {
+        let capacity = if defer_prefetch_after_first_window {
+            16
+        } else {
+            context.effective_buffer_policy().channel_capacity()
+        };
         let (sender, receiver) = mpsc::channel(capacity);
+        let (cancel, cancelled) = oneshot::channel();
         let producer_config = config.clone();
         let producer = tokio::spawn(async move {
-            if let Err(error) = produce(producer_config, context, start, end, &sender).await {
+            if let Err(error) = produce(
+                producer_config,
+                context,
+                start,
+                end,
+                &sender,
+                cancelled,
+                defer_prefetch_after_first_window,
+            )
+            .await
+            {
                 let _ = sender.send(Err(error)).await;
             }
         });
@@ -52,6 +92,7 @@ impl SubscriptionStream {
             config,
             receiver,
             producer,
+            cancel: Some(cancel),
             pending: VecDeque::new(),
             watermark: None,
             exhausted: false,
@@ -73,6 +114,14 @@ impl SubscriptionStream {
 
     pub fn watermark(&self) -> Option<DateTime> {
         self.watermark
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn producer_is_finished(&self) -> bool {
+        self.producer.is_finished()
     }
 
     pub fn is_ready_for(&self, frontier: DateTime) -> bool {
@@ -160,7 +209,12 @@ impl SubscriptionStream {
 
 impl Drop for SubscriptionStream {
     fn drop(&mut self) {
-        self.producer.abort();
+        // Let the producer cancel its in-flight sidecar query and explicitly
+        // unregister the remote subscription. Aborting the task here skips the
+        // cleanup after `produce_registered`, leaking both on the sidecar.
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -170,6 +224,8 @@ async fn produce(
     start: DateTime,
     end: DateTime,
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+    mut cancelled: oneshot::Receiver<()>,
+    defer_prefetch_after_first_window: bool,
 ) -> LeanResult<()> {
     let sidecar = &context.sidecar;
     let registration = sidecar
@@ -187,23 +243,32 @@ async fn produce(
         effective_start = %effective_start,
         "registered backtest subscription"
     );
-    let factor_rows = match load_auxiliary_rows(&config, &context).await {
+    let factor_rows_result = tokio::select! {
+        _ = &mut cancelled => {
+            let _ = sidecar.remove_subscription(subscription_id).await;
+            return Ok(());
+        }
+        result = load_auxiliary_rows(&config, &context) => result,
+    };
+    let factor_rows = match factor_rows_result {
         Ok(rows) => rows,
         Err(error) => {
             let _ = sidecar.remove_subscription(subscription_id).await;
             return Err(error);
         }
     };
-    let result = produce_registered(
-        &config,
-        &context,
-        subscription_id,
-        effective_start,
-        end,
-        &factor_rows,
-        sender,
-    )
-    .await;
+    let result = tokio::select! {
+        _ = &mut cancelled => Ok(()),
+        result = produce_registered(
+            &config,
+            &context,
+            subscription_id,
+            (effective_start, end),
+            &factor_rows,
+            sender,
+            defer_prefetch_after_first_window,
+        ) => result,
+    };
     if let Err(error) = sidecar.remove_subscription(subscription_id).await {
         tracing::warn!(subscription_id, %error, "failed to remove sidecar subscription");
     }
@@ -223,6 +288,10 @@ async fn load_auxiliary_rows(
     if config.symbol.security_type() != SecurityType::Equity {
         return Ok(Vec::new());
     }
+    let cache_key = auxiliary_cache_key(config);
+    if let Some(rows) = context.cached_auxiliary_factor_rows(&cache_key) {
+        return Ok(rows);
+    }
 
     let mut factor_spec = SubscriptionSpec::from(config);
     factor_spec.config_id ^= 0xfac7_0000_0000_0000;
@@ -236,29 +305,24 @@ async fn load_auxiliary_rows(
     }
     factor_rows.sort_by_key(|row| row.date);
 
-    let mut map_spec = SubscriptionSpec::from(config);
-    map_spec.config_id ^= 0x6d61_7000_0000_0000;
-    map_spec.data_type = WireDataType::MapFile as i32;
-    map_spec.resolution = 4;
-    map_spec.tick_type = 0;
-    let map_batches = query_auxiliary(context, map_spec).await?;
-    let mut map_rows = Vec::new();
-    for batch in &map_batches {
-        map_rows.extend(decode_map_file_batch(batch).map_err(data_error)?);
-    }
-    map_rows.sort_by_key(|row| row.date);
-
     tracing::info!(
         ticker = %config.symbol.permtick,
         factor_rows = factor_rows.len(),
-        map_rows = map_rows.len(),
-        "loaded equity auxiliary data from sidecar"
+        "loaded equity factor rows from sidecar"
     );
     if config.normalization_mode != rlean_core::DataNormalizationMode::Raw && factor_rows.is_empty()
     {
         context.record_unadjusted_equity(config.symbol.permtick.as_ref());
     }
+    context.cache_auxiliary_factor_rows(cache_key, factor_rows.clone());
     Ok(factor_rows)
+}
+
+fn auxiliary_cache_key(config: &SubscriptionDataConfig) -> String {
+    format!(
+        "{}:{}:{:?}",
+        config.symbol.id.sid, config.symbol.permtick, config.normalization_mode
+    )
 }
 
 async fn query_auxiliary(
@@ -293,11 +357,12 @@ async fn produce_registered(
     config: &SubscriptionDataConfig,
     context: &DataFeedContext,
     subscription_id: u64,
-    start: DateTime,
-    end: DateTime,
+    range: (DateTime, DateTime),
     factor_rows: &[FactorFileEntry],
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+    defer_prefetch_after_first_window: bool,
 ) -> LeanResult<()> {
+    let (start, end) = range;
     let wire_type = WireDataType::try_from(SubscriptionSpec::from(config).data_type)
         .map_err(|value| LeanError::DataError(format!("unknown sidecar data type {value}")))?;
     let mut window_start = start.date_utc();
@@ -305,6 +370,7 @@ async fn produce_registered(
     let mut last_point: Option<SubscriptionDataPoint> = None;
     let mut last_real_frontier: Option<DateTime> = None;
     let mut previous_window_had_points = false;
+    let mut first_window = true;
 
     while window_start <= end_date {
         // An empty range consumes no channel capacity. Keep scanning through
@@ -313,7 +379,9 @@ async fn produce_registered(
         if previous_window_had_points {
             wait_for_prefetch_horizon(context, window_start).await;
         }
-        let window_end = if previous_window_had_points {
+        let window_end = if first_window && defer_prefetch_after_first_window {
+            window_start
+        } else if previous_window_had_points {
             backtest_window_end(config.resolution, window_start, end_date, context)
         } else {
             // The consumer frontier intentionally does not constrain empty
@@ -341,6 +409,17 @@ async fn produce_registered(
         points = coalesce_fundamental_snapshots(points);
         points.sort_by_key(SubscriptionDataPoint::frontier_time);
         points = deduplicate_points(config, points);
+        tracing::debug!(
+            subscription_id,
+            symbol = %config.symbol.value,
+            source = ?config.custom.as_ref().map(|custom| custom.source_type.as_str()),
+            window_start = %window_start,
+            window_end = %window_end,
+            points = points.len(),
+            first_frontier = ?points.first().map(SubscriptionDataPoint::frontier_time),
+            last_frontier = ?points.last().map(SubscriptionDataPoint::frontier_time),
+            "decoded backtest subscription window"
+        );
         previous_window_had_points = !points.is_empty();
 
         for point in points {
@@ -385,12 +464,36 @@ async fn produce_registered(
         {
             return Ok(());
         }
+        if first_window && defer_prefetch_after_first_window && window_end < end_date {
+            wait_for_consumer_frontier_after(context, window_end).await;
+        }
+        first_window = false;
         window_start = match window_end.succ_opt() {
             Some(next) => next,
             None => break,
         };
     }
     Ok(())
+}
+
+async fn wait_for_consumer_frontier_after(context: &DataFeedContext, date: chrono::NaiveDate) {
+    loop {
+        let has_advanced = context
+            .consumer_frontier_date()
+            .map(|frontier| frontier > date)
+            .unwrap_or(false);
+        if has_advanced {
+            return;
+        }
+        let notified = context.frontier_advanced();
+        let still_waiting = context
+            .consumer_frontier_date()
+            .map(|frontier| frontier <= date)
+            .unwrap_or(true);
+        if still_waiting {
+            notified.await;
+        }
+    }
 }
 
 fn decode_points(

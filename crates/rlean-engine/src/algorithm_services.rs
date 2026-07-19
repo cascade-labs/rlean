@@ -14,9 +14,10 @@ use rlean_execution::{ExecutionOrderType, OrderRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Apply a universe-selection diff to the algorithm: subscribe added symbols at
-/// `resolution`, and unsubscribe removed symbols that are neither invested nor
-/// serving as an option underlying. Mirrors C# LEAN's UniverseSelection flow.
+/// Apply a universe-selection diff to the algorithm. Removed securities enter
+/// the same pending-removal path as C# LEAN: the logical change is delivered
+/// now, while physical subscription/security removal waits for zero holdings,
+/// open orders, targets, and unsettled cash.
 pub fn register_universe_changes(
     alg: &mut QcAlgorithm,
     added: &[Symbol],
@@ -27,10 +28,7 @@ pub fn register_universe_changes(
         alg.add_security_symbol(symbol.clone(), resolution);
     }
     for symbol in removed {
-        if !alg.is_invested(symbol) && !alg.is_option_underlying(symbol) {
-            alg.subscription_manager.remove_symbol(symbol);
-            alg.securities.remove(symbol);
-        }
+        alg.request_universe_security_removal(symbol);
     }
 }
 
@@ -219,5 +217,44 @@ pub fn submit_execution_order_requests(
     let mut alg = algorithm.lock().unwrap();
     for request in requests {
         submit_execution_order_request(&mut alg, request);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn universe_removal_is_pending_while_invested_and_reselection_cancels_it() {
+        let mut algorithm = QcAlgorithm::new("universe-removal", dec!(100_000));
+        let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm.securities.update_price(&symbol, dec!(500));
+        algorithm.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            dec!(500),
+            dec!(10),
+            dec!(0),
+            dec!(1),
+        );
+
+        register_universe_changes(
+            &mut algorithm,
+            &[],
+            std::slice::from_ref(&symbol),
+            Resolution::Minute,
+        );
+        assert!(algorithm.is_security_pending_removal(&symbol));
+        assert!(algorithm.securities.contains(&symbol));
+        assert!(algorithm.process_pending_security_removals().is_empty());
+
+        register_universe_changes(
+            &mut algorithm,
+            std::slice::from_ref(&symbol),
+            &[],
+            Resolution::Minute,
+        );
+        assert!(!algorithm.is_security_pending_removal(&symbol));
+        assert!(algorithm.securities.contains(&symbol));
     }
 }

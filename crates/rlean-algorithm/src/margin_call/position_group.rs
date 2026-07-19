@@ -44,9 +44,12 @@ impl PositionGroupCollection {
             if !holding.is_invested() {
                 continue;
             }
-            let Some(security) = securities.get(&holding.symbol) else {
-                continue;
-            };
+            let security = securities.get(&holding.symbol).unwrap_or_else(|| {
+                panic!(
+                    "portfolio invariant violated: invested holding {} has no Security",
+                    holding.symbol.value
+                )
+            });
             groups.push(DefaultPositionGroup {
                 symbol: holding.symbol.clone(),
                 quantity: holding.quantity,

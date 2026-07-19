@@ -98,6 +98,16 @@ fn algorithm_handle_adds_and_removes_common_security_types() {
     assert!(algorithm.has_security(crypto_symbol));
 
     assert!(algorithm.remove_security(equity_symbol.clone(), Some("test removal".to_string())));
+    assert!(algorithm.has_security(equity_symbol.clone()));
+    {
+        let shared_algorithm = algorithm.inner();
+        let mut inner = shared_algorithm.lock().unwrap();
+        assert!(inner.is_security_pending_removal(equity_symbol.inner()));
+        assert_eq!(
+            inner.process_pending_security_removals(),
+            vec![equity_symbol.inner().clone()]
+        );
+    }
     assert!(!algorithm.has_security(equity_symbol));
 }
 

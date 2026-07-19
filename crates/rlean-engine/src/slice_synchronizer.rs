@@ -2,6 +2,9 @@ use crate::data_feed::DataFeedContext;
 use crate::subscription_reader::SubscriptionStream;
 use rlean_core::{DateTime, Result as LeanResult};
 use rlean_data::Slice;
+use std::time::Duration;
+
+const STREAM_PROGRESS_WARNING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Synchronizes multiple subscription streams into time-aligned `Slice`s,
 /// mirroring C# LEAN's subscription synchronization.
@@ -70,7 +73,28 @@ impl SliceSynchronizer {
                             .unwrap_or(true)
                     })
                 {
-                    stream.advance_until_progress().await?;
+                    match tokio::time::timeout(
+                        STREAM_PROGRESS_WARNING_INTERVAL,
+                        stream.advance_until_progress(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            tracing::warn!(
+                                symbol = %stream.config().symbol.value,
+                                subscription_id = stream.config().unique_id(),
+                                pending = stream.pending_len(),
+                                exhausted = stream.is_exhausted(),
+                                producer_finished = stream.producer_is_finished(),
+                                watermark = ?stream.watermark(),
+                                consumer_frontier = ?self.context.consumer_frontier_date(),
+                                prefetch_ceiling = ?self.context.prefetch_ceiling_date(),
+                                "subscription stream made no progress while synchronizer had no candidate"
+                            );
+                            continue;
+                        }
+                    }
                     advanced_any = true;
                     if stream.peek().is_some() {
                         break;
@@ -96,7 +120,28 @@ impl SliceSynchronizer {
                 .iter_mut()
                 .find(|stream| !stream.is_ready_for(candidate))
             {
-                stream.advance_until_progress().await?;
+                match tokio::time::timeout(
+                    STREAM_PROGRESS_WARNING_INTERVAL,
+                    stream.advance_until_progress(),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::warn!(
+                            candidate = %candidate,
+                            symbol = %stream.config().symbol.value,
+                            subscription_id = stream.config().unique_id(),
+                            pending = stream.pending_len(),
+                            exhausted = stream.is_exhausted(),
+                            producer_finished = stream.producer_is_finished(),
+                            watermark = ?stream.watermark(),
+                            consumer_frontier = ?self.context.consumer_frontier_date(),
+                            prefetch_ceiling = ?self.context.prefetch_ceiling_date(),
+                            "subscription stream made no progress while synchronizer waited for candidate"
+                        );
+                    }
+                }
                 continue;
             }
 

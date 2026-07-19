@@ -337,6 +337,7 @@ assert not hasattr(algo, "SetPortfolioConstruction")
         run_python(
             r#"
 from AlgorithmImports import (
+    QCAlgorithm,
     InsightWeightingPortfolioConstructionModel,
     EqualWeightingPortfolioConstructionModel,
     MeanVarianceOptimizationPortfolioConstructionModel,
@@ -348,6 +349,7 @@ from AlgorithmImports import (
     NullRiskManagementModel,
     MaximumDrawdownPercentPerSecurity,
     TrailingStopRiskManagementModel,
+    MaximumUnrealizedProfitPercentPerSecurity,
     ConstantAlphaModel,
     EmaCrossAlphaModel,
     HistoricalReturnsAlphaModel,
@@ -367,6 +369,7 @@ models = [
     NullRiskManagementModel(),
     MaximumDrawdownPercentPerSecurity(0.05),
     TrailingStopRiskManagementModel(0.1),
+    MaximumUnrealizedProfitPercentPerSecurity(0.25),
     ConstantAlphaModel("up", 1, 0.01),
     EmaCrossAlphaModel(12, 26, 1),
     HistoricalReturnsAlphaModel(20, 1),
@@ -374,6 +377,15 @@ models = [
     RsiAlphaModel(14, 1),
 ]
 assert all(model is not None for model in models)
+
+algo = QCAlgorithm()
+for model in [
+    NullRiskManagementModel(),
+    MaximumDrawdownPercentPerSecurity(0.05),
+    TrailingStopRiskManagementModel(0.1),
+    MaximumUnrealizedProfitPercentPerSecurity(0.25),
+]:
+    algo.set_risk_management(model)
 "#,
         );
     }
