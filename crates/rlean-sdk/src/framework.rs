@@ -462,7 +462,19 @@ pub fn create_equal_weighting_pcm_with_policy(
 }
 
 pub fn create_insight_weighting_pcm() -> Box<dyn IPortfolioConstructionModel> {
-    Box::new(rlean_portfolio_construction::InsightWeightingPortfolioConstructionModel::new())
+    create_insight_weighting_pcm_with_policy(PortfolioBias::LongShort, RebalancePolicy::daily())
+}
+
+pub fn create_insight_weighting_pcm_with_policy(
+    portfolio_bias: PortfolioBias,
+    rebalance_policy: RebalancePolicy,
+) -> Box<dyn IPortfolioConstructionModel> {
+    Box::new(
+        rlean_portfolio_construction::InsightWeightingPortfolioConstructionModel::with_bias_and_rebalance_policy(
+            portfolio_bias,
+            rebalance_policy,
+        ),
+    )
 }
 
 pub fn create_mean_variance_pcm() -> Box<dyn IPortfolioConstructionModel> {
@@ -726,11 +738,31 @@ pub fn create_max_unrealized_profit_per_security(
     feature = "python",
     pyo3::pyclass(name = "InsightWeightingPortfolioConstructionModel")
 )]
-pub struct InsightWeightingPortfolioConstructionModel;
+#[derive(Clone)]
+pub struct InsightWeightingPortfolioConstructionModel {
+    pub portfolio_bias: PortfolioBias,
+    pub rebalance_policy: RebalancePolicy,
+    pub rebalance_on_security_changes: bool,
+    pub rebalance_on_insight_changes: bool,
+}
 
 impl InsightWeightingPortfolioConstructionModel {
     pub fn new() -> Self {
-        Self
+        Self {
+            portfolio_bias: PortfolioBias::LongShort,
+            rebalance_policy: default_rebalance_policy(),
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
+        }
+    }
+
+    pub fn into_pcm(self) -> Box<dyn IPortfolioConstructionModel> {
+        create_insight_weighting_pcm_with_policy(
+            self.portfolio_bias,
+            self.rebalance_policy
+                .with_security_changes(self.rebalance_on_security_changes)
+                .with_insight_changes(self.rebalance_on_insight_changes),
+        )
     }
 }
 
@@ -1002,7 +1034,47 @@ macro_rules! py_model_new_no_args {
 }
 
 #[cfg(feature = "python")]
-py_model_new_no_args!(InsightWeightingPortfolioConstructionModel);
+#[pyo3::pymethods]
+impl InsightWeightingPortfolioConstructionModel {
+    #[new]
+    #[pyo3(signature = (rebalance=None, portfolio_bias=None))]
+    fn py_new(
+        rebalance: Option<pyo3::Bound<'_, pyo3::PyAny>>,
+        portfolio_bias: Option<PortfolioBiasView>,
+    ) -> Self {
+        Self {
+            portfolio_bias: portfolio_bias
+                .map(portfolio_bias_from_view)
+                .unwrap_or(PortfolioBias::LongShort),
+            rebalance_policy: rebalance
+                .as_ref()
+                .and_then(parse_rebalance_policy_arg)
+                .unwrap_or_else(default_rebalance_policy),
+            rebalance_on_security_changes: true,
+            rebalance_on_insight_changes: true,
+        }
+    }
+
+    #[getter]
+    fn rebalance_on_security_changes(&self) -> bool {
+        self.rebalance_on_security_changes
+    }
+
+    #[setter]
+    fn set_rebalance_on_security_changes(&mut self, value: bool) {
+        self.rebalance_on_security_changes = value;
+    }
+
+    #[getter]
+    fn rebalance_on_insight_changes(&self) -> bool {
+        self.rebalance_on_insight_changes
+    }
+
+    #[setter]
+    fn set_rebalance_on_insight_changes(&mut self, value: bool) {
+        self.rebalance_on_insight_changes = value;
+    }
+}
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl EqualWeightingPortfolioConstructionModel {
@@ -1171,6 +1243,7 @@ pub struct InsightProjection {
     pub period_nanos: i64,
     pub magnitude: Option<f64>,
     pub confidence: Option<f64>,
+    pub weight: Option<f64>,
     pub source_model: String,
     pub score_direction: Option<f64>,
     pub score_magnitude: Option<f64>,
@@ -1189,15 +1262,17 @@ impl InsightProjection {
         source_model: Option<String>,
         weight: Option<f64>,
     ) -> Self {
-        let _ = weight;
-        project_alpha_insight(&Insight::new(
-            symbol,
-            alpha_direction_from_sdk(direction),
-            period.as_timespan(),
-            magnitude.and_then(Decimal::from_f64),
-            confidence.and_then(Decimal::from_f64),
-            source_model.as_deref().unwrap_or_default(),
-        ))
+        project_alpha_insight(
+            &Insight::new(
+                symbol,
+                alpha_direction_from_sdk(direction),
+                period.as_timespan(),
+                magnitude.and_then(Decimal::from_f64),
+                confidence.and_then(Decimal::from_f64),
+                source_model.as_deref().unwrap_or_default(),
+            )
+            .with_weight(weight.and_then(Decimal::from_f64)),
+        )
     }
     pub fn price_value(&self) -> Option<f64> {
         self.magnitude
@@ -1215,6 +1290,9 @@ impl InsightProjection {
     }
     pub fn confidence(&self) -> Option<f64> {
         self.confidence
+    }
+    pub fn weight(&self) -> Option<f64> {
+        self.weight
     }
 
     pub fn source_model(&self) -> String {
@@ -1250,15 +1328,17 @@ impl InsightProjection {
         weight: Option<f64>,
     ) -> pyo3::PyResult<Self> {
         let period = crate::python_framework::insight_period_from_py(period)?;
-        let _ = weight;
-        Ok(project_alpha_insight(&Insight::new(
-            symbol.into_inner(),
-            alpha_direction_from_sdk(direction),
-            period,
-            magnitude.and_then(Decimal::from_f64),
-            confidence.and_then(Decimal::from_f64),
-            source_model.as_deref().unwrap_or_default(),
-        )))
+        Ok(project_alpha_insight(
+            &Insight::new(
+                symbol.into_inner(),
+                alpha_direction_from_sdk(direction),
+                period,
+                magnitude.and_then(Decimal::from_f64),
+                confidence.and_then(Decimal::from_f64),
+                source_model.as_deref().unwrap_or_default(),
+            )
+            .with_weight(weight.and_then(Decimal::from_f64)),
+        ))
     }
 
     #[staticmethod]
@@ -1306,6 +1386,11 @@ impl InsightProjection {
         self.confidence()
     }
 
+    #[getter(weight)]
+    fn py_weight(&self) -> Option<f64> {
+        self.weight()
+    }
+
     #[getter(score_direction)]
     fn py_score_direction(&self) -> Option<f64> {
         self.score_direction
@@ -1340,6 +1425,7 @@ pub fn project_alpha_insight(insight: &Insight) -> InsightProjection {
         period_nanos: insight.period.nanos,
         magnitude: insight.magnitude.and_then(|m| m.to_f64()),
         confidence: insight.confidence.and_then(|c| c.to_f64()),
+        weight: insight.weight.and_then(|w| w.to_f64()),
         source_model: insight.source_model.to_string(),
         score_direction: insight.score_direction,
         score_magnitude: insight.score_magnitude,
@@ -1357,6 +1443,7 @@ pub fn project_pcm_insight(insight: &InsightForPcm, utc_now: DateTime) -> Insigh
         period_nanos: TimeSpan::ONE_DAY.nanos,
         magnitude: insight.magnitude.and_then(|m| m.to_f64()),
         confidence: insight.confidence.and_then(|c| c.to_f64()),
+        weight: insight.weight.and_then(|w| w.to_f64()),
         source_model: insight.source_model.clone(),
         score_direction: None,
         score_magnitude: None,
@@ -1375,6 +1462,7 @@ pub fn insight_from_projection(projection: &InsightProjection) -> Insight {
         projection.confidence.and_then(Decimal::from_f64),
         &projection.source_model,
     )
+    .with_weight(projection.weight.and_then(Decimal::from_f64))
 }
 
 #[derive(Debug, Clone, PartialEq)]

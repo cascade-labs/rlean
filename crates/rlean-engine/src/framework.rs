@@ -237,6 +237,7 @@ impl FrameworkState {
                 },
                 magnitude: i.magnitude,
                 confidence: i.confidence,
+                weight: i.weight,
                 source_model: i.source_model.as_ref(),
             })
             .collect();

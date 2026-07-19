@@ -3,22 +3,40 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 use crate::portfolio_construction_model::{
-    IPortfolioConstructionModel, InsightDirection, InsightForPcm,
+    IPortfolioConstructionModel, InsightDirection, InsightForPcm, RebalancePolicy,
 };
-use crate::portfolio_target::PortfolioTarget;
+use crate::{PortfolioBias, PortfolioTarget};
 
-/// Weights insights by their confidence value, normalized so the sum <= 1.
-/// Mirrors C# InsightWeightingPortfolioConstructionModel.
+/// Generates percent targets from `Insight.weight`, matching C# LEAN.
 ///
-/// - Uses `confidence` as the weight (abs value).
-/// - If total weight > 1, scales all down proportionally.
-/// - Insights with no confidence are excluded (weight = 0).
-/// - Falls back to equal weighting when all confidences are None/zero.
-pub struct InsightWeightingPortfolioConstructionModel;
+/// Insights without a weight are ignored. If the gross weight is greater than
+/// one, targets are scaled proportionally so gross exposure is one.
+pub struct InsightWeightingPortfolioConstructionModel {
+    portfolio_bias: PortfolioBias,
+    rebalance_policy: RebalancePolicy,
+}
 
 impl InsightWeightingPortfolioConstructionModel {
     pub fn new() -> Self {
-        Self
+        Self::with_bias_and_rebalance_policy(PortfolioBias::LongShort, RebalancePolicy::daily())
+    }
+
+    pub fn with_bias_and_rebalance_policy(
+        portfolio_bias: PortfolioBias,
+        rebalance_policy: RebalancePolicy,
+    ) -> Self {
+        Self {
+            portfolio_bias,
+            rebalance_policy,
+        }
+    }
+
+    fn respects_bias(&self, insight: &InsightForPcm) -> bool {
+        match self.portfolio_bias {
+            PortfolioBias::LongShort => true,
+            PortfolioBias::Long => insight.direction == InsightDirection::Up,
+            PortfolioBias::Short => insight.direction == InsightDirection::Down,
+        }
     }
 }
 
@@ -35,58 +53,41 @@ impl IPortfolioConstructionModel for InsightWeightingPortfolioConstructionModel 
         portfolio_value: Decimal,
         prices: &HashMap<u64, Decimal>,
     ) -> Vec<PortfolioTarget> {
-        // Get the absolute confidence value for each insight (0 if None).
-        let get_value = |insight: &InsightForPcm| -> Decimal {
-            insight.confidence.map(|c| c.abs()).unwrap_or(Decimal::ZERO)
-        };
-
-        // Sum weights for all non-Flat insights to detect normalization need.
-        // Mirrors C# weightSums / weightFactor logic.
-        let weight_sum: Decimal = insights
+        let eligible: Vec<&InsightForPcm> = insights
             .iter()
-            .filter(|i| i.direction != InsightDirection::Flat)
-            .map(get_value)
-            .fold(Decimal::ZERO, |acc, v| acc + v);
-
+            .filter(|insight| insight.weight.is_some())
+            .collect();
+        let weight_sum: Decimal = eligible
+            .iter()
+            .filter(|insight| self.respects_bias(insight))
+            .map(|insight| insight.weight.unwrap_or_default().abs())
+            .sum();
         let weight_factor = if weight_sum > Decimal::ONE {
             Decimal::ONE / weight_sum
         } else {
             Decimal::ONE
         };
 
-        // If all confidences are zero/None, fall back to equal weighting.
-        let active_non_flat = insights
-            .iter()
-            .filter(|i| i.direction != InsightDirection::Flat)
-            .count();
-
-        let use_equal = weight_sum == Decimal::ZERO && active_non_flat > 0;
-        let equal_weight = if use_equal && active_non_flat > 0 {
-            Decimal::ONE / Decimal::from(active_non_flat)
-        } else {
-            Decimal::ZERO
-        };
-
-        insights
-            .iter()
+        eligible
+            .into_iter()
             .map(|insight| {
-                let direction_sign = Decimal::from(insight.direction.as_i32());
-
-                let pct = if insight.direction == InsightDirection::Flat {
-                    Decimal::ZERO
-                } else if use_equal {
-                    direction_sign * equal_weight
+                let direction = if self.respects_bias(insight) {
+                    Decimal::from(insight.direction.as_i32())
                 } else {
-                    direction_sign * get_value(insight) * weight_factor
+                    Decimal::ZERO
                 };
-
+                let percent = direction * insight.weight.unwrap_or_default().abs() * weight_factor;
                 let price = prices
                     .get(&insight.symbol.id.sid)
                     .copied()
-                    .unwrap_or(Decimal::ZERO);
-                PortfolioTarget::percent(insight.symbol.clone(), pct, portfolio_value, price)
+                    .unwrap_or_default();
+                PortfolioTarget::percent(insight.symbol.clone(), percent, portfolio_value, price)
             })
             .collect()
+    }
+
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.rebalance_policy.clone()
     }
 
     fn name(&self) -> &str {

@@ -34,6 +34,9 @@ pub struct Insight {
     pub magnitude: Option<Decimal>,
     /// Confidence in [0, 1] (optional).
     pub confidence: Option<Decimal>,
+    /// Portfolio allocation weight used by InsightWeightingPortfolioConstructionModel.
+    #[serde(default)]
+    pub weight: Option<Decimal>,
     pub source_model: Arc<str>,
     pub generated_time_utc: DateTime,
     pub close_time_utc: DateTime,
@@ -70,6 +73,7 @@ impl Insight {
             period,
             magnitude,
             confidence,
+            weight: None,
             source_model: Arc::from(source_model),
             generated_time_utc: now,
             close_time_utc: close,
@@ -144,6 +148,11 @@ impl Insight {
     pub fn with_generated_time_utc(mut self, generated_time_utc: DateTime) -> Self {
         self.generated_time_utc = generated_time_utc;
         self.close_time_utc = generated_time_utc + self.period;
+        self
+    }
+
+    pub fn with_weight(mut self, weight: Option<Decimal>) -> Self {
+        self.weight = weight;
         self
     }
 

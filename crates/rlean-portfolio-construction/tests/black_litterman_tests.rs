@@ -30,6 +30,7 @@ fn make_insight(symbol: Symbol, direction: InsightDirection, magnitude: f64) -> 
         direction,
         magnitude: Some(Decimal::try_from(magnitude).unwrap()),
         confidence: Some(dec!(0.8)),
+        weight: None,
         source_model: "TestAlpha".to_string(),
     }
 }
@@ -40,6 +41,7 @@ fn make_insight_no_mag(symbol: Symbol, direction: InsightDirection) -> InsightFo
         direction,
         magnitude: None,
         confidence: None,
+        weight: None,
         source_model: "TestAlpha".to_string(),
     }
 }
@@ -257,6 +259,7 @@ fn multiple_source_models_produce_targets_for_each() {
             direction: InsightDirection::Up,
             magnitude: Some(dec!(0.08)),
             confidence: Some(dec!(0.9)),
+            weight: None,
             source_model: "AlphaA".to_string(),
         },
         InsightForPcm {
@@ -264,6 +267,7 @@ fn multiple_source_models_produce_targets_for_each() {
             direction: InsightDirection::Up,
             magnitude: Some(dec!(0.03)),
             confidence: Some(dec!(0.7)),
+            weight: None,
             source_model: "AlphaB".to_string(),
         },
     ];

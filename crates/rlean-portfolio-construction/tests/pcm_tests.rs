@@ -26,20 +26,22 @@ fn make_insight(symbol: Symbol, direction: InsightDirection) -> InsightForPcm {
         direction,
         magnitude: None,
         confidence: None,
+        weight: None,
         source_model: "test".to_string(),
     }
 }
 
-fn make_insight_with_confidence(
+fn make_insight_with_weight(
     symbol: Symbol,
     direction: InsightDirection,
-    confidence: Option<Decimal>,
+    weight: Option<Decimal>,
 ) -> InsightForPcm {
     InsightForPcm {
         symbol,
         direction,
         magnitude: None,
-        confidence,
+        confidence: None,
+        weight,
         source_model: "test".to_string(),
     }
 }
@@ -533,13 +535,13 @@ mod insight_weighting_tests {
     /// Two insights with equal weight=1: each gets 50% (weights sum to 2, so
     /// each normalized weight = 0.5). Mirrors C# WeightsProportionally test.
     #[test]
-    fn weights_proportionally_equal_confidence() {
+    fn weights_proportionally() {
         let spy = make_equity("SPY");
         let ibm = make_equity("IBM");
 
         let insights = vec![
-            make_insight_with_confidence(spy.clone(), InsightDirection::Up, Some(dec!(1))),
-            make_insight_with_confidence(ibm.clone(), InsightDirection::Up, Some(dec!(1))),
+            make_insight_with_weight(spy.clone(), InsightDirection::Up, Some(dec!(1))),
+            make_insight_with_weight(ibm.clone(), InsightDirection::Up, Some(dec!(1))),
         ];
 
         let portfolio_value = dec!(100_000);
@@ -566,18 +568,15 @@ mod insight_weighting_tests {
         assert_eq!(get_qty("IBM"), ibm_expected);
     }
 
-    /// Insight with None confidence falls back to equal weighting.
-    /// Mirrors C# GeneratesNoTargetsForInsightsWithNoWeight — in the Rust port
-    /// None confidence triggers equal-weight fallback rather than exclusion.
+    /// Mirrors C# GeneratesNoTargetsForInsightsWithNoWeight.
     #[test]
-    fn no_confidence_falls_back_to_equal_weight() {
+    fn no_weight_is_ignored() {
         let spy = make_equity("SPY");
         let ibm = make_equity("IBM");
 
-        // Both have None confidence → should fall back to equal weighting (50/50)
         let insights = vec![
-            make_insight_with_confidence(spy.clone(), InsightDirection::Up, None),
-            make_insight_with_confidence(ibm.clone(), InsightDirection::Up, None),
+            make_insight_with_weight(spy.clone(), InsightDirection::Up, None),
+            make_insight_with_weight(ibm.clone(), InsightDirection::Up, None),
         ];
 
         let portfolio_value = dec!(100_000);
@@ -586,31 +585,15 @@ mod insight_weighting_tests {
         let mut model = InsightWeightingPortfolioConstructionModel::new();
         let targets = model.create_targets(&insights, portfolio_value, &prices);
 
-        assert_eq!(targets.len(), 2);
-        for t in &targets {
-            assert!(
-                t.quantity > Decimal::ZERO,
-                "fallback equal weight should produce positive quantities"
-            );
-        }
+        assert!(targets.is_empty());
     }
 
-    /// When a single insight has zero confidence, the Rust model falls back to
-    /// equal weighting (the only non-Flat insight gets 100% allocation).
-    ///
-    /// NOTE: This diverges from C# InsightWeightingPortfolioConstructionModel,
-    /// which emits a zero-quantity target for zero-weight insights. The Rust
-    /// port treats zero/None confidence as "no preference expressed" and falls
-    /// back to equal weighting so the position is still sized. This behaviour
-    /// is intentional — if you want the C# zero-weight semantics, set the
-    /// insight direction to Flat instead.
+    /// Explicit zero weight produces a zero target.
     #[test]
-    fn zero_confidence_single_insight_falls_back_to_equal_weight() {
+    fn zero_weight_produces_zero_target() {
         let spy = make_equity("SPY");
 
-        // confidence = Some(0) → weight_sum = 0 → equal-weight fallback kicks in.
-        // With only one non-Flat insight the entire portfolio is allocated to it.
-        let insights = vec![make_insight_with_confidence(
+        let insights = vec![make_insight_with_weight(
             spy.clone(),
             InsightDirection::Down,
             Some(Decimal::ZERO),
@@ -625,24 +608,19 @@ mod insight_weighting_tests {
 
         assert_eq!(targets.len(), 1);
 
-        // Equal-weight fallback: weight = 1/1 = 1.0 (full portfolio), direction = Down → short.
-        let expected_qty = -(portfolio_value / price).floor();
-        assert_eq!(
-            targets[0].quantity, expected_qty,
-            "Zero-confidence single Down insight: equal-weight fallback, full short allocation"
-        );
+        assert_eq!(targets[0].quantity, Decimal::ZERO);
     }
 
-    /// Asymmetric weights: confidence 0.3 vs 0.7 — higher confidence gets
+    /// Asymmetric weights: 0.3 vs 0.7 — higher weight gets
     /// proportionally larger allocation.
     #[test]
-    fn asymmetric_confidence_weights() {
+    fn asymmetric_weights() {
         let aig = make_equity("AIG");
         let ibm = make_equity("IBM");
 
         let insights = vec![
-            make_insight_with_confidence(aig.clone(), InsightDirection::Up, Some(dec!(0.3))),
-            make_insight_with_confidence(ibm.clone(), InsightDirection::Up, Some(dec!(0.7))),
+            make_insight_with_weight(aig.clone(), InsightDirection::Up, Some(dec!(0.3))),
+            make_insight_with_weight(ibm.clone(), InsightDirection::Up, Some(dec!(0.7))),
         ];
 
         let portfolio_value = dec!(100_000);
@@ -669,12 +647,12 @@ mod insight_weighting_tests {
         assert_eq!(get_qty("IBM"), ibm_expected);
     }
 
-    /// Flat insight in InsightWeighting → zero target regardless of confidence.
+    /// Flat insight in InsightWeighting produces a zero target.
     #[test]
     fn flat_direction_always_zero() {
         let spy = make_equity("SPY");
 
-        let insights = vec![make_insight_with_confidence(
+        let insights = vec![make_insight_with_weight(
             spy.clone(),
             InsightDirection::Flat,
             Some(dec!(0.5)),

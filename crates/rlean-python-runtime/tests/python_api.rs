@@ -298,9 +298,11 @@ insight = Insight.price(
     0.05,
     1.0,
     "test_model",
-    None,
+    0.35,
 )
 assert insight.magnitude == 0.05
+assert insight.confidence == 1.0
+assert insight.weight == 0.35
 assert insight.source_model == "test_model"
 assert insight.direction == InsightDirection.Up
 "#,
@@ -377,6 +379,11 @@ models = [
     RsiAlphaModel(14, 1),
 ]
 assert all(model is not None for model in models)
+
+weighted = InsightWeightingPortfolioConstructionModel(lambda _: None)
+weighted.rebalance_on_security_changes = False
+weighted.rebalance_on_insight_changes = True
+assert weighted.rebalance_on_security_changes is False
 
 algo = QCAlgorithm()
 for model in [

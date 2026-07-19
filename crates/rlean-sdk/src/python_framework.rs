@@ -22,11 +22,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::algorithm::{AlgorithmApi, AlgorithmHandle};
 use crate::data::{CustomDataPointView, FundamentalDataView, SharedSliceFrame, SliceView};
 use crate::framework::{
-    create_immediate_execution_model, create_insight_weighting_pcm,
-    create_max_drawdown_percent_per_security, create_max_sharpe_ratio_pcm,
-    create_max_unrealized_profit_per_security, create_mean_variance_pcm,
-    create_null_risk_management_model, create_trailing_stop_risk_model, insight_from_projection,
-    portfolio_target_from_projection, portfolio_target_projection_from_execution_target,
+    create_immediate_execution_model, create_max_drawdown_percent_per_security,
+    create_max_sharpe_ratio_pcm, create_max_unrealized_profit_per_security,
+    create_mean_variance_pcm, create_null_risk_management_model, create_trailing_stop_risk_model,
+    insight_from_projection, portfolio_target_from_projection,
+    portfolio_target_projection_from_execution_target,
     portfolio_target_projection_from_risk_target, project_alpha_insight, project_pcm_insight,
     EqualWeightingPortfolioConstructionModel, ImmediateExecutionModel, InsightProjection,
     InsightWeightingPortfolioConstructionModel, MaximumDrawdownPercentPerSecurity,
@@ -413,9 +413,8 @@ pub fn register_portfolio_construction(
         framework_registry(handle)?.set_portfolio_construction_model(builtin.into_pcm());
         return Ok(());
     }
-    if bound.is_instance_of::<InsightWeightingPortfolioConstructionModel>() {
-        framework_registry(handle)?
-            .set_portfolio_construction_model(create_insight_weighting_pcm());
+    if let Ok(builtin) = bound.extract::<InsightWeightingPortfolioConstructionModel>() {
+        framework_registry(handle)?.set_portfolio_construction_model(builtin.into_pcm());
         return Ok(());
     }
     if bound.is_instance_of::<MeanVarianceOptimizationPortfolioConstructionModel>() {
