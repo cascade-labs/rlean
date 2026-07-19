@@ -1,6 +1,7 @@
 use rlean_core::MarketHoursDatabase;
 use rlean_data_sidecar::DataSidecarClient;
-use std::collections::HashSet;
+use rlean_data_tables::FactorFileEntry;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -70,6 +71,7 @@ pub struct DataFeedContext {
     pub consumer_frontier_days: Arc<AtomicI64>,
     frontier_advanced: Arc<Notify>,
     unadjusted_equities: Arc<Mutex<HashSet<String>>>,
+    auxiliary_factor_rows: Arc<Mutex<HashMap<String, Vec<FactorFileEntry>>>>,
 }
 
 impl DataFeedContext {
@@ -82,6 +84,7 @@ impl DataFeedContext {
             consumer_frontier_days: Arc::new(AtomicI64::new(CONSUMER_FRONTIER_UNSET)),
             frontier_advanced: Arc::new(Notify::new()),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
+            auxiliary_factor_rows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -153,6 +156,19 @@ impl DataFeedContext {
             .unwrap_or_default();
         tickers.sort();
         tickers
+    }
+
+    pub fn cached_auxiliary_factor_rows(&self, key: &str) -> Option<Vec<FactorFileEntry>> {
+        self.auxiliary_factor_rows
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(key).cloned())
+    }
+
+    pub fn cache_auxiliary_factor_rows(&self, key: String, rows: Vec<FactorFileEntry>) {
+        if let Ok(mut cache) = self.auxiliary_factor_rows.lock() {
+            cache.insert(key, rows);
+        }
     }
 }
 

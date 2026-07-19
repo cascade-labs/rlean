@@ -119,6 +119,7 @@ fn cmd_remote_set(url: &str, workspace: &Path) -> Result<()> {
 
 fn cmd_commit(message: Option<&str>, workspace: &Path) -> Result<()> {
     require_git_repo(workspace)?;
+    crate::init::ensure_gitignore(workspace)?;
     if !is_dirty(workspace)? {
         println!("Nothing to commit — working tree clean.");
         return Ok(());
@@ -132,6 +133,7 @@ fn cmd_commit(message: Option<&str>, workspace: &Path) -> Result<()> {
 fn cmd_push(message: Option<&str>, workspace: &Path) -> Result<()> {
     require_git_repo(workspace)?;
     require_remote(workspace)?;
+    crate::init::ensure_gitignore(workspace)?;
 
     if is_dirty(workspace)? {
         run_git(&["add", "-A"], workspace)?;
@@ -163,6 +165,7 @@ fn cmd_pull(workspace: &Path) -> Result<()> {
 fn cmd_sync(message: Option<&str>, workspace: &Path) -> Result<()> {
     require_git_repo(workspace)?;
     require_remote(workspace)?;
+    crate::init::ensure_gitignore(workspace)?;
 
     // Auto-commit dirty changes before rebasing.
     if is_dirty(workspace)? {

@@ -470,6 +470,34 @@ where
     }
 
     pub fn end_time_step(&mut self, services: &mut dyn AlgorithmServices) {
+        if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+            let logical_removals = algorithm_state
+                .lock()
+                .unwrap()
+                .take_pending_removed_security_changes();
+            if !logical_removals.is_empty() {
+                crate::notify_framework_securities_changed(
+                    &self.runtime_context.framework(),
+                    &[],
+                    &logical_removals,
+                );
+                self.algorithm.on_securities_changed(
+                    &rlean_algorithm::algorithm::SecurityChanges {
+                        added: Vec::new(),
+                        removed: logical_removals,
+                    },
+                    services,
+                );
+            }
+
+            // C# LEAN performs physical user-defined-universe/data-feed removal
+            // at end of time step, after synchronous order processing. Unsafe
+            // removals remain pending and are checked again each time step.
+            algorithm_state
+                .lock()
+                .unwrap()
+                .process_pending_security_removals();
+        }
         self.algorithm.on_end_of_time_step(services);
     }
 

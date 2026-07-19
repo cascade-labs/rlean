@@ -893,11 +893,15 @@ impl Default for NullRiskManagementModel {
     feature = "python",
     pyo3::pyclass(name = "MaximumDrawdownPercentPerSecurity")
 )]
-pub struct MaximumDrawdownPercentPerSecurity;
+pub struct MaximumDrawdownPercentPerSecurity {
+    pub maximum_drawdown_percent: f64,
+}
 
 impl MaximumDrawdownPercentPerSecurity {
-    pub fn new(_maximum_drawdown_percent: f64) -> Self {
-        Self
+    pub fn new(maximum_drawdown_percent: f64) -> Self {
+        Self {
+            maximum_drawdown_percent,
+        }
     }
 }
 
@@ -905,11 +909,29 @@ impl MaximumDrawdownPercentPerSecurity {
     feature = "python",
     pyo3::pyclass(name = "TrailingStopRiskManagementModel")
 )]
-pub struct TrailingStopRiskManagementModel;
+pub struct TrailingStopRiskManagementModel {
+    pub trailing_amount: f64,
+}
 
 impl TrailingStopRiskManagementModel {
-    pub fn new(_trailing_amount: f64) -> Self {
-        Self
+    pub fn new(trailing_amount: f64) -> Self {
+        Self { trailing_amount }
+    }
+}
+
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(name = "MaximumUnrealizedProfitPercentPerSecurity")
+)]
+pub struct MaximumUnrealizedProfitPercentPerSecurityModel {
+    pub maximum_unrealized_profit_percent: f64,
+}
+
+impl MaximumUnrealizedProfitPercentPerSecurityModel {
+    pub fn new(maximum_unrealized_profit_percent: f64) -> Self {
+        Self {
+            maximum_unrealized_profit_percent,
+        }
     }
 }
 
@@ -1064,6 +1086,15 @@ impl TrailingStopRiskManagementModel {
     #[new]
     fn py_new(trailing_amount: f64) -> Self {
         Self::new(trailing_amount)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl MaximumUnrealizedProfitPercentPerSecurityModel {
+    #[new]
+    fn py_new(maximum_unrealized_profit_percent: f64) -> Self {
+        Self::new(maximum_unrealized_profit_percent)
     }
 }
 

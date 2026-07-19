@@ -22,14 +22,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::algorithm::{AlgorithmApi, AlgorithmHandle};
 use crate::data::{CustomDataPointView, FundamentalDataView, SharedSliceFrame, SliceView};
 use crate::framework::{
-    create_immediate_execution_model, create_insight_weighting_pcm, create_max_sharpe_ratio_pcm,
-    create_mean_variance_pcm, create_null_risk_management_model, insight_from_projection,
+    create_immediate_execution_model, create_insight_weighting_pcm,
+    create_max_drawdown_percent_per_security, create_max_sharpe_ratio_pcm,
+    create_max_unrealized_profit_per_security, create_mean_variance_pcm,
+    create_null_risk_management_model, create_trailing_stop_risk_model, insight_from_projection,
     portfolio_target_from_projection, portfolio_target_projection_from_execution_target,
     portfolio_target_projection_from_risk_target, project_alpha_insight, project_pcm_insight,
     EqualWeightingPortfolioConstructionModel, ImmediateExecutionModel, InsightProjection,
-    InsightWeightingPortfolioConstructionModel, MaximumSharpeRatioPortfolioConstructionModel,
+    InsightWeightingPortfolioConstructionModel, MaximumDrawdownPercentPerSecurity,
+    MaximumSharpeRatioPortfolioConstructionModel, MaximumUnrealizedProfitPercentPerSecurityModel,
     MeanVarianceOptimizationPortfolioConstructionModel, NullRiskManagementModel,
-    PortfolioTargetProjection,
+    PortfolioTargetProjection, TrailingStopRiskManagementModel,
 };
 use crate::securities::SymbolHandle;
 use crate::universe::ScheduledUniverseDescriptor;
@@ -262,6 +265,9 @@ impl IPortfolioConstructionModel for PythonPortfolioConstructionModelAdapter {
 
 fn rebalance_policy_from_py_str(value: &str) -> Option<RebalancePolicy> {
     match value.trim().to_ascii_lowercase().as_str() {
+        "insight_changes" | "insight-changes" | "insight_changes_only" | "insight-changes-only" => {
+            Some(RebalancePolicy::insight_changes_only())
+        }
         "daily" | "day" | "1d" => Some(RebalancePolicy::daily()),
         "every_slice" | "everyslice" | "every-slice" | "slice" | "tick" | "every_tick"
         | "everytick" => Some(RebalancePolicy::every_slice()),
@@ -447,8 +453,28 @@ pub fn register_risk_management(
     handle: &AlgorithmHandle,
     model: Py<PyAny>,
 ) -> PyResult<()> {
-    if model.bind(py).is_instance_of::<NullRiskManagementModel>() {
+    let bound = model.bind(py);
+    if bound.is_instance_of::<NullRiskManagementModel>() {
         framework_registry(handle)?.set_risk_management_model(create_null_risk_management_model());
+        return Ok(());
+    }
+    if let Ok(model_ref) = bound.extract::<PyRef<'_, MaximumDrawdownPercentPerSecurity>>() {
+        framework_registry(handle)?.set_risk_management_model(
+            create_max_drawdown_percent_per_security(model_ref.maximum_drawdown_percent),
+        );
+        return Ok(());
+    }
+    if let Ok(model_ref) = bound.extract::<PyRef<'_, TrailingStopRiskManagementModel>>() {
+        framework_registry(handle)?
+            .set_risk_management_model(create_trailing_stop_risk_model(model_ref.trailing_amount));
+        return Ok(());
+    }
+    if let Ok(model_ref) =
+        bound.extract::<PyRef<'_, MaximumUnrealizedProfitPercentPerSecurityModel>>()
+    {
+        framework_registry(handle)?.set_risk_management_model(
+            create_max_unrealized_profit_per_security(model_ref.maximum_unrealized_profit_percent),
+        );
         return Ok(());
     }
     let algorithm = algorithm_py_object(py, handle)?.unbind();
@@ -803,6 +829,23 @@ mod tests {
             let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, py.None());
             let policy = adapter.rebalance_policy();
             assert!(matches!(policy.cadence(), RebalanceCadence::Period(_)));
+        });
+    }
+
+    #[test]
+    fn rebalance_policy_parses_insight_changes_only() {
+        Python::attach(|py| {
+            let model = build_model(
+                py,
+                "class Model:\n\
+                 \x20\x20\x20\x20rebalance_policy = \"insight_changes_only\"\n\
+                 model = Model()\n",
+            );
+            let adapter = PythonPortfolioConstructionModelAdapter::new(py, model, py.None());
+            let policy = adapter.rebalance_policy();
+            assert!(matches!(policy.cadence(), RebalanceCadence::NextTime(_)));
+            assert!(!policy.rebalance_on_security_changes());
+            assert!(policy.rebalance_on_insight_changes());
         });
     }
 }

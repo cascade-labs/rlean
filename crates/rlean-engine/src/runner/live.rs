@@ -71,6 +71,11 @@ where
     );
 
     algorithm_manager.initialize(&mut services)?;
+    // The deployment selects execution independently from strategy source.
+    // Strategies often set a brokerage model for backtests in Initialize;
+    // re-apply the live deployment model so the same strategy can be deployed
+    // through Fidelity, Robinhood, Tradier, or paper without source edits.
+    algorithm_manager.set_brokerage_model(config.brokerage_model);
     let risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel> = Arc::new(
         crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
             &config.data_sidecar,
@@ -302,12 +307,16 @@ where
             break;
         }
 
-        let Some(item) = next_live_item(&mut live_subscriptions, Duration::from_millis(250))?
-        else {
-            continue;
-        };
+        let ready_slices =
+            match next_live_item(&mut live_subscriptions, Duration::from_millis(250))? {
+                Some(item) => assembler.push(item),
+                None => assembler
+                    .flush_ready(rlean_core::DateTime::now())
+                    .into_iter()
+                    .collect(),
+            };
 
-        for mut slice in assembler.push(item) {
+        for mut slice in ready_slices {
             apply_risk_free_rate_to_option_chains(
                 &mut slice,
                 risk_free_interest_rate_model.as_ref(),

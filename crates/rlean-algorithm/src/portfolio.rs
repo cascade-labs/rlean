@@ -72,6 +72,11 @@ pub struct SecurityHolding {
     pub total_fees: Price,
     pub total_funding: Price,
     pub last_price: Price,
+    /// Most recent framework portfolio target. C# LEAN stores this on
+    /// `SecurityHolding.Target` and will not physically remove a security while
+    /// the target is non-zero.
+    #[serde(default)]
+    pub target: Option<Quantity>,
 }
 
 impl SecurityHolding {
@@ -91,6 +96,7 @@ impl SecurityHolding {
             total_fees: dec!(0),
             total_funding: dec!(0),
             last_price: dec!(0),
+            target: None,
         }
     }
 
@@ -115,6 +121,10 @@ impl SecurityHolding {
     }
     pub fn is_invested(&self) -> bool {
         self.quantity != dec!(0)
+    }
+
+    pub fn has_open_target(&self) -> bool {
+        self.target.is_some_and(|quantity| !quantity.is_zero())
     }
     pub fn abs_quantity(&self) -> Quantity {
         self.quantity.abs()
@@ -182,8 +192,9 @@ impl SecurityHolding {
 pub struct SecurityPortfolioManager {
     pub cash: RwLock<Price>,
     starting_cash: RwLock<Price>,
-    /// LEAN `UnsettledCashBook` parity stub — always zero until settlement model exists.
-    unsettled_cash: RwLock<Price>,
+    /// Per-security unsettled cash used by LEAN's pending-removal safety check.
+    /// The aggregate is also deducted from margin remaining.
+    unsettled_cash_by_symbol: RwLock<HashMap<u64, Price>>,
     holdings: SharedHoldings,
     margin_interest_states: RwLock<HashMap<u64, MarginInterestState>>,
     pub total_fees: RwLock<Price>,
@@ -196,7 +207,7 @@ impl SecurityPortfolioManager {
         SecurityPortfolioManager {
             cash: RwLock::new(starting_cash),
             starting_cash: RwLock::new(starting_cash),
-            unsettled_cash: RwLock::new(dec!(0)),
+            unsettled_cash_by_symbol: RwLock::new(HashMap::new()),
             holdings: Arc::new(RwLock::new(HashMap::new())),
             margin_interest_states: RwLock::new(HashMap::new()),
             total_fees: RwLock::new(dec!(0)),
@@ -227,7 +238,24 @@ impl SecurityPortfolioManager {
     }
 
     pub fn unsettled_cash(&self) -> Price {
-        *self.unsettled_cash.read()
+        self.unsettled_cash_by_symbol.read().values().copied().sum()
+    }
+
+    pub fn unsettled_cash_for_symbol(&self, symbol: &Symbol) -> Price {
+        self.unsettled_cash_by_symbol
+            .read()
+            .get(&symbol.id.sid)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn set_unsettled_cash_for_symbol(&self, symbol: &Symbol, amount: Price) {
+        let mut unsettled = self.unsettled_cash_by_symbol.write();
+        if amount.is_zero() {
+            unsettled.remove(&symbol.id.sid);
+        } else {
+            unsettled.insert(symbol.id.sid, amount);
+        }
     }
 
     /// Mirrors C# `SecurityPortfolioManager.GetMarginRemaining(totalPortfolioValue)`.
@@ -267,6 +295,29 @@ impl SecurityPortfolioManager {
             let dummy = rlean_core::Symbol::create_equity("UNKNOWN", &rlean_core::Market::usa());
             SecurityHolding::new(dummy)
         })
+    }
+
+    pub fn set_target(&self, symbol: &Symbol, quantity: Quantity) {
+        let mut holdings = self.holdings.write();
+        let holding = holdings
+            .entry(symbol.id.sid)
+            .or_insert_with(|| SecurityHolding::new(symbol.clone()));
+        holding.target = Some(quantity);
+    }
+
+    /// C# `SecurityPortfolioManager` is an adapter over `Securities`, so a
+    /// physically removed flat security has no independent holdings entry.
+    pub fn remove_holding_if_flat(&self, symbol: &Symbol) -> bool {
+        let mut holdings = self.holdings.write();
+        let removable = holdings
+            .get(&symbol.id.sid)
+            .is_some_and(|holding| !holding.is_invested() && !holding.has_open_target());
+        if removable {
+            holdings.remove(&symbol.id.sid);
+            self.margin_interest_states.write().remove(&symbol.id.sid);
+            self.unsettled_cash_by_symbol.write().remove(&symbol.id.sid);
+        }
+        removable
     }
 
     pub fn is_invested(&self, symbol: &Symbol) -> bool {

@@ -414,6 +414,22 @@ mod insight_collection_tests {
         assert_eq!(closed.score_direction, Some(1.0));
         assert!(closed.is_final_score);
     }
+
+    #[test]
+    fn restored_snapshot_advances_insight_id_allocator() {
+        let mut restored_insight = Insight::up(spy(), TimeSpan::from_days(1));
+        restored_insight.id = 1_000_000_000;
+        let snapshot = rlean_alpha::InsightCollectionSnapshot {
+            active: vec![restored_insight],
+            closed: Vec::new(),
+            total_count: 1,
+        };
+
+        let _ = InsightCollection::from_snapshot(snapshot);
+        let new_insight = Insight::up(aapl(), TimeSpan::from_days(1));
+
+        assert!(new_insight.id > 1_000_000_000);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 use crate::risk_management::{PortfolioTarget, RiskContext, RiskManagementModel};
+use rlean_core::Symbol;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -17,6 +18,7 @@ struct HoldingsState {
 pub struct TrailingStopRiskManagementModel {
     pub trailing_pct: Decimal,
     trailing_holdings_state: HashMap<u64, HoldingsState>,
+    canceled_symbols: Vec<Symbol>,
 }
 
 impl TrailingStopRiskManagementModel {
@@ -24,6 +26,7 @@ impl TrailingStopRiskManagementModel {
         TrailingStopRiskManagementModel {
             trailing_pct: trailing_pct.abs(),
             trailing_holdings_state: HashMap::new(),
+            canceled_symbols: Vec::new(),
         }
     }
 }
@@ -40,6 +43,7 @@ impl RiskManagementModel for TrailingStopRiskManagementModel {
     ) -> Vec<PortfolioTarget> {
         let mut result = Vec::new();
         let mut invested_sids = std::collections::HashSet::new();
+        self.canceled_symbols.clear();
 
         for holding in &ctx.holdings {
             let sid = holding.symbol.id.sid;
@@ -90,6 +94,7 @@ impl RiskManagementModel for TrailingStopRiskManagementModel {
             let drawdown = ((trailing_value - absolute_holdings_value) / trailing_value).abs();
             if self.trailing_pct < drawdown {
                 self.trailing_holdings_state.remove(&sid);
+                self.canceled_symbols.push(holding.symbol.clone());
                 result.push(PortfolioTarget::new(holding.symbol.clone(), Decimal::ZERO));
             }
         }
@@ -98,5 +103,9 @@ impl RiskManagementModel for TrailingStopRiskManagementModel {
             .retain(|sid, _| invested_sids.contains(sid));
 
         result
+    }
+
+    fn canceled_insights(&mut self) -> Vec<Symbol> {
+        std::mem::take(&mut self.canceled_symbols)
     }
 }

@@ -210,6 +210,13 @@ pub struct QcAlgorithm {
     pub minimum_order_margin_portfolio_percentage: Decimal,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     security_leverage_overrides: HashMap<u64, f64>,
+    /// Securities logically removed by `RemoveSecurity` or universe selection
+    /// but retained until LEAN's removal safety conditions are satisfied.
+    pending_security_removals: HashMap<u64, Symbol>,
+    /// Direct `RemoveSecurity` calls flow through LEAN's user-defined universe
+    /// change path. The engine drains these logical removals and notifies the
+    /// algorithm framework before physical removal.
+    pending_removed_security_changes: Vec<Symbol>,
 }
 
 impl QcAlgorithm {
@@ -249,6 +256,8 @@ impl QcAlgorithm {
             minimum_order_margin_portfolio_percentage: dec!(0.001),
             market_hours_database: MarketHoursDatabase::global(),
             security_leverage_overrides: HashMap::new(),
+            pending_security_removals: HashMap::new(),
+            pending_removed_security_changes: Vec::new(),
         }
     }
 
@@ -469,6 +478,8 @@ impl QcAlgorithm {
     ) -> Symbol {
         self.add_equity_subscriptions(symbol.clone(), resolution, normalization_mode);
 
+        self.cancel_pending_security_removal(&symbol);
+
         // Idempotent: if the security already exists (e.g. called again during
         // universe rebalancing), keep it as-is so the runner-updated price is
         // not reset to zero.
@@ -603,6 +614,7 @@ impl QcAlgorithm {
     }
 
     fn ensure_base_security(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        self.cancel_pending_security_removal(&symbol);
         if self.securities.contains(&symbol) {
             return symbol;
         }
@@ -653,6 +665,7 @@ impl QcAlgorithm {
 
     pub fn add_forex(&mut self, ticker: &str, resolution: Resolution) -> Symbol {
         let symbol = Symbol::create_forex(ticker);
+        self.cancel_pending_security_removal(&symbol);
         let config = SubscriptionDataConfig::new_forex(symbol.clone(), resolution);
         self.subscription_manager.add(config);
         let hours = self.market_hours_database.exchange_hours(&symbol);
@@ -671,6 +684,7 @@ impl QcAlgorithm {
 
     pub fn add_crypto(&mut self, ticker: &str, market: &Market, resolution: Resolution) -> Symbol {
         let symbol = Symbol::create_crypto(ticker, market);
+        self.cancel_pending_security_removal(&symbol);
         let config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
         self.subscription_manager.add(config);
         let mut quote_config = SubscriptionDataConfig::new_crypto(symbol.clone(), resolution);
@@ -697,6 +711,7 @@ impl QcAlgorithm {
         resolution: Resolution,
     ) -> Symbol {
         let symbol = Symbol::create_crypto_future(ticker, market);
+        self.cancel_pending_security_removal(&symbol);
         let trade_config = SubscriptionDataConfig::new_crypto_future(symbol.clone(), resolution);
         self.subscription_manager.add(trade_config);
         let mut quote_config =
@@ -860,6 +875,12 @@ impl QcAlgorithm {
                 }
             }
             let Some(security) = self.securities.get(&holding.symbol) else {
+                if holding.is_invested() {
+                    panic!(
+                        "portfolio invariant violated: invested holding {} has no Security",
+                        holding.symbol.value
+                    );
+                }
                 continue;
             };
             let price = if let Some((order, fill_price)) = order {
@@ -1051,6 +1072,15 @@ impl QcAlgorithm {
     }
 
     fn validate_brokerage_order(&self, order: &Order) -> Option<String> {
+        if let Some(security) = self.securities.get(&order.symbol) {
+            if !security.is_tradable() {
+                return Some(format!(
+                    "The security with symbol '{}' is marked as non-tradable.",
+                    order.symbol.value
+                ));
+            }
+        }
+
         if self.hyperliquid_post_only_order_crosses_book(order) {
             return Some(
                 "Hyperliquid post-only limit orders must not cross the current bid/ask".into(),
@@ -1837,21 +1867,147 @@ impl QcAlgorithm {
             return false;
         }
 
-        self.transactions
-            .cancel_open_orders_for_symbol(symbol.id.sid, self.utc_time);
+        if !self.is_warming_up {
+            self.transactions
+                .cancel_open_orders_for_symbol(symbol.id.sid, self.utc_time);
+        }
         if self.is_invested(symbol) {
             self.liquidate(Some(symbol));
         }
-        self.subscription_manager.remove_symbol(symbol);
-        self.securities.remove(symbol);
-        self.open_option_contracts
-            .retain(|existing| existing.id.sid != symbol.id.sid);
+
+        // C# LEAN resets the security here but does not remove it from
+        // `Securities` or the data feed. The user-defined universe removal is
+        // applied at end-of-time-step and the data feed defers physical removal
+        // while holdings, orders, or targets remain.
+        if let Some(security) = self.securities.get(symbol) {
+            security.reset();
+        }
+        self.pending_security_removals
+            .insert(symbol.id.sid, symbol.clone());
+        if !self
+            .pending_removed_security_changes
+            .iter()
+            .any(|existing| existing.id.sid == symbol.id.sid)
+        {
+            self.pending_removed_security_changes.push(symbol.clone());
+        }
         true
     }
 
     /// LEAN sugar for `RemoveSecurity` on a specific option contract.
     pub fn remove_option_contract(&mut self, symbol: &Symbol, tag: Option<&str>) -> bool {
         self.remove_security(symbol, tag)
+    }
+
+    /// Queue a universe-selected security for LEAN-style deferred physical
+    /// removal. Universe selection itself does not cancel orders, liquidate, or
+    /// mark the security non-tradable; framework security-change processing is
+    /// responsible for producing the zero target.
+    pub fn request_universe_security_removal(&mut self, symbol: &Symbol) -> bool {
+        if !self.securities.contains(symbol) {
+            return false;
+        }
+        self.pending_security_removals
+            .insert(symbol.id.sid, symbol.clone());
+        true
+    }
+
+    /// Re-selection cancels pending removal exactly like LEAN's
+    /// `PendingRemovalsManager.CheckPendingRemovals` path.
+    pub fn cancel_pending_security_removal(&mut self, symbol: &Symbol) -> bool {
+        let removed = self
+            .pending_security_removals
+            .remove(&symbol.id.sid)
+            .is_some();
+        self.pending_removed_security_changes
+            .retain(|pending| pending.id.sid != symbol.id.sid);
+        if removed {
+            if let Some(security) = self.securities.get(symbol) {
+                security.reinitialize();
+            }
+        }
+        removed
+    }
+
+    pub fn is_security_pending_removal(&self, symbol: &Symbol) -> bool {
+        self.pending_security_removals.contains_key(&symbol.id.sid)
+    }
+
+    /// Drain logical removals generated by direct `RemoveSecurity` calls. The
+    /// engine turns these into one `SecurityChanges.Removed` notification while
+    /// retaining the physical security until it is safe to remove.
+    pub fn take_pending_removed_security_changes(&mut self) -> Vec<Symbol> {
+        std::mem::take(&mut self.pending_removed_security_changes)
+    }
+
+    fn security_is_safe_to_remove(&self, symbol: &Symbol) -> bool {
+        let holding = self.portfolio.get_holding(symbol);
+        if holding.is_invested() || holding.has_open_target() {
+            return false;
+        }
+        if self
+            .transactions
+            .get_open_orders()
+            .iter()
+            .any(|order| order.symbol.id.sid == symbol.id.sid)
+        {
+            return false;
+        }
+
+        if !self.portfolio.unsettled_cash_for_symbol(symbol).is_zero() {
+            return false;
+        }
+
+        // LEAN also retains an underlying while a dependent derivative still
+        // has holdings, an order, or an open target.
+        for dependent in self.securities.all().filter(|security| {
+            security
+                .symbol
+                .underlying
+                .as_ref()
+                .is_some_and(|underlying| underlying.id.sid == symbol.id.sid)
+        }) {
+            let dependent_holding = self.portfolio.get_holding(&dependent.symbol);
+            if dependent_holding.is_invested()
+                || dependent_holding.has_open_target()
+                || self
+                    .transactions
+                    .get_open_orders()
+                    .iter()
+                    .any(|order| order.symbol.id.sid == dependent.symbol.id.sid)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Apply physical data/security removals whose LEAN safety conditions are
+    /// satisfied. Called by the engine at end of each time step after
+    /// synchronous order processing and framework target generation.
+    pub fn process_pending_security_removals(&mut self) -> Vec<Symbol> {
+        let removable: Vec<Symbol> = self
+            .pending_security_removals
+            .values()
+            .filter(|symbol| self.security_is_safe_to_remove(symbol))
+            .cloned()
+            .collect();
+
+        let mut removed = Vec::with_capacity(removable.len());
+        for symbol in removable {
+            self.subscription_manager.remove_symbol(&symbol);
+            if self.securities.remove(&symbol).is_none() {
+                // The SecurityManager enforces the central invariant that an
+                // invested holding can never be detached from its Security.
+                continue;
+            }
+            self.open_option_contracts
+                .retain(|existing| existing.id.sid != symbol.id.sid);
+            self.portfolio.remove_holding_if_flat(&symbol);
+            self.pending_security_removals.remove(&symbol.id.sid);
+            removed.push(symbol);
+        }
+        removed
     }
 
     fn remove_option_subscription(&mut self, canonical: &Symbol) -> bool {
@@ -1879,15 +2035,7 @@ impl QcAlgorithm {
             .cloned()
             .collect();
         for child in child_symbols {
-            self.transactions
-                .cancel_open_orders_for_symbol(child.id.sid, self.utc_time);
-            if self.is_invested(&child) {
-                self.liquidate(Some(&child));
-            }
-            self.subscription_manager.remove_symbol(&child);
-            self.securities.remove(&child);
-            self.open_option_contracts
-                .retain(|existing| existing.id.sid != child.id.sid);
+            self.remove_security(&child, None);
         }
 
         true
@@ -1916,6 +2064,7 @@ impl QcAlgorithm {
 
     pub fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
         self.add_option_contract_subscriptions(symbol.clone(), resolution);
+        self.cancel_pending_security_removal(symbol);
         if self.securities.contains(symbol) {
             return;
         }
@@ -2195,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_security_removes_equity_subscription_and_security() {
+    fn remove_security_defers_physical_equity_removal_until_end_of_time_step() {
         let mut alg = QcAlgorithm::new("test", dec!(100_000));
         let symbol = alg.add_equity("MSFT", Resolution::Minute);
 
@@ -2207,12 +2356,146 @@ mod tests {
             .any(|config| config.symbol.id.sid == symbol.id.sid));
 
         assert!(alg.remove_security(&symbol, None));
+        assert!(alg.is_security_pending_removal(&symbol));
+        assert!(alg.securities.contains(&symbol));
+        assert!(!alg.securities.get(&symbol).unwrap().is_tradable());
+        assert!(alg
+            .subscription_manager
+            .get_all()
+            .iter()
+            .any(|config| config.symbol.id.sid == symbol.id.sid));
+
+        assert_eq!(
+            alg.process_pending_security_removals(),
+            vec![symbol.clone()]
+        );
         assert!(!alg.securities.contains(&symbol));
         assert!(!alg
             .subscription_manager
             .get_all()
             .iter()
             .any(|config| config.symbol.id.sid == symbol.id.sid));
+    }
+
+    #[test]
+    fn remove_security_retains_invested_security_until_liquidation_fills() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        alg.securities.update_price(&symbol, dec!(100));
+        alg.portfolio
+            .apply_fill_with_multiplier(&symbol, dec!(100), dec!(100), dec!(0), dec!(1));
+
+        assert!(alg.remove_security(&symbol, None));
+        assert!(alg.securities.contains(&symbol));
+        assert!(alg.is_invested(&symbol));
+        assert!(alg.process_pending_security_removals().is_empty());
+
+        let liquidation = alg
+            .transactions
+            .get_open_orders()
+            .into_iter()
+            .find(|order| order.symbol.id.sid == symbol.id.sid)
+            .expect("RemoveSecurity must submit a liquidation order");
+        assert_eq!(liquidation.quantity, dec!(-100));
+        alg.portfolio.apply_fill_with_multiplier(
+            &symbol,
+            dec!(100),
+            liquidation.quantity,
+            dec!(0),
+            dec!(1),
+        );
+        alg.transactions.process_order_event(OrderEvent::filled(
+            liquidation.id,
+            symbol.clone(),
+            alg.utc_time,
+            dec!(100),
+            liquidation.quantity,
+        ));
+
+        assert_eq!(
+            alg.process_pending_security_removals(),
+            vec![symbol.clone()]
+        );
+        assert!(!alg.securities.contains(&symbol));
+        assert!(!alg.is_invested(&symbol));
+    }
+
+    #[test]
+    fn pending_removal_waits_for_zero_framework_target() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        alg.portfolio.set_target(&symbol, dec!(100));
+
+        assert!(alg.remove_security(&symbol, None));
+        assert!(alg.process_pending_security_removals().is_empty());
+        assert!(alg.securities.contains(&symbol));
+
+        alg.portfolio.set_target(&symbol, dec!(0));
+        assert_eq!(
+            alg.process_pending_security_removals(),
+            vec![symbol.clone()]
+        );
+    }
+
+    #[test]
+    fn pending_removal_waits_for_security_settlement() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        alg.portfolio
+            .set_unsettled_cash_for_symbol(&symbol, dec!(1_000));
+
+        assert!(alg.remove_security(&symbol, None));
+        assert!(alg.process_pending_security_removals().is_empty());
+        assert!(alg.securities.contains(&symbol));
+
+        alg.portfolio
+            .set_unsettled_cash_for_symbol(&symbol, dec!(0));
+        assert_eq!(
+            alg.process_pending_security_removals(),
+            vec![symbol.clone()]
+        );
+    }
+
+    #[test]
+    fn readding_security_cancels_pending_removal_and_reinitializes_it() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        assert!(alg.remove_security(&symbol, None));
+        assert!(!alg.securities.get(&symbol).unwrap().is_tradable());
+
+        let readded = alg.add_equity("MSFT", Resolution::Minute);
+        assert_eq!(readded.id.sid, symbol.id.sid);
+        assert!(!alg.is_security_pending_removal(&symbol));
+        assert!(alg.securities.get(&symbol).unwrap().is_tradable());
+        assert!(alg.process_pending_security_removals().is_empty());
+    }
+
+    #[test]
+    fn remove_security_marks_security_non_tradable_before_physical_removal() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        alg.securities.update_price(&symbol, dec!(100));
+
+        assert!(alg.remove_security(&symbol, None));
+        let ticket = alg.market_order(&symbol, dec!(1));
+        let events = ticket.order_events();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, OrderStatus::Invalid);
+        assert!(events[0].message.contains("marked as non-tradable"));
+    }
+
+    #[test]
+    fn security_manager_refuses_to_orphan_an_invested_holding() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+        alg.securities.update_price(&symbol, dec!(100));
+        alg.portfolio
+            .apply_fill_with_multiplier(&symbol, dec!(100), dec!(100), dec!(0), dec!(1));
+
+        assert!(alg.securities.remove(&symbol).is_none());
+        assert!(alg.securities.contains(&symbol));
+        assert_eq!(alg.total_margin_used(), dec!(5_000));
     }
 
     #[test]
@@ -2253,6 +2536,7 @@ mod tests {
         assert!(alg.securities.contains(&contract));
 
         assert!(alg.remove_security(&canonical, None));
+        alg.process_pending_security_removals();
 
         assert!(!alg
             .option_subscriptions

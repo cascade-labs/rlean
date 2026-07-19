@@ -68,6 +68,7 @@ fn register_framework(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rlean_sdk::framework::NullRiskManagementModel>()?;
     m.add_class::<rlean_sdk::framework::MaximumDrawdownPercentPerSecurity>()?;
     m.add_class::<rlean_sdk::framework::TrailingStopRiskManagementModel>()?;
+    m.add_class::<rlean_sdk::framework::MaximumUnrealizedProfitPercentPerSecurityModel>()?;
     m.add_class::<rlean_sdk::framework::ConstantAlphaModel>()?;
     m.add_class::<rlean_sdk::framework::EmaCrossAlphaModel>()?;
     m.add_class::<rlean_sdk::framework::HistoricalReturnsAlphaModel>()?;
