@@ -137,6 +137,8 @@ pub struct InsightForPcm {
     pub magnitude: Option<rust_decimal::Decimal>,
     /// Confidence in the insight (0.0 to 1.0)
     pub confidence: Option<rust_decimal::Decimal>,
+    /// Portfolio allocation weight (0.0 to 1.0).
+    pub weight: Option<rust_decimal::Decimal>,
     /// Source model name (used for grouping in Black-Litterman style)
     pub source_model: String,
 }
@@ -152,6 +154,7 @@ pub struct InsightForPcmRef<'a> {
     pub direction: InsightDirection,
     pub magnitude: Option<rust_decimal::Decimal>,
     pub confidence: Option<rust_decimal::Decimal>,
+    pub weight: Option<rust_decimal::Decimal>,
     pub source_model: &'a str,
 }
 
@@ -178,6 +181,7 @@ pub trait IPortfolioConstructionModel: Send + Sync {
                 direction: insight.direction,
                 magnitude: insight.magnitude,
                 confidence: insight.confidence,
+                weight: insight.weight,
                 source_model: insight.source_model.to_string(),
             })
             .collect();

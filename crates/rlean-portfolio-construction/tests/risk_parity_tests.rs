@@ -31,6 +31,7 @@ fn make_insight(symbol: Symbol, direction: InsightDirection) -> InsightForPcm {
         direction,
         magnitude: None,
         confidence: None,
+        weight: None,
         source_model: "TestAlpha".to_string(),
     }
 }

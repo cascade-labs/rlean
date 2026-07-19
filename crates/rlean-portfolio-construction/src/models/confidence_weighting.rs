@@ -125,6 +125,7 @@ mod tests {
                 direction: InsightDirection::Up,
                 magnitude: None,
                 confidence: Some(dec!(0.8)), // high confidence
+                weight: None,
                 source_model: "test".to_string(),
             },
             InsightForPcm {
@@ -132,6 +133,7 @@ mod tests {
                 direction: InsightDirection::Up,
                 magnitude: None,
                 confidence: Some(dec!(0.2)), // low confidence
+                weight: None,
                 source_model: "test".to_string(),
             },
         ];
@@ -171,6 +173,7 @@ mod tests {
             direction: InsightDirection::Down,
             magnitude: None,
             confidence: None, // no confidence → excluded
+            weight: None,
             source_model: "test".to_string(),
         }];
 
@@ -197,6 +200,7 @@ mod tests {
             direction: InsightDirection::Down,
             magnitude: None,
             confidence: Some(dec!(0)),
+            weight: None,
             source_model: "test".to_string(),
         }];
 
@@ -221,6 +225,7 @@ mod tests {
                 direction: InsightDirection::Down,
                 magnitude: None,
                 confidence: Some(dec!(1)),
+                weight: None,
                 source_model: "test".to_string(),
             },
             InsightForPcm {
@@ -228,6 +233,7 @@ mod tests {
                 direction: InsightDirection::Down,
                 magnitude: None,
                 confidence: Some(dec!(1)),
+                weight: None,
                 source_model: "test".to_string(),
             },
         ];
