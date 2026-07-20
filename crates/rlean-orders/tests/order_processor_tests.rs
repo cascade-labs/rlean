@@ -93,6 +93,42 @@ fn process_orders_with_quotes_uses_quote_aware_immediate_market_fill() {
 }
 
 #[test]
+fn quote_only_market_buy_fills_at_ask_without_a_trade_bar() {
+    let symbol = spy();
+    let tm = Arc::new(TransactionManager::new());
+    tm.add_order(Order::market(1, symbol.clone(), dec!(10), ts(0), ""));
+    let processor = OrderProcessor::new(
+        Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+        tm,
+    );
+    let quotes = HashMap::from([(symbol.id.sid, quote_bar(symbol))]);
+
+    let events = processor.process_orders_with_quotes(&HashMap::new(), &quotes, ts(60));
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].fill_price, dec!(101));
+    assert_eq!(events[0].fill_quantity, dec!(10));
+}
+
+#[test]
+fn quote_only_market_sell_fills_at_bid_without_a_trade_bar() {
+    let symbol = spy();
+    let tm = Arc::new(TransactionManager::new());
+    tm.add_order(Order::market(1, symbol.clone(), dec!(-10), ts(0), ""));
+    let processor = OrderProcessor::new(
+        Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+        tm,
+    );
+    let quotes = HashMap::from([(symbol.id.sid, quote_bar(symbol))]);
+
+    let events = processor.process_orders_with_quotes(&HashMap::new(), &quotes, ts(60));
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].fill_price, dec!(99));
+    assert_eq!(events[0].fill_quantity, dec!(-10));
+}
+
+#[test]
 fn process_orders_with_quotes_uses_quote_side_for_limit_trigger() {
     let symbol = spy();
     let tm = Arc::new(TransactionManager::new());

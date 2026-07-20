@@ -1,5 +1,5 @@
 use crate::time::{NanosecondTimestamp, TimeSpan};
-use crate::{SecurityType, Symbol};
+use crate::{SecurityType, Symbol, SymbolOptionsExt};
 use chrono::{Datelike, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use once_cell::sync::Lazy;
@@ -146,6 +146,37 @@ impl MarketHoursDatabase {
         date.and_hms_opt(12, 0, 0)
             .map(|midday| self.exchange_hours(symbol).is_open_at_local_naive(midday))
             .unwrap_or(false)
+    }
+
+    /// Returns the exchange-local expiration frontier for an option contract.
+    ///
+    /// This is the rlean equivalent of C# LEAN
+    /// `OptionSymbol.TryGetExpirationDateTime`: contracts expire at the last
+    /// regular market close on their expiration trading day, not at midnight.
+    /// If the encoded expiration date is closed, the previous trading day's
+    /// close is used.
+    pub fn option_expiration_time(&self, symbol: &Symbol) -> Option<NanosecondTimestamp> {
+        let option = symbol.option_symbol_id()?;
+        let hours = self.exchange_hours(symbol);
+        let mut trading_day = option.expiry;
+
+        for _ in 0..14 {
+            if let Some((_, close)) = hours.session_bounds(trading_day) {
+                return Some(close);
+            }
+            trading_day = trading_day.pred_opt()?;
+        }
+        None
+    }
+
+    /// C# LEAN `OptionSymbol.IsOptionContractExpired` parity.
+    pub fn is_option_contract_expired(
+        &self,
+        symbol: &Symbol,
+        current_time_utc: NanosecondTimestamp,
+    ) -> bool {
+        self.option_expiration_time(symbol)
+            .is_some_and(|expiration| current_time_utc >= expiration)
     }
 
     /// Walk back `bar_count` regular trading days from `end_date` (exclusive)
@@ -455,5 +486,26 @@ mod tests {
                     .unwrap()
             )
         );
+    }
+
+    #[test]
+    fn option_contract_expires_at_exchange_close_not_start_of_expiry_date() {
+        let database = MarketHoursDatabase::from_builtin_defaults();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let expiry = NaiveDate::from_ymd_opt(2024, 7, 24).unwrap();
+        let option = Symbol::create_option_osi(
+            underlying,
+            rust_decimal_macros::dec!(531),
+            expiry,
+            crate::OptionRight::Call,
+            crate::OptionStyle::American,
+            &Market::usa(),
+        );
+        let hours = database.exchange_hours(&option);
+        let (open, close) = hours.session_bounds(expiry).unwrap();
+
+        assert!(!database.is_option_contract_expired(&option, open));
+        assert!(!database.is_option_contract_expired(&option, close - TimeSpan::from_secs(60)));
+        assert!(database.is_option_contract_expired(&option, close));
     }
 }

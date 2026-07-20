@@ -77,6 +77,28 @@ pub struct SecurityData {
     pub open_order_quantity: Decimal,
 }
 
+/// Authoritative algorithm services required by execution models.
+///
+/// C# LEAN passes the algorithm itself to `IExecutionModel.Execute`, so models
+/// resolve the current `Security`, projected holdings, buying-power model, and
+/// margin state at execution time. This interface preserves that ownership
+/// boundary without making the lower-level execution crate depend on
+/// `rlean-algorithm`.
+pub trait IExecutionAlgorithm: Send + Sync {
+    fn is_warming_up(&self) -> bool;
+    fn security(&self, symbol: &Symbol) -> Option<SecurityData>;
+    fn security_has_data(&self, symbol: &Symbol) -> bool;
+    fn security_is_tradable(&self, symbol: &Symbol) -> bool;
+    fn projected_quantity(&self, symbol: &Symbol) -> Decimal;
+    fn holdings_quantity(&self, symbol: &Symbol) -> Decimal;
+    fn above_minimum_order_margin_portfolio_percentage(
+        &self,
+        symbol: &Symbol,
+        quantity: Decimal,
+        minimum_order_margin_portfolio_percentage: Decimal,
+    ) -> bool;
+}
+
 /// Algorithm-aware execution context.
 ///
 /// C# LEAN passes the full QCAlgorithm instance into IExecutionModel.Execute.
@@ -89,6 +111,7 @@ pub struct ExecutionContext<'a> {
     pub open_orders: &'a [ExecutionOpenOrder],
     pub portfolio_value: Decimal,
     pub minimum_order_margin_portfolio_percentage: Decimal,
+    algorithm: Option<&'a dyn IExecutionAlgorithm>,
 }
 
 /// Sorts targets using the same high-level priority as C# LEAN's
@@ -167,7 +190,13 @@ impl<'a> ExecutionContext<'a> {
             open_orders,
             portfolio_value,
             minimum_order_margin_portfolio_percentage: Decimal::ZERO,
+            algorithm: None,
         }
+    }
+
+    pub fn with_algorithm(mut self, algorithm: &'a dyn IExecutionAlgorithm) -> Self {
+        self.algorithm = Some(algorithm);
+        self
     }
 
     pub fn with_minimum_order_margin_portfolio_percentage(mut self, percentage: Decimal) -> Self {
@@ -187,8 +216,67 @@ impl<'a> ExecutionContext<'a> {
         {
             return true;
         }
-        let order_value = (quantity * security.price).abs();
-        order_value >= self.portfolio_value * self.minimum_order_margin_portfolio_percentage
+        if let Some(algorithm) = self.algorithm {
+            return algorithm.above_minimum_order_margin_portfolio_percentage(
+                &security.symbol,
+                quantity,
+                self.minimum_order_margin_portfolio_percentage,
+            );
+        }
+
+        // Standalone execution-model contexts used by lower-level models and
+        // unit tests have no algorithm-owned buying-power model. Production
+        // framework execution always delegates above.
+        let abs_final_order_margin = (quantity * security.price).abs();
+        let minimum_value = self.portfolio_value * self.minimum_order_margin_portfolio_percentage;
+        minimum_value <= abs_final_order_margin
+    }
+
+    pub fn is_warming_up(&self) -> bool {
+        self.algorithm
+            .is_some_and(IExecutionAlgorithm::is_warming_up)
+    }
+
+    pub fn has_authoritative_algorithm(&self) -> bool {
+        self.algorithm.is_some()
+    }
+
+    /// Resolve the current security through the algorithm-owned SecurityManager.
+    /// A configured algorithm is authoritative: a miss is never replaced with
+    /// snapshot data. Standalone model contexts use their explicit snapshot.
+    pub fn authoritative_security(&self, symbol: &Symbol) -> Option<SecurityData> {
+        match self.algorithm {
+            Some(algorithm) => algorithm.security(symbol),
+            None => self.security(symbol).cloned(),
+        }
+    }
+
+    pub fn security_has_data(&self, security: &SecurityData) -> bool {
+        self.algorithm
+            .map(|algorithm| algorithm.security_has_data(&security.symbol))
+            .unwrap_or(security.price > Decimal::ZERO)
+    }
+
+    pub fn security_is_tradable(&self, security: &SecurityData) -> bool {
+        self.algorithm
+            .map(|algorithm| algorithm.security_is_tradable(&security.symbol))
+            .unwrap_or(true)
+    }
+
+    pub fn authoritative_projected_quantity(
+        &self,
+        symbol: &Symbol,
+        security: &SecurityData,
+    ) -> Decimal {
+        self.algorithm
+            .map(|algorithm| algorithm.projected_quantity(symbol))
+            .unwrap_or_else(|| self.projected_quantity(symbol, security))
+    }
+
+    pub fn authoritative_holdings_quantity(&self, security: &SecurityData) -> Decimal {
+        self.algorithm
+            .map(|algorithm| algorithm.holdings_quantity(&security.symbol))
+            .unwrap_or(security.current_quantity)
     }
 
     pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {

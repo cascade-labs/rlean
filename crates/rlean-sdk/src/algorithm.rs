@@ -585,6 +585,17 @@ impl AlgorithmHandle {
         )
     }
 
+    pub fn add_option_quote_contract(
+        &self,
+        symbol: SymbolHandle,
+        resolution: Resolution,
+    ) -> SymbolHandle {
+        SymbolHandle::new(
+            AlgorithmApi::new(&mut self.inner.lock().unwrap())
+                .add_option_quote_contract(symbol.into_inner(), resolution),
+        )
+    }
+
     pub fn add_data(
         &self,
         source_type: String,
@@ -1048,6 +1059,24 @@ impl AlgorithmHandle {
         resolution: crate::types::Resolution,
     ) -> OptionSecurityHandle {
         self.add_option(underlying_ticker, resolution.into())
+    }
+
+    #[pyo3(name = "add_option_contract")]
+    fn py_add_option_contract(
+        &self,
+        symbol: SymbolHandle,
+        resolution: crate::types::Resolution,
+    ) -> SymbolHandle {
+        self.add_option_contract(symbol, resolution.into())
+    }
+
+    #[pyo3(name = "add_option_quote_contract")]
+    fn py_add_option_quote_contract(
+        &self,
+        symbol: SymbolHandle,
+        resolution: crate::types::Resolution,
+    ) -> SymbolHandle {
+        self.add_option_quote_contract(symbol, resolution.into())
     }
 
     #[pyo3(name = "add_data", signature = (source_type, ticker, resolution, properties=None))]
@@ -1571,6 +1600,10 @@ impl<'a> AlgorithmApi<'a> {
 
     pub fn add_option_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         self.algorithm.add_option_contract(symbol, resolution)
+    }
+
+    pub fn add_option_quote_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        self.algorithm.add_option_quote_contract(symbol, resolution)
     }
 
     pub fn add_security_symbol(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {

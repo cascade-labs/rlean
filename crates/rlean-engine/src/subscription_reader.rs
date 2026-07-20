@@ -2,7 +2,9 @@ use crate::data_feed::DataFeedContext;
 use crate::normalization::{normalize_quote_bar, normalize_trade_bar};
 use crate::subscription_data::SubscriptionDataPoint;
 use futures::StreamExt;
-use rlean_core::{DateTime, LeanError, Resolution, Result as LeanResult, SecurityType};
+use rlean_core::{
+    DateTime, LeanError, Resolution, Result as LeanResult, SecurityType, SymbolOptionsExt,
+};
 use rlean_data::SubscriptionDataConfig;
 use rlean_data_sidecar::{
     decode_batch, decode_factor_file_batch, CanonicalDataBatch, DeliveryMode, SubscriptionSpec,
@@ -124,12 +126,24 @@ impl SubscriptionStream {
         self.producer.is_finished()
     }
 
-    pub fn is_ready_for(&self, frontier: DateTime) -> bool {
+    /// Whether this stream has proved that no further point can be emitted at
+    /// or before `frontier`.
+    ///
+    /// A queued point beyond the frontier proves ordering, an inclusive
+    /// watermark proves the bounded range is complete, and exhaustion proves
+    /// the entire stream is complete. Merely having a due point queued is not
+    /// sufficient: after consuming it the synchronizer must continue pumping,
+    /// just like C# LEAN repeatedly calls `MoveNext()` until Current is beyond
+    /// the frontier.
+    pub fn is_synchronized_through(&self, frontier: DateTime) -> bool {
         self.exhausted
-            || !self.pending.is_empty()
+            || self
+                .peek()
+                .map(|point| point.frontier_time() > frontier)
+                .unwrap_or(false)
             || self
                 .watermark
-                .map(|watermark| watermark > frontier)
+                .map(|watermark| watermark >= frontier)
                 .unwrap_or(false)
     }
 
@@ -163,7 +177,7 @@ impl SubscriptionStream {
             return Ok(());
         }
         match self.receiver.recv().await {
-            Some(Ok(message)) => self.handle_message(message),
+            Some(Ok(message)) => self.handle_message(message)?,
             Some(Err(error)) => {
                 self.exhausted = true;
                 return Err(error);
@@ -176,7 +190,7 @@ impl SubscriptionStream {
     pub fn drain_available_messages(&mut self) -> LeanResult<()> {
         loop {
             match self.receiver.try_recv() {
-                Ok(Ok(message)) => self.handle_message(message),
+                Ok(Ok(message)) => self.handle_message(message)?,
                 Ok(Err(error)) => {
                     self.exhausted = true;
                     return Err(error);
@@ -191,20 +205,55 @@ impl SubscriptionStream {
         Ok(())
     }
 
-    fn handle_message(&mut self, message: SubscriptionStreamMessage) {
+    fn handle_message(&mut self, message: SubscriptionStreamMessage) -> LeanResult<()> {
         match message {
-            SubscriptionStreamMessage::Point(point) => self.pending.push_back(*point),
+            SubscriptionStreamMessage::Point(point) => {
+                let frontier = point.frontier_time();
+                validate_point_against_watermark(&self.config, frontier, self.watermark)?;
+                self.pending.push_back(*point);
+            }
             SubscriptionStreamMessage::Watermark(watermark) => {
-                if self
-                    .watermark
-                    .map(|current| watermark > current)
-                    .unwrap_or(true)
-                {
-                    self.watermark = Some(watermark);
+                if let Some(current) = self.watermark {
+                    if watermark < current {
+                        return Err(LeanError::DataError(format!(
+                            "subscription watermark moved backward: subscription_id={}, symbol={}, previous={}, incoming={}",
+                            self.config.unique_id(), self.config.symbol.value, current, watermark
+                        )));
+                    }
                 }
+                self.watermark = Some(watermark);
             }
         }
+        Ok(())
     }
+}
+
+fn watermark_contract_error(
+    config: &SubscriptionDataConfig,
+    point_frontier: DateTime,
+    watermark: DateTime,
+) -> LeanError {
+    LeanError::DataError(format!(
+        "subscription delivered data behind its watermark: subscription_id={}, symbol={}, point_frontier={}, watermark={}",
+        config.unique_id(), config.symbol.value, point_frontier, watermark
+    ))
+}
+
+fn validate_point_against_watermark(
+    config: &SubscriptionDataConfig,
+    point_frontier: DateTime,
+    watermark: Option<DateTime>,
+) -> LeanResult<()> {
+    // `produce_registered` publishes a watermark only after its inclusive
+    // bounded query is fully decoded and every point from that window has
+    // already been sent on the same ordered channel. A subsequently received
+    // point at or below that watermark therefore violates the stream contract.
+    if let Some(watermark) = watermark {
+        if point_frontier <= watermark {
+            return Err(watermark_contract_error(config, point_frontier, watermark));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for SubscriptionStream {
@@ -366,7 +415,7 @@ async fn produce_registered(
     let wire_type = WireDataType::try_from(SubscriptionSpec::from(config).data_type)
         .map_err(|value| LeanError::DataError(format!("unknown sidecar data type {value}")))?;
     let mut window_start = start.date_utc();
-    let end_date = end.date_utc();
+    let end_date = effective_subscription_end(config, end.date_utc());
     let mut last_point: Option<SubscriptionDataPoint> = None;
     let mut last_real_frontier: Option<DateTime> = None;
     let mut previous_window_had_points = false;
@@ -703,6 +752,17 @@ fn backtest_window_candidate(
     }
 }
 
+fn effective_subscription_end(
+    config: &SubscriptionDataConfig,
+    requested_end: chrono::NaiveDate,
+) -> chrono::NaiveDate {
+    config
+        .symbol
+        .option_symbol_id()
+        .map(|contract| requested_end.min(contract.expiry))
+        .unwrap_or(requested_end)
+}
+
 fn partition_day_start(date: chrono::NaiveDate) -> DateTime {
     DateTime::from(date.and_hms_opt(0, 0, 0).expect("valid day start"))
 }
@@ -770,7 +830,7 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rlean_core::{Market, Symbol, TimeSpan};
+    use rlean_core::{Market, OptionRight, OptionStyle, Symbol, TimeSpan};
     use rlean_data::{CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata};
     use rlean_data_tables::{CustomDataPoint, TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
@@ -856,6 +916,29 @@ mod tests {
     }
 
     #[test]
+    fn option_contract_queries_stop_at_expiration() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 7, 24).unwrap();
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            expiry,
+            dec!(531),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option(contract, Resolution::Minute);
+
+        assert_eq!(
+            effective_subscription_end(
+                &config,
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()
+            ),
+            expiry
+        );
+    }
+
+    #[test]
     fn provider_availability_clamps_subscription_start() {
         let requested = partition_day_start(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
         let available = partition_day_start(chrono::NaiveDate::from_ymd_opt(2023, 8, 16).unwrap());
@@ -865,5 +948,35 @@ mod tests {
             available
         );
         assert_eq!(effective_subscription_start(available, None), available);
+    }
+
+    #[test]
+    fn watermark_is_an_inclusive_stream_barrier() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            rlean_core::DataNormalizationMode::Raw,
+        );
+        let watermark = DateTime::from_secs(2_000);
+
+        let behind =
+            validate_point_against_watermark(&config, DateTime::from_secs(1_000), Some(watermark))
+                .unwrap_err();
+        let equal =
+            validate_point_against_watermark(&config, watermark, Some(watermark)).unwrap_err();
+
+        assert!(behind
+            .to_string()
+            .contains("subscription delivered data behind its watermark"));
+        assert!(equal
+            .to_string()
+            .contains("subscription delivered data behind its watermark"));
+        assert!(validate_point_against_watermark(
+            &config,
+            DateTime::from_secs(3_000),
+            Some(watermark)
+        )
+        .is_ok());
     }
 }

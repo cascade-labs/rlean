@@ -176,6 +176,44 @@ assert abs(ticket.quantity + 1.0) < 1e-9
     }
 
     #[test]
+    fn add_option_contract_is_available_from_python() {
+        run_python(
+            r#"
+from datetime import date
+from AlgorithmImports import QCAlgorithm, OptionRight, OptionStyle, Resolution, Symbol
+
+algo = QCAlgorithm()
+spy = algo.add_equity("SPY", Resolution.Minute).symbol
+contract = Symbol.create_option_osi(
+    spy,
+    600.0,
+    date(2026, 7, 20),
+    OptionRight.Call,
+    OptionStyle.American,
+    "usa",
+)
+added = algo.add_option_contract(contract, Resolution.Minute)
+assert added == contract
+assert algo.has_security(contract)
+assert algo.remove_option_contract(contract)
+
+quote_contract = Symbol.create_option_osi(
+    spy,
+    601.0,
+    date(2026, 7, 20),
+    OptionRight.Call,
+    OptionStyle.American,
+    "usa",
+)
+added_quote = algo.add_option_quote_contract(quote_contract, Resolution.Minute)
+assert added_quote == quote_contract
+assert algo.has_security(quote_contract)
+assert algo.remove_option_contract(quote_contract)
+"#,
+        );
+    }
+
+    #[test]
     fn enum_aliases_and_sdk_objects_match_python_parity() {
         run_python(
             r#"
