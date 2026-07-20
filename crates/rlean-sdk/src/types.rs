@@ -263,6 +263,8 @@ enum_aliases!(
     InteractiveBrokersBrokerage => INTERACTIVE_BROKERS_BROKERAGE,
     TradierBrokerage => TRADIER_BROKERAGE,
     HyperliquidBrokerage => HYPERLIQUID_BROKERAGE,
+    RobinhoodBrokerage => ROBINHOOD_BROKERAGE,
+    FidelityBrokerage => FIDELITY_BROKERAGE,
 );
 #[cfg(feature = "python")]
 enum_aliases!(
