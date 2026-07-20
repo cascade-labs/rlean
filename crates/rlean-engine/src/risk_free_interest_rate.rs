@@ -10,6 +10,12 @@ use rlean_data_sidecar::{
 };
 use tokio_stream::StreamExt;
 
+const FIRST_INTEREST_RATE_DATE: (i32, u32, u32) = (1998, 1, 1);
+
+fn default_risk_free_rate() -> rust_decimal::Decimal {
+    rust_decimal::Decimal::new(1, 2)
+}
+
 pub async fn load_risk_free_interest_rate_model(
     sidecar: &Arc<DataSidecarClient>,
     end: NaiveDate,
@@ -37,7 +43,14 @@ pub async fn load_risk_free_interest_rate_model(
         .context("register canonical risk-free interest-rate subscription")?;
     let subscription_id = registration.subscription_id;
     let start = Utc
-        .with_ymd_and_hms(1998, 1, 1, 0, 0, 0)
+        .with_ymd_and_hms(
+            FIRST_INTEREST_RATE_DATE.0,
+            FIRST_INTEREST_RATE_DATE.1,
+            FIRST_INTEREST_RATE_DATE.2,
+            0,
+            0,
+            0,
+        )
         .single()
         .expect("valid LEAN interest-rate start");
     let end = Utc.from_utc_datetime(&end.and_hms_opt(23, 59, 59).expect("valid end of day"));
@@ -73,5 +86,42 @@ pub async fn load_risk_free_interest_rate_model(
         .remove_subscription(subscription_id)
         .await
         .context("remove canonical risk-free interest-rate subscription")?;
+    dated_model_or_lean_default(rates)
+}
+
+fn dated_model_or_lean_default(
+    mut rates: BTreeMap<NaiveDate, rust_decimal::Decimal>,
+) -> Result<DatedRiskFreeInterestRateModel> {
+    if rates.is_empty() {
+        let first_date = NaiveDate::from_ymd_opt(
+            FIRST_INTEREST_RATE_DATE.0,
+            FIRST_INTEREST_RATE_DATE.1,
+            FIRST_INTEREST_RATE_DATE.2,
+        )
+        .expect("valid LEAN interest-rate start");
+        tracing::error!(
+            default_rate = %default_risk_free_rate(),
+            "no risk-free interest rates were loaded; using LEAN's default rate"
+        );
+        rates.insert(first_date, default_risk_free_rate());
+    }
     DatedRiskFreeInterestRateModel::new(rates).map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlean_core::{DateTime, RiskFreeInterestRateModel};
+
+    #[test]
+    fn empty_series_uses_lean_default_rate() {
+        let model = dated_model_or_lean_default(BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            model.get_interest_rate(DateTime::from(
+                Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).single().unwrap()
+            )),
+            default_risk_free_rate()
+        );
+    }
 }

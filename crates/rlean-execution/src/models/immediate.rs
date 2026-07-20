@@ -37,6 +37,11 @@ impl ImmediateExecutionModel {
             return Vec::new();
         }
 
+        // C# LEAN's OrderTargetsByMarginImpact emits no targets during warmup.
+        if context.is_warming_up() {
+            return Vec::new();
+        }
+
         let mut orders = Vec::new();
         let mut fulfilled = Vec::new();
         let mut target_snapshot: Vec<_> = self
@@ -47,20 +52,41 @@ impl ImmediateExecutionModel {
         context.sort_targets_by_margin_impact(&mut target_snapshot);
 
         for (key, symbol, target_quantity) in target_snapshot {
-            let Some(security) = context.security(&symbol) else {
+            // C# LEAN indexes algorithm.Securities[target.Symbol]. A missing
+            // security is an engine invariant violation, not a target to drop.
+            let Some(security) = context.authoritative_security(&symbol) else {
+                if context.has_authoritative_algorithm() {
+                    panic!(
+                        "ImmediateExecutionModel target {} is missing from the algorithm SecurityManager",
+                        symbol.value
+                    );
+                }
                 continue;
             };
-
-            if context.actual_holding_delta(security, target_quantity) == Decimal::ZERO {
+            let target_quantity =
+                crate::execution_model::adjust_by_lot_size(security.lot_size, target_quantity);
+            let holdings_quantity = context.authoritative_holdings_quantity(&security);
+            if (target_quantity - holdings_quantity).abs() < security.lot_size {
+                // C# ImmediateExecutionModel calls PortfolioTargetCollection.ClearFulfilled
+                // after OrderTargetsByMarginImpact. That cleanup is independent of HasData
+                // and IsTradable, so a reset security can retire its already-fulfilled target
+                // before deferred physical removal.
                 fulfilled.push(key);
                 continue;
             }
 
-            let delta = context.unordered_quantity(&symbol, security, target_quantity);
+            if !context.security_has_data(&security) || !context.security_is_tradable(&security) {
+                continue;
+            }
+
+            let delta = crate::execution_model::adjust_by_lot_size(
+                security.lot_size,
+                target_quantity - context.authoritative_projected_quantity(&symbol, &security),
+            );
             if delta == Decimal::ZERO {
                 continue;
             }
-            if !context.above_minimum_order_margin_portfolio_percentage(security, delta) {
+            if !context.above_minimum_order_margin_portfolio_percentage(&security, delta) {
                 continue;
             }
 

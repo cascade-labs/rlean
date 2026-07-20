@@ -359,9 +359,58 @@ pub(crate) fn integration_config_json(name: &str) -> Result<Vec<u8>> {
     serde_json::to_vec(&value).context("failed to serialize sidecar integration configuration")
 }
 
+/// Serialize a brokerage's configured credentials together with the account
+/// selected for this deployment. Account selection belongs to the deployment,
+/// not the shared integration configuration.
+pub(crate) fn brokerage_config_json(name: &str, account: Option<&str>) -> Result<Vec<u8>> {
+    let configs = config::IntegrationConfigs::load()?;
+    let value = brokerage_config(configs.get_integration(name), account);
+    serde_json::to_vec(&serde_json::Value::Object(value))
+        .context("failed to serialize sidecar brokerage configuration")
+}
+
+fn brokerage_config(
+    mut value: serde_json::Map<String, serde_json::Value>,
+    account: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let Some(account) = account {
+        value.insert(
+            "account_number".to_string(),
+            serde_json::Value::String(account.to_string()),
+        );
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brokerage_account_overrides_shared_integration_default() {
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "account_number".to_string(),
+            serde_json::Value::String("old-account".to_string()),
+        );
+        config.insert(
+            "username".to_string(),
+            serde_json::Value::String("configured-user".to_string()),
+        );
+
+        let config = brokerage_config(config, Some("deployment-account"));
+
+        assert_eq!(
+            config
+                .get("account_number")
+                .and_then(|value| value.as_str()),
+            Some("deployment-account")
+        );
+        assert_eq!(
+            config.get("username").and_then(|value| value.as_str()),
+            Some("configured-user")
+        );
+    }
     use std::path::Path;
 
     #[test]

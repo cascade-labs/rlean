@@ -233,7 +233,8 @@ where
             market_slices_after_warmup += 1;
         }
         if has_data_for_algorithm {
-            let new_trading_day = algorithm_manager.handle_new_trading_day(&slice, &mut services);
+            let new_trading_day =
+                algorithm_manager.handle_new_trading_day(&slice, &mut services)?;
             let changes =
                 algorithm_manager.apply_universe_selection(&slice, new_trading_day, &mut services);
             if changes.has_changes() {

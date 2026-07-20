@@ -29,6 +29,8 @@ struct LiveDeploymentMetadata {
     stopped: Option<String>,
     updated_at: String,
     brokerage: Option<String>,
+    #[serde(default)]
+    brokerage_account: Option<String>,
     paper_trading: bool,
     command: Vec<String>,
     error: Option<String>,
@@ -52,6 +54,15 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
             anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
         })?;
     let paper_trading = is_paper_brokerage_name(requested_brokerage);
+    let brokerage_account = run_args
+        .brokerage_account
+        .as_deref()
+        .map(str::trim)
+        .filter(|account| !account.is_empty())
+        .map(str::to_string);
+    if paper_trading && brokerage_account.is_some() {
+        bail!("--brokerage-account cannot be used with the internal paper brokerage");
+    }
 
     let strategy_name = strategy_name_from_path(&run_args.strategy);
     let live_root = run_args
@@ -88,6 +99,7 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         stopped: None,
         updated_at: now,
         brokerage: run_args.brokerage.clone(),
+        brokerage_account,
         paper_trading,
         command,
         error: None,
@@ -154,6 +166,7 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
                 "stopped": metadata.stopped,
                 "updated_at": metadata.updated_at,
                 "brokerage": metadata.brokerage,
+                "brokerage_account": metadata.brokerage_account,
                 "paper_trading": metadata.paper_trading,
                 "error": metadata.error,
                 "exit_code": metadata.exit_code,
@@ -360,8 +373,8 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
 
     let filter = status_filter.map(|status| status.as_str().to_string());
     println!(
-        "{:<36} {:<14} {:<8} {:<24} {:<16} STRATEGY",
-        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE"
+        "{:<36} {:<14} {:<8} {:<24} {:<16} {:<12} STRATEGY",
+        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE", "ACCOUNT"
     );
     for (_, metadata) in rows {
         let status = effective_live_status(&metadata);
@@ -369,7 +382,7 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
             continue;
         }
         println!(
-            "{:<36} {:<14} {:<8} {:<24} {:<16} {}",
+            "{:<36} {:<14} {:<8} {:<24} {:<16} {:<12} {}",
             metadata.deploy_id,
             status,
             running_live_pid(&metadata)
@@ -377,6 +390,11 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
                 .unwrap_or_else(|| "-".to_string()),
             metadata.launched,
             metadata.brokerage.as_deref().unwrap_or("Paper"),
+            metadata
+                .brokerage_account
+                .as_deref()
+                .map(mask_brokerage_account)
+                .unwrap_or_else(|| "-".to_string()),
             metadata.strategy.display()
         );
     }
@@ -414,6 +432,9 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
     if let Some(value) = &args.brokerage {
         values.extend(["--brokerage".to_string(), value.clone()]);
     }
+    if let Some(value) = &args.brokerage_account {
+        values.extend(["--brokerage-account".to_string(), value.clone()]);
+    }
     if let Some(value) = &args.start_date {
         values.extend(["--start-date".to_string(), value.clone()]);
     }
@@ -444,6 +465,12 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
 
 fn live_dir_name(datetime: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
     backtest_dir_name(datetime, strategy_name)
+}
+
+fn mask_brokerage_account(account: &str) -> String {
+    let visible = account.chars().rev().take(4).collect::<Vec<_>>();
+    let suffix = visible.into_iter().rev().collect::<String>();
+    format!("****{suffix}")
 }
 
 fn reserve_live_dir(
@@ -916,6 +943,7 @@ mod tests {
                 data_sidecar_token: None,
                 live_data_feed: Some("tradier".to_string()),
                 brokerage: Some("hyperliquid".to_string()),
+                brokerage_account: Some("account-1234".to_string()),
                 start_date: None,
                 end_date: None,
                 parameters: vec!["foo=bar".to_string()],
@@ -940,6 +968,8 @@ mod tests {
         assert!(child_args.contains(&"foo=bar".to_string()));
         assert!(child_args.contains(&"--data-sidecar".to_string()));
         assert!(child_args.contains(&"--live-data-feed".to_string()));
+        assert!(child_args.contains(&"--brokerage-account".to_string()));
+        assert!(child_args.contains(&"account-1234".to_string()));
         assert!(!child_args.contains(&"--data-sidecar-token".to_string()));
         assert!(child_args.contains(&"--verbose".to_string()));
     }
@@ -984,6 +1014,7 @@ mod tests {
             stopped: Some("2026-06-22T00:01:00Z".to_string()),
             updated_at: "2026-06-22T00:01:00Z".to_string(),
             brokerage: Some("paper".to_string()),
+            brokerage_account: None,
             paper_trading: true,
             command: vec![
                 "/usr/local/bin/rlean".to_string(),

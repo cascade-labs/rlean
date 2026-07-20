@@ -16,7 +16,7 @@ use rlean_alpha::{
 use rlean_core::{DateTime, Symbol, TickType};
 use rlean_execution::execution_model::ExecutionTargetRef;
 use rlean_execution::{
-    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, IExecutionModel,
+    ExecutionContext, ExecutionOpenOrder, ExecutionOrderType, IExecutionAlgorithm, IExecutionModel,
     ImmediateExecutionModel, OrderRequest, SecurityData,
 };
 use rlean_portfolio_construction::portfolio_construction_model::{
@@ -500,12 +500,14 @@ pub fn run_framework_pipeline(
     // added, so no pre-alpha full build is needed.
     let inputs = build_framework_inputs(algorithm, slice);
     let mut fw = framework.lock().unwrap();
+    let algorithm_execution = AlgorithmExecutionContext::new(algorithm.clone());
     let execution_context = ExecutionContext::new(
         slice.time,
         &inputs.security_data,
         &inputs.open_order_data,
         inputs.portfolio_value,
     )
+    .with_algorithm(&algorithm_execution)
     .with_minimum_order_margin_portfolio_percentage(
         inputs.minimum_order_margin_portfolio_percentage,
     );
@@ -546,6 +548,112 @@ struct FrameworkInputs {
     risk_context: RiskContext,
     security_data: HashMap<u64, SecurityData>,
     open_order_data: Vec<ExecutionOpenOrder>,
+}
+
+/// Execution-time view of the authoritative algorithm state.
+///
+/// This is the rlean equivalent of C# LEAN passing `QCAlgorithm` into
+/// `IExecutionModel.Execute`: security lookup, projected holdings, and buying
+/// power remain owned by the algorithm instead of being reimplemented by an
+/// execution model from a stale snapshot.
+struct AlgorithmExecutionContext {
+    algorithm: Arc<Mutex<rlean_algorithm::qc_algorithm::QcAlgorithm>>,
+}
+
+impl AlgorithmExecutionContext {
+    fn new(algorithm: Arc<Mutex<rlean_algorithm::qc_algorithm::QcAlgorithm>>) -> Self {
+        Self { algorithm }
+    }
+}
+
+impl IExecutionAlgorithm for AlgorithmExecutionContext {
+    fn is_warming_up(&self) -> bool {
+        self.algorithm.lock().unwrap().is_warming_up
+    }
+
+    fn security(&self, symbol: &Symbol) -> Option<SecurityData> {
+        let algorithm = self.algorithm.lock().unwrap();
+        let security = algorithm.securities.get(symbol)?;
+        let current_quantity = algorithm.portfolio.get_holding(symbol).quantity;
+        let open_order_quantity = algorithm
+            .transactions
+            .get_open_orders()
+            .into_iter()
+            .filter(|order| order.symbol.id.sid == symbol.id.sid)
+            .map(|order| order.remaining_quantity())
+            .sum();
+        Some(SecurityData {
+            symbol: security.symbol.clone(),
+            price: security.current_price(),
+            bid: (security.bid_price() > Decimal::ZERO).then(|| security.bid_price()),
+            ask: (security.ask_price() > Decimal::ZERO).then(|| security.ask_price()),
+            volume: None,
+            vwap_price: None,
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(algorithm.utc_time),
+            lot_size: security.lot_size_decimal(),
+            minimum_price_variation: security.minimum_price_variation_decimal(),
+            current_quantity,
+            open_order_quantity,
+        })
+    }
+
+    fn security_has_data(&self, symbol: &Symbol) -> bool {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .get(symbol)
+            .is_some_and(|security| security.current_price() > Decimal::ZERO)
+    }
+
+    fn security_is_tradable(&self, symbol: &Symbol) -> bool {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .get(symbol)
+            .is_some_and(|security| security.is_tradable())
+    }
+
+    fn projected_quantity(&self, symbol: &Symbol) -> Decimal {
+        let algorithm = self.algorithm.lock().unwrap();
+        let holdings = algorithm.portfolio.get_holding(symbol).quantity;
+        let open_orders: Decimal = algorithm
+            .transactions
+            .get_open_orders()
+            .into_iter()
+            .filter(|order| order.symbol.id.sid == symbol.id.sid)
+            .map(|order| order.remaining_quantity())
+            .sum();
+        holdings + open_orders
+    }
+
+    fn holdings_quantity(&self, symbol: &Symbol) -> Decimal {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .portfolio
+            .get_holding(symbol)
+            .quantity
+    }
+
+    fn above_minimum_order_margin_portfolio_percentage(
+        &self,
+        symbol: &Symbol,
+        quantity: Decimal,
+        minimum_order_margin_portfolio_percentage: Decimal,
+    ) -> bool {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .above_minimum_order_margin_portfolio_percentage(
+                symbol,
+                quantity,
+                minimum_order_margin_portfolio_percentage,
+            )
+    }
 }
 
 fn build_framework_inputs(
@@ -774,9 +882,44 @@ fn execution_security_data_from_slice(
 mod tests {
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};
-    use rlean_alpha::ConstantAlphaModel;
-    use rlean_core::{Resolution, TimeSpan};
+    use rlean_alpha::{ConstantAlphaModel, IAlphaModel};
+    use rlean_core::{Market, OptionRight, OptionStyle, Resolution, TimeSpan};
     use rlean_execution::ExecutionTarget;
+    use rlean_portfolio_construction::{InsightForPcm, PortfolioTarget};
+    use rust_decimal_macros::dec;
+
+    struct OneShotAlpha {
+        symbol: Symbol,
+        emitted: bool,
+    }
+
+    impl IAlphaModel for OneShotAlpha {
+        fn update(&mut self, _slice: &rlean_data::Slice, _securities: &[Symbol]) -> Vec<Insight> {
+            if std::mem::replace(&mut self.emitted, true) {
+                Vec::new()
+            } else {
+                vec![Insight::up(self.symbol.clone(), TimeSpan::ONE_DAY)]
+            }
+        }
+    }
+
+    struct FixedQuantityPcm {
+        quantity: Decimal,
+    }
+
+    impl IPortfolioConstructionModel for FixedQuantityPcm {
+        fn create_targets(
+            &mut self,
+            insights: &[InsightForPcm],
+            _portfolio_value: Decimal,
+            _prices: &HashMap<u64, Decimal>,
+        ) -> Vec<PortfolioTarget> {
+            insights
+                .iter()
+                .map(|insight| PortfolioTarget::new(insight.symbol.clone(), self.quantity))
+                .collect()
+        }
+    }
 
     fn dt(year: i32, month: u32, day: u32) -> DateTime {
         let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
@@ -952,5 +1095,95 @@ mod tests {
         let holding = algorithm.lock().unwrap().portfolio.get_holding(&symbol);
         assert_eq!(holding.target, Some(orders[0].quantity));
         assert!(holding.has_open_target());
+    }
+
+    #[test]
+    fn immediate_execution_uses_option_buying_power_model_for_minimum_order_margin() {
+        let now = dt(2026, 1, 16);
+        let mut algorithm =
+            rlean_algorithm::qc_algorithm::QcAlgorithm::new("option-target", dec!(100_000));
+        let underlying = algorithm.add_equity("SPY", Resolution::Minute);
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+            dec!(600),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        algorithm.add_option_quote_contract(contract.clone(), Resolution::Minute);
+        algorithm
+            .securities
+            .update_quote(&contract, dec!(1.99), dec!(2.01));
+        // $100 threshold. The old hand-rolled quantity*price check saw $2 and
+        // rejected it; the option buying-power model sees $200 via the 100x
+        // contract multiplier and accepts it, matching C# LEAN.
+        algorithm.minimum_order_margin_portfolio_percentage = dec!(0.001);
+        let algorithm = Arc::new(Mutex::new(algorithm));
+
+        let mut state = FrameworkState::new();
+        state.alpha_models.push(Box::new(OneShotAlpha {
+            symbol: contract.clone(),
+            emitted: false,
+        }));
+        state.pcm = Box::new(FixedQuantityPcm { quantity: dec!(1) });
+        state.exec_model = Box::new(ImmediateExecutionModel::new());
+        let framework = Arc::new(Mutex::new(state));
+        let slice = rlean_data::Slice::new(now);
+
+        let orders = run_framework_pipeline(&framework, &algorithm, &slice);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].symbol, contract);
+        assert_eq!(orders[0].quantity, Decimal::ONE);
+    }
+
+    #[test]
+    fn immediate_execution_clears_fulfilled_target_before_security_removal() {
+        let now = dt(2026, 1, 16);
+        let mut algorithm =
+            rlean_algorithm::qc_algorithm::QcAlgorithm::new("remove-target", dec!(100_000));
+        let symbol = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm.securities.update_price(&symbol, dec!(600));
+        algorithm.securities.get(&symbol).unwrap().reset();
+        let algorithm = Arc::new(Mutex::new(algorithm));
+        let slice = rlean_data::Slice::new(now);
+        let inputs = build_framework_inputs(&algorithm, &slice);
+        let authoritative = AlgorithmExecutionContext::new(algorithm.clone());
+        let context = ExecutionContext::new(
+            now,
+            &inputs.security_data,
+            &inputs.open_order_data,
+            inputs.portfolio_value,
+        )
+        .with_algorithm(&authoritative);
+        let mut execution = ImmediateExecutionModel::new();
+
+        // C# PortfolioTargetCollection.ClearFulfilled runs even when a reset
+        // security is no longer tradable. The flat target must be retired
+        // before deferred physical removal.
+        assert!(execution
+            .execute(
+                &[ExecutionTarget {
+                    symbol: symbol.clone(),
+                    quantity: Decimal::ZERO,
+                    tag: String::new(),
+                }],
+                &context,
+            )
+            .is_empty());
+
+        {
+            let algorithm = algorithm.lock().unwrap();
+            algorithm.securities.get(&symbol).unwrap().reinitialize();
+            algorithm.portfolio.apply_fill_with_multiplier(
+                &symbol,
+                dec!(600),
+                Decimal::ONE,
+                Decimal::ZERO,
+                Decimal::ONE,
+            );
+        }
+        assert!(execution.execute(&[], &context).is_empty());
     }
 }

@@ -176,7 +176,9 @@ service when `--system` is explicit).
 
 Pass `--brokerage <name>` (or `paper` for simulated fills), select a
 `--live-data-feed`, and configure `--data-sidecar grpc://host:port` plus an
-optional `--data-sidecar-token`. Live data and brokerage operations use
+optional `--data-sidecar-token`. For brokerages with multiple accounts, pass
+`--brokerage-account <account-id>`; the selected account is persisted with that
+deployment and restored by `rleand`. Live data and brokerage operations use
 independent connections through the persistent Flight session. Strategy SDK
 calls create and remove symbol subscriptions; live batches are pushed
 unsolicited and routed by subscription id.

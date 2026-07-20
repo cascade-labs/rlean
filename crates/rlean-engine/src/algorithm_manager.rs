@@ -5,7 +5,9 @@ use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubscription};
 use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::AlphaAnalytics;
-use rlean_core::{DateTime, MarketHoursDatabase, Resolution, TimeSpan};
+use rlean_core::{
+    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, TimeSpan,
+};
 use rlean_data::{Slice, SubscriptionDataConfig};
 use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
 use rlean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
@@ -172,12 +174,9 @@ where
         &mut self,
         slice: &Slice,
         services: &mut dyn AlgorithmServices,
-    ) -> bool {
+    ) -> LeanResult<bool> {
         let slice_date = slice.time.date_utc();
-        let new_trading_day = self
-            .last_date
-            .map(|prev| prev != slice_date)
-            .unwrap_or(true);
+        let new_trading_day = trading_day_transition(self.last_date, slice_date, slice.time)?;
         if new_trading_day {
             if self.last_date.is_some() {
                 self.algorithm.on_end_of_day(None, services);
@@ -186,7 +185,7 @@ where
         }
         self.last_date = Some(slice_date);
         self.slices_processed += 1;
-        new_trading_day
+        Ok(new_trading_day)
     }
 
     pub fn apply_universe_selection(
@@ -339,9 +338,15 @@ where
             return;
         };
 
-        let positions = algorithm_state.lock().unwrap().get_option_positions();
+        let (positions, market_hours_database) = {
+            let algorithm = algorithm_state.lock().unwrap();
+            (
+                algorithm.get_option_positions(),
+                algorithm.market_hours_database.clone(),
+            )
+        };
         for position in positions {
-            if position.expiry > slice.time.date_utc() {
+            if !market_hours_database.is_option_contract_expired(&position.symbol, slice.time) {
                 continue;
             }
 
@@ -568,6 +573,20 @@ where
     }
 }
 
+fn trading_day_transition(
+    previous: Option<chrono::NaiveDate>,
+    incoming: chrono::NaiveDate,
+    slice_time: DateTime,
+) -> LeanResult<bool> {
+    match previous {
+        Some(previous) if incoming < previous => Err(LeanError::DataError(format!(
+            "algorithm time moved backward across trading days: previous={previous}, incoming={incoming}, slice_time={slice_time}"
+        ))),
+        Some(previous) => Ok(incoming > previous),
+        None => Ok(true),
+    }
+}
+
 /// Synthesize quote bars for option contracts from their chain bid/ask so the
 /// fill model prices market orders at the quote side. Contracts without any
 /// positive quote are skipped and fall back to the synthesized trade bar.
@@ -627,5 +646,39 @@ fn extend_bars_with_option_contracts(
                 ),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trading_day_tests {
+    use super::*;
+
+    #[test]
+    fn backward_date_errors_before_it_can_increment_the_day_count() {
+        let august = chrono::NaiveDate::from_ymd_opt(2025, 8, 21).unwrap();
+        let december = chrono::NaiveDate::from_ymd_opt(2025, 12, 24).unwrap();
+        let mut trading_days = 0;
+
+        if trading_day_transition(None, august, DateTime::from_secs(1_000)).unwrap() {
+            trading_days += 1;
+        }
+        if trading_day_transition(Some(august), december, DateTime::from_secs(2_000)).unwrap() {
+            trading_days += 1;
+        }
+        let error =
+            trading_day_transition(Some(december), august, DateTime::from_secs(1_000)).unwrap_err();
+
+        assert_eq!(trading_days, 2);
+        assert!(error
+            .to_string()
+            .contains("algorithm time moved backward across trading days"));
+    }
+
+    #[test]
+    fn repeated_slices_on_one_date_do_not_double_count_the_day() {
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 12, 24).unwrap();
+
+        assert!(trading_day_transition(None, date, DateTime::from_secs(1_000)).unwrap());
+        assert!(!trading_day_transition(Some(date), date, DateTime::from_secs(2_000)).unwrap());
     }
 }

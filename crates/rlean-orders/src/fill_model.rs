@@ -37,6 +37,22 @@ pub trait FillModel: Send + Sync {
         self.market_fill(order, bar, time)
     }
 
+    /// Fill from a QuoteBar when no TradeBar subscription exists.
+    ///
+    /// C# LEAN's fill models read the security cache and can price an order from
+    /// quote data alone. The directional quote side is promoted to the common
+    /// OHLC input used by rlean fill models: buys consume ask OHLC and sells
+    /// consume bid OHLC.
+    fn market_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        Some(self.market_fill_with_quotes(order, &bar, Some(quote_bar), time))
+    }
+
     fn limit_fill_with_quotes(
         &self,
         order: &Order,
@@ -54,6 +70,16 @@ pub trait FillModel: Send + Sync {
         }
     }
 
+    fn limit_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        self.limit_fill_with_quotes(order, &bar, Some(quote_bar), time)
+    }
+
     fn stop_market_fill_with_quotes(
         &self,
         order: &Order,
@@ -66,6 +92,16 @@ pub trait FillModel: Send + Sync {
         } else {
             self.stop_market_fill(order, bar, time)
         }
+    }
+
+    fn stop_market_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        self.stop_market_fill_with_quotes(order, &bar, Some(quote_bar), time)
     }
 
     fn stop_limit_fill_with_quotes(
@@ -82,6 +118,16 @@ pub trait FillModel: Send + Sync {
         }
     }
 
+    fn stop_limit_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        self.stop_limit_fill_with_quotes(order, &bar, Some(quote_bar), time)
+    }
+
     fn market_on_open_fill_with_quotes(
         &self,
         order: &Order,
@@ -96,6 +142,16 @@ pub trait FillModel: Send + Sync {
         }
     }
 
+    fn market_on_open_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        Some(self.market_on_open_fill_with_quotes(order, &bar, Some(quote_bar), time))
+    }
+
     fn market_on_close_fill_with_quotes(
         &self,
         order: &Order,
@@ -108,6 +164,16 @@ pub trait FillModel: Send + Sync {
         } else {
             self.market_on_close_fill(order, bar, time)
         }
+    }
+
+    fn market_on_close_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<Fill> {
+        let bar = directional_trade_bar_from_quote(order, quote_bar)?;
+        Some(self.market_on_close_fill_with_quotes(order, &bar, Some(quote_bar), time))
     }
 }
 
@@ -133,6 +199,12 @@ fn directional_quote_trade_bar(
     quote_bar: Option<&QuoteBar>,
 ) -> Option<TradeBar> {
     let quote_bar = quote_bar?;
+    let mut bar = directional_trade_bar_from_quote(order, quote_bar)?;
+    bar.volume = fallback.volume;
+    Some(bar)
+}
+
+fn directional_trade_bar_from_quote(order: &Order, quote_bar: &QuoteBar) -> Option<TradeBar> {
     let side = if order.quantity > dec!(0) {
         quote_bar.ask.as_ref().or(quote_bar.bid.as_ref())
     } else {
@@ -140,10 +212,16 @@ fn directional_quote_trade_bar(
     }?;
 
     Some(TradeBar::new(
-        fallback.symbol.clone(),
+        order.symbol.clone(),
         quote_bar.time,
         quote_bar.period,
-        TradeBarData::new(side.open, side.high, side.low, side.close, fallback.volume),
+        TradeBarData::new(
+            side.open,
+            side.high,
+            side.low,
+            side.close,
+            quote_bar.last_bid_size + quote_bar.last_ask_size,
+        ),
     ))
 }
 

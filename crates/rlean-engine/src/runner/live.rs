@@ -871,7 +871,7 @@ async fn process_live_slice<B: AlgorithmBridge>(
     }
     let slice_arc = Arc::new(slice.clone());
 
-    let new_trading_day = algorithm_manager.handle_new_trading_day(slice, services);
+    let new_trading_day = algorithm_manager.handle_new_trading_day(slice, services)?;
     let changes = algorithm_manager.apply_universe_selection(slice, new_trading_day, services);
     if changes.has_changes() {
         sync_live_subscriptions(

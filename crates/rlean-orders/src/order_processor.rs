@@ -104,10 +104,13 @@ impl OrderProcessor {
                 continue;
             }
             let sid = order.symbol.id.sid;
-            if let Some(bar) = bars.get(&sid) {
-                if let Some(event) = self.try_fill(&order, bar, quote_bars.get(&sid), time) {
-                    events.push(event);
-                }
+            let event = match (bars.get(&sid), quote_bars.get(&sid)) {
+                (Some(bar), quote_bar) => self.try_fill(&order, bar, quote_bar, time),
+                (None, Some(quote_bar)) => self.try_fill_from_quote(&order, quote_bar, time),
+                (None, None) => None,
+            };
+            if let Some(event) = event {
+                events.push(event);
             }
         }
 
@@ -152,6 +155,41 @@ impl OrderProcessor {
                     .market_on_close_fill_with_quotes(order, bar, quote_bar, time);
                 Some(fill.order_event)
             }
+            _ => None,
+        }
+    }
+
+    fn try_fill_from_quote(
+        &self,
+        order: &Order,
+        quote_bar: &QuoteBar,
+        time: DateTime,
+    ) -> Option<OrderEvent> {
+        match order.order_type {
+            OrderType::Market => self
+                .fill_model
+                .market_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
+            OrderType::Limit => self
+                .fill_model
+                .limit_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
+            OrderType::StopMarket => self
+                .fill_model
+                .stop_market_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
+            OrderType::StopLimit => self
+                .fill_model
+                .stop_limit_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
+            OrderType::MarketOnOpen => self
+                .fill_model
+                .market_on_open_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
+            OrderType::MarketOnClose => self
+                .fill_model
+                .market_on_close_fill_from_quote(order, quote_bar, time)
+                .map(|fill| fill.order_event),
             _ => None,
         }
     }

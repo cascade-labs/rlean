@@ -944,6 +944,46 @@ impl QcAlgorithm {
         (collateral - used).max(Decimal::ZERO)
     }
 
+    /// C# LEAN `BuyingPowerModelExtensions.AboveMinimumOrderMarginPortfolioPercentage`.
+    ///
+    /// The decision belongs to the security's buying-power model because the
+    /// initial margin can depend on the security type, contract multiplier, and
+    /// leverage. Execution models must not approximate it with quantity times
+    /// price.
+    pub fn above_minimum_order_margin_portfolio_percentage(
+        &self,
+        symbol: &Symbol,
+        quantity: Decimal,
+        minimum_order_margin_portfolio_percentage: Decimal,
+    ) -> bool {
+        if minimum_order_margin_portfolio_percentage.is_zero() {
+            return true;
+        }
+
+        let Some(security) = self.securities.get(symbol) else {
+            panic!(
+                "buying-power check requested for missing security {}",
+                symbol.value
+            );
+        };
+        let abs_final_order_margin = security
+            .buying_power_model()
+            .initial_margin_requirement(
+                quantity,
+                security.current_price(),
+                self.security_contract_multiplier(symbol),
+                security.leverage(),
+            )
+            .abs();
+
+        BuyingPowerModel::above_minimum_order_margin_portfolio_percentage(
+            self.portfolio_value(),
+            minimum_order_margin_portfolio_percentage,
+            abs_final_order_margin,
+            self.margin_remaining_for_symbol(symbol),
+        )
+    }
+
     pub fn validate_order_buying_power(
         &self,
         order: &Order,
@@ -1825,6 +1865,24 @@ impl QcAlgorithm {
 
     /// Subscribe to a specific option contract.
     pub fn add_option_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        self.add_option_contract_with_data(symbol, resolution, true)
+    }
+
+    /// Subscribe to a specific option contract's quote stream only.
+    ///
+    /// This is useful for quote-driven strategies that neither consume nor
+    /// want to synchronize against a redundant trade-bar stream. Execution
+    /// still uses the canonical option security and quote-based fill model.
+    pub fn add_option_quote_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
+        self.add_option_contract_with_data(symbol, resolution, false)
+    }
+
+    fn add_option_contract_with_data(
+        &mut self,
+        symbol: Symbol,
+        resolution: Resolution,
+        include_trade_bars: bool,
+    ) -> Symbol {
         // Add the underlying equity subscription if not already tracked.
         if let Some(ref u) = symbol.underlying {
             if !self.securities.contains(u) {
@@ -1835,7 +1893,7 @@ impl QcAlgorithm {
             self.subscription_manager
                 .set_normalization_mode(u, DataNormalizationMode::Raw);
         }
-        self.ensure_option_security(&symbol, resolution);
+        self.ensure_option_security_with_data(&symbol, resolution, include_trade_bars);
         if !self
             .open_option_contracts
             .iter()
@@ -2063,11 +2121,20 @@ impl QcAlgorithm {
     }
 
     pub fn ensure_option_security(&mut self, symbol: &Symbol, resolution: Resolution) {
-        self.add_option_contract_subscriptions(symbol.clone(), resolution);
+        self.ensure_option_security_with_data(symbol, resolution, true);
+    }
+
+    fn ensure_option_security_with_data(
+        &mut self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        include_trade_bars: bool,
+    ) {
         self.cancel_pending_security_removal(symbol);
         if self.securities.contains(symbol) {
             return;
         }
+        self.add_option_contract_subscriptions(symbol.clone(), resolution, include_trade_bars);
         let hours = self.market_hours_database.exchange_hours(symbol);
         let props = SymbolProperties {
             contract_multiplier: 100.0,
@@ -2084,18 +2151,27 @@ impl QcAlgorithm {
         self.securities.add(security);
     }
 
-    fn add_option_contract_subscriptions(&self, symbol: Symbol, resolution: Resolution) {
+    fn add_option_contract_subscriptions(
+        &self,
+        symbol: Symbol,
+        resolution: Resolution,
+        include_trade_bars: bool,
+    ) {
         if symbol.is_canonical_option() {
             return;
         }
 
         // Options are always Raw — `new_option` enforces that.
-        self.subscription_manager
-            .add(SubscriptionDataConfig::new_option(
-                symbol.clone(),
-                resolution,
-            ));
-        if resolution != Resolution::Hour && resolution != Resolution::Daily {
+        if include_trade_bars {
+            self.subscription_manager
+                .add(SubscriptionDataConfig::new_option(
+                    symbol.clone(),
+                    resolution,
+                ));
+        }
+        if !include_trade_bars
+            || (resolution != Resolution::Hour && resolution != Resolution::Daily)
+        {
             let mut quote_config = SubscriptionDataConfig::new_option(symbol, resolution);
             quote_config.set_tick_type(rlean_core::TickType::Quote);
             self.subscription_manager.add(quote_config);
@@ -2483,6 +2559,28 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].status, OrderStatus::Invalid);
         assert!(events[0].message.contains("marked as non-tradable"));
+    }
+
+    #[test]
+    fn market_order_preserves_an_existing_quote_only_option_subscription() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap(),
+            dec!(600),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+
+        alg.add_option_quote_contract(contract.clone(), Resolution::Minute);
+        alg.securities.update_price(&contract, dec!(2));
+        let _ = alg.market_order(&contract, dec!(1));
+
+        let configs = alg.subscription_manager.get_configs_for_symbol(&contract);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].tick_type, rlean_core::TickType::Quote);
     }
 
     #[test]

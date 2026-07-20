@@ -184,7 +184,9 @@ mod tests {
             "--data-sidecar",
             "tcp://127.0.0.1:50051",
             "--brokerage",
-            "hyperliquid",
+            "fidelity",
+            "--brokerage-account",
+            "account-1234",
         ])
         .unwrap();
 
@@ -193,7 +195,8 @@ mod tests {
                 assert!(args.command.is_none());
                 assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
                 assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
-                assert_eq!(args.brokerage.as_deref(), Some("hyperliquid"));
+                assert_eq!(args.brokerage.as_deref(), Some("fidelity"));
+                assert_eq!(args.brokerage_account.as_deref(), Some("account-1234"));
             }
             _ => panic!("expected live command"),
         }
