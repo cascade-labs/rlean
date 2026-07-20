@@ -10,8 +10,9 @@ use crate::live_deployments::{
     launch_live_detached, run_live_control, update_live_deployment_status,
 };
 use crate::runtime::{
-    connect_data_sidecar, ensure_python_baseline_packages, integration_config_json,
-    parse_algorithm_parameters_for_strategy, resolve_strategy_file, validate_strategy_path,
+    brokerage_config_json, connect_data_sidecar, ensure_python_baseline_packages,
+    integration_config_json, parse_algorithm_parameters_for_strategy, resolve_strategy_file,
+    validate_strategy_path,
 };
 
 pub(crate) async fn run(args: LiveArgs) -> Result<()> {
@@ -81,6 +82,14 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
         })?;
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
+    let brokerage_account = args
+        .brokerage_account
+        .as_deref()
+        .map(str::trim)
+        .filter(|account| !account.is_empty());
+    if requested_paper_brokerage && brokerage_account.is_some() {
+        bail!("--brokerage-account cannot be used with the internal paper brokerage");
+    }
 
     ensure_python_baseline_packages()?;
     use rlean_python_runtime::AlgorithmImports;
@@ -93,7 +102,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         let (connection_id, events) = data_sidecar
             .open_brokerage(
                 requested_brokerage,
-                integration_config_json(requested_brokerage)?,
+                brokerage_config_json(requested_brokerage, brokerage_account)?,
             )
             .await
             .with_context(|| format!("failed to open sidecar brokerage '{requested_brokerage}'"))?;

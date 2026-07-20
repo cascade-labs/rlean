@@ -90,6 +90,11 @@ pub(crate) struct RuntimeArgs {
     #[arg(long, env = "RLEAN_BROKERAGE")]
     pub(crate) brokerage: Option<String>,
 
+    /// Brokerage account identifier for this live deployment. This is passed
+    /// to the selected sidecar brokerage when the connection is opened.
+    #[arg(long, env = "RLEAN_BROKERAGE_ACCOUNT")]
+    pub(crate) brokerage_account: Option<String>,
+
     // ── Date range override ───────────────────────────────────────────────────
     /// Override the strategy start date (YYYY-MM-DD)
     #[arg(long)]
