@@ -18,7 +18,7 @@ use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
-use rlean_algorithm::qc_algorithm::QcAlgorithm;
+use rlean_algorithm::qc_algorithm::{AccountType, QcAlgorithm};
 #[cfg(test)]
 use rlean_brokerages::Brokerage;
 use rlean_core::{DateTime, Price, Quantity};
@@ -138,6 +138,15 @@ pub struct LiveBrokerageRouter {
     moo_deferred_logged: std::collections::HashSet<i64>,
 }
 
+fn order_reduces_position(algorithm: &QcAlgorithm, order: &Order) -> bool {
+    let holdings = algorithm.portfolio.get_holding(&order.symbol).quantity;
+    let remaining = order.remaining_quantity();
+    holdings != Decimal::ZERO
+        && ((holdings > Decimal::ZERO && remaining < Decimal::ZERO)
+            || (holdings < Decimal::ZERO && remaining > Decimal::ZERO))
+        && (holdings + remaining).abs() < holdings.abs()
+}
+
 impl LiveBrokerageRouter {
     /// Spawn the worker thread and hand ownership of the brokerage to it, using
     /// the default `SUBMIT_BACKOFF` retry schedule.
@@ -224,7 +233,40 @@ impl LiveBrokerageRouter {
     ) -> Vec<OrderEvent> {
         let mut invalid_events = Vec::new();
         let now_instant = std::time::Instant::now();
-        for order in transactions.get_open_orders() {
+        let mut open_orders = transactions.get_open_orders();
+        let cash_account = algorithm.brokerage_model.account_type == AccountType::Cash;
+        let has_pending_reduction = cash_account
+            && open_orders
+                .iter()
+                .any(|order| order_reduces_position(algorithm, order));
+
+        // C# LEAN's target ordering submits position reductions before orders
+        // that consume buying power. Preserve that ordering across the live
+        // brokerage boundary as well: TransactionManager storage order is not
+        // an execution-ordering contract.
+        open_orders.sort_by_key(|order| {
+            (
+                !order_reduces_position(algorithm, order),
+                order.created_time,
+                order.id,
+            )
+        });
+
+        for order in open_orders {
+            // A cash account cannot spend anticipated sale proceeds. Keep
+            // expansion orders New while a position reduction is working; the
+            // live loop services brokerage events independently of data slices
+            // and dispatches these orders immediately after the fill updates
+            // cash/holdings. This is the event-driven equivalent of C# LEAN's
+            // synchronous sell-before-buy MarketOrder sequence.
+            if has_pending_reduction && !order_reduces_position(algorithm, &order) {
+                tracing::debug!(
+                    order_id = order.id,
+                    symbol = %order.symbol.value,
+                    "cash account expansion deferred until position reductions close"
+                );
+                continue;
+            }
             match order.status {
                 // A `New` order that is not already in flight is (re)submitted
                 // once its retry backoff (if any) has elapsed. A first submit has
@@ -1365,6 +1407,73 @@ mod tests {
             algorithm.transactions.get_order(1).unwrap().status,
             OrderStatus::Invalid
         );
+        router.shutdown();
+    }
+
+    #[test]
+    fn cash_rebalance_dispatches_reduction_before_replacement_buy() {
+        let mut algorithm = QcAlgorithm::new("test", dec!(8226));
+        algorithm.set_brokerage_model(BrokerageName::RobinhoodBrokerage, AccountType::Cash);
+
+        let existing = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm.securities.update_price(&existing, dec!(800));
+        algorithm
+            .portfolio
+            .set_holdings(&existing, dec!(100), dec!(800), dec!(1));
+        let replacement = algorithm.add_equity("FHN", Resolution::Minute);
+        algorithm.securities.update_price(&replacement, dec!(25.39));
+
+        let sell = Order::market(1, existing.clone(), dec!(-100), DateTime::now(), "replace");
+        let buy = Order::market(
+            2,
+            replacement.clone(),
+            dec!(419),
+            DateTime::now(),
+            "replace",
+        );
+        algorithm.transactions.add_order(sell.clone());
+        algorithm.transactions.add_order(buy);
+
+        let mock = MockBrokerage::new();
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
+        let events = router.dispatch_pending(&algorithm.transactions, &algorithm);
+        assert!(events.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while submitted.lock().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(submitted.lock().len(), 1);
+        assert_eq!(submitted.lock()[0].symbol, existing);
+        assert_eq!(
+            algorithm.transactions.get_order(2).unwrap().status,
+            OrderStatus::New
+        );
+
+        // Once the sale fill is reconciled, its proceeds are real cash and the
+        // still-New replacement order is dispatched immediately by the next
+        // brokerage-service pass (which the live loop runs every 250 ms).
+        algorithm
+            .portfolio
+            .apply_fill(&sell, dec!(800), dec!(-100), Decimal::ZERO);
+        algorithm
+            .transactions
+            .process_order_event(OrderEvent::filled(
+                1,
+                existing,
+                DateTime::now(),
+                dec!(800),
+                dec!(-100),
+            ));
+        let events = router.dispatch_pending(&algorithm.transactions, &algorithm);
+        assert!(events.is_empty());
+
+        while submitted.lock().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(submitted.lock().len(), 2);
+        assert_eq!(submitted.lock()[1].symbol, replacement);
         router.shutdown();
     }
 
