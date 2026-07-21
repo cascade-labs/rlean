@@ -3,7 +3,8 @@ use crate::normalization::{normalize_quote_bar, normalize_trade_bar};
 use crate::subscription_data::SubscriptionDataPoint;
 use futures::StreamExt;
 use rlean_core::{
-    DateTime, LeanError, Resolution, Result as LeanResult, SecurityType, SymbolOptionsExt,
+    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, SecurityType,
+    SymbolOptionsExt,
 };
 use rlean_data::SubscriptionDataConfig;
 use rlean_data_sidecar::{
@@ -489,7 +490,15 @@ async fn produce_registered(
                 continue;
             }
             if let Some(previous) = last_point.as_ref() {
-                send_fill_forward(config, context, previous, frontier, end, sender).await?;
+                send_fill_forward_before(
+                    config,
+                    &context.market_hours_database,
+                    previous,
+                    frontier,
+                    end,
+                    sender,
+                )
+                .await?;
             }
             if sender
                 .send(Ok(SubscriptionStreamMessage::Point(Box::new(
@@ -504,10 +513,29 @@ async fn produce_registered(
             last_point = Some(point);
         }
 
+        let watermark = partition_day_end(window_end);
+        // C# LEAN places FillForwardEnumerator in front of the subscription
+        // synchronizer, so every synthetic point covered by a frontier is
+        // emitted before the synchronizer can advance beyond that frontier.
+        // Our source is queried in bounded windows. Complete fill-forward for
+        // the proven window before publishing its inclusive watermark so the
+        // next window can never manufacture data behind that watermark.
+        if let Some(previous) = last_point.as_ref() {
+            if let Some(fill) = send_fill_forward_through(
+                config,
+                &context.market_hours_database,
+                previous,
+                watermark.min(end),
+                end,
+                sender,
+            )
+            .await?
+            {
+                last_point = Some(fill);
+            }
+        }
         if sender
-            .send(Ok(SubscriptionStreamMessage::Watermark(partition_day_end(
-                window_end,
-            ))))
+            .send(Ok(SubscriptionStreamMessage::Watermark(watermark)))
             .await
             .is_err()
         {
@@ -658,49 +686,91 @@ fn deduplicate_points(
     by_frontier.into_values().collect()
 }
 
-async fn send_fill_forward(
+async fn send_fill_forward_before(
     config: &SubscriptionDataConfig,
-    context: &DataFeedContext,
+    market_hours_database: &MarketHoursDatabase,
     previous: &SubscriptionDataPoint,
     next_real_frontier: DateTime,
     end: DateTime,
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
-) -> LeanResult<()> {
+) -> LeanResult<Option<SubscriptionDataPoint>> {
+    send_fill_forward_until(
+        config,
+        market_hours_database,
+        previous,
+        next_real_frontier,
+        false,
+        end,
+        sender,
+    )
+    .await
+}
+
+async fn send_fill_forward_through(
+    config: &SubscriptionDataConfig,
+    market_hours_database: &MarketHoursDatabase,
+    previous: &SubscriptionDataPoint,
+    frontier: DateTime,
+    end: DateTime,
+    sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+) -> LeanResult<Option<SubscriptionDataPoint>> {
+    send_fill_forward_until(
+        config,
+        market_hours_database,
+        previous,
+        frontier,
+        true,
+        end,
+        sender,
+    )
+    .await
+}
+
+async fn send_fill_forward_until(
+    config: &SubscriptionDataConfig,
+    market_hours_database: &MarketHoursDatabase,
+    previous: &SubscriptionDataPoint,
+    limit: DateTime,
+    include_limit: bool,
+    end: DateTime,
+    sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+) -> LeanResult<Option<SubscriptionDataPoint>> {
     if config.resolution.is_tick() || !config.fill_data_forward {
-        return Ok(());
+        return Ok(None);
     }
     let Some(period) = config.resolution.to_time_span() else {
-        return Ok(());
+        return Ok(None);
     };
     let mut frontier = previous.frontier_time() + period;
-    while frontier < next_real_frontier && frontier <= end {
-        if is_market_open(config, context, frontier, period) {
+    let mut last_fill = None;
+    while frontier <= end && (frontier < limit || include_limit && frontier == limit) {
+        if is_market_open(config, market_hours_database, frontier, period) {
             if let Some(fill) = fill_forward_point(previous, frontier, period) {
                 if sender
-                    .send(Ok(SubscriptionStreamMessage::Point(Box::new(fill))))
+                    .send(Ok(SubscriptionStreamMessage::Point(Box::new(fill.clone()))))
                     .await
                     .is_err()
                 {
-                    return Ok(());
+                    return Ok(last_fill);
                 }
+                last_fill = Some(fill);
             }
         }
         frontier = frontier + period;
     }
-    Ok(())
+    Ok(last_fill)
 }
 
 fn is_market_open(
     config: &SubscriptionDataConfig,
-    context: &DataFeedContext,
+    market_hours_database: &MarketHoursDatabase,
     frontier: DateTime,
     period: rlean_core::TimeSpan,
 ) -> bool {
     if config.symbol.security_type() != SecurityType::Equity {
         return true;
     }
-    context
-        .market_hours_database
+    market_hours_database
         .exchange_hours(&config.symbol)
         .is_open_at(frontier - period)
 }
@@ -978,5 +1048,91 @@ mod tests {
             Some(watermark)
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn fill_forward_completes_window_before_inclusive_watermark() {
+        let symbol = Symbol::create_equity("ROIV", &Market::usa());
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol.clone(),
+            Resolution::Minute,
+            rlean_core::DataNormalizationMode::Raw,
+        );
+        config.fill_data_forward = true;
+        let period = TimeSpan::ONE_MINUTE;
+        let last_real_end = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                .unwrap()
+                .and_hms_opt(19, 5, 0)
+                .unwrap(),
+        );
+        let previous = SubscriptionDataPoint::TradeBar(TradeBar::new(
+            symbol,
+            last_real_end - period,
+            period,
+            TradeBarData::new(dec!(11), dec!(11), dec!(11), dec!(11), dec!(100)),
+        ));
+        let watermark = partition_day_end(chrono::NaiveDate::from_ymd_opt(2024, 7, 19).unwrap());
+        let (sender, mut receiver) = mpsc::channel(128);
+
+        let last_fill = send_fill_forward_through(
+            &config,
+            MarketHoursDatabase::global().as_ref(),
+            &previous,
+            watermark,
+            watermark,
+            &sender,
+        )
+        .await
+        .unwrap()
+        .expect("the incomplete regular session should be filled");
+        sender
+            .send(Ok(SubscriptionStreamMessage::Watermark(watermark)))
+            .await
+            .unwrap();
+
+        let expected_close = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                .unwrap()
+                .and_hms_opt(20, 0, 0)
+                .unwrap(),
+        );
+        assert_eq!(last_fill.frontier_time(), expected_close);
+
+        let mut point_count = 0;
+        let mut saw_watermark = false;
+        while let Ok(message) = receiver.try_recv() {
+            match message.unwrap() {
+                SubscriptionStreamMessage::Point(point) => {
+                    assert!(!saw_watermark, "fill-forward arrived after its watermark");
+                    assert!(point.frontier_time() <= watermark);
+                    point_count += 1;
+                }
+                SubscriptionStreamMessage::Watermark(incoming) => {
+                    assert_eq!(incoming, watermark);
+                    saw_watermark = true;
+                }
+            }
+        }
+        assert_eq!(point_count, 55);
+        assert!(saw_watermark);
+
+        let next_real = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 22)
+                .unwrap()
+                .and_hms_opt(13, 31, 0)
+                .unwrap(),
+        );
+        assert!(send_fill_forward_before(
+            &config,
+            MarketHoursDatabase::global().as_ref(),
+            &last_fill,
+            next_real,
+            next_real,
+            &sender,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 }
