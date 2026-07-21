@@ -316,6 +316,27 @@ where
                     .collect(),
             };
 
+        // Brokerage fills are an independent event source. Service them even
+        // when no market-data slice is ready so cash-account sell proceeds can
+        // release a deferred replacement buy without waiting for the next bar.
+        if ready_slices.is_empty() {
+            if let (Some(router), Some(transactions)) =
+                (brokerage_router.as_mut(), transactions.as_ref())
+            {
+                service_live_brokerage(
+                    &mut algorithm_manager,
+                    &mut services,
+                    router,
+                    transactions,
+                    portfolio.as_ref(),
+                    live_writer.as_ref(),
+                    &mut all_order_events,
+                    &mut trade_builder,
+                    &mut completed_trades,
+                );
+            }
+        }
+
         for mut slice in ready_slices {
             apply_risk_free_rate_to_option_chains(
                 &mut slice,
@@ -845,6 +866,55 @@ fn open_closing_quantity(
         })
         .map(|order| order.remaining_quantity())
         .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_live_brokerage<B: AlgorithmBridge>(
+    algorithm_manager: &mut AlgorithmManager<B>,
+    services: &mut dyn AlgorithmServices,
+    router: &mut crate::live::transaction_handler::LiveBrokerageRouter,
+    transactions: &Arc<rlean_orders::TransactionManager>,
+    portfolio: Option<&Arc<rlean_algorithm::portfolio::SecurityPortfolioManager>>,
+    live_writer: Option<&crate::live::deployment_writer::LiveDeploymentWriter>,
+    all_order_events: &mut Vec<OrderEvent>,
+    trade_builder: &mut TradeBuilder,
+    completed_trades: &mut Vec<Trade>,
+) {
+    let previous_order_events = all_order_events.len();
+    let previous_trades = completed_trades.len();
+    router.drain_events(
+        algorithm_manager,
+        services,
+        transactions,
+        portfolio,
+        all_order_events,
+        trade_builder,
+        completed_trades,
+    );
+    if let Some(writer) = live_writer {
+        writer.append_order_events(&all_order_events[previous_order_events..]);
+        writer.append_trades(&completed_trades[previous_trades..]);
+    }
+
+    let invalid_events = algorithm_manager
+        .algorithm()
+        .algorithm_state()
+        .map(|state| {
+            let algorithm = state.lock().expect("algorithm state poisoned");
+            router.dispatch_pending(transactions, &algorithm)
+        })
+        .unwrap_or_default();
+    if invalid_events.is_empty() {
+        return;
+    }
+
+    for event in &invalid_events {
+        algorithm_manager.algorithm.on_order_event(event, services);
+    }
+    if let Some(writer) = live_writer {
+        writer.append_order_events(&invalid_events);
+    }
+    all_order_events.extend(invalid_events);
 }
 
 #[allow(clippy::too_many_arguments)]
