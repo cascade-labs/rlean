@@ -14,15 +14,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Bounded wait applied to live price seeding (`get_last_known_prices`). A seed
-/// the lakehouse can answer returns well under this; only a genuine vendor
-/// gap-fill reaches the bound, after which the security is added unseeded
-/// (price 0) — the same degraded behavior as before seeding was bounded.
-///
-/// Deliberately a hardcoded constant, not a config knob: a live time step must
-/// never hang waiting on a seed, and there is no legitimate per-deployment
-/// reason to tune this.
-pub const LIVE_SEED_GRACE: Duration = Duration::from_secs(5);
+/// Log-only visibility threshold for slow price seeds (`get_last_known_prices`):
+/// a seed still pending after this long WARNs (symbol + elapsed) and keeps
+/// warning each interval until it returns. It is not a timeout — seeding blocks
+/// until the query answers, in live exactly as in backtest — and deliberately
+/// not a config knob: it changes nothing but log output.
+pub const SLOW_SEED_WARN_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AlgorithmHistoryContext {
@@ -32,30 +29,11 @@ pub struct AlgorithmHistoryContext {
 #[derive(Clone)]
 pub struct HistoryService {
     context: AlgorithmHistoryContext,
-    /// When set (live mode), price-seed history reads are bounded by this grace.
-    /// Backtests leave it `None`: algorithm time blocks on the full historical
-    /// query, which is why a backtest already observes the seed within the same
-    /// time step as the price-guarded admission check that discards it in live.
-    seed_grace: Option<Duration>,
 }
 
 impl HistoryService {
-    /// Backtest history service: price seeds block on the full historical query.
     pub fn new(context: AlgorithmHistoryContext) -> Self {
-        Self {
-            context,
-            seed_grace: None,
-        }
-    }
-
-    /// Live history service: price seeds are bounded by [`LIVE_SEED_GRACE`] so a
-    /// slow vendor gap-fill cannot stall the live time step. On timeout the
-    /// security is added unseeded, degrading to the pre-seeding behavior.
-    pub fn new_live(context: AlgorithmHistoryContext) -> Self {
-        Self {
-            context,
-            seed_grace: Some(LIVE_SEED_GRACE),
-        }
+        Self { context }
     }
 
     pub fn load_trade_bars_blocking_with_normalization(
@@ -108,10 +86,9 @@ impl HistoryService {
         let end_date = as_of.date_utc();
         let start_date = end_date - chrono::Duration::days(lookback_days);
         let start = date_to_datetime(start_date, 0, 0, 0);
-        // Build the seed read once, then dispatch bounded (live) or unbounded
-        // (backtest) depending on `seed_grace`. This is the only caller of
-        // `load_last_known_trade_bar` (price seeding); the general `history`
-        // path is never grace-bounded.
+        // One shared seeding path for live and backtest: block until the query
+        // answers. The only extra over a plain history read is slow-seed WARN
+        // logging, so a vendor gap-fill stalling a live time step is visible.
         let provider = self.subscription_history_provider();
         let symbol_owned = symbol.clone();
         let load = async move {
@@ -120,7 +97,7 @@ impl HistoryService {
                 .await
                 .map_err(|error| anyhow!(error.to_string()))
         };
-        let mut bars = load_seed_within_grace(load, self.seed_grace, symbol)?;
+        let mut bars = load_seed_blocking(load, symbol)?;
         bars.retain(|bar| bar.close > Decimal::ZERO && bar.end_time.0 <= as_of.0);
         bars.sort_by_key(|bar| bar.end_time.0);
         if bars.len() > 1 {
@@ -430,24 +407,22 @@ where
         .map_err(|_| anyhow!("history worker panicked"))?
 }
 
-/// Run a price-seed history read on a dedicated background runtime, applying the
-/// live grace when one is set.
+/// Run a price-seed history read on a dedicated background runtime, blocking
+/// the caller until the query answers — the same semantics in live as in
+/// backtest, where algorithm time blocks on the historical query.
 ///
 /// Deadlock note: a seed is answered over the sidecar Flight exchange whose
-/// response router runs as a task on the *main* multi-threaded runtime. Running
-/// the read (and its timeout) on a dedicated current-thread runtime — exactly as
-/// [`block_on_background`] already does for every history read — keeps the bound
-/// independent of that main runtime, so the timeout fires even while the calling
-/// worker is parked here. The router keeps making progress on the main runtime's
-/// other workers, so a lakehouse-answerable seed still returns sub-second, while
-/// a genuine gap-fill can only ever cost one blocked worker for the grace before
-/// a clean unseeded fallback. We never block the worker that services the very
-/// channel the seed answers on.
-fn load_seed_within_grace<F>(
-    future: F,
-    grace: Option<Duration>,
-    symbol: &Symbol,
-) -> Result<Vec<TradeBar>>
+/// response router runs as a task on the *main* multi-threaded runtime. The
+/// read runs on a dedicated current-thread runtime on a fresh thread — exactly
+/// as [`block_on_background`] already does for every history read — so parking
+/// the calling worker here, even for minutes, cannot starve the router: it
+/// keeps making progress on the main runtime's other workers, which is what
+/// eventually completes this very read. We never block the worker that
+/// services the channel the seed answers on, so the wait is stall-bounded by
+/// the query itself, not a deadlock. The accepted worst case is that the live
+/// time step stalls for the full duration of a vendor gap-fill; the WARNs
+/// emitted while waiting make that stall visible.
+fn load_seed_blocking<F>(future: F, symbol: &Symbol) -> Result<Vec<TradeBar>>
 where
     F: Future<Output = Result<Vec<TradeBar>>> + Send + 'static,
 {
@@ -457,46 +432,38 @@ where
             .enable_all()
             .build()
             .map_err(|error| anyhow!(error))?
-            .block_on(seed_within_grace_opt(future, grace, symbol_label))
+            .block_on(seed_awaiting_result(future, symbol_label))
     });
     handle
         .join()
         .map_err(|_| anyhow!("history seed worker panicked"))?
 }
 
-/// Await a price-seed read, optionally bounded by `grace`.
-///
-/// - `None` (backtest): await the full historical query, unchanged.
-/// - `Some(grace)` (live): on timeout, warn (symbol + elapsed) and return no
-///   bars so the caller adds the security unseeded — the same degraded behavior
-///   as before live seeding was bounded, but now visible in the log.
+/// Await a price-seed read to completion, WARNing (symbol + elapsed) every
+/// [`SLOW_SEED_WARN_AFTER`] while it is still pending. Logging only — the read
+/// is never abandoned.
 ///
 /// Split from the threaded dispatcher so it can be driven under tokio's virtual
 /// clock (`start_paused`) in tests.
-async fn seed_within_grace_opt<F>(
-    future: F,
-    grace: Option<Duration>,
-    symbol: String,
-) -> Result<Vec<TradeBar>>
+async fn seed_awaiting_result<F>(future: F, symbol: String) -> Result<Vec<TradeBar>>
 where
     F: Future<Output = Result<Vec<TradeBar>>>,
 {
-    let Some(grace) = grace else {
-        return future.await;
-    };
+    tokio::pin!(future);
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(grace, future).await {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                symbol = %symbol,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "price seed did not return within the live grace window; the \
-                 security is added unseeded (price 0) and will be priced when \
-                 live data arrives — a price-guarded admission is skipped this \
-                 time step"
-            );
-            Ok(Vec::new())
+    loop {
+        // `timeout` here is only a warn ticker: on expiry the pinned read is
+        // kept and re-awaited, so no work is ever cancelled.
+        match tokio::time::timeout(SLOW_SEED_WARN_AFTER, &mut future).await {
+            Ok(result) => return result,
+            Err(_) => {
+                tracing::warn!(
+                    symbol = %symbol,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "price seed still pending; blocking the time step until it \
+                     returns so the security is admitted with a real price"
+                );
+            }
         }
     }
 }
@@ -548,28 +515,11 @@ mod tests {
         }
     }
 
-    // Live parity, fast path: a lakehouse-answerable seed returns before the
-    // grace elapses, so the security is admitted WITH its seeded price in the
-    // same time step. This is the case that fails today, where the live add
-    // returns before the seed query resolves.
+    // Fast path: a lakehouse-answerable seed returns sub-second, so the
+    // security is admitted WITH its seeded price in the same time step and
+    // nothing is logged. This is the common case (daily lakehouse ingest).
     #[tokio::test(start_paused = true)]
-    async fn seed_returns_bars_when_source_answers_within_grace() {
-        let load = async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            Ok(vec![sample_bar(dec!(42))])
-        };
-        let bars = seed_within_grace_opt(load, Some(LIVE_SEED_GRACE), "NVTS".to_string())
-            .await
-            .expect("seed load");
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].close, dec!(42));
-    }
-
-    // Live parity, slow path: a genuine vendor gap-fill exceeds the grace, so the
-    // security is added unseeded (empty result) exactly at the grace boundary and
-    // a WARN naming the symbol and elapsed time is logged.
-    #[tokio::test(start_paused = true)]
-    async fn seed_falls_back_unseeded_at_grace_boundary_and_warns() {
+    async fn fast_seed_returns_bars_without_warning() {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -577,59 +527,86 @@ mod tests {
             .with_writer(BufferWriter(buffer.clone()))
             .finish();
 
-        let started = tokio::time::Instant::now();
         let load = async {
-            tokio::time::sleep(LIVE_SEED_GRACE * 2).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             Ok(vec![sample_bar(dec!(42))])
         };
         let bars = {
             let _guard = tracing::subscriber::set_default(subscriber);
-            seed_within_grace_opt(load, Some(LIVE_SEED_GRACE), "NVTS".to_string())
+            seed_awaiting_result(load, "NVTS".to_string())
+                .await
+                .expect("seed load")
+        };
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].close, dec!(42));
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(captured.is_empty(), "a fast seed must not warn: {captured}");
+    }
+
+    // Slow path: a genuine vendor gap-fill takes far longer than a few seconds.
+    // The engine must BLOCK AND WAIT for it — exactly the backtest semantics —
+    // and admit the security WITH its seeded price, emitting WARNs while it
+    // waits so the stall is visible in the log.
+    #[tokio::test(start_paused = true)]
+    async fn slow_seed_is_awaited_unbounded_and_returns_bars() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(BufferWriter(buffer.clone()))
+            .finish();
+
+        // Well past the rejected 5s bounded grace: the wait must not stop there.
+        let source_delay = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let load = async move {
+            tokio::time::sleep(source_delay).await;
+            Ok(vec![sample_bar(dec!(42))])
+        };
+        let bars = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            seed_awaiting_result(load, "NVTS".to_string())
                 .await
                 .expect("seed load")
         };
         let elapsed = started.elapsed();
 
         assert!(
-            bars.is_empty(),
-            "timed-out seed must add the security unseeded"
+            elapsed >= source_delay,
+            "seed must be awaited unbounded (waited {elapsed:?}, source took {source_delay:?})"
         );
-        // Stopped at the boundary, not after the full 2x source delay.
-        assert!(elapsed >= LIVE_SEED_GRACE, "must wait the full grace");
-        assert!(
-            elapsed < LIVE_SEED_GRACE * 2,
-            "must not wait past the grace"
-        );
+        assert_eq!(bars.len(), 1, "slow seed must still admit WITH price");
+        assert_eq!(bars[0].close, dec!(42));
 
         let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         assert!(
             captured.contains("WARN"),
-            "timeout must log at WARN: {captured}"
+            "slow seed must WARN while waiting: {captured}"
         );
         assert!(
             captured.contains("NVTS"),
             "warn must name the symbol: {captured}"
         );
-        assert!(
-            captured.contains("grace window"),
-            "warn must explain the timeout: {captured}"
-        );
     }
 
-    // Backtest behavior unchanged: with no grace (backtest mode), the same slow
-    // source is awaited to completion and its bars are returned — algorithm time
-    // blocks on the historical query, which is why backtests already observe the
-    // seed within the same time step.
+    // Backtest behavior unchanged: seeding blocks on the full historical query —
+    // algorithm time blocks, which is why backtests always observe the seed
+    // within the same time step. Live now runs this exact same path; there is no
+    // per-mode variant to diverge.
     #[tokio::test(start_paused = true)]
-    async fn seed_without_grace_awaits_full_result() {
-        let load = async {
-            tokio::time::sleep(LIVE_SEED_GRACE * 5).await;
+    async fn seed_awaits_full_result_matching_backtest() {
+        let source_delay = Duration::from_secs(120);
+        let started = tokio::time::Instant::now();
+        let load = async move {
+            tokio::time::sleep(source_delay).await;
             Ok(vec![sample_bar(dec!(42))])
         };
-        let bars = seed_within_grace_opt(load, None, "NVTS".to_string())
+        let bars = seed_awaiting_result(load, "NVTS".to_string())
             .await
             .expect("seed load");
-        assert_eq!(bars.len(), 1, "backtest seed must await the full result");
+        assert!(started.elapsed() >= source_delay);
+        assert_eq!(bars.len(), 1, "seed must await the full result");
         assert_eq!(bars[0].close, dec!(42));
     }
 }

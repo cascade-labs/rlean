@@ -36,10 +36,8 @@ pub async fn run_live<B>(bridge: B, config: LiveRunConfig) -> Result<LiveRunResu
 where
     B: AlgorithmBridge,
 {
-    let runtime_context = crate::AlgorithmRuntimeContext::new_live(
-        config.data_sidecar.clone(),
-        config.parameters.clone(),
-    );
+    let runtime_context =
+        crate::AlgorithmRuntimeContext::new(config.data_sidecar.clone(), config.parameters.clone());
     run_live_with_runtime(bridge, config, runtime_context).await
 }
 

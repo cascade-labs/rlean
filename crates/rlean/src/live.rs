@@ -159,7 +159,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             rust_decimal::Decimal::new(100000, 0),
         ),
     ));
-    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new_live(
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
         live_config.data_sidecar.clone(),
         live_config.parameters.clone(),
     );
