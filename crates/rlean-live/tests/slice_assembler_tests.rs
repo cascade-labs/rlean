@@ -38,22 +38,16 @@ fn bar_symbols(slice: &Slice) -> Vec<String> {
 fn same_frontier_items_are_emitted_in_one_slice() {
     let mut assembler = LiveSliceAssembler::new();
 
-    assert!(assembler
-        .push(LiveDataItem::TradeBar(bar("BTCUSDT", DateTime::EPOCH, 101)))
-        .is_empty());
-    assert!(assembler
-        .push(LiveDataItem::TradeBar(bar("ETHUSDT", DateTime::EPOCH, 202)))
-        .is_empty());
+    assembler.enqueue(LiveDataItem::TradeBar(bar("BTCUSDT", DateTime::EPOCH, 101)));
+    assembler.enqueue(LiveDataItem::TradeBar(bar("ETHUSDT", DateTime::EPOCH, 202)));
 
     let next_time = DateTime::EPOCH + TimeSpan::ONE_MINUTE;
-    let emitted = assembler.push(LiveDataItem::TradeBar(bar("SOLUSDT", next_time, 303)));
+    assembler.enqueue(LiveDataItem::TradeBar(bar("SOLUSDT", next_time, 303)));
+    let frontier = next_time + TimeSpan::ONE_MINUTE;
+    let emitted = assembler.advance(frontier).unwrap();
 
-    assert_eq!(emitted.len(), 1);
-    assert_eq!(emitted[0].time, DateTime::EPOCH + TimeSpan::ONE_MINUTE);
-    assert_eq!(bar_symbols(&emitted[0]), vec!["BTCUSDT", "ETHUSDT"]);
-
-    let tail = assembler.flush().unwrap();
-    assert_eq!(bar_symbols(&tail), vec!["SOLUSDT"]);
+    assert_eq!(emitted.time, frontier);
+    assert_eq!(bar_symbols(&emitted), vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 }
 
 #[test]
@@ -61,18 +55,60 @@ fn idle_flush_only_emits_completed_frontiers() {
     let mut assembler = LiveSliceAssembler::new();
     let frontier = DateTime::EPOCH + TimeSpan::from_hours(1);
 
+    assembler.enqueue(LiveDataItem::TradeBar(bar(
+        "BTCUSDT",
+        frontier - TimeSpan::ONE_MINUTE,
+        101,
+    )));
     assert!(assembler
-        .push(LiveDataItem::TradeBar(bar(
-            "BTCUSDT",
-            frontier - TimeSpan::ONE_MINUTE,
-            101
-        )))
-        .is_empty());
-    assert!(assembler
-        .flush_ready(frontier - TimeSpan::from_secs(1))
+        .advance(frontier - TimeSpan::from_secs(1))
         .is_none());
 
-    let ready = assembler.flush_ready(frontier).unwrap();
+    let ready = assembler.advance(frontier).unwrap();
     assert_eq!(ready.time, frontier);
+    assert_eq!(bar_symbols(&ready), vec!["BTCUSDT"]);
+}
+
+#[test]
+fn late_provider_data_is_delivered_at_the_monotonic_live_frontier() {
+    let mut assembler = LiveSliceAssembler::new();
+    let live_frontier = DateTime::EPOCH + TimeSpan::from_hours(2);
+
+    assembler.enqueue(LiveDataItem::TradeBar(bar(
+        "BTCUSDT",
+        live_frontier - TimeSpan::ONE_MINUTE,
+        101,
+    )));
+    let first = assembler.advance(live_frontier).unwrap();
+    assert_eq!(first.time, live_frontier);
+
+    let stale_source_time = live_frontier - TimeSpan::from_hours(1);
+    assembler.enqueue(LiveDataItem::TradeBar(bar(
+        "ETHUSDT",
+        stale_source_time,
+        202,
+    )));
+    let late = assembler
+        .advance(live_frontier - TimeSpan::from_secs(1))
+        .unwrap();
+
+    assert_eq!(late.time, live_frontier);
+    assert_eq!(bar_symbols(&late), vec!["ETHUSDT"]);
+    assert_eq!(late.bars.values().next().unwrap().time, stale_source_time);
+}
+
+#[test]
+fn future_provider_data_waits_for_the_live_frontier() {
+    let mut assembler = LiveSliceAssembler::new();
+    let live_frontier = DateTime::EPOCH + TimeSpan::from_hours(2);
+    let future_time = live_frontier + TimeSpan::ONE_MINUTE;
+
+    assembler.enqueue(LiveDataItem::TradeBar(bar("BTCUSDT", future_time, 101)));
+
+    assert!(assembler.advance(live_frontier).is_none());
+    let ready = assembler
+        .advance(future_time + TimeSpan::ONE_MINUTE)
+        .unwrap();
+    assert_eq!(ready.time, future_time + TimeSpan::ONE_MINUTE);
     assert_eq!(bar_symbols(&ready), vec!["BTCUSDT"]);
 }
