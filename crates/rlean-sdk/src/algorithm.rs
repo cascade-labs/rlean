@@ -27,6 +27,7 @@ use crate::indicators::{
 };
 use crate::orders::{OrderTicketContext, OrderTicketHandle};
 use crate::portfolio::PortfolioView;
+use crate::scheduling::ScheduleManagerHandle;
 use crate::securities::{
     read_algorithm_security_price, set_algorithm_security_price_from_float,
     AlgorithmSettingsHandle, OptionSecurityHandle, SecurityHandle, SecurityManagerHandle,
@@ -305,6 +306,10 @@ impl AlgorithmHandle {
     }
     pub fn time_rules(&self) -> TimeRulesHandle {
         TimeRulesHandle::new()
+    }
+
+    pub fn schedule(&self) -> ScheduleManagerHandle {
+        ScheduleManagerHandle::new(self.runtime_services.clone())
     }
 
     fn order_ticket_context(&self) -> OrderTicketContext {
@@ -1415,6 +1420,21 @@ impl AlgorithmHandle {
     #[getter(settings)]
     fn py_settings(&self) -> AlgorithmSettingsHandle {
         self.algorithm_settings()
+    }
+
+    #[getter(schedule)]
+    fn py_schedule(&self) -> ScheduleManagerHandle {
+        self.schedule()
+    }
+
+    #[getter(date_rules)]
+    fn py_date_rules(&self) -> DateRulesHandle {
+        self.date_rules()
+    }
+
+    #[getter(time_rules)]
+    fn py_time_rules(&self) -> TimeRulesHandle {
+        self.time_rules()
     }
 }
 

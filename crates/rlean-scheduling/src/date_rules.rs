@@ -1,5 +1,6 @@
 use chrono::{Datelike, NaiveDate};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DateRule {
     EveryDay,
     EveryWeekDay,

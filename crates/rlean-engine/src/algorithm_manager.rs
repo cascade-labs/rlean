@@ -283,6 +283,44 @@ where
         self.runtime_context.update_registered_indicators(slice);
     }
 
+    pub fn prime_scheduled_events(&self, utc_time: DateTime) {
+        self.runtime_context.schedule().skip_until(utc_time);
+    }
+
+    /// Fire engine-owned scheduled events through `utc_time`. The algorithm
+    /// clock is set to each event's exact UTC trigger before its callback, as in
+    /// C# LEAN's BacktestingRealTimeHandler.ScanPastEvents. The subsequent data
+    /// frontier advance restores the slice time.
+    pub fn scan_scheduled_events(&mut self, utc_time: DateTime) -> anyhow::Result<()> {
+        let market_hours_database = self
+            .algorithm
+            .algorithm_state()
+            .map(|state| state.lock().unwrap().market_hours_database.clone())
+            .unwrap_or_else(MarketHoursDatabase::global);
+        let due = self
+            .runtime_context
+            .schedule()
+            .due_events(utc_time, market_hours_database.as_ref());
+        for event in due {
+            if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                crate::algorithm_services::advance_algorithm_time(
+                    &mut algorithm_state.lock().unwrap(),
+                    event.trigger_time,
+                );
+            }
+            let result = (event.callback.lock())();
+            if let Err(error) = result {
+                anyhow::bail!(
+                    "scheduled event '{}' failed at {}: {}",
+                    event.name,
+                    event.trigger_time,
+                    error
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn process_order_events(&mut self, processing: OrderEventProcessing<'_>) {
         let OrderEventProcessing {
             slice,
@@ -472,6 +510,29 @@ where
                 slice,
             );
         }
+    }
+
+    /// Process one historical warm-up slice through the same algorithm and
+    /// framework state paths used by a normal time step, while suppressing
+    /// executable framework orders until warm-up completes.
+    pub fn process_warmup_slice(
+        &mut self,
+        slice: Arc<Slice>,
+        services: &mut dyn AlgorithmServices,
+    ) -> anyhow::Result<()> {
+        self.advance_frontier(slice.as_ref(), services);
+        self.deliver_data(
+            DataDeliveryPayload {
+                slice: slice.clone(),
+            },
+            services,
+        );
+        if let Some(error) = self.algorithm.runtime_error() {
+            anyhow::bail!("Algorithm runtime error during warm-up: {error}");
+        }
+        self.advance_framework_warmup(slice.as_ref(), services);
+        self.end_time_step(services);
+        Ok(())
     }
 
     pub fn end_time_step(&mut self, services: &mut dyn AlgorithmServices) {

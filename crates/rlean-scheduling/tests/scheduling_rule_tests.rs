@@ -1,5 +1,5 @@
 use chrono::{NaiveDate, Weekday};
-use rlean_core::TimeSpan;
+use rlean_core::{Market, MarketHoursDatabase, Symbol, TimeSpan};
 use rlean_scheduling::date_rules::{DateRule, DateRules};
 use rlean_scheduling::time_rules::{TimeRule, TimeRules};
 
@@ -32,21 +32,67 @@ fn date_rule_offsets_match_lean_month_start_and_end_offsets() {
 fn time_rules_construct_expected_offsets() {
     // Mirrors LEAN TimeRulesTests for At/Every/market-offset construction.
     match TimeRules::at(9, 31) {
-        TimeRule::At(span) => assert_eq!(span, TimeSpan::from_secs(9 * 3600 + 31 * 60)),
+        TimeRule::At { hour, minute } => assert_eq!((hour, minute), (9, 31)),
         _ => panic!("expected At rule"),
     }
     match TimeRules::after_market_open(15) {
-        TimeRule::AfterMarketOpen { offset } => assert_eq!(offset, TimeSpan::from_mins(15)),
+        TimeRule::AfterMarketOpen { minutes_after_open } => {
+            assert_eq!(minutes_after_open, 15)
+        }
         _ => panic!("expected AfterMarketOpen rule"),
     }
-    match TimeRules::before_market_close(10) {
-        TimeRule::BeforeMarketClose { offset } => assert_eq!(offset, TimeSpan::from_mins(10)),
+    let spy = Symbol::create_equity("SPY", &Market::usa());
+    match TimeRules::before_market_close(spy.clone(), 10) {
+        TimeRule::BeforeMarketClose {
+            symbol,
+            minutes_before_close,
+            extended_market_close,
+        } => {
+            assert_eq!(symbol, spy);
+            assert_eq!(minutes_before_close, 10);
+            assert!(!extended_market_close);
+        }
         _ => panic!("expected BeforeMarketClose rule"),
     }
     match TimeRules::every(30) {
         TimeRule::Every(span) => assert_eq!(span, TimeSpan::from_mins(30)),
         _ => panic!("expected Every rule"),
     }
+}
+
+#[test]
+fn before_market_close_uses_exchange_calendar_and_early_close() {
+    use std::sync::{Arc, Mutex};
+
+    let spy = Symbol::create_equity("SPY", &Market::usa());
+    let fired = Arc::new(Mutex::new(0usize));
+    let count = fired.clone();
+    let manager = rlean_scheduling::ScheduleManager::new();
+    manager.add(
+        "rebalance",
+        DateRule::EveryDay,
+        TimeRules::before_market_close(spy, 15),
+        move || {
+            *count.lock().unwrap() += 1;
+            Ok(())
+        },
+    );
+
+    // 2025-07-03 is a 13:00 America/New_York close, so the event is 16:45 UTC.
+    let start = chrono::DateTime::parse_from_rfc3339("2025-07-03T16:44:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+        .into();
+    let due = chrono::DateTime::parse_from_rfc3339("2025-07-03T16:45:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+        .into();
+    manager.skip_until(start);
+    let events = manager.due_events(due, MarketHoursDatabase::global().as_ref());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].trigger_time, due);
+    (events[0].callback.lock())().unwrap();
+    assert_eq!(*fired.lock().unwrap(), 1);
 }
 
 #[test]
