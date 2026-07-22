@@ -1,11 +1,15 @@
 use rlean_core::DateTime;
 use rlean_data::{LiveDataItem, Slice};
 
-/// Converts live provider events into monotonic LEAN `Slice` frontiers.
+/// Synchronizes provider events against a monotonic live-time frontier.
+///
+/// Provider timestamps describe when data occurred. They do not control the
+/// algorithm clock: late data is delivered at the current frontier and future
+/// data waits until the frontier reaches it, matching LEAN's live synchronizer.
 #[derive(Debug, Default)]
 pub struct LiveSliceAssembler {
-    current_time: Option<DateTime>,
-    current: Option<Slice>,
+    pending: Vec<LiveDataItem>,
+    last_frontier: Option<DateTime>,
 }
 
 impl LiveSliceAssembler {
@@ -13,59 +17,43 @@ impl LiveSliceAssembler {
         Self::default()
     }
 
-    pub fn push(&mut self, item: LiveDataItem) -> Vec<Slice> {
-        let item_time = item.end_time();
-        match self.current_time {
-            None => {
-                let mut slice = Slice::new(item_time);
-                item.add_to_slice(&mut slice);
-                self.current_time = Some(item_time);
-                self.current = Some(slice);
-                Vec::new()
-            }
-            Some(current_time) if item_time == current_time => {
-                if let Some(slice) = &mut self.current {
-                    item.add_to_slice(slice);
-                }
-                Vec::new()
-            }
-            Some(current_time) if item_time > current_time => {
-                let completed = self.current.take();
-                let mut next = Slice::new(item_time);
-                item.add_to_slice(&mut next);
-                self.current_time = Some(item_time);
-                self.current = Some(next);
-                completed
-                    .into_iter()
-                    .filter(|slice| slice.has_data)
-                    .collect()
-            }
-            Some(_) => {
-                let mut late = Slice::new(item_time);
-                item.add_to_slice(&mut late);
-                if late.has_data {
-                    vec![late]
-                } else {
-                    Vec::new()
-                }
-            }
-        }
+    /// Adds provider data without advancing algorithm time.
+    pub fn enqueue(&mut self, item: LiveDataItem) {
+        self.pending.push(item);
     }
 
-    pub fn flush(&mut self) -> Option<Slice> {
-        self.current_time = None;
-        self.current.take().filter(|slice| slice.has_data)
+    /// Advances live time and emits all data whose availability time is at or
+    /// behind that frontier. A caller-supplied clock regression is clamped to
+    /// the last frontier, so this type can never emit a backward `Slice`.
+    pub fn advance(&mut self, frontier: DateTime) -> Option<Slice> {
+        let frontier = self
+            .last_frontier
+            .map_or(frontier, |last| frontier.max(last));
+        self.last_frontier = Some(frontier);
+
+        let mut due = Vec::new();
+        let mut future = Vec::new();
+        for item in self.pending.drain(..) {
+            if item.end_time() <= frontier {
+                due.push(item);
+            } else {
+                future.push(item);
+            }
+        }
+        self.pending = future;
+
+        if due.is_empty() {
+            return None;
+        }
+
+        let mut slice = Slice::new(frontier);
+        for item in due {
+            item.add_to_slice(&mut slice);
+        }
+        slice.has_data.then_some(slice)
     }
 
-    pub fn flush_ready(&mut self, now: DateTime) -> Option<Slice> {
-        if self
-            .current_time
-            .map(|current_time| current_time <= now)
-            .unwrap_or(false)
-        {
-            self.flush()
-        } else {
-            None
-        }
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 }

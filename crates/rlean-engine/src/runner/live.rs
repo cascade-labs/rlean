@@ -363,14 +363,16 @@ where
 
         algorithm_manager.scan_scheduled_events(rlean_core::DateTime::now())?;
 
-        let ready_slices =
-            match next_live_item(&mut live_subscriptions, Duration::from_millis(250))? {
-                Some(item) => assembler.push(item),
-                None => assembler
-                    .flush_ready(rlean_core::DateTime::now())
-                    .into_iter()
-                    .collect(),
-            };
+        if let Some(item) = next_live_item(&mut live_subscriptions, Duration::from_millis(250))? {
+            assembler.enqueue(item);
+            while let Some(item) = next_live_item(&mut live_subscriptions, Duration::ZERO)? {
+                assembler.enqueue(item);
+            }
+        }
+        let ready_slices: Vec<_> = assembler
+            .advance(rlean_core::DateTime::now())
+            .into_iter()
+            .collect();
 
         // Brokerage fills are an independent event source. Service them even
         // when no market-data slice is ready so cash-account sell proceeds can
@@ -437,7 +439,7 @@ where
     if algorithm_manager.algorithm().terminal_status().is_none()
         && algorithm_manager.algorithm().runtime_error().is_none()
     {
-        if let Some(mut slice) = assembler.flush() {
+        if let Some(mut slice) = assembler.advance(rlean_core::DateTime::now()) {
             apply_risk_free_rate_to_option_chains(
                 &mut slice,
                 risk_free_interest_rate_model.as_ref(),
