@@ -14,7 +14,7 @@ use rlean_algorithm::lifecycle::{
     AlgorithmHistoryService, AlgorithmRuntimeServices, AlgorithmServices,
     CustomUniverseSelectorRegistrationRequest as RegistrationRequest,
     FundamentalUniverseSelectorRegistrationRequest as FundamentalRegistrationRequest,
-    RegisteredIndicatorRegistry,
+    RegisteredIndicatorRegistry, ScheduledEventRegistrationRequest,
 };
 use rlean_algorithm::FrameworkModelRegistry;
 use rlean_core::{DateTime, Resolution};
@@ -32,6 +32,7 @@ pub struct AlgorithmRuntimeContext {
     framework_registry: Arc<EngineFrameworkRegistry>,
     custom_universe_selectors: CustomUniverseSelectorRegistry,
     fundamental_universe_selectors: FundamentalUniverseSelectorRegistry,
+    schedule: Arc<rlean_scheduling::ScheduleManager>,
 }
 
 impl AlgorithmRuntimeContext {
@@ -58,6 +59,7 @@ impl AlgorithmRuntimeContext {
             framework_registry: Arc::new(EngineFrameworkRegistry::new(framework)),
             custom_universe_selectors: Arc::new(Mutex::new(Vec::new())),
             fundamental_universe_selectors: Arc::new(Mutex::new(Vec::new())),
+            schedule: Arc::new(rlean_scheduling::ScheduleManager::new()),
         }
     }
 
@@ -87,6 +89,10 @@ impl AlgorithmRuntimeContext {
 
     pub fn fundamental_universe_selectors(&self) -> FundamentalUniverseSelectorRegistry {
         self.fundamental_universe_selectors.clone()
+    }
+
+    pub fn schedule(&self) -> Arc<rlean_scheduling::ScheduleManager> {
+        self.schedule.clone()
     }
 
     pub fn with_framework(mut self, framework: Arc<Mutex<FrameworkState>>) -> Self {
@@ -176,6 +182,15 @@ impl AlgorithmRuntimeServices for AlgorithmRuntimeContext {
 
     fn registered_indicators(&self) -> RegisteredIndicatorRegistry {
         self.registered_indicators()
+    }
+
+    fn register_scheduled_event(&self, registration: ScheduledEventRegistrationRequest) {
+        self.schedule.add(
+            registration.name,
+            registration.date_rule,
+            registration.time_rule,
+            registration.callback,
+        );
     }
 
     fn framework_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {

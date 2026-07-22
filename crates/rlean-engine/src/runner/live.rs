@@ -1,9 +1,11 @@
 use crate::{
     algorithm_manager::{AlgorithmManager, OrderEventProcessing},
     data_feed::DataFeedContext,
+    data_manager::DataManager,
     runner::backtest::{
         apply_risk_free_rate_to_option_chains, benchmark_subscription_for_symbol,
         subscriptions_with_benchmark, subscriptions_with_option_chains,
+        warmup_start_from_bar_count, warmup_subscriptions_at_resolution,
     },
     LiveRunConfig, LiveRunResult,
 };
@@ -53,7 +55,7 @@ where
         crate::EngineAlgorithmServices::new(rlean_core::DateTime::now(), runtime_context.clone());
     let mut algorithm_manager = AlgorithmManager::new(bridge, runtime_context);
     let market_hours_database = MarketHoursDatabase::global();
-    algorithm_manager.set_market_hours_database(market_hours_database);
+    algorithm_manager.set_market_hours_database(market_hours_database.clone());
     algorithm_manager.set_brokerage_model(config.brokerage_model);
 
     // Execution is independent from the live-data feed. A sidecar brokerage
@@ -132,11 +134,63 @@ where
         .map(|config| (**config).clone())
         .collect();
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
+    let feed_context = DataFeedContext::new(config.data_sidecar.clone());
+    if algorithm_manager.is_warming_up() {
+        let live_frontier = rlean_core::DateTime::now();
+        let warmup_start = if let Some(bar_count) = algorithm_manager.warmup_bar_count() {
+            warmup_start_from_bar_count(
+                &market_hours_database,
+                &subscriptions,
+                bar_count,
+                live_frontier.date_utc(),
+            )
+            .map(|date| {
+                rlean_core::DateTime::from(
+                    date.and_hms_opt(0, 0, 0).expect("valid live warmup start"),
+                )
+            })
+        } else {
+            algorithm_manager
+                .warmup_duration()
+                .map(|duration| live_frontier - duration)
+        };
+        if let Some(warmup_start) = warmup_start {
+            let warmup_end = live_frontier - rlean_core::TimeSpan::from_nanos(1);
+            if warmup_start <= warmup_end {
+                tracing::info!(
+                    %warmup_start,
+                    %warmup_end,
+                    warmup_bar_count = ?algorithm_manager.warmup_bar_count(),
+                    "replaying live algorithm warm-up history"
+                );
+                let warmup_subscriptions = warmup_subscriptions_at_resolution(
+                    &subscriptions,
+                    algorithm_manager.warmup_resolution(),
+                );
+                let mut warmup_data_manager = DataManager::from_context(feed_context.clone());
+                warmup_data_manager
+                    .initialize_feed(&warmup_subscriptions, warmup_start, warmup_end)
+                    .await?;
+                while let Some(mut slice) = warmup_data_manager.next_slice().await? {
+                    apply_risk_free_rate_to_option_chains(
+                        &mut slice,
+                        risk_free_interest_rate_model.as_ref(),
+                    );
+                    if !slice.has_data {
+                        continue;
+                    }
+                    algorithm_manager.process_warmup_slice(Arc::new(slice), &mut services)?;
+                }
+            }
+        }
+    }
     algorithm_manager.warmup_finished(&mut services);
+    // Match C# LEAN's live real-time handler: scheduled events that elapsed
+    // while the deployment was offline or warming up are skipped, not replayed.
+    algorithm_manager.prime_scheduled_events(rlean_core::DateTime::now());
 
     // The sidecar owns every live subscription and pushes canonical batches on
     // the persistent exchange; the engine only assembles them into slices.
-    let feed_context = DataFeedContext::new(config.data_sidecar.clone());
     let sidecar = config.data_sidecar.clone();
     let mut live_subscriptions =
         LiveSubscriptionSet::subscribe_initial(sidecar.as_ref(), &subscriptions).await?;
@@ -306,6 +360,8 @@ where
         ) {
             break;
         }
+
+        algorithm_manager.scan_scheduled_events(rlean_core::DateTime::now())?;
 
         let ready_slices =
             match next_live_item(&mut live_subscriptions, Duration::from_millis(250))? {

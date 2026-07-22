@@ -157,5 +157,6 @@ fn register_universe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rlean_sdk::universe::TimeRulesHandle>()?;
     m.add_class::<rlean_sdk::universe::ScheduledUniverseHandle>()?;
     m.add_class::<rlean_sdk::universe::SecurityChangesView>()?;
+    m.add_class::<rlean_sdk::scheduling::ScheduleManagerHandle>()?;
     Ok(())
 }

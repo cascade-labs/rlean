@@ -149,9 +149,13 @@ where
         if let Some(warmup_start) = warmup_start {
             let warmup_end = normal_start - rlean_core::TimeSpan::from_nanos(1);
             if warmup_start <= warmup_end {
+                let warmup_subscriptions = warmup_subscriptions_at_resolution(
+                    &feed_subscriptions_owned,
+                    algorithm_manager.warmup_resolution(),
+                );
                 let mut warmup_data_manager = DataManager::from_context(feed_context.clone());
                 warmup_data_manager
-                    .initialize_feed(&feed_subscriptions_owned, warmup_start, warmup_end)
+                    .initialize_feed(&warmup_subscriptions, warmup_start, warmup_end)
                     .await?;
                 while let Some(mut slice) = warmup_data_manager.next_slice().await? {
                     apply_risk_free_rate_to_option_chains(
@@ -161,19 +165,7 @@ where
                     if !slice.has_data {
                         continue;
                     }
-                    let slice = Arc::new(slice);
-                    algorithm_manager.advance_frontier(slice.as_ref(), &mut services);
-                    algorithm_manager.deliver_data(
-                        rlean_algorithm::algorithm::DataDeliveryPayload {
-                            slice: slice.clone(),
-                        },
-                        &mut services,
-                    );
-                    if let Some(error) = algorithm_manager.algorithm().runtime_error() {
-                        anyhow::bail!("Algorithm runtime error during warm-up: {error}");
-                    }
-                    algorithm_manager.advance_framework_warmup(slice.as_ref(), &mut services);
-                    algorithm_manager.end_time_step(&mut services);
+                    algorithm_manager.process_warmup_slice(Arc::new(slice), &mut services)?;
                 }
             }
         }
@@ -181,6 +173,7 @@ where
     } else {
         algorithm_manager.warmup_finished(&mut services);
     }
+    algorithm_manager.prime_scheduled_events(normal_start - rlean_core::TimeSpan::from_nanos(1));
 
     let mut data_manager = DataManager::from_context(feed_context);
     data_manager
@@ -249,6 +242,7 @@ where
             }
         }
 
+        algorithm_manager.scan_scheduled_events(slice.time)?;
         let slice = Arc::new(slice);
         algorithm_manager.advance_frontier(slice.as_ref(), &mut services);
         let option_chains: Vec<(&str, &OptionChain)> = slice
@@ -520,7 +514,7 @@ fn lean_style_active_subscriptions(
 /// calendar and taking the earliest (min) start — matching LEAN, which selects
 /// the minimum start across warmup history requests. Internal/benchmark feeds
 /// are ignored so they don't skew the window.
-fn warmup_start_from_bar_count(
+pub(crate) fn warmup_start_from_bar_count(
     market_hours_database: &MarketHoursDatabase,
     subscriptions: &[rlean_data::SubscriptionDataConfig],
     bar_count: usize,
@@ -533,6 +527,29 @@ fn warmup_start_from_bar_count(
             market_hours_database.warmup_start_date(&config.symbol, bar_count, normal_start_date)
         })
         .min()
+}
+
+/// C# LEAN creates warm-up history requests at `Settings.WarmupResolution`
+/// when the caller supplied one. Do the same without mutating the algorithm's
+/// live subscriptions (for example, a minute SPY clock is replayed as Daily
+/// during `SetWarmUp(410, Resolution.Daily)`).
+pub(crate) fn warmup_subscriptions_at_resolution(
+    subscriptions: &[rlean_data::SubscriptionDataConfig],
+    resolution: Option<Resolution>,
+) -> Vec<rlean_data::SubscriptionDataConfig> {
+    subscriptions
+        .iter()
+        .map(|config| {
+            let mut warmup = config.clone();
+            if let Some(resolution) = resolution {
+                warmup.resolution = resolution;
+                if let Some(custom) = warmup.custom.as_mut() {
+                    custom.config.resolution = resolution;
+                }
+            }
+            warmup
+        })
+        .collect()
 }
 
 fn resolve_backtest_dates(
@@ -918,6 +935,7 @@ mod tests {
         benchmark_subscription_for_symbol, compute_subscription_diff,
         desired_backtest_subscriptions_from_parts, lean_style_active_subscriptions,
         resolve_backtest_dates, subscription_requires_stream_replacement,
+        warmup_subscriptions_at_resolution,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rlean_core::{DataNormalizationMode, DateTime, Market, Resolution, Symbol};
@@ -1223,5 +1241,18 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("start date 2024-01-02"));
+    }
+
+    #[test]
+    fn explicit_daily_warmup_resolution_rewrites_history_requests_only() {
+        let minute = equity_config("SPY");
+        let warmed = warmup_subscriptions_at_resolution(
+            std::slice::from_ref(&minute),
+            Some(Resolution::Daily),
+        );
+
+        assert_eq!(minute.resolution, Resolution::Minute);
+        assert_eq!(warmed[0].resolution, Resolution::Daily);
+        assert_ne!(minute.unique_id(), warmed[0].unique_id());
     }
 }

@@ -173,13 +173,14 @@ pub fn should_trigger_scheduled(
     match descriptor.date_rule {
         DateRule::EveryDay => {}
     }
-    match descriptor.time_rule {
+    match &descriptor.time_rule {
         TimeRule::EveryResolution => resolution == descriptor.trigger_resolution,
-        TimeRule::At { hour, minute } => dt.hour() == hour && dt.minute() == minute,
+        TimeRule::At { hour, minute } => dt.hour() == *hour && dt.minute() == *minute,
         TimeRule::AfterMarketOpen { minutes_after_open } => {
-            let open = market_open_time(minutes_after_open);
+            let open = market_open_time(*minutes_after_open);
             dt.time().hour() == open.hour() && dt.time().minute() == open.minute()
         }
+        TimeRule::BeforeMarketClose { .. } => false,
     }
 }
 
@@ -192,7 +193,7 @@ pub fn trigger_times(
     let mut date = ns_to_utc_datetime(start_ns).date_naive();
     let end_dt = ns_to_utc_datetime(end_ns);
     while date <= end_dt.date_naive() {
-        let Some(trigger) = trigger_time_for_date(date, descriptor.time_rule) else {
+        let Some(trigger) = trigger_time_for_date(date, &descriptor.time_rule) else {
             date += chrono::Duration::days(1);
             continue;
         };
@@ -205,14 +206,18 @@ pub fn trigger_times(
     out
 }
 
-fn trigger_time_for_date(date: chrono::NaiveDate, rule: TimeRule) -> Option<chrono::NaiveDateTime> {
+fn trigger_time_for_date(
+    date: chrono::NaiveDate,
+    rule: &TimeRule,
+) -> Option<chrono::NaiveDateTime> {
     match rule {
-        TimeRule::At { hour, minute } => date.and_hms_opt(hour, minute, 0),
+        TimeRule::At { hour, minute } => date.and_hms_opt(*hour, *minute, 0),
         TimeRule::AfterMarketOpen { minutes_after_open } => Some(chrono::NaiveDateTime::new(
             date,
-            market_open_time(minutes_after_open),
+            market_open_time(*minutes_after_open),
         )),
         TimeRule::EveryResolution => date.and_hms_opt(0, 0, 0),
+        TimeRule::BeforeMarketClose { .. } => None,
     }
 }
 

@@ -123,6 +123,71 @@ assert algo.get_parameter("lookback", None) == "63"
     }
 
     #[test]
+    fn python_schedule_supports_exchange_aware_before_market_close() {
+        init_python();
+        let state = Arc::new(Mutex::new(QcAlgorithm::new("Algorithm", dec!(100000))));
+        let runtime_context = rlean_engine::AlgorithmRuntimeContext::with_history_service(
+            Arc::new(NullHistoryService),
+            std::collections::HashMap::new(),
+        );
+        let context = AlgorithmConstructionContext::new_with_runtime_services(
+            state,
+            Arc::new(runtime_context.clone()),
+        );
+        AlgorithmHandle::with_default_context(context, || {
+            Python::attach(|py| {
+                let code = std::ffi::CString::new(
+                    r#"
+import builtins
+from AlgorithmImports import QCAlgorithm, Resolution
+
+builtins._rlean_scheduled_fired = 0
+algo = QCAlgorithm()
+spy = algo.add_equity("SPY", Resolution.Daily).symbol
+def rebalance():
+    builtins._rlean_scheduled_fired += 1
+algo.schedule.on(
+    algo.date_rules.every_day(),
+    algo.time_rules.before_market_close(spy, 15),
+    rebalance,
+)
+"#,
+                )
+                .unwrap();
+                py.run(code.as_c_str(), None, None).unwrap();
+            });
+        });
+
+        let before: rlean_core::DateTime =
+            chrono::DateTime::parse_from_rfc3339("2025-07-03T16:44:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+        let due: rlean_core::DateTime =
+            chrono::DateTime::parse_from_rfc3339("2025-07-03T16:45:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+        runtime_context.schedule().skip_until(before);
+        let events = runtime_context
+            .schedule()
+            .due_events(due, rlean_core::MarketHoursDatabase::global().as_ref());
+        assert_eq!(events.len(), 1);
+        (events[0].callback.lock())().unwrap();
+        Python::attach(|py| {
+            let builtins = py.import("builtins").unwrap();
+            assert_eq!(
+                builtins
+                    .getattr("_rlean_scheduled_fired")
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
     fn algorithm_cash_security_and_order_helpers_work_from_python() {
         run_python(
             r#"

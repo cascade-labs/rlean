@@ -1,17 +1,31 @@
-use rlean_core::TimeSpan;
+use rlean_core::{Symbol, TimeSpan};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeRule {
-    At(TimeSpan),
-    AfterMarketOpen { offset: TimeSpan },
-    BeforeMarketClose { offset: TimeSpan },
+    At {
+        hour: u32,
+        minute: u32,
+    },
+    AfterMarketOpen {
+        minutes_after_open: i64,
+    },
+    BeforeMarketClose {
+        symbol: Symbol,
+        minutes_before_close: i64,
+        extended_market_close: bool,
+    },
     Every(TimeSpan),
+    EveryResolution,
 }
 
 pub struct TimeRules;
 
 impl TimeRules {
     pub fn at(hour: u8, minute: u8) -> TimeRule {
-        TimeRule::At(TimeSpan::from_secs(hour as i64 * 3600 + minute as i64 * 60))
+        TimeRule::At {
+            hour: u32::from(hour),
+            minute: u32::from(minute),
+        }
     }
 
     pub fn at_midnight() -> TimeRule {
@@ -23,13 +37,15 @@ impl TimeRules {
 
     pub fn after_market_open(offset_minutes: i64) -> TimeRule {
         TimeRule::AfterMarketOpen {
-            offset: TimeSpan::from_mins(offset_minutes),
+            minutes_after_open: offset_minutes,
         }
     }
 
-    pub fn before_market_close(offset_minutes: i64) -> TimeRule {
+    pub fn before_market_close(symbol: Symbol, offset_minutes: i64) -> TimeRule {
         TimeRule::BeforeMarketClose {
-            offset: TimeSpan::from_mins(offset_minutes),
+            symbol,
+            minutes_before_close: offset_minutes,
+            extended_market_close: false,
         }
     }
 

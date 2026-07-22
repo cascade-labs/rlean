@@ -180,10 +180,20 @@ pub enum DateRule {
     EveryDay,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeRule {
-    At { hour: u32, minute: u32 },
-    AfterMarketOpen { minutes_after_open: i64 },
+    At {
+        hour: u32,
+        minute: u32,
+    },
+    AfterMarketOpen {
+        minutes_after_open: i64,
+    },
+    BeforeMarketClose {
+        symbol: Symbol,
+        minutes_before_close: i64,
+        extended_market_close: bool,
+    },
     EveryResolution,
 }
 
@@ -242,9 +252,55 @@ impl TimeRulesHandle {
         TimeRuleHandle::new(TimeRule::AfterMarketOpen { minutes_after_open })
     }
 
+    pub fn before_market_close(
+        &self,
+        symbol: crate::securities::SymbolHandle,
+        minutes_before_close: i64,
+        extended_market_close: bool,
+    ) -> TimeRuleHandle {
+        TimeRuleHandle::new(TimeRule::BeforeMarketClose {
+            symbol: symbol.into_inner(),
+            minutes_before_close,
+            extended_market_close,
+        })
+    }
+
     pub fn every(&self, interval_seconds: i64) -> TimeRuleHandle {
         let minutes_after_open = (interval_seconds / 60).max(0);
         TimeRuleHandle::new(TimeRule::AfterMarketOpen { minutes_after_open })
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl DateRulesHandle {
+    #[pyo3(name = "every_day")]
+    fn py_every_day(&self) -> DateRuleHandle {
+        self.every_day()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl TimeRulesHandle {
+    #[pyo3(name = "at", signature = (hour, minute, second=0))]
+    fn py_at(&self, hour: u32, minute: u32, second: u32) -> TimeRuleHandle {
+        self.at(hour, minute, second)
+    }
+
+    #[pyo3(name = "after_market_open")]
+    fn py_after_market_open(&self, minutes_after_open: i64) -> TimeRuleHandle {
+        self.after_market_open(minutes_after_open)
+    }
+
+    #[pyo3(name = "before_market_close", signature = (symbol, minutes_before_close=0, extended_market_close=false))]
+    fn py_before_market_close(
+        &self,
+        symbol: crate::securities::SymbolHandle,
+        minutes_before_close: i64,
+        extended_market_close: bool,
+    ) -> TimeRuleHandle {
+        self.before_market_close(symbol, minutes_before_close, extended_market_close)
     }
 }
 
@@ -513,6 +569,18 @@ mod tests {
                 minutes_after_open: 15
             }
         );
+
+        let spy =
+            crate::securities::SymbolHandle::new(Symbol::create_equity("SPY", &Market::usa()));
+        let before_close = TimeRulesHandle::new().before_market_close(spy, 15, false);
+        assert!(matches!(
+            before_close.kind,
+            TimeRule::BeforeMarketClose {
+                minutes_before_close: 15,
+                extended_market_close: false,
+                ..
+            }
+        ));
     }
 
     #[test]

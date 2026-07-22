@@ -15,6 +15,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub struct ScheduledEventRegistrationRequest {
+    pub name: String,
+    pub date_rule: rlean_scheduling::DateRule,
+    pub time_rule: rlean_scheduling::TimeRule,
+    pub callback: Box<dyn FnMut() -> Result<(), String> + Send>,
+}
+
 pub type HistoryColumns = HashMap<String, Vec<String>>;
 
 pub trait AlgorithmHistoryService: Send + Sync {
@@ -73,6 +80,9 @@ pub trait AlgorithmRuntimeServices: Send + Sync {
     fn history_service(&self) -> Arc<dyn AlgorithmHistoryService>;
     fn runtime_parameters(&self) -> Arc<std::sync::RwLock<HashMap<String, String>>>;
     fn registered_indicators(&self) -> RegisteredIndicatorRegistry;
+    fn register_scheduled_event(&self, registration: ScheduledEventRegistrationRequest) {
+        let _ = registration;
+    }
     fn framework_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         None
     }
