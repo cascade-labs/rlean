@@ -74,6 +74,9 @@ pub struct SidecarBrokerageConnection {
     pub client: Arc<DataSidecarClient>,
     pub connection_id: u64,
     pub name: String,
+    /// Opaque brokerage credentials/config, kept so the worker can re-open the
+    /// brokerage connection after the sidecar session is re-established.
+    pub opaque_config_json: Vec<u8>,
     pub events: BrokerageEventStream,
 }
 

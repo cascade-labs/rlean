@@ -142,61 +142,109 @@ struct SessionInner {
     next_request_id: AtomicU64,
     next_subscription_id: AtomicU64,
     next_connection_id: AtomicU64,
+    /// Monotonic session generation. A fresh session (initial connect or a
+    /// reconnect after a sidecar restart) carries a higher epoch so concurrent
+    /// reconnect requests can coalesce onto a single re-establish.
+    epoch: u64,
+}
+
+/// A live-data feed remembered so that a reconnect can restore it on the fresh
+/// session under the same connection id the deployment already holds.
+#[derive(Clone)]
+struct RememberedLiveFeed {
+    provider: String,
+    opaque_config_json: Vec<u8>,
+    feed_connection_id: u64,
+}
+
+struct ClientShared {
+    config: DataSidecarConfig,
     origin_id: String,
     session_id: String,
+    /// The current Flight session. Swapped atomically on reconnect so every
+    /// `Arc<DataSidecarClient>` holder transparently follows the new session.
+    session: std::sync::Mutex<Arc<SessionInner>>,
+    live_feed: std::sync::Mutex<Option<RememberedLiveFeed>>,
+    /// Serializes reconnect attempts so a sidecar restart triggers exactly one
+    /// re-establish even when several stream owners notice the drop at once.
+    reconnect_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
 pub struct DataSidecarClient {
-    inner: Arc<SessionInner>,
+    shared: Arc<ClientShared>,
 }
 
 impl DataSidecarClient {
     pub async fn connect(config: DataSidecarConfig) -> anyhow::Result<Self> {
-        let channel = connect_channel(&config).await?;
-        let mut client = FlightServiceClient::new(channel)
-            .max_decoding_message_size(16 * 1024 * 1024)
-            .max_encoding_message_size(16 * 1024 * 1024);
-        let (outbound, receiver) = mpsc::channel(256);
-        let mut request = Request::new(ReceiverStream::new(receiver));
-        if let Some(token) = &config.token {
-            request.metadata_mut().insert(
-                "authorization",
-                MetadataValue::try_from(format!("Bearer {token}"))
-                    .context("invalid Flight authorization metadata")?,
-            );
+        let origin_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        let session = connect_session(&config, &origin_id, &session_id, 0).await?;
+        Ok(Self {
+            shared: Arc::new(ClientShared {
+                config,
+                origin_id,
+                session_id,
+                session: std::sync::Mutex::new(session),
+                live_feed: std::sync::Mutex::new(None),
+                reconnect_lock: tokio::sync::Mutex::new(()),
+            }),
+        })
+    }
+
+    /// Snapshot the current Flight session. Cheap `Arc` clone; callers that need
+    /// consistency across several operations hold the returned handle so a
+    /// concurrent reconnect cannot swap the session out from under them.
+    fn session(&self) -> Arc<SessionInner> {
+        self.shared
+            .session
+            .lock()
+            .expect("session lock poisoned")
+            .clone()
+    }
+
+    /// Generation of the current session. A caller records this before a stream
+    /// dies and passes it back in through `reconnect` so an already-completed
+    /// reconnect is not repeated.
+    pub fn session_epoch(&self) -> u64 {
+        self.session().epoch
+    }
+
+    /// Re-establish the Flight session after the sidecar dropped it (restart,
+    /// crash-loop, transient network fault). Coalesced by epoch: if another
+    /// stream owner already reconnected since this session's epoch, the call is
+    /// a no-op. On success the remembered live-data feed is reopened on the
+    /// fresh session under its original connection id; live subscriptions and
+    /// brokerage connections are re-registered by their owners.
+    pub async fn reconnect(&self) -> anyhow::Result<()> {
+        let failed_epoch = self.session().epoch;
+        let _guard = self.shared.reconnect_lock.lock().await;
+        // Another owner may have re-established the session while we waited for
+        // the reconnect lock; if so, adopt it rather than churning a new one.
+        if self.session().epoch != failed_epoch {
+            return Ok(());
         }
-        let response = client
-            .do_exchange(request)
-            .await
-            .with_context(|| format!("failed to open Flight exchange at {}", config.endpoint))?
-            .into_inner();
-        let inner = Arc::new(SessionInner {
-            outbound,
-            controls: Mutex::new(HashMap::new()),
-            queries: Mutex::new(HashMap::new()),
-            live: Mutex::new(HashMap::new()),
-            relay: Mutex::new(HashMap::new()),
-            live_data_feed: Mutex::new(None),
-            brokerages: Mutex::new(HashMap::new()),
-            next_request_id: AtomicU64::new(1),
-            next_subscription_id: AtomicU64::new(1),
-            next_connection_id: AtomicU64::new(1),
-            origin_id: Uuid::new_v4().to_string(),
-            session_id: Uuid::new_v4().to_string(),
-        });
-        tokio::spawn(route_server_messages(Arc::downgrade(&inner), response));
-        let this = Self { inner };
-        let response = this
-            .send_and_wait(ClientPayload::Initialize(Initialize {
-                origin_id: this.inner.origin_id.clone(),
-                session_id: this.inner.session_id.clone(),
-            }))
-            .await?;
-        if !matches!(response.payload, Some(ServerPayload::Initialized(_))) {
-            bail!("sidecar returned an invalid Initialize acknowledgement");
+        let next_epoch = failed_epoch.wrapping_add(1);
+        let session = connect_session(
+            &self.shared.config,
+            &self.shared.origin_id,
+            &self.shared.session_id,
+            next_epoch,
+        )
+        .await?;
+        // Reopen the remembered live-data feed before publishing the session so
+        // no subscriber ever observes a live session without its feed.
+        let feed = self
+            .shared
+            .live_feed
+            .lock()
+            .expect("live-feed lock poisoned")
+            .clone();
+        if let Some(feed) = feed {
+            reopen_live_data_feed(&session, &feed).await?;
         }
-        Ok(this)
+        *self.shared.session.lock().expect("session lock poisoned") = session;
+        Ok(())
     }
 
     /// Returns the sidecar-owned manifest without interpreting its contents.
@@ -211,11 +259,11 @@ impl DataSidecarClient {
     }
 
     pub fn origin_id(&self) -> &str {
-        &self.inner.origin_id
+        &self.shared.origin_id
     }
 
     pub fn session_id(&self) -> &str {
-        &self.inner.session_id
+        &self.shared.session_id
     }
 
     /// Open the session's default live-data feed. Strategy subscriptions remain
@@ -225,23 +273,38 @@ impl DataSidecarClient {
         provider: impl Into<String>,
         opaque_config_json: Vec<u8>,
     ) -> anyhow::Result<u64> {
-        let mut active_feed = self.inner.live_data_feed.lock().await;
+        let inner = self.session();
+        let provider = provider.into();
+        let mut active_feed = inner.live_data_feed.lock().await;
         if active_feed.is_some() {
             bail!("this sidecar session already has an open live-data feed");
         }
-        let feed_connection_id = self.next_connection_id();
-        let response = self
-            .send_and_wait(ClientPayload::OpenLiveDataFeed(OpenLiveDataFeed {
+        let feed_connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let response = send_and_wait_on(
+            &inner,
+            ClientPayload::OpenLiveDataFeed(OpenLiveDataFeed {
                 feed_connection_id,
-                provider: provider.into(),
-                opaque_config_json,
-            }))
-            .await?;
+                provider: provider.clone(),
+                opaque_config_json: opaque_config_json.clone(),
+            }),
+        )
+        .await?;
         match response.payload {
             Some(ServerPayload::LiveDataFeedOpened(opened))
                 if opened.feed_connection_id == feed_connection_id =>
             {
                 *active_feed = Some(feed_connection_id);
+                // Remember the feed so a reconnect can restore it on the fresh
+                // session under this same connection id.
+                *self
+                    .shared
+                    .live_feed
+                    .lock()
+                    .expect("live-feed lock poisoned") = Some(RememberedLiveFeed {
+                    provider,
+                    opaque_config_json,
+                    feed_connection_id,
+                });
                 Ok(feed_connection_id)
             }
             _ => bail!("sidecar returned an invalid OpenLiveDataFeed acknowledgement"),
@@ -249,18 +312,32 @@ impl DataSidecarClient {
     }
 
     pub async fn close_live_data_feed(&self, feed_connection_id: u64) -> anyhow::Result<()> {
-        let response = self
-            .send_and_wait(ClientPayload::CloseLiveDataFeed(CloseLiveDataFeed {
-                feed_connection_id,
-            }))
-            .await?;
+        let inner = self.session();
+        let response = send_and_wait_on(
+            &inner,
+            ClientPayload::CloseLiveDataFeed(CloseLiveDataFeed { feed_connection_id }),
+        )
+        .await?;
         match response.payload {
             Some(ServerPayload::LiveDataFeedClosed(closed))
                 if closed.feed_connection_id == feed_connection_id =>
             {
-                let mut active_feed = self.inner.live_data_feed.lock().await;
+                let mut active_feed = inner.live_data_feed.lock().await;
                 if *active_feed == Some(feed_connection_id) {
                     *active_feed = None;
+                }
+                // A deliberately closed feed must not be resurrected by a later
+                // reconnect.
+                let mut remembered = self
+                    .shared
+                    .live_feed
+                    .lock()
+                    .expect("live-feed lock poisoned");
+                if remembered
+                    .as_ref()
+                    .is_some_and(|feed| feed.feed_connection_id == feed_connection_id)
+                {
+                    *remembered = None;
                 }
                 Ok(())
             }
@@ -273,20 +350,23 @@ impl DataSidecarClient {
         brokerage: impl Into<String>,
         opaque_config_json: Vec<u8>,
     ) -> anyhow::Result<(u64, BrokerageEventStream)> {
-        let brokerage_connection_id = self.next_connection_id();
+        let inner = self.session();
+        let brokerage_connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(256);
-        self.inner
+        inner
             .brokerages
             .lock()
             .await
             .insert(brokerage_connection_id, sender);
-        let result = self
-            .send_and_wait(ClientPayload::OpenBrokerage(OpenBrokerage {
+        let result = send_and_wait_on(
+            &inner,
+            ClientPayload::OpenBrokerage(OpenBrokerage {
                 brokerage_connection_id,
                 brokerage: brokerage.into(),
                 opaque_config_json,
-            }))
-            .await;
+            }),
+        )
+        .await;
         match result {
             Ok(response)
                 if matches!(
@@ -298,7 +378,7 @@ impl DataSidecarClient {
                 Ok((brokerage_connection_id, ReceiverStream::new(receiver)))
             }
             Ok(_) => {
-                self.inner
+                inner
                     .brokerages
                     .lock()
                     .await
@@ -306,7 +386,7 @@ impl DataSidecarClient {
                 bail!("sidecar returned an invalid OpenBrokerage acknowledgement")
             }
             Err(error) => {
-                self.inner
+                inner
                     .brokerages
                     .lock()
                     .await
@@ -317,12 +397,15 @@ impl DataSidecarClient {
     }
 
     pub async fn close_brokerage(&self, brokerage_connection_id: u64) -> anyhow::Result<()> {
-        let response = self
-            .send_and_wait(ClientPayload::CloseBrokerage(CloseBrokerage {
+        let inner = self.session();
+        let response = send_and_wait_on(
+            &inner,
+            ClientPayload::CloseBrokerage(CloseBrokerage {
                 brokerage_connection_id,
-            }))
-            .await?;
-        self.inner
+            }),
+        )
+        .await?;
+        inner
             .brokerages
             .lock()
             .await
@@ -428,17 +511,17 @@ impl DataSidecarClient {
         spec: SubscriptionSpec,
         mode: DeliveryMode,
     ) -> anyhow::Result<SubscriptionRegistration> {
-        let subscription_id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .send_and_wait(ClientPayload::AddSubscription(AddSubscription {
+        let inner = self.session();
+        let subscription_id = inner.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        let response = send_and_wait_on(
+            &inner,
+            ClientPayload::AddSubscription(AddSubscription {
                 subscription_id,
                 mode: mode as i32,
                 subscription: Some(spec),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         match response.payload {
             Some(ServerPayload::SubscriptionAdded(added))
                 if added.subscription_id == subscription_id =>
@@ -455,13 +538,14 @@ impl DataSidecarClient {
     }
 
     pub async fn remove_subscription(&self, subscription_id: u64) -> anyhow::Result<()> {
-        self.inner.live.lock().await.remove(&subscription_id);
-        self.inner.relay.lock().await.remove(&subscription_id);
-        let response = self
-            .send_and_wait(ClientPayload::RemoveSubscription(RemoveSubscription {
-                subscription_id,
-            }))
-            .await?;
+        let inner = self.session();
+        inner.live.lock().await.remove(&subscription_id);
+        inner.relay.lock().await.remove(&subscription_id);
+        let response = send_and_wait_on(
+            &inner,
+            ClientPayload::RemoveSubscription(RemoveSubscription { subscription_id }),
+        )
+        .await?;
         match response.payload {
             Some(ServerPayload::SubscriptionRemoved(removed))
                 if removed.subscription_id == subscription_id =>
@@ -478,11 +562,13 @@ impl DataSidecarClient {
         start_time_ns: i64,
         end_time_ns: i64,
     ) -> anyhow::Result<DataBatchStream> {
-        let request_id = self.next_request_id();
+        let inner = self.session();
+        let request_id = inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(16);
-        self.inner.queries.lock().await.insert(request_id, sender);
-        if let Err(error) = self
-            .send(ClientMessage {
+        inner.queries.lock().await.insert(request_id, sender);
+        if let Err(error) = send_on(
+            &inner,
+            ClientMessage {
                 protocol_version: PROTOCOL_VERSION,
                 request_id,
                 payload: Some(ClientPayload::BacktestQuery(BacktestQuery {
@@ -490,10 +576,11 @@ impl DataSidecarClient {
                     start_time_ns,
                     end_time_ns,
                 })),
-            })
-            .await
+            },
+        )
+        .await
         {
-            self.inner.queries.lock().await.remove(&request_id);
+            inner.queries.lock().await.remove(&request_id);
             return Err(error);
         }
         Ok(ReceiverStream::new(receiver))
@@ -514,22 +601,22 @@ impl DataSidecarClient {
         &self,
         spec: SubscriptionSpec,
     ) -> anyhow::Result<(u64, DataBatchStream)> {
-        if self.inner.live_data_feed.lock().await.is_none() {
+        let inner = self.session();
+        if inner.live_data_feed.lock().await.is_none() {
             bail!("cannot add a live subscription before opening the live-data feed");
         }
-        let subscription_id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
+        let subscription_id = inner.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(256);
-        self.inner.live.lock().await.insert(subscription_id, sender);
-        let result = self
-            .send_and_wait(ClientPayload::AddSubscription(AddSubscription {
+        inner.live.lock().await.insert(subscription_id, sender);
+        let result = send_and_wait_on(
+            &inner,
+            ClientPayload::AddSubscription(AddSubscription {
                 subscription_id,
                 mode: DeliveryMode::Live as i32,
                 subscription: Some(spec),
-            }))
-            .await;
+            }),
+        )
+        .await;
         match result {
             Ok(response)
                 if matches!(
@@ -541,11 +628,11 @@ impl DataSidecarClient {
                 Ok((subscription_id, ReceiverStream::new(receiver)))
             }
             Ok(_) => {
-                self.inner.live.lock().await.remove(&subscription_id);
+                inner.live.lock().await.remove(&subscription_id);
                 bail!("sidecar returned an invalid live AddSubscription acknowledgement")
             }
             Err(error) => {
-                self.inner.live.lock().await.remove(&subscription_id);
+                inner.live.lock().await.remove(&subscription_id);
                 Err(error)
             }
         }
@@ -554,23 +641,19 @@ impl DataSidecarClient {
     /// Registers one daemon-level subscription for every canonical batch
     /// ingested by the upstream leader.
     pub async fn subscribe_relay(&self) -> anyhow::Result<(u64, RelayBatchStream)> {
-        let subscription_id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
+        let inner = self.session();
+        let subscription_id = inner.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(256);
-        self.inner
-            .relay
-            .lock()
-            .await
-            .insert(subscription_id, sender);
-        let result = self
-            .send_and_wait(ClientPayload::AddSubscription(AddSubscription {
+        inner.relay.lock().await.insert(subscription_id, sender);
+        let result = send_and_wait_on(
+            &inner,
+            ClientPayload::AddSubscription(AddSubscription {
                 subscription_id,
                 mode: DeliveryMode::Relay as i32,
                 subscription: Some(SubscriptionSpec::default()),
-            }))
-            .await;
+            }),
+        )
+        .await;
         match result {
             Ok(response)
                 if matches!(
@@ -582,53 +665,134 @@ impl DataSidecarClient {
                 Ok((subscription_id, ReceiverStream::new(receiver)))
             }
             Ok(_) => {
-                self.inner.relay.lock().await.remove(&subscription_id);
+                inner.relay.lock().await.remove(&subscription_id);
                 bail!("sidecar returned an invalid relay AddSubscription acknowledgement")
             }
             Err(error) => {
-                self.inner.relay.lock().await.remove(&subscription_id);
+                inner.relay.lock().await.remove(&subscription_id);
                 Err(error)
             }
         }
     }
 
-    fn next_request_id(&self) -> u64 {
-        self.inner.next_request_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn next_connection_id(&self) -> u64 {
-        self.inner
-            .next_connection_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-
     async fn send_and_wait(&self, payload: ClientPayload) -> anyhow::Result<ServerMessage> {
-        let request_id = self.next_request_id();
-        let (sender, receiver) = oneshot::channel();
-        self.inner.controls.lock().await.insert(request_id, sender);
-        if let Err(error) = self
-            .send(ClientMessage {
-                protocol_version: PROTOCOL_VERSION,
-                request_id,
-                payload: Some(payload),
-            })
-            .await
-        {
-            self.inner.controls.lock().await.remove(&request_id);
-            return Err(error);
-        }
-        receiver
-            .await
-            .context("Flight exchange closed before acknowledgement")?
+        send_and_wait_on(&self.session(), payload).await
     }
+}
 
-    async fn send(&self, message: ClientMessage) -> anyhow::Result<()> {
-        self.inner
-            .outbound
-            .send(message.into_flight_data())
-            .await
-            .context("Flight exchange request stream is closed")
+/// Establish a fresh Flight session: open the bidirectional exchange, spawn the
+/// server-message router, and complete the Initialize handshake. Used for the
+/// first connect and for every reconnect after a sidecar restart.
+async fn connect_session(
+    config: &DataSidecarConfig,
+    origin_id: &str,
+    session_id: &str,
+    epoch: u64,
+) -> anyhow::Result<Arc<SessionInner>> {
+    let channel = connect_channel(config).await?;
+    let mut client = FlightServiceClient::new(channel)
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .max_encoding_message_size(16 * 1024 * 1024);
+    let (outbound, receiver) = mpsc::channel(256);
+    let mut request = Request::new(ReceiverStream::new(receiver));
+    if let Some(token) = &config.token {
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}"))
+                .context("invalid Flight authorization metadata")?,
+        );
     }
+    let response = client
+        .do_exchange(request)
+        .await
+        .with_context(|| format!("failed to open Flight exchange at {}", config.endpoint))?
+        .into_inner();
+    let inner = Arc::new(SessionInner {
+        outbound,
+        controls: Mutex::new(HashMap::new()),
+        queries: Mutex::new(HashMap::new()),
+        live: Mutex::new(HashMap::new()),
+        relay: Mutex::new(HashMap::new()),
+        live_data_feed: Mutex::new(None),
+        brokerages: Mutex::new(HashMap::new()),
+        next_request_id: AtomicU64::new(1),
+        next_subscription_id: AtomicU64::new(1),
+        next_connection_id: AtomicU64::new(1),
+        epoch,
+    });
+    tokio::spawn(route_server_messages(Arc::downgrade(&inner), response));
+    let response = send_and_wait_on(
+        &inner,
+        ClientPayload::Initialize(Initialize {
+            origin_id: origin_id.to_string(),
+            session_id: session_id.to_string(),
+        }),
+    )
+    .await?;
+    if !matches!(response.payload, Some(ServerPayload::Initialized(_))) {
+        bail!("sidecar returned an invalid Initialize acknowledgement");
+    }
+    Ok(inner)
+}
+
+/// Reopen a remembered live-data feed on a freshly reconnected session under its
+/// original connection id, so the deployment's `live_data_feed_connection_id`
+/// stays valid across a sidecar restart.
+async fn reopen_live_data_feed(
+    inner: &SessionInner,
+    feed: &RememberedLiveFeed,
+) -> anyhow::Result<()> {
+    let response = send_and_wait_on(
+        inner,
+        ClientPayload::OpenLiveDataFeed(OpenLiveDataFeed {
+            feed_connection_id: feed.feed_connection_id,
+            provider: feed.provider.clone(),
+            opaque_config_json: feed.opaque_config_json.clone(),
+        }),
+    )
+    .await?;
+    match response.payload {
+        Some(ServerPayload::LiveDataFeedOpened(opened))
+            if opened.feed_connection_id == feed.feed_connection_id =>
+        {
+            *inner.live_data_feed.lock().await = Some(feed.feed_connection_id);
+            Ok(())
+        }
+        _ => bail!("sidecar returned an invalid OpenLiveDataFeed acknowledgement on reconnect"),
+    }
+}
+
+async fn send_and_wait_on(
+    inner: &SessionInner,
+    payload: ClientPayload,
+) -> anyhow::Result<ServerMessage> {
+    let request_id = inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = oneshot::channel();
+    inner.controls.lock().await.insert(request_id, sender);
+    if let Err(error) = send_on(
+        inner,
+        ClientMessage {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            payload: Some(payload),
+        },
+    )
+    .await
+    {
+        inner.controls.lock().await.remove(&request_id);
+        return Err(error);
+    }
+    receiver
+        .await
+        .context("Flight exchange closed before acknowledgement")?
+}
+
+async fn send_on(inner: &SessionInner, message: ClientMessage) -> anyhow::Result<()> {
+    inner
+        .outbound
+        .send(message.into_flight_data())
+        .await
+        .context("Flight exchange request stream is closed")
 }
 
 async fn route_server_messages(
