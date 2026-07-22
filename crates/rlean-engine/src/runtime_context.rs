@@ -46,6 +46,19 @@ impl AlgorithmRuntimeContext {
         Self::with_history_service(history_service, runtime_parameters)
     }
 
+    /// Live runtime context: price seeding is bounded by a hardcoded grace so a
+    /// slow vendor gap-fill cannot stall a live time step. Backtests use
+    /// [`AlgorithmRuntimeContext::new`], which blocks on the full seed query.
+    pub fn new_live(
+        data_sidecar: Arc<DataSidecarClient>,
+        runtime_parameters: HashMap<String, String>,
+    ) -> Self {
+        let history_service = Arc::new(HistoryService::new_live(AlgorithmHistoryContext {
+            data_sidecar,
+        }));
+        Self::with_history_service(history_service, runtime_parameters)
+    }
+
     pub fn with_history_service(
         history_service: Arc<dyn AlgorithmHistoryService>,
         runtime_parameters: HashMap<String, String>,
