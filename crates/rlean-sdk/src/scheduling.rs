@@ -66,7 +66,7 @@ impl ScheduleManagerHandle {
         callback: pyo3::Py<pyo3::PyAny>,
     ) {
         use pyo3::types::PyAnyMethods;
-        let name = PythonCallbackName::new(&callback);
+        let name = PythonCallbackName::from_callback(&callback);
         self.on(name, date_rule, time_rule, move || {
             pyo3::Python::attach(|py| callback.bind(py).call0().map(|_| ()))
                 .map_err(|error| error.to_string())
@@ -79,7 +79,7 @@ struct PythonCallbackName;
 
 #[cfg(feature = "python")]
 impl PythonCallbackName {
-    fn new(callback: &pyo3::Py<pyo3::PyAny>) -> String {
+    fn from_callback(callback: &pyo3::Py<pyo3::PyAny>) -> String {
         use pyo3::types::PyAnyMethods;
         pyo3::Python::attach(|py| {
             callback
