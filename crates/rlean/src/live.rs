@@ -99,17 +99,16 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let brokerage = if requested_paper_brokerage {
         None
     } else {
+        let opaque_config_json = brokerage_config_json(requested_brokerage, brokerage_account)?;
         let (connection_id, events) = data_sidecar
-            .open_brokerage(
-                requested_brokerage,
-                brokerage_config_json(requested_brokerage, brokerage_account)?,
-            )
+            .open_brokerage(requested_brokerage, opaque_config_json.clone())
             .await
             .with_context(|| format!("failed to open sidecar brokerage '{requested_brokerage}'"))?;
         Some(rlean_engine::SidecarBrokerageConnection {
             client: data_sidecar.clone(),
             connection_id,
             name: requested_brokerage.to_string(),
+            opaque_config_json,
             events,
         })
     };
