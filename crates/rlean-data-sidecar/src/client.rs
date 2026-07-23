@@ -179,7 +179,13 @@ impl DataSidecarClient {
     pub async fn connect(config: DataSidecarConfig) -> anyhow::Result<Self> {
         let origin_id = Uuid::new_v4().to_string();
         let session_id = Uuid::new_v4().to_string();
-        let session = connect_session(&config, &origin_id, &session_id, 0).await?;
+        let session = connect_session(
+            &config,
+            &origin_id,
+            &transport_session_id(&session_id, 0),
+            0,
+        )
+        .await?;
         Ok(Self {
             shared: Arc::new(ClientShared {
                 config,
@@ -217,7 +223,18 @@ impl DataSidecarClient {
     /// fresh session under its original connection id; live subscriptions and
     /// brokerage connections are re-registered by their owners.
     pub async fn reconnect(&self) -> anyhow::Result<()> {
-        let failed_epoch = self.session().epoch;
+        self.reconnect_failed_epoch(self.session_epoch()).await
+    }
+
+    /// Re-establish the Flight session that owned a failed stream.
+    ///
+    /// Stream owners must pass the epoch captured when their stream was opened.
+    /// This is intentionally different from [`Self::reconnect`]: a second owner
+    /// can observe its old stream fail after another owner has already advanced
+    /// the shared session. In that case this method adopts the newer session
+    /// instead of tearing it down again and attempting to initialize the same
+    /// logical session twice.
+    pub async fn reconnect_failed_epoch(&self, failed_epoch: u64) -> anyhow::Result<()> {
         let _guard = self.shared.reconnect_lock.lock().await;
         // Another owner may have re-established the session while we waited for
         // the reconnect lock; if so, adopt it rather than churning a new one.
@@ -228,7 +245,7 @@ impl DataSidecarClient {
         let session = connect_session(
             &self.shared.config,
             &self.shared.origin_id,
-            &self.shared.session_id,
+            &transport_session_id(&self.shared.session_id, next_epoch),
             next_epoch,
         )
         .await?;
@@ -680,6 +697,15 @@ impl DataSidecarClient {
     }
 }
 
+/// A deployment keeps one logical id for idempotent brokerage commands, while
+/// each transport generation gets a distinct protocol session id. This mirrors
+/// LEAN's separation between an algorithm job and a concrete brokerage/data
+/// connection and prevents a stale server-side session from rejecting recovery
+/// as "already connected".
+fn transport_session_id(logical_session_id: &str, epoch: u64) -> String {
+    format!("{logical_session_id}:{epoch}")
+}
+
 /// Establish a fresh Flight session: open the bidirectional exchange, spawn the
 /// server-message router, and complete the Initialize handshake. Used for the
 /// first connect and for every reconnect after a sidecar restart.
@@ -992,5 +1018,20 @@ async fn connect_channel(config: &DataSidecarConfig) -> anyhow::Result<Channel> 
                 .await
                 .with_context(|| format!("failed to connect to Flight socket {}", path.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transport_session_id;
+
+    #[test]
+    fn each_transport_generation_has_a_distinct_protocol_session() {
+        assert_eq!(transport_session_id("deployment", 0), "deployment:0");
+        assert_eq!(transport_session_id("deployment", 1), "deployment:1");
+        assert_ne!(
+            transport_session_id("deployment", 41),
+            transport_session_id("deployment", 42)
+        );
     }
 }

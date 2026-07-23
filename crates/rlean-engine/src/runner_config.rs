@@ -73,6 +73,8 @@ pub struct LiveRunConfig {
 pub struct SidecarBrokerageConnection {
     pub client: Arc<DataSidecarClient>,
     pub connection_id: u64,
+    /// Flight session generation that owns `events`.
+    pub session_epoch: u64,
     pub name: String,
     /// Opaque brokerage credentials/config, kept so the worker can re-open the
     /// brokerage connection after the sidecar session is re-established.

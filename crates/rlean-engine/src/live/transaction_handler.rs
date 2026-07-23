@@ -711,17 +711,19 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000
 /// misconfiguration) is surfaced instead of looping.
 async fn reopen_sidecar_brokerage(
     client: &rlean_data_sidecar::DataSidecarClient,
+    failed_epoch: u64,
     provider: &str,
     opaque_config_json: &[u8],
-) -> anyhow::Result<(u64, rlean_data_sidecar::BrokerageEventStream)> {
+) -> anyhow::Result<(u64, rlean_data_sidecar::BrokerageEventStream, u64)> {
     let policy = rlean_live::ReconnectPolicy::sidecar_session();
     let mut attempt: u32 = 0;
     loop {
         let outcome = async {
-            client.reconnect().await?;
-            client
+            client.reconnect_failed_epoch(failed_epoch).await?;
+            let connection = client
                 .open_brokerage(provider.to_string(), opaque_config_json.to_vec())
-                .await
+                .await?;
+            Ok::<_, anyhow::Error>((connection.0, connection.1, client.session_epoch()))
         }
         .await;
         match outcome {
@@ -764,8 +766,14 @@ fn run_sidecar_worker(
     runtime.block_on(async move {
         let client = connection.client.clone();
         // Updated when the brokerage connection is re-opened after a sidecar
-        // restart; the session id stays stable across reconnects.
+        // restart. The logical session id stays stable for idempotent commands;
+        // each underlying Flight transport generation has its own protocol id.
         let mut connection_id = connection.connection_id;
+        // Epoch that owns `connection.events`. A concurrent data-stream
+        // reconnect may already have advanced the shared session by the time
+        // this stream reports its failure; retaining the owning epoch prevents
+        // the brokerage worker from reconnecting that fresh session again.
+        let mut connection_epoch = connection.session_epoch;
         let session_id = client.session_id().to_string();
         let mut stop = false;
         while !stop {
@@ -865,6 +873,7 @@ fn run_sidecar_worker(
                 break;
             }
 
+            let mut reconnect_reason = None;
             tokio::select! {
                 event = connection.events.next() => {
                     match event {
@@ -899,74 +908,55 @@ fn run_sidecar_worker(
                         }
                         Some(Ok(SidecarBrokerageEvent::Connection(state))) => {
                             if !state.connected {
-                                tracing::error!(
-                                    brokerage = %connection.name,
-                                    "sidecar brokerage disconnected: {}",
+                                reconnect_reason = Some(format!(
+                                    "brokerage reported disconnected: {}",
                                     state.message
-                                );
+                                ));
                             }
                         }
                         Some(Err(error)) => {
-                            tracing::warn!(
-                                brokerage = %connection.name,
-                                "sidecar brokerage event stream failed; re-establishing: {error}"
-                            );
-                            match reopen_sidecar_brokerage(
-                                &client,
-                                &connection.name,
-                                &connection.opaque_config_json,
-                            )
-                            .await
-                            {
-                                Ok((new_id, events)) => {
-                                    connection_id = new_id;
-                                    connection.events = events;
-                                    tracing::warn!(
-                                        brokerage = %connection.name,
-                                        connection_id = new_id,
-                                        "re-established sidecar brokerage event stream"
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        "sidecar brokerage reconnect is not retryable: {error}"
-                                    );
-                                    break;
-                                }
-                            }
+                            reconnect_reason =
+                                Some(format!("brokerage event stream failed: {error}"));
                         }
                         None => {
-                            tracing::warn!(
-                                brokerage = %connection.name,
-                                "sidecar brokerage event stream closed; re-establishing"
-                            );
-                            match reopen_sidecar_brokerage(
-                                &client,
-                                &connection.name,
-                                &connection.opaque_config_json,
-                            )
-                            .await
-                            {
-                                Ok((new_id, events)) => {
-                                    connection_id = new_id;
-                                    connection.events = events;
-                                    tracing::warn!(
-                                        brokerage = %connection.name,
-                                        connection_id = new_id,
-                                        "re-established sidecar brokerage event stream"
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        "sidecar brokerage reconnect is not retryable: {error}"
-                                    );
-                                    break;
-                                }
-                            }
+                            reconnect_reason =
+                                Some("brokerage event stream closed".to_string());
                         }
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
+            if let Some(reason) = reconnect_reason {
+                tracing::warn!(
+                    brokerage = %connection.name,
+                    "{reason}; re-establishing"
+                );
+                match reopen_sidecar_brokerage(
+                    &client,
+                    connection_epoch,
+                    &connection.name,
+                    &connection.opaque_config_json,
+                )
+                .await
+                {
+                    Ok((new_id, events, new_epoch)) => {
+                        connection_id = new_id;
+                        connection_epoch = new_epoch;
+                        connection.events = events;
+                        tracing::warn!(
+                            brokerage = %connection.name,
+                            connection_id = new_id,
+                            session_epoch = new_epoch,
+                            "re-established sidecar brokerage event stream"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "sidecar brokerage reconnect is not retryable: {error}"
+                        );
+                        break;
+                    }
+                }
             }
         }
         if let Err(error) = client.close_brokerage(connection_id).await {
