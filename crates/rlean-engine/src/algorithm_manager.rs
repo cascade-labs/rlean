@@ -202,12 +202,22 @@ where
             .algorithm
             .universe_resolution()
             .unwrap_or(rlean_core::Resolution::Daily);
+        let mut selection_pass = false;
         let mut changes = SecurityChanges::empty();
         if new_trading_day {
-            for selection in
+            let selections =
                 self.algorithm
-                    .select_universe_changes(slice.time.0, resolution, services)
-            {
+                    .select_universe_changes(slice.time.0, resolution, services);
+            if !selections.is_empty() {
+                selection_pass = true;
+                if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                    algorithm_state
+                        .lock()
+                        .unwrap()
+                        .begin_universe_selection_pass();
+                }
+            }
+            for selection in selections {
                 if let Some(algorithm_state) = self.algorithm.algorithm_state() {
                     let mut algorithm = algorithm_state.lock().unwrap();
                     crate::algorithm_services::apply_universe_changes(
@@ -223,12 +233,22 @@ where
             }
         }
         if !slice.custom_data.is_empty() {
-            for selection in self.algorithm.select_custom_universe_changes(
+            let selections = self.algorithm.select_custom_universe_changes(
                 slice.time.0,
                 resolution,
                 &slice.custom_data,
                 services,
-            ) {
+            );
+            if !selection_pass && !selections.is_empty() {
+                selection_pass = true;
+                if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                    algorithm_state
+                        .lock()
+                        .unwrap()
+                        .begin_universe_selection_pass();
+                }
+            }
+            for selection in selections {
                 if let Some(algorithm_state) = self.algorithm.algorithm_state() {
                     let mut algorithm = algorithm_state.lock().unwrap();
                     crate::algorithm_services::apply_custom_universe_changes(
@@ -245,12 +265,22 @@ where
             }
         }
         if !slice.fundamentals.is_empty() {
-            for selection in self.algorithm.select_fundamental_universe_changes(
+            let selections = self.algorithm.select_fundamental_universe_changes(
                 slice.time.0,
                 resolution,
                 &slice.fundamentals,
                 services,
-            ) {
+            );
+            if !selection_pass && !selections.is_empty() {
+                selection_pass = true;
+                if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                    algorithm_state
+                        .lock()
+                        .unwrap()
+                        .begin_universe_selection_pass();
+                }
+            }
+            for selection in selections {
                 if let Some(algorithm_state) = self.algorithm.algorithm_state() {
                     let mut algorithm = algorithm_state.lock().unwrap();
                     // The fundamental selector uses the normal equity
@@ -268,8 +298,29 @@ where
                 }
             }
         }
+        if selection_pass {
+            if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+                // C# PendingRemovalsManager checks removals from an earlier
+                // selection only after the current selections are known. The
+                // add path above cancels a removal when the symbol is selected
+                // again; newly removed symbols cannot disappear this pass.
+                algorithm_state
+                    .lock()
+                    .unwrap()
+                    .process_pending_universe_security_removals();
+            }
+        }
         if changes.has_changes() {
+            // Match C# AlgorithmManager: the user callback and every framework
+            // model receive the same time-slice SecurityChanges before OnData.
+            // Without this notification the framework can retain insights and
+            // execution targets for a universe member after it is removed.
             self.algorithm.on_securities_changed(&changes, services);
+            crate::notify_framework_securities_changed(
+                &self.runtime_context.framework(),
+                &changes.added,
+                &changes.removed,
+            );
         }
         changes
     }
@@ -556,13 +607,12 @@ where
                 );
             }
 
-            // C# LEAN performs physical user-defined-universe/data-feed removal
-            // at end of time step, after synchronous order processing. Unsafe
-            // removals remain pending and are checked again each time step.
-            algorithm_state
-                .lock()
-                .unwrap()
-                .process_pending_security_removals();
+            // Direct RemoveSecurity calls use LEAN's user-defined-universe
+            // path and can physically detach at end of time step. Universe
+            // selection removals are reconsidered only by a later selection.
+            let mut algorithm = algorithm_state.lock().unwrap();
+            algorithm.process_pending_direct_security_removals();
+            algorithm.advance_removal_time_step();
         }
         self.algorithm.on_end_of_time_step(services);
     }

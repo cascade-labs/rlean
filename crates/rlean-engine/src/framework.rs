@@ -295,6 +295,14 @@ impl FrameworkState {
                 .map(|target| (target.symbol.clone(), target.quantity)),
         );
 
+        // C# QCAlgorithm.ProcessInsights assigns SecurityHolding.Target before
+        // invoking the execution model. PendingRemovalsManager observes that
+        // authoritative target, so execution and universe-removal state cannot
+        // diverge during this time step.
+        for target in adjusted_by_symbol.values() {
+            execution_context.set_authoritative_holdings_target(&target.symbol, target.quantity);
+        }
+
         let exec_targets: Vec<ExecutionTargetRef<'_>> = adjusted_by_symbol
             .iter()
             .map(|t| ExecutionTargetRef {
@@ -381,17 +389,7 @@ impl FrameworkState {
         }
         self.pcm.on_securities_changed(added, removed);
         self.exec_model.on_securities_changed(added, removed);
-        let removed_insights = self.insights.clear_symbols(removed);
-        self.alpha_tracker.record_expired(&removed_insights);
-        self.push_insight_events(
-            InsightEventKind::UniverseRemoved,
-            DateTime::now(),
-            &removed_insights,
-        );
-        for mut insight in removed_insights {
-            insight.direction = AlphaDir::Flat;
-            self.pending_flat_targets.push(insight);
-        }
+        self.risk_model.on_securities_changed(added, removed);
     }
 
     fn push_insight_event(
@@ -637,6 +635,14 @@ impl IExecutionAlgorithm for AlgorithmExecutionContext {
             .portfolio
             .get_holding(symbol)
             .quantity
+    }
+
+    fn set_holdings_target(&self, symbol: &Symbol, quantity: Decimal) {
+        self.algorithm
+            .lock()
+            .unwrap()
+            .portfolio
+            .set_target(symbol, quantity);
     }
 
     fn above_minimum_order_margin_portfolio_percentage(
@@ -1000,6 +1006,23 @@ mod tests {
         );
 
         assert!(!framework.is_rebalance_due(now, false));
+    }
+
+    #[test]
+    fn security_changes_do_not_implicitly_delete_framework_insights() {
+        let mut framework = FrameworkState::new();
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &rlean_core::Market::usa());
+        framework
+            .insights
+            .add(Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now));
+
+        framework.on_securities_changed(&[], std::slice::from_ref(&symbol));
+
+        // C# OnFrameworkSecuritiesChanged only forwards the change to models.
+        // Insight lifetime remains owned by InsightCollection/alpha emissions.
+        assert!(framework.insights.has_active(&symbol, now));
+        assert!(framework.pending_flat_targets.is_empty());
     }
 
     #[test]

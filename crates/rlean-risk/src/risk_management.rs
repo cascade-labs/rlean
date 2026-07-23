@@ -50,6 +50,10 @@ pub struct RiskContext {
 pub trait RiskManagementModel: Send + Sync {
     fn manage_risk(&mut self, targets: &[PortfolioTarget]) -> Vec<PortfolioTarget>;
 
+    /// Called when the algorithm's security set changes. This mirrors LEAN's
+    /// `IRiskManagementModel.OnSecuritiesChanged` lifecycle hook.
+    fn on_securities_changed(&mut self, _added: &[Symbol], _removed: &[Symbol]) {}
+
     /// Called with full portfolio context.  Default impl ignores context and
     /// delegates to `manage_risk`, so existing impls need not override this.
     fn manage_risk_with_context(
