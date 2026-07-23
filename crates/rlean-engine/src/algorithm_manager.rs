@@ -342,7 +342,7 @@ where
     /// clock is set to each event's exact UTC trigger before its callback, as in
     /// C# LEAN's BacktestingRealTimeHandler.ScanPastEvents. The subsequent data
     /// frontier advance restores the slice time.
-    pub fn scan_scheduled_events(&mut self, utc_time: DateTime) -> anyhow::Result<()> {
+    pub fn scan_scheduled_events(&mut self, utc_time: DateTime) -> anyhow::Result<Vec<DateTime>> {
         let market_hours_database = self
             .algorithm
             .algorithm_state()
@@ -352,6 +352,7 @@ where
             .runtime_context
             .schedule()
             .due_events(utc_time, market_hours_database.as_ref());
+        let mut fired = Vec::with_capacity(due.len());
         for event in due {
             if let Some(algorithm_state) = self.algorithm.algorithm_state() {
                 crate::algorithm_services::advance_algorithm_time(
@@ -368,8 +369,9 @@ where
                     error
                 );
             }
+            fired.push(event.trigger_time);
         }
-        Ok(())
+        Ok(fired)
     }
 
     pub fn process_order_events(&mut self, processing: OrderEventProcessing<'_>) {

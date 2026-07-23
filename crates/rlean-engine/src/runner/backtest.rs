@@ -242,7 +242,7 @@ where
             }
         }
 
-        algorithm_manager.scan_scheduled_events(slice.time)?;
+        let _ = algorithm_manager.scan_scheduled_events(slice.time)?;
         let slice = Arc::new(slice);
         algorithm_manager.advance_frontier(slice.as_ref(), &mut services);
         let option_chains: Vec<(&str, &OptionChain)> = slice
