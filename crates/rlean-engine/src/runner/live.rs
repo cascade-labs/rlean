@@ -362,7 +362,32 @@ where
             break;
         }
 
-        algorithm_manager.scan_scheduled_events(rlean_core::DateTime::now())?;
+        let scheduled_event_times =
+            algorithm_manager.scan_scheduled_events(rlean_core::DateTime::now())?;
+        if let Some(trigger_time) = scheduled_event_times.last().copied() {
+            // Live scheduled callbacks run independently of market-data
+            // arrival, as in C# LEAN's LiveTradingRealTimeHandler. Give the
+            // framework one empty time-step after the callbacks so a PCM gated
+            // by a scheduled event can create and execute targets immediately
+            // even when the algorithm only subscribes to Daily data.
+            let scheduled_slice = rlean_data::Slice::new(trigger_time);
+            algorithm_manager.run_framework(&scheduled_slice, &mut services);
+            if let (Some(router), Some(transactions)) =
+                (brokerage_router.as_mut(), transactions.as_ref())
+            {
+                service_live_brokerage(
+                    &mut algorithm_manager,
+                    &mut services,
+                    router,
+                    transactions,
+                    portfolio.as_ref(),
+                    live_writer.as_ref(),
+                    &mut all_order_events,
+                    &mut trade_builder,
+                    &mut completed_trades,
+                );
+            }
+        }
 
         match poll_live_item(&mut live_subscriptions, Duration::from_millis(250)) {
             LivePoll::Item(item) => {

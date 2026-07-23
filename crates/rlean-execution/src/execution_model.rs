@@ -91,6 +91,12 @@ pub trait IExecutionAlgorithm: Send + Sync {
     fn security_is_tradable(&self, symbol: &Symbol) -> bool;
     fn projected_quantity(&self, symbol: &Symbol) -> Decimal;
     fn holdings_quantity(&self, symbol: &Symbol) -> Decimal;
+
+    /// Store the latest framework portfolio target on the authoritative
+    /// holding before execution. C# LEAN's `QCAlgorithm.ProcessInsights` does
+    /// this before calling `Execution.Execute`, and pending universe removals
+    /// use this value to decide whether a security is safe to detach.
+    fn set_holdings_target(&self, _symbol: &Symbol, _quantity: Decimal) {}
     fn above_minimum_order_margin_portfolio_percentage(
         &self,
         symbol: &Symbol,
@@ -277,6 +283,12 @@ impl<'a> ExecutionContext<'a> {
         self.algorithm
             .map(|algorithm| algorithm.holdings_quantity(&security.symbol))
             .unwrap_or(security.current_quantity)
+    }
+
+    pub fn set_authoritative_holdings_target(&self, symbol: &Symbol, quantity: Decimal) {
+        if let Some(algorithm) = self.algorithm {
+            algorithm.set_holdings_target(symbol, quantity);
+        }
     }
 
     pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {

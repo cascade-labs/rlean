@@ -213,6 +213,16 @@ pub struct QcAlgorithm {
     /// Securities logically removed by `RemoveSecurity` or universe selection
     /// but retained until LEAN's removal safety conditions are satisfied.
     pending_security_removals: HashMap<u64, Symbol>,
+    /// Universe removals are reconsidered only by a later universe-selection
+    /// pass, matching LEAN's `PendingRemovalsManager`. The value is the
+    /// selection generation in which the removal was requested.
+    pending_universe_removal_generations: HashMap<u64, u64>,
+    universe_selection_generation: u64,
+    /// Direct `RemoveSecurity` updates the user-defined universe at the end of
+    /// the current time step. Physical removal therefore cannot occur until a
+    /// later time step has allowed execution to observe any resulting fills.
+    pending_direct_removal_generations: HashMap<u64, u64>,
+    removal_time_step_generation: u64,
     /// Direct `RemoveSecurity` calls flow through LEAN's user-defined universe
     /// change path. The engine drains these logical removals and notifies the
     /// algorithm framework before physical removal.
@@ -257,6 +267,10 @@ impl QcAlgorithm {
             market_hours_database: MarketHoursDatabase::global(),
             security_leverage_overrides: HashMap::new(),
             pending_security_removals: HashMap::new(),
+            pending_universe_removal_generations: HashMap::new(),
+            universe_selection_generation: 0,
+            pending_direct_removal_generations: HashMap::new(),
+            removal_time_step_generation: 0,
             pending_removed_security_changes: Vec::new(),
         }
     }
@@ -1942,6 +1956,10 @@ impl QcAlgorithm {
         }
         self.pending_security_removals
             .insert(symbol.id.sid, symbol.clone());
+        self.pending_universe_removal_generations
+            .remove(&symbol.id.sid);
+        self.pending_direct_removal_generations
+            .insert(symbol.id.sid, self.removal_time_step_generation);
         if !self
             .pending_removed_security_changes
             .iter()
@@ -1967,6 +1985,10 @@ impl QcAlgorithm {
         }
         self.pending_security_removals
             .insert(symbol.id.sid, symbol.clone());
+        self.pending_direct_removal_generations
+            .remove(&symbol.id.sid);
+        self.pending_universe_removal_generations
+            .insert(symbol.id.sid, self.universe_selection_generation);
         true
     }
 
@@ -1977,6 +1999,10 @@ impl QcAlgorithm {
             .pending_security_removals
             .remove(&symbol.id.sid)
             .is_some();
+        self.pending_universe_removal_generations
+            .remove(&symbol.id.sid);
+        self.pending_direct_removal_generations
+            .remove(&symbol.id.sid);
         self.pending_removed_security_changes
             .retain(|pending| pending.id.sid != symbol.id.sid);
         if removed {
@@ -2040,13 +2066,59 @@ impl QcAlgorithm {
         true
     }
 
-    /// Apply physical data/security removals whose LEAN safety conditions are
-    /// satisfied. Called by the engine at end of each time step after
-    /// synchronous order processing and framework target generation.
+    /// Mark the beginning of a universe-selection pass. A universe removal
+    /// requested in this generation cannot be physically applied until a
+    /// later generation, giving framework models time to flatten and discard
+    /// their retained targets exactly like C# LEAN.
+    pub fn begin_universe_selection_pass(&mut self) {
+        self.universe_selection_generation = self.universe_selection_generation.wrapping_add(1);
+    }
+
+    /// Apply safe universe removals requested by an earlier selection pass.
+    /// Re-selected symbols have already been cancelled by the add path before
+    /// this method runs.
+    pub fn process_pending_universe_security_removals(&mut self) -> Vec<Symbol> {
+        let generation = self.universe_selection_generation;
+        let eligible: Vec<u64> = self
+            .pending_universe_removal_generations
+            .iter()
+            .filter_map(|(sid, requested)| (*requested < generation).then_some(*sid))
+            .collect();
+        self.process_pending_security_removal_ids(&eligible)
+    }
+
+    /// Apply safe removals produced by direct `RemoveSecurity` calls from an
+    /// earlier time step. In C# LEAN the current end-of-step only mutates the
+    /// user-defined universe; the data feed observes that change later. This
+    /// generation barrier preserves the same opportunity for execution models
+    /// to reconcile fills before the SecurityManager can detach the symbol.
+    pub fn process_pending_direct_security_removals(&mut self) -> Vec<Symbol> {
+        let eligible: Vec<u64> = self
+            .pending_direct_removal_generations
+            .iter()
+            .filter_map(|(sid, requested)| {
+                (*requested < self.removal_time_step_generation).then_some(*sid)
+            })
+            .collect();
+        self.process_pending_security_removal_ids(&eligible)
+    }
+
+    pub fn advance_removal_time_step(&mut self) {
+        self.removal_time_step_generation = self.removal_time_step_generation.wrapping_add(1);
+    }
+
+    /// Apply every safe pending removal. This is retained as the explicit
+    /// administrative/test drain; engine lifecycle code uses the direct and
+    /// universe-specific methods above.
     pub fn process_pending_security_removals(&mut self) -> Vec<Symbol> {
-        let removable: Vec<Symbol> = self
-            .pending_security_removals
-            .values()
+        let eligible: Vec<u64> = self.pending_security_removals.keys().copied().collect();
+        self.process_pending_security_removal_ids(&eligible)
+    }
+
+    fn process_pending_security_removal_ids(&mut self, eligible: &[u64]) -> Vec<Symbol> {
+        let removable: Vec<Symbol> = eligible
+            .iter()
+            .filter_map(|sid| self.pending_security_removals.get(sid))
             .filter(|symbol| self.security_is_safe_to_remove(symbol))
             .cloned()
             .collect();
@@ -2063,6 +2135,10 @@ impl QcAlgorithm {
                 .retain(|existing| existing.id.sid != symbol.id.sid);
             self.portfolio.remove_holding_if_flat(&symbol);
             self.pending_security_removals.remove(&symbol.id.sid);
+            self.pending_universe_removal_generations
+                .remove(&symbol.id.sid);
+            self.pending_direct_removal_generations
+                .remove(&symbol.id.sid);
             removed.push(symbol);
         }
         removed
@@ -2420,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_security_defers_physical_equity_removal_until_end_of_time_step() {
+    fn remove_security_defers_physical_equity_removal_until_pending_removals_are_drained() {
         let mut alg = QcAlgorithm::new("test", dec!(100_000));
         let symbol = alg.add_equity("MSFT", Resolution::Minute);
 
@@ -2511,6 +2587,61 @@ mod tests {
             alg.process_pending_security_removals(),
             vec![symbol.clone()]
         );
+    }
+
+    #[test]
+    fn universe_removal_is_reconsidered_only_on_a_later_selection_pass() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+
+        alg.begin_universe_selection_pass();
+        assert!(alg.request_universe_security_removal(&symbol));
+
+        // End-of-time-step processing is reserved for direct RemoveSecurity.
+        assert!(alg.process_pending_direct_security_removals().is_empty());
+        // A removal cannot be physically applied by the pass that requested it.
+        assert!(alg.process_pending_universe_security_removals().is_empty());
+        assert!(alg.securities.contains(&symbol));
+
+        alg.begin_universe_selection_pass();
+        assert_eq!(
+            alg.process_pending_universe_security_removals(),
+            vec![symbol.clone()]
+        );
+        assert!(!alg.securities.contains(&symbol));
+    }
+
+    #[test]
+    fn universe_reselection_cancels_deferred_removal() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+
+        alg.begin_universe_selection_pass();
+        assert!(alg.request_universe_security_removal(&symbol));
+        alg.begin_universe_selection_pass();
+
+        let reselected = alg.add_equity("MSFT", Resolution::Minute);
+        assert_eq!(reselected.id.sid, symbol.id.sid);
+        assert!(alg.process_pending_universe_security_removals().is_empty());
+        assert!(!alg.is_security_pending_removal(&symbol));
+        assert!(alg.securities.contains(&symbol));
+    }
+
+    #[test]
+    fn direct_removal_waits_until_a_later_time_step() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("MSFT", Resolution::Minute);
+
+        assert!(alg.remove_security(&symbol, None));
+        assert!(alg.process_pending_direct_security_removals().is_empty());
+        assert!(alg.securities.contains(&symbol));
+
+        alg.advance_removal_time_step();
+        assert_eq!(
+            alg.process_pending_direct_security_removals(),
+            vec![symbol.clone()]
+        );
+        assert!(!alg.securities.contains(&symbol));
     }
 
     #[test]
