@@ -28,6 +28,30 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// LEAN-style real-time pulse source. LiveSynchronizer advances the algorithm
+/// clock from wall time after warmup even when no subscription produced data;
+/// the pulse is a clock event, not a Slice delivered to `OnData`.
+struct LiveTimePulse {
+    last_second: i64,
+}
+
+impl LiveTimePulse {
+    fn new(now: rlean_core::DateTime) -> Self {
+        Self {
+            last_second: now.as_secs(),
+        }
+    }
+
+    fn next(&mut self, now: rlean_core::DateTime) -> Option<rlean_core::DateTime> {
+        let second = now.as_secs();
+        if second <= self.last_second {
+            return None;
+        }
+        self.last_second = second;
+        Some(rlean_core::DateTime::from_secs(second))
+    }
+}
+
 /// Engine-owned live runner entry point.
 ///
 /// All strategy languages enter through `rlean_algorithm::lifecycle::AlgorithmBridge`; language
@@ -351,6 +375,8 @@ where
     }
     let run_started = Instant::now();
     let mut assembler = LiveSliceAssembler::new();
+    let mut time_pulse = LiveTimePulse::new(rlean_core::DateTime::now());
+    let mut live_reconnect: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
     'live: loop {
         if should_stop(
@@ -362,16 +388,44 @@ where
             break;
         }
 
-        let scheduled_event_times =
-            algorithm_manager.scan_scheduled_events(rlean_core::DateTime::now())?;
-        if let Some(trigger_time) = scheduled_event_times.last().copied() {
-            // Live scheduled callbacks run independently of market-data
-            // arrival, as in C# LEAN's LiveTradingRealTimeHandler. Give the
-            // framework one empty time-step after the callbacks so a PCM gated
-            // by a scheduled event can create and execute targets immediately
-            // even when the algorithm only subscribes to Daily data.
-            let scheduled_slice = rlean_data::Slice::new(trigger_time);
-            algorithm_manager.run_framework(&scheduled_slice, &mut services);
+        if live_reconnect
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            live_reconnect
+                .take()
+                .expect("finished reconnect task is present")
+                .await??;
+            live_subscriptions.finish_reconnect().await?;
+        }
+
+        // C# LEAN's LiveTradingRealTimeHandler is driven by wall time, not by
+        // subscription enumerators. A pulse advances algorithm time and scans
+        // scheduled events, but is never delivered to OnData.
+        let now = rlean_core::DateTime::now();
+        if let Some(pulse_time) = time_pulse.next(now) {
+            let scheduled_event_times = algorithm_manager.scan_scheduled_events(pulse_time)?;
+            if let Some(trigger_time) = scheduled_event_times.last().copied() {
+                // Give the framework one empty scheduled time-step so a PCM
+                // explicitly gated by the callback can produce targets.
+                let scheduled_slice = rlean_data::Slice::new(trigger_time);
+                algorithm_manager.run_framework(&scheduled_slice, &mut services);
+            }
+            // Scheduled callbacks set the clock to their exact trigger. Restore
+            // the current wall-clock frontier afterwards without invoking
+            // OnData, universe selection, indicators, or slice counters.
+            algorithm_manager.advance_frontier(&rlean_data::Slice::new(pulse_time), &mut services);
+            if let (Some(writer), Some(portfolio)) = (live_writer.as_ref(), portfolio.as_ref()) {
+                writer.record_time_pulse(
+                    pulse_time,
+                    portfolio,
+                    crate::live::deployment_writer::LiveSnapshotCounts {
+                        slices_processed: algorithm_manager.slices_processed() as usize,
+                        order_events: all_order_events.len(),
+                        trades: completed_trades.len(),
+                    },
+                );
+            }
             if let (Some(router), Some(transactions)) =
                 (brokerage_router.as_mut(), transactions.as_ref())
             {
@@ -389,7 +443,13 @@ where
             }
         }
 
-        match poll_live_item(&mut live_subscriptions, Duration::from_millis(250)) {
+        let poll = if live_reconnect.is_none() {
+            poll_live_item(&mut live_subscriptions, Duration::from_millis(250))
+        } else {
+            std::thread::sleep(Duration::from_millis(250));
+            LivePoll::Idle
+        };
+        match poll {
             LivePoll::Item(item) => {
                 assembler.enqueue(*item);
                 loop {
@@ -397,11 +457,10 @@ where
                         LivePoll::Item(item) => assembler.enqueue(*item),
                         LivePoll::Idle => break,
                         // A live subscription stream dropped: re-establish the
-                        // sidecar session and resubscribe, then resume. The
-                        // assembler frontier is untouched, so algorithm time does
-                        // not move backward.
+                        // sidecar session in the background. Wall-clock pulses,
+                        // schedules and brokerage servicing must remain live.
                         LivePoll::StreamLost => {
-                            live_subscriptions.reconnect().await?;
+                            live_reconnect = Some(live_subscriptions.begin_reconnect());
                             break;
                         }
                     }
@@ -409,7 +468,7 @@ where
             }
             LivePoll::Idle => {}
             LivePoll::StreamLost => {
-                live_subscriptions.reconnect().await?;
+                live_reconnect = Some(live_subscriptions.begin_reconnect());
             }
         }
         let ready_slices: Vec<_> = assembler
@@ -516,6 +575,9 @@ where
 
     if let Some(router) = brokerage_router.as_mut() {
         router.shutdown();
+    }
+    if let Some(reconnect) = live_reconnect.take() {
+        reconnect.abort();
     }
     algorithm_manager.finish(&mut services);
     live_subscriptions.unsubscribe_all().await;
@@ -1262,9 +1324,11 @@ fn poll_live_item(subscriptions: &mut LiveSubscriptionSet, timeout: Duration) ->
 /// production implementation is `DataSidecarClient`.
 #[async_trait::async_trait]
 pub(crate) trait LiveFeedTransport: Send + Sync {
+    /// Generation that owns newly-opened streams.
+    fn session_epoch(&self) -> u64;
     /// Re-establish the underlying Flight session after a sidecar drop. Coalesced
     /// across concurrent callers so a restart triggers a single re-establish.
-    async fn reconnect_session(&self) -> Result<()>;
+    async fn reconnect_session(&self, failed_epoch: u64) -> Result<()>;
     /// Register a single live subscription, returning its sidecar-side (remote)
     /// id and the batch stream.
     async fn subscribe_live(
@@ -1277,8 +1341,12 @@ pub(crate) trait LiveFeedTransport: Send + Sync {
 
 #[async_trait::async_trait]
 impl LiveFeedTransport for DataSidecarClient {
-    async fn reconnect_session(&self) -> Result<()> {
-        self.reconnect().await
+    fn session_epoch(&self) -> u64 {
+        DataSidecarClient::session_epoch(self)
+    }
+
+    async fn reconnect_session(&self, failed_epoch: u64) -> Result<()> {
+        self.reconnect_failed_epoch(failed_epoch).await
     }
 
     async fn subscribe_live(
@@ -1299,6 +1367,7 @@ struct LiveSubscriptionSet {
     configs: HashMap<u64, SubscriptionDataConfig>,
     remote_ids: HashMap<u64, u64>,
     tasks: HashMap<u64, tokio::task::JoinHandle<()>>,
+    session_epoch: u64,
     /// Unique-id set from the last full `sync_live_subscriptions` pass. Used to
     /// short-circuit the per-slice sync when the subscription set is unchanged
     /// (issue #39). `None` until the first sync runs.
@@ -1310,12 +1379,14 @@ impl LiveSubscriptionSet {
         transport: Arc<dyn LiveFeedTransport>,
         subscriptions: &[SubscriptionDataConfig],
     ) -> Result<Self> {
+        let session_epoch = transport.session_epoch();
         let mut set = Self {
             transport,
             market: HashMap::new(),
             configs: HashMap::new(),
             remote_ids: HashMap::new(),
             tasks: HashMap::new(),
+            session_epoch,
             last_synced_ids: None,
         };
         for config in subscriptions {
@@ -1428,32 +1499,49 @@ impl LiveSubscriptionSet {
     /// are minted for the new session; the old session's ids died with it, so no
     /// subscription is duplicated. The slice synchronizer's frontier is untouched,
     /// so algorithm time never moves backward across a reconnect.
+    #[cfg(test)]
     async fn reconnect(&mut self) -> Result<()> {
+        self.begin_reconnect().await??;
+        self.finish_reconnect().await
+    }
+
+    /// Start only the potentially unbounded transport recovery. The runner
+    /// keeps this join handle off its data/schedule loop, matching LEAN's
+    /// independent real-time handler.
+    fn begin_reconnect(&self) -> tokio::task::JoinHandle<Result<()>> {
+        let transport = self.transport.clone();
+        let failed_epoch = self.session_epoch;
+        tokio::spawn(async move {
+            let policy = rlean_live::ReconnectPolicy::sidecar_session();
+            let mut attempt: u32 = 0;
+            loop {
+                match transport.reconnect_session(failed_epoch).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        if !is_transient_sidecar_error(&error) {
+                            return Err(
+                                error.context("live sidecar reconnect failed and is not retryable")
+                            );
+                        }
+                        attempt = attempt.saturating_add(1);
+                        let delay = policy.delay_for_attempt(attempt - 1);
+                        tracing::warn!(
+                            attempt,
+                            delay_secs = delay.as_secs(),
+                            "live sidecar session down; retrying reconnect: {error}"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Re-register the desired subscriptions after transport recovery.
+    async fn finish_reconnect(&mut self) -> Result<()> {
         // Snapshot the desired set before we start; removals during downtime have
         // already dropped their entries from `configs`.
         let desired: Vec<SubscriptionDataConfig> = self.configs.values().cloned().collect();
-        let policy = rlean_live::ReconnectPolicy::sidecar_session();
-        let mut attempt: u32 = 0;
-        loop {
-            match self.transport.reconnect_session().await {
-                Ok(()) => break,
-                Err(error) => {
-                    if !is_transient_sidecar_error(&error) {
-                        return Err(
-                            error.context("live sidecar reconnect failed and is not retryable")
-                        );
-                    }
-                    attempt = attempt.saturating_add(1);
-                    let delay = policy.delay_for_attempt(attempt - 1);
-                    tracing::warn!(
-                        attempt,
-                        delay_secs = delay.as_secs(),
-                        "live sidecar session down; retrying reconnect: {error}"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
 
         // Abort the drained forwarding tasks and clear the dead session's state.
         for (_, task) in self.tasks.drain() {
@@ -1468,9 +1556,10 @@ impl LiveSubscriptionSet {
             self.add(config).await?;
             resubscribed += 1;
         }
+        self.session_epoch = self.transport.session_epoch();
         tracing::warn!(
-            reconnect_attempts = attempt.saturating_add(1),
             resubscribed,
+            session_epoch = self.session_epoch,
             "re-established live sidecar subscriptions after reconnect"
         );
         Ok(())
@@ -1575,6 +1664,41 @@ fn live_items(
 }
 
 #[cfg(test)]
+mod live_time_pulse_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_feeds_still_advance_on_wall_clock_seconds() {
+        let mut pulses = LiveTimePulse::new(rlean_core::DateTime::from_secs(100));
+
+        assert_eq!(
+            pulses.next(rlean_core::DateTime::from_secs(100)),
+            None,
+            "a pulse is not market data and must not repeat the current frontier"
+        );
+        assert_eq!(
+            pulses.next(rlean_core::DateTime::from_secs(101)),
+            Some(rlean_core::DateTime::from_secs(101))
+        );
+        assert_eq!(
+            pulses.next(rlean_core::DateTime::from_secs(105)),
+            Some(rlean_core::DateTime::from_secs(105)),
+            "a delayed runner adopts wall time rather than replaying fake slices"
+        );
+    }
+
+    #[test]
+    fn wall_clock_regression_never_moves_live_time_backward() {
+        let mut pulses = LiveTimePulse::new(rlean_core::DateTime::from_secs(100));
+        assert_eq!(pulses.next(rlean_core::DateTime::from_secs(99)), None);
+        assert_eq!(
+            pulses.next(rlean_core::DateTime::from_secs(101)),
+            Some(rlean_core::DateTime::from_secs(101))
+        );
+    }
+}
+
+#[cfg(test)]
 mod unmanaged_liquidation_tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -1655,6 +1779,7 @@ mod sidecar_reconnect_tests {
     /// before recovering, or to fail permanently (a hard/auth failure).
     struct FakeTransport {
         reconnect_calls: AtomicUsize,
+        session_epoch: AtomicU64,
         next_remote_id: AtomicU64,
         subscribe_log: StdMutex<Vec<String>>,
         remove_log: StdMutex<Vec<u64>>,
@@ -1666,6 +1791,7 @@ mod sidecar_reconnect_tests {
         fn new() -> Self {
             Self {
                 reconnect_calls: AtomicUsize::new(0),
+                session_epoch: AtomicU64::new(0),
                 next_remote_id: AtomicU64::new(1000),
                 subscribe_log: StdMutex::new(Vec::new()),
                 remove_log: StdMutex::new(Vec::new()),
@@ -1677,7 +1803,14 @@ mod sidecar_reconnect_tests {
 
     #[async_trait::async_trait]
     impl LiveFeedTransport for FakeTransport {
-        async fn reconnect_session(&self) -> Result<()> {
+        fn session_epoch(&self) -> u64 {
+            self.session_epoch.load(AtomicOrdering::SeqCst)
+        }
+
+        async fn reconnect_session(&self, failed_epoch: u64) -> Result<()> {
+            if self.session_epoch() != failed_epoch {
+                return Ok(());
+            }
             self.reconnect_calls.fetch_add(1, AtomicOrdering::SeqCst);
             if self.hard_fail {
                 return Err(anyhow::anyhow!("invalid Flight authorization metadata"));
@@ -1686,6 +1819,7 @@ mod sidecar_reconnect_tests {
                 self.reconnects_to_fail.fetch_sub(1, AtomicOrdering::SeqCst);
                 return Err(anyhow::anyhow!("Flight exchange closed"));
             }
+            self.session_epoch.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
         }
 
@@ -1792,5 +1926,46 @@ mod sidecar_reconnect_tests {
             "a hard/auth failure must not retry forever"
         );
         assert_eq!(transport.reconnect_calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_stream_owner_adopts_newer_session_generation() {
+        let transport = FakeTransport::new();
+
+        transport.reconnect_session(0).await.unwrap();
+        assert_eq!(transport.session_epoch(), 1);
+        transport.reconnect_session(0).await.unwrap();
+
+        assert_eq!(
+            transport.reconnect_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a brokerage stream failing after data reconnected must not churn the fresh session"
+        );
+        assert_eq!(transport.session_epoch(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_retry_does_not_own_the_live_clock() {
+        let transport = Arc::new(FakeTransport::new());
+        transport
+            .reconnects_to_fail
+            .store(usize::MAX, AtomicOrdering::SeqCst);
+        let set = LiveSubscriptionSet::subscribe_initial(transport, &[equity_config("SPY")])
+            .await
+            .unwrap();
+        let reconnect = set.begin_reconnect();
+        tokio::task::yield_now().await;
+        assert!(
+            !reconnect.is_finished(),
+            "the simulated sidecar remains unavailable"
+        );
+
+        let mut pulses = LiveTimePulse::new(rlean_core::DateTime::from_secs(100));
+        assert_eq!(
+            pulses.next(rlean_core::DateTime::from_secs(101)),
+            Some(rlean_core::DateTime::from_secs(101)),
+            "wall-clock scheduling must continue while sidecar recovery retries"
+        );
+        reconnect.abort();
     }
 }

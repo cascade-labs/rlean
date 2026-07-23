@@ -374,6 +374,25 @@ impl LiveDeploymentWriter {
             );
         }
     }
+
+    /// Record liveness from LEAN-style wall-clock time pulses. This deliberately
+    /// bypasses the heavier portfolio/order/insight snapshot writes; the
+    /// heartbeat's own 30-second gate keeps quiet Daily strategies observable
+    /// without turning an empty time pulse into market data.
+    pub(crate) fn record_time_pulse(
+        &self,
+        time: DateTime,
+        portfolio: &SecurityPortfolioManager,
+        counts: LiveSnapshotCounts,
+    ) {
+        self.append_heartbeat(
+            time,
+            portfolio,
+            counts.slices_processed,
+            counts.order_events,
+            counts.trades,
+        );
+    }
 }
 
 pub fn load_live_insight_snapshot(dir: &Path) -> Option<LiveInsightSnapshot> {

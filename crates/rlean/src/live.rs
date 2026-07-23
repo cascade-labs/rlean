@@ -107,6 +107,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         Some(rlean_engine::SidecarBrokerageConnection {
             client: data_sidecar.clone(),
             connection_id,
+            session_epoch: data_sidecar.session_epoch(),
             name: requested_brokerage.to_string(),
             opaque_config_json,
             events,
