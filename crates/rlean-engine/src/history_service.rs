@@ -468,7 +468,7 @@ mod tests {
     }
 
     /// A `tracing` writer that captures emitted events into a shared buffer so a
-    /// test can assert the seed-timeout WARN was logged.
+    /// test can assert the no-price seed ERROR was logged (and that waiting is silent).
     #[derive(Clone)]
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
 
