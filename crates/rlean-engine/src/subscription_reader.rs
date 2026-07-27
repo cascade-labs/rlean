@@ -14,11 +14,17 @@ use rlean_data_sidecar::{
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{BTreeMap, VecDeque};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
-enum SubscriptionStreamMessage {
+pub(crate) enum SubscriptionStreamMessage {
     Point(Box<SubscriptionDataPoint>),
     Watermark(DateTime),
+}
+
+#[cfg(test)]
+impl SubscriptionStreamMessage {
+    pub(crate) fn point(point: SubscriptionDataPoint) -> Self {
+        Self::Point(Box::new(point))
+    }
 }
 
 /// One engine subscription backed by one registered sidecar subscription.
@@ -29,7 +35,6 @@ enum SubscriptionStreamMessage {
 pub struct SubscriptionStream {
     config: SubscriptionDataConfig,
     receiver: mpsc::Receiver<LeanResult<SubscriptionStreamMessage>>,
-    producer: JoinHandle<()>,
     cancel: Option<oneshot::Sender<()>>,
     pending: VecDeque<SubscriptionDataPoint>,
     watermark: Option<DateTime>,
@@ -76,7 +81,10 @@ impl SubscriptionStream {
         let (sender, receiver) = mpsc::channel(capacity);
         let (cancel, cancelled) = oneshot::channel();
         let producer_config = config.clone();
-        let producer = tokio::spawn(async move {
+        // The producer task is detached: its lifetime is governed by the
+        // cancel channel (see `Drop`) and its completion closes `sender`,
+        // which is what marks the stream exhausted.
+        tokio::spawn(async move {
             if let Err(error) = produce(
                 producer_config,
                 context,
@@ -94,8 +102,28 @@ impl SubscriptionStream {
         Self {
             config,
             receiver,
-            producer,
             cancel: Some(cancel),
+            pending: VecDeque::new(),
+            watermark: None,
+            exhausted: false,
+            producer_error: None,
+        }
+    }
+
+    /// Build a stream fed by a bare channel instead of a sidecar-backed
+    /// producer, so synchronizer wait behavior can be driven under tokio's
+    /// virtual clock in tests. The test owns the sender: an in-flight provider
+    /// request is "sender alive, nothing sent yet", a transport failure is an
+    /// `Err` message, and a resolved-empty request is dropping the sender.
+    #[cfg(test)]
+    pub(crate) fn from_channel_for_tests(
+        config: SubscriptionDataConfig,
+        receiver: mpsc::Receiver<LeanResult<SubscriptionStreamMessage>>,
+    ) -> Self {
+        Self {
+            config,
+            receiver,
+            cancel: None,
             pending: VecDeque::new(),
             watermark: None,
             exhausted: false,
@@ -117,14 +145,6 @@ impl SubscriptionStream {
 
     pub fn watermark(&self) -> Option<DateTime> {
         self.watermark
-    }
-
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub fn producer_is_finished(&self) -> bool {
-        self.producer.is_finished()
     }
 
     /// Whether this stream has proved that no further point can be emitted at

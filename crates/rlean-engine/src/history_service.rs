@@ -12,14 +12,6 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Log-only visibility threshold for slow price seeds (`get_last_known_prices`):
-/// a seed still pending after this long WARNs (symbol + elapsed) and keeps
-/// warning each interval until it returns. It is not a timeout — seeding blocks
-/// until the query answers, in live exactly as in backtest — and deliberately
-/// not a config knob: it changes nothing but log output.
-pub const SLOW_SEED_WARN_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AlgorithmHistoryContext {
@@ -86,18 +78,20 @@ impl HistoryService {
         let end_date = as_of.date_utc();
         let start_date = end_date - chrono::Duration::days(lookback_days);
         let start = date_to_datetime(start_date, 0, 0, 0);
-        // One shared seeding path for live and backtest: block until the query
-        // answers. The only extra over a plain history read is slow-seed WARN
-        // logging, so a vendor gap-fill stalling a live time step is visible.
+        // One shared seeding path for live and backtest: block until the
+        // query resolves, exactly like every other history read. Waiting on
+        // an active provider request is normal operation and is deliberately
+        // silent — no periodic WARN, no wall-clock bound. The request ends
+        // only by resolving (rows or empty) or by a transport failure, and a
+        // no-price resolution is reported loudly by `resolve_seed_price`.
         let provider = self.subscription_history_provider();
         let symbol_owned = symbol.clone();
-        let load = async move {
+        let mut bars = block_on_background(async move {
             provider
                 .get_trade_bars(symbol_owned, resolution, start, as_of, normalization_mode)
                 .await
                 .map_err(|error| anyhow!(error.to_string()))
-        };
-        let mut bars = load_seed_blocking(load, symbol)?;
+        })?;
         bars.retain(|bar| bar.close > Decimal::ZERO && bar.end_time.0 <= as_of.0);
         bars.sort_by_key(|bar| bar.end_time.0);
         if bars.len() > 1 {
@@ -419,6 +413,19 @@ fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> Dat
     DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(hour, minute, second).unwrap()))
 }
 
+/// Run a history read on a dedicated current-thread runtime on a fresh
+/// thread, blocking the caller until the query resolves.
+///
+/// Deadlock note: reads are answered over the sidecar Flight exchange whose
+/// response router runs as a task on the *main* multi-threaded runtime.
+/// Parking the calling worker here, even for minutes, cannot starve the
+/// router: it keeps making progress on the main runtime's other workers,
+/// which is what eventually completes this very read. We never block the
+/// worker that services the channel the read answers on, so the wait is
+/// bounded by the query itself — it ends when the request resolves or fails
+/// at the transport level, never by a wall-clock bound imposed here. The
+/// accepted worst case is that a live time step blocks for the full duration
+/// of a vendor gap-fill.
 fn block_on_background<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
@@ -436,67 +443,6 @@ where
         .map_err(|_| anyhow!("history worker panicked"))?
 }
 
-/// Run a price-seed history read on a dedicated background runtime, blocking
-/// the caller until the query answers — the same semantics in live as in
-/// backtest, where algorithm time blocks on the historical query.
-///
-/// Deadlock note: a seed is answered over the sidecar Flight exchange whose
-/// response router runs as a task on the *main* multi-threaded runtime. The
-/// read runs on a dedicated current-thread runtime on a fresh thread — exactly
-/// as [`block_on_background`] already does for every history read — so parking
-/// the calling worker here, even for minutes, cannot starve the router: it
-/// keeps making progress on the main runtime's other workers, which is what
-/// eventually completes this very read. We never block the worker that
-/// services the channel the seed answers on, so the wait is stall-bounded by
-/// the query itself, not a deadlock. The accepted worst case is that the live
-/// time step stalls for the full duration of a vendor gap-fill; the WARNs
-/// emitted while waiting make that stall visible.
-fn load_seed_blocking<F>(future: F, symbol: &Symbol) -> Result<Vec<TradeBar>>
-where
-    F: Future<Output = Result<Vec<TradeBar>>> + Send + 'static,
-{
-    let symbol_label = symbol.to_string();
-    let handle = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| anyhow!(error))?
-            .block_on(seed_awaiting_result(future, symbol_label))
-    });
-    handle
-        .join()
-        .map_err(|_| anyhow!("history seed worker panicked"))?
-}
-
-/// Await a price-seed read to completion, WARNing (symbol + elapsed) every
-/// [`SLOW_SEED_WARN_AFTER`] while it is still pending. Logging only — the read
-/// is never abandoned.
-///
-/// Split from the threaded dispatcher so it can be driven under tokio's virtual
-/// clock (`start_paused`) in tests.
-async fn seed_awaiting_result<F>(future: F, symbol: String) -> Result<Vec<TradeBar>>
-where
-    F: Future<Output = Result<Vec<TradeBar>>>,
-{
-    tokio::pin!(future);
-    let started = tokio::time::Instant::now();
-    loop {
-        // `timeout` here is only a warn ticker: on expiry the pinned read is
-        // kept and re-awaited, so no work is ever cancelled.
-        match tokio::time::timeout(SLOW_SEED_WARN_AFTER, &mut future).await {
-            Ok(result) => return result,
-            Err(_) => {
-                tracing::warn!(
-                    symbol = %symbol,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "price seed still pending; blocking the time step until it \
-                     returns so the security is admitted with a real price"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +451,6 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     fn sample_bar(close: Decimal) -> TradeBar {
         TradeBar::new(
@@ -542,81 +487,6 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
-    }
-
-    // Fast path: a lakehouse-answerable seed returns sub-second, so the
-    // security is admitted WITH its seeded price in the same time step and
-    // nothing is logged. This is the common case (daily lakehouse ingest).
-    #[tokio::test(start_paused = true)]
-    async fn fast_seed_returns_bars_without_warning() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(BufferWriter(buffer.clone()))
-            .finish();
-
-        let load = async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            Ok(vec![sample_bar(dec!(42))])
-        };
-        let bars = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            seed_awaiting_result(load, "NVTS".to_string())
-                .await
-                .expect("seed load")
-        };
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].close, dec!(42));
-
-        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
-        assert!(captured.is_empty(), "a fast seed must not warn: {captured}");
-    }
-
-    // Slow path: a genuine vendor gap-fill takes far longer than a few seconds.
-    // The engine must BLOCK AND WAIT for it — exactly the backtest semantics —
-    // and admit the security WITH its seeded price, emitting WARNs while it
-    // waits so the stall is visible in the log.
-    #[tokio::test(start_paused = true)]
-    async fn slow_seed_is_awaited_unbounded_and_returns_bars() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(BufferWriter(buffer.clone()))
-            .finish();
-
-        // Well past the rejected 5s bounded grace: the wait must not stop there.
-        let source_delay = Duration::from_secs(30);
-        let started = tokio::time::Instant::now();
-        let load = async move {
-            tokio::time::sleep(source_delay).await;
-            Ok(vec![sample_bar(dec!(42))])
-        };
-        let bars = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            seed_awaiting_result(load, "NVTS".to_string())
-                .await
-                .expect("seed load")
-        };
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= source_delay,
-            "seed must be awaited unbounded (waited {elapsed:?}, source took {source_delay:?})"
-        );
-        assert_eq!(bars.len(), 1, "slow seed must still admit WITH price");
-        assert_eq!(bars[0].close, dec!(42));
-
-        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
-        assert!(
-            captured.contains("WARN"),
-            "slow seed must WARN while waiting: {captured}"
-        );
-        assert!(
-            captured.contains("NVTS"),
-            "warn must name the symbol: {captured}"
-        );
     }
 
     /// Capture logs emitted while running `resolve_seed_price` at ERROR level.
@@ -708,25 +578,5 @@ mod tests {
         assert!(price.is_none());
         assert!(captured.contains("ERROR"), "captured: {captured:?}");
         assert!(captured.contains("TRMB"), "captured: {captured:?}");
-    }
-
-    // Backtest behavior unchanged: seeding blocks on the full historical query —
-    // algorithm time blocks, which is why backtests always observe the seed
-    // within the same time step. Live now runs this exact same path; there is no
-    // per-mode variant to diverge.
-    #[tokio::test(start_paused = true)]
-    async fn seed_awaits_full_result_matching_backtest() {
-        let source_delay = Duration::from_secs(120);
-        let started = tokio::time::Instant::now();
-        let load = async move {
-            tokio::time::sleep(source_delay).await;
-            Ok(vec![sample_bar(dec!(42))])
-        };
-        let bars = seed_awaiting_result(load, "NVTS".to_string())
-            .await
-            .expect("seed load");
-        assert!(started.elapsed() >= source_delay);
-        assert_eq!(bars.len(), 1, "seed must await the full result");
-        assert_eq!(bars[0].close, dec!(42));
     }
 }
