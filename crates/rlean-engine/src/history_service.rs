@@ -168,26 +168,55 @@ impl AlgorithmHistoryService for HistoryService {
             Some(resolution),
             DataNormalizationMode::Adjusted,
         );
-        let bars = match self.load_last_known_trade_bar(symbol, resolution, as_of, normalization) {
-            Ok(bars) => bars,
-            Err(error) => {
-                // A failed seeding read leaves the security's price at zero,
-                // which silently disqualifies it from trading (strategies guard
-                // on price > 0). Surface it loudly instead of returning None
-                // without a trace.
-                tracing::error!(
-                    symbol = %symbol,
-                    %error,
-                    "get_last_known_prices: history read for price seeding failed; \
-                     the security keeps a zero price and will be skipped by \
-                     price-guarded strategies"
-                );
-                return None;
-            }
-        };
-        bars.last()
-            .and_then(|bar| bar.close.to_f64())
-            .filter(|price| *price > 0.0 && price.is_finite())
+        let result = self.load_last_known_trade_bar(symbol, resolution, as_of, normalization);
+        resolve_seed_price(symbol, result)
+    }
+}
+
+/// Turn a completed price-seed read into a usable seed price, or `None`.
+///
+/// Every `None` outcome leaves the security at a zero price, which
+/// price-guarded strategies drop without a trace — the 2026-07-27 live
+/// incident where two valid entry signals (TRMB, DBX) were lost at the seed
+/// step because the seed produced no bars in the lookback window and the empty
+/// result was silently mapped to `None`. So each no-price outcome — a failed
+/// read, an empty result, or a non-positive/non-finite close — must be an
+/// error-level log naming the symbol and the reason, not a silent `None`.
+fn resolve_seed_price(symbol: &Symbol, result: Result<Vec<TradeBar>>) -> Option<f64> {
+    let bars = match result {
+        Ok(bars) => bars,
+        Err(error) => {
+            tracing::error!(
+                symbol = %symbol,
+                %error,
+                "get_last_known_prices: history read for price seeding failed; \
+                 the security keeps a zero price and will be skipped by \
+                 price-guarded strategies"
+            );
+            return None;
+        }
+    };
+    let Some(bar) = bars.last() else {
+        tracing::error!(
+            symbol = %symbol,
+            "get_last_known_prices: price seed returned no bars within the \
+             lookback window (stale or missing data); the security keeps a zero \
+             price and will be skipped by price-guarded strategies"
+        );
+        return None;
+    };
+    match bar.close.to_f64() {
+        Some(price) if price > 0.0 && price.is_finite() => Some(price),
+        _ => {
+            tracing::error!(
+                symbol = %symbol,
+                close = %bar.close,
+                "get_last_known_prices: price seed produced a non-positive or \
+                 non-finite close; the security keeps a zero price and will be \
+                 skipped by price-guarded strategies"
+            );
+            None
+        }
     }
 }
 
@@ -588,6 +617,97 @@ mod tests {
             captured.contains("NVTS"),
             "warn must name the symbol: {captured}"
         );
+    }
+
+    /// Capture logs emitted while running `resolve_seed_price` at ERROR level.
+    fn resolve_seed_price_capturing_logs(
+        symbol: &Symbol,
+        result: Result<Vec<TradeBar>>,
+    ) -> (Option<f64>, String) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(BufferWriter(buffer.clone()))
+            .finish();
+        let price = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            resolve_seed_price(symbol, result)
+        };
+        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (price, captured)
+    }
+
+    // Regression for the 2026-07-27 lost-signal incident: a seed that returns
+    // NO bars in the lookback window (stale/missing data) must not vanish. It
+    // must produce no price AND a LOUD error naming the symbol, so the operator
+    // sees which security kept a zero price instead of the signal being dropped
+    // in silence.
+    #[test]
+    fn empty_seed_result_logs_a_loud_error_naming_the_symbol() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let (price, captured) = resolve_seed_price_capturing_logs(&symbol, Ok(Vec::new()));
+
+        assert!(
+            price.is_none(),
+            "an empty seed cannot produce a price: {price:?}"
+        );
+        assert!(
+            captured.contains("ERROR"),
+            "an empty seed must log at ERROR level, not vanish silently: {captured:?}"
+        );
+        assert!(
+            captured.contains("TRMB"),
+            "the error must name the symbol that lost its seed: {captured:?}"
+        );
+    }
+
+    // A seeded bar with a non-positive close is equally unusable and must be
+    // just as loud — a zero/negative price silently disqualifies the security.
+    #[test]
+    fn non_positive_seed_close_logs_a_loud_error_naming_the_symbol() {
+        let symbol = Symbol::create_equity("DBX", &Market::usa());
+        let (price, captured) =
+            resolve_seed_price_capturing_logs(&symbol, Ok(vec![sample_bar(dec!(0))]));
+
+        assert!(
+            price.is_none(),
+            "a non-positive close is unusable: {price:?}"
+        );
+        assert!(
+            captured.contains("ERROR"),
+            "a non-positive seed close must log at ERROR level: {captured:?}"
+        );
+        assert!(
+            captured.contains("DBX"),
+            "the error must name the symbol: {captured:?}"
+        );
+    }
+
+    // A good seed still returns its price and stays quiet at ERROR level.
+    #[test]
+    fn usable_seed_returns_price_without_error() {
+        let symbol = Symbol::create_equity("NVTS", &Market::usa());
+        let (price, captured) =
+            resolve_seed_price_capturing_logs(&symbol, Ok(vec![sample_bar(dec!(42))]));
+
+        assert_eq!(price, Some(42.0));
+        assert!(
+            captured.is_empty(),
+            "a usable seed must not log an error: {captured:?}"
+        );
+    }
+
+    // A failed read stays loud (unchanged behavior, guarded against regression).
+    #[test]
+    fn failed_seed_read_logs_a_loud_error_naming_the_symbol() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let (price, captured) =
+            resolve_seed_price_capturing_logs(&symbol, Err(anyhow!("sidecar query failed")));
+
+        assert!(price.is_none());
+        assert!(captured.contains("ERROR"), "captured: {captured:?}");
+        assert!(captured.contains("TRMB"), "captured: {captured:?}");
     }
 
     // Backtest behavior unchanged: seeding blocks on the full historical query —
