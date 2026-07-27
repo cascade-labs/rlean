@@ -64,9 +64,9 @@ impl HistoryService {
         Ok(bars)
     }
 
-    /// Load the single most-recent known trade bar for `symbol`, applying
-    /// LEAN's resolution-dependent lookback window. Language-neutral rule moved
-    /// out of the Python binding.
+    /// Load the single most-recent known trade bar for `symbol` using LEAN's
+    /// bar-count seeding ladder (`QCAlgorithm.GetLastKnownPricesImpl`).
+    /// Language-neutral rule moved out of the Python binding.
     pub fn load_last_known_trade_bar(
         &self,
         symbol: &Symbol,
@@ -74,30 +74,33 @@ impl HistoryService {
         as_of: DateTime,
         normalization_mode: DataNormalizationMode,
     ) -> Result<Vec<TradeBar>> {
-        let lookback_days = last_known_lookback_days(resolution);
-        let end_date = as_of.date_utc();
-        let start_date = end_date - chrono::Duration::days(lookback_days);
-        let start = date_to_datetime(start_date, 0, 0, 0);
-        // One shared seeding path for live and backtest: block until the
-        // query resolves, exactly like every other history read. Waiting on
-        // an active provider request is normal operation and is deliberately
-        // silent — no periodic WARN, no wall-clock bound. The request ends
-        // only by resolving (rows or empty) or by a transport failure, and a
-        // no-price resolution is reported loudly by `resolve_seed_price`.
-        let provider = self.subscription_history_provider();
-        let symbol_owned = symbol.clone();
-        let mut bars = block_on_background(async move {
-            provider
-                .get_trade_bars(symbol_owned, resolution, start, as_of, normalization_mode)
-                .await
-                .map_err(|error| anyhow!(error.to_string()))
-        })?;
-        bars.retain(|bar| bar.close > Decimal::ZERO && bar.end_time.0 <= as_of.0);
-        bars.sort_by_key(|bar| bar.end_time.0);
-        if bars.len() > 1 {
-            bars = bars[bars.len() - 1..].to_vec();
-        }
-        Ok(bars)
+        // Each attempt is one shared blocking read, live exactly like
+        // backtest: awaited until it resolves, silently — no periodic WARN,
+        // no wall-clock bound. A transport failure aborts the ladder with an
+        // `Err`, and a ladder that resolves empty end-to-end is reported
+        // loudly by `resolve_seed_price`.
+        run_seed_attempts(
+            rlean_core::MarketHoursDatabase::global().as_ref(),
+            symbol,
+            resolution,
+            as_of,
+            |attempt_resolution, start| {
+                let provider = self.subscription_history_provider();
+                let symbol_owned = symbol.clone();
+                block_on_background(async move {
+                    provider
+                        .get_trade_bars(
+                            symbol_owned,
+                            attempt_resolution,
+                            start,
+                            as_of,
+                            normalization_mode,
+                        )
+                        .await
+                        .map_err(|error| anyhow!(error.to_string()))
+                })
+            },
+        )
     }
 
     pub fn load_custom_history_blocking(
@@ -167,6 +170,111 @@ impl AlgorithmHistoryService for HistoryService {
     }
 }
 
+// LEAN's bar-count seeding ladder, mirroring QCAlgorithm.History.cs:34-37
+// (SeedLookbackPeriod and the seed-retry lookback periods) and
+// GetLastKnownPricesImpl's escalation. Plain constants by design: LEAN exposes
+// config keys for these, rlean deliberately does not.
+const SEED_LOOKBACK_BARS: usize = 5;
+const SEED_RETRY_MINUTE_BARS: usize = 24 * 60;
+const SEED_RETRY_HOUR_BARS: usize = 24;
+const SEED_RETRY_DAILY_BARS: usize = 10;
+/// LEAN's last resort: `Math.Min(60, 5 * SeedRetryDailyLookbackPeriod)` = 50
+/// daily bars.
+const SEED_FINAL_DAILY_BARS: usize = 50;
+
+/// The seed request ladder: which (resolution, bar count) to try, in order,
+/// until one resolves with a usable bar. Mirrors LEAN's
+/// `GetLastKnownPricesImpl`: 5 bars, then one day's worth at the resolution
+/// (an illiquid security), then a daily last resort.
+fn seed_attempt_plan(resolution: Resolution) -> Vec<(Resolution, usize)> {
+    // LEAN promotes sub-minute seed requests to minute bars (attempt 0's
+    // `request.Resolution < Resolution.Minute` branch).
+    let resolution = match resolution {
+        Resolution::Tick | Resolution::Second => Resolution::Minute,
+        other => other,
+    };
+    let retry_bars = match resolution {
+        Resolution::Daily => SEED_RETRY_DAILY_BARS,
+        Resolution::Hour => SEED_RETRY_HOUR_BARS,
+        _ => SEED_RETRY_MINUTE_BARS,
+    };
+    vec![
+        (resolution, SEED_LOOKBACK_BARS),
+        (resolution, retry_bars),
+        (Resolution::Daily, SEED_FINAL_DAILY_BARS),
+    ]
+}
+
+/// Start of the query range for a bar-count seed attempt, computed back
+/// through the EXCHANGE CALENDAR like LEAN's `CreateBarCountHistoryRequests`:
+/// only bars inside trading sessions are counted, so five minute-bars just
+/// after Monday's open reach into Friday's close — the weekend and holidays
+/// are never part of the request. This is what keeps the seed a handful of
+/// lakehouse rows instead of a multi-day speculative range (the 2026-07-27
+/// incident's 7-calendar-day request forced a 2,094-row, 26.5s remote
+/// gap-fill for what LEAN semantics answer with ~5 rows).
+fn seed_bar_count_start(
+    market_hours: &rlean_core::MarketHoursDatabase,
+    symbol: &Symbol,
+    resolution: Resolution,
+    as_of: DateTime,
+    bars: usize,
+) -> DateTime {
+    if resolution == Resolution::Daily {
+        // N daily bars = N open sessions back through the calendar.
+        let start_date = market_hours.warmup_start_date(symbol, bars, as_of.date_utc());
+        return date_to_datetime(start_date, 0, 0, 0);
+    }
+    let period = resolution
+        .to_time_span()
+        .unwrap_or(rlean_core::TimeSpan::ONE_MINUTE);
+    let exchange_hours = market_hours.exchange_hours(symbol);
+    // Walk bar-by-bar, counting only bars whose start falls inside a session
+    // (the same convention as fill-forward's `is_market_open`). Capped so a
+    // pathological calendar cannot loop forever; hitting the cap only yields
+    // a wider — still safe — range.
+    let closed_span_cap = (30 * rlean_core::TimeSpan::ONE_DAY.nanos / period.nanos) as usize;
+    let max_steps = bars.saturating_add(closed_span_cap);
+    let mut cursor = as_of;
+    let mut remaining = bars;
+    for _ in 0..max_steps {
+        if remaining == 0 {
+            break;
+        }
+        cursor = cursor - period;
+        if exchange_hours.is_open_at(cursor) {
+            remaining -= 1;
+        }
+    }
+    cursor
+}
+
+/// Run the seed ladder: issue each attempt's request in turn, keeping the
+/// most recent usable bar of the first attempt that resolves non-empty.
+/// Returns empty only after every attempt resolved empty; a transport failure
+/// aborts immediately with the fetch error.
+fn run_seed_attempts<F>(
+    market_hours: &rlean_core::MarketHoursDatabase,
+    symbol: &Symbol,
+    resolution: Resolution,
+    as_of: DateTime,
+    mut fetch: F,
+) -> Result<Vec<TradeBar>>
+where
+    F: FnMut(Resolution, DateTime) -> Result<Vec<TradeBar>>,
+{
+    for (attempt_resolution, bars) in seed_attempt_plan(resolution) {
+        let start = seed_bar_count_start(market_hours, symbol, attempt_resolution, as_of, bars);
+        let mut fetched = fetch(attempt_resolution, start)?;
+        fetched.retain(|bar| bar.close > Decimal::ZERO && bar.end_time.0 <= as_of.0);
+        fetched.sort_by_key(|bar| bar.end_time.0);
+        if let Some(last) = fetched.pop() {
+            return Ok(vec![last]);
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// Turn a completed price-seed read into a usable seed price, or `None`.
 ///
 /// Every `None` outcome leaves the security at a zero price, which
@@ -193,9 +301,10 @@ fn resolve_seed_price(symbol: &Symbol, result: Result<Vec<TradeBar>>) -> Option<
     let Some(bar) = bars.last() else {
         tracing::error!(
             symbol = %symbol,
-            "get_last_known_prices: price seed returned no bars within the \
-             lookback window (stale or missing data); the security keeps a zero \
-             price and will be skipped by price-guarded strategies"
+            "get_last_known_prices: price seed resolved empty after every \
+             lookback attempt (5-bar, one-day-of-bars, 50-bar daily); the \
+             security keeps a zero price and will be skipped by price-guarded \
+             strategies"
         );
         return None;
     };
@@ -370,15 +479,6 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
     columns
 }
 
-/// LEAN's resolution-dependent lookback window for "last known price" lookups.
-pub fn last_known_lookback_days(resolution: Resolution) -> i64 {
-    match resolution {
-        Resolution::Tick | Resolution::Second | Resolution::Minute => 7,
-        Resolution::Hour => 14,
-        Resolution::Daily => 31,
-    }
-}
-
 /// Select the data-normalization mode for a history request from the matching
 /// subscriptions, mirroring C# Lean's `GetMatchingSubscriptions`: prefer a
 /// trade subscription at the requested resolution, then any subscription for
@@ -506,6 +606,168 @@ mod tests {
         };
         let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         (price, captured)
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime {
+        DateTime::from(Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap())
+    }
+
+    fn sample_bar_at(close: Decimal, end_time: DateTime) -> TradeBar {
+        TradeBar::new(
+            Symbol::create_equity("TRMB", &Market::usa()),
+            end_time - TimeSpan::ONE_MINUTE,
+            TimeSpan::ONE_MINUTE,
+            TradeBarData {
+                open: close,
+                high: close,
+                low: close,
+                close,
+                volume: dec!(1),
+            },
+        )
+    }
+
+    // LEAN seeds with a 5-BAR count request (QCAlgorithm.History.cs:34,
+    // SeedLookbackPeriod), whose start is computed back through the EXCHANGE
+    // CALENDAR — not a speculative multi-day range. Mid-session on Monday
+    // 2026-07-27 17:00Z (13:00 ET), five minute-bars start five minutes ago.
+    // This is the request shape whose 7-calendar-day predecessor forced the
+    // sidecar into a 2,094-row 26.5s gap-fill for what should be ~5 rows.
+    #[test]
+    fn first_seed_attempt_requests_five_bars_through_the_exchange_calendar() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let market_hours = rlean_core::MarketHoursDatabase::global();
+        let as_of = utc(2026, 7, 27, 17, 0);
+
+        let plan = seed_attempt_plan(Resolution::Minute);
+        assert_eq!(
+            plan[0],
+            (Resolution::Minute, 5),
+            "the first attempt is LEAN's 5-bar seed request"
+        );
+
+        let start = seed_bar_count_start(&market_hours, &symbol, plan[0].0, as_of, plan[0].1);
+        assert_eq!(
+            start,
+            utc(2026, 7, 27, 16, 55),
+            "five minute-bars mid-session start five minutes back, \
+             not seven calendar days"
+        );
+    }
+
+    // Just after Monday's open (2026-07-27 13:31Z = 09:31 ET) only one bar of
+    // the session exists; the other four come from Friday's close. The
+    // computed start must land inside Friday's session — the weekend is never
+    // part of the request.
+    #[test]
+    fn bar_count_start_walks_back_through_the_weekend_to_fridays_session() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let market_hours = rlean_core::MarketHoursDatabase::global();
+        let at_open = utc(2026, 7, 27, 13, 31);
+
+        let start = seed_bar_count_start(&market_hours, &symbol, Resolution::Minute, at_open, 5);
+
+        assert_eq!(
+            start,
+            utc(2026, 7, 24, 19, 56),
+            "four of the five bars are Friday's last four minutes \
+             (session close 20:00Z); weekend minutes are never counted"
+        );
+    }
+
+    // LEAN's escalation (GetLastKnownPricesImpl): an EMPTY 5-bar attempt
+    // widens to one day's worth at the resolution (minute: 24*60 bars), and an
+    // empty retry falls back to min(60, 5*10) = 50 DAILY bars. Only after the
+    // daily fallback resolves empty does the seed conclude "no price" (which
+    // `resolve_seed_price` then reports loudly).
+    #[test]
+    fn empty_attempts_escalate_to_one_day_of_bars_then_daily_fallback() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let market_hours = rlean_core::MarketHoursDatabase::global();
+        let as_of = utc(2026, 7, 27, 17, 0);
+
+        assert_eq!(
+            seed_attempt_plan(Resolution::Minute),
+            vec![
+                (Resolution::Minute, 5),
+                (Resolution::Minute, 24 * 60),
+                (Resolution::Daily, 50),
+            ]
+        );
+
+        let mut requests = Vec::new();
+        let result = run_seed_attempts(
+            &market_hours,
+            &symbol,
+            Resolution::Minute,
+            as_of,
+            |resolution, start| {
+                requests.push((resolution, start));
+                Ok(Vec::new())
+            },
+        )
+        .expect("an all-empty ladder resolves, it does not fail");
+
+        assert!(result.is_empty(), "all attempts resolved empty");
+        assert_eq!(requests.len(), 3, "every rung of the ladder was tried");
+        assert_eq!(requests[0].0, Resolution::Minute);
+        assert_eq!(requests[1].0, Resolution::Minute);
+        assert_eq!(requests[2].0, Resolution::Daily);
+        assert!(
+            requests[1].1 < requests[0].1,
+            "the retry must reach further back than the 5-bar attempt"
+        );
+        assert!(
+            requests[2].1 < requests[1].1,
+            "the 50-bar daily fallback must reach further back than one \
+             day's worth of minutes"
+        );
+    }
+
+    // A non-empty first attempt stops the ladder: one request, its bar wins.
+    #[test]
+    fn successful_first_attempt_stops_the_ladder() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let market_hours = rlean_core::MarketHoursDatabase::global();
+        let as_of = utc(2026, 7, 27, 17, 0);
+        let bar = sample_bar_at(dec!(70), utc(2026, 7, 27, 16, 59));
+
+        let mut calls = 0;
+        let result =
+            run_seed_attempts(&market_hours, &symbol, Resolution::Minute, as_of, |_, _| {
+                calls += 1;
+                Ok(vec![bar.clone()])
+            })
+            .expect("seed load");
+
+        assert_eq!(calls, 1, "a resolved non-empty attempt ends the ladder");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].close, dec!(70));
+    }
+
+    // A transport failure resolves the ladder immediately with the error —
+    // no further attempts, and the loud failed-read path takes over.
+    #[test]
+    fn transport_failure_aborts_the_ladder_immediately() {
+        let symbol = Symbol::create_equity("TRMB", &Market::usa());
+        let market_hours = rlean_core::MarketHoursDatabase::global();
+        let as_of = utc(2026, 7, 27, 17, 0);
+
+        let mut calls = 0;
+        let error = run_seed_attempts(
+            &market_hours,
+            &symbol,
+            Resolution::Minute,
+            as_of,
+            |_, _| -> Result<Vec<TradeBar>> {
+                calls += 1;
+                Err(anyhow!("sidecar transport failed"))
+            },
+        )
+        .expect_err("a transport failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("sidecar transport failed"));
     }
 
     // Regression for the 2026-07-27 lost-signal incident: a seed that returns

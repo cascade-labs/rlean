@@ -46,9 +46,7 @@ pub use fundamental_universe::{
     FundamentalUniverseSelectFn, FundamentalUniverseSelectorRegistry,
     FundamentalUniverseSelectorSlot,
 };
-pub use history_service::{
-    last_known_lookback_days, matching_normalization_mode, AlgorithmHistoryContext, HistoryService,
-};
+pub use history_service::{matching_normalization_mode, AlgorithmHistoryContext, HistoryService};
 pub use research::{IndicatorResult, ResearchEngine};
 pub use result_handler::ResultHandler;
 pub use runner_config::{
