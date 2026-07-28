@@ -253,7 +253,23 @@ where
                             .lock()
                             .expect("algorithm state poisoned during brokerage account sync");
                         ensure_brokerage_holding_securities(&mut algorithm, &sync.holdings);
+                        seed_missing_brokerage_holding_prices(
+                            &mut algorithm,
+                            &sync.holdings,
+                            &history_service,
+                        );
                     }
+                    // Brokerage holdings are unrequested LEAN securities. They
+                    // must join the live feed immediately so a holding whose
+                    // brokerage and history prices are both unavailable can
+                    // receive a quote and release its deferred liquidation.
+                    sync_live_subscriptions(
+                        &algorithm_manager,
+                        &mut live_subscriptions,
+                        benchmark_subscription.as_ref(),
+                        &feed_context,
+                    )
+                    .await?;
                     if let Some(portfolio) = portfolio.as_ref() {
                         crate::live::deployment_writer::set_live_starting_portfolio_value_from_synced_account(portfolio);
                     }
@@ -629,6 +645,49 @@ fn ensure_brokerage_holding_securities(
             algorithm
                 .portfolio
                 .update_prices(&holding.symbol, holding.market_price);
+        }
+    }
+}
+
+/// Match C# LEAN BrokerageSetupHandler.LoadExistingHoldingsAndOrders: after
+/// creating an unrequested security and applying the brokerage holding, resolve
+/// a zero brokerage MarketPrice through GetLastKnownPrice and seed both the
+/// security and portfolio before any liquidation/order validation runs.
+fn seed_missing_brokerage_holding_prices(
+    algorithm: &mut rlean_algorithm::qc_algorithm::QcAlgorithm,
+    holdings: &[rlean_brokerages::BrokerageHolding],
+    history_service: &Arc<dyn rlean_algorithm::lifecycle::AlgorithmHistoryService>,
+) {
+    if algorithm.utc_time == rlean_core::DateTime::EPOCH {
+        crate::algorithm_services::advance_algorithm_time(algorithm, rlean_core::DateTime::now());
+    }
+    for holding in holdings {
+        let current_price = algorithm
+            .securities
+            .get(&holding.symbol)
+            .map(|security| security.current_price())
+            .unwrap_or_default();
+        if current_price > rust_decimal::Decimal::ZERO {
+            continue;
+        }
+        let seeded = history_service
+            .last_known_close_price(algorithm, &holding.symbol, rlean_core::Resolution::Daily)
+            .and_then(|price| rust_decimal::Decimal::try_from(price).ok())
+            .filter(|price| *price > rust_decimal::Decimal::ZERO);
+        match seeded {
+            Some(price) => {
+                algorithm.securities.update_price(&holding.symbol, price);
+                algorithm.portfolio.update_prices(&holding.symbol, price);
+                tracing::info!(
+                    "seeded last-known price for brokerage holding {}: {}",
+                    holding.symbol.value,
+                    price
+                );
+            }
+            None => tracing::warn!(
+                "no brokerage or last-known price available for holding {}; position-reducing orders will wait for live data",
+                holding.symbol.value
+            ),
         }
     }
 }
@@ -1701,7 +1760,32 @@ mod live_time_pulse_tests {
 #[cfg(test)]
 mod unmanaged_liquidation_tests {
     use super::*;
+    use rlean_algorithm::lifecycle::AlgorithmHistoryService;
+    use rlean_core::{Resolution, Symbol};
     use rust_decimal_macros::dec;
+
+    struct FixedLastKnownPrice(f64);
+
+    impl AlgorithmHistoryService for FixedLastKnownPrice {
+        fn history(
+            &self,
+            _algorithm: &rlean_algorithm::qc_algorithm::QcAlgorithm,
+            _symbol: &Symbol,
+            _periods: usize,
+            _resolution: Resolution,
+        ) -> rlean_algorithm::lifecycle::HistoryColumns {
+            HashMap::new()
+        }
+
+        fn last_known_close_price(
+            &self,
+            _algorithm: &rlean_algorithm::qc_algorithm::QcAlgorithm,
+            _symbol: &Symbol,
+            _resolution: Resolution,
+        ) -> Option<f64> {
+            Some(self.0)
+        }
+    }
 
     #[test]
     fn queued_closing_orders_reduce_restart_liquidation_quantity() {
@@ -1753,6 +1837,32 @@ mod unmanaged_liquidation_tests {
         assert!(algorithm.securities.contains(&symbol));
         assert_eq!(
             algorithm.securities.get(&symbol).unwrap().current_price(),
+            dec!(45.23)
+        );
+    }
+
+    #[test]
+    fn zero_price_brokerage_holding_is_seeded_from_last_known_history() {
+        let symbol = rlean_core::Symbol::create_equity("AA", &rlean_core::Market::usa());
+        let mut algorithm = rlean_algorithm::qc_algorithm::QcAlgorithm::new("test", dec!(10000));
+        let holding = rlean_brokerages::BrokerageHolding {
+            symbol: symbol.clone(),
+            quantity: dec!(198),
+            average_price: dec!(46.51),
+            market_price: dec!(0),
+        };
+        ensure_brokerage_holding_securities(&mut algorithm, std::slice::from_ref(&holding));
+        let history_service: Arc<dyn AlgorithmHistoryService> =
+            Arc::new(FixedLastKnownPrice(45.23));
+
+        seed_missing_brokerage_holding_prices(&mut algorithm, &[holding], &history_service);
+
+        assert_eq!(
+            algorithm.securities.get(&symbol).unwrap().current_price(),
+            dec!(45.23)
+        );
+        assert_eq!(
+            algorithm.portfolio.get_holding(&symbol).last_price,
             dec!(45.23)
         );
     }

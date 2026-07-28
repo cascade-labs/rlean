@@ -10,7 +10,7 @@ use anyhow::Result;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, OptionSubscription};
 use rlean_core::{
     DataNormalizationMode, Market, MarketHoursDatabase, Resolution, RiskFreeInterestRateModel,
-    Symbol,
+    SecurityType, Symbol, TickType,
 };
 use rlean_data::{
     OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
@@ -539,7 +539,7 @@ pub(crate) fn warmup_subscriptions_at_resolution(
 ) -> Vec<rlean_data::SubscriptionDataConfig> {
     subscriptions
         .iter()
-        .map(|config| {
+        .filter_map(|config| {
             let mut warmup = config.clone();
             if let Some(resolution) = resolution {
                 warmup.resolution = resolution;
@@ -547,9 +547,18 @@ pub(crate) fn warmup_subscriptions_at_resolution(
                     custom.config.resolution = resolution;
                 }
             }
-            warmup
+            lean_data_configuration_is_valid(&warmup).then_some(warmup)
         })
         .collect()
+}
+
+/// Mirrors LEAN's `LeanData.IsValidConfiguration` constraint for equity bars:
+/// hourly and daily equity subscriptions are trade-only. Minute and finer
+/// equity subscriptions may carry both trades and quotes.
+fn lean_data_configuration_is_valid(config: &SubscriptionDataConfig) -> bool {
+    !(config.symbol.security_type() == SecurityType::Equity
+        && matches!(config.resolution, Resolution::Hour | Resolution::Daily)
+        && config.tick_type == TickType::Quote)
 }
 
 fn resolve_backtest_dates(
@@ -1254,5 +1263,18 @@ mod tests {
         assert_eq!(minute.resolution, Resolution::Minute);
         assert_eq!(warmed[0].resolution, Resolution::Daily);
         assert_ne!(minute.unique_id(), warmed[0].unique_id());
+    }
+
+    #[test]
+    fn daily_warmup_drops_equity_quote_subscription_like_lean() {
+        let trade = equity_config("SPY");
+        let mut quote = trade.clone();
+        quote.set_tick_type(rlean_core::TickType::Quote);
+
+        let warmed = warmup_subscriptions_at_resolution(&[trade, quote], Some(Resolution::Daily));
+
+        assert_eq!(warmed.len(), 1);
+        assert_eq!(warmed[0].tick_type, rlean_core::TickType::Trade);
+        assert_eq!(warmed[0].resolution, Resolution::Daily);
     }
 }
