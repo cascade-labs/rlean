@@ -391,6 +391,7 @@ where
     }
     let run_started = Instant::now();
     let mut assembler = LiveSliceAssembler::new();
+    assembler.set_subscriptions(live_subscriptions.configs.values());
     let mut time_pulse = LiveTimePulse::new(rlean_core::DateTime::now());
     let mut live_reconnect: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
@@ -487,6 +488,10 @@ where
                 live_reconnect = Some(live_subscriptions.begin_reconnect());
             }
         }
+        // Universe and strategy code can add/remove subscriptions while live.
+        // Keep the assembler's LEAN-style fill-forward enumerators aligned with
+        // the exact active sidecar subscription set.
+        assembler.set_subscriptions(live_subscriptions.configs.values());
         let ready_slices: Vec<_> = assembler
             .advance(rlean_core::DateTime::now())
             .into_iter()
