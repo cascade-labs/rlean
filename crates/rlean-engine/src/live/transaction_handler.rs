@@ -136,6 +136,11 @@ pub struct LiveBrokerageRouter {
     /// Market-on-open orders already logged as deferred, so holding an order
     /// across a closed market logs once instead of once per live iteration.
     moo_deferred_logged: std::collections::HashSet<i64>,
+    /// Position-reducing orders waiting for their security's first usable
+    /// market price. LEAN seeds brokerage holdings with GetLastKnownPrice before
+    /// trading; this is the asynchronous safety net when both the brokerage
+    /// snapshot and history seed are temporarily empty.
+    price_deferred_logged: std::collections::HashSet<i64>,
 }
 
 fn order_reduces_position(algorithm: &QcAlgorithm, order: &Order) -> bool {
@@ -182,6 +187,7 @@ impl LiveBrokerageRouter {
             submit_attempts: HashMap::new(),
             retry_not_before: HashMap::new(),
             moo_deferred_logged: std::collections::HashSet::new(),
+            price_deferred_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -208,6 +214,7 @@ impl LiveBrokerageRouter {
             submit_attempts: HashMap::new(),
             retry_not_before: HashMap::new(),
             moo_deferred_logged: std::collections::HashSet::new(),
+            price_deferred_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -279,6 +286,29 @@ impl LiveBrokerageRouter {
                             .get(&order.id)
                             .is_none_or(|not_before| now_instant >= *not_before) =>
                 {
+                    // C# LEAN's BrokerageSetupHandler resolves a zero brokerage
+                    // holding price through GetLastKnownPrice before orders can
+                    // be submitted. Live sidecar pricing is asynchronous, so if
+                    // both snapshot and history seeding are empty, keep a
+                    // reducing order New until its first quote instead of
+                    // terminally invalidating a liquidation that requires no
+                    // additional buying power.
+                    let current_price = algorithm
+                        .securities
+                        .get(&order.symbol)
+                        .map(|security| security.current_price())
+                        .unwrap_or_default();
+                    if order_reduces_position(algorithm, &order) && current_price <= Decimal::ZERO {
+                        if self.price_deferred_logged.insert(order.id) {
+                            tracing::warn!(
+                                order_id = order.id,
+                                symbol = %order.symbol.value,
+                                "position-reducing order has no market price; deferring until brokerage, history, or live data seeds the security"
+                            );
+                        }
+                        continue;
+                    }
+                    self.price_deferred_logged.remove(&order.id);
                     match algorithm.validate_order_submission_buying_power(&order) {
                         Ok(()) => self.dispatch_new_order(order, transactions, now),
                         Err(message) => {
@@ -1491,6 +1521,49 @@ mod tests {
             algorithm.transactions.get_order(1).unwrap().status,
             OrderStatus::Invalid
         );
+        router.shutdown();
+    }
+
+    #[test]
+    fn zero_price_position_reduction_waits_for_price_instead_of_becoming_invalid() {
+        let mut algorithm = QcAlgorithm::new("test", dec!(10000));
+        algorithm.set_brokerage_model(BrokerageName::TradierBrokerage, AccountType::Margin);
+
+        let existing = algorithm.add_equity("SPY", Resolution::Minute);
+        algorithm
+            .portfolio
+            .set_holdings(&existing, dec!(100), dec!(10), dec!(1));
+        let sell = Order::market(
+            1,
+            existing.clone(),
+            dec!(-10),
+            DateTime::now(),
+            "Liquidate unmanaged holding",
+        );
+        algorithm.transactions.add_order(sell);
+
+        let mock = MockBrokerage::new();
+        let submitted = mock.submitted.clone();
+        let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
+
+        let events = router.dispatch_pending(&algorithm.transactions, &algorithm);
+        assert!(events.is_empty());
+        assert!(submitted.lock().is_empty());
+        assert_eq!(
+            algorithm.transactions.get_order(1).unwrap().status,
+            OrderStatus::New
+        );
+
+        algorithm.securities.update_price(&existing, dec!(101));
+        algorithm.portfolio.update_prices(&existing, dec!(101));
+        let events = router.dispatch_pending(&algorithm.transactions, &algorithm);
+        assert!(events.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while submitted.lock().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(submitted.lock().len(), 1);
+        assert_eq!(submitted.lock()[0].symbol, existing);
         router.shutdown();
     }
 
