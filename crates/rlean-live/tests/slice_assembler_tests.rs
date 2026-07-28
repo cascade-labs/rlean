@@ -207,6 +207,31 @@ fn real_quote_at_custom_frontier_wins_over_fill_forward() {
 }
 
 #[test]
+fn custom_data_between_minute_boundaries_contains_current_quote() {
+    let spy = Symbol::create_equity("SPY", &Market::usa());
+    let mut quote_config = SubscriptionDataConfig::new_equity(
+        spy.clone(),
+        Resolution::Minute,
+        DataNormalizationMode::Raw,
+    );
+    quote_config.set_tick_type(TickType::Quote);
+
+    let mut assembler = LiveSliceAssembler::new();
+    assembler.set_subscriptions([&quote_config]);
+    let quote_time = utc("2026-07-28T15:59:00Z");
+    assembler.enqueue(LiveDataItem::QuoteBar(spy_quote(quote_time, 635, 636)));
+    assembler.advance(utc("2026-07-28T16:00:00Z")).unwrap();
+
+    let custom_time = utc("2026-07-28T16:00:35Z");
+    assembler.enqueue(custom_item(utc("2026-07-28T16:00:00Z")));
+    let slice = assembler.advance(custom_time).unwrap();
+
+    let quote = &slice.quote_bars[&spy.id.sid];
+    assert_eq!(quote.time, quote_time);
+    assert_eq!(quote.end_time, utc("2026-07-28T16:00:00Z"));
+}
+
+#[test]
 fn removed_subscription_does_not_fill_forward() {
     let spy = Symbol::create_equity("SPY", &Market::usa());
     let mut quote_config = SubscriptionDataConfig::new_equity(

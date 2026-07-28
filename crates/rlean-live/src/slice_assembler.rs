@@ -186,9 +186,6 @@ fn fill_forward_item(
         return None;
     }
     let steps = (frontier.0 - previous_frontier.0) / period.nanos;
-    if steps == 0 {
-        return None;
-    }
     let fill_frontier = NanosecondTimestamp(previous_frontier.0 + steps * period.nanos);
     if config.symbol.security_type() == SecurityType::Equity
         && !MarketHoursDatabase::global()
@@ -196,6 +193,14 @@ fn fill_forward_item(
             .is_open_at(fill_frontier - period)
     {
         return None;
+    }
+    // Another stream can arrive between resolution boundaries. The latest
+    // completed market bar is still the current value for that subscription,
+    // so expose it in the cross-stream Slice without manufacturing a new
+    // timestamp. This is the live equivalent of LEAN's subscription
+    // synchronizer consuming the current fill-forward enumerator value.
+    if steps == 0 {
+        return Some(previous.clone());
     }
 
     match previous {
