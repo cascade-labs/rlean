@@ -295,8 +295,12 @@ where
             });
             algorithm_manager.process_option_expirations(slice.as_ref(), &mut services);
         }
-        let run_framework_this_slice =
-            has_data_for_algorithm && !(had_warmup && market_slices_after_warmup == 1);
+        let run_framework_this_slice = should_run_framework_on_slice(
+            has_data_for_algorithm,
+            had_warmup,
+            market_slices_after_warmup,
+            slice.as_ref(),
+        );
         if run_framework_this_slice {
             algorithm_manager.run_framework(slice.as_ref(), &mut services);
             sync_data_manager_subscriptions(
@@ -453,7 +457,29 @@ fn slice_has_algorithm_data(slice: &rlean_data::Slice) -> bool {
         || !slice.quote_bars.is_empty()
         || !slice.ticks.is_empty()
         || !slice.custom_data.is_empty()
+        // LEAN's chain-universe data is itself an algorithm/universe event.
+        // It commonly arrives at exchange-local midnight before the first
+        // underlying bar and must run selection immediately so the concrete
+        // contract streams exist when the session opens.
+        || !slice.option_chains.is_empty()
         || !slice.order_books.is_empty()
+}
+
+fn should_run_framework_on_slice(
+    has_data_for_algorithm: bool,
+    had_warmup: bool,
+    market_slices_after_warmup: usize,
+    slice: &rlean_data::Slice,
+) -> bool {
+    has_data_for_algorithm
+        && !(had_warmup
+            && market_slices_after_warmup == 1
+            // The historical warm-up range is inclusive at its boundary, so
+            // its first repeated market-data Slice is suppressed.
+            // Chain-universe selection is different: its exchange-local
+            // midnight Slice was not processed by the normal feed and must
+            // reach the alpha so it can retain today's candidates.
+            && slice.option_chains.is_empty())
 }
 
 fn slice_has_fill_data(slice: &rlean_data::Slice) -> bool {
@@ -943,11 +969,13 @@ mod tests {
     use super::{
         benchmark_subscription_for_symbol, compute_subscription_diff,
         desired_backtest_subscriptions_from_parts, lean_style_active_subscriptions,
-        resolve_backtest_dates, subscription_requires_stream_replacement,
-        warmup_subscriptions_at_resolution,
+        resolve_backtest_dates, should_run_framework_on_slice, slice_has_algorithm_data,
+        subscription_requires_stream_replacement, warmup_subscriptions_at_resolution,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use rlean_core::{DataNormalizationMode, DateTime, Market, Resolution, Symbol};
+    use rlean_core::{
+        DataNormalizationMode, DateTime, Market, Resolution, Symbol, SymbolOptionsExt,
+    };
     use rlean_data::{
         CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, SubscriptionDataConfig,
     };
@@ -1001,6 +1029,26 @@ mod tests {
 
     fn into_arcs(configs: &[SubscriptionDataConfig]) -> Vec<Arc<SubscriptionDataConfig>> {
         configs.iter().cloned().map(Arc::new).collect()
+    }
+
+    #[test]
+    fn option_chain_only_slice_runs_universe_selection() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
+        let mut slice = rlean_data::Slice::new(DateTime::from_secs(1_721_281_600));
+        slice.add_option_chain(
+            canonical.permtick.to_string(),
+            Arc::new(rlean_options::OptionChain::new(
+                canonical,
+                rust_decimal::Decimal::ZERO,
+            )),
+        );
+
+        assert!(slice_has_algorithm_data(&slice));
+        assert!(
+            should_run_framework_on_slice(true, true, 1, &slice),
+            "the first post-warmup chain slice must reach framework models"
+        );
     }
 
     fn assert_diff_matches_reference(

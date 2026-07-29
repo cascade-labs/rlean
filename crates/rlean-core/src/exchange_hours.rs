@@ -215,6 +215,21 @@ impl MarketHoursDatabase {
 }
 
 impl ExchangeHours {
+    /// Convert an exchange-local calendar date at midnight to UTC.
+    ///
+    /// Universe data is stamped in the exchange time zone in C# LEAN. Using
+    /// UTC midnight directly would surface a US universe on the prior
+    /// algorithm date (20:00 ET during daylight saving time).
+    pub fn local_midnight_utc(&self, date: NaiveDate) -> Option<NanosecondTimestamp> {
+        let timezone: Tz = self.timezone.parse().ok()?;
+        let midnight = timezone
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+            .earliest()?;
+        Some(NanosecondTimestamp::from(
+            midnight.with_timezone(&chrono::Utc),
+        ))
+    }
+
     /// Returns the first regular-session open and last regular-session close for
     /// `date` in UTC. Holidays and closed weekdays return `None`; late-open and
     /// early-close overrides are applied before converting through the exchange
@@ -231,11 +246,7 @@ impl ExchangeHours {
         let last = schedule.sessions.last()?;
         let open = self.late_opens.get(&date).copied().unwrap_or(first.open);
         let close = self.early_closes.get(&date).copied().unwrap_or(last.close);
-        let timezone: Tz = self.timezone.parse().ok()?;
-        let midnight = timezone
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
-            .earliest()?;
-        let midnight_utc = NanosecondTimestamp::from(midnight.with_timezone(&chrono::Utc));
+        let midnight_utc = self.local_midnight_utc(date)?;
         Some((midnight_utc + open, midnight_utc + close))
     }
 
@@ -485,6 +496,32 @@ mod tests {
                     .single()
                     .unwrap()
             )
+        );
+    }
+
+    #[test]
+    fn local_midnight_uses_exchange_timezone_and_dst() {
+        let hours = ExchangeHours::us_equity();
+
+        assert_eq!(
+            hours
+                .local_midnight_utc(NaiveDate::from_ymd_opt(2024, 7, 18).unwrap())
+                .unwrap()
+                .to_utc(),
+            chrono::Utc
+                .with_ymd_and_hms(2024, 7, 18, 4, 0, 0)
+                .single()
+                .unwrap()
+        );
+        assert_eq!(
+            hours
+                .local_midnight_utc(NaiveDate::from_ymd_opt(2024, 12, 18).unwrap())
+                .unwrap()
+                .to_utc(),
+            chrono::Utc
+                .with_ymd_and_hms(2024, 12, 18, 5, 0, 0)
+                .single()
+                .unwrap()
         );
     }
 

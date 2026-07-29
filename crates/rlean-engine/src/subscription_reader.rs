@@ -440,7 +440,13 @@ async fn produce_registered(
         let mut points = Vec::new();
         while let Some(batch) = batches.next().await {
             let batch = batch.map_err(data_error)?;
-            points.extend(decode_points(config, wire_type, batch, factor_rows)?);
+            points.extend(decode_points(
+                config,
+                wire_type,
+                batch,
+                factor_rows,
+                &context.market_hours_database,
+            )?);
         }
         // Flight is free to split one daily cross-section across record
         // batches. Reassemble all pieces before the synchronizer sees it so a
@@ -541,6 +547,7 @@ fn decode_points(
     wire_type: WireDataType,
     batch: arrow::record_batch::RecordBatch,
     factor_rows: &[FactorFileEntry],
+    market_hours_database: &MarketHoursDatabase,
 ) -> LeanResult<Vec<SubscriptionDataPoint>> {
     let decoded = decode_batch(wire_type, batch, &config.symbol).map_err(data_error)?;
     match decoded {
@@ -605,22 +612,31 @@ fn decode_points(
         CanonicalDataBatch::OptionUniverse(rows) => {
             let chains = crate::option_universe::option_chains_from_rows(config, rows)
                 .map_err(data_error)?;
-            Ok(chains
+            chains
                 .into_iter()
                 .map(|(date, chain)| {
                     let frontier_date = date.succ_opt().unwrap_or(date);
-                    let frontier_time = DateTime::from(
-                        frontier_date
-                            .and_hms_opt(0, 0, 0)
-                            .expect("valid option-universe frontier"),
-                    );
-                    SubscriptionDataPoint::OptionChain {
+                    // LEAN assigns BaseChainUniverseData the exchange data
+                    // time zone, so EndTime at the following midnight is
+                    // converted from exchange-local time to UTC. A raw UTC
+                    // midnight appears on the previous algorithm date for US
+                    // markets and breaks same-day expiry filters.
+                    let frontier_time = market_hours_database
+                        .exchange_hours(&config.symbol)
+                        .local_midnight_utc(frontier_date)
+                        .ok_or_else(|| {
+                            LeanError::DataError(format!(
+                                "invalid option-universe exchange timezone for {}",
+                                config.symbol.value
+                            ))
+                        })?;
+                    Ok(SubscriptionDataPoint::OptionChain {
                         canonical_permtick: config.symbol.permtick.to_string(),
                         chain: Arc::new(chain),
                         frontier_time,
-                    }
+                    })
                 })
-                .collect())
+                .collect()
         }
         CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
             Err(LeanError::DataError(format!(
