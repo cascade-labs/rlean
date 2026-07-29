@@ -1,4 +1,3 @@
-use crate::data_feed::DataFeedContext;
 use crate::subscription_reader::SubscriptionStream;
 use rlean_core::{DateTime, LeanError, Result as LeanResult};
 use rlean_data::Slice;
@@ -8,7 +7,6 @@ use rlean_data::Slice;
 pub struct SliceSynchronizer {
     streams: Vec<SubscriptionStream>,
     end: DateTime,
-    context: DataFeedContext,
     /// C# LEAN's `SubscriptionFrontierTimeProvider` ratchets UTC time with
     /// `max(earlyBird, utcNow)`. Keep the same state here so a subscription
     /// which becomes ready late can be drained without rewinding algorithm
@@ -18,11 +16,10 @@ pub struct SliceSynchronizer {
 }
 
 impl SliceSynchronizer {
-    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime, context: DataFeedContext) -> Self {
+    pub fn new(streams: Vec<SubscriptionStream>, end: DateTime) -> Self {
         SliceSynchronizer {
             streams,
             end,
-            context,
             frontier: None,
             last_emitted_slice_time: None,
         }
@@ -44,20 +41,7 @@ impl SliceSynchronizer {
             }
 
             let Some(early_bird) = frontier else {
-                // No stream has a current point. Ratchet the frontier to the
-                // minimum watermark so producers gated on the prefetch horizon
-                // wake up and load the next partitions; otherwise a data gap
-                // longer than the horizon deadlocks producer<->consumer.
-                let min_watermark = self
-                    .streams
-                    .iter()
-                    .filter(|stream| !stream.is_exhausted())
-                    .filter_map(|stream| stream.watermark())
-                    .min();
-                if let Some(watermark) = min_watermark {
-                    self.context.observe_consumer_frontier(watermark.date_utc());
-                }
-                if !await_any_candidate(&mut self.streams, min_watermark).await? {
+                if !await_any_candidate(&mut self.streams).await? {
                     return Ok(None);
                 }
                 continue;
@@ -70,13 +54,6 @@ impl SliceSynchronizer {
             if candidate > self.end {
                 return Ok(None);
             }
-            // LEAN's frontier is the candidate being synchronized (the minimum
-            // current emit time), not the last emitted slice. Publish it before
-            // waiting on any stream so a producer whose next partition is needed
-            // for this candidate is never gated behind the prefetch horizon —
-            // gating on the previous slice date deadlocks across market-closed
-            // gaps (weekend + holiday) longer than the horizon.
-            self.context.observe_consumer_frontier(candidate.date_utc());
             let mut slice = Slice::new(candidate);
             for stream in &mut self.streams {
                 // Match C# LEAN's inner SubscriptionSynchronizer loop: consume
@@ -151,30 +128,9 @@ impl SliceSynchronizer {
 ///
 /// Split from `next_slice` so it can be driven under tokio's virtual clock
 /// (`start_paused`) in tests without a sidecar session.
-async fn await_any_candidate(
-    streams: &mut [SubscriptionStream],
-    min_watermark: Option<DateTime>,
-) -> LeanResult<bool> {
+async fn await_any_candidate(streams: &mut [SubscriptionStream]) -> LeanResult<bool> {
     let mut advanced_any = false;
-    for stream in streams
-        .iter_mut()
-        .filter(|stream| !stream.is_exhausted())
-        // Do not await a stream that is already ahead of the
-        // minimum watermark. In an all-empty range that producer
-        // is gated on the lagging streams; awaiting it first would
-        // prevent us from consuming those lagging watermarks and
-        // deadlock the shared prefetch frontier.
-        .filter(|stream| {
-            min_watermark
-                .map(|minimum| {
-                    stream
-                        .watermark()
-                        .map(|watermark| watermark <= minimum)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true)
-        })
-    {
+    for stream in streams.iter_mut().filter(|stream| !stream.is_exhausted()) {
         // Resolves when the producer delivers a message, fails with a
         // transport error, or completes and closes the channel (which marks
         // the stream exhausted). A producer with a request in flight keeps
@@ -293,7 +249,7 @@ mod tests {
 
         let has_candidate = {
             let _guard = tracing::subscriber::set_default(subscriber);
-            await_any_candidate(&mut streams, None)
+            await_any_candidate(&mut streams)
                 .await
                 .expect("await must not fail")
         };
@@ -332,7 +288,7 @@ mod tests {
         });
 
         let started = tokio::time::Instant::now();
-        let error = await_any_candidate(&mut streams, None)
+        let error = await_any_candidate(&mut streams)
             .await
             .expect_err("a transport failure must surface as an error");
 
@@ -360,7 +316,7 @@ mod tests {
         });
 
         let started = tokio::time::Instant::now();
-        let resolved = await_any_candidate(&mut streams, None)
+        let resolved = await_any_candidate(&mut streams)
             .await
             .expect("resolution must not fail");
         assert!(resolved, "the empty resolution itself is progress");
@@ -370,7 +326,7 @@ mod tests {
         );
         assert!(streams[0].peek().is_none());
 
-        let no_candidate = await_any_candidate(&mut streams, None)
+        let no_candidate = await_any_candidate(&mut streams)
             .await
             .expect("exhausted streams must resolve");
         assert!(

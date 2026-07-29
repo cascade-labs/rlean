@@ -4,7 +4,6 @@ use crate::subscription_reader::SubscriptionStream;
 use rlean_core::{DateTime, Result as LeanResult};
 use rlean_data::{Slice, SubscriptionDataConfig};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 /// Drives backtest data through registered Flight subscriptions.
 pub struct DataManager {
@@ -35,7 +34,6 @@ impl DataManager {
         end: DateTime,
     ) -> LeanResult<()> {
         self.active_subscriptions.clear();
-        self.context.seed_consumer_frontier(start.date_utc());
         let streams = configs
             .iter()
             .cloned()
@@ -45,16 +43,9 @@ impl DataManager {
                 SubscriptionStream::new(config, self.context.clone(), start, end)
             })
             .collect();
-        self.synchronizer = Some(SliceSynchronizer::new(streams, end, self.context.clone()));
+        self.synchronizer = Some(SliceSynchronizer::new(streams, end));
         self.end = Some(end);
-        self.sync_subscription_count();
         Ok(())
-    }
-
-    fn sync_subscription_count(&self) {
-        self.context
-            .active_subscription_count
-            .store(self.active_subscriptions.len(), Ordering::Relaxed);
     }
 
     pub fn add_subscription(&mut self, config: SubscriptionDataConfig, start: DateTime) {
@@ -69,14 +60,9 @@ impl DataManager {
         match self.synchronizer.as_mut() {
             Some(sync) => sync.add_stream(stream),
             None => {
-                self.synchronizer = Some(SliceSynchronizer::new(
-                    vec![stream],
-                    end,
-                    self.context.clone(),
-                ));
+                self.synchronizer = Some(SliceSynchronizer::new(vec![stream], end));
             }
         }
-        self.sync_subscription_count();
     }
 
     pub async fn add_subscription_async(
@@ -105,7 +91,6 @@ impl DataManager {
             if let Some(sync) = self.synchronizer.as_mut() {
                 sync.remove_stream(id);
             }
-            self.sync_subscription_count();
         }
     }
 
@@ -114,10 +99,6 @@ impl DataManager {
             Some(sync) => sync.next_slice().await?,
             None => None,
         };
-        if let Some(slice) = slice.as_ref() {
-            self.context
-                .observe_consumer_frontier(slice.time.date_utc());
-        }
         Ok(slice)
     }
 }
