@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Context;
 use chrono::NaiveDate;
 use rlean_core::{
-    Greeks, Market, OptionRight, OptionStyle, SecurityType, Symbol, SymbolOptionsExt,
+    Greeks, Market, MarketHoursDatabase, OptionRight, OptionStyle, SecurityType, Symbol,
+    SymbolOptionsExt,
 };
 use rlean_data::{OptionChainSubscriptionMetadata, SubscriptionDataConfig};
 use rlean_data_tables::OptionUniverseRow;
@@ -38,16 +39,25 @@ fn chain_for_date(
     date: NaiveDate,
     rows: Vec<OptionUniverseRow>,
 ) -> anyhow::Result<(NaiveDate, OptionChain)> {
-    // LEAN's BaseChainUniverseData.Time is the source-file date and EndTime is
-    // the following midnight, when selection actually runs. Expiry filters
-    // are relative to that selection date, not the stored row date.
-    let selection_date = date.succ_opt().unwrap_or(date);
     let underlying = config
         .symbol
         .underlying
         .as_deref()
         .cloned()
         .unwrap_or_else(|| Symbol::create_equity(&metadata.underlying_ticker, &Market::usa()));
+    // LEAN's BaseChainUniverseData.Time is the source-file date and EndTime is
+    // the following midnight, when selection actually runs. If that midnight
+    // falls on a closed date, OptionFilterUniverse advances the expiration
+    // reference to the next trading day (for example Friday data selects
+    // Monday contracts at Saturday midnight).
+    let mut selection_date = date.succ_opt().unwrap_or(date);
+    let exchange_hours = MarketHoursDatabase::global().exchange_hours(&underlying);
+    while exchange_hours.session_bounds(selection_date).is_none() {
+        let Some(next) = selection_date.succ_opt() else {
+            break;
+        };
+        selection_date = next;
+    }
     let underlying_price = rows
         .iter()
         .find(|row| row.expiration.is_none())
@@ -69,23 +79,15 @@ fn chain_for_date(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    if !unique_strikes.is_empty() {
-        let atm = unique_strikes.partition_point(|strike| *strike < underlying_price);
-        let atm = atm.min(unique_strikes.len().saturating_sub(1));
-        let min_index = (atm as i32 + metadata.filter.min_strike_rank)
-            .max(0)
-            .min(unique_strikes.len().saturating_sub(1) as i32) as usize;
-        let max_index = (atm as i32 + metadata.filter.max_strike_rank)
-            .max(0)
-            .min(unique_strikes.len().saturating_sub(1) as i32) as usize;
-        if min_index <= max_index {
-            let min_strike = unique_strikes[min_index];
-            let max_strike = unique_strikes[max_index];
-            contracts
-                .retain(|contract| contract.strike >= min_strike && contract.strike <= max_strike);
-        } else {
-            contracts.clear();
-        }
+    if let Some((min_strike, max_strike)) = lean_relative_strike_bounds(
+        &unique_strikes,
+        underlying_price,
+        metadata.filter.min_strike_rank,
+        metadata.filter.max_strike_rank,
+    ) {
+        contracts.retain(|contract| contract.strike >= min_strike && contract.strike <= max_strike);
+    } else {
+        contracts.clear();
     }
 
     let mut chain = OptionChain::new(config.symbol.clone(), underlying_price);
@@ -93,6 +95,49 @@ fn chain_for_date(
         chain.add_contract(contract);
     }
     Ok((date, chain))
+}
+
+/// Exact port of C# LEAN `OptionFilterUniverse.Strikes`.
+fn lean_relative_strike_bounds(
+    unique_strikes: &[Decimal],
+    underlying_price: Decimal,
+    min_strike_rank: i32,
+    max_strike_rank: i32,
+) -> Option<(Decimal, Decimal)> {
+    let (index, exact_price_found) = match unique_strikes.binary_search(&underlying_price) {
+        Ok(index) => (index as i32, true),
+        Err(index) if index == unique_strikes.len() => return None,
+        Err(index) => (index as i32, false),
+    };
+
+    let mut min_index = index + min_strike_rank;
+    let mut max_index = index + max_strike_rank;
+    if !exact_price_found {
+        if min_strike_rank < 0 && max_strike_rank > 0 {
+            max_index -= 1;
+        } else if min_strike_rank > 0 {
+            min_index -= 1;
+            max_index -= 1;
+        }
+    }
+
+    if min_index < 0 {
+        min_index = 0;
+    } else if min_index >= unique_strikes.len() as i32 {
+        return None;
+    }
+    if max_index < 0 {
+        return None;
+    }
+    if max_index >= unique_strikes.len() as i32 {
+        max_index = unique_strikes.len() as i32 - 1;
+    }
+    (min_index <= max_index).then(|| {
+        (
+            unique_strikes[min_index as usize],
+            unique_strikes[max_index as usize],
+        )
+    })
 }
 
 fn contract_from_row(
@@ -239,6 +284,61 @@ mod tests {
         .unwrap();
 
         assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].1.contracts.len(), 1);
+    }
+
+    #[test]
+    fn relative_strikes_match_lean_when_underlying_is_between_strikes() {
+        let strikes = [
+            Decimal::new(739, 0),
+            Decimal::new(740, 0),
+            Decimal::new(741, 0),
+            Decimal::new(742, 0),
+        ];
+
+        assert_eq!(
+            lean_relative_strike_bounds(&strikes, Decimal::new(7403, 1), -1, 1),
+            Some((Decimal::new(740, 0), Decimal::new(741, 0)))
+        );
+    }
+
+    #[test]
+    fn friday_universe_uses_monday_as_expiration_reference() {
+        let source_date = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::MIN,
+            Decimal::ZERO,
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+
+        let chains = option_chains_from_rows(
+            &config,
+            vec![
+                row(source_date, None, None),
+                row(source_date, Some(monday), Some(Decimal::new(500, 0))),
+            ],
+        )
+        .unwrap();
+
         assert_eq!(chains[0].1.contracts.len(), 1);
     }
 }
