@@ -9,8 +9,8 @@ use arrow_array::{
 use rlean_core::{Market, NanosecondTimestamp, Symbol, TickType, TimeSpan};
 use rlean_data::FundamentalData;
 use rlean_data_tables::{
-    Bar, CustomDataPoint, DataMappingMode, FactorFileEntry, MapFileEntry, QuoteBar,
-    RiskFreeInterestRate, Tick, TradeBar, DECIMAL_SCALE,
+    Bar, CustomDataPoint, DataMappingMode, FactorFileEntry, MapFileEntry, OptionUniverseRow,
+    QuoteBar, RiskFreeInterestRate, Tick, TradeBar, DECIMAL_SCALE,
 };
 use rust_decimal::Decimal;
 
@@ -24,6 +24,7 @@ pub enum CanonicalDataBatch {
     Custom(Vec<CustomDataPoint>),
     Universe(Vec<CustomDataPoint>),
     Fundamentals(Vec<FundamentalData>),
+    OptionUniverse(Vec<OptionUniverseRow>),
     RiskFreeInterestRates(Vec<RiskFreeInterestRate>),
     /// The contract remains available to callers that consume a canonical
     /// universe or auxiliary table directly.
@@ -50,11 +51,66 @@ pub fn decode_batch(
         WireDataType::FundamentalUniverse => Ok(CanonicalDataBatch::Fundamentals(
             decode_fundamentals(&batch)?,
         )),
+        WireDataType::OptionUniverse => Ok(CanonicalDataBatch::OptionUniverse(
+            decode_option_universe(&batch)?,
+        )),
         WireDataType::RiskFreeInterestRate => Ok(CanonicalDataBatch::RiskFreeInterestRates(
             decode_risk_free_interest_rates(&batch)?,
         )),
         _ => Ok(CanonicalDataBatch::RecordBatch(batch)),
     }
+}
+
+fn decode_option_universe(batch: &RecordBatch) -> anyhow::Result<Vec<OptionUniverseRow>> {
+    let date = int64(batch, "date_ns")?;
+    let market = required_strings(batch, "market")?;
+    let security_type = required_strings(batch, "security_type")?;
+    let symbol_sid = required_strings(batch, "symbol_sid")?;
+    let symbol_value = required_strings(batch, "symbol_value")?;
+    let expiration = int64(batch, "expiration_ns")?;
+    let strike = decimal(batch, "strike")?;
+    let open = decimal(batch, "open")?;
+    let high = decimal(batch, "high")?;
+    let low = decimal(batch, "low")?;
+    let close = decimal(batch, "close")?;
+    let volume = decimal(batch, "volume")?;
+    let open_interest = decimal(batch, "open_interest")?;
+    let implied_volatility = decimal(batch, "implied_volatility")?;
+    let delta = decimal(batch, "delta")?;
+    let gamma = decimal(batch, "gamma")?;
+    let vega = decimal(batch, "vega")?;
+    let theta = decimal(batch, "theta")?;
+    let rho = decimal(batch, "rho")?;
+    let optional_decimal = |values: &Decimal128Array, row| {
+        (!values.is_null(row)).then(|| decimal_value(values.value(row)))
+    };
+    Ok((0..batch.num_rows())
+        .map(|row| OptionUniverseRow {
+            date: NanosecondTimestamp(date.value(row)).date_utc(),
+            market: market.value(row).to_string(),
+            security_type: security_type.value(row).to_string(),
+            symbol_sid: symbol_sid.value(row).to_string(),
+            symbol_value: symbol_value.value(row).to_string(),
+            underlying_sid: string_at(batch, "underlying_sid", row),
+            underlying_value: string_at(batch, "underlying_value", row),
+            expiration: (!expiration.is_null(row))
+                .then(|| NanosecondTimestamp(expiration.value(row)).date_utc()),
+            strike: optional_decimal(strike, row),
+            right: string_at(batch, "right", row),
+            open: decimal_value(open.value(row)),
+            high: decimal_value(high.value(row)),
+            low: decimal_value(low.value(row)),
+            close: decimal_value(close.value(row)),
+            volume: decimal_value(volume.value(row)),
+            open_interest: optional_decimal(open_interest, row),
+            implied_volatility: optional_decimal(implied_volatility, row),
+            delta: optional_decimal(delta, row),
+            gamma: optional_decimal(gamma, row),
+            vega: optional_decimal(vega, row),
+            theta: optional_decimal(theta, row),
+            rho: optional_decimal(rho, row),
+        })
+        .collect())
 }
 
 fn decode_risk_free_interest_rates(

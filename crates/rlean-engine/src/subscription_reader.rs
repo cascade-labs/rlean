@@ -13,6 +13,7 @@ use rlean_data_sidecar::{
 };
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) enum SubscriptionStreamMessage {
@@ -601,6 +602,26 @@ fn decode_points(
                 )
                 .collect())
         }
+        CanonicalDataBatch::OptionUniverse(rows) => {
+            let chains = crate::option_universe::option_chains_from_rows(config, rows)
+                .map_err(data_error)?;
+            Ok(chains
+                .into_iter()
+                .map(|(date, chain)| {
+                    let frontier_date = date.succ_opt().unwrap_or(date);
+                    let frontier_time = DateTime::from(
+                        frontier_date
+                            .and_hms_opt(0, 0, 0)
+                            .expect("valid option-universe frontier"),
+                    );
+                    SubscriptionDataPoint::OptionChain {
+                        canonical_permtick: config.symbol.permtick.to_string(),
+                        chain: Arc::new(chain),
+                        frontier_time,
+                    }
+                })
+                .collect())
+        }
         CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
             Err(LeanError::DataError(format!(
                 "sidecar data type {wire_type:?} is not consumable by a subscription"
@@ -757,6 +778,12 @@ fn effective_subscription_end(
     config: &SubscriptionDataConfig,
     requested_end: chrono::NaiveDate,
 ) -> chrono::NaiveDate {
+    // Canonical option-universe symbols carry an option-shaped SID but do not
+    // represent one expiring contract. Their stream spans the algorithm range;
+    // only concrete contract subscriptions are capped at the contract expiry.
+    if config.option_chain.is_some() {
+        return requested_end;
+    }
     config
         .symbol
         .option_symbol_id()
@@ -832,7 +859,10 @@ use chrono::Datelike;
 mod tests {
     use super::*;
     use rlean_core::{Market, OptionRight, OptionStyle, Symbol, TimeSpan};
-    use rlean_data::{CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata};
+    use rlean_data::{
+        CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, OptionChainFilterMetadata,
+        OptionChainSubscriptionMetadata,
+    };
     use rlean_data_tables::{CustomDataPoint, TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
@@ -914,6 +944,39 @@ mod tests {
         );
         assert_eq!(backtest_window_candidate(Resolution::Second, start), start);
         assert_eq!(backtest_window_candidate(Resolution::Tick, start), start);
+    }
+
+    #[test]
+    fn canonical_option_universe_is_not_capped_by_placeholder_sid_expiry() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::MIN,
+            dec!(0),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+        let requested_end = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+
+        assert_eq!(
+            effective_subscription_end(&config, requested_end),
+            requested_end
+        );
     }
 
     #[test]

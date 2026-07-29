@@ -400,7 +400,7 @@ fn tradier_equity_is_free() {
 }
 
 #[test]
-fn tradier_options_are_free_to_match_lean_brokerage_model() {
+fn tradier_option_buy_includes_pass_through_fees() {
     let model = TradierFeeModel;
     let sym = Symbol::create_equity("AAPL", &Market::usa());
     let order = Order::market(1, sym, dec!(10), ts(0), "");
@@ -413,7 +413,53 @@ fn tradier_options_are_free_to_match_lean_brokerage_model() {
         dec!(100),
     );
     let fee = model.get_order_fee(&p);
-    assert_eq!(fee.amount, dec!(0));
+    assert_eq!(fee.amount, dec!(2.6062343750));
+    assert_eq!(fee.currency, "USD");
+}
+
+#[test]
+fn tradier_option_sell_includes_taf() {
+    let model = TradierFeeModel;
+    let sym = Symbol::create_equity("AAPL", &Market::usa());
+    let order = Order::market(1, sym, dec!(-10), ts(0), "");
+    let p = params_full(
+        &order,
+        dec!(5),
+        SecurityType::Option,
+        "USD",
+        None,
+        dec!(100),
+    );
+    let fee = model.get_order_fee(&p);
+    assert_eq!(fee.amount, dec!(2.6341343750));
+}
+
+#[test]
+fn tradier_live_spy_round_trip_calibration_matches_broker_cash() {
+    let model = TradierFeeModel;
+    let sym = Symbol::create_equity("SPY", &Market::usa());
+    let buy = Order::market(1, sym.clone(), dec!(16), ts(0), "");
+    let sell = Order::market(2, sym, dec!(-16), ts(1), "");
+    let buy_params = params_full(
+        &buy,
+        dec!(2.91),
+        SecurityType::Option,
+        "USD",
+        None,
+        dec!(100),
+    );
+    let sell_params = params_full(
+        &sell,
+        dec!(2.79),
+        SecurityType::Option,
+        "USD",
+        None,
+        dec!(100),
+    );
+
+    let round_trip =
+        model.get_order_fee(&buy_params).amount + model.get_order_fee(&sell_params).amount;
+    assert_eq!(round_trip, dec!(8.38459));
 }
 
 // ─── GDAXFeeModel / CoinbaseFeeModel ─────────────────────────────────────────

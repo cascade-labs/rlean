@@ -481,6 +481,12 @@ impl AlgorithmHandle {
     /// rlean's default history seeding. Skips securities that already have a
     /// non-zero price.
     fn apply_security_initializer(&self, symbol: &Symbol, resolution: Resolution) {
+        // C# FuncSecuritySeeder never attempts history for canonical
+        // derivatives. They are universe handles, not tradable securities, and
+        // have no last-known market price of their own.
+        if symbol.is_canonical_option() {
+            return;
+        }
         if read_algorithm_security_price(&self.inner, symbol)
             .map(|price| price > 0.0)
             .unwrap_or(false)

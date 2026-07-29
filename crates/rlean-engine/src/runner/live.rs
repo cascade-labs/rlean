@@ -446,6 +446,7 @@ where
             if let (Some(router), Some(transactions)) =
                 (brokerage_router.as_mut(), transactions.as_ref())
             {
+                router.request_cash_sync_if_due(pulse_time);
                 service_live_brokerage(
                     &mut algorithm_manager,
                     &mut services,
@@ -1720,6 +1721,17 @@ fn live_items(
                 return Ok(Vec::new());
             };
             vec![LiveDataItem::FundamentalUniverseData { time, data: rows }]
+        }
+        CanonicalDataBatch::OptionUniverse(rows) => {
+            let time = rlean_core::DateTime::now();
+            crate::option_universe::option_chains_from_rows(config, rows)?
+                .into_iter()
+                .map(|(_, chain)| LiveDataItem::OptionChainData {
+                    time,
+                    canonical_permtick: config.symbol.permtick.to_string(),
+                    chain: Arc::new(chain),
+                })
+                .collect()
         }
         CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
             anyhow::bail!("unsupported canonical live batch type")

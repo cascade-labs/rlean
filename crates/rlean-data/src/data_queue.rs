@@ -1,4 +1,4 @@
-use crate::{FundamentalData, OrderBook, Slice, SubscriptionDataConfig};
+use crate::{FundamentalData, OptionChain, OrderBook, Slice, SubscriptionDataConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rlean_core::{DateTime, Resolution, Result, Symbol};
 use rlean_data_tables::{CustomDataPoint, MarginInterestRate, QuoteBar, Tick, TradeBar};
@@ -86,6 +86,11 @@ pub enum LiveDataItem {
         time: DateTime,
         data: Vec<FundamentalData>,
     },
+    OptionChainData {
+        time: DateTime,
+        canonical_permtick: String,
+        chain: std::sync::Arc<OptionChain>,
+    },
     Heartbeat(DateTime),
 }
 
@@ -100,6 +105,7 @@ impl LiveDataItem {
             Self::CustomData { point, .. } => point.time,
             Self::UniverseData { time, .. } => *time,
             Self::FundamentalUniverseData { time, .. } => *time,
+            Self::OptionChainData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }
     }
@@ -114,6 +120,7 @@ impl LiveDataItem {
             Self::CustomData { point, .. } => point.end_time,
             Self::UniverseData { time, .. } => *time,
             Self::FundamentalUniverseData { time, .. } => *time,
+            Self::OptionChainData { time, .. } => *time,
             Self::Heartbeat(time) => *time,
         }
     }
@@ -128,6 +135,7 @@ impl LiveDataItem {
             Self::CustomData { symbol, .. } => Some(symbol),
             Self::UniverseData { .. }
             | Self::FundamentalUniverseData { .. }
+            | Self::OptionChainData { .. }
             | Self::Heartbeat(_) => None,
         }
     }
@@ -150,6 +158,11 @@ impl LiveDataItem {
             }
             Self::UniverseData { .. } => {}
             Self::FundamentalUniverseData { data, .. } => slice.add_fundamentals(data),
+            Self::OptionChainData {
+                canonical_permtick,
+                chain,
+                ..
+            } => slice.add_option_chain(canonical_permtick, chain),
             Self::Heartbeat(_) => {}
         }
     }
