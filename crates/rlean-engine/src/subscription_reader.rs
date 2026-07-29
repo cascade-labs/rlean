@@ -71,13 +71,9 @@ impl SubscriptionStream {
         context: DataFeedContext,
         start: DateTime,
         end: DateTime,
-        defer_prefetch_after_first_window: bool,
+        _dynamic_subscription: bool,
     ) -> Self {
-        let capacity = if defer_prefetch_after_first_window {
-            16
-        } else {
-            context.effective_buffer_policy().channel_capacity()
-        };
+        let capacity = context.channel_capacity();
         let (sender, receiver) = mpsc::channel(capacity);
         let (cancel, cancelled) = oneshot::channel();
         let producer_config = config.clone();
@@ -85,16 +81,8 @@ impl SubscriptionStream {
         // cancel channel (see `Drop`) and its completion closes `sender`,
         // which is what marks the stream exhausted.
         tokio::spawn(async move {
-            if let Err(error) = produce(
-                producer_config,
-                context,
-                start,
-                end,
-                &sender,
-                cancelled,
-                defer_prefetch_after_first_window,
-            )
-            .await
+            if let Err(error) =
+                produce(producer_config, context, start, end, &sender, cancelled).await
             {
                 let _ = sender.send(Err(error)).await;
             }
@@ -295,7 +283,6 @@ async fn produce(
     end: DateTime,
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     mut cancelled: oneshot::Receiver<()>,
-    defer_prefetch_after_first_window: bool,
 ) -> LeanResult<()> {
     let sidecar = &context.sidecar;
     let registration = sidecar
@@ -336,7 +323,6 @@ async fn produce(
             (effective_start, end),
             &factor_rows,
             sender,
-            defer_prefetch_after_first_window,
         ) => result,
     };
     if let Err(error) = sidecar.remove_subscription(subscription_id).await {
@@ -430,7 +416,6 @@ async fn produce_registered(
     range: (DateTime, DateTime),
     factor_rows: &[FactorFileEntry],
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
-    defer_prefetch_after_first_window: bool,
 ) -> LeanResult<()> {
     let (start, end) = range;
     let wire_type = WireDataType::try_from(SubscriptionSpec::from(config).data_type)
@@ -439,26 +424,9 @@ async fn produce_registered(
     let end_date = effective_subscription_end(config, end.date_utc());
     let mut last_point: Option<SubscriptionDataPoint> = None;
     let mut last_real_frontier: Option<DateTime> = None;
-    let mut previous_window_had_points = false;
-    let mut first_window = true;
 
     while window_start <= end_date {
-        // An empty range consumes no channel capacity. Keep scanning through
-        // leading/pre-listing gaps instead of waiting for a consumer frontier
-        // that cannot advance until some subscription produces a point.
-        if previous_window_had_points {
-            wait_for_prefetch_horizon(context, window_start).await;
-        }
-        let window_end = if first_window && defer_prefetch_after_first_window {
-            window_start
-        } else if previous_window_had_points {
-            backtest_window_end(config.resolution, window_start, end_date, context)
-        } else {
-            // The consumer frontier intentionally does not constrain empty
-            // scans. Pair the ungated start with an ungated end so the stale
-            // prefetch ceiling cannot produce an inverted range.
-            backtest_window_candidate(config.resolution, window_start).min(end_date)
-        };
+        let window_end = backtest_window_candidate(config.resolution, window_start).min(end_date);
         let mut batches = context
             .sidecar
             .query(
@@ -490,8 +458,6 @@ async fn produce_registered(
             last_frontier = ?points.last().map(SubscriptionDataPoint::frontier_time),
             "decoded backtest subscription window"
         );
-        previous_window_had_points = !points.is_empty();
-
         for point in points {
             let frontier = point.frontier_time();
             if frontier < start || frontier > end {
@@ -561,36 +527,12 @@ async fn produce_registered(
         {
             return Ok(());
         }
-        if first_window && defer_prefetch_after_first_window && window_end < end_date {
-            wait_for_consumer_frontier_after(context, window_end).await;
-        }
-        first_window = false;
         window_start = match window_end.succ_opt() {
             Some(next) => next,
             None => break,
         };
     }
     Ok(())
-}
-
-async fn wait_for_consumer_frontier_after(context: &DataFeedContext, date: chrono::NaiveDate) {
-    loop {
-        let has_advanced = context
-            .consumer_frontier_date()
-            .map(|frontier| frontier > date)
-            .unwrap_or(false);
-        if has_advanced {
-            return;
-        }
-        let notified = context.frontier_advanced();
-        let still_waiting = context
-            .consumer_frontier_date()
-            .map(|frontier| frontier <= date)
-            .unwrap_or(true);
-        if still_waiting {
-            notified.await;
-        }
-    }
 }
 
 fn decode_points(
@@ -795,37 +737,6 @@ fn is_market_open(
         .is_open_at(frontier - period)
 }
 
-async fn wait_for_prefetch_horizon(context: &DataFeedContext, date: chrono::NaiveDate) {
-    loop {
-        let beyond = context
-            .prefetch_ceiling_date()
-            .map(|ceiling| date > ceiling)
-            .unwrap_or(false);
-        if !beyond {
-            return;
-        }
-        let notified = context.frontier_advanced();
-        let still_beyond = context
-            .prefetch_ceiling_date()
-            .map(|ceiling| date > ceiling)
-            .unwrap_or(false);
-        if still_beyond {
-            notified.await;
-        }
-    }
-}
-
-fn backtest_window_end(
-    resolution: Resolution,
-    start: chrono::NaiveDate,
-    backtest_end: chrono::NaiveDate,
-    context: &DataFeedContext,
-) -> chrono::NaiveDate {
-    let candidate = backtest_window_candidate(resolution, start);
-    let horizon = context.prefetch_ceiling_date().unwrap_or(backtest_end);
-    candidate.min(backtest_end).min(horizon)
-}
-
 fn backtest_window_candidate(
     resolution: Resolution,
     start: chrono::NaiveDate,
@@ -1003,6 +914,20 @@ mod tests {
         );
         assert_eq!(backtest_window_candidate(Resolution::Second, start), start);
         assert_eq!(backtest_window_candidate(Resolution::Tick, start), start);
+    }
+
+    #[test]
+    fn daily_and_hour_queries_use_stable_windows_not_consumer_frontier_fragments() {
+        let start = chrono::NaiveDate::from_ymd_opt(2019, 4, 9).unwrap();
+
+        assert_eq!(
+            backtest_window_candidate(Resolution::Daily, start),
+            chrono::NaiveDate::from_ymd_opt(2020, 4, 9).unwrap()
+        );
+        assert_eq!(
+            backtest_window_candidate(Resolution::Hour, start),
+            chrono::NaiveDate::from_ymd_opt(2019, 5, 9).unwrap()
+        );
     }
 
     #[test]

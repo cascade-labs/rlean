@@ -28,7 +28,7 @@ impl SubscriptionHistoryProvider {
         // Sharing the feed context is safe: frontier publication is monotonic
         // (fetch_max), and history windows end at or before the backtest clock,
         // so a history sync can only ever no-op the live frontier.
-        let mut synchronizer = SliceSynchronizer::new(streams, end, self.context.clone());
+        let mut synchronizer = SliceSynchronizer::new(streams, end);
         let mut slices = Vec::new();
         while let Some(slice) = synchronizer.next_slice().await? {
             slices.push(slice);
