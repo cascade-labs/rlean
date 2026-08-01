@@ -240,6 +240,11 @@ fn query_subscription(args: &QueryArgs) -> Result<SubscriptionSpec> {
         custom_query,
         properties,
         venue: args.venue.clone(),
+        option_underlying_ticker: args.symbol.clone().unwrap_or_default(),
+        option_min_strike_rank: -1,
+        option_max_strike_rank: 1,
+        option_min_expiry_days: 0,
+        option_max_expiry_days: 35,
     })
 }
 

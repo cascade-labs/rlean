@@ -1,7 +1,8 @@
-use rlean_core::{DataNormalizationMode, Market, Resolution, Symbol};
+use rlean_core::{DataNormalizationMode, Market, Resolution, Symbol, SymbolOptionsExt};
 use rlean_data::{
     CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata,
-    FundamentalUniverseSubscriptionMetadata, SubscriptionDataConfig,
+    FundamentalUniverseSubscriptionMetadata, OptionChainFilterMetadata,
+    OptionChainSubscriptionMetadata, SubscriptionDataConfig,
 };
 use rlean_data_sidecar::{
     client_message, server_message, AddSubscription, ClientMessage, DataBatch, DataSidecarConfig,
@@ -164,6 +165,11 @@ fn subscription_definition_has_no_query_time_range() {
         ticker: String::new(),
         custom_query: None,
         properties: Default::default(),
+        option_underlying_ticker: String::new(),
+        option_min_strike_rank: 0,
+        option_max_strike_rank: 0,
+        option_min_expiry_days: 0,
+        option_max_expiry_days: 0,
     };
     let message = ClientMessage {
         protocol_version: PROTOCOL_VERSION,
@@ -227,6 +233,34 @@ fn fundamental_universe_subscription_uses_typed_snapshot_wire_contract() {
     assert_eq!(spec.ticker, "*");
     assert_eq!(config.normalization_mode, DataNormalizationMode::Raw);
     assert!(config.is_universe_data());
+}
+
+#[test]
+fn option_universe_subscription_carries_filter_metadata() {
+    let underlying = Symbol::create_equity("SPY", &Market::usa());
+    let canonical = Symbol::create_canonical_option(&underlying, &Market::usa());
+    let config = SubscriptionDataConfig::new_option_chain(
+        canonical,
+        Resolution::Minute,
+        OptionChainSubscriptionMetadata {
+            canonical_permtick: "?SPY".into(),
+            underlying_ticker: "SPY".into(),
+            filter: OptionChainFilterMetadata {
+                min_strike_rank: -5,
+                max_strike_rank: 5,
+                min_expiry_days: 0,
+                max_expiry_days: 0,
+            },
+        },
+    );
+
+    let spec = SubscriptionSpec::from(&config);
+    assert_eq!(spec.data_type, WireDataType::OptionUniverse as i32);
+    assert_eq!(spec.option_underlying_ticker, "SPY");
+    assert_eq!(spec.option_min_strike_rank, -5);
+    assert_eq!(spec.option_max_strike_rank, 5);
+    assert_eq!(spec.option_min_expiry_days, 0);
+    assert_eq!(spec.option_max_expiry_days, 0);
 }
 
 #[test]

@@ -116,12 +116,26 @@ pub struct SubscriptionSpec {
     /// LEAN market used to construct the symbol SID.
     #[prost(string, tag = "15")]
     pub venue: String,
+    /// Canonical option-universe metadata. These fields are populated only
+    /// when `data_type == OptionUniverse`; keeping them on the existing
+    /// prototype contract avoids an opaque provider-specific property bag.
+    #[prost(string, tag = "16")]
+    pub option_underlying_ticker: String,
+    #[prost(sint32, tag = "17")]
+    pub option_min_strike_rank: i32,
+    #[prost(sint32, tag = "18")]
+    pub option_max_strike_rank: i32,
+    #[prost(sint32, tag = "19")]
+    pub option_min_expiry_days: i32,
+    #[prost(sint32, tag = "20")]
+    pub option_max_expiry_days: i32,
 }
 
 impl From<&SubscriptionDataConfig> for SubscriptionSpec {
     fn from(config: &SubscriptionDataConfig) -> Self {
         let custom = config.custom.as_ref();
         let fundamental = config.fundamental_universe.as_ref();
+        let option = config.option_chain.as_ref();
         Self {
             config_id: config.unique_id(),
             symbol_sid: config.symbol.id.sid,
@@ -148,6 +162,21 @@ impl From<&SubscriptionDataConfig> for SubscriptionSpec {
                 .map(|value| value.config.properties.clone())
                 .unwrap_or_default(),
             venue: config.venue.clone(),
+            option_underlying_ticker: option
+                .map(|value| value.underlying_ticker.clone())
+                .unwrap_or_default(),
+            option_min_strike_rank: option
+                .map(|value| value.filter.min_strike_rank)
+                .unwrap_or_default(),
+            option_max_strike_rank: option
+                .map(|value| value.filter.max_strike_rank)
+                .unwrap_or_default(),
+            option_min_expiry_days: option
+                .map(|value| value.filter.min_expiry_days)
+                .unwrap_or_default(),
+            option_max_expiry_days: option
+                .map(|value| value.filter.max_expiry_days)
+                .unwrap_or_default(),
         }
     }
 }

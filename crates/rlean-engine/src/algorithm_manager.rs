@@ -194,8 +194,33 @@ where
         new_trading_day: bool,
         services: &mut dyn AlgorithmServices,
     ) -> SecurityChanges {
-        if !self.algorithm.has_universes() {
-            return SecurityChanges::empty();
+        let mut changes = SecurityChanges::empty();
+        if let Some(algorithm_state) = self.algorithm.algorithm_state() {
+            let mut algorithm = algorithm_state.lock().unwrap();
+            for (canonical_key, chain) in &slice.option_chains {
+                let canonical = algorithm
+                    .option_subscriptions
+                    .iter()
+                    .find(|symbol| symbol.permtick.as_ref() == canonical_key)
+                    .cloned();
+                if let Some(canonical) = canonical {
+                    let option_changes =
+                        algorithm.apply_option_universe_membership(&canonical, chain.as_ref());
+                    changes.added.extend(option_changes.added);
+                    changes.removed.extend(option_changes.removed);
+                }
+            }
+        }
+        if !self.algorithm.has_universes() && changes.has_changes() {
+            self.algorithm.on_securities_changed(&changes, services);
+            crate::notify_framework_securities_changed(
+                &self.runtime_context.framework(),
+                &changes.added,
+                &changes.removed,
+            );
+            return changes;
+        } else if !self.algorithm.has_universes() {
+            return changes;
         }
 
         let resolution = self
@@ -203,7 +228,6 @@ where
             .universe_resolution()
             .unwrap_or(rlean_core::Resolution::Daily);
         let mut selection_pass = false;
-        let mut changes = SecurityChanges::empty();
         if new_trading_day {
             let selections =
                 self.algorithm

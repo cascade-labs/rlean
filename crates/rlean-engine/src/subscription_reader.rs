@@ -13,6 +13,7 @@ use rlean_data_sidecar::{
 };
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) enum SubscriptionStreamMessage {
@@ -439,7 +440,13 @@ async fn produce_registered(
         let mut points = Vec::new();
         while let Some(batch) = batches.next().await {
             let batch = batch.map_err(data_error)?;
-            points.extend(decode_points(config, wire_type, batch, factor_rows)?);
+            points.extend(decode_points(
+                config,
+                wire_type,
+                batch,
+                factor_rows,
+                &context.market_hours_database,
+            )?);
         }
         // Flight is free to split one daily cross-section across record
         // batches. Reassemble all pieces before the synchronizer sees it so a
@@ -540,6 +547,7 @@ fn decode_points(
     wire_type: WireDataType,
     batch: arrow::record_batch::RecordBatch,
     factor_rows: &[FactorFileEntry],
+    market_hours_database: &MarketHoursDatabase,
 ) -> LeanResult<Vec<SubscriptionDataPoint>> {
     let decoded = decode_batch(wire_type, batch, &config.symbol).map_err(data_error)?;
     match decoded {
@@ -600,6 +608,35 @@ fn decode_points(
                     },
                 )
                 .collect())
+        }
+        CanonicalDataBatch::OptionUniverse(rows) => {
+            let chains = crate::option_universe::option_chains_from_rows(config, rows)
+                .map_err(data_error)?;
+            chains
+                .into_iter()
+                .map(|(date, chain)| {
+                    let frontier_date = date.succ_opt().unwrap_or(date);
+                    // LEAN assigns BaseChainUniverseData the exchange data
+                    // time zone, so EndTime at the following midnight is
+                    // converted from exchange-local time to UTC. A raw UTC
+                    // midnight appears on the previous algorithm date for US
+                    // markets and breaks same-day expiry filters.
+                    let frontier_time = market_hours_database
+                        .exchange_hours(&config.symbol)
+                        .local_midnight_utc(frontier_date)
+                        .ok_or_else(|| {
+                            LeanError::DataError(format!(
+                                "invalid option-universe exchange timezone for {}",
+                                config.symbol.value
+                            ))
+                        })?;
+                    Ok(SubscriptionDataPoint::OptionChain {
+                        canonical_permtick: config.symbol.permtick.to_string(),
+                        chain: Arc::new(chain),
+                        frontier_time,
+                    })
+                })
+                .collect()
         }
         CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
             Err(LeanError::DataError(format!(
@@ -757,6 +794,12 @@ fn effective_subscription_end(
     config: &SubscriptionDataConfig,
     requested_end: chrono::NaiveDate,
 ) -> chrono::NaiveDate {
+    // Canonical option-universe symbols carry an option-shaped SID but do not
+    // represent one expiring contract. Their stream spans the algorithm range;
+    // only concrete contract subscriptions are capped at the contract expiry.
+    if config.option_chain.is_some() {
+        return requested_end;
+    }
     config
         .symbol
         .option_symbol_id()
@@ -832,7 +875,10 @@ use chrono::Datelike;
 mod tests {
     use super::*;
     use rlean_core::{Market, OptionRight, OptionStyle, Symbol, TimeSpan};
-    use rlean_data::{CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata};
+    use rlean_data::{
+        CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, OptionChainFilterMetadata,
+        OptionChainSubscriptionMetadata,
+    };
     use rlean_data_tables::{CustomDataPoint, TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
@@ -914,6 +960,39 @@ mod tests {
         );
         assert_eq!(backtest_window_candidate(Resolution::Second, start), start);
         assert_eq!(backtest_window_candidate(Resolution::Tick, start), start);
+    }
+
+    #[test]
+    fn canonical_option_universe_is_not_capped_by_placeholder_sid_expiry() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::MIN,
+            dec!(0),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+        let requested_end = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+
+        assert_eq!(
+            effective_subscription_end(&config, requested_end),
+            requested_end
+        );
     }
 
     #[test]

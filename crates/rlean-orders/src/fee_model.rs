@@ -372,13 +372,53 @@ impl FeeModel for AlpacaFeeModel {
 
 /// Tradier fee model.
 ///
-/// C# LEAN's `TradierBrokerageModel.GetFeeModel` returns a constant zero fee
-/// model for all supported security types.
+/// Tradier Pro charges no commission for equities or equity/ETF options, but
+/// options still incur clearing, regulatory, and exchange pass-through fees.
+/// Tradier's fill/status REST payload does not report those charges, so the
+/// live engine cannot apply an exact brokerage fee at fill time. This model
+/// uses Tradier's published July 2026 clearing/regulatory schedule plus the
+/// average exchange charge observed on a production SPY option round trip.
+///
+/// The exchange component is deliberately isolated: it can be replaced when
+/// Tradier exposes the routed venue or an authoritative per-fill fee.
 pub struct TradierFeeModel;
 
+impl TradierFeeModel {
+    /// Tradier-published option clearing fee per contract.
+    pub const OPTION_CLEARING_FEE: Price = dec!(0.0775);
+    /// Options Regulatory Fee per contract.
+    pub const OPTION_REGULATORY_FEE: Price = dec!(0.0187);
+    /// Regulatory reporting fee: $0.000072 per equivalent share, with one
+    /// option contract representing 100 equivalent shares.
+    pub const OPTION_REPORTING_FEE: Price = dec!(0.0072);
+    /// FINRA Trading Activity Fee, charged on option sales.
+    pub const OPTION_SELL_TAF: Price = dec!(0.00279);
+    /// Average routed-exchange charge calibrated from the 2026-07-29 SPY
+    /// 0-DTE round trip: 16 contracts bought and sold generated $8.38459 in
+    /// broker cash charges after removing the gross trade P&L.
+    pub const OPTION_EXCHANGE_FEE_ESTIMATE: Price = dec!(0.1572234375);
+
+    fn option_fee_per_contract(order: &Order) -> Price {
+        let mut fee = Self::OPTION_CLEARING_FEE
+            + Self::OPTION_REGULATORY_FEE
+            + Self::OPTION_REPORTING_FEE
+            + Self::OPTION_EXCHANGE_FEE_ESTIMATE;
+        if order.direction() == OrderDirection::Sell {
+            fee += Self::OPTION_SELL_TAF;
+        }
+        fee
+    }
+}
+
 impl FeeModel for TradierFeeModel {
-    fn get_order_fee(&self, _params: &OrderFeeParameters<'_>) -> OrderFee {
-        OrderFee::zero()
+    fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
+        match params.security_type {
+            SecurityType::Option | SecurityType::IndexOption => OrderFee::new(
+                params.order.abs_quantity() * Self::option_fee_per_contract(params.order),
+                &params.quote_currency,
+            ),
+            _ => OrderFee::zero(),
+        }
     }
 }
 

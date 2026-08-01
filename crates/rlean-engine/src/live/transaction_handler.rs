@@ -8,13 +8,14 @@
 //! A dedicated worker owns the sidecar event stream. The live loop communicates
 //! with it over two crossbeam channels:
 //!
-//!   * request channel (loop -> worker): submit/cancel/update/stop.
+//!   * request channel (loop -> worker): submit/cancel/update/cash-sync/stop.
 //!   * event channel (worker -> loop): status + fill notifications.
 //!
 //! Portfolio, `TransactionManager` and algorithm callbacks are only ever touched
 //! on the live-loop thread. The worker only talks to the brokerage.
 
 use anyhow::Context;
+use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
@@ -42,6 +43,8 @@ enum BrokerageRequest {
     Cancel(Order),
     /// Update an order that has a brokerage id.
     Update(Order),
+    /// Pull an authoritative cash snapshot from the brokerage.
+    CashSync,
     /// Shut the worker down.
     Stop,
 }
@@ -77,6 +80,11 @@ pub(crate) enum BrokerageEvent {
         cumulative_filled: Quantity,
         commission: Option<Price>,
     },
+    /// Authoritative per-currency cash balances returned by the brokerage.
+    CashSnapshot { cash_balances: Vec<(String, Price)> },
+    /// A cash snapshot failed. Trading continues and the synchronization state
+    /// retries with backoff; a brokerage outage must not terminate a strategy.
+    CashSyncFailed { message: String },
 }
 
 /// Backoff schedule for retrying a failed order submission. Its length + 1 is
@@ -93,6 +101,107 @@ const SUBMIT_BACKOFF: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(5),
     std::time::Duration::from_secs(15),
 ];
+
+const CASH_SYNC_HOUR_ET: u32 = 7;
+const CASH_SYNC_MINUTE_ET: u32 = 45;
+const CASH_SYNC_MIN_FILL_AGE_NS: i64 = 10_000_000_000;
+const CASH_SYNC_VERIFY_DELAY_NS: i64 = 10_000_000_000;
+const CASH_SYNC_RECENT_FILL_NS: i64 = 20_000_000_000;
+const CASH_SYNC_MAX_RETRY_NS: i64 = 60_000_000_000;
+
+#[derive(Debug, Clone)]
+struct LiveCashSyncState {
+    last_sync_date_et: chrono::NaiveDate,
+    request_in_flight: bool,
+    retry_not_before: Option<DateTime>,
+    failures: u32,
+    verify_at: Option<DateTime>,
+    last_fill_time: Option<DateTime>,
+}
+
+impl LiveCashSyncState {
+    fn new(now: DateTime) -> Self {
+        Self {
+            // Startup account synchronization is authoritative for the current
+            // day, matching C# LEAN's `_syncedLiveBrokerageCashToday = true`.
+            last_sync_date_et: now.to_tz(rlean_core::time::tz::NEW_YORK).date_naive(),
+            request_in_flight: false,
+            retry_not_before: None,
+            failures: 0,
+            verify_at: None,
+            last_fill_time: None,
+        }
+    }
+
+    fn record_fill(&mut self, now: DateTime) {
+        self.last_fill_time = Some(now);
+    }
+
+    fn should_request(&mut self, now: DateTime) -> bool {
+        if self.verify_at.is_some_and(|verify_at| now >= verify_at) {
+            self.verify_at = None;
+            if self
+                .last_fill_time
+                .is_some_and(|fill| now.0.saturating_sub(fill.0) <= CASH_SYNC_RECENT_FILL_NS)
+            {
+                // The snapshot may have raced a fill. Make the current day
+                // eligible again so the next quiet interval re-synchronizes.
+                self.last_sync_date_et = self
+                    .last_sync_date_et
+                    .pred_opt()
+                    .unwrap_or(self.last_sync_date_et);
+                tracing::info!(
+                    "brokerage cash sync was followed by a recent fill; resynchronization required"
+                );
+            } else {
+                tracing::info!("brokerage cash sync verified");
+            }
+        }
+
+        if self.request_in_flight
+            || self
+                .retry_not_before
+                .is_some_and(|retry_not_before| now < retry_not_before)
+            || self
+                .last_fill_time
+                .is_some_and(|fill| now.0.saturating_sub(fill.0) <= CASH_SYNC_MIN_FILL_AGE_NS)
+        {
+            return false;
+        }
+
+        let now_et = now.to_tz(rlean_core::time::tz::NEW_YORK);
+        let after_sync_time = now_et.hour() > CASH_SYNC_HOUR_ET
+            || (now_et.hour() == CASH_SYNC_HOUR_ET && now_et.minute() >= CASH_SYNC_MINUTE_ET);
+        after_sync_time && now_et.date_naive() != self.last_sync_date_et
+    }
+
+    fn request_started(&mut self) {
+        self.request_in_flight = true;
+    }
+
+    fn request_succeeded(&mut self, now: DateTime) {
+        self.last_sync_date_et = now.to_tz(rlean_core::time::tz::NEW_YORK).date_naive();
+        self.request_in_flight = false;
+        self.retry_not_before = None;
+        self.failures = 0;
+        self.verify_at = Some(rlean_core::NanosecondTimestamp(
+            now.0.saturating_add(CASH_SYNC_VERIFY_DELAY_NS),
+        ));
+    }
+
+    fn request_failed(&mut self, now: DateTime) {
+        self.request_in_flight = false;
+        self.failures = self.failures.saturating_add(1);
+        let exponent = self.failures.saturating_sub(1).min(5);
+        let delay_ns = 2_i64
+            .saturating_pow(exponent)
+            .saturating_mul(1_000_000_000)
+            .min(CASH_SYNC_MAX_RETRY_NS);
+        self.retry_not_before = Some(rlean_core::NanosecondTimestamp(
+            now.0.saturating_add(delay_ns),
+        ));
+    }
+}
 
 /// State the worker tracks per order it has seen from the brokerage, so it only
 /// emits an event when something actually changed.
@@ -141,6 +250,8 @@ pub struct LiveBrokerageRouter {
     /// trading; this is the asynchronous safety net when both the brokerage
     /// snapshot and history seed are temporarily empty.
     price_deferred_logged: std::collections::HashSet<i64>,
+    /// LEAN-style daily authoritative brokerage cash reconciliation.
+    cash_sync: LiveCashSyncState,
 }
 
 fn order_reduces_position(algorithm: &QcAlgorithm, order: &Order) -> bool {
@@ -150,6 +261,13 @@ fn order_reduces_position(algorithm: &QcAlgorithm, order: &Order) -> bool {
         && ((holdings > Decimal::ZERO && remaining < Decimal::ZERO)
             || (holdings < Decimal::ZERO && remaining > Decimal::ZERO))
         && (holdings + remaining).abs() < holdings.abs()
+}
+
+fn fee_model_order_for_fill(order: &Order, fill_quantity: Quantity) -> Order {
+    let mut fill_order = order.clone();
+    fill_order.quantity = fill_quantity;
+    fill_order.filled_quantity = Decimal::ZERO;
+    fill_order
 }
 
 impl LiveBrokerageRouter {
@@ -188,6 +306,7 @@ impl LiveBrokerageRouter {
             retry_not_before: HashMap::new(),
             moo_deferred_logged: std::collections::HashSet::new(),
             price_deferred_logged: std::collections::HashSet::new(),
+            cash_sync: LiveCashSyncState::new(DateTime::now()),
         }
     }
 
@@ -215,6 +334,28 @@ impl LiveBrokerageRouter {
             retry_not_before: HashMap::new(),
             moo_deferred_logged: std::collections::HashSet::new(),
             price_deferred_logged: std::collections::HashSet::new(),
+            cash_sync: LiveCashSyncState::new(DateTime::now()),
+        }
+    }
+
+    /// Request C# LEAN-style authoritative cash synchronization when the
+    /// brokerage session has crossed into a new New York date and it is at
+    /// least 07:45 ET. The request is non-blocking and runs through the worker
+    /// that owns the current sidecar connection id, so reconnects cannot leave
+    /// this path pointing at a stale connection.
+    pub fn request_cash_sync_if_due(&mut self, now: DateTime) {
+        if !self.cash_sync.should_request(now) {
+            return;
+        }
+        match self.request_tx.send(BrokerageRequest::CashSync) {
+            Ok(()) => {
+                self.cash_sync.request_started();
+                tracing::info!("requesting authoritative brokerage cash synchronization");
+            }
+            Err(error) => {
+                self.cash_sync.request_failed(now);
+                tracing::warn!("could not queue brokerage cash synchronization: {error}");
+            }
         }
     }
 
@@ -610,24 +751,31 @@ impl LiveBrokerageRouter {
                     .copied()
                     .unwrap_or_default();
                 let fill_delta = cumulative_filled - previously_applied;
-                let cumulative_commission = commission.unwrap_or_default();
                 let previously_applied_fee = self
                     .applied_fees
                     .get(&order_id)
                     .copied()
                     .unwrap_or_default();
-                let fee_delta = cumulative_commission - previously_applied_fee;
+                let fee_delta =
+                    commission.map(|cumulative_fee| cumulative_fee - previously_applied_fee);
 
                 let mut order_event =
                     OrderEvent::new(order.id, order.symbol.clone(), DateTime::now(), status);
                 order_event.apply_order_fields(&order);
                 order_event.fill_price = fill_price;
                 order_event.fill_quantity = fill_delta;
-                if fee_delta > Price::ZERO {
+                if let Some(fee_delta) = fee_delta {
                     order_event.order_fee = fee_delta;
                 }
 
                 if status.is_fill() && !fill_delta.is_zero() {
+                    let fee = fee_delta.unwrap_or_else(|| {
+                        let fill_order = fee_model_order_for_fill(&order, fill_delta);
+                        algorithm_manager
+                            .algorithm
+                            .order_fee(&fill_order, order_event.fill_price)
+                    });
+                    order_event.order_fee = fee;
                     self.settle_fill(
                         &order,
                         &mut order_event,
@@ -636,8 +784,11 @@ impl LiveBrokerageRouter {
                         trade_builder,
                         completed_trades,
                     );
+                    self.cash_sync.record_fill(DateTime::now());
                     self.applied_filled.insert(order_id, cumulative_filled);
-                    self.applied_fees.insert(order_id, cumulative_commission);
+                    if let Some(cumulative_fee) = commission {
+                        self.applied_fees.insert(order_id, cumulative_fee);
+                    }
                 } else if !status.is_fill() {
                     order_event.message = status_message(status);
                 }
@@ -650,14 +801,48 @@ impl LiveBrokerageRouter {
                     all_order_events,
                 );
             }
+            BrokerageEvent::CashSnapshot { cash_balances } => {
+                let now = DateTime::now();
+                let cash = rlean_live::account_sync::settlement_cash(&cash_balances);
+                if let Some(portfolio) = portfolio {
+                    let previous_cash = *portfolio.cash.read();
+                    let previous_value = portfolio.total_portfolio_value();
+                    let delta = cash - previous_cash;
+                    *portfolio.cash.write() = cash;
+                    let material_threshold = previous_value.abs() * Decimal::new(2, 2);
+                    if delta.abs() > material_threshold {
+                        tracing::warn!(
+                            previous_cash = %previous_cash,
+                            brokerage_cash = %cash,
+                            delta = %delta,
+                            portfolio_value = %previous_value,
+                            "authoritative brokerage cash synchronization applied a material correction"
+                        );
+                    } else {
+                        tracing::info!(
+                            previous_cash = %previous_cash,
+                            brokerage_cash = %cash,
+                            delta = %delta,
+                            "authoritative brokerage cash synchronization applied"
+                        );
+                    }
+                }
+                self.cash_sync.request_succeeded(now);
+            }
+            BrokerageEvent::CashSyncFailed { message } => {
+                let now = DateTime::now();
+                self.cash_sync.request_failed(now);
+                tracing::warn!(
+                    attempt = self.cash_sync.failures,
+                    "brokerage cash synchronization failed; trading remains active and the sync will retry: {message}"
+                );
+            }
         }
     }
 
-    /// Apply a fill's cash/holdings effect to the portfolio, mirroring
-    /// `settle_fill_event_bridge`: use the brokerage-reported commission when
-    /// present, otherwise the security's fee model. Buying-power failures
-    /// downgrade the event to Invalid (defensive; the brokerage already
-    /// accepted it).
+    /// Apply a fill's cash/holdings effect to the portfolio. The caller has
+    /// already resolved `event.order_fee` from either the brokerage's exact
+    /// cumulative fee delta or the security's fill-sized fee model.
     fn settle_fill<B: AlgorithmBridge>(
         &self,
         order: &Order,
@@ -668,12 +853,7 @@ impl LiveBrokerageRouter {
         completed_trades: &mut Vec<Trade>,
     ) {
         let bridge = &algorithm_manager.algorithm;
-        let fee = if event.order_fee > Decimal::ZERO {
-            event.order_fee
-        } else {
-            bridge.order_fee(order, event.fill_price)
-        };
-        event.order_fee = fee;
+        let fee = event.order_fee;
 
         let Some(portfolio) = portfolio else {
             return;
@@ -892,6 +1072,40 @@ fn run_sidecar_worker(
                             ),
                         }
                     }
+                    Ok(BrokerageRequest::CashSync) => {
+                        let result = client
+                            .brokerage_snapshot(connection_id)
+                            .await
+                            .and_then(|snapshot| {
+                                snapshot
+                                    .cash
+                                    .into_iter()
+                                    .map(|balance| {
+                                        Ok((
+                                            balance.currency,
+                                            balance.amount.parse().with_context(|| {
+                                                format!(
+                                                    "invalid brokerage cash amount '{}'",
+                                                    balance.amount
+                                                )
+                                            })?,
+                                        ))
+                                    })
+                                    .collect::<anyhow::Result<Vec<_>>>()
+                            });
+                        match result {
+                            Ok(cash_balances) => {
+                                let _ = event_tx.send(BrokerageEvent::CashSnapshot {
+                                    cash_balances,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(BrokerageEvent::CashSyncFailed {
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         stop = true;
@@ -1038,6 +1252,10 @@ fn run_worker(
                 if let Err(error) = brokerage.update_order(&order) {
                     tracing::warn!("live brokerage update failed for {}: {error}", order.id);
                 }
+            }
+            Ok(BrokerageRequest::CashSync) => {
+                let cash_balances = brokerage.get_cash_balance();
+                let _ = event_tx.send(BrokerageEvent::CashSnapshot { cash_balances });
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1446,8 +1664,91 @@ mod tests {
     use rlean_core::{DateTime, Market, Resolution, Symbol};
     use rust_decimal_macros::dec;
 
+    fn ny_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime {
+        use chrono::TimeZone;
+        rlean_core::time::tz::NEW_YORK
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .into()
+    }
+
     fn spy() -> Symbol {
         Symbol::create_equity("SPY", &Market::usa())
+    }
+
+    #[test]
+    fn live_cash_sync_matches_lean_daily_schedule_and_fill_quiet_period() {
+        let startup = ny_time(2026, 7, 29, 6, 0);
+        let mut state = LiveCashSyncState::new(startup);
+
+        // Startup synchronization covers the current day.
+        assert!(!state.should_request(ny_time(2026, 7, 29, 8, 0)));
+        assert!(!state.should_request(ny_time(2026, 7, 30, 7, 44)));
+        assert!(state.should_request(ny_time(2026, 7, 30, 7, 45)));
+
+        state.request_started();
+        let synced = ny_time(2026, 7, 30, 7, 45);
+        state.request_succeeded(synced);
+        state.record_fill(rlean_core::NanosecondTimestamp(synced.0 + 5_000_000_000));
+
+        // Ten seconds after the snapshot, the recent fill invalidates it.
+        assert!(!state.should_request(rlean_core::NanosecondTimestamp(
+            synced.0 + CASH_SYNC_VERIFY_DELAY_NS
+        )));
+        // Once the fill is more than ten seconds old, the same day is eligible
+        // again and the authoritative snapshot is retried.
+        assert!(state.should_request(rlean_core::NanosecondTimestamp(synced.0 + 21_000_000_000)));
+    }
+
+    #[test]
+    fn live_cash_sync_failure_retries_without_terminating_trading() {
+        let now = ny_time(2026, 7, 30, 7, 45);
+        let mut state = LiveCashSyncState::new(ny_time(2026, 7, 29, 8, 0));
+        assert!(state.should_request(now));
+        state.request_started();
+        state.request_failed(now);
+
+        assert_eq!(state.failures, 1);
+        assert!(!state.request_in_flight);
+        assert!(!state.should_request(rlean_core::NanosecondTimestamp(now.0 + 999_000_000)));
+        assert!(state.should_request(rlean_core::NanosecondTimestamp(now.0 + 1_000_000_000)));
+    }
+
+    #[test]
+    fn fee_model_fallback_prices_only_each_partial_fill() {
+        let order = Order::market(1, spy(), dec!(10), DateTime::now(), "");
+        let first = fee_model_order_for_fill(&order, dec!(3));
+        let second = fee_model_order_for_fill(&order, dec!(7));
+
+        assert_eq!(first.quantity, dec!(3));
+        assert_eq!(second.quantity, dec!(7));
+        assert_eq!(first.filled_quantity, Decimal::ZERO);
+        assert_eq!(second.filled_quantity, Decimal::ZERO);
+        assert_eq!(first.quantity + second.quantity, order.quantity);
+    }
+
+    #[test]
+    fn live_cash_sync_request_uses_worker_owned_brokerage_connection() {
+        let mock = MockBrokerage {
+            cash: vec![("USD".to_string(), dec!(12345.67))],
+            ..MockBrokerage::new()
+        };
+        let mut router = LiveBrokerageRouter::spawn(Box::new(mock));
+        router.cash_sync = LiveCashSyncState::new(ny_time(2026, 7, 29, 8, 0));
+        router.request_cash_sync_if_due(ny_time(2026, 7, 30, 7, 45));
+
+        let event = router
+            .event_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("cash snapshot event");
+        assert!(matches!(
+            event,
+            BrokerageEvent::CashSnapshot { cash_balances }
+                if cash_balances == vec![("USD".to_string(), dec!(12345.67))]
+        ));
+        router.shutdown();
     }
 
     #[test]

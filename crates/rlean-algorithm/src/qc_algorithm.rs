@@ -29,7 +29,7 @@ use rlean_orders::{
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// LEAN-style option universe filter configured through `Option.set_filter`.
@@ -193,6 +193,11 @@ pub struct QcAlgorithm {
     pub open_option_contracts: Vec<Symbol>,
     /// Generated option chains keyed by canonical ticker (e.g. "?SPY").
     pub option_chains: HashMap<String, OptionChain>,
+    /// Concrete contract membership selected by each canonical option
+    /// universe. Membership owns the child subscriptions exactly as LEAN's
+    /// `OptionChainUniverse` does; holdings and open targets still defer
+    /// physical removal through the normal pending-removal manager.
+    option_universe_members: HashMap<String, HashSet<Symbol>>,
 
     /// The benchmark symbol set by the algorithm (ticker, e.g. "SPY").
     /// When None, the runner defaults to SPY automatically.
@@ -256,6 +261,7 @@ impl QcAlgorithm {
             option_subscriptions_generation: 0,
             open_option_contracts: Vec::new(),
             option_chains: HashMap::new(),
+            option_universe_members: HashMap::new(),
             benchmark_symbol: None,
             risk_free_interest_rate_model: Arc::new(
                 rlean_core::ConstantRiskFreeInterestRateModel::new(dec!(0.01)),
@@ -1877,6 +1883,55 @@ impl QcAlgorithm {
         self.option_subscriptions_generation += 1;
     }
 
+    /// Apply one filtered option-chain universe snapshot and materialize its
+    /// concrete market-data subscriptions before the slice reaches the alpha.
+    pub fn apply_option_universe_membership(
+        &mut self,
+        canonical: &Symbol,
+        chain: &OptionChain,
+    ) -> crate::algorithm::SecurityChanges {
+        let key = canonical.permtick.to_string();
+        let resolution = self
+            .option_subscription_resolutions
+            .get(&key)
+            .copied()
+            .unwrap_or(Resolution::Minute);
+        let desired = chain.contracts.keys().cloned().collect::<HashSet<_>>();
+        let previous = self
+            .option_universe_members
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        if desired == previous {
+            self.option_chains.insert(key, chain.clone());
+            return crate::algorithm::SecurityChanges::empty();
+        }
+
+        self.begin_universe_selection_pass();
+        let mut changes = crate::algorithm::SecurityChanges::empty();
+        for symbol in desired.difference(&previous) {
+            self.cancel_pending_security_removal(symbol);
+            self.ensure_option_security_with_data(symbol, resolution, true);
+            if !self
+                .open_option_contracts
+                .iter()
+                .any(|existing| existing.id.sid == symbol.id.sid)
+            {
+                self.open_option_contracts.push(symbol.clone());
+            }
+            changes.added.push(symbol.clone());
+        }
+        for symbol in previous.difference(&desired) {
+            if self.request_universe_security_removal(symbol) {
+                changes.removed.push(symbol.clone());
+            }
+        }
+        self.process_pending_universe_security_removals();
+        self.option_universe_members.insert(key.clone(), desired);
+        self.option_chains.insert(key, chain.clone());
+        changes
+    }
+
     /// Subscribe to a specific option contract.
     pub fn add_option_contract(&mut self, symbol: Symbol, resolution: Resolution) -> Symbol {
         self.add_option_contract_with_data(symbol, resolution, true)
@@ -2160,6 +2215,7 @@ impl QcAlgorithm {
         self.option_subscription_resolutions.remove(&canonical_key);
         self.option_filters.remove(&canonical_key);
         self.option_chains.remove(&canonical_key);
+        self.option_universe_members.remove(&canonical_key);
         self.option_subscriptions_generation += 1;
 
         let child_symbols: Vec<Symbol> = self
@@ -2712,6 +2768,37 @@ mod tests {
         let configs = alg.subscription_manager.get_configs_for_symbol(&contract);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].tick_type, rlean_core::TickType::Quote);
+    }
+
+    #[test]
+    fn option_universe_materializes_contract_subscriptions_before_alpha_use() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let canonical = alg.add_option("SPY", Resolution::Minute);
+        let underlying = canonical.underlying.as_ref().unwrap().as_ref().clone();
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::from_ymd_opt(2026, 7, 29).unwrap(),
+            dec!(740),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let mut chain = OptionChain::new(canonical.clone(), dec!(739.5));
+        chain.add_contract(rlean_options::OptionContract::new(contract.clone()));
+
+        let changes = alg.apply_option_universe_membership(&canonical, &chain);
+
+        assert_eq!(changes.added, vec![contract.clone()]);
+        assert!(changes.removed.is_empty());
+        assert!(alg.securities.contains(&contract));
+        let configs = alg.subscription_manager.get_configs_for_symbol(&contract);
+        assert_eq!(configs.len(), 2);
+        assert!(configs
+            .iter()
+            .any(|config| config.tick_type == rlean_core::TickType::Trade));
+        assert!(configs
+            .iter()
+            .any(|config| config.tick_type == rlean_core::TickType::Quote));
     }
 
     #[test]

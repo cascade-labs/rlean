@@ -36,6 +36,11 @@ pub async fn load_risk_free_interest_rate_model(
         custom_query: None,
         properties: Default::default(),
         venue: String::new(),
+        option_underlying_ticker: String::new(),
+        option_min_strike_rank: 0,
+        option_max_strike_rank: 0,
+        option_min_expiry_days: 0,
+        option_max_expiry_days: 0,
     };
     let registration = sidecar
         .add_subscription_spec(spec, DeliveryMode::Backtest)

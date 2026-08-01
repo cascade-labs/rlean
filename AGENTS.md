@@ -2,6 +2,17 @@
 
 Rust rewrite of QuantConnect LEAN. Targets the same `QCAlgorithm` Python strategy API as LEAN's C# bindings while adding a native Rust `IAlgorithm` trait.
 
+## C# LEAN is the behavioral source of truth
+
+Before changing framework or SDK behavior—subscriptions, universe selection,
+filtering, scheduling, data synchronization, security lifecycle, brokerage
+state, orders, fills, fees, portfolio accounting, or event ordering—locate and
+read the exact implementation in `../Lean/` and port its semantics. Do not
+infer behavior from a comment, approximate it from memory, or hand-roll an
+alternative. Any intentional divergence requires an explicit user decision and
+must be documented and covered by tests; PR descriptions should name the LEAN
+classes or methods used as the reference.
+
 ## Workspace Layout
 
 ```
