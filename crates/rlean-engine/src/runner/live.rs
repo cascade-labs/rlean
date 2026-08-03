@@ -306,6 +306,18 @@ where
                 &mut router,
                 rlean_core::DateTime::now(),
             );
+            // A live insight checkpoint restores the source of portfolio
+            // targets, not the execution model's transient target collection.
+            // Once actual brokerage holdings/orders are known, rebuild those
+            // targets once from the complete active insight set. This mirrors
+            // C# PortfolioConstructionModel.CreateTargets, which evaluates the
+            // active Algorithm.Insights collection when reconciliation is due,
+            // without pretending the restored insights are newly emitted alpha.
+            algorithm_manager
+                .framework()
+                .lock()
+                .expect("framework poisoned during startup reconciliation")
+                .request_rebalance();
             brokerage_router = Some(router);
         }
     }

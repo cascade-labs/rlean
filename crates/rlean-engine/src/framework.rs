@@ -57,6 +57,11 @@ pub struct FrameworkState {
     pending_flat_targets: Vec<Insight>,
     pending_insight_events: Vec<InsightEvent>,
     pending_security_changes: bool,
+    /// Engine-requested one-shot reconciliation, used after restoring live
+    /// insights and synchronizing the actual brokerage account. This is kept
+    /// separate from insight changes so checkpoint restoration does not turn
+    /// into recurring alpha-driven rebalancing.
+    pending_rebalance: bool,
     /// Final PCM/risk targets generated during the current pipeline pass. C#
     /// LEAN stores these on `SecurityHolding.Target` before execution.
     pending_target_updates: Vec<(Symbol, Decimal)>,
@@ -77,6 +82,7 @@ impl FrameworkState {
             pending_flat_targets: Vec::new(),
             pending_insight_events: Vec::new(),
             pending_security_changes: false,
+            pending_rebalance: false,
             pending_target_updates: Vec::new(),
             next_rebalance_time: None,
             observer: None,
@@ -380,6 +386,17 @@ impl FrameworkState {
         }
     }
 
+    /// Request one portfolio-construction pass on the next framework time step.
+    ///
+    /// Live restart uses this after brokerage state has been synchronized so
+    /// the restored active insight set is converted back into portfolio targets
+    /// exactly once. C# LEAN's PCM derives targets from the complete active
+    /// `Algorithm.Insights` collection whenever a rebalance is due; this flag
+    /// supplies that missing restart boundary without reporting fake new alpha.
+    pub fn request_rebalance(&mut self) {
+        self.pending_rebalance = true;
+    }
+
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
         if !added.is_empty() || !removed.is_empty() {
             self.pending_security_changes = true;
@@ -424,6 +441,11 @@ impl FrameworkState {
             }
         }
 
+        if self.pending_rebalance {
+            self.refresh_rebalance(now, &policy);
+            return true;
+        }
+
         if policy.rebalance_on_security_changes() && self.pending_security_changes {
             self.refresh_rebalance(now, &policy);
             return true;
@@ -448,6 +470,7 @@ impl FrameworkState {
     fn refresh_rebalance(&mut self, now: DateTime, policy: &RebalancePolicy) {
         self.next_rebalance_time = next_rebalance_time(policy, now);
         self.pending_security_changes = false;
+        self.pending_rebalance = false;
     }
 }
 
@@ -1006,6 +1029,24 @@ mod tests {
         );
 
         assert!(!framework.is_rebalance_due(now, false));
+    }
+
+    #[test]
+    fn explicit_startup_reconciliation_is_one_shot() {
+        let mut framework = FrameworkState::new();
+        framework.pcm = Box::new(
+            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
+                rlean_portfolio_construction::PortfolioBias::LongShort,
+                None,
+                RebalancePolicy::insight_changes_only(),
+            ),
+        );
+        let now = dt(2026, 1, 1);
+
+        framework.request_rebalance();
+
+        assert!(framework.is_rebalance_due(now, false));
+        assert!(!framework.is_rebalance_due(now + TimeSpan::ONE_MINUTE, false));
     }
 
     #[test]
