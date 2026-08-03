@@ -428,13 +428,10 @@ async fn produce_registered(
 
     while window_start <= end_date {
         let window_end = backtest_window_candidate(config.resolution, window_start).min(end_date);
+        let (query_start, query_end) = bounded_query_times(window_start, window_end, start, end);
         let mut batches = context
             .sidecar
-            .query(
-                subscription_id,
-                partition_day_start(window_start).0,
-                partition_day_end(window_end).0,
-            )
+            .query(subscription_id, query_start.0, query_end.0)
             .await
             .map_err(data_error)?;
         let mut points = Vec::new();
@@ -506,7 +503,7 @@ async fn produce_registered(
             last_point = Some(point);
         }
 
-        let watermark = partition_day_end(window_end);
+        let watermark = query_end;
         // C# LEAN places FillForwardEnumerator in front of the subscription
         // synchronizer, so every synthetic point covered by a frontier is
         // emitted before the synchronizer can advance beyond that frontier.
@@ -540,6 +537,23 @@ async fn produce_registered(
         };
     }
     Ok(())
+}
+
+/// Keep partition-aligned interior windows while preserving the caller's exact
+/// first and final frontiers. In particular, a live last-known-price request
+/// ending during an open session must not be widened to 23:59:59: C# LEAN ends
+/// the history request at algorithm time, so the unfinished Daily bar is not
+/// available yet.
+fn bounded_query_times(
+    window_start: chrono::NaiveDate,
+    window_end: chrono::NaiveDate,
+    requested_start: DateTime,
+    requested_end: DateTime,
+) -> (DateTime, DateTime) {
+    (
+        partition_day_start(window_start).max(requested_start),
+        partition_day_end(window_end).min(requested_end),
+    )
 }
 
 fn decode_points(
@@ -1007,6 +1021,19 @@ mod tests {
             backtest_window_candidate(Resolution::Hour, start),
             chrono::NaiveDate::from_ymd_opt(2019, 5, 9).unwrap()
         );
+    }
+
+    #[test]
+    fn bounded_query_preserves_partial_day_history_frontiers() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let requested_start = DateTime::from(date.and_hms_opt(13, 30, 0).unwrap());
+        let requested_end = DateTime::from(date.and_hms_opt(16, 52, 0).unwrap());
+
+        let (query_start, query_end) =
+            bounded_query_times(date, date, requested_start, requested_end);
+
+        assert_eq!(query_start, requested_start);
+        assert_eq!(query_end, requested_end);
     }
 
     #[test]

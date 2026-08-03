@@ -33,12 +33,13 @@ pub enum OrderStatus {
 
 impl OrderStatus {
     pub fn is_open(&self) -> bool {
-        matches!(
+        // C# LEAN's OrderStatus.IsOpen is the inverse of IsClosed. In
+        // particular, CancelPending remains open until the brokerage confirms
+        // cancellation, so its remaining quantity must continue to participate
+        // in projected holdings and liquidation sizing.
+        !matches!(
             self,
-            OrderStatus::New
-                | OrderStatus::Submitted
-                | OrderStatus::PartiallyFilled
-                | OrderStatus::UpdateSubmitted
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Invalid
         )
     }
 

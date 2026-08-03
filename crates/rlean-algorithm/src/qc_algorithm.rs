@@ -158,6 +158,9 @@ pub struct QcAlgorithm {
     // Current time (updated each bar)
     pub time: DateTime,
     pub utc_time: DateTime,
+    /// Whether the algorithm is executing against live data and brokerage
+    /// services. Mirrors C# LEAN's `QCAlgorithm.LiveMode`.
+    pub live_mode: bool,
 
     // Logging
     pub log: AlgorithmLogging,
@@ -247,6 +250,7 @@ impl QcAlgorithm {
             subscription_manager: SubscriptionManager::new(),
             time: DateTime::EPOCH,
             utc_time: DateTime::EPOCH,
+            live_mode: false,
             log: AlgorithmLogging::default(),
             statistics: RuntimeStatistics::default(),
             warmup_period: None,
@@ -1685,9 +1689,44 @@ impl QcAlgorithm {
         let mut tickets = Vec::new();
         for sym in symbols {
             let holding = self.portfolio.get_holding(&sym);
-            if holding.is_invested() {
-                let ticket = self.market_order(&sym, -holding.quantity);
-                tickets.push(ticket);
+            if !holding.is_invested() {
+                continue;
+            }
+
+            // Match QCAlgorithm.Liquidate: pending market-order quantity is
+            // already on its way to the portfolio and must be deducted from
+            // the closing order. This is especially important for a cash
+            // brokerage where a rebalance trim can still be in flight when an
+            // insight expires and RemoveSecurity requests a full liquidation.
+            let open_orders = self
+                .transactions
+                .get_open_orders()
+                .into_iter()
+                .filter(|order| order.symbol.id.sid == sym.id.sid)
+                .collect::<Vec<_>>();
+            if open_orders.len() == 1
+                && open_orders[0].order_type == OrderType::Market
+                && open_orders[0].remaining_quantity() == -holding.quantity
+            {
+                continue;
+            }
+
+            let mut market_orders_quantity = Decimal::ZERO;
+            for order in open_orders {
+                if order.order_type == OrderType::Market {
+                    market_orders_quantity += order.remaining_quantity();
+                } else {
+                    self.transactions.request_cancel_order(
+                        order.id,
+                        self.utc_time,
+                        "Liquidated".to_string(),
+                    );
+                }
+            }
+
+            let closing_quantity = -holding.quantity - market_orders_quantity;
+            if !closing_quantity.is_zero() {
+                tickets.push(self.market_order(&sym, closing_quantity));
             }
         }
         tickets
@@ -1995,8 +2034,19 @@ impl QcAlgorithm {
         }
 
         if !self.is_warming_up {
-            self.transactions
-                .cancel_open_orders_for_symbol(symbol.id.sid, self.utc_time);
+            // Match Transactions.CancelOpenOrders: cancellation is a request,
+            // not a local terminal transition. CancelPending remains open until
+            // acknowledged and Liquidate below accounts for any remaining
+            // market-order quantity while that acknowledgement is in flight.
+            for order in self.transactions.get_open_orders() {
+                if order.symbol.id.sid == symbol.id.sid {
+                    self.transactions.request_cancel_order(
+                        order.id,
+                        self.utc_time,
+                        "Removed".to_string(),
+                    );
+                }
+            }
         }
         if self.is_invested(symbol) {
             self.liquidate(Some(symbol));
@@ -2626,6 +2676,43 @@ mod tests {
         );
         assert!(!alg.securities.contains(&symbol));
         assert!(!alg.is_invested(&symbol));
+    }
+
+    #[test]
+    fn remove_security_accounts_for_pending_market_order_when_liquidating() {
+        let mut alg = QcAlgorithm::new("test", dec!(100_000));
+        let symbol = alg.add_equity("VG", Resolution::Minute);
+        alg.securities.update_price(&symbol, dec!(13));
+        alg.portfolio
+            .apply_fill_with_multiplier(&symbol, dec!(13), dec!(825), dec!(0), dec!(1));
+
+        let trim = alg.market_order(&symbol, dec!(-15));
+        assert!(alg.remove_security(&symbol, None));
+
+        let trim_order = alg
+            .transactions
+            .get_order(trim.order_id)
+            .expect("trim order must remain tracked");
+        assert_eq!(trim_order.status, OrderStatus::CancelPending);
+
+        let mut remaining_market_quantities = alg
+            .transactions
+            .get_open_orders()
+            .into_iter()
+            .filter(|order| {
+                order.symbol.id.sid == symbol.id.sid && order.order_type == OrderType::Market
+            })
+            .map(|order| order.remaining_quantity())
+            .collect::<Vec<_>>();
+        remaining_market_quantities.sort();
+
+        // LEAN's Liquidate subtracts the pending -15 trim from the -825
+        // position, so the replacement liquidation is -810, not another -825.
+        assert_eq!(remaining_market_quantities, vec![dec!(-810), dec!(-15)]);
+        assert_eq!(
+            remaining_market_quantities.into_iter().sum::<Decimal>(),
+            dec!(-825)
+        );
     }
 
     #[test]

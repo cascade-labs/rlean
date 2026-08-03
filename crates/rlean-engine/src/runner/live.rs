@@ -93,6 +93,18 @@ where
             .to_string(),
     );
 
+    // LEAN's BrokerageSetupHandler sets the live algorithm clock to UTC now
+    // before calling Initialize. Security seeders invoked by add_equity during
+    // Initialize must therefore resolve history relative to the live frontier,
+    // not the strategy's backtest start date.
+    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+        let mut algorithm = algorithm_state.lock().expect("algorithm state poisoned");
+        algorithm.live_mode = true;
+        crate::algorithm_services::advance_algorithm_time(
+            &mut algorithm,
+            rlean_core::DateTime::now(),
+        );
+    }
     algorithm_manager.initialize(&mut services)?;
     // The deployment selects execution independently from strategy source.
     // Strategies often set a brokerage model for backtests in Initialize;
@@ -312,6 +324,18 @@ where
                 &mut router,
                 rlean_core::DateTime::now(),
             );
+            // A live insight checkpoint restores the source of portfolio
+            // targets, not the execution model's transient target collection.
+            // Once actual brokerage holdings/orders are known, rebuild those
+            // targets once from the complete active insight set. This mirrors
+            // C# PortfolioConstructionModel.CreateTargets, which evaluates the
+            // active Algorithm.Insights collection when reconciliation is due,
+            // without pretending the restored insights are newly emitted alpha.
+            algorithm_manager
+                .framework()
+                .lock()
+                .expect("framework poisoned during startup reconciliation")
+                .request_rebalance();
             brokerage_router = Some(router);
         }
     }
