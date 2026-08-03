@@ -96,6 +96,18 @@ where
             .to_string(),
     );
 
+    // LEAN's BrokerageSetupHandler sets the live algorithm clock to UTC now
+    // before calling Initialize. Security seeders invoked by add_equity during
+    // Initialize must therefore resolve history relative to the live frontier,
+    // not the strategy's backtest start date.
+    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+        let mut algorithm = algorithm_state.lock().expect("algorithm state poisoned");
+        algorithm.live_mode = true;
+        crate::algorithm_services::advance_algorithm_time(
+            &mut algorithm,
+            rlean_core::DateTime::now(),
+        );
+    }
     algorithm_manager.initialize(&mut services)?;
     // The deployment selects execution independently from strategy source.
     // Strategies often set a brokerage model for backtests in Initialize;

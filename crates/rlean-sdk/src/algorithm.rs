@@ -435,6 +435,9 @@ impl AlgorithmHandle {
     pub fn is_warming_up(&self) -> bool {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).is_warming_up()
     }
+    pub fn live_mode(&self) -> bool {
+        AlgorithmApi::new(&mut self.inner.lock().unwrap()).live_mode()
+    }
 
     pub fn history(
         &self,
@@ -1013,6 +1016,11 @@ impl AlgorithmHandle {
         self.is_warming_up()
     }
 
+    #[getter(live_mode)]
+    fn py_live_mode(&self) -> bool {
+        self.live_mode()
+    }
+
     #[pyo3(name = "get_parameter", signature = (key, default=None))]
     fn py_get_parameter(&self, key: String, default: Option<String>) -> Option<String> {
         self.get_parameter(key, default)
@@ -1504,6 +1512,9 @@ impl<'a> AlgorithmApi<'a> {
     }
     pub fn is_warming_up(&self) -> bool {
         self.algorithm.is_warming_up
+    }
+    pub fn live_mode(&self) -> bool {
+        self.algorithm.live_mode
     }
 
     pub fn history_end_date(&self) -> chrono::NaiveDate {

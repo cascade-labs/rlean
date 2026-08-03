@@ -158,6 +158,9 @@ pub struct QcAlgorithm {
     // Current time (updated each bar)
     pub time: DateTime,
     pub utc_time: DateTime,
+    /// Whether the algorithm is executing against live data and brokerage
+    /// services. Mirrors C# LEAN's `QCAlgorithm.LiveMode`.
+    pub live_mode: bool,
 
     // Logging
     pub log: AlgorithmLogging,
@@ -247,6 +250,7 @@ impl QcAlgorithm {
             subscription_manager: SubscriptionManager::new(),
             time: DateTime::EPOCH,
             utc_time: DateTime::EPOCH,
+            live_mode: false,
             log: AlgorithmLogging::default(),
             statistics: RuntimeStatistics::default(),
             warmup_period: None,
