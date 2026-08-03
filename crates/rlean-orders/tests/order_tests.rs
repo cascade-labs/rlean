@@ -98,6 +98,12 @@ fn canceled_status_is_closed() {
     assert!(OrderStatus::Canceled.is_closed());
 }
 
+#[test]
+fn cancel_pending_status_remains_open_until_confirmed() {
+    assert!(OrderStatus::CancelPending.is_open());
+    assert!(!OrderStatus::CancelPending.is_closed());
+}
+
 // ─── Quantity helpers ────────────────────────────────────────────────────────
 
 #[test]
@@ -170,7 +176,7 @@ fn transaction_manager_request_cancel_sets_cancel_pending_and_tracks_request() {
     let order = tm.get_order(1).expect("order should exist");
     assert_eq!(order.status, OrderStatus::CancelPending);
     assert_eq!(ticket.status(), OrderStatus::CancelPending);
-    assert!(tm.get_open_orders().is_empty());
+    assert_eq!(tm.get_open_orders().len(), 1);
     let requests = tm.get_cancel_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].order_id, 1);
