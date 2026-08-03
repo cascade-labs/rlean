@@ -19,10 +19,7 @@ use rlean_data_sidecar::{
     decode_batch, CanonicalDataBatch, DataSidecarClient, SubscriptionSpec, WireDataType,
 };
 use rlean_live::{is_transient_sidecar_error, LiveSliceAssembler};
-use rlean_orders::{
-    fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
-    OrderEvent,
-};
+use rlean_orders::{fill_model::ImmediateFillModel, order_processor::OrderProcessor, OrderEvent};
 use rlean_statistics::{Trade, TradeBuilder};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -226,9 +223,18 @@ where
     // transaction manager to the deployment-writer snapshot. It is always built
     // (so snapshots keep working), but under real brokerage routing it is *not*
     // passed to `process_order_events`, so it never generates local fills.
+    let algorithm_state = algorithm_manager.algorithm.algorithm_state();
     let order_processor = transactions.as_ref().map(|tm| {
         OrderProcessor::new(
-            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
+            Box::new(ImmediateFillModel::new(
+                algorithm_state
+                    .clone()
+                    .map(|state| {
+                        Box::new(crate::algorithm_manager::SecuritySlippageModel::new(state))
+                            as Box<dyn rlean_orders::SlippageModel>
+                    })
+                    .unwrap_or_else(|| Box::new(rlean_orders::NullSlippageModel)),
+            )),
             tm.clone(),
         )
     });
@@ -1130,17 +1136,36 @@ fn service_live_brokerage<B: AlgorithmBridge>(
             router.dispatch_pending(transactions, &algorithm)
         })
         .unwrap_or_default();
-    if invalid_events.is_empty() {
-        return;
+    if !invalid_events.is_empty() {
+        for event in &invalid_events {
+            algorithm_manager.algorithm.on_order_event(event, services);
+        }
+        if let Some(writer) = live_writer {
+            writer.append_order_events(&invalid_events);
+        }
+        all_order_events.extend(invalid_events);
     }
 
-    for event in &invalid_events {
-        algorithm_manager.algorithm.on_order_event(event, services);
+    // Brokerage events are independent of market-data slices. Match LEAN's
+    // transaction/result lifecycle by refreshing restart and CLI artifacts as
+    // soon as submitted/filled/invalid state changes, including for sparse
+    // Daily strategies that may not receive another slice today.
+    if all_order_events.len() != previous_order_events || completed_trades.len() != previous_trades
+    {
+        if let (Some(writer), Some(portfolio)) = (live_writer, portfolio) {
+            writer.record_snapshot_from_transactions(
+                rlean_core::DateTime::now(),
+                portfolio,
+                transactions.as_ref(),
+                Some(&algorithm_manager.framework()),
+                crate::live::deployment_writer::LiveSnapshotCounts {
+                    slices_processed: algorithm_manager.slices_processed() as usize,
+                    order_events: all_order_events.len(),
+                    trades: completed_trades.len(),
+                },
+            );
+        }
     }
-    if let Some(writer) = live_writer {
-        writer.append_order_events(&invalid_events);
-    }
-    all_order_events.extend(invalid_events);
 }
 
 #[allow(clippy::too_many_arguments)]

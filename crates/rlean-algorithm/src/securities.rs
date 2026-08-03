@@ -3,6 +3,7 @@ use crate::portfolio::{SecurityHolding, SharedHoldings};
 use parking_lot::RwLock;
 use rlean_core::exchange_hours::ExchangeHours;
 use rlean_core::{Price, Resolution, SecurityType, Symbol, SymbolProperties};
+use rlean_orders::{NullSlippageModel, SlippageModel};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ pub struct Security {
     pub exchange_hours: Arc<ExchangeHours>,
     pub leverage: RwLock<f64>,
     pub buying_power_model: RwLock<BuyingPowerModel>,
+    slippage_model: RwLock<Arc<dyn SlippageModel>>,
     is_tradable: AtomicBool,
     pub is_delisted: bool,
     pub price: RwLock<Price>,
@@ -66,6 +68,7 @@ impl Security {
             exchange_hours,
             leverage: RwLock::new(1.0),
             buying_power_model: RwLock::new(BuyingPowerModel::SecurityMargin),
+            slippage_model: RwLock::new(Arc::new(NullSlippageModel)),
             is_tradable: AtomicBool::new(true),
             is_delisted: false,
             price: RwLock::new(rust_decimal_macros::dec!(0)),
@@ -156,6 +159,15 @@ impl Security {
 
     pub fn set_buying_power_model(&self, model: BuyingPowerModel) {
         *self.buying_power_model.write() = model;
+    }
+
+    pub fn slippage_model(&self) -> Arc<dyn SlippageModel> {
+        self.slippage_model.read().clone()
+    }
+
+    /// Mirrors C# LEAN `Security.SetSlippageModel`.
+    pub fn set_slippage_model(&self, model: Arc<dyn SlippageModel>) {
+        *self.slippage_model.write() = model;
     }
 }
 

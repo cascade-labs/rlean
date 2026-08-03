@@ -18,10 +18,7 @@ use rlean_data::{
 };
 use rlean_data_tables::TradeBar;
 use rlean_options::OptionChain;
-use rlean_orders::{
-    fill_model::ImmediateFillModel, order_processor::OrderProcessor, slippage::NullSlippageModel,
-    OrderEvent,
-};
+use rlean_orders::{fill_model::ImmediateFillModel, order_processor::OrderProcessor, OrderEvent};
 use rlean_statistics::{PortfolioStatistics, TradeBuilder};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
@@ -186,11 +183,16 @@ where
     // any strategy language gets identical execution semantics.
     let transactions = algorithm_manager.transactions();
     let portfolio = algorithm_manager.portfolio();
+    let algorithm_state = algorithm_manager.algorithm.algorithm_state();
     let order_processor = transactions.as_ref().map(|tm| {
-        OrderProcessor::new(
-            Box::new(ImmediateFillModel::new(Box::new(NullSlippageModel))),
-            tm.clone(),
-        )
+        let slippage: Box<dyn rlean_orders::SlippageModel> = algorithm_state
+            .clone()
+            .map(|state| {
+                Box::new(crate::algorithm_manager::SecuritySlippageModel::new(state))
+                    as Box<dyn rlean_orders::SlippageModel>
+            })
+            .unwrap_or_else(|| Box::new(rlean_orders::NullSlippageModel));
+        OrderProcessor::new(Box::new(ImmediateFillModel::new(slippage)), tm.clone())
     });
     let mut all_order_events: Vec<OrderEvent> = Vec::new();
     let mut market_slices_after_warmup = 0usize;

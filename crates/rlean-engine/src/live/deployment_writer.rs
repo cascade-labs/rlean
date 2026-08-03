@@ -6,7 +6,7 @@ use rlean_core::{DateTime, Resolution, Symbol};
 use rlean_live::AccountState;
 use rlean_orders::order::Order;
 use rlean_orders::order_processor::OrderProcessor;
-use rlean_orders::OrderEvent;
+use rlean_orders::{OrderEvent, TransactionManager};
 use rlean_statistics::Trade;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -26,7 +26,13 @@ pub const MIRROR_DEBOUNCE: Duration = Duration::from_secs(3);
 
 /// Restart-recovery artifacts mirrored when order events / trades changed
 /// since the last mirror (debounced by [`MIRROR_DEBOUNCE`]).
-const ORDER_STATE_FILES: [&str; 3] = ["orders.json", "order-events.jsonl", "trades.jsonl"];
+const ORDER_STATE_FILES: [&str; 5] = [
+    "portfolio.json",
+    "progress.json",
+    "orders.json",
+    "order-events.jsonl",
+    "trades.jsonl",
+];
 
 /// Insight-derived artifacts mirrored when the insight set changed — i.e. the
 /// framework drained insight events (emit/expire/close/restore) — debounced by
@@ -179,6 +185,28 @@ impl LiveDeploymentWriter {
         framework: Option<&Arc<Mutex<FrameworkState>>>,
         counts: LiveSnapshotCounts,
     ) {
+        self.record_snapshot_from_transactions(
+            time,
+            portfolio,
+            order_processor.transaction_manager.as_ref(),
+            framework,
+            counts,
+        );
+    }
+
+    /// Persist the authoritative live state after brokerage-originated order
+    /// events, even when no market-data slice is available. C# LEAN's live
+    /// result handler consumes transaction events independently and refreshes
+    /// its portfolio/result state from that path; sparse Daily strategies must
+    /// not leave their restart artifacts at the pre-fill account snapshot.
+    pub(crate) fn record_snapshot_from_transactions(
+        &self,
+        time: DateTime,
+        portfolio: &SecurityPortfolioManager,
+        transactions: &TransactionManager,
+        framework: Option<&Arc<Mutex<FrameworkState>>>,
+        counts: LiveSnapshotCounts,
+    ) {
         let updated_at = chrono::Utc::now().to_rfc3339();
         let holdings = portfolio
             .all_holdings()
@@ -230,7 +258,7 @@ impl LiveDeploymentWriter {
         });
         write_json_pretty_atomic(&self.portfolio_path, &portfolio_payload);
 
-        let orders = order_processor.transaction_manager.get_all_orders();
+        let orders = transactions.get_all_orders();
         let orders_payload = serde_json::json!({
             "status": "running",
             "time": time.to_string(),
@@ -306,14 +334,25 @@ impl LiveDeploymentWriter {
             }
         }
 
+        self.flush_debounced_mirrors_locked(&mut policy, now);
+    }
+
+    fn flush_debounced_mirrors_locked(&self, policy: &mut MirrorPolicy, now: Instant) {
         policy.dirty.retain(|file, changed_at| {
-            if changed_at.elapsed() >= MIRROR_DEBOUNCE {
+            if now.duration_since(*changed_at) >= MIRROR_DEBOUNCE {
                 self.mirror(file);
                 false
             } else {
                 true
             }
         });
+    }
+
+    fn flush_debounced_mirrors(&self) {
+        let Ok(mut policy) = self.mirror_policy.lock() else {
+            return;
+        };
+        self.flush_debounced_mirrors_locked(&mut policy, Instant::now());
     }
 
     /// Write the insight snapshot files. Returns true when the insight set
@@ -392,6 +431,10 @@ impl LiveDeploymentWriter {
             counts.order_events,
             counts.trades,
         );
+        // A quiet Daily strategy may have no data slice after its final fill.
+        // The wall-clock pulse completes the trailing debounce without doing
+        // another heavy portfolio/insight serialization pass.
+        self.flush_debounced_mirrors();
     }
 }
 
@@ -613,5 +656,52 @@ fn append_json_lines<T: serde::Serialize>(path: &Path, values: &[T]) {
                 let _ = writeln!(file, "{line}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn brokerage_snapshot_refreshes_portfolio_without_market_data_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = LiveDeploymentWriter::new(dir.path().to_path_buf());
+        let portfolio = SecurityPortfolioManager::new_live(dec!(1_000));
+        let transactions = TransactionManager::new();
+        let first_time = DateTime::from_secs(1_700_000_000);
+
+        writer.record_snapshot_from_transactions(
+            first_time,
+            &portfolio,
+            &transactions,
+            None,
+            LiveSnapshotCounts {
+                slices_processed: 0,
+                order_events: 0,
+                trades: 0,
+            },
+        );
+        *portfolio.cash.write() = dec!(875);
+        let fill_time = first_time + rlean_core::TimeSpan::from_secs(5);
+        writer.record_snapshot_from_transactions(
+            fill_time,
+            &portfolio,
+            &transactions,
+            None,
+            LiveSnapshotCounts {
+                slices_processed: 0,
+                order_events: 1,
+                trades: 0,
+            },
+        );
+
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("portfolio.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["time"], fill_time.to_string());
+        assert_eq!(snapshot["cash"], "875");
     }
 }

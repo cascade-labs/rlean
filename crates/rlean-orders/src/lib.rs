@@ -55,6 +55,9 @@ pub use order_event::OrderEvent;
 pub use order_processor::OrderProcessor;
 pub use order_ticket::{OrderTicket, UpdateOrderFields};
 pub use security_transaction_model::SecurityTransactionModel;
-pub use slippage::{ConstantSlippageModel, NullSlippageModel, SlippageModel, SpreadSlippageModel};
+pub use slippage::{
+    ConstantSlippageModel, NullSlippageModel, SlippageModel, SpreadSlippageModel,
+    VolumeShareSlippageModel,
+};
 pub use trailing_stop_order::TrailingStopOrder;
 pub use transaction_manager::{CancelOrderRequest, TransactionManager, UpdateOrderRequest};
