@@ -3,6 +3,7 @@
 use chrono::NaiveDate;
 use rlean_algorithm::qc_algorithm::{OptionFilter, QcAlgorithm};
 use rlean_core::{Market, Price, Symbol, SymbolOptionsExt};
+use rlean_orders::{SlippageModel, VolumeShareSlippageModel};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -19,6 +20,45 @@ use pyo3::types::PyAnyMethods;
 pub struct SecurityHandle {
     symbol: Symbol,
     algorithm: Option<Arc<Mutex<QcAlgorithm>>>,
+}
+
+/// LEAN-compatible volume-share price-impact model.
+#[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(name = "VolumeShareSlippageModel"))]
+pub struct VolumeShareSlippageModelHandle {
+    inner: Arc<dyn SlippageModel>,
+}
+
+impl VolumeShareSlippageModelHandle {
+    pub fn new(volume_limit: f64, price_impact: f64) -> Self {
+        let volume_limit = Decimal::from_f64_retain(volume_limit).unwrap_or(Decimal::ZERO);
+        let price_impact = Decimal::from_f64_retain(price_impact).unwrap_or(Decimal::ZERO);
+        Self {
+            inner: Arc::new(VolumeShareSlippageModel::new(volume_limit, price_impact)),
+        }
+    }
+
+    fn model(&self) -> Arc<dyn SlippageModel> {
+        self.inner.clone()
+    }
+}
+
+impl Default for VolumeShareSlippageModelHandle {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(VolumeShareSlippageModel::default()),
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl VolumeShareSlippageModelHandle {
+    #[new]
+    #[pyo3(signature = (volume_limit=0.025, price_impact=0.1))]
+    fn py_new(volume_limit: f64, price_impact: f64) -> Self {
+        Self::new(volume_limit, price_impact)
+    }
 }
 
 impl SecurityHandle {
@@ -57,6 +97,21 @@ impl SecurityHandle {
         let hours = rlean_core::MarketHoursDatabase::global().exchange_hours(&self.symbol);
         SecurityExchangeView { hours }
     }
+
+    pub fn set_slippage_model(&self, model: &VolumeShareSlippageModelHandle) -> Result<(), String> {
+        let algorithm = self
+            .algorithm
+            .as_ref()
+            .ok_or_else(|| "security handle is not bound to an algorithm".to_string())?;
+        let security = algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .get(&self.symbol)
+            .ok_or_else(|| format!("security {} is not registered", self.symbol))?;
+        security.set_slippage_model(model.model());
+        Ok(())
+    }
 }
 
 #[cfg(feature = "python")]
@@ -75,6 +130,12 @@ impl SecurityHandle {
     #[getter(exchange)]
     fn py_exchange(&self) -> SecurityExchangeView {
         self.exchange()
+    }
+
+    #[pyo3(name = "set_slippage_model")]
+    fn py_set_slippage_model(&self, model: &VolumeShareSlippageModelHandle) -> PyResult<()> {
+        self.set_slippage_model(model)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
     }
 }
 

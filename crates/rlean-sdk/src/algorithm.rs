@@ -472,7 +472,7 @@ impl AlgorithmHandle {
             symbol
         };
         self.apply_security_initializer(&symbol, resolution);
-        SecurityHandle::new(symbol)
+        SecurityHandle::with_algorithm(symbol, self.inner.clone())
     }
 
     /// Seed a newly added security's price, mirroring C# LEAN's
@@ -614,12 +614,15 @@ impl AlgorithmHandle {
         resolution: Resolution,
         properties: Option<HashMap<String, String>>,
     ) -> SecurityHandle {
-        SecurityHandle::new(self.inner.lock().unwrap().add_custom_data(
-            &source_type,
-            &ticker,
-            resolution,
-            properties.unwrap_or_default(),
-        ))
+        SecurityHandle::with_algorithm(
+            self.inner.lock().unwrap().add_custom_data(
+                &source_type,
+                &ticker,
+                resolution,
+                properties.unwrap_or_default(),
+            ),
+            self.inner.clone(),
+        )
     }
 
     pub fn add_data_with_properties(

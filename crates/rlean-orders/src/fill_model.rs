@@ -199,9 +199,8 @@ fn directional_quote_trade_bar(
     quote_bar: Option<&QuoteBar>,
 ) -> Option<TradeBar> {
     let quote_bar = quote_bar?;
-    let mut bar = directional_trade_bar_from_quote(order, quote_bar)?;
-    bar.volume = fallback.volume;
-    Some(bar)
+    let _ = fallback;
+    directional_trade_bar_from_quote(order, quote_bar)
 }
 
 fn directional_trade_bar_from_quote(order: &Order, quote_bar: &QuoteBar) -> Option<TradeBar> {
@@ -220,7 +219,13 @@ fn directional_trade_bar_from_quote(order: &Order, quote_bar: &QuoteBar) -> Opti
             side.high,
             side.low,
             side.close,
-            quote_bar.last_bid_size + quote_bar.last_ask_size,
+            // Match C# LEAN VolumeShareSlippageModel exactly. Its QuoteBar
+            // branch uses bid size for buys and ask size for sells.
+            if order.quantity > dec!(0) {
+                quote_bar.last_bid_size
+            } else {
+                quote_bar.last_ask_size
+            },
         ),
     ))
 }

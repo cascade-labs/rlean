@@ -122,6 +122,7 @@ fn register_research(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_securities(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rlean_sdk::securities::SecurityHandle>()?;
+    m.add_class::<rlean_sdk::securities::VolumeShareSlippageModelHandle>()?;
     m.add_class::<rlean_sdk::securities::OptionSecurityHandle>()?;
     m.add_class::<rlean_sdk::securities::SecurityExchangeView>()?;
     m.add_class::<rlean_sdk::securities::ExchangeHoursHandle>()?;

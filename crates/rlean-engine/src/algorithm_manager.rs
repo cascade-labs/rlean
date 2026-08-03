@@ -6,16 +6,49 @@ use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubsc
 use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{
-    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, TimeSpan,
+    DateTime, LeanError, MarketHoursDatabase, Price, Resolution, Result as LeanResult, TimeSpan,
 };
 use rlean_data::{Slice, SubscriptionDataConfig};
 use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
 use rlean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
-use rlean_orders::{order_processor::OrderProcessor, OrderEvent};
+use rlean_orders::{order_processor::OrderProcessor, Order, OrderEvent, SlippageModel};
 use rlean_statistics::{Trade, TradeBuilder};
 use rust_decimal_macros::dec;
 use std::sync::{Arc, Mutex};
 use tracing::info;
+
+/// Routes fill slippage through the model attached to each security, matching
+/// C# LEAN's `Security.SlippageModel` ownership.
+pub struct SecuritySlippageModel {
+    algorithm: Arc<Mutex<rlean_algorithm::qc_algorithm::QcAlgorithm>>,
+}
+
+impl std::fmt::Debug for SecuritySlippageModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecuritySlippageModel")
+    }
+}
+
+impl SecuritySlippageModel {
+    pub fn new(algorithm: Arc<Mutex<rlean_algorithm::qc_algorithm::QcAlgorithm>>) -> Self {
+        Self { algorithm }
+    }
+}
+
+impl SlippageModel for SecuritySlippageModel {
+    fn get_slippage_amount(&self, order: &Order, bar: &TradeBar) -> Price {
+        let model = self
+            .algorithm
+            .lock()
+            .unwrap()
+            .securities
+            .get(&order.symbol)
+            .map(|security| security.slippage_model());
+        model
+            .map(|model| model.get_slippage_amount(order, bar))
+            .unwrap_or_default()
+    }
+}
 
 pub struct OrderEventProcessing<'a> {
     pub slice: &'a Slice,

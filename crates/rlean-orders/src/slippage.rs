@@ -5,11 +5,12 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Models price slippage on order fills.
-pub trait SlippageModel: Send + Sync {
+pub trait SlippageModel: Send + Sync + std::fmt::Debug {
     fn get_slippage_amount(&self, order: &Order, bar: &TradeBar) -> Price;
 }
 
 /// Zero slippage — ideal execution at exact price.
+#[derive(Debug)]
 pub struct NullSlippageModel;
 
 impl SlippageModel for NullSlippageModel {
@@ -19,6 +20,7 @@ impl SlippageModel for NullSlippageModel {
 }
 
 /// Fixed absolute slippage per trade (e.g., $0.01 per share).
+#[derive(Debug)]
 pub struct ConstantSlippageModel {
     pub slippage: Price,
 }
@@ -37,6 +39,7 @@ impl SlippageModel for ConstantSlippageModel {
 
 /// Half-spread slippage model — assume execution at mid ± half the spread.
 /// For daily bars, approximates using (high - low) / 2 as a proxy for spread.
+#[derive(Debug)]
 pub struct SpreadSlippageModel {
     pub spread_fraction: Decimal,
 }
@@ -61,18 +64,22 @@ impl SlippageModel for SpreadSlippageModel {
     }
 }
 
-/// Volume-weighted slippage — larger orders get worse fills.
+/// LEAN-compatible volume-share slippage.
+///
+/// Price impact is `price_impact * min(quantity / volume, volume_limit)^2`.
+/// Quote-driven fills promote LEAN's directional QuoteBar size into the
+/// synthetic TradeBar volume before invoking this model.
+#[derive(Debug)]
 pub struct VolumeShareSlippageModel {
-    /// Price impact = price_impact * (quantity / volume)^volume_exponent
+    pub volume_limit: Decimal,
     pub price_impact: Decimal,
-    pub volume_exponent: Decimal,
 }
 
 impl VolumeShareSlippageModel {
-    pub fn new(price_impact: Decimal, volume_exponent: Decimal) -> Self {
+    pub fn new(volume_limit: Decimal, price_impact: Decimal) -> Self {
         VolumeShareSlippageModel {
+            volume_limit,
             price_impact,
-            volume_exponent,
         }
     }
 }
@@ -80,26 +87,61 @@ impl VolumeShareSlippageModel {
 impl Default for VolumeShareSlippageModel {
     fn default() -> Self {
         VolumeShareSlippageModel {
+            volume_limit: dec!(0.025),
             price_impact: dec!(0.1),
-            volume_exponent: dec!(2),
         }
     }
 }
 
 impl SlippageModel for VolumeShareSlippageModel {
     fn get_slippage_amount(&self, order: &Order, bar: &TradeBar) -> Price {
-        if bar.volume.is_zero() {
-            return dec!(0);
-        }
+        let volume_share = if bar.volume > Decimal::ZERO {
+            (order.abs_quantity() / bar.volume).min(self.volume_limit)
+        } else {
+            self.volume_limit
+        };
+        bar.close * self.price_impact * volume_share * volume_share
+    }
+}
 
-        use rust_decimal::prelude::ToPrimitive;
-        let qty_f = order.abs_quantity().to_f64().unwrap_or(0.0);
-        let vol_f = bar.volume.to_f64().unwrap_or(1.0);
-        let vol_share = qty_f / vol_f;
-        let exp = self.volume_exponent.to_f64().unwrap_or(2.0);
-        let impact = vol_share.powf(exp);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlean_core::{Market, NanosecondTimestamp, Symbol, TimeSpan};
+    use rlean_data_tables::TradeBarData;
 
-        let impact_dec = Decimal::from_f64_retain(impact).unwrap_or(dec!(0));
-        bar.close * self.price_impact * impact_dec
+    fn fixture(quantity: Decimal, volume: Decimal) -> (Order, TradeBar) {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let time = NanosecondTimestamp::from_secs(1);
+        (
+            Order::market(1, symbol.clone(), quantity, time, ""),
+            TradeBar::new(
+                symbol,
+                time,
+                TimeSpan::ONE_MINUTE,
+                TradeBarData::new(dec!(10), dec!(10), dec!(10), dec!(10), volume),
+            ),
+        )
+    }
+
+    #[test]
+    fn volume_share_matches_lean_below_limit() {
+        let (order, bar) = fixture(dec!(1), dec!(100));
+        let model = VolumeShareSlippageModel::default();
+        assert_eq!(model.get_slippage_amount(&order, &bar), dec!(0.0001));
+    }
+
+    #[test]
+    fn volume_share_caps_participation_at_lean_default() {
+        let (order, bar) = fixture(dec!(100), dec!(100));
+        let model = VolumeShareSlippageModel::default();
+        assert_eq!(model.get_slippage_amount(&order, &bar), dec!(0.0006250));
+    }
+
+    #[test]
+    fn zero_volume_uses_maximum_slippage() {
+        let (order, bar) = fixture(dec!(1), Decimal::ZERO);
+        let model = VolumeShareSlippageModel::default();
+        assert_eq!(model.get_slippage_amount(&order, &bar), dec!(0.0006250));
     }
 }

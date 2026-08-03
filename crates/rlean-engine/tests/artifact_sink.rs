@@ -356,6 +356,8 @@ async fn live_mirror_order_event_triggers_debounced_upload() {
     wait_for_puts(&fx.store, K_ORDERS, 1).await;
     wait_for_puts(&fx.store, K_ORDER_EVENTS, 1).await;
     wait_for_puts(&fx.store, K_TRADES, 1).await;
+    wait_for_puts(&fx.store, K_PORTFOLIO, 2).await;
+    wait_for_puts(&fx.store, K_PROGRESS, 2).await;
 
     // Further unchanged snapshots do not re-upload.
     fx.snapshot(day_time(1), None, counts(3, 1, 1));
