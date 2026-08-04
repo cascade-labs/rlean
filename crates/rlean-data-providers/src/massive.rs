@@ -134,7 +134,7 @@ impl MassiveHistoricalDataProvider {
                 (end_time > request.range.start && end_time <= request.range.end).then(|| {
                     Ok(TradeBar {
                         symbol: request.configuration.symbol.clone(),
-                        venue: Some("massive".to_string()),
+                        venue: Some(request.configuration.venue.clone()),
                         time,
                         end_time,
                         open: decimal(row.open)?,
@@ -301,7 +301,7 @@ fn aggregate_quotes(request: &HistoryRequest, quotes: Vec<Quote>) -> Result<Vec<
         .filter(|bar| bar.end > request.range.start && bar.end <= request.range.end)
         .map(|bar| QuoteBar {
             symbol: request.configuration.symbol.clone(),
-            venue: Some("massive".to_string()),
+            venue: Some(request.configuration.venue.clone()),
             time: bar.start,
             end_time: bar.end,
             bid: Some(bar.bid),

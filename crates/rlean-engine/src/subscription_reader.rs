@@ -7,6 +7,7 @@ use rlean_core::{
     SymbolOptionsExt,
 };
 use rlean_data::SubscriptionDataConfig;
+use rlean_data_providers::{HistoricalData, HistoricalDataProvider, HistoryRequest};
 use rlean_data_sidecar::{
     decode_batch, decode_factor_file_batch, CanonicalDataBatch, DeliveryMode, SubscriptionSpec,
     WireDataType,
@@ -285,6 +286,39 @@ async fn produce(
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     mut cancelled: oneshot::Receiver<()>,
 ) -> LeanResult<()> {
+    if let Some(provider) = context.historical_provider.clone() {
+        let request = HistoryRequest::new(config.clone(), start, end).map_err(data_error)?;
+        if provider.supports(&request) {
+            let factor_rows = tokio::select! {
+                _ = &mut cancelled => return Ok(()),
+                result = load_auxiliary_rows(&config, &context) => result?,
+            };
+            return produce_native(
+                &config,
+                &context,
+                provider,
+                (start, end),
+                &factor_rows,
+                sender,
+                &mut cancelled,
+            )
+            .await;
+        }
+        if config.data_kind == rlean_data::SubscriptionDataKind::Market
+            && matches!(
+                config.tick_type,
+                rlean_core::TickType::Trade | rlean_core::TickType::Quote
+            )
+        {
+            return Err(LeanError::DataError(format!(
+                "historical provider '{}' does not support {:?} {:?} data for {}",
+                provider.name(),
+                config.symbol.security_type(),
+                config.tick_type,
+                config.symbol.value
+            )));
+        }
+    }
     let sidecar = &context.sidecar;
     let registration = sidecar
         .add_subscription(&config, DeliveryMode::Backtest)
@@ -330,6 +364,132 @@ async fn produce(
         tracing::warn!(subscription_id, %error, "failed to remove sidecar subscription");
     }
     result
+}
+
+async fn produce_native(
+    config: &SubscriptionDataConfig,
+    context: &DataFeedContext,
+    provider: Arc<dyn HistoricalDataProvider>,
+    range: (DateTime, DateTime),
+    factor_rows: &[FactorFileEntry],
+    sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+    cancelled: &mut oneshot::Receiver<()>,
+) -> LeanResult<()> {
+    let (start, end) = range;
+    let mut window_start = start.date_utc();
+    let end_date = effective_subscription_end(config, end.date_utc());
+    let mut last_point: Option<SubscriptionDataPoint> = None;
+    let mut last_real_frontier: Option<DateTime> = None;
+
+    while window_start <= end_date {
+        let window_end = backtest_window_candidate(config.resolution, window_start).min(end_date);
+        let (query_start, query_end) = bounded_query_times(window_start, window_end, start, end);
+        let request =
+            HistoryRequest::new(config.clone(), query_start, query_end).map_err(data_error)?;
+        let data = tokio::select! {
+            _ = &mut *cancelled => return Ok(()),
+            result = provider.get_history(&request) => result.map_err(data_error)?,
+        };
+        let mut points = native_points(config, data, factor_rows)?;
+        points.sort_by_key(SubscriptionDataPoint::frontier_time);
+        points = deduplicate_points(config, points);
+        tracing::debug!(
+            provider = provider.name(),
+            symbol = %config.symbol.value,
+            window_start = %window_start,
+            window_end = %window_end,
+            points = points.len(),
+            "decoded native historical-provider window"
+        );
+        for point in points {
+            let frontier = point.frontier_time();
+            if frontier < start || frontier > end {
+                continue;
+            }
+            let out_of_order_or_duplicate = last_real_frontier
+                .map(|last| frontier <= last)
+                .unwrap_or(false);
+            if out_of_order_or_duplicate && !config.resolution.is_tick() {
+                continue;
+            }
+            if let Some(previous) = last_point.as_ref() {
+                send_fill_forward_before(
+                    config,
+                    &context.market_hours_database,
+                    previous,
+                    frontier,
+                    end,
+                    sender,
+                )
+                .await?;
+            }
+            if sender
+                .send(Ok(SubscriptionStreamMessage::Point(Box::new(
+                    point.clone(),
+                ))))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            last_real_frontier = Some(frontier);
+            last_point = Some(point);
+        }
+
+        let watermark = query_end;
+        if let Some(previous) = last_point.as_ref() {
+            if let Some(fill) = send_fill_forward_through(
+                config,
+                &context.market_hours_database,
+                previous,
+                watermark.min(end),
+                end,
+                sender,
+            )
+            .await?
+            {
+                last_point = Some(fill);
+            }
+        }
+        if sender
+            .send(Ok(SubscriptionStreamMessage::Watermark(watermark)))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        window_start = match window_end.succ_opt() {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Ok(())
+}
+
+fn native_points(
+    config: &SubscriptionDataConfig,
+    data: HistoricalData,
+    factor_rows: &[FactorFileEntry],
+) -> LeanResult<Vec<SubscriptionDataPoint>> {
+    match data {
+        HistoricalData::TradeBars(rows) => Ok(rows
+            .into_iter()
+            .filter_map(|mut bar| {
+                bar.venue.get_or_insert_with(|| config.venue.clone());
+                normalize_trade_bar(&mut bar, config.normalization_mode, factor_rows);
+                bar.is_valid()
+                    .then_some(SubscriptionDataPoint::TradeBar(bar))
+            })
+            .collect()),
+        HistoricalData::QuoteBars(rows) => Ok(rows
+            .into_iter()
+            .map(|mut bar| {
+                bar.venue.get_or_insert_with(|| config.venue.clone());
+                normalize_quote_bar(&mut bar, config.normalization_mode, factor_rows);
+                SubscriptionDataPoint::QuoteBar(bar)
+            })
+            .collect()),
+    }
 }
 
 fn effective_subscription_start(start: DateTime, available_from: Option<DateTime>) -> DateTime {

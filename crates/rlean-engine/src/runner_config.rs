@@ -3,6 +3,7 @@ use crate::data_feed::DataFeedOptions;
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::{AlphaAnalytics, InsightEvent};
+use rlean_data_providers::HistoricalDataProvider;
 use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
 use rlean_orders::{Order, OrderEvent};
 use rlean_statistics::{PortfolioStatistics, Trade};
@@ -22,6 +23,7 @@ pub struct BacktestProgress {
 
 pub struct BacktestRunConfig {
     pub data_sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
     pub _compression_level: i32,
     /// Override the strategy's set_start_date (YYYY-MM-DD).
     pub start_date_override: Option<chrono::NaiveDate>,
@@ -43,6 +45,7 @@ pub struct BacktestRunConfig {
 
 pub struct LiveRunConfig {
     pub data_sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
     /// Session-scoped live feed selected by deployment configuration. Strategy
     /// SDK calls create the actual subscriptions beneath this connection.
     pub live_data_feed_connection_id: u64,

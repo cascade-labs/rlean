@@ -142,8 +142,13 @@ pub trait HistoricalDataProvider: Send + Sync {
 pub trait HistoricalDataStore: Send + Sync {
     async fn coverage(&self, request: &HistoryRequest) -> Result<Coverage>;
     async fn read(&self, request: &HistoryRequest) -> Result<HistoricalData>;
-    async fn append(&self, request: &HistoryRequest, data: &HistoricalData) -> Result<()>;
-    async fn mark_covered(&self, request: &HistoryRequest) -> Result<()>;
+    async fn append(
+        &self,
+        request: &HistoryRequest,
+        provider: &str,
+        data: &HistoricalData,
+    ) -> Result<()>;
+    async fn mark_covered(&self, request: &HistoryRequest, provider: &str) -> Result<()>;
 }
 
 /// LEAN-style cache/provider composition: read persisted data first, request
@@ -193,9 +198,13 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
             let mut fetched = provider.get_history(&missing_request).await?;
             fetched.sort_and_deduplicate();
             if !fetched.is_empty() {
-                self.store.append(&missing_request, &fetched).await?;
+                self.store
+                    .append(&missing_request, provider.name(), &fetched)
+                    .await?;
             }
-            self.store.mark_covered(&missing_request).await?;
+            self.store
+                .mark_covered(&missing_request, provider.name())
+                .await?;
         }
         let mut data = self.store.read(request).await?;
         data.sort_and_deduplicate();
@@ -250,11 +259,16 @@ mod tests {
             Ok(HistoricalData::TradeBars(Vec::new()))
         }
 
-        async fn append(&self, _request: &HistoryRequest, _data: &HistoricalData) -> Result<()> {
+        async fn append(
+            &self,
+            _request: &HistoryRequest,
+            _provider: &str,
+            _data: &HistoricalData,
+        ) -> Result<()> {
             Ok(())
         }
 
-        async fn mark_covered(&self, request: &HistoryRequest) -> Result<()> {
+        async fn mark_covered(&self, request: &HistoryRequest, _provider: &str) -> Result<()> {
             self.marks.fetch_add(1, Ordering::Relaxed);
             self.coverage.lock().covered.push(request.range);
             Ok(())

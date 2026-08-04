@@ -7,7 +7,8 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::runtime::{
     backtest_progress_bar, connect_data_sidecar, ensure_python_baseline_packages,
-    parse_algorithm_parameters_for_strategy, strategy_name_from_path, validate_strategy_path,
+    historical_data_provider, parse_algorithm_parameters_for_strategy, strategy_name_from_path,
+    validate_strategy_path,
 };
 
 pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
@@ -31,11 +32,16 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
     let data_sidecar = connect_data_sidecar(&args, &global_config)
         .await?
         .ok_or_else(|| anyhow::anyhow!("backtests require --data-sidecar"))?;
+    let historical_provider = historical_data_provider(&args).await?;
 
-    run_strategy_backtest(args, data_sidecar).await
+    run_strategy_backtest(args, data_sidecar, historical_provider).await
 }
 
-async fn run_strategy_backtest(args: RunArgs, data_sidecar: Arc<DataSidecarClient>) -> Result<()> {
+async fn run_strategy_backtest(
+    args: RunArgs,
+    data_sidecar: Arc<DataSidecarClient>,
+    historical_provider: Option<Arc<dyn rlean_data_providers::HistoricalDataProvider>>,
+) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
 
     let ext = args
@@ -121,6 +127,7 @@ async fn run_strategy_backtest(args: RunArgs, data_sidecar: Arc<DataSidecarClien
     let data_feed_options = rlean_engine::data_feed::DataFeedOptions::default();
     let config = rlean_engine::BacktestRunConfig {
         data_sidecar,
+        historical_provider: historical_provider.clone(),
         _compression_level: 3,
         start_date_override,
         end_date_override,
@@ -131,8 +138,9 @@ async fn run_strategy_backtest(args: RunArgs, data_sidecar: Arc<DataSidecarClien
         progress: Some(progress),
     };
 
-    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new_with_historical_provider(
         config.data_sidecar.clone(),
+        historical_provider,
         config.parameters.clone(),
     );
 

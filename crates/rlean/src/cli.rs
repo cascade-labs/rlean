@@ -83,6 +83,11 @@ pub(crate) struct RuntimeArgs {
     #[arg(long, env = "RLEAN_DATA_SIDECAR_TOKEN", hide_env_values = true)]
     pub(crate) data_sidecar_token: Option<String>,
 
+    /// Historical market-data provider. Provider responses are normalized to
+    /// rlean's canonical tables and cached through Verglas before consumption.
+    #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
+    pub(crate) data_provider_historical: Option<String>,
+
     /// Sidecar live market-data provider. Symbols and resolutions remain
     /// strategy SDK subscriptions; this selects the integration serving them.
     #[arg(long, env = "RLEAN_LIVE_DATA_FEED")]

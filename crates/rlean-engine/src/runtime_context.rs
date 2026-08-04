@@ -18,6 +18,7 @@ use rlean_algorithm::lifecycle::{
 };
 use rlean_algorithm::FrameworkModelRegistry;
 use rlean_core::{DateTime, Resolution};
+use rlean_data_providers::HistoricalDataProvider;
 use rlean_data_sidecar::DataSidecarClient;
 use std::any::Any;
 use std::collections::HashMap;
@@ -40,8 +41,17 @@ impl AlgorithmRuntimeContext {
         data_sidecar: Arc<DataSidecarClient>,
         runtime_parameters: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_historical_provider(data_sidecar, None, runtime_parameters)
+    }
+
+    pub fn new_with_historical_provider(
+        data_sidecar: Arc<DataSidecarClient>,
+        historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
+        runtime_parameters: HashMap<String, String>,
+    ) -> Self {
         let history_service = Arc::new(HistoryService::new(AlgorithmHistoryContext {
             data_sidecar,
+            historical_provider,
         }));
         Self::with_history_service(history_service, runtime_parameters)
     }

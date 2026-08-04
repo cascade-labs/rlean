@@ -1,4 +1,5 @@
 use rlean_core::MarketHoursDatabase;
+use rlean_data_providers::HistoricalDataProvider;
 use rlean_data_sidecar::DataSidecarClient;
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +27,10 @@ impl Default for DataFeedOptions {
 #[derive(Clone)]
 pub struct DataFeedContext {
     pub sidecar: Arc<DataSidecarClient>,
+    /// Explicit native history route for canonical market subscriptions.
+    /// Custom and universe streams remain on their separately selected source
+    /// while the provider migration is in progress.
+    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     unadjusted_equities: Arc<Mutex<HashSet<String>>>,
@@ -36,11 +41,17 @@ impl DataFeedContext {
     pub fn new(sidecar: Arc<DataSidecarClient>) -> Self {
         Self {
             sidecar,
+            historical_provider: None,
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
             auxiliary_factor_rows: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_historical_provider(mut self, provider: Arc<dyn HistoricalDataProvider>) -> Self {
+        self.historical_provider = Some(provider);
+        self
     }
 
     pub fn channel_capacity(&self) -> usize {

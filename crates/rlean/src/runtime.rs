@@ -5,6 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use rlean_data_providers::{
+    CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
+    MassiveHistoricalDataProvider, VerglasHistoricalDataStore,
+};
 use rlean_data_sidecar::{DataSidecarClient, DataSidecarConfig};
 
 use crate::cli::RunArgs;
@@ -46,6 +50,45 @@ pub(crate) async fn connect_data_sidecar(
     .with_context(|| format!("failed to connect to data sidecar at {endpoint}"))?;
     tracing::info!(%endpoint, "Connected to Arrow Flight data sidecar");
     Ok(Some(Arc::new(client)))
+}
+
+pub(crate) async fn historical_data_provider(
+    args: &RunArgs,
+) -> Result<Option<Arc<dyn HistoricalDataProvider>>> {
+    let Some(name) = args
+        .data_provider_historical
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(None);
+    };
+    let provider: Arc<dyn HistoricalDataProvider> = match name {
+        "massive" => {
+            let integration = config::IntegrationConfigs::load()?.get_integration("massive");
+            let api_key = integration
+                .get("api_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "historical provider massive requires integration config key massive.api_key"
+                    )
+                })?;
+            Arc::new(MassiveHistoricalDataProvider::new(MassiveConfig::new(
+                api_key,
+            ))?)
+        }
+        other => bail!("unsupported historical data provider '{other}'"),
+    };
+    let store = Arc::new(VerglasHistoricalDataStore::from_env().await?);
+    let provider = CacheFirstHistoryProvider::new(store, vec![provider])?;
+    tracing::info!(
+        provider = name,
+        "Configured cache-first historical data provider"
+    );
+    Ok(Some(Arc::new(provider)))
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {

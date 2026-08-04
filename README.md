@@ -43,6 +43,7 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 | `rlean-statistics` | Backtest result statistics |
 | `rlean-python-runtime` | PyO3 bindings — embeds Python strategies in a Rust process |
 | `rlean-data-sidecar` | Persistent Arrow Flight subscription protocol and client |
+| `rlean-data-providers` | LEAN-style historical/live providers and cache-first Verglas storage |
 | `rlean-options` | Option chain, greeks, exercise models |
 | `rlean-execution` | Order routing / execution models |
 | `rlean-optimization` | Parameter optimization |
@@ -182,6 +183,14 @@ deployment and restored by `rleand`. Live data and brokerage operations use
 independent connections through the persistent Flight session. Strategy SDK
 calls create and remove symbol subscriptions; live batches are pushed
 unsolicited and routed by subscription id.
+
+Historical market data can be selected independently with
+`--data-provider-historical massive`. Massive TradeBars and QuoteBars are
+converted to the provider-neutral contracts, queried cache-first through
+Verglas, and synchronously persisted through the Verglas write role before the
+engine consumes a newly fetched range. Configure the provider credential as
+`massive.api_key`; rlean does not receive object-store credentials or embed an
+Iceberg query engine.
 
 ### Cloud fleet
 
@@ -329,6 +338,7 @@ rlean backtest my_first_strategy/main.py
 ```sh
 rlean live my_first_strategy/main.py \
   --data-sidecar grpc://127.0.0.1:7410 \
+  --data-provider-historical massive \
   --live-data-feed tradier \
   --brokerage paper
 ```

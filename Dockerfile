@@ -21,8 +21,8 @@ RUN apt-get update \
 COPY --from=builder /tmp/rlean /usr/local/bin/rlean
 WORKDIR /strategy
 
-# Verglas is only the node-local S3 cache/data path. The SDK discovers the real
-# Iceberg catalog from its admin endpoint and performs catalog/query work itself.
+# One Verglas gateway advertises the catalog and routes bounded Arrow queries
+# and writes to its isolated query/write roles. rlean never receives object
+# store credentials and never embeds an Iceberg query engine.
 ENV VERGLAS_ENDPOINT=http://host.docker.internal:8334
-ENV VERGLAS_S3_ENDPOINT=http://host.docker.internal:8333
 ENTRYPOINT ["/usr/local/bin/rlean"]

@@ -11,8 +11,8 @@ use crate::live_deployments::{
 };
 use crate::runtime::{
     brokerage_config_json, connect_data_sidecar, ensure_python_baseline_packages,
-    integration_config_json, parse_algorithm_parameters_for_strategy, resolve_strategy_file,
-    validate_strategy_path,
+    historical_data_provider, integration_config_json, parse_algorithm_parameters_for_strategy,
+    resolve_strategy_file, validate_strategy_path,
 };
 
 pub(crate) async fn run(args: LiveArgs) -> Result<()> {
@@ -61,6 +61,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let data_sidecar = connect_data_sidecar(&args, &global_config)
         .await?
         .ok_or_else(|| anyhow::anyhow!("live trading requires --data-sidecar"))?;
+    let historical_provider = historical_data_provider(&args).await?;
 
     let live_data_feed = args
         .live_data_feed
@@ -140,6 +141,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let strategy_path = args.strategy.clone();
     let live_config = rlean_engine::LiveRunConfig {
         data_sidecar,
+        historical_provider: historical_provider.clone(),
         live_data_feed_connection_id,
         parameters,
         brokerage,
@@ -159,8 +161,9 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             rust_decimal::Decimal::new(100000, 0),
         ),
     ));
-    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new_with_historical_provider(
         live_config.data_sidecar.clone(),
+        historical_provider,
         live_config.parameters.clone(),
     );
     let context = rlean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(

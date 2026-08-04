@@ -44,20 +44,28 @@ crates/
   rlean              # CLI binary (backtest, live, init, create-project, config)
 ```
 
-## Data Architecture — Sidecar Only
+## Data Architecture — Native Providers + Verglas
 
-- Strategy processes receive canonical batches exclusively through the sidecar;
-  the sidecar owns vendor and persistence decisions.
-- rlean has no local market-data cache, catalog client, or storage backend.
+- Historical providers, live providers, and execution brokerages are separate
+  LEAN-style interfaces selected at deployment time. Strategy SDK calls still
+  own add/remove subscription intent.
+- Historical reads are cache-first: query canonical data through the Verglas
+  SDK, request only durable uncovered ranges from the selected provider,
+  persist canonical bounded Arrow batches, then consume the ordered result.
+- Live provider events enter the synchronizer immediately and are independently
+  persisted through a bounded asynchronous Verglas writer.
+- The Verglas SDK connects to one gateway. Catalog metadata goes to the
+  advertised catalog service; queries and writes are streamed to Verglas's
+  isolated query and write roles. rlean must not embed Iceberg/DataFusion or
+  receive object-store credentials.
 - If adding a new data type, define its provider-neutral Arrow contract in
   `rlean-data-tables`.
+- Private brokerage or data adapters integrate through the generic HTTP
+  provider/brokerage contracts, not compiled plugins.
 
-Backtests and live runs use a persistent Arrow Flight sidecar session. Live
-feed and execution brokerage connections are independently authenticated.
-Strategy SDK calls own add/remove subscription intent. Backtests issue bounded
-range queries against registered subscriptions; live batches are pushed
-unsolicited. The canonical wire and persisted schemas live in
-`rlean-data-tables`, including the venue discriminator.
+The canonical wire and persisted schemas live in `rlean-data-tables`, including
+the venue discriminator. Provider adapters must convert vendor payloads into
+these types before persistence; raw provider JSON is not a cache contract.
 
 ## Key Invariants
 

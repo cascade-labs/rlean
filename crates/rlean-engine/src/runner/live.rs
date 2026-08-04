@@ -168,6 +168,10 @@ where
         .collect();
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
     let feed_context = DataFeedContext::new(config.data_sidecar.clone());
+    let feed_context = match &config.historical_provider {
+        Some(provider) => feed_context.with_historical_provider(provider.clone()),
+        None => feed_context,
+    };
     if algorithm_manager.is_warming_up() {
         let live_frontier = rlean_core::DateTime::now();
         let warmup_start = if let Some(bar_count) = algorithm_manager.warmup_bar_count() {

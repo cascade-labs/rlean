@@ -107,6 +107,10 @@ where
     let feed_context = DataFeedContext::new(config.data_sidecar.clone())
         .with_options(config.data_feed_options)
         .with_market_hours_database(market_hours_database.clone());
+    let feed_context = match &config.historical_provider {
+        Some(provider) => feed_context.with_historical_provider(provider.clone()),
+        None => feed_context,
+    };
 
     let normal_start = rlean_core::NanosecondTimestamp::from(
         start.and_hms_opt(0, 0, 0).expect("valid start of day"),

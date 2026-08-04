@@ -6,6 +6,7 @@ use rlean_algorithm::lifecycle::{AlgorithmHistoryService, HistoryColumns};
 use rlean_algorithm::qc_algorithm::QcAlgorithm;
 use rlean_core::{DataNormalizationMode, DateTime, NanosecondTimestamp, Resolution, Symbol};
 use rlean_data::SubscriptionDataConfig;
+use rlean_data_providers::HistoricalDataProvider;
 use rlean_data_sidecar::DataSidecarClient;
 use rlean_data_tables::{CustomDataPoint, TradeBar};
 use rust_decimal::prelude::ToPrimitive;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AlgorithmHistoryContext {
     pub data_sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
 }
 
 #[derive(Clone)]
@@ -127,6 +129,10 @@ impl HistoryService {
 
     fn subscription_history_provider(&self) -> SubscriptionHistoryProvider {
         let context = DataFeedContext::new(self.context.data_sidecar.clone());
+        let context = match &self.context.historical_provider {
+            Some(provider) => context.with_historical_provider(provider.clone()),
+            None => context,
+        };
         SubscriptionHistoryProvider::new(context)
     }
 }

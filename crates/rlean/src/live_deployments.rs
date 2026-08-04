@@ -426,6 +426,9 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
     if let Some(value) = &args.data_sidecar {
         values.extend(["--data-sidecar".to_string(), value.clone()]);
     }
+    if let Some(value) = &args.data_provider_historical {
+        values.extend(["--data-provider-historical".to_string(), value.clone()]);
+    }
     if let Some(value) = &args.live_data_feed {
         values.extend(["--live-data-feed".to_string(), value.clone()]);
     }
@@ -941,6 +944,7 @@ mod tests {
             runtime: RuntimeArgs {
                 data_sidecar: Some("tcp://127.0.0.1:50051".to_string()),
                 data_sidecar_token: None,
+                data_provider_historical: Some("massive".to_string()),
                 live_data_feed: Some("tradier".to_string()),
                 brokerage: Some("hyperliquid".to_string()),
                 brokerage_account: Some("account-1234".to_string()),
@@ -966,6 +970,8 @@ mod tests {
         assert!(child_args.contains(&"--parameter".to_string()));
         assert!(child_args.contains(&"foo=bar".to_string()));
         assert!(child_args.contains(&"--data-sidecar".to_string()));
+        assert!(child_args.contains(&"--data-provider-historical".to_string()));
+        assert!(child_args.contains(&"massive".to_string()));
         assert!(child_args.contains(&"--live-data-feed".to_string()));
         assert!(child_args.contains(&"--brokerage-account".to_string()));
         assert!(child_args.contains(&"account-1234".to_string()));
