@@ -3,6 +3,7 @@ members = [
     "crates/rlean-core",
     "crates/rlean-data",
     "crates/rlean-data-tables",
+    "crates/rlean-data-providers",
     "crates/rlean-data-sidecar",
     "crates/rlean-engine",
     "crates/rlean-sdk",
@@ -55,6 +56,7 @@ object_store = { version = "0.11.2", features = ["aws"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 prost = "0.14.1"
 tonic = { version = "0.14.1", features = ["transport", "tls-webpki-roots", "tls-ring"] }
@@ -122,6 +124,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server"] }
 rlean-core           = { path = "crates/rlean-core" }
 rlean-data           = { path = "crates/rlean-data" }
 rlean-data-tables    = { path = "crates/rlean-data-tables" }
+rlean-data-providers = { path = "crates/rlean-data-providers" }
 rlean-data-sidecar   = { path = "crates/rlean-data-sidecar" }
 
 [profile.release]

@@ -1,0 +1,19 @@
+//! Native data-provider contracts.
+//!
+//! The layering follows C# LEAN's `IHistoryProvider`/`IDataQueueHandler`
+//! split: history is a finite pull, live data is a subscription whose values
+//! are pushed by the provider. Persistence is an independent concern wrapped
+//! around history providers, not implemented inside a vendor adapter.
+
+mod history;
+mod live;
+mod massive;
+mod tradier;
+
+pub use history::{
+    CacheFirstHistoryProvider, Coverage, HistoricalData, HistoricalDataProvider,
+    HistoricalDataStore, HistoryRequest, TimeRange,
+};
+pub use live::{LiveDataEvent, LiveDataProvider, LiveSubscription};
+pub use massive::{MassiveConfig, MassiveHistoricalDataProvider};
+pub use tradier::{TradierEnvironment, TradierLiveDataProvider, TradierMarketDataConfig};
