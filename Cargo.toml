@@ -119,7 +119,10 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
-verglas-sdk = { git = "https://github.com/verglas-org/verglas.git", rev = "d8eee12b0bc173c6c1c915f2c3a9f90298386033" }
+verglas-sdk = { git = "https://github.com/verglas-org/verglas.git", rev = "0c61768da9c0d1dbfbb07add74f46c8518f7ddca" }
+
+[patch.crates-io]
+iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
 rlean-core           = { path = "crates/rlean-core" }

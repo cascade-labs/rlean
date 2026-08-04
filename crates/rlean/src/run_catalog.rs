@@ -40,7 +40,8 @@ impl RunCatalog {
         parameters: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
         let client = Client::connect(ConnectOptions::from_env())
-            .context("configure Verglas client from VERGLAS_ENDPOINT/VERGLAS_TOKEN")?;
+            .await
+            .context("connect to the Verglas catalog through the local cache")?;
         let catalog = Self {
             client,
             run_id,

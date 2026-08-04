@@ -30,7 +30,8 @@ enum RunsCommand {
 
 pub(crate) async fn run(args: RunsArgs) -> Result<()> {
     let client = Client::connect(ConnectOptions::from_env())
-        .context("configure Verglas client from VERGLAS_ENDPOINT/VERGLAS_TOKEN")?;
+        .await
+        .context("connect to the Verglas catalog through the local cache")?;
     match args.command {
         RunsCommand::List { limit, json } => {
             let sql = format!(

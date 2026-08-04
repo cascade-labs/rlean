@@ -21,7 +21,8 @@ RUN apt-get update \
 COPY --from=builder /tmp/rlean /usr/local/bin/rlean
 WORKDIR /strategy
 
-# Verglas and market-data services are node services. A run container has no
-# result volume: every durable backtest result is committed through this API.
+# Verglas is only the node-local S3 cache/data path. The SDK discovers the real
+# Iceberg catalog from its admin endpoint and performs catalog/query work itself.
 ENV VERGLAS_ENDPOINT=http://host.docker.internal:8334
+ENV VERGLAS_S3_ENDPOINT=http://host.docker.internal:8333
 ENTRYPOINT ["/usr/local/bin/rlean"]
