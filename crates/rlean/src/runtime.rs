@@ -275,73 +275,12 @@ pub(crate) fn strategy_name_from_path(strategy: &Path) -> String {
     }
 }
 
-/// Build the backtest output directory path in LEAN format:
-///   `<backtests_root>/YYYY-MM-DD_HHMMSS_<strategy_name>`
+/// Stable timestamped name used for live deployment snapshots.
 pub(crate) fn backtest_dir_name(
     datetime: chrono::DateTime<chrono::Utc>,
     strategy_name: &str,
 ) -> String {
     format!("{}_{}", datetime.format("%Y-%m-%d_%H%M%S"), strategy_name)
-}
-
-pub(crate) fn reserve_backtest_dir(
-    backtests_root: &Path,
-    datetime: chrono::DateTime<chrono::Utc>,
-    strategy_name: &str,
-) -> Result<PathBuf> {
-    std::fs::create_dir_all(backtests_root)?;
-    let base = backtest_dir_name(datetime, strategy_name);
-    for attempt in 0..1000 {
-        let name = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{base}_{}", attempt + 1)
-        };
-        let candidate = backtests_root.join(name);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!(
-        "could not reserve unique backtest directory under {} for {}",
-        backtests_root.display(),
-        base
-    )
-}
-
-/// Point `<backtests_root>/latest` at the most recently completed backtest directory.
-pub(crate) fn update_backtests_latest_symlink(
-    backtests_root: &Path,
-    backtest_dir: &Path,
-) -> Result<()> {
-    let dir_name = backtest_dir
-        .file_name()
-        .context("backtest directory has no name")?;
-    let latest = backtests_root.join("latest");
-
-    match std::fs::symlink_metadata(&latest) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            std::fs::remove_file(&latest)?;
-        }
-        Ok(_) => {
-            bail!(
-                "{} exists and is not a symlink; remove it manually to enable backtests/latest",
-                latest.display()
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(dir_name, &latest)?;
-
-    #[cfg(all(windows, not(unix)))]
-    std::os::windows::fs::symlink_dir(dir_name, &latest)?;
-
-    Ok(())
 }
 
 pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
@@ -502,94 +441,6 @@ mod tests {
 
         assert_eq!(parameters.get("max_holds").map(String::as_str), Some("12"));
         assert_eq!(parameters.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_backtest_dir_name_format() {
-        use chrono::{TimeZone, Utc};
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-        let dir = backtest_dir_name(dt, "sma_crossover");
-        assert_eq!(dir, "2026-04-10_143000_sma_crossover");
-    }
-
-    #[test]
-    fn test_backtest_dir_name_seconds_unique() {
-        use chrono::{TimeZone, Utc};
-        let dt1 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-        let dt2 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 5).unwrap();
-        let d1 = backtest_dir_name(dt1, "spy_wheel");
-        let d2 = backtest_dir_name(dt2, "spy_wheel");
-        assert_ne!(d1, d2, "runs on same day must produce different dirs");
-    }
-
-    #[test]
-    fn test_backtest_dir_name_date_prefix() {
-        use chrono::{TimeZone, Utc};
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 9, 5, 3).unwrap();
-        let dir = backtest_dir_name(dt, "sma_crossover");
-        assert!(dir.starts_with("2026-04-10_090503_"), "dir={dir}");
-    }
-
-    #[test]
-    fn test_reserve_backtest_dir_adds_suffix_on_collision() {
-        use chrono::{TimeZone, Utc};
-        let root =
-            std::env::temp_dir().join(format!("rlean-backtest-dir-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-
-        let first = reserve_backtest_dir(&root, dt, "strategy").unwrap();
-        let second = reserve_backtest_dir(&root, dt, "strategy").unwrap();
-
-        assert_eq!(
-            first.file_name().and_then(|n| n.to_str()),
-            Some("2026-04-10_143000_strategy")
-        );
-        assert_eq!(
-            second.file_name().and_then(|n| n.to_str()),
-            Some("2026-04-10_143000_strategy_2")
-        );
-        assert!(first.is_dir());
-        assert!(second.is_dir());
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_update_backtests_latest_symlink() {
-        let root =
-            std::env::temp_dir().join(format!("rlean-backtest-latest-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        let first = root.join("2026-06-24_120000_strategy");
-        let second = root.join("2026-06-24_120100_strategy");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-
-        update_backtests_latest_symlink(&root, &first).unwrap();
-        let latest = root.join("latest");
-        assert!(latest.is_symlink());
-        assert_eq!(
-            std::fs::read_link(&latest).unwrap(),
-            PathBuf::from("2026-06-24_120000_strategy")
-        );
-        assert_eq!(
-            latest.canonicalize().unwrap(),
-            first.canonicalize().unwrap()
-        );
-
-        update_backtests_latest_symlink(&root, &second).unwrap();
-        assert_eq!(
-            std::fs::read_link(&latest).unwrap(),
-            PathBuf::from("2026-06-24_120100_strategy")
-        );
-        assert_eq!(
-            latest.canonicalize().unwrap(),
-            second.canonicalize().unwrap()
-        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

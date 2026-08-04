@@ -2,10 +2,10 @@ use crate::artifacts::RunArtifactSink;
 use crate::data_feed::DataFeedOptions;
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::qc_algorithm::BrokerageModel;
-use rlean_alpha::AlphaAnalytics;
+use rlean_alpha::{AlphaAnalytics, InsightEvent};
 use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
 use rlean_orders::{Order, OrderEvent};
-use rlean_statistics::PortfolioStatistics;
+use rlean_statistics::{PortfolioStatistics, Trade};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +115,10 @@ pub struct BacktestRunResult {
     pub order_events: Vec<OrderEvent>,
     /// Final order states from the backtest run.
     pub orders: Vec<Order>,
+    /// Completed round-trip trades used to compute the final statistics.
+    pub trades: Vec<Trade>,
+    /// Complete framework insight lifecycle, in engine event order.
+    pub insight_events: Vec<InsightEvent>,
     /// Symbols/dates for which the sidecar returned data.
     pub succeeded_data_requests: Vec<String>,
     /// Symbols/dates for which no data was found.

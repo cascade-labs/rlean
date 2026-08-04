@@ -119,6 +119,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
+verglas-sdk = { git = "https://github.com/verglas-org/verglas.git", rev = "d8eee12b0bc173c6c1c915f2c3a9f90298386033" }
 
 [patch."ssh://git@github.com/cascade-labs/rlean"]
 rlean-core           = { path = "crates/rlean-core" }

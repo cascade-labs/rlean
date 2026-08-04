@@ -33,6 +33,8 @@ mod live_deployments;
 mod project;
 mod research;
 mod research_daemon;
+mod run_catalog;
+mod runs_cmd;
 mod runtime;
 mod stubs_cmd;
 mod vcs_cmd;
@@ -79,6 +81,7 @@ async fn main() -> Result<()> {
         Command::Config(args) => run_config(args),
         Command::Data(args) => run_data(args).await,
         Command::Backtest(args) => backtest::run(args).await,
+        Command::Runs(args) => runs_cmd::run(args).await,
         Command::Live(args) => live::run(args).await,
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),

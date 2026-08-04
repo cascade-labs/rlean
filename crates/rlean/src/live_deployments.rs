@@ -951,7 +951,6 @@ mod tests {
                 artifact_s3: None,
                 verbose: true,
             },
-            report: None,
             live_limits: LiveLimitArgs {
                 live_max_slices: Some(2),
                 live_max_runtime_seconds: Some(10),

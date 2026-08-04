@@ -12,6 +12,7 @@ use crate::init::InitArgs;
 use crate::project::CreateProjectArgs;
 use crate::research::ResearchArgs;
 use crate::research_daemon::ResearchDaemonArgs;
+use crate::runs_cmd::RunsArgs;
 use crate::stubs_cmd::StubsArgs;
 use crate::vcs_cmd::VcsArgs;
 
@@ -43,6 +44,9 @@ pub(crate) enum Command {
 
     /// Run a backtest
     Backtest(RunArgs),
+
+    /// Inspect durable backtest results in the Verglas catalog
+    Runs(RunsArgs),
 
     /// Run live trading or inspect local live deployments
     Live(LiveArgs),
@@ -143,11 +147,6 @@ pub(crate) struct RunArgs {
 
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
-
-    // ── Output ────────────────────────────────────────────────────────────────
-    /// Override the report output path (default: <project>/backtests/<timestamp>.html)
-    #[arg(long)]
-    pub(crate) report: Option<PathBuf>,
 
     #[command(flatten)]
     pub(crate) live_limits: LiveLimitArgs,
@@ -265,7 +264,6 @@ impl LiveArgs {
         Ok(RunArgs {
             strategy,
             runtime: self.runtime.clone(),
-            report: None,
             live_limits: self.live_limits.clone(),
         })
     }

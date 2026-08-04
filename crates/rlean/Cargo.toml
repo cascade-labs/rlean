@@ -26,6 +26,7 @@ rlean-sdk            = { path = "../rlean-sdk", version = "0.1.1" }
 rlean-algorithm      = { path = "../rlean-algorithm", version = "0.1.1" }
 rlean-live           = { path = "../rlean-live", version = "0.1.1" }
 rlean-python-runtime = { path = "../rlean-python-runtime", version = "0.1.1" }
+verglas-sdk         = { workspace = true }
 
 clap               = { workspace = true }
 tokio              = { workspace = true }
@@ -39,6 +40,8 @@ chrono             = { workspace = true }
 rust_decimal       = { workspace = true }
 arrow              = { workspace = true }
 arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+arrow-cast         = { workspace = true }
 futures            = { workspace = true }
 pyo3               = { workspace = true }
 glob               = { workspace = true }
@@ -48,6 +51,7 @@ indicatif = "0.18.5"
 ctrlc = "3.5.2"
 tempfile           = { workspace = true }
 sha2               = { workspace = true }
+uuid               = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

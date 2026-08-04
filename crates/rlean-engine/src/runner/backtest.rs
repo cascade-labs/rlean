@@ -198,6 +198,7 @@ where
     let mut market_slices_after_warmup = 0usize;
     let mut trade_builder = TradeBuilder::new();
     let mut completed_trades = Vec::new();
+    let mut insight_events = Vec::new();
 
     // Optional incremental result streamer. When an output directory (or an
     // artifact sink) is set the runner appends order events / trades and
@@ -325,6 +326,13 @@ where
             });
             algorithm_manager.process_option_expirations(slice.as_ref(), &mut services);
         }
+        insight_events.extend(
+            algorithm_manager
+                .framework()
+                .lock()
+                .expect("framework state poisoned")
+                .take_insight_events(),
+        );
         algorithm_manager.end_time_step(&mut services);
 
         if has_data_for_algorithm {
@@ -381,6 +389,13 @@ where
     }
 
     algorithm_manager.finish(&mut services);
+    insight_events.extend(
+        algorithm_manager
+            .framework()
+            .lock()
+            .expect("framework state poisoned")
+            .take_insight_events(),
+    );
 
     let total_fees: f64 = all_order_events
         .iter()
@@ -425,6 +440,8 @@ where
         end,
         all_order_events,
         final_orders,
+        completed_trades,
+        insight_events,
         total_fees,
         algorithm_manager,
         config,
@@ -890,6 +907,8 @@ fn build_backtest_result(
     end_date: chrono::NaiveDate,
     order_events: Vec<OrderEvent>,
     orders: Vec<rlean_orders::Order>,
+    trades: Vec<rlean_statistics::Trade>,
+    insight_events: Vec<rlean_alpha::InsightEvent>,
     total_fees: f64,
     algorithm_manager: AlgorithmManager<impl AlgorithmBridge>,
     _config: BacktestRunConfig,
@@ -958,6 +977,8 @@ fn build_backtest_result(
         charts: algorithm_manager.charts(),
         order_events,
         orders,
+        trades,
+        insight_events,
         succeeded_data_requests: Vec::new(),
         failed_data_requests: Vec::new(),
         backtest_id: chrono::Utc::now().timestamp(),
