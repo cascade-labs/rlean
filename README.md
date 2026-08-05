@@ -173,12 +173,17 @@ for a private execution service implementing the
 subscriptions; live events are pushed by the selected provider.
 
 Historical market data can be selected independently with
-`--data-provider-historical massive`. Massive TradeBars, QuoteBars, ticks, and
-option-universe rows are converted to provider-neutral contracts. Equity map
-and factor files are loaded through their separate LEAN-style auxiliary
-provider paths. Every contract is queried cache-first through Verglas and a
-newly fetched range is synchronously persisted through the Verglas write role
-before the engine consumes it.
+`--data-provider-historical massive` or `--data-provider-historical thetadata`.
+Both providers convert vendor responses to provider-neutral contracts before
+they reach the engine or cache. The native ThetaData provider supports US
+equity and option TradeBars, QuoteBars, ticks, and option-universe history;
+configure it once with `rlean config set thetadata.api_key <key>`. Optional
+`thetadata.base_url`, `thetadata.max_concurrent`, and
+`thetadata.requests_per_second` integration settings control private gateways
+and request limits. Equity map and factor files are loaded through their
+separate LEAN-style auxiliary provider paths. Every contract is queried
+cache-first through Verglas and a newly fetched range is synchronously
+persisted through the Verglas write role before the engine consumes it.
 
 Use `--live-data-feed massive` for Massive websocket trades and quotes. rlean
 maintains dynamic websocket membership as strategy subscriptions are added and

@@ -13,8 +13,9 @@ use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
     CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
     MassiveHistoricalDataProvider, MassiveLiveConfig, MassiveLiveDataProvider,
-    RoutedLiveDataProvider, TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider,
-    TradierMarketDataConfig, VerglasCustomLiveDataProvider, VerglasHistoricalDataStore,
+    RoutedLiveDataProvider, ThetaDataConfig, ThetaDataHistoricalDataProvider,
+    TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider, TradierMarketDataConfig,
+    VerglasCustomLiveDataProvider, VerglasHistoricalDataStore,
 };
 use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
@@ -59,6 +60,21 @@ pub(crate) async fn historical_data_provider(
             Arc::new(MassiveHistoricalDataProvider::new(MassiveConfig::new(
                 api_key,
             ))?)
+        }
+        "thetadata" => {
+            let integration = config::IntegrationConfigs::load()?.get_integration("thetadata");
+            let api_key = optional_string(&integration, "api_key");
+            let mut provider_config = ThetaDataConfig::new(api_key);
+            if let Some(base_url) = optional_string(&integration, "base_url") {
+                provider_config.base_url = base_url;
+            }
+            if let Some(max_concurrent) = optional_usize(&integration, "max_concurrent") {
+                provider_config.max_concurrent = max_concurrent.max(1);
+            }
+            if let Some(requests_per_second) = optional_f64(&integration, "requests_per_second") {
+                provider_config.requests_per_second = requests_per_second;
+            }
+            Arc::new(ThetaDataHistoricalDataProvider::new(provider_config)?)
         }
         other => bail!("unsupported historical data provider '{other}'"),
     };
@@ -173,6 +189,23 @@ fn optional_string(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn optional_usize(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<usize> {
+    values.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .or_else(|| value.as_str()?.trim().parse().ok())
+    })
+}
+
+fn optional_f64(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
+    values.get(key).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str()?.trim().parse().ok())
+    })
 }
 
 /// Connects once to the configured Verglas gateway. The SDK discovers the

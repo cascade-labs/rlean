@@ -10,6 +10,7 @@ mod live;
 mod massive;
 mod massive_live;
 mod routed_live;
+mod thetadata;
 mod tradier;
 mod verglas_store;
 
@@ -21,5 +22,6 @@ pub use live::{LiveDataEvent, LiveDataProvider, LiveSubscription};
 pub use massive::{MassiveConfig, MassiveHistoricalDataProvider};
 pub use massive_live::{MassiveLiveConfig, MassiveLiveDataProvider};
 pub use routed_live::{RoutedLiveDataProvider, VerglasCustomLiveDataProvider};
+pub use thetadata::{ThetaDataConfig, ThetaDataHistoricalDataProvider};
 pub use tradier::{TradierEnvironment, TradierLiveDataProvider, TradierMarketDataConfig};
 pub use verglas_store::VerglasHistoricalDataStore;
