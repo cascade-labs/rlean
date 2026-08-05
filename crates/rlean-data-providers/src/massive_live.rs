@@ -499,9 +499,14 @@ fn convert_event(
         .context("Massive live bars require fixed resolution")?;
     let (start, period) = if config.resolution == Resolution::Daily {
         let hours = rlean_core::MarketHoursDatabase::global().exchange_hours(&config.symbol);
-        let timezone = hours.timezone.parse().context("invalid exchange timezone")?;
+        let timezone = hours
+            .timezone
+            .parse()
+            .context("invalid exchange timezone")?;
         let date = time.to_tz(timezone).date_naive();
-        let Some((open, close)) = hours.session_bounds(date) else { return Ok(None); };
+        let Some((open, close)) = hours.session_bounds(date) else {
+            return Ok(None);
+        };
         (open, close - open)
     } else {
         (bucket(time, requested_period), requested_period)
