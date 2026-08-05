@@ -171,12 +171,19 @@ independent native connections. Strategy SDK calls create and remove symbol
 subscriptions; live events are pushed by the selected provider.
 
 Historical market data can be selected independently with
-`--data-provider-historical massive`. Massive TradeBars and QuoteBars are
-converted to the provider-neutral contracts, queried cache-first through
-Verglas, and synchronously persisted through the Verglas write role before the
-engine consumes a newly fetched range. Configure the provider credential as
-`massive.api_key`; rlean does not receive object-store credentials or embed an
-Iceberg query engine.
+`--data-provider-historical massive`. Massive TradeBars, QuoteBars, ticks, and
+option-universe rows are converted to provider-neutral contracts. Equity map
+and factor files are loaded through their separate LEAN-style auxiliary
+provider paths. Every contract is queried cache-first through Verglas and a
+newly fetched range is synchronously persisted through the Verglas write role
+before the engine consumes it.
+
+Use `--live-data-feed massive` for Massive websocket trades and quotes. rlean
+maintains dynamic websocket membership as strategy subscriptions are added and
+removed, reconnects and re-authenticates automatically, and aggregates raw
+events into the requested resolution before emitting completed bars. Configure
+both historical and live Massive access with `massive.api_key`; rlean does not
+receive object-store credentials or embed an Iceberg query engine.
 
 ### Cloud fleet
 

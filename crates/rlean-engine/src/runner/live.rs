@@ -1571,6 +1571,70 @@ fn native_live_items(
                 LiveDataItem::QuoteBar(bar)
             })
             .collect(),
+        HistoricalData::Ticks(rows) => rows
+            .into_iter()
+            .map(|mut tick| {
+                tick.venue.get_or_insert_with(|| config.venue.clone());
+                LiveDataItem::Tick(tick)
+            })
+            .collect(),
+        HistoricalData::OptionUniverse(rows) => {
+            crate::option_universe::option_chains_from_rows(config, rows)?
+                .into_iter()
+                .filter_map(|(date, chain)| {
+                    Some(LiveDataItem::OptionChainData {
+                        time: rlean_core::NanosecondTimestamp(
+                            date.succ_opt()?
+                                .and_hms_opt(0, 0, 0)?
+                                .and_utc()
+                                .timestamp_nanos_opt()?,
+                        ),
+                        canonical_permtick: config
+                            .option_chain
+                            .as_ref()?
+                            .canonical_permtick
+                            .clone(),
+                        chain: std::sync::Arc::new(chain),
+                    })
+                })
+                .collect()
+        }
+        HistoricalData::FundamentalUniverse(rows) => {
+            let mut by_frontier = std::collections::BTreeMap::new();
+            for row in rows {
+                let time = rlean_core::NanosecondTimestamp(
+                    row.time.and_utc().timestamp_nanos_opt().unwrap_or_default(),
+                );
+                let frontier = rlean_core::NanosecondTimestamp(
+                    row.end_time
+                        .and_utc()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_default(),
+                );
+                let mut point = rlean_data::FundamentalData::new(
+                    rlean_core::Symbol::create_equity(
+                        &row.symbol_value,
+                        &rlean_core::Market::new(&row.market),
+                    ),
+                    time,
+                );
+                point.end_time = frontier;
+                point.volume = Some(row.volume);
+                point.dollar_volume = Some(row.dollar_volume);
+                point.market_cap = Some(row.market_cap);
+                by_frontier
+                    .entry(frontier)
+                    .or_insert_with(Vec::new)
+                    .push(point);
+            }
+            by_frontier
+                .into_iter()
+                .map(|(time, data)| LiveDataItem::FundamentalUniverseData { time, data })
+                .collect()
+        }
+        HistoricalData::FutureUniverse(_) => {
+            anyhow::bail!("future-universe live delivery is not supported")
+        }
     })
 }
 

@@ -1,6 +1,6 @@
 use rlean_core::MarketHoursDatabase;
 use rlean_data_providers::HistoricalDataProvider;
-use rlean_data_tables::FactorFileEntry;
+use rlean_data_tables::{FactorFileEntry, MapFileEntry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +30,7 @@ pub struct DataFeedContext {
     pub market_hours_database: Arc<MarketHoursDatabase>,
     unadjusted_equities: Arc<Mutex<HashSet<String>>>,
     auxiliary_factor_rows: Arc<Mutex<HashMap<String, Vec<FactorFileEntry>>>>,
+    auxiliary_map_rows: Arc<Mutex<HashMap<String, Vec<MapFileEntry>>>>,
 }
 
 impl DataFeedContext {
@@ -40,6 +41,7 @@ impl DataFeedContext {
             market_hours_database: MarketHoursDatabase::global(),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
             auxiliary_factor_rows: Arc::new(Mutex::new(HashMap::new())),
+            auxiliary_map_rows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -85,6 +87,19 @@ impl DataFeedContext {
 
     pub fn cache_auxiliary_factor_rows(&self, key: String, rows: Vec<FactorFileEntry>) {
         if let Ok(mut cache) = self.auxiliary_factor_rows.lock() {
+            cache.insert(key, rows);
+        }
+    }
+
+    pub fn cached_auxiliary_map_rows(&self, key: &str) -> Option<Vec<MapFileEntry>> {
+        self.auxiliary_map_rows
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(key).cloned())
+    }
+
+    pub fn cache_auxiliary_map_rows(&self, key: String, rows: Vec<MapFileEntry>) {
+        if let Ok(mut cache) = self.auxiliary_map_rows.lock() {
             cache.insert(key, rows);
         }
     }

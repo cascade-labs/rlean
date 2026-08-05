@@ -289,12 +289,43 @@ async fn produce(
             config.symbol.value
         )));
     }
+    let auxiliary_key = format!("{}:{}", config.symbol.market(), config.symbol.permtick);
+    let factor_rows = if config.symbol.security_type() == rlean_core::SecurityType::Equity {
+        if let Some(rows) = context.cached_auxiliary_factor_rows(&auxiliary_key) {
+            rows
+        } else {
+            let rows = provider
+                .get_factor_file(&config.symbol)
+                .await
+                .map_err(data_error)?
+                .unwrap_or_default();
+            context.cache_auxiliary_factor_rows(auxiliary_key.clone(), rows.clone());
+            rows
+        }
+    } else {
+        Vec::new()
+    };
+    let map_rows = if config.symbol.security_type() == rlean_core::SecurityType::Equity {
+        if let Some(rows) = context.cached_auxiliary_map_rows(&auxiliary_key) {
+            rows
+        } else {
+            let rows = provider
+                .get_map_file(&config.symbol)
+                .await
+                .map_err(data_error)?
+                .unwrap_or_default();
+            context.cache_auxiliary_map_rows(auxiliary_key, rows.clone());
+            rows
+        }
+    } else {
+        Vec::new()
+    };
     produce_native(
         &config,
         &context,
         provider,
         (start, end),
-        &[],
+        (&factor_rows, &map_rows),
         sender,
         &mut cancelled,
     )
@@ -306,7 +337,7 @@ async fn produce_native(
     context: &DataFeedContext,
     provider: Arc<dyn HistoricalDataProvider>,
     range: (DateTime, DateTime),
-    factor_rows: &[FactorFileEntry],
+    auxiliary: (&[FactorFileEntry], &[rlean_data_tables::MapFileEntry]),
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     cancelled: &mut oneshot::Receiver<()>,
 ) -> LeanResult<()> {
@@ -319,13 +350,17 @@ async fn produce_native(
     while window_start <= end_date {
         let window_end = backtest_window_candidate(config.resolution, window_start).min(end_date);
         let (query_start, query_end) = bounded_query_times(window_start, window_end, start, end);
+        let mut query_config = config.clone();
+        if let Some(mapped) = auxiliary.1.iter().find(|row| row.date >= window_start) {
+            query_config.symbol = config.symbol.with_mapped_value(&mapped.mapped_symbol);
+        }
         let request =
-            HistoryRequest::new(config.clone(), query_start, query_end).map_err(data_error)?;
+            HistoryRequest::new(query_config, query_start, query_end).map_err(data_error)?;
         let data = tokio::select! {
             _ = &mut *cancelled => return Ok(()),
             result = provider.get_history(&request) => result.map_err(data_error)?,
         };
-        let mut points = native_points(config, data, factor_rows)?;
+        let mut points = native_points(config, data, auxiliary.0)?;
         points.sort_by_key(SubscriptionDataPoint::frontier_time);
         points = deduplicate_points(config, points);
         tracing::debug!(
@@ -424,6 +459,74 @@ fn native_points(
                 SubscriptionDataPoint::QuoteBar(bar)
             })
             .collect()),
+        HistoricalData::Ticks(rows) => Ok(rows
+            .into_iter()
+            .map(|mut tick| {
+                tick.venue.get_or_insert_with(|| config.venue.clone());
+                SubscriptionDataPoint::Tick(tick)
+            })
+            .collect()),
+        HistoricalData::OptionUniverse(rows) => {
+            let chains = crate::option_universe::option_chains_from_rows(config, rows)
+                .map_err(data_error)?;
+            Ok(chains
+                .into_iter()
+                .filter_map(|(date, chain)| {
+                    let frontier_date = date.succ_opt()?;
+                    let frontier_time = partition_day_start(frontier_date);
+                    Some(SubscriptionDataPoint::OptionChain {
+                        canonical_permtick: config
+                            .option_chain
+                            .as_ref()?
+                            .canonical_permtick
+                            .clone(),
+                        chain: std::sync::Arc::new(chain),
+                        frontier_time,
+                    })
+                })
+                .collect())
+        }
+        HistoricalData::FundamentalUniverse(rows) => {
+            let mut by_frontier = std::collections::BTreeMap::new();
+            for row in rows {
+                let frontier_time = rlean_core::NanosecondTimestamp(
+                    row.end_time
+                        .and_utc()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_default(),
+                );
+                let time = rlean_core::NanosecondTimestamp(
+                    row.time.and_utc().timestamp_nanos_opt().unwrap_or_default(),
+                );
+                let mut point = rlean_data::FundamentalData::new(
+                    rlean_core::Symbol::create_equity(
+                        &row.symbol_value,
+                        &rlean_core::Market::new(&row.market),
+                    ),
+                    time,
+                );
+                point.end_time = frontier_time;
+                point.volume = Some(row.volume);
+                point.dollar_volume = Some(row.dollar_volume);
+                point.market_cap = Some(row.market_cap);
+                by_frontier
+                    .entry(frontier_time)
+                    .or_insert_with(Vec::new)
+                    .push(point);
+            }
+            Ok(by_frontier
+                .into_iter()
+                .map(
+                    |(frontier_time, data)| SubscriptionDataPoint::FundamentalUniverse {
+                        data,
+                        frontier_time,
+                    },
+                )
+                .collect())
+        }
+        HistoricalData::FutureUniverse(_) => Err(LeanError::DataError(
+            "future-universe delivery is not yet supported by the engine".to_string(),
+        )),
     }
 }
 

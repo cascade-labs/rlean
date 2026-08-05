@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use arrow_array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, UInt8Array,
 };
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -10,7 +11,8 @@ use chrono::Datelike;
 use futures::{stream, TryStreamExt};
 use rlean_core::{NanosecondTimestamp, TickType, TimeSpan};
 use rlean_data_tables::{
-    Bar, PartitionTransform, QuoteBar, TableContract, TradeBar, DECIMAL_PRECISION, DECIMAL_SCALE,
+    Bar, DataMappingMode, FactorFileEntry, MapFileEntry, OptionUniverseRow, PartitionTransform,
+    QuoteBar, TableContract, Tick, TradeBar, DECIMAL_PRECISION, DECIMAL_SCALE,
 };
 use rust_decimal::Decimal;
 use verglas_sdk::{
@@ -21,6 +23,10 @@ use crate::{Coverage, HistoricalData, HistoricalDataStore, HistoryRequest, TimeR
 
 const TRADE_BARS: &str = "rlean.market_trade_bars";
 const QUOTE_BARS: &str = "rlean.market_quote_bars";
+const TICKS: &str = "rlean.market_ticks";
+const OPTION_UNIVERSE: &str = "rlean.option_universe";
+const FACTOR_FILES: &str = "rlean.factor_files";
+const MAP_FILES: &str = "rlean.map_files";
 const COVERAGE: &str = "rlean.history_coverage";
 const BATCH_ROWS: usize = 8_192;
 
@@ -55,6 +61,26 @@ impl VerglasHistoricalDataStore {
             .ensure_table(QUOTE_BARS, &contract_definition::<QuoteBar>()?)
             .await
             .context("ensure canonical quote-bar table")?;
+        // `market_ticks` is part of the shared rlean catalog manifest. Its
+        // canonical `tick_type` is UInt8, which Verglas's generic create-table
+        // surface intentionally does not coerce to a wider integer. Do not let
+        // an unrelated bar-only process fail while eagerly ensuring this table;
+        // tick queries and appends use the manifest-created table as-is.
+        client
+            .ensure_table(
+                OPTION_UNIVERSE,
+                &contract_definition::<OptionUniverseRow>()?,
+            )
+            .await
+            .context("ensure canonical option-universe table")?;
+        client
+            .ensure_table(FACTOR_FILES, &contract_definition::<FactorFileEntry>()?)
+            .await
+            .context("ensure canonical factor-file table")?;
+        client
+            .ensure_table(MAP_FILES, &contract_definition::<MapFileEntry>()?)
+            .await
+            .context("ensure canonical map-file table")?;
         client
             .ensure_table(COVERAGE, &coverage_definition())
             .await
@@ -63,6 +89,12 @@ impl VerglasHistoricalDataStore {
     }
 
     fn table(request: &HistoryRequest) -> Result<&'static str> {
+        if request.configuration.option_chain.is_some() {
+            return Ok(OPTION_UNIVERSE);
+        }
+        if request.configuration.resolution == rlean_core::Resolution::Tick {
+            return Ok(TICKS);
+        }
         match request.configuration.tick_type {
             TickType::Trade => Ok(TRADE_BARS),
             TickType::Quote => Ok(QUOTE_BARS),
@@ -71,6 +103,14 @@ impl VerglasHistoricalDataStore {
     }
 
     fn identity_predicate(request: &HistoryRequest) -> Result<String> {
+        if let Some(metadata) = request.configuration.option_chain.as_ref() {
+            return Ok(format!(
+                "market = '{}' AND (underlying_value = '{}' OR (underlying_value IS NULL AND symbol_value = '{}'))",
+                sql_string(request.configuration.symbol.market().as_str()),
+                sql_string(&metadata.underlying_ticker),
+                sql_string(&metadata.underlying_ticker),
+            ));
+        }
         let sid = i64::try_from(request.configuration.symbol.sid())
             .context("symbol SID exceeds the canonical signed 64-bit contract")?;
         Ok(format!(
@@ -109,7 +149,11 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
             .await
             .context("query historical coverage")?;
         let mut covered = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .context("stream historical coverage")?
+        {
             let starts = int64(&batch, "start_ns")?;
             let ends = int64(&batch, "end_ns")?;
             covered.extend((0..batch.num_rows()).filter_map(|row| {
@@ -125,8 +169,16 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
 
     async fn read(&self, request: &HistoryRequest) -> Result<HistoricalData> {
         let table = Self::table(request)?;
+        let (time_column, lower_comparison, upper_comparison) =
+            if request.configuration.option_chain.is_some() {
+                ("date_ns", ">=", "<")
+            } else if request.configuration.resolution == rlean_core::Resolution::Tick {
+                ("time_ns", ">=", "<")
+            } else {
+                ("end_time_ns", ">", "<=")
+            };
         let sql = format!(
-            "SELECT * FROM {table} WHERE {} AND end_time_ns > {} AND end_time_ns <= {} ORDER BY end_time_ns, time_ns",
+            "SELECT * FROM {table} WHERE {} AND {time_column} {lower_comparison} {} AND {time_column} {upper_comparison} {} ORDER BY {time_column}",
             Self::identity_predicate(request)?,
             request.range.start.0,
             request.range.end.0,
@@ -136,17 +188,43 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
             .query_stream(&sql)
             .await
             .with_context(|| format!("query cached history from {table}"))?;
+        if request.configuration.option_chain.is_some() {
+            let mut rows = Vec::new();
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .context("stream cached option universe")?
+            {
+                rows.extend(decode_option_universe(&batch)?);
+            }
+            return Ok(HistoricalData::OptionUniverse(rows));
+        }
+        if request.configuration.resolution == rlean_core::Resolution::Tick {
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.try_next().await.context("stream cached ticks")? {
+                rows.extend(decode_ticks(&batch, &request.configuration.symbol)?);
+            }
+            return Ok(HistoricalData::Ticks(rows));
+        }
         match request.configuration.tick_type {
             TickType::Trade => {
                 let mut rows = Vec::new();
-                while let Some(batch) = stream.try_next().await? {
+                while let Some(batch) = stream
+                    .try_next()
+                    .await
+                    .context("stream cached trade bars")?
+                {
                     rows.extend(decode_trade_bars(&batch, &request.configuration.symbol)?);
                 }
                 Ok(HistoricalData::TradeBars(rows))
             }
             TickType::Quote => {
                 let mut rows = Vec::new();
-                while let Some(batch) = stream.try_next().await? {
+                while let Some(batch) = stream
+                    .try_next()
+                    .await
+                    .context("stream cached quote bars")?
+                {
                     rows.extend(decode_quote_bars(&batch, &request.configuration.symbol)?);
                 }
                 Ok(HistoricalData::QuoteBars(rows))
@@ -199,6 +277,102 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
             .context("persist successful historical coverage")?;
         Ok(())
     }
+
+    async fn read_factor_file(&self, symbol: &rlean_core::Symbol) -> Result<Vec<FactorFileEntry>> {
+        let sql = format!(
+            "SELECT * FROM {FACTOR_FILES} WHERE market = '{}' AND ticker = '{}' ORDER BY date_ns",
+            sql_string(symbol.market().as_str()),
+            sql_string(&symbol.permtick)
+        );
+        let mut stream = self
+            .client
+            .query_stream(&sql)
+            .await
+            .context("query cached factor file")?;
+        let mut rows = Vec::new();
+        loop {
+            match stream.try_next().await {
+                Ok(Some(batch)) => rows.extend(decode_factor_file(&batch)?),
+                Ok(None) => break,
+                Err(error) if rows.is_empty() && is_empty_arrow_stream(&error) => break,
+                Err(error) => return Err(error).context("stream cached factor file"),
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn append_factor_file(
+        &self,
+        symbol: &rlean_core::Symbol,
+        provider: &str,
+        rows: &[FactorFileEntry],
+    ) -> Result<()> {
+        let batch = encode_factor_file(symbol, rows)?;
+        let version = rows
+            .iter()
+            .map(FactorFileEntry::date_ns)
+            .max()
+            .unwrap_or_default();
+        let key = format!(
+            "rlean-auxiliary:factor:{provider}:{}:{}:{version}:{}",
+            symbol.market(),
+            symbol.permtick,
+            rows.len()
+        );
+        self.client
+            .append_stream(FACTOR_FILES, stream::iter(vec![Ok(batch)]), &key)
+            .await
+            .map_err(|error| anyhow::anyhow!("append factor file: {error}"))?;
+        Ok(())
+    }
+
+    async fn read_map_file(&self, symbol: &rlean_core::Symbol) -> Result<Vec<MapFileEntry>> {
+        let sql = format!(
+            "SELECT * FROM {MAP_FILES} WHERE market = '{}' AND permtick = '{}' ORDER BY date_ns",
+            sql_string(symbol.market().as_str()),
+            sql_string(&symbol.permtick)
+        );
+        let mut stream = self
+            .client
+            .query_stream(&sql)
+            .await
+            .context("query cached map file")?;
+        let mut rows = Vec::new();
+        loop {
+            match stream.try_next().await {
+                Ok(Some(batch)) => rows.extend(decode_map_file(&batch)?),
+                Ok(None) => break,
+                Err(error) if rows.is_empty() && is_empty_arrow_stream(&error) => break,
+                Err(error) => return Err(error).context("stream cached map file"),
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn append_map_file(
+        &self,
+        symbol: &rlean_core::Symbol,
+        provider: &str,
+        rows: &[MapFileEntry],
+    ) -> Result<()> {
+        let batch = encode_map_file(symbol, rows)?;
+        let version = rows
+            .iter()
+            .map(MapFileEntry::date_ns)
+            .max()
+            .unwrap_or_default();
+        let key = format!(
+            "rlean-auxiliary:map:{provider}:{}:{}:{version}:{}",
+            symbol.market(),
+            symbol.permtick,
+            rows.len()
+        );
+        self.client
+            .append_stream(MAP_FILES, stream::iter(vec![Ok(batch)]), &key)
+            .await
+            .map_err(|error| anyhow::anyhow!("append map file: {error}"))?;
+        Ok(())
+    }
 }
 
 fn idempotency_key(
@@ -228,6 +402,17 @@ fn encode_history(request: &HistoryRequest, data: &HistoricalData) -> Result<Vec
             .chunks(BATCH_ROWS)
             .map(|chunk| encode_quote_bars(request, chunk))
             .collect(),
+        HistoricalData::Ticks(rows) => rows
+            .chunks(BATCH_ROWS)
+            .map(|chunk| encode_ticks(request, chunk))
+            .collect(),
+        HistoricalData::OptionUniverse(rows) => rows
+            .chunks(BATCH_ROWS)
+            .map(encode_option_universe)
+            .collect(),
+        HistoricalData::FutureUniverse(_) | HistoricalData::FundamentalUniverse(_) => {
+            bail!("Verglas encoder does not yet support this universe type")
+        }
     }
 }
 
@@ -410,6 +595,360 @@ fn decode_trade_bars(batch: &RecordBatch, symbol: &rlean_core::Symbol) -> Result
         .collect())
 }
 
+fn encode_ticks(request: &HistoryRequest, rows: &[Tick]) -> Result<RecordBatch> {
+    let sid = i64::try_from(request.configuration.symbol.sid())
+        .context("symbol SID exceeds the canonical signed 64-bit contract")?;
+    let decimals = |values: Vec<Decimal>| -> Result<ArrayRef> {
+        Ok(Arc::new(
+            Decimal128Array::from(values.into_iter().map(scale_decimal).collect::<Vec<_>>())
+                .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)?,
+        ))
+    };
+    RecordBatch::try_new(
+        Tick::schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.time.0),
+            )),
+            Arc::new(Int64Array::from(vec![sid; rows.len()])),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.symbol.value()),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.venue.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from_iter_values(rows.iter().map(
+                |row| match row.tick_type {
+                    TickType::Trade => 0,
+                    TickType::Quote => 1,
+                    TickType::OpenInterest => 2,
+                },
+            ))),
+            decimals(rows.iter().map(|row| row.value).collect())?,
+            decimals(rows.iter().map(|row| row.quantity).collect())?,
+            decimals(rows.iter().map(|row| row.bid_price).collect())?,
+            decimals(rows.iter().map(|row| row.ask_price).collect())?,
+            decimals(rows.iter().map(|row| row.bid_size).collect())?,
+            decimals(rows.iter().map(|row| row.ask_size).collect())?,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.exchange.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.sale_condition.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|row| row.suspicious).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![
+                request
+                    .configuration
+                    .symbol
+                    .security_type()
+                    .to_string();
+                rows.len()
+            ])),
+            Arc::new(StringArray::from(vec![
+                request
+                    .configuration
+                    .symbol
+                    .market()
+                    .as_str();
+                rows.len()
+            ])),
+            Arc::new(StringArray::from(vec![
+                request
+                    .configuration
+                    .resolution
+                    .to_string();
+                rows.len()
+            ])),
+            Arc::new(Date32Array::from_iter_values(
+                rows.iter().map(|row| date32(row.time)),
+            )),
+        ],
+    )
+    .context("encode canonical ticks")
+}
+
+fn decode_ticks(batch: &RecordBatch, symbol: &rlean_core::Symbol) -> Result<Vec<Tick>> {
+    let time = int64(batch, "time_ns")?;
+    let tick_type = batch
+        .column_by_name("tick_type")
+        .context("missing tick_type column")?
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .context("tick_type is not UInt8")?;
+    let value = decimal(batch, "value")?;
+    let quantity = decimal(batch, "quantity")?;
+    let bid_price = decimal(batch, "bid_price")?;
+    let ask_price = decimal(batch, "ask_price")?;
+    let bid_size = decimal(batch, "bid_size")?;
+    let ask_size = decimal(batch, "ask_size")?;
+    let suspicious = batch
+        .column_by_name("suspicious")
+        .context("missing suspicious column")?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .context("suspicious is not Boolean")?;
+    Ok((0..batch.num_rows())
+        .map(|row| Tick {
+            symbol: symbol.clone(),
+            venue: string_at(batch, "venue", row),
+            time: NanosecondTimestamp(time.value(row)),
+            tick_type: match tick_type.value(row) {
+                0 => TickType::Trade,
+                1 => TickType::Quote,
+                _ => TickType::OpenInterest,
+            },
+            value: decimal_value(value.value(row)),
+            quantity: decimal_value(quantity.value(row)),
+            bid_price: decimal_value(bid_price.value(row)),
+            ask_price: decimal_value(ask_price.value(row)),
+            bid_size: decimal_value(bid_size.value(row)),
+            ask_size: decimal_value(ask_size.value(row)),
+            exchange: string_at(batch, "exchange", row),
+            sale_condition: string_at(batch, "sale_condition", row),
+            suspicious: suspicious.value(row),
+        })
+        .collect())
+}
+
+fn encode_option_universe(rows: &[OptionUniverseRow]) -> Result<RecordBatch> {
+    let required_decimals = |values: Vec<Decimal>| -> Result<ArrayRef> {
+        Ok(Arc::new(
+            Decimal128Array::from(values.into_iter().map(scale_decimal).collect::<Vec<_>>())
+                .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)?,
+        ))
+    };
+    let nullable_decimals = |values: Vec<Option<Decimal>>| -> Result<ArrayRef> {
+        Ok(Arc::new(
+            Decimal128Array::from(
+                values
+                    .into_iter()
+                    .map(|value| value.map(scale_decimal))
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)?,
+        ))
+    };
+    let date_ns = |date: chrono::NaiveDate| {
+        date.and_hms_opt(0, 0, 0)
+            .and_then(|v| v.and_utc().timestamp_nanos_opt())
+            .unwrap_or_default()
+    };
+    RecordBatch::try_new(
+        OptionUniverseRow::schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| date_ns(row.date)),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.market.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.security_type.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.symbol_sid.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.symbol_value.as_str()),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.underlying_sid.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.underlying_value.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|row| row.expiration.map(date_ns))
+                    .collect::<Vec<_>>(),
+            )),
+            nullable_decimals(rows.iter().map(|row| row.strike).collect())?,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.right.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            required_decimals(rows.iter().map(|row| row.open).collect())?,
+            required_decimals(rows.iter().map(|row| row.high).collect())?,
+            required_decimals(rows.iter().map(|row| row.low).collect())?,
+            required_decimals(rows.iter().map(|row| row.close).collect())?,
+            required_decimals(rows.iter().map(|row| row.volume).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.open_interest).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.implied_volatility).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.delta).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.gamma).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.vega).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.theta).collect())?,
+            nullable_decimals(rows.iter().map(|row| row.rho).collect())?,
+            Arc::new(Date32Array::from_iter_values(
+                rows.iter().map(|row| row.date.num_days_from_ce() - 719_163),
+            )),
+        ],
+    )
+    .context("encode canonical option universe")
+}
+
+fn decode_option_universe(batch: &RecordBatch) -> Result<Vec<OptionUniverseRow>> {
+    let date_ns = int64(batch, "date_ns")?;
+    let expiration_ns = int64(batch, "expiration_ns")?;
+    let required = |name| decimal(batch, name);
+    let strike = required("strike")?;
+    let open = required("open")?;
+    let high = required("high")?;
+    let low = required("low")?;
+    let close = required("close")?;
+    let volume = required("volume")?;
+    let oi = required("open_interest")?;
+    let iv = required("implied_volatility")?;
+    let delta = required("delta")?;
+    let gamma = required("gamma")?;
+    let vega = required("vega")?;
+    let theta = required("theta")?;
+    let rho = required("rho")?;
+    let date = |ns: i64| chrono::DateTime::from_timestamp_nanos(ns).date_naive();
+    let optional_decimal = |array: &Decimal128Array, row| {
+        (!array.is_null(row)).then(|| decimal_value(array.value(row)))
+    };
+    Ok((0..batch.num_rows())
+        .map(|row| OptionUniverseRow {
+            date: date(date_ns.value(row)),
+            market: string_at(batch, "market", row).unwrap_or_default(),
+            security_type: string_at(batch, "security_type", row).unwrap_or_default(),
+            symbol_sid: string_at(batch, "symbol_sid", row).unwrap_or_default(),
+            symbol_value: string_at(batch, "symbol_value", row).unwrap_or_default(),
+            underlying_sid: string_at(batch, "underlying_sid", row),
+            underlying_value: string_at(batch, "underlying_value", row),
+            expiration: (!expiration_ns.is_null(row)).then(|| date(expiration_ns.value(row))),
+            strike: optional_decimal(strike, row),
+            right: string_at(batch, "right", row),
+            open: decimal_value(open.value(row)),
+            high: decimal_value(high.value(row)),
+            low: decimal_value(low.value(row)),
+            close: decimal_value(close.value(row)),
+            volume: decimal_value(volume.value(row)),
+            open_interest: optional_decimal(oi, row),
+            implied_volatility: optional_decimal(iv, row),
+            delta: optional_decimal(delta, row),
+            gamma: optional_decimal(gamma, row),
+            vega: optional_decimal(vega, row),
+            theta: optional_decimal(theta, row),
+            rho: optional_decimal(rho, row),
+        })
+        .collect())
+}
+
+fn encode_factor_file(
+    symbol: &rlean_core::Symbol,
+    rows: &[FactorFileEntry],
+) -> Result<RecordBatch> {
+    let decimal_array = |values: Vec<Decimal>| -> Result<ArrayRef> {
+        Ok(Arc::new(
+            Decimal128Array::from(values.into_iter().map(scale_decimal).collect::<Vec<_>>())
+                .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)?,
+        ))
+    };
+    RecordBatch::try_new(
+        FactorFileEntry::schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(FactorFileEntry::date_ns),
+            )),
+            decimal_array(rows.iter().map(|row| row.price_factor).collect())?,
+            decimal_array(rows.iter().map(|row| row.split_factor).collect())?,
+            decimal_array(rows.iter().map(|row| row.reference_price).collect())?,
+            Arc::new(StringArray::from(vec![
+                symbol.market().as_str();
+                rows.len()
+            ])),
+            Arc::new(StringArray::from(vec![
+                symbol.permtick.as_ref();
+                rows.len()
+            ])),
+        ],
+    )
+    .context("encode factor file")
+}
+
+fn decode_factor_file(batch: &RecordBatch) -> Result<Vec<FactorFileEntry>> {
+    let date_ns = int64(batch, "date_ns")?;
+    let price = decimal(batch, "price_factor")?;
+    let split = decimal(batch, "split_factor")?;
+    let reference = decimal(batch, "reference_price")?;
+    Ok((0..batch.num_rows())
+        .map(|row| FactorFileEntry {
+            date: chrono::DateTime::from_timestamp_nanos(date_ns.value(row)).date_naive(),
+            price_factor: decimal_value(price.value(row)),
+            split_factor: decimal_value(split.value(row)),
+            reference_price: decimal_value(reference.value(row)),
+        })
+        .collect())
+}
+
+fn encode_map_file(symbol: &rlean_core::Symbol, rows: &[MapFileEntry]) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        MapFileEntry::schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(MapFileEntry::date_ns),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.mapped_symbol.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.primary_exchange_code.as_str()),
+            )),
+            Arc::new(Int32Array::from(
+                rows.iter()
+                    .map(|row| row.data_mapping_mode.map(|mode| mode as i32))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![
+                symbol.market().as_str();
+                rows.len()
+            ])),
+            Arc::new(StringArray::from(vec![
+                symbol.permtick.as_ref();
+                rows.len()
+            ])),
+        ],
+    )
+    .context("encode map file")
+}
+
+fn decode_map_file(batch: &RecordBatch) -> Result<Vec<MapFileEntry>> {
+    let date_ns = int64(batch, "date_ns")?;
+    let mode = batch
+        .column_by_name("data_mapping_mode")
+        .context("missing data_mapping_mode")?
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .context("data_mapping_mode is not Int32")?;
+    Ok((0..batch.num_rows())
+        .map(|row| MapFileEntry {
+            date: chrono::DateTime::from_timestamp_nanos(date_ns.value(row)).date_naive(),
+            mapped_symbol: string_at(batch, "mapped_symbol", row).unwrap_or_default(),
+            primary_exchange_code: string_at(batch, "primary_exchange_code", row)
+                .unwrap_or_default(),
+            data_mapping_mode: (!mode.is_null(row))
+                .then(|| DataMappingMode::try_from(mode.value(row)).ok())
+                .flatten(),
+        })
+        .collect())
+}
+
 fn decode_quote_bars(batch: &RecordBatch, symbol: &rlean_core::Symbol) -> Result<Vec<QuoteBar>> {
     let time = int64(batch, "time_ns")?;
     let end_time = int64(batch, "end_time_ns")?;
@@ -500,6 +1039,11 @@ fn date32(value: NanosecondTimestamp) -> i32 {
 
 fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn is_empty_arrow_stream(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("Unexpected End of Stream") || message.contains("Unexpected end of stream")
 }
 
 fn coverage_schema() -> Arc<Schema> {

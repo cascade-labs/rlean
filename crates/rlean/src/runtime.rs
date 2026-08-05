@@ -12,8 +12,9 @@ use rlean_brokerages::{
 use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
     CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
-    MassiveHistoricalDataProvider, TradierEnvironment as TradierDataEnvironment,
-    TradierLiveDataProvider, TradierMarketDataConfig, VerglasHistoricalDataStore,
+    MassiveHistoricalDataProvider, MassiveLiveConfig, MassiveLiveDataProvider,
+    TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider, TradierMarketDataConfig,
+    VerglasHistoricalDataStore,
 };
 use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
@@ -78,6 +79,13 @@ pub(crate) fn live_data_provider(args: &RunArgs) -> Result<Arc<dyn LiveDataProvi
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
     match name {
+        "massive" => {
+            let integration = config::IntegrationConfigs::load()?.get_integration("massive");
+            let api_key = required_string(&integration, "api_key", "massive")?;
+            Ok(Arc::new(MassiveLiveDataProvider::new(
+                MassiveLiveConfig::new(api_key),
+            )?))
+        }
         "tradier" => {
             let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
             let token = required_string(&integration, "access_token", "tradier")?;

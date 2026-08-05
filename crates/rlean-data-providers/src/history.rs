@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use rlean_core::DateTime;
+use rlean_core::{DateTime, Symbol};
 use rlean_data::SubscriptionDataConfig;
-use rlean_data_tables::{QuoteBar, TradeBar};
+use rlean_data_tables::{
+    FactorFileEntry, FundamentalUniverseRow, FutureUniverseRow, MapFileEntry, OptionUniverseRow,
+    QuoteBar, Tick, TradeBar,
+};
 
 /// A half-open UTC range `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,10 @@ impl HistoryRequest {
 pub enum HistoricalData {
     TradeBars(Vec<TradeBar>),
     QuoteBars(Vec<QuoteBar>),
+    Ticks(Vec<Tick>),
+    OptionUniverse(Vec<OptionUniverseRow>),
+    FutureUniverse(Vec<FutureUniverseRow>),
+    FundamentalUniverse(Vec<FundamentalUniverseRow>),
 }
 
 impl HistoricalData {
@@ -62,6 +69,10 @@ impl HistoricalData {
         match self {
             Self::TradeBars(rows) => rows.is_empty(),
             Self::QuoteBars(rows) => rows.is_empty(),
+            Self::Ticks(rows) => rows.is_empty(),
+            Self::OptionUniverse(rows) => rows.is_empty(),
+            Self::FutureUniverse(rows) => rows.is_empty(),
+            Self::FundamentalUniverse(rows) => rows.is_empty(),
         }
     }
 
@@ -83,6 +94,40 @@ impl HistoricalData {
                         && left.venue == right.venue
                         && left.time == right.time
                         && left.end_time == right.end_time
+                });
+            }
+            Self::Ticks(rows) => {
+                rows.sort_by_key(|row| row.time);
+                rows.dedup_by(|left, right| {
+                    left.symbol == right.symbol
+                        && left.venue == right.venue
+                        && left.time == right.time
+                        && left.tick_type == right.tick_type
+                        && left.exchange == right.exchange
+                        && left.value == right.value
+                        && left.quantity == right.quantity
+                });
+            }
+            Self::OptionUniverse(rows) => {
+                rows.sort_by(|left, right| {
+                    (left.date, &left.symbol_sid).cmp(&(right.date, &right.symbol_sid))
+                });
+                rows.dedup_by(|left, right| {
+                    left.date == right.date && left.symbol_sid == right.symbol_sid
+                });
+            }
+            Self::FutureUniverse(rows) => {
+                rows.sort_by(|left, right| {
+                    (left.date, &left.symbol_sid).cmp(&(right.date, &right.symbol_sid))
+                });
+                rows.dedup_by(|left, right| {
+                    left.date == right.date && left.symbol_sid == right.symbol_sid
+                });
+            }
+            Self::FundamentalUniverse(rows) => {
+                rows.sort_by_key(|row| (row.end_time, row.symbol_sid));
+                rows.dedup_by(|left, right| {
+                    left.end_time == right.end_time && left.symbol_sid == right.symbol_sid
                 });
             }
         }
@@ -134,6 +179,15 @@ pub trait HistoricalDataProvider: Send + Sync {
     fn name(&self) -> &str;
     fn supports(&self, request: &HistoryRequest) -> bool;
     async fn get_history(&self, request: &HistoryRequest) -> Result<HistoricalData>;
+    /// LEAN `IFactorFileProvider` boundary. `None` means unsupported; an empty
+    /// vector is a successful provider response.
+    async fn get_factor_file(&self, _symbol: &Symbol) -> Result<Option<Vec<FactorFileEntry>>> {
+        Ok(None)
+    }
+    /// LEAN `IMapFileProvider` boundary.
+    async fn get_map_file(&self, _symbol: &Symbol) -> Result<Option<Vec<MapFileEntry>>> {
+        Ok(None)
+    }
 }
 
 /// Verglas implements this boundary. The provider coordinator depends only on
@@ -149,6 +203,28 @@ pub trait HistoricalDataStore: Send + Sync {
         data: &HistoricalData,
     ) -> Result<()>;
     async fn mark_covered(&self, request: &HistoryRequest, provider: &str) -> Result<()>;
+    async fn read_factor_file(&self, _symbol: &Symbol) -> Result<Vec<FactorFileEntry>> {
+        Ok(Vec::new())
+    }
+    async fn append_factor_file(
+        &self,
+        _symbol: &Symbol,
+        _provider: &str,
+        _rows: &[FactorFileEntry],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn read_map_file(&self, _symbol: &Symbol) -> Result<Vec<MapFileEntry>> {
+        Ok(Vec::new())
+    }
+    async fn append_map_file(
+        &self,
+        _symbol: &Symbol,
+        _provider: &str,
+        _rows: &[MapFileEntry],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// LEAN-style cache/provider composition: read persisted data first, request
@@ -209,6 +285,42 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
         let mut data = self.store.read(request).await?;
         data.sort_and_deduplicate();
         Ok(data)
+    }
+
+    async fn get_factor_file(&self, symbol: &Symbol) -> Result<Option<Vec<FactorFileEntry>>> {
+        let cached = self.store.read_factor_file(symbol).await?;
+        if !cached.is_empty() {
+            return Ok(Some(cached));
+        }
+        for provider in &self.providers {
+            if let Some(rows) = provider.get_factor_file(symbol).await? {
+                if !rows.is_empty() {
+                    self.store
+                        .append_factor_file(symbol, provider.name(), &rows)
+                        .await?;
+                }
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_map_file(&self, symbol: &Symbol) -> Result<Option<Vec<MapFileEntry>>> {
+        let cached = self.store.read_map_file(symbol).await?;
+        if !cached.is_empty() {
+            return Ok(Some(cached));
+        }
+        for provider in &self.providers {
+            if let Some(rows) = provider.get_map_file(symbol).await? {
+                if !rows.is_empty() {
+                    self.store
+                        .append_map_file(symbol, provider.name(), &rows)
+                        .await?;
+                }
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
     }
 }
 

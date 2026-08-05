@@ -12,7 +12,6 @@ pub mod history_service;
 pub mod history_subscription;
 pub mod live;
 pub mod normalization;
-#[allow(dead_code)]
 mod option_universe;
 pub mod options_service;
 pub mod orders;

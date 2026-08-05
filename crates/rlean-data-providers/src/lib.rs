@@ -8,6 +8,7 @@
 mod history;
 mod live;
 mod massive;
+mod massive_live;
 mod tradier;
 mod verglas_store;
 
@@ -17,5 +18,6 @@ pub use history::{
 };
 pub use live::{LiveDataEvent, LiveDataProvider, LiveSubscription};
 pub use massive::{MassiveConfig, MassiveHistoricalDataProvider};
+pub use massive_live::{MassiveLiveConfig, MassiveLiveDataProvider};
 pub use tradier::{TradierEnvironment, TradierLiveDataProvider, TradierMarketDataConfig};
 pub use verglas_store::VerglasHistoricalDataStore;
