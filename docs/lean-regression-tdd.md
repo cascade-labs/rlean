@@ -28,7 +28,7 @@ Tests must use public strategy APIs only:
 - Rust cases implement `IAlgorithm` and use types exported by `rlean-sdk`.
 - Python cases subclass `QCAlgorithm` and import from `AlgorithmImports`.
 - Neither case may reach into `rlean-engine`, construct slices directly, mutate
-  the portfolio behind the algorithm, or bypass the sidecar client.
+  the portfolio behind the algorithm, or bypass the provider interface.
 
 When LEAN ships a Python version of a regression algorithm, use that source
 unchanged except for a preserved license header and any packaging needed to
@@ -79,7 +79,7 @@ tests/lean-regressions/
     regression-result.schema.json
     regression-trace.schema.json
 
-crates/rlean-data-sidecar-test-support/
+crates/rlean-data-provider-test-support/
   src/
     server.rs
     scenario.rs
@@ -140,43 +140,25 @@ gap = "missing_add_future"
 issue = 123
 ```
 
-## Mocked sidecar
+## Mocked providers
 
-All regression data enters rlean through a real `DataSidecarClient` connected to
-an in-process mocked Arrow Flight service. The mock replaces vendors and
-persistence, not the client or protocol. Tests therefore exercise the same
-session, subscription, query, decoding, chunking, and live-push code used by the
+Regression fixtures implement the production `HistoricalDataProvider`,
+`LiveDataProvider`, `HistoricalDataStore`, and `Brokerage` interfaces. The
+fixtures replace vendors and persistence while exercising the same request,
+cache coverage, subscription, synchronization, and brokerage paths used by the
 engine.
 
-The current repository tests protocol serialization but does not provide this
-service. Implement it once in `rlean-data-sidecar-test-support` and reuse it
-across every section.
-
-### Protocol behavior
-
-The mock implements Flight `do_exchange` and the production control messages:
-
-- `Initialize` -> `Initialized`.
-- `AddSubscription` -> validate the exact `SubscriptionSpec`, then
-  `SubscriptionAdded`.
-- `BacktestQuery` -> emit zero or more `DataBatch` messages followed by
-  `BacktestQueryComplete`.
-- `RemoveSubscription` -> `SubscriptionRemoved`.
-- `OpenLiveDataFeed` -> `LiveDataFeedOpened`, then scripted unsolicited batches.
-- `OpenBrokerage` -> `BrokerageOpened`, snapshots, command results, order
-  updates, and connection-state events.
-- `GetManifest` -> a deterministic fixture manifest.
-
-Every unexpected request fails the test with a structural diff. This makes
-subscription intent, query boundaries, resolution, tick type, normalization,
-venue, and custom query predicates independently testable.
+Implement reusable recording providers in `rlean-data-provider-test-support`.
+Every unexpected request fails with a structural diff so subscription intent,
+query boundaries, resolution, tick type, normalization, venue, and custom query
+predicates remain independently testable.
 
 ### Fixture model
 
 A scenario contains:
 
 ```rust,ignore
-pub struct SidecarScenario {
+pub struct ProviderScenario {
     pub expected_subscriptions: Vec<ExpectedSubscription>,
     pub backtest_batches: Vec<ScheduledBatch>,
     pub live_batches: Vec<ScheduledBatch>,
@@ -287,7 +269,7 @@ logging, controlled quit/status, and initialization errors.
 named arguments, overload resolution, enums, `get_parameter`, and lifecycle
 method discovery.
 
-**Mock sidecar:** Validate session initialization and that no subscriptions or
+**Mock providers:** Validate session initialization and that no subscriptions or
 queries occur before the strategy requests them. Provide a minimal SPY stream
 for the basic template.
 
@@ -307,7 +289,7 @@ end-of-day per symbol, end-of-time-step, and deterministic exception behavior.
 **Python SDK:** Optional callback discovery, correct callback argument types,
 snake_case/PascalCase behavior, and exception propagation.
 
-**Mock sidecar:** Session-boundary bars across holidays, early closes, daylight
+**Mock providers:** Session-boundary bars across holidays, early closes, daylight
 saving changes, extended hours, and empty leading windows.
 
 **Assertions:** Exact callback ordering and timestamps, no duplicate EOD,
@@ -328,7 +310,7 @@ initializers, seeding, subscription settings, and last-known data.
 security return objects, `securities`, `active_securities`, and collection
 semantics.
 
-**Mock sidecar:** Assert exact `SubscriptionSpec` creation/removal and return
+**Mock providers:** Assert exact `SubscriptionSpec` creation/removal and return
 seed/history rows for newly created securities.
 
 **Assertions:** Symbol identity survives the wire, duplicate adds are
@@ -348,7 +330,7 @@ fill-forward metadata, and raw/adjusted values.
 **Python SDK:** Dictionary iteration/indexing, `Slice.get`, typed collections,
 bar properties, quote bid/ask nesting, and pandas conversions where applicable.
 
-**Mock sidecar:** Trade, quote, tick, and open-interest batches with missing
+**Mock providers:** Trade, quote, tick, and open-interest batches with missing
 symbols, simultaneous data types, empty ranges, and multiple venues.
 
 **Assertions:** Frontier coalescing, `has_data`, collection contents, iteration
@@ -369,7 +351,7 @@ history errors.
 **Python SDK:** LEAN overloads, typed enumerable and pandas return shapes,
 multi-symbol history, `is_warming_up`, and automatic/manual indicator warm-up.
 
-**Mock sidecar:** Validate bounded query ranges and serve trade, quote, tick,
+**Mock providers:** Validate bounded query ranges and serve trade, quote, tick,
 custom, universe, option, and future history from deterministic fixtures.
 
 **Assertions:** Exact requests, history point counts, ordering, data shape,
@@ -388,7 +370,7 @@ factor/map resolution; holding and open-order adjustment.
 **Python SDK:** Typed slice collections and callback dictionaries with LEAN
 property names and symbol behavior.
 
-**Mock sidecar:** Add canonical auxiliary contracts and emit factor/map rows and
+**Mock providers:** Add canonical auxiliary contracts and emit factor/map rows and
 events at exact availability frontiers.
 
 **Assertions:** Adjusted data, raw holdings, cash distributions, order changes,
@@ -408,7 +390,7 @@ warm-up, reset, composition, and all consolidator families.
 **Python SDK:** Indicator constructors/factories, `current`, readiness, update
 events, consolidator callbacks, selector overloads, and deregistration.
 
-**Mock sidecar:** Fine-grained bars/ticks across calendar boundaries, sparse
+**Mock providers:** Fine-grained bars/ticks across calendar boundaries, sparse
 updates, multiple tick types, and out-of-session data.
 
 **Assertions:** Sample counts, readiness frontier, exact indicator values,
@@ -430,7 +412,7 @@ groups.
 arguments, ticket properties and methods, update fields, response errors, and
 order-event views.
 
-**Mock sidecar:** Backtest quote/trade paths for local fills plus brokerage
+**Mock providers:** Backtest quote/trade paths for local fills plus brokerage
 scripts for accepted/rejected/live orders, partial fills, fees, and retries.
 
 **Assertions:** Submission fields, fill side and price, event sequence, status,
@@ -451,7 +433,7 @@ providers, and borrow costs.
 **Python SDK:** Portfolio/cash collections, holdings access, account currency,
 margin APIs, security model setters, and margin/shortability callbacks.
 
-**Mock sidecar:** Multiple currency pairs, delayed settlement events, borrow
+**Mock providers:** Multiple currency pairs, delayed settlement events, borrow
 availability/fees, margin-rate changes, and brokerage account snapshots.
 
 **Assertions:** Cash by currency, conversion graph, settled/unsettled balances,
@@ -473,7 +455,7 @@ membership diffs.
 **Python SDK:** `add_universe` overloads and return handle, selector row views,
 `UniverseSettings`, `SecurityChanges`, and framework selection models.
 
-**Mock sidecar:** Whole cross-section batches with availability times, filings,
+**Mock providers:** Whole cross-section batches with availability times, filings,
 ETF compositions, empty selections, unchanged selections, and shuffled Arrow
 batch boundaries.
 
@@ -496,7 +478,7 @@ callbacks.
 **Python SDK:** Subclass adapters and built-in models with complete
 `Update`/`CreateTargets`/`ManageRisk`/`Execute`/`OnSecuritiesChanged` contracts.
 
-**Mock sidecar:** Multi-symbol price streams, universe changes, gaps, and
+**Mock providers:** Multi-symbol price streams, universe changes, gaps, and
 volatility regimes that drive deterministic insights and rebalances.
 
 **Assertions:** Trace insights -> targets -> risk adjustments -> orders,
@@ -514,7 +496,7 @@ fees, settlement, corporate actions, and sessions.
 **Python SDK:** `add_equity` overloads, typed `Equity`/`Security` view, market
 hours, normalization setters, and session properties.
 
-**Mock sidecar:** Raw trade/quote/tick data, factors/maps, sessions, and extended
+**Mock providers:** Raw trade/quote/tick data, factors/maps, sessions, and extended
 hours.
 
 **Assertions:** All shared engine assertions plus equity-specific normalization,
@@ -536,7 +518,7 @@ and combo orders.
 **Python SDK:** `add_option`, `add_option_contract`, filters, iterable chains,
 contract properties, open/close helpers, pricing methods, and option strategies.
 
-**Mock sidecar:** Underlying bars, full option-universe snapshots, contract
+**Mock providers:** Underlying bars, full option-universe snapshots, contract
 quotes, OI, IV, Greeks, multipliers, splits, and expiry boundaries.
 
 **Assertions:** Contract set, filters before subscription, spread-side fills,
@@ -557,7 +539,7 @@ extended hours.
 **Python SDK:** `add_future`, `add_future_contract`, filter and chain APIs,
 future history, mapped symbol properties, and symbol-change callbacks.
 
-**Mock sidecar:** Future-universe snapshots, contract bars/OI, mapping rows,
+**Mock providers:** Future-universe snapshots, contract bars/OI, mapping rows,
 roll dates, back months, and exchange calendars.
 
 **Assertions:** Chain contents, mapped contract, prices, rollover events,
@@ -577,7 +559,7 @@ margin groups, exercise/assignment, expiry, and liquidation timing.
 **Python SDK:** Future-option adders, chain views, contracts, filters, and event
 callbacks matching equity-option conventions.
 
-**Mock sidecar:** Coordinated underlying future and option-universe streams,
+**Mock providers:** Coordinated underlying future and option-universe streams,
 contract quotes, rolls, expiries, and settlement prices.
 
 **Assertions:** Underlying identity, chain membership, prices, margin offsets,
@@ -597,7 +579,7 @@ price models, multipliers, exercise, and margin.
 **Python SDK:** Typed adders and views, chains, filters, Greeks, and settlement
 callbacks.
 
-**Mock sidecar:** Index bars, index-option universes and quotes, weekly/standard
+**Mock providers:** Index bars, index-option universes and quotes, weekly/standard
 expiries, and official settlement values.
 
 **Assertions:** Correct target option, cash versus physical settlement, expiry
@@ -615,7 +597,7 @@ conversion, swap/financing, fills, and settlement.
 **Python SDK:** `add_forex`, `add_cfd`, typed security views, cash books,
 conversion APIs, and brokerage-model behavior.
 
-**Mock sidecar:** Bid/ask bars and ticks, direct/triangulated conversion pairs,
+**Mock providers:** Bid/ask bars and ticks, direct/triangulated conversion pairs,
 rollover/swap rates, and market calendars.
 
 **Assertions:** Bid/ask fills, pip value, conversion, TPV, margin, financing, and
@@ -634,7 +616,7 @@ funding/margin interest, leverage, 24/7 calendars, and cash accounting.
 **Python SDK:** `add_crypto`, `add_crypto_future`, typed views, brokerage models,
 margin-interest access, and portfolio funding totals.
 
-**Mock sidecar:** Spot/perpetual trade and quote data, margin-interest batches,
+**Mock providers:** Spot/perpetual trade and quote data, margin-interest batches,
 funding schedules, stablecoin conversion, and brokerage fee updates.
 
 **Assertions:** Fractional sizing, maker/taker fee, funding cash flow and cadence,
@@ -655,7 +637,7 @@ universe usage, and strategy-scoped object storage.
 **Python SDK:** `add_data`, dynamic fields, typed/custom history, custom universe
 selectors, and ObjectStore CRUD/list/persistence semantics.
 
-**Mock sidecar:** Canonical custom points with arbitrary fields and explicit
+**Mock providers:** Canonical custom points with arbitrary fields and explicit
 `EndTime`, multiple files/feeds, mappings, empty values, and replayed batches.
 
 **Assertions:** No look-ahead, field types, symbol association, history shape,
@@ -673,7 +655,7 @@ indicator, fundamental, option, and future contracts as algorithms.
 **Python SDK:** Full `QuantBook` surface, pandas return shapes, option/future
 history objects, fundamentals, indicator history, and portfolio statistics.
 
-**Mock sidecar:** The same fixtures used by algorithm regressions, proving that
+**Mock providers:** The same fixtures used by algorithm regressions, proving that
 research does not have a second data path.
 
 **Assertions:** Query requests, returned frames/collections, types, index/column
@@ -692,7 +674,7 @@ trade builder, capacity, and final statistics.
 **Python SDK:** `plot`, chart creation, benchmark setters, runtime statistics,
 and result-facing properties with LEAN names.
 
-**Mock sidecar:** Deterministic strategy and benchmark streams, volumes for
+**Mock providers:** Deterministic strategy and benchmark streams, volumes for
 capacity, risk-free rates, and controlled gaps.
 
 **Assertions:** Chart samples, benchmark alignment, trades, daily equity,
@@ -711,7 +693,7 @@ unmanaged holdings/orders, pause/resume, checkpoint restore, and disconnects.
 **Python SDK:** Brokerage callbacks, live-mode properties, order tickets, and
 restored insight/security/portfolio state.
 
-**Mock sidecar:** Scripted live feed and brokerage with snapshots, orders,
+**Mock providers:** Scripted live feed and brokerage with snapshots, orders,
 partial fills, cumulative fees, external activity, reconnects, and restarts.
 
 **Assertions:** Idempotent reconciliation, exact callback order, no duplicated
@@ -726,7 +708,7 @@ Every stable regression section should opt into them.
 **Rust SDK and Python SDK:** No extra APIs. Both must remain deterministic under
 equivalent inputs.
 
-**Mock sidecar variants:** Batch-size changes, empty batches, independent stream
+**Mock provider variants:** Batch-size changes, empty batches, independent stream
 reordering, duplicate live batches, delayed query completion, disconnects,
 replayed brokerage updates, and checkpoint boundaries.
 
@@ -746,7 +728,7 @@ Each case records its highest passing stage:
 6. `portfolio`: cash, holdings, fees, funding, and equity match.
 7. `statistics`: formatted LEAN statistics and order hash match.
 8. `trace`: high-fidelity traces match.
-9. `metamorphic`: all enabled sidecar/fault variants match.
+9. `metamorphic`: all enabled provider/fault variants match.
 
 CI fails if a case falls below its recorded stage. Implementing a gap advances
 the stage and commits the new baseline; it never weakens an assertion to make a
@@ -781,7 +763,7 @@ Nightly:
 
 A regression section is implemented only when:
 
-- Its shared engine behavior is covered by canonical mocked-sidecar fixtures.
+- Its shared engine behavior is covered by canonical mocked-provider fixtures.
 - At least one Rust SDK strategy and one Python SDK strategy exercise each
   required public contract.
 - Each SDK output independently matches the pinned LEAN oracle.

@@ -32,8 +32,10 @@ pub async fn run_backtest<B>(bridge: B, config: BacktestRunConfig) -> Result<Bac
 where
     B: AlgorithmBridge,
 {
-    let runtime_context =
-        crate::AlgorithmRuntimeContext::new(config.data_sidecar.clone(), config.parameters.clone());
+    let runtime_context = crate::AlgorithmRuntimeContext::new(
+        config.historical_provider.clone(),
+        config.parameters.clone(),
+    );
     run_backtest_with_runtime(bridge, config, runtime_context).await
 }
 
@@ -60,13 +62,8 @@ where
         engine_time.date_utc(),
     )?;
     let starting_cash = algorithm_manager.starting_cash();
-    let risk_free_interest_rate_model: Arc<dyn RiskFreeInterestRateModel> = Arc::new(
-        crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
-            &config.data_sidecar,
-            end,
-        )
-        .await?,
-    );
+    let risk_free_interest_rate_model: Arc<dyn RiskFreeInterestRateModel> =
+        Arc::new(crate::risk_free_interest_rate::load_risk_free_interest_rate_model(end)?);
     if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
         algorithm_state
             .lock()
@@ -104,13 +101,9 @@ where
         last_version: None,
     };
 
-    let feed_context = DataFeedContext::new(config.data_sidecar.clone())
+    let feed_context = DataFeedContext::new(config.historical_provider.clone())
         .with_options(config.data_feed_options)
         .with_market_hours_database(market_hours_database.clone());
-    let feed_context = match &config.historical_provider {
-        Some(provider) => feed_context.with_historical_provider(provider.clone()),
-        None => feed_context,
-    };
 
     let normal_start = rlean_core::NanosecondTimestamp::from(
         start.and_hms_opt(0, 0, 0).expect("valid start of day"),
@@ -780,7 +773,7 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
 /// The benchmark is engine-owned and therefore absent from `bridge.subscriptions()`
 /// when the strategy has not separately subscribed to it. It must be re-added on
 /// every sync just like option-chain feeds; otherwise the first sync treats it as
-/// removed and tears down the sidecar stream.
+/// removed and tears down the provider stream.
 fn desired_backtest_subscriptions<B: AlgorithmBridge>(
     bridge: &B,
     benchmark_subscription: Option<&SubscriptionDataConfig>,

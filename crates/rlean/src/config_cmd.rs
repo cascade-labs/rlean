@@ -1,13 +1,11 @@
 use crate::config::{GlobalConfig, IntegrationConfigs, WorkspaceConfig};
-/// `rlean config` — get/set/list workspace and sidecar integration configuration
+/// `rlean config` — get/set/list workspace and provider integration configuration
 ///
 /// Integration credentials are stored in ~/.rlean/integration-configs.json.
 /// Workspace settings are stored in ~/.rlean/config and rlean.json.
 ///
 /// Known keys:
 ///   default-language            python | csharp
-///   data_sidecar                Arrow Flight sidecar endpoint (e.g. grpc://127.0.0.1:7410)
-///   data_sidecar_token          Optional sidecar authentication token
 ///   verglas_endpoint            Verglas SDK gateway (e.g. http://127.0.0.1:8334)
 ///   verglas_token               Verglas bearer token for all discovered services
 ///   artifact_store              Run artifact relay mode: local | s3 | mirror
@@ -16,7 +14,7 @@ use crate::config::{GlobalConfig, IntegrationConfigs, WorkspaceConfig};
 ///   artifact_s3_region          Artifact region
 ///   artifact_s3_access_key      Artifact access key
 ///   artifact_s3_secret_key      Artifact secret key
-///   <integration>.<key>         Sidecar integration config (e.g. thetadata.api_key)
+///   <integration>.<key>         Provider integration config (e.g. thetadata.api_key)
 use anyhow::{bail, Result};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
@@ -31,7 +29,7 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Set a configuration value
     Set {
-        /// Config key (e.g. default-language, data_sidecar, tradier.access_token)
+        /// Config key (e.g. default-language, verglas_endpoint, tradier.access_token)
         key: String,
         /// Value to set
         value: String,
@@ -58,7 +56,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_set(key: &str, value: &str) -> Result<()> {
-    // Dotted keys configure a named sidecar integration.
+    // Dotted keys configure a named provider integration.
     if let Some((integration, subkey)) = key.split_once('.') {
         let mut configs = IntegrationConfigs::load()?;
         configs.set_key(
@@ -87,16 +85,6 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
                 ws_cfg.save(&ws)?;
             }
             println!("Set default-language = {value}");
-        }
-        "data_sidecar" | "data_sidecar_token" => {
-            let mut cfg = GlobalConfig::load()?;
-            set_sidecar_key(&mut cfg, key, value.to_string())?;
-            cfg.save()?;
-            if key == "data_sidecar_token" {
-                println!("Set {key} in ~/.rlean/config");
-            } else {
-                println!("Set {key} = {value} in ~/.rlean/config");
-            }
         }
         "verglas_endpoint" | "verglas_token" => {
             let mut cfg = GlobalConfig::load()?;
@@ -152,14 +140,6 @@ fn cmd_get(key: &str) -> Result<()> {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.default_language);
         }
-        "data_sidecar" | "data_sidecar_token" => {
-            let cfg = GlobalConfig::load()?;
-            match get_sidecar_key(&cfg, key)? {
-                Some(value) if key == "data_sidecar_token" => println!("{}", mask(value)),
-                Some(value) => println!("{value}"),
-                None => println!("(not set)"),
-            }
-        }
         "verglas_endpoint" | "verglas_token" => {
             let cfg = GlobalConfig::load()?;
             match get_verglas_key(&cfg, key)? {
@@ -196,12 +176,6 @@ fn cmd_list() -> Result<()> {
     println!("{}", "-".repeat(60));
 
     println!("{:<30} {}", "default-language", global.default_language);
-    if let Some(endpoint) = global.data_sidecar.as_deref() {
-        println!("{:<30} {}", "data_sidecar", endpoint);
-    }
-    if let Some(token) = global.data_sidecar_token.as_deref() {
-        println!("{:<30} {}", "data_sidecar_token", mask(token));
-    }
     if let Some(endpoint) = global.verglas_endpoint.as_deref() {
         println!("{:<30} {}", "verglas_endpoint", endpoint);
     }
@@ -233,7 +207,7 @@ fn cmd_list() -> Result<()> {
 
     if !integration_names.is_empty() {
         println!();
-        println!("Sidecar integration configs (~/.rlean/integration-configs.json):");
+        println!("Provider integration configs (~/.rlean/integration-configs.json):");
         println!("{}", "-".repeat(60));
         for integration in integration_names {
             let cfg = integration_cfgs.get_integration(integration);
@@ -266,11 +240,10 @@ fn mask(s: &str) -> String {
 
 fn unknown_key_message(key: &str) -> String {
     format!(
-        "Unknown key '{key}'. Known keys: default-language, data_sidecar, data_sidecar_token, \
-         verglas_endpoint, verglas_token, \
+        "Unknown key '{key}'. Known keys: default-language, verglas_endpoint, verglas_token, \
          artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
          artifact_s3_access_key, artifact_s3_secret_key. \
-         Use <integration>.<key> for sidecar integration config (e.g. thetadata.api_key)."
+         Use <integration>.<key> for provider integration config (e.g. massive.api_key)."
     )
 }
 
@@ -288,23 +261,6 @@ fn get_verglas_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a st
         "verglas_endpoint" => Ok(cfg.verglas_endpoint.as_deref()),
         "verglas_token" => Ok(cfg.verglas_token.as_deref()),
         _ => bail!("unknown Verglas config key '{key}'"),
-    }
-}
-
-fn set_sidecar_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
-    match key {
-        "data_sidecar" => cfg.data_sidecar = Some(value),
-        "data_sidecar_token" => cfg.data_sidecar_token = Some(value),
-        _ => bail!("unknown sidecar config key '{key}'"),
-    }
-    Ok(())
-}
-
-fn get_sidecar_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
-    match key {
-        "data_sidecar" => Ok(cfg.data_sidecar.as_deref()),
-        "data_sidecar_token" => Ok(cfg.data_sidecar_token.as_deref()),
-        _ => bail!("unknown sidecar config key '{key}'"),
     }
 }
 

@@ -6,7 +6,7 @@ title: Live Trading
 # Live Trading
 
 rlean runs the same engine used for backtests in live mode against a real (or
-paper) brokerage and a persistent Arrow Flight data sidecar.
+paper) brokerage and a native live-data provider.
 
 ## Running live locally
 
@@ -24,7 +24,7 @@ and restores deployments whose desired state is running.
 <strategy>` command snapshots the strategy, records the deployment, and submits
 the hidden foreground engine command to the daemon over its local Unix control
 socket. The daemon owns that long-running child, reboot recovery, pause/resume,
-and sidecar-failure restarts. Finite commands such as backtests, data inspection,
+and integration-failure restarts. Finite commands such as backtests, data inspection,
 configuration, research setup, and cloud SSH probes run directly as CLI
 processes and exit; they are not jobs inside `rleand`.
 
@@ -39,35 +39,28 @@ Pass `--system` only for a machine-wide launchd/systemd service; the default is
 the current user's service. Both `rlean` and `rleand` must be installed beside
 one another.
 
-Live trading uses independent sidecar connections for market data and live
+Live trading uses independent native connections for market data and live
 execution. Strategy SDK calls such as `add_equity` create the subscriptions;
 the run command selects only the feed and execution integrations:
 
 ```sh
 rlean live my_strategy/main.py \
-  --data-sidecar grpc://127.0.0.1:7410 \
   --live-data-feed tradier \
   --brokerage robinhood
 ```
 
-- `--live-data-feed` selects and authenticates the sidecar market-data feed. It
+- `--live-data-feed` selects and authenticates the native market-data provider. It
   does not declare symbols, resolutions, or data types.
-- `--brokerage` independently selects sidecar order execution. Use
+- `--brokerage` independently selects native order execution. Use
   `--brokerage paper` to retain local paper fills.
-- `--data-sidecar` selects the local or remote Flight service. Use
-  `--data-sidecar-token` when the service requires bearer authentication.
-
 Integration credentials come from `~/.rlean/integration-configs.json`. For
-example, `rlean config set tradier.access_token ...` updates the opaque Tradier
-credential bundle. rlean does not interpret integration-specific fields; it
-passes the selected bundle to the sidecar connection.
+example, `rlean config set tradier.access_token ...` updates the Tradier
+credential bundle used by the native adapter.
 
-Live batches are unsolicited. After a subscription is acknowledged, the
-sidecar pushes matching canonical Arrow batches over the persistent exchange;
-rlean routes them by subscription id into `on_data`. There is no live polling
-fallback in the engine.
+Live events are unsolicited. After a subscription is acknowledged, the provider
+pushes matching canonical values into the synchronizer and `on_data`.
 
-If the Flight sidecar is restarted, the affected strategy process exits and
+If a provider or brokerage connection fails terminally, the strategy exits and
 `rleand` recreates it with bounded exponential backoff. The existing deployment
 directory is reused, so framework insights and strategy subscriptions are
 restored. A restart is refused when account state exists but its insight
@@ -104,8 +97,8 @@ the requested release, verifies its checksums, and atomically replaces both
 `~/.local/bin/rlean` and `~/.local/bin/rleand`. It regenerates
 `~/.rlean/config`, copies `~/.rlean/integration-configs.json` when present, sets
 both files to mode `0600`, and installs/starts the node's rleand systemd user
-service. The remote host does not need GitHub credentials. Data and brokerage
-integrations remain in the separately deployed sidecar.
+service. The remote host does not need GitHub credentials. Native data and
+brokerage integrations run inside the strategy process.
 
 ### Deploy a strategy
 
@@ -115,8 +108,8 @@ rlean cloud deploy <name> <strategy-dir> \
 ```
 
 `deploy` snapshots a local strategy directory and submits it to the node's
-`rleand`. The node's rlean configuration supplies its Flight sidecar endpoint
-and optional token.
+`rleand`. The node's machine configuration supplies provider credentials and
+the Verglas gateway connection.
 
 ### Monitor deployments
 

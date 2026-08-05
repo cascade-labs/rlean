@@ -1,7 +1,7 @@
 # Canonical data-table contract
 
 `rlean-data-tables` is the only row and schema contract shared by rlean and data
-sidecars. Runtime types are not separately translated
+providers and persistence implementations. Runtime types are not separately translated
 into provider-specific records.
 
 The contract currently includes:
@@ -44,5 +44,5 @@ Custom data retains its original named payload in `fields_json`, with stable
 `symbol_sid`/`symbol_value`. `end_time_ns` is the availability frontier and the
 point must not reach a strategy before it.
 
-Factor and map rows use the same sidecar subscription/query path as market
+Factor and map rows use the same cache-first provider path as market
 data. They are not files read directly by a strategy process.

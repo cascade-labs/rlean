@@ -1,21 +1,19 @@
 ---
 sidebar_position: 4
-title: Data Contract and Sidecar
+title: Data Providers and Contract
 ---
 
-# Data Contract and Sidecar
+# Data Providers and Contract
 
-Strategy processes do not load an in-process data provider or storage backend.
-They receive canonical Arrow record batches through the persistent Flight
-session described in [Sidecar Data Plane](./sidecar-data-plane.md).
-
-The sidecar owns provider and persistence decisions. Those decisions do not
-change the contract seen by rlean.
+rlean uses separate LEAN-style interfaces for historical providers and live
+providers. Historical reads are cache-first through the Verglas Rust SDK;
+uncovered ranges are fetched from the selected provider and persisted as
+canonical Arrow batches before the engine consumes them.
 
 ## Canonical tables
 
-`rlean-data-tables` is the authoritative contract shared by the engine and
-sidecars. It currently defines:
+`rlean-data-tables` is the authoritative contract shared by the engine,
+providers, and Verglas persistence. It currently defines:
 
 | Table | Partition specification |
 |---|---|
@@ -53,18 +51,3 @@ while existing prototype data is backfilled.
 Custom rows preserve provider-specific fields in `fields_json` and route by
 `provider`, `feed`, and `resolution`. `end_time_ns` is the availability
 frontier: a point must not be emitted to a strategy before that instant.
-
-## Sidecar discovery and queries
-
-rlean can inspect the sidecar-owned manifest and run bounded tooling queries
-without direct storage access:
-
-```sh
-rlean data manifest --json
-rlean data query custom_points SPY --provider unusual_whales \
-  --feed flow_alerts --resolution tick \
-  --start 2026-07-01 --end 2026-07-15 --json
-```
-
-The query uses the same temporary subscription and Arrow `DataBatch` exchange
-as a backtest. JSON output is an optional CLI rendering of those Arrow rows.

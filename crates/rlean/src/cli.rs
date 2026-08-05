@@ -36,10 +36,10 @@ pub(crate) enum Command {
     #[command(name = "create-project")]
     CreateProject(CreateProjectArgs),
 
-    /// Get, set, or list runtime and sidecar integration configuration
+    /// Get, set, or list runtime and provider integration configuration
     Config(ConfigArgs),
 
-    /// Inspect the canonical sidecar data contract
+    /// Inspect the canonical data contract
     Data(DataArgs),
 
     /// Run a backtest
@@ -74,33 +74,24 @@ pub(crate) enum Command {
 #[derive(clap::Args, Clone)]
 pub(crate) struct RuntimeArgs {
     // ── Data ─────────────────────────────────────────────────────────────────
-    /// Apache Arrow Flight data sidecar endpoint. Examples:
-    /// grpc://127.0.0.1:7410, grpc+tls://data.example.com:443.
-    #[arg(long, env = "RLEAN_DATA_SIDECAR")]
-    pub(crate) data_sidecar: Option<String>,
-
-    /// Optional bearer token sent to the data sidecar.
-    #[arg(long, env = "RLEAN_DATA_SIDECAR_TOKEN", hide_env_values = true)]
-    pub(crate) data_sidecar_token: Option<String>,
-
     /// Historical market-data provider. Provider responses are normalized to
     /// rlean's canonical tables and cached through Verglas before consumption.
     #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
     pub(crate) data_provider_historical: Option<String>,
 
-    /// Sidecar live market-data provider. Symbols and resolutions remain
+    /// Live market-data provider. Symbols and resolutions remain
     /// strategy SDK subscriptions; this selects the integration serving them.
     #[arg(long, env = "RLEAN_LIVE_DATA_FEED")]
     pub(crate) live_data_feed: Option<String>,
 
     /// Execution brokerage for live runs. Use "paper" for local simulated
-    /// fills, or a sidecar brokerage such as "robinhood" for live orders. This
+    /// fills, or a native brokerage such as "tradier" for live orders. This
     /// is independent from --live-data-feed.
     #[arg(long, env = "RLEAN_BROKERAGE")]
     pub(crate) brokerage: Option<String>,
 
     /// Brokerage account identifier for this live deployment. This is passed
-    /// to the selected sidecar brokerage when the connection is opened.
+    /// to the selected brokerage when the connection is opened.
     #[arg(long, env = "RLEAN_BROKERAGE_ACCOUNT")]
     pub(crate) brokerage_account: Option<String>,
 

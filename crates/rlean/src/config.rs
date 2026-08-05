@@ -30,23 +30,6 @@ pub struct GlobalConfig {
     #[serde(default = "default_language")]
     pub default_language: String,
 
-    /// Apache Arrow Flight endpoint used for all market and custom data.
-    #[serde(
-        default,
-        rename = "data_sidecar",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_sidecar: Option<String>,
-
-    /// Optional sidecar bearer token. Environment/CLI configuration is
-    /// preferred for deployed credentials.
-    #[serde(
-        default,
-        rename = "data_sidecar_token",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub data_sidecar_token: Option<String>,
-
     /// Verglas gateway used for canonical queries, writes, and catalog access.
     #[serde(
         default,
@@ -220,13 +203,13 @@ impl ProjectConfig {
     }
 }
 
-// ── Sidecar integration configs ──────────────────────────────────────────────
+// ── Provider integration configs ───────────────────────────────────────────────
 
 pub fn integration_configs_path() -> Result<PathBuf> {
     Ok(rlean_dir()?.join("integration-configs.json"))
 }
 
-/// Provider-specific credentials passed opaquely to sidecar integrations.
+/// Provider-specific credentials used by native integrations.
 ///
 /// The outer map key is the integration name (for example `"thetadata"`).
 /// rlean never interprets the inner map.

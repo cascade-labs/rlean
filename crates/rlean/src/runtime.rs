@@ -5,11 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use rlean_brokerages::{
+    Brokerage, TradierBrokerage, TradierBrokerageConfig,
+    TradierEnvironment as TradierBrokerageEnvironment,
+};
+use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
     CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
-    MassiveHistoricalDataProvider, VerglasHistoricalDataStore,
+    MassiveHistoricalDataProvider, TradierEnvironment as TradierDataEnvironment,
+    TradierLiveDataProvider, TradierMarketDataConfig, VerglasHistoricalDataStore,
 };
-use rlean_data_sidecar::{DataSidecarClient, DataSidecarConfig};
 use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
 use crate::cli::RunArgs;
@@ -27,44 +32,16 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     bar
 }
 
-pub(crate) async fn connect_data_sidecar(
-    args: &RunArgs,
-    global_config: &config::GlobalConfig,
-) -> Result<Option<Arc<DataSidecarClient>>> {
-    let Some(endpoint) = args
-        .data_sidecar
-        .clone()
-        .or_else(|| global_config.data_sidecar.clone())
-    else {
-        return Ok(None);
-    };
-    let token = args
-        .data_sidecar_token
-        .clone()
-        .or_else(|| global_config.data_sidecar_token.clone());
-    let client = DataSidecarClient::connect(DataSidecarConfig {
-        endpoint: endpoint.clone(),
-        token,
-        connect_timeout_ms: 10_000,
-    })
-    .await
-    .with_context(|| format!("failed to connect to data sidecar at {endpoint}"))?;
-    tracing::info!(%endpoint, "Connected to Arrow Flight data sidecar");
-    Ok(Some(Arc::new(client)))
-}
-
 pub(crate) async fn historical_data_provider(
     args: &RunArgs,
-    verglas: Option<VerglasClient>,
-) -> Result<Option<Arc<dyn HistoricalDataProvider>>> {
-    let Some(name) = args
+    verglas: VerglasClient,
+) -> Result<Arc<dyn HistoricalDataProvider>> {
+    let name = args
         .data_provider_historical
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-    else {
-        return Ok(None);
-    };
+        .ok_or_else(|| anyhow::anyhow!("a historical data provider is required"))?;
     let provider: Arc<dyn HistoricalDataProvider> = match name {
         "massive" => {
             let integration = config::IntegrationConfigs::load()?.get_integration("massive");
@@ -84,16 +61,92 @@ pub(crate) async fn historical_data_provider(
         }
         other => bail!("unsupported historical data provider '{other}'"),
     };
-    let client = verglas.ok_or_else(|| {
-        anyhow::anyhow!("historical data providers require a connected Verglas SDK client")
-    })?;
-    let store = Arc::new(VerglasHistoricalDataStore::new(client).await?);
+    let store = Arc::new(VerglasHistoricalDataStore::new(verglas).await?);
     let provider = CacheFirstHistoryProvider::new(store, vec![provider])?;
     tracing::info!(
         provider = name,
         "Configured cache-first historical data provider"
     );
-    Ok(Some(Arc::new(provider)))
+    Ok(Arc::new(provider))
+}
+
+pub(crate) fn live_data_provider(args: &RunArgs) -> Result<Arc<dyn LiveDataProvider>> {
+    let name = args
+        .live_data_feed
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
+    match name {
+        "tradier" => {
+            let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
+            let token = required_string(&integration, "access_token", "tradier")?;
+            let environment = match optional_string(&integration, "environment").as_deref() {
+                Some("paper") | Some("sandbox") => TradierDataEnvironment::Paper,
+                _ => TradierDataEnvironment::Live,
+            };
+            Ok(Arc::new(TradierLiveDataProvider::new(
+                TradierMarketDataConfig::new(token, environment),
+            )?))
+        }
+        other => bail!("unsupported live data provider '{other}'"),
+    }
+}
+
+pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Brokerage>>> {
+    let name = args
+        .brokerage
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --brokerage"))?;
+    if matches!(name, "paper" | "paperbrokerage") {
+        return Ok(None);
+    }
+    match name {
+        "tradier" | "tradierbrokerage" => {
+            let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
+            let token = required_string(&integration, "access_token", "tradier")?;
+            let account = args
+                .brokerage_account
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| optional_string(&integration, "account_number"))
+                .ok_or_else(|| anyhow::anyhow!("Tradier brokerage requires --brokerage-account"))?;
+            let environment = match optional_string(&integration, "environment").as_deref() {
+                Some("paper") | Some("sandbox") => TradierBrokerageEnvironment::Paper,
+                _ => TradierBrokerageEnvironment::Live,
+            };
+            Ok(Some(Box::new(TradierBrokerage::new(
+                TradierBrokerageConfig::new(token, account, environment),
+            )?)))
+        }
+        other => bail!("unsupported execution brokerage '{other}'"),
+    }
+}
+
+fn required_string(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    integration: &str,
+) -> Result<String> {
+    optional_string(values, key).ok_or_else(|| {
+        anyhow::anyhow!("{integration} requires integration config key {integration}.{key}")
+    })
+}
+
+fn optional_string(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    values
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Connects once to the configured Verglas gateway. The SDK discovers the
@@ -360,66 +413,9 @@ pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Serialize one integration's running rlean configuration as an opaque secret
-/// bundle. Only the sidecar adapter interprets provider-specific fields.
-pub(crate) fn integration_config_json(name: &str) -> Result<Vec<u8>> {
-    let configs = config::IntegrationConfigs::load()?;
-    let value = serde_json::Value::Object(configs.get_integration(name));
-    serde_json::to_vec(&value).context("failed to serialize sidecar integration configuration")
-}
-
-/// Serialize a brokerage's configured credentials together with the account
-/// selected for this deployment. Account selection belongs to the deployment,
-/// not the shared integration configuration.
-pub(crate) fn brokerage_config_json(name: &str, account: Option<&str>) -> Result<Vec<u8>> {
-    let configs = config::IntegrationConfigs::load()?;
-    let value = brokerage_config(configs.get_integration(name), account);
-    serde_json::to_vec(&serde_json::Value::Object(value))
-        .context("failed to serialize sidecar brokerage configuration")
-}
-
-fn brokerage_config(
-    mut value: serde_json::Map<String, serde_json::Value>,
-    account: Option<&str>,
-) -> serde_json::Map<String, serde_json::Value> {
-    if let Some(account) = account {
-        value.insert(
-            "account_number".to_string(),
-            serde_json::Value::String(account.to_string()),
-        );
-    }
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn brokerage_account_overrides_shared_integration_default() {
-        let mut config = serde_json::Map::new();
-        config.insert(
-            "account_number".to_string(),
-            serde_json::Value::String("old-account".to_string()),
-        );
-        config.insert(
-            "username".to_string(),
-            serde_json::Value::String("configured-user".to_string()),
-        );
-
-        let config = brokerage_config(config, Some("deployment-account"));
-
-        assert_eq!(
-            config
-                .get("account_number")
-                .and_then(|value| value.as_str()),
-            Some("deployment-account")
-        );
-        assert_eq!(
-            config.get("username").and_then(|value| value.as_str()),
-            Some("configured-user")
-        );
-    }
     use std::path::Path;
 
     #[test]

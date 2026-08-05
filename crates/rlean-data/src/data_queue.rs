@@ -42,7 +42,7 @@ pub struct LiveUniverseSubscriptionConfig {
     pub properties: HashMap<String, String>,
 }
 
-/// One sidecar-backed live subscription stream consumed by the engine.
+/// One provider-backed live subscription stream consumed by the engine.
 pub struct LiveDataSubscription {
     pub config: LiveDataSubscriptionConfig,
     pub receiver: Receiver<Result<LiveDataItem>>,

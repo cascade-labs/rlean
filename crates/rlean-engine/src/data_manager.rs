@@ -5,7 +5,7 @@ use rlean_core::{DateTime, Result as LeanResult};
 use rlean_data::{Slice, SubscriptionDataConfig};
 use std::collections::HashMap;
 
-/// Drives backtest data through registered Flight subscriptions.
+/// Drives backtest data through registered provider subscriptions.
 pub struct DataManager {
     context: DataFeedContext,
     active_subscriptions: HashMap<u64, SubscriptionDataConfig>,

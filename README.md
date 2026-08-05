@@ -42,7 +42,6 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 | `rlean-scheduling` | Scheduled events |
 | `rlean-statistics` | Backtest result statistics |
 | `rlean-python-runtime` | PyO3 bindings — embeds Python strategies in a Rust process |
-| `rlean-data-sidecar` | Persistent Arrow Flight subscription protocol and client |
 | `rlean-data-providers` | LEAN-style historical/live providers and cache-first Verglas storage |
 | `rlean-options` | Option chain, greeks, exercise models |
 | `rlean-execution` | Order routing / execution models |
@@ -62,25 +61,9 @@ persists provider-neutral Arrow batches before consuming them. A single SDK
 connection discovers the catalog, query, and write services from the configured
 Verglas gateway.
 
-Custom and private integrations can still use the persistent Apache Arrow
-Flight sidecar session. Strategy SDK calls remain the source of subscription
-intent.
-
-### Sidecar config
-
-Strategy runs require only a reachable sidecar endpoint and, when configured by
-the service, a bearer token:
-
-```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
-rlean config set data_sidecar_token <token>
-```
-
-Plaintext `grpc://` is loopback-only. Remote services use
-`grpc+tls://host:port`; local Unix sockets use
-`grpc+unix:///absolute/path`. Integration credentials such as
-`tradier.access_token` are stored in `~/.rlean/integration-configs.json` and
-passed opaquely to the selected sidecar connection.
+Strategy SDK calls remain the source of subscription intent. Provider and
+brokerage credentials such as `tradier.access_token` are stored once per
+machine in `~/.rlean/integration-configs.json`.
 
 Configure Verglas once per machine. The token is stored masked in CLI output
 and is applied by the SDK to every service discovered from the gateway:
@@ -98,18 +81,6 @@ query, or write endpoints separately.
 `rlean-data-tables` defines eleven canonical Arrow table contracts. Use
 `rlean data tables` and `rlean data schema <table>` as the executable source of
 truth.
-
-Inspect and query the configured sidecar through the same exchange used by
-backtests:
-
-```sh
-rlean data manifest --json
-rlean data query market_trade_bars SPY --resolution daily \
-  --start 2025-07-01 --end 2025-07-01 --json
-rlean data query custom_points SPY --provider unusual_whales \
-  --feed flow_alerts --resolution tick \
-  --start 2026-07-01 --end 2026-07-15 --json
-```
 
 Prices, quantities, rates, and custom values use `decimal(38,18)`. Timestamps
 are `i64` nanoseconds since the Unix epoch (UTC), and partition days are logical
@@ -192,14 +163,12 @@ service when `--system` is explicit).
 - `rlean live status` / `portfolio` / `orders` / `logs` — inspect one deployment
 - `rlean live pause` / `resume` / `upgrade` / `remove` — control a deployment
 
-Pass `--brokerage <name>` (or `paper` for simulated fills), select a
-`--live-data-feed`, and configure `--data-sidecar grpc://host:port` plus an
-optional `--data-sidecar-token`. For brokerages with multiple accounts, pass
+Pass `--brokerage <name>` (or `paper` for simulated fills) and select a
+`--live-data-feed`. For brokerages with multiple accounts, pass
 `--brokerage-account <account-id>`; the selected account is persisted with that
 deployment and restored by `rleand`. Live data and brokerage operations use
-independent connections through the persistent Flight session. Strategy SDK
-calls create and remove symbol subscriptions; live batches are pushed
-unsolicited and routed by subscription id.
+independent native connections. Strategy SDK calls create and remove symbol
+subscriptions; live events are pushed by the selected provider.
 
 Historical market data can be selected independently with
 `--data-provider-historical massive`. Massive TradeBars and QuoteBars are
@@ -271,17 +240,6 @@ The release workflow builds one `rlean-<version>-<triple>.tar.gz` per supported 
 ## Quick start
 
 ### 1. Configure data services
-
-A backtest and live run both use a persistent Arrow Flight sidecar session.
-Configure its local or remote endpoint first:
-
-```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
-```
-
-If the service requires authentication, also set `data_sidecar_token`. Vendor
-credentials use dotted integration keys and are stored separately in
-`~/.rlean/integration-configs.json`.
 
 Configure the one Verglas gateway used by cache-first historical providers and
 durable run results:
@@ -358,11 +316,10 @@ impl IAlgorithm for MyStrategy {
 rlean backtest my_first_strategy/main.py
 ```
 
-### 5. Configure the sidecar and run live
+### 5. Run live
 
 ```sh
 rlean live my_first_strategy/main.py \
-  --data-sidecar grpc://127.0.0.1:7410 \
   --data-provider-historical massive \
   --live-data-feed tradier \
   --brokerage paper

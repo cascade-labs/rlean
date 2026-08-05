@@ -28,9 +28,9 @@ const FEATURES: FeatureItem[] = [
       'Trade bars, quotes, ticks, auxiliary files, universes, and custom data use canonical Arrow schemas.',
   },
   {
-    title: 'Flight data sidecar',
+    title: 'Cache-first native providers',
     description:
-      'Backtest queries and pushed live data share one persistent, versioned Arrow Flight subscription session.',
+      'Historical providers read and persist through Verglas while native live providers push events directly.',
   },
 ];
 

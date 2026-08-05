@@ -17,7 +17,7 @@ crates/
   rlean-orders        # Order types, fills, fee models
   rlean-live          # Live execution infrastructure
   rlean-brokerages    # Built-in brokerage models
-  rlean-data-sidecar # Persistent Arrow Flight data and brokerage protocol/client
+  rlean-data-providers # Native historical/live providers and Verglas adapter
   rlean-scheduling    # Scheduled events
   rlean-statistics    # Backtest result stats
   rlean-universe      # Universe selection
@@ -33,18 +33,18 @@ crates/
   rlean              # CLI binary (backtest, live, init, create-project, config)
 ```
 
-## Data Architecture — Sidecar Only
+## Data Architecture — Native Providers + Verglas
 
-- Strategy processes receive canonical batches exclusively through the sidecar;
-  the sidecar owns vendor and persistence decisions.
-- rlean has no local market-data cache, catalog client, or storage backend.
+- Historical providers, live providers, and execution brokerages implement
+  separate LEAN-style interfaces selected at deployment time.
+- Historical reads are cache-first through the Verglas SDK. Successful vendor
+  responses are normalized to canonical bounded Arrow batches and persisted.
+- Live events enter the synchronizer immediately and persist asynchronously.
 - If adding a new data type, define its provider-neutral Arrow contract in
   `rlean-data-tables`.
 
-Backtests and live runs use a persistent Arrow Flight sidecar session. Backtests
-issue bounded queries against registered subscriptions; live batches are pushed
-unsolicited. Live-feed and execution-brokerage connections are independently
-authenticated, and paper brokerage remains inside rlean.
+Live-feed and execution-brokerage connections are independently authenticated,
+and paper brokerage remains inside rlean.
 
 ## Key Invariants
 
@@ -63,7 +63,7 @@ The Python API must stay LEAN-compatible:
 
 ## Related Repos (sibling directories)
 
-- **`../data_sidecar/`** — internal market/custom-data Flight service and integration stubs.
+- **`../verglas/`** — canonical cache, catalog, query, and write services used through the Rust SDK.
 - **`../Lean/`** — the original LEAN C# engine. Available for reference or spot-checking behavior against rlean's output.
 
 ## Build

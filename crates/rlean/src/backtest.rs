@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use rlean_data_sidecar::DataSidecarClient;
 
 use crate::cli::RunArgs;
 use crate::config;
 use crate::runtime::{
-    backtest_progress_bar, connect_data_sidecar, connect_verglas, ensure_python_baseline_packages,
+    backtest_progress_bar, connect_verglas, ensure_python_baseline_packages,
     historical_data_provider, parse_algorithm_parameters_for_strategy, strategy_name_from_path,
     validate_strategy_path,
 };
@@ -30,18 +29,14 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
 
     let global_config = config::GlobalConfig::load()?;
     let verglas = connect_verglas(&global_config).await?;
-    let data_sidecar = connect_data_sidecar(&args, &global_config)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("backtests require --data-sidecar"))?;
-    let historical_provider = historical_data_provider(&args, Some(verglas.clone())).await?;
+    let historical_provider = historical_data_provider(&args, verglas.clone()).await?;
 
-    run_strategy_backtest(args, data_sidecar, historical_provider, verglas).await
+    run_strategy_backtest(args, historical_provider, verglas).await
 }
 
 async fn run_strategy_backtest(
     args: RunArgs,
-    data_sidecar: Arc<DataSidecarClient>,
-    historical_provider: Option<Arc<dyn rlean_data_providers::HistoricalDataProvider>>,
+    historical_provider: Arc<dyn rlean_data_providers::HistoricalDataProvider>,
     verglas: verglas_sdk::Client,
 ) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
@@ -133,7 +128,6 @@ async fn run_strategy_backtest(
     };
     let data_feed_options = rlean_engine::data_feed::DataFeedOptions::default();
     let config = rlean_engine::BacktestRunConfig {
-        data_sidecar,
         historical_provider: historical_provider.clone(),
         _compression_level: 3,
         start_date_override,
@@ -145,11 +139,8 @@ async fn run_strategy_backtest(
         progress: Some(progress),
     };
 
-    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new_with_historical_provider(
-        config.data_sidecar.clone(),
-        historical_provider,
-        config.parameters.clone(),
-    );
+    let runtime_context =
+        rlean_engine::AlgorithmRuntimeContext::new(historical_provider, config.parameters.clone());
 
     let bridge: Box<dyn rlean_sdk::AlgorithmBridge> = match ext {
         "py" => {

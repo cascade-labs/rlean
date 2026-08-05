@@ -1,13 +1,12 @@
 use rlean_core::MarketHoursDatabase;
 use rlean_data_providers::HistoricalDataProvider;
-use rlean_data_sidecar::DataSidecarClient;
 use rlean_data_tables::FactorFileEntry;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// Bounds the adapter queue between each sidecar-backed enumerator and the
+/// Bounds the adapter queue between each provider-backed enumerator and the
 /// synchronizer. C# LEAN keeps one `Current` value per subscription and pulls
-/// the next value on demand. Flight reads are batched, so a small bounded queue
+/// the next value on demand. Provider reads are batched, so a small bounded queue
 /// preserves that pull/backpressure model without issuing one RPC per point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataFeedOptions {
@@ -22,15 +21,11 @@ impl Default for DataFeedOptions {
     }
 }
 
-/// Shared subscription services. Market data comes exclusively from the
-/// persistent Flight session; the engine owns only flow control and calendars.
+/// Shared subscription services. The engine owns flow control and calendars;
+/// the selected provider owns data acquisition.
 #[derive(Clone)]
 pub struct DataFeedContext {
-    pub sidecar: Arc<DataSidecarClient>,
-    /// Explicit native history route for canonical market subscriptions.
-    /// Custom and universe streams remain on their separately selected source
-    /// while the provider migration is in progress.
-    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     unadjusted_equities: Arc<Mutex<HashSet<String>>>,
@@ -38,20 +33,14 @@ pub struct DataFeedContext {
 }
 
 impl DataFeedContext {
-    pub fn new(sidecar: Arc<DataSidecarClient>) -> Self {
+    pub fn new(historical_provider: Arc<dyn HistoricalDataProvider>) -> Self {
         Self {
-            sidecar,
-            historical_provider: None,
+            historical_provider,
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
             auxiliary_factor_rows: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    pub fn with_historical_provider(mut self, provider: Arc<dyn HistoricalDataProvider>) -> Self {
-        self.historical_provider = Some(provider);
-        self
     }
 
     pub fn channel_capacity(&self) -> usize {

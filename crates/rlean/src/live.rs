@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use rlean_algorithm::qc_algorithm::{AccountType, BrokerageModel, BrokerageName};
 
 use crate::cli::LiveArgs;
@@ -10,8 +10,8 @@ use crate::live_deployments::{
     launch_live_detached, run_live_control, update_live_deployment_status,
 };
 use crate::runtime::{
-    brokerage_config_json, connect_data_sidecar, ensure_python_baseline_packages,
-    historical_data_provider, integration_config_json, parse_algorithm_parameters_for_strategy,
+    connect_verglas, ensure_python_baseline_packages, execution_brokerage,
+    historical_data_provider, live_data_provider, parse_algorithm_parameters_for_strategy,
     resolve_strategy_file, validate_strategy_path,
 };
 
@@ -58,35 +58,16 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     validate_strategy_path(&args.strategy)?;
 
     let global_config = config::GlobalConfig::load()?;
-    let data_sidecar = connect_data_sidecar(&args, &global_config)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("live trading requires --data-sidecar"))?;
-    let verglas = if args.data_provider_historical.is_some() {
-        Some(crate::runtime::connect_verglas(&global_config).await?)
-    } else {
-        None
-    };
+    let verglas = connect_verglas(&global_config).await?;
     let historical_provider = historical_data_provider(&args, verglas).await?;
-
-    let live_data_feed = args
-        .live_data_feed
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
-    let live_data_feed_connection_id = data_sidecar
-        .open_live_data_feed(live_data_feed, integration_config_json(live_data_feed)?)
-        .await
-        .with_context(|| format!("failed to open live data feed '{live_data_feed}'"))?;
+    let live_data_provider = live_data_provider(&args)?;
 
     let requested_brokerage = args
         .brokerage
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("live mode requires --brokerage"))?;
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
     let brokerage_account = args
         .brokerage_account
@@ -102,23 +83,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
-    let brokerage = if requested_paper_brokerage {
-        None
-    } else {
-        let opaque_config_json = brokerage_config_json(requested_brokerage, brokerage_account)?;
-        let (connection_id, events) = data_sidecar
-            .open_brokerage(requested_brokerage, opaque_config_json.clone())
-            .await
-            .with_context(|| format!("failed to open sidecar brokerage '{requested_brokerage}'"))?;
-        Some(rlean_engine::SidecarBrokerageConnection {
-            client: data_sidecar.clone(),
-            connection_id,
-            session_epoch: data_sidecar.session_epoch(),
-            name: requested_brokerage.to_string(),
-            opaque_config_json,
-            events,
-        })
-    };
+    let brokerage = execution_brokerage(&args)?;
     let paper_trading = requested_paper_brokerage;
     let brokerage_name = if requested_paper_brokerage {
         Some("Paper".to_string())
@@ -145,9 +110,8 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     let strategy_path = args.strategy.clone();
     let live_config = rlean_engine::LiveRunConfig {
-        data_sidecar,
         historical_provider: historical_provider.clone(),
-        live_data_feed_connection_id,
+        live_data_provider,
         parameters,
         brokerage,
         brokerage_model,
@@ -166,8 +130,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             rust_decimal::Decimal::new(100000, 0),
         ),
     ));
-    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new_with_historical_provider(
-        live_config.data_sidecar.clone(),
+    let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
         historical_provider,
         live_config.parameters.clone(),
     );

@@ -13,7 +13,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 /// Convert canonical option-universe rows into one filtered LEAN chain per
-/// trading date. The sidecar may already push down the filter, but applying it
+/// trading date. The provider may already push down the filter, but applying it
 /// again here keeps provider behavior irrelevant to the engine contract.
 pub(crate) fn option_chains_from_rows(
     config: &SubscriptionDataConfig,

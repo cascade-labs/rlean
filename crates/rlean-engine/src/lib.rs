@@ -12,11 +12,11 @@ pub mod history_service;
 pub mod history_subscription;
 pub mod live;
 pub mod normalization;
+#[allow(dead_code)]
 mod option_universe;
 pub mod options_service;
 pub mod orders;
 pub mod report;
-pub mod research;
 pub mod result_handler;
 pub mod risk_free_interest_rate;
 pub mod runner;
@@ -48,11 +48,9 @@ pub use fundamental_universe::{
     FundamentalUniverseSelectorSlot,
 };
 pub use history_service::{matching_normalization_mode, AlgorithmHistoryContext, HistoryService};
-pub use research::{IndicatorResult, ResearchEngine};
 pub use result_handler::ResultHandler;
 pub use runner_config::{
     BacktestProgress, BacktestRunConfig, BacktestRunResult, LiveRunConfig, LiveRunResult,
-    SidecarBrokerageConnection,
 };
 pub use runtime_context::{AlgorithmRuntimeContext, EngineAlgorithmServices};
 pub use universe_selection::{

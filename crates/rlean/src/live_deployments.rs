@@ -51,7 +51,7 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
+            anyhow::anyhow!("live mode requires --brokerage paper or a native execution brokerage")
         })?;
     let paper_trading = is_paper_brokerage_name(requested_brokerage);
     let brokerage_account = run_args
@@ -109,10 +109,7 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
 
     let log_path = deployment_dir.join("live.log");
     File::create(&log_path).with_context(|| format!("failed to create {}", log_path.display()))?;
-    let mut environment = BTreeMap::new();
-    if let Some(token) = &run_args.data_sidecar_token {
-        environment.insert("RLEAN_DATA_SIDECAR_TOKEN".to_owned(), token.clone());
-    }
+    let environment = BTreeMap::new();
     register_live_deployment(&deployment_dir);
     let response = daemon::request(&Request::Start(DeploymentSpec {
         deploy_id: deploy_id.clone(),
@@ -423,9 +420,6 @@ fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
         args.strategy.to_string_lossy().to_string(),
     ];
 
-    if let Some(value) = &args.data_sidecar {
-        values.extend(["--data-sidecar".to_string(), value.clone()]);
-    }
     if let Some(value) = &args.data_provider_historical {
         values.extend(["--data-provider-historical".to_string(), value.clone()]);
     }
@@ -942,8 +936,6 @@ mod tests {
         let args = RunArgs {
             strategy: PathBuf::from("/tmp/strategy/main.py"),
             runtime: RuntimeArgs {
-                data_sidecar: Some("tcp://127.0.0.1:50051".to_string()),
-                data_sidecar_token: None,
                 data_provider_historical: Some("massive".to_string()),
                 live_data_feed: Some("tradier".to_string()),
                 brokerage: Some("hyperliquid".to_string()),
@@ -969,13 +961,11 @@ mod tests {
         assert!(child_args.contains(&"/tmp/strategy/live/deploy".to_string()));
         assert!(child_args.contains(&"--parameter".to_string()));
         assert!(child_args.contains(&"foo=bar".to_string()));
-        assert!(child_args.contains(&"--data-sidecar".to_string()));
         assert!(child_args.contains(&"--data-provider-historical".to_string()));
         assert!(child_args.contains(&"massive".to_string()));
         assert!(child_args.contains(&"--live-data-feed".to_string()));
         assert!(child_args.contains(&"--brokerage-account".to_string()));
         assert!(child_args.contains(&"account-1234".to_string()));
-        assert!(!child_args.contains(&"--data-sidecar-token".to_string()));
         assert!(child_args.contains(&"--verbose".to_string()));
     }
 

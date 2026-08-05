@@ -5,11 +5,11 @@ This document compares rlean `main` at
 at `be0ad6cb7031980b09166e5451c2edd1f60261e0`.
 
 The companion [regression-driven development specification](lean-regression-tdd.md)
-defines the cross-SDK regression sections, mocked-sidecar fixtures, result
+defines the cross-SDK regression sections, mocked-provider fixtures, result
 comparisons, and CI contract used to close these gaps.
 
 The goal is strategy and behavior compatibility, not a line-for-line Rust port.
-rlean's Arrow Flight sidecar, native Rust `IAlgorithm` surface, artifact relay,
+rlean's native provider architecture, native Rust `IAlgorithm` surface, artifact relay,
 and deployment supervisor are intentional architectural differences. They are
 not gaps unless they prevent a LEAN strategy from observing the same data,
 orders, portfolio state, callbacks, or results.
@@ -75,7 +75,7 @@ algorithm-output regression suite.
 The following areas are sufficiently real that new work should extend them,
 not replace them:
 
-- Persistent sidecar sessions, bounded backtest queries, pushed live batches,
+- Persistent provider streams, bounded backtest queries, pushed live batches,
   canonical Arrow contracts, factor/map files, and provider-neutral venue
   metadata.
 - Equity trade/quote/tick subscriptions, custom data, point-in-time fundamental
@@ -126,7 +126,7 @@ at field level, with an explicit allowlist for intentional differences.
 `../Lean/Engine/DataFeeds`, and `../Lean/Engine/AlgorithmManager.cs`.
 
 **Current rlean state:** `SubscriptionDataPoint` carries trade bars, quote bars,
-ticks, custom data, fundamental snapshots, and option chains. The sidecar wire
+ticks, custom data, fundamental snapshots, and option chains. The canonical data contract
 enum also names open interest and margin interest, while `Slice` has Rust
 containers for splits, dividends, delistings, symbol changes, and margin
 interest. Those pieces are not connected end to end.
@@ -138,13 +138,13 @@ interest. Those pieces are not connected end to end.
   is the remaining work in issue #79; the dated risk-free model in #102 is a
   separate rate and does not change cash.
 - Add provider-neutral split, dividend, delisting, and symbol-change contracts
-  to `rlean-data-tables` and the Flight protocol.
+  to `rlean-data-tables` and the native provider interfaces.
 - Generate and synchronize those events into `Slice`, then invoke the existing
   algorithm callbacks and order/holding adjustment paths.
 - Define live delivery for each event rather than supporting backtests only.
 
 **Acceptance:** Each data type is proven through
-sidecar batch -> decoder -> subscription frontier -> `Slice` -> callback and,
+provider batch -> decoder -> subscription frontier -> `Slice` -> callback and,
 where applicable, portfolio/order mutation.
 
 ### 3. Replace scalar cash accounting with LEAN-compatible cash and settlement
@@ -268,7 +268,7 @@ option/future history, fundamental history, and portfolio-statistics helpers.
   enumerables.
 - `QuantBook` security adders plus option history, future history, fundamental
   queries, indicator history, and portfolio statistics.
-- Sidecar query support for every canonical type required by those requests.
+- Provider query support for every canonical type required by those requests.
 
 **Acceptance:** Port LEAN's basic and kitchen-sink QuantBook notebooks and a
 matrix of History regression algorithms.
@@ -377,7 +377,7 @@ surface, training scheduler, or signal export contract.
 
 Implement these as engine services so Python and native Rust strategies share
 one behavior. Object-store persistence must be session/deployment scoped and
-must not bypass the sidecar's ownership of market data.
+must not bypass the provider and Verglas ownership of market data.
 
 ### 13. Close results and statistics gaps
 
@@ -403,7 +403,7 @@ After History/QuantBook parity:
   artifact manifests.
 - Add resumable job ids, status, cancellation, reproducibility metadata, and
   result comparison.
-- Keep research data access on the public SDK/sidecar path; raw Python execution
+- Keep research data access on the public SDK/provider path; raw Python execution
   should not become a second engine contract.
 
 ### 15. Finish remote artifact reads

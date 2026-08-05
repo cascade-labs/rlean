@@ -3,8 +3,8 @@ use crate::data_feed::DataFeedOptions;
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::{AlphaAnalytics, InsightEvent};
-use rlean_data_providers::HistoricalDataProvider;
-use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
+use rlean_brokerages::Brokerage;
+use rlean_data_providers::{HistoricalDataProvider, LiveDataProvider};
 use rlean_orders::{Order, OrderEvent};
 use rlean_statistics::{PortfolioStatistics, Trade};
 use std::collections::HashMap;
@@ -22,8 +22,7 @@ pub struct BacktestProgress {
 }
 
 pub struct BacktestRunConfig {
-    pub data_sidecar: Arc<DataSidecarClient>,
-    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
     pub _compression_level: i32,
     /// Override the strategy's set_start_date (YYYY-MM-DD).
     pub start_date_override: Option<chrono::NaiveDate>,
@@ -44,16 +43,12 @@ pub struct BacktestRunConfig {
 }
 
 pub struct LiveRunConfig {
-    pub data_sidecar: Arc<DataSidecarClient>,
-    pub historical_provider: Option<Arc<dyn HistoricalDataProvider>>,
-    /// Session-scoped live feed selected by deployment configuration. Strategy
-    /// SDK calls create the actual subscriptions beneath this connection.
-    pub live_data_feed_connection_id: u64,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
+    pub live_data_provider: Arc<dyn LiveDataProvider>,
     pub parameters: HashMap<String, String>,
-    /// Optional authenticated sidecar execution connection. Market-data
-    /// subscriptions do not reference this connection and may use a completely
-    /// different provider. `None` keeps execution in rlean's paper path.
-    pub brokerage: Option<SidecarBrokerageConnection>,
+    /// Optional authenticated execution brokerage. Market data remains an
+    /// independent provider. `None` keeps execution in rlean's paper path.
+    pub brokerage: Option<Box<dyn Brokerage>>,
     /// Brokerage model selected by the live deployment. The execution
     /// brokerage and account type are modeled together, matching C# LEAN's
     /// `IBrokerageModel` boundary.
@@ -71,18 +66,6 @@ pub struct LiveRunConfig {
     /// Optional artifact sink. When set, snapshots are written into the sink's
     /// working dir and mirrored to S3 asynchronously per the sink's mode.
     pub artifact_sink: Option<Arc<RunArtifactSink>>,
-}
-
-pub struct SidecarBrokerageConnection {
-    pub client: Arc<DataSidecarClient>,
-    pub connection_id: u64,
-    /// Flight session generation that owns `events`.
-    pub session_epoch: u64,
-    pub name: String,
-    /// Opaque brokerage credentials/config, kept so the worker can re-open the
-    /// brokerage connection after the sidecar session is re-established.
-    pub opaque_config_json: Vec<u8>,
-    pub events: BrokerageEventStream,
 }
 
 pub struct LiveRunResult {
@@ -122,7 +105,7 @@ pub struct BacktestRunResult {
     pub trades: Vec<Trade>,
     /// Complete framework insight lifecycle, in engine event order.
     pub insight_events: Vec<InsightEvent>,
-    /// Symbols/dates for which the sidecar returned data.
+    /// Symbols/dates for which the configured provider returned data.
     pub succeeded_data_requests: Vec<String>,
     /// Symbols/dates for which no data was found.
     pub failed_data_requests: Vec<String>,

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         if verbose {
             EnvFilter::new(
                 "info,rlean=debug,rlean_algorithm=debug,rlean_core=debug,rlean_data=debug,\
-                 rlean_data_sidecar=debug,rlean_engine=debug,lean_python=debug",
+                 rlean_engine=debug,lean_python=debug",
             )
         } else {
             EnvFilter::new("info")
@@ -184,8 +184,8 @@ mod tests {
             "rlean",
             "live",
             "main.py",
-            "--data-sidecar",
-            "tcp://127.0.0.1:50051",
+            "--live-data-feed",
+            "tradier",
             "--brokerage",
             "fidelity",
             "--brokerage-account",
@@ -197,7 +197,7 @@ mod tests {
             Command::Live(args) => {
                 assert!(args.command.is_none());
                 assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
-                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
+                assert_eq!(args.live_data_feed.as_deref(), Some("tradier"));
                 assert_eq!(args.brokerage.as_deref(), Some("fidelity"));
                 assert_eq!(args.brokerage_account.as_deref(), Some("account-1234"));
             }
@@ -330,8 +330,8 @@ mod tests {
             "--live-deploy-dir",
             "/tmp/deploy",
             "/tmp/strategy/main.py",
-            "--data-sidecar",
-            "tcp://127.0.0.1:50051",
+            "--live-data-feed",
+            "tradier",
         ])
         .unwrap();
 
@@ -343,7 +343,7 @@ mod tests {
                     args.strategy.as_deref(),
                     Some(Path::new("/tmp/strategy/main.py"))
                 );
-                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
+                assert_eq!(args.live_data_feed.as_deref(), Some("tradier"));
             }
             _ => panic!("expected live command"),
         }

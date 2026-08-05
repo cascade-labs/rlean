@@ -28,7 +28,7 @@ crates/
   rlean-orders        # Order types, fills, fee models
   rlean-live          # Live execution infrastructure
   rlean-brokerages    # Paper brokerage and built-in brokerage models
-  rlean-data-sidecar # Arrow Flight data and brokerage protocol/client
+  rlean-data-providers # Native historical/live providers and Verglas adapter
   rlean-scheduling    # Scheduled events
   rlean-statistics    # Backtest result stats
   rlean-universe      # Universe selection
@@ -84,7 +84,7 @@ The Python API must stay LEAN-compatible:
 
 ## Related Repos (sibling directories)
 
-- **`../data_sidecar/`** — internal market/custom-data/brokerage Flight service and integration stubs.
+- **`../verglas/`** — canonical cache, catalog, query, and write services used through the Rust SDK.
 - **`../Lean/`** — the original LEAN C# engine. Available for reference or spot-checking behavior against rlean's output.
 
 ## Build

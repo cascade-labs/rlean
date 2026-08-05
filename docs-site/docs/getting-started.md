@@ -50,19 +50,18 @@ my-strategies/
   rlean.json      # workspace config
 ```
 
-## 2. Configure the sidecar endpoint
+## 2. Configure Verglas and providers
 
-Backtests, live deployments, research, and data tooling all communicate with a
-sidecar. rlean does not configure or access the sidecar's storage backend.
+Configure the Verglas gateway once per machine. Historical providers query it
+before fetching uncovered ranges.
 
 ```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
-# Only when the sidecar requires authentication:
-rlean config set data_sidecar_token <token>
+rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_token <token>
+rlean config set massive.api_key <your-key>
 ```
 
-See [Data Contract and Sidecar](./data-backend.md) for the canonical tables and
-query tooling.
+See [Data Providers and Contract](./data-backend.md) for the canonical tables.
 
 ## 3. Create a project
 
@@ -130,17 +129,16 @@ impl IAlgorithm for MyStrategy {
 rlean backtest my_first_strategy/main.py
 ```
 
-## 6. Configure the sidecar
+## 6. Configure provider credentials
 
 ```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
 rlean config set thetadata.api_key  <your-key>
 rlean config set massive.api_key    <your-key>
 ```
 
-The endpoint is stored in `~/.rlean/config`. Dotted integration keys are stored
-in the owner-only `~/.rlean/integration-configs.json` and passed opaquely to the
-sidecar. Strategies still declare symbols and resolutions through calls such as
+The Verglas endpoint is stored in `~/.rlean/config`. Dotted integration keys are
+stored in the owner-only `~/.rlean/integration-configs.json`. Strategies still
+declare symbols and resolutions through calls such as
 `add_equity`; configuration only selects and authenticates integrations.
 
 ## Using rlean as a library

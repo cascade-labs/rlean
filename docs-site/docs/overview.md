@@ -12,8 +12,7 @@ interface — the goal is for existing `QCAlgorithm`-based Python strategies to 
 with little or no modification — while adding a native Rust library for writing
 high-performance strategies directly.
 
-All market and custom data enters the engine through a versioned Apache Arrow
-Flight sidecar contract.
+All market and custom data uses provider-neutral canonical Arrow contracts.
 
 ## Features
 
@@ -24,10 +23,10 @@ Flight sidecar contract.
   backtests and live execution.
 - **Provider-neutral data plane** — trade bars, quotes, ticks, auxiliary files,
   universes, and custom data use canonical Arrow schemas.
-- **Sidecar data plane** — backtest queries and pushed live data share a
-  persistent, versioned Arrow Flight subscription session.
-- **Sidecar integrations** — market data and brokerages run out of process over
-  the Arrow Flight contract.
+- **Native providers** — historical pulls and pushed live data use independent
+  LEAN-style interfaces.
+- **Cache-first history** — the Verglas SDK supplies canonical cached data and
+  persists successful provider fills.
 - **Research mode** — launches a Jupyter environment wired to the same engine
   used in backtests.
 
@@ -42,7 +41,7 @@ rlean is a Cargo workspace. The crates you are most likely to use as a library:
 | `rlean-engine` | Backtest/live runners and subscription flow control |
 | `rlean-data` | `Slice` and subscription definitions |
 | `rlean-data-tables` | Canonical provider-neutral Arrow row and table contracts |
-| `rlean-data-sidecar` | Versioned Arrow Flight protocol and client |
+| `rlean-data-providers` | Native historical/live providers and Verglas adapter |
 | `rlean-options` | Option chain, greeks, exercise models |
 | `rlean-python-runtime` | PyO3 bindings — embed Python strategies in a Rust process |
 | `rlean-indicators` | SMA, EMA, RSI, Bollinger Bands, and more |
@@ -55,9 +54,7 @@ The `rlean` crate is the CLI binary (`backtest`, `live`, `init`,
 
 - [Getting Started](./getting-started.md) — install the CLI, create a workspace,
   write and run your first strategy.
-- [Sidecar Data Plane](./sidecar-data-plane.md) — subscriptions, bounded
-  backtest pulls, pushed live batches, integrations, and relays.
-- [Data Contract and Sidecar](./data-backend.md) — canonical tables, discovery,
-  and bounded queries.
+- [Data Providers and Contract](./data-backend.md) — canonical tables,
+  cache-first history, and live providers.
 - [Python Strategy API](./python-strategy-api.md) — the `QCAlgorithm` surface.
 - [Live Trading](./live-trading.md) — live deployments and the cloud fleet.

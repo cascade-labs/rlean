@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GlobalConfig, ProjectConfig};
+use crate::config::ProjectConfig;
 use crate::project::research_notebook;
 use crate::research_daemon::sock_path;
 
@@ -458,18 +458,10 @@ fn ensure_alive(sock: &Path, session: &str) -> Result<()> {
 
 fn spawn_daemon(session: &str, project: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("Cannot determine current exe path")?;
-    let config = GlobalConfig::load()?;
-    let sidecar = config.data_sidecar.context(
-        "research requires data_sidecar; set it with `rlean config set data_sidecar grpc://host:port`",
-    )?;
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["__research-daemon", "--session", session]);
     cmd.args(["--project", &project.to_string_lossy()]);
-    cmd.env("RLEAN_DATA_SIDECAR", sidecar);
-    if let Some(token) = config.data_sidecar_token {
-        cmd.env("RLEAN_DATA_SIDECAR_TOKEN", token);
-    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

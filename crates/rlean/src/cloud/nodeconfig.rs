@@ -12,7 +12,6 @@ use crate::config::GlobalConfig;
 /// node's absolute `$HOME`.
 ///
 /// - `workspace`     → `<node_home>/rlean-cloud/workspace`
-/// - `data_sidecar*` → copied verbatim
 /// - `artifact_store`→ `"mirror"` (overrides the local, typically `"local"`)
 /// - `artifact_s3*`  → copied verbatim from the local config (operator creds),
 ///   except the endpoint, which `artifact_endpoint` overrides when given — a
@@ -30,8 +29,6 @@ pub(crate) fn node_config_from_local(
     let node_home = node_home.trim_end_matches('/');
     GlobalConfig {
         default_language: local.default_language.clone(),
-        data_sidecar: local.data_sidecar.clone(),
-        data_sidecar_token: local.data_sidecar_token.clone(),
         verglas_endpoint: local.verglas_endpoint.clone(),
         verglas_token: local.verglas_token.clone(),
         artifact_store: Some("mirror".to_string()),
@@ -53,8 +50,6 @@ mod tests {
     fn local_with_artifacts() -> GlobalConfig {
         GlobalConfig {
             default_language: "python".to_string(),
-            data_sidecar: None,
-            data_sidecar_token: None,
             verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
             verglas_token: Some("vgk_test".to_string()),
             // Local operator runs artifact_store=local but supplies artifact creds.

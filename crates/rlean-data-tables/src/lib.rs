@@ -1,6 +1,6 @@
 //! Canonical rlean data types and provider-neutral Arrow table contracts.
 //!
-//! Sidecars, the runtime engine, and persistence all use these same values.
+//! Providers, the runtime engine, and persistence all use these same values.
 
 pub mod base_data;
 pub mod contract;

@@ -275,7 +275,7 @@ fn supervise(deployments: &mut BTreeMap<String, Managed>) -> Result<()> {
                     changed = true;
                     continue;
                 }
-                if transient_sidecar_failure(&managed.spec.deployment_dir) {
+                if transient_integration_failure(&managed.spec.deployment_dir) {
                     managed.failures = managed.failures.saturating_add(1);
                     let delay = restart_delay(managed.failures);
                     managed.restart_at = Some(now + delay);
@@ -283,13 +283,13 @@ fn supervise(deployments: &mut BTreeMap<String, Managed>) -> Result<()> {
                     tracing::warn!(
                         deployment = %managed.spec.deploy_id,
                         ?delay,
-                        "live process lost its sidecar session; scheduling restart"
+                        "live process lost a provider or brokerage connection; scheduling restart"
                     );
                     changed = true;
                 } else {
                     managed.spec.desired_state = "runtime-error".to_owned();
                     managed.restart_at = None;
-                    tracing::error!(deployment = %managed.spec.deploy_id, %status, "live process failed; not restarting non-sidecar error");
+                    tracing::error!(deployment = %managed.spec.deploy_id, %status, "live process failed; not restarting non-integration error");
                     changed = true;
                 }
             }
@@ -409,7 +409,7 @@ fn restart_delay(failures: u32) -> Duration {
     )
 }
 
-fn transient_sidecar_failure(deployment_dir: &Path) -> bool {
+fn transient_integration_failure(deployment_dir: &Path) -> bool {
     let Ok(value) = read_deployment_json(deployment_dir) else {
         return false;
     };
@@ -419,10 +419,9 @@ fn transient_sidecar_failure(deployment_dir: &Path) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     [
-        "sidecar",
-        "flight exchange",
         "failed to open live data feed",
-        "failed to open sidecar brokerage",
+        "failed to open brokerage",
+        "provider stream closed",
         "transport error",
         "connection reset",
         "broken pipe",
@@ -441,7 +440,7 @@ fn mark_restarting(deployment_dir: &Path, delay: Duration) {
     value["pid"] = serde_json::Value::Null;
     value["updated_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
     value["error"] = serde_json::Value::String(format!(
-        "sidecar unavailable; rleand retrying in {}s",
+        "provider or brokerage unavailable; rleand retrying in {}s",
         delay.as_secs()
     ));
     let _ = write_json_atomic(&deployment_dir.join("deployment.json"), &value);
@@ -616,32 +615,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidecar_errors_are_transient_but_python_errors_are_not() {
+    fn integration_errors_are_transient_but_python_errors_are_not() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("deployment.json"),
-            r#"{"error":"Data error: Flight exchange closed"}"#,
+            r#"{"error":"Data error: provider stream closed"}"#,
         )
         .unwrap();
-        assert!(transient_sidecar_failure(dir.path()));
+        assert!(transient_integration_failure(dir.path()));
         std::fs::write(
             dir.path().join("deployment.json"),
             r#"{"error":"failed to open live data feed 'robinhood'"}"#,
         )
         .unwrap();
-        assert!(transient_sidecar_failure(dir.path()));
+        assert!(transient_integration_failure(dir.path()));
         std::fs::write(
             dir.path().join("deployment.json"),
-            r#"{"error":"failed to open sidecar brokerage 'tradier'"}"#,
+            r#"{"error":"failed to open brokerage 'tradier'"}"#,
         )
         .unwrap();
-        assert!(transient_sidecar_failure(dir.path()));
+        assert!(transient_integration_failure(dir.path()));
         std::fs::write(
             dir.path().join("deployment.json"),
             r#"{"error":"Python exception: division by zero"}"#,
         )
         .unwrap();
-        assert!(!transient_sidecar_failure(dir.path()));
+        assert!(!transient_integration_failure(dir.path()));
     }
 
     #[test]

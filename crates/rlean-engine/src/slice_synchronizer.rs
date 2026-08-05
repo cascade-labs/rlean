@@ -121,13 +121,13 @@ impl SliceSynchronizer {
 /// resolves — with rows, with an empty result, or with a transport error the
 /// producer propagates through the channel. The 2026-07-27 lost-signal
 /// incident was exactly a wall-clock bound racing a live request: the seed's
-/// sidecar gap-fill was actively fetching (19-26.5s) when a 15s "no progress"
+/// provider gap-fill was actively fetching (19-26.5s) when a 15s "no progress"
 /// bailout concluded "no candidate" and the seed resolved empty, seconds
 /// before the data arrived. Liveness is "the request is still in flight", not
 /// "N seconds elapsed"; timeouts belong at the transport level only.
 ///
 /// Split from `next_slice` so it can be driven under tokio's virtual clock
-/// (`start_paused`) in tests without a sidecar session.
+/// (`start_paused`) in tests without a live provider connection.
 async fn await_any_candidate(streams: &mut [SubscriptionStream]) -> LeanResult<bool> {
     let mut advanced_any = false;
     for stream in streams.iter_mut().filter(|stream| !stream.is_exhausted()) {
@@ -240,7 +240,7 @@ mod tests {
         let expected_frontier = point.frontier_time();
         tokio::spawn(async move {
             // Resolves well past the old 15s no-progress bound, matching the
-            // observed 19-26.5s sidecar gap-fills that were abandoned live.
+            // observed 19-26.5s provider gap-fills that were abandoned live.
             tokio::time::sleep(Duration::from_secs(20)).await;
             let _ = sender
                 .send(Ok(SubscriptionStreamMessage::point(point)))
@@ -282,7 +282,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let _ = sender
                 .send(Err(LeanError::DataError(
-                    "sidecar transport failed".to_string(),
+                    "provider transport failed".to_string(),
                 )))
                 .await;
         });
@@ -293,7 +293,7 @@ mod tests {
             .expect_err("a transport failure must surface as an error");
 
         assert!(
-            error.to_string().contains("sidecar transport failed"),
+            error.to_string().contains("provider transport failed"),
             "the producer's transport error must propagate: {error}"
         );
         assert!(

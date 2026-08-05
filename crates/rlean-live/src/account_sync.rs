@@ -30,7 +30,7 @@ pub fn settlement_cash(cash_balances: &[(String, Decimal)]) -> Decimal {
 }
 
 /// Provider-neutral account snapshot used for deployment persistence and
-/// restart recovery. Acquisition now comes from the sidecar protocol.
+/// restart recovery. Acquisition comes from the selected brokerage interface.
 #[derive(Debug, Clone)]
 pub struct AccountState {
     pub cash: Decimal,

@@ -15,10 +15,8 @@ use futures::StreamExt;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_core::MarketHoursDatabase;
 use rlean_data::{LiveDataItem, LiveDataSubscription, SubscriptionDataConfig};
-use rlean_data_sidecar::{
-    decode_batch, CanonicalDataBatch, DataSidecarClient, SubscriptionSpec, WireDataType,
-};
-use rlean_live::{is_transient_sidecar_error, LiveSliceAssembler};
+use rlean_data_providers::{HistoricalData, LiveDataEvent, LiveDataProvider, LiveSubscription};
+use rlean_live::LiveSliceAssembler;
 use rlean_orders::{fill_model::ImmediateFillModel, order_processor::OrderProcessor, OrderEvent};
 use rlean_statistics::{Trade, TradeBuilder};
 use std::collections::{HashMap, HashSet};
@@ -57,8 +55,10 @@ pub async fn run_live<B>(bridge: B, config: LiveRunConfig) -> Result<LiveRunResu
 where
     B: AlgorithmBridge,
 {
-    let runtime_context =
-        crate::AlgorithmRuntimeContext::new(config.data_sidecar.clone(), config.parameters.clone());
+    let runtime_context = crate::AlgorithmRuntimeContext::new(
+        config.historical_provider.clone(),
+        config.parameters.clone(),
+    );
     run_live_with_runtime(bridge, config, runtime_context).await
 }
 
@@ -79,9 +79,8 @@ where
     algorithm_manager.set_market_hours_database(market_hours_database.clone());
     algorithm_manager.set_brokerage_model(config.brokerage_model);
 
-    // Execution is independent from the live-data feed. A sidecar brokerage
-    // connection enables real routing; without one, fills remain local paper
-    // fills even though market data still arrives through the sidecar.
+    // Execution is independent from the live-data feed. Without a configured
+    // execution brokerage, fills remain local paper fills.
     let real_routing = config.brokerage.is_some();
     let mut snapshot = crate::live::snapshots::LiveDeploymentSnapshot::new(
         config
@@ -113,10 +112,8 @@ where
     algorithm_manager.set_brokerage_model(config.brokerage_model);
     let risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel> = Arc::new(
         crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
-            &config.data_sidecar,
             chrono::Utc::now().date_naive(),
-        )
-        .await?,
+        )?,
     );
     if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
         algorithm_state
@@ -167,11 +164,7 @@ where
         .map(|config| (**config).clone())
         .collect();
     algorithm_manager.prepare_data_delivery(&subscriptions)?;
-    let feed_context = DataFeedContext::new(config.data_sidecar.clone());
-    let feed_context = match &config.historical_provider {
-        Some(provider) => feed_context.with_historical_provider(provider.clone()),
-        None => feed_context,
-    };
+    let feed_context = DataFeedContext::new(config.historical_provider.clone());
     if algorithm_manager.is_warming_up() {
         let live_frontier = rlean_core::DateTime::now();
         let warmup_start = if let Some(bar_count) = algorithm_manager.warmup_bar_count() {
@@ -226,12 +219,9 @@ where
     // while the deployment was offline or warming up are skipped, not replayed.
     algorithm_manager.prime_scheduled_events(rlean_core::DateTime::now());
 
-    // The sidecar owns every live subscription and pushes canonical batches on
-    // the persistent exchange; the engine only assembles them into slices.
-    let sidecar = config.data_sidecar.clone();
-    let transport: Arc<dyn LiveFeedTransport> = sidecar.clone();
     let mut live_subscriptions =
-        LiveSubscriptionSet::subscribe_initial(transport, &subscriptions).await?;
+        LiveSubscriptionSet::subscribe_initial(config.live_data_provider.clone(), &subscriptions)
+            .await?;
 
     let transactions = algorithm_manager.transactions();
     let portfolio = algorithm_manager.portfolio();
@@ -262,13 +252,12 @@ where
     let mut brokerage_router = None;
     if real_routing {
         if let Some(brokerage) = config.brokerage.take() {
-            let sync = match crate::live::transaction_handler::startup_sidecar_account_sync(
-                &brokerage,
+            let mut brokerage = brokerage;
+            let sync = match crate::live::transaction_handler::startup_account_sync(
+                &mut brokerage,
                 portfolio.as_ref(),
                 transactions.as_ref(),
-            )
-            .await
-            {
+            ) {
                 Ok(sync) => {
                     if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
                         let mut algorithm = algorithm_state
@@ -310,7 +299,7 @@ where
                 }
             };
             let mut router =
-                crate::live::transaction_handler::LiveBrokerageRouter::spawn_sidecar(brokerage);
+                crate::live::transaction_handler::LiveBrokerageRouter::spawn(brokerage);
             // Feature B: unconditionally liquidate synced account holdings that no
             // active (restored) framework insight covers. This is the default,
             // always-on convergence behavior under real brokerage routing: live
@@ -427,7 +416,6 @@ where
     let mut assembler = LiveSliceAssembler::new();
     assembler.set_subscriptions(live_subscriptions.configs.values());
     let mut time_pulse = LiveTimePulse::new(rlean_core::DateTime::now());
-    let mut live_reconnect: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
     'live: loop {
         if should_stop(
@@ -437,17 +425,6 @@ where
             config.max_runtime,
         ) {
             break;
-        }
-
-        if live_reconnect
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            live_reconnect
-                .take()
-                .expect("finished reconnect task is present")
-                .await??;
-            live_subscriptions.finish_reconnect().await?;
         }
 
         // C# LEAN's LiveTradingRealTimeHandler is driven by wall time, not by
@@ -495,12 +472,7 @@ where
             }
         }
 
-        let poll = if live_reconnect.is_none() {
-            poll_live_item(&mut live_subscriptions, Duration::from_millis(250))
-        } else {
-            std::thread::sleep(Duration::from_millis(250));
-            LivePoll::Idle
-        };
+        let poll = poll_live_item(&mut live_subscriptions, Duration::from_millis(250));
         match poll {
             LivePoll::Item(item) => {
                 assembler.enqueue(*item);
@@ -508,24 +480,20 @@ where
                     match poll_live_item(&mut live_subscriptions, Duration::ZERO) {
                         LivePoll::Item(item) => assembler.enqueue(*item),
                         LivePoll::Idle => break,
-                        // A live subscription stream dropped: re-establish the
-                        // sidecar session in the background. Wall-clock pulses,
-                        // schedules and brokerage servicing must remain live.
                         LivePoll::StreamLost => {
-                            live_reconnect = Some(live_subscriptions.begin_reconnect());
-                            break;
+                            anyhow::bail!("live data provider event stream ended unexpectedly")
                         }
                     }
                 }
             }
             LivePoll::Idle => {}
             LivePoll::StreamLost => {
-                live_reconnect = Some(live_subscriptions.begin_reconnect());
+                anyhow::bail!("live data provider event stream ended unexpectedly")
             }
         }
         // Universe and strategy code can add/remove subscriptions while live.
         // Keep the assembler's LEAN-style fill-forward enumerators aligned with
-        // the exact active sidecar subscription set.
+        // the exact active provider subscription set.
         assembler.set_subscriptions(live_subscriptions.configs.values());
         let ready_slices: Vec<_> = assembler
             .advance(rlean_core::DateTime::now())
@@ -632,14 +600,9 @@ where
     if let Some(router) = brokerage_router.as_mut() {
         router.shutdown();
     }
-    if let Some(reconnect) = live_reconnect.take() {
-        reconnect.abort();
-    }
     algorithm_manager.finish(&mut services);
     live_subscriptions.unsubscribe_all().await;
-    sidecar
-        .close_live_data_feed(config.live_data_feed_connection_id)
-        .await?;
+    config.live_data_provider.disconnect().await?;
     snapshot.slices_processed = algorithm_manager.slices_processed() as usize;
     snapshot.final_value = algorithm_manager
         .portfolio_value()
@@ -1405,8 +1368,7 @@ enum LivePoll {
     Item(Box<LiveDataItem>),
     /// No item is ready right now, but every subscription stream is healthy.
     Idle,
-    /// A subscription stream dropped (channel error or disconnect) — the sidecar
-    /// session died and the runner must re-establish it.
+    /// A subscription stream dropped because its channel or provider disconnected.
     StreamLost,
 }
 
@@ -1437,74 +1399,82 @@ fn poll_live_item(subscriptions: &mut LiveSubscriptionSet, timeout: Duration) ->
     }
 }
 
-/// The live-data operations the runner needs from the sidecar session. Extracted
-/// as a seam so the reconnect supervisor can be exercised with a test double; the
-/// production implementation is `DataSidecarClient`.
-#[async_trait::async_trait]
-pub(crate) trait LiveFeedTransport: Send + Sync {
-    /// Generation that owns newly-opened streams.
-    fn session_epoch(&self) -> u64;
-    /// Re-establish the underlying Flight session after a sidecar drop. Coalesced
-    /// across concurrent callers so a restart triggers a single re-establish.
-    async fn reconnect_session(&self, failed_epoch: u64) -> Result<()>;
-    /// Register a single live subscription, returning its sidecar-side (remote)
-    /// id and the batch stream.
-    async fn subscribe_live(
-        &self,
-        config: &SubscriptionDataConfig,
-    ) -> Result<(u64, rlean_data_sidecar::DataBatchStream)>;
-    /// Remove a live subscription by its sidecar-side (remote) id.
-    async fn remove_subscription(&self, remote_id: u64) -> Result<()>;
-}
-
-#[async_trait::async_trait]
-impl LiveFeedTransport for DataSidecarClient {
-    fn session_epoch(&self) -> u64 {
-        DataSidecarClient::session_epoch(self)
-    }
-
-    async fn reconnect_session(&self, failed_epoch: u64) -> Result<()> {
-        self.reconnect_failed_epoch(failed_epoch).await
-    }
-
-    async fn subscribe_live(
-        &self,
-        config: &SubscriptionDataConfig,
-    ) -> Result<(u64, rlean_data_sidecar::DataBatchStream)> {
-        DataSidecarClient::subscribe_live(self, config).await
-    }
-
-    async fn remove_subscription(&self, remote_id: u64) -> Result<()> {
-        DataSidecarClient::remove_subscription(self, remote_id).await
-    }
+#[derive(Clone)]
+struct ProviderSubscriptionSender {
+    config: SubscriptionDataConfig,
+    sender: crossbeam_channel::Sender<rlean_core::Result<LiveDataItem>>,
 }
 
 struct LiveSubscriptionSet {
-    transport: Arc<dyn LiveFeedTransport>,
+    provider: Arc<dyn LiveDataProvider>,
     market: HashMap<u64, LiveDataSubscription>,
     configs: HashMap<u64, SubscriptionDataConfig>,
-    remote_ids: HashMap<u64, u64>,
-    tasks: HashMap<u64, tokio::task::JoinHandle<()>>,
-    session_epoch: u64,
-    /// Unique-id set from the last full `sync_live_subscriptions` pass. Used to
-    /// short-circuit the per-slice sync when the subscription set is unchanged
-    /// (issue #39). `None` until the first sync runs.
+    senders: Arc<std::sync::Mutex<HashMap<u64, ProviderSubscriptionSender>>>,
+    dispatcher: tokio::task::JoinHandle<()>,
     last_synced_ids: Option<HashSet<u64>>,
 }
 
 impl LiveSubscriptionSet {
     async fn subscribe_initial(
-        transport: Arc<dyn LiveFeedTransport>,
+        provider: Arc<dyn LiveDataProvider>,
         subscriptions: &[SubscriptionDataConfig],
     ) -> Result<Self> {
-        let session_epoch = transport.session_epoch();
+        let mut events = provider.events().await?;
+        provider.connect().await?;
+        let senders = Arc::new(std::sync::Mutex::new(HashMap::<
+            u64,
+            ProviderSubscriptionSender,
+        >::new()));
+        let dispatch_senders = senders.clone();
+        let dispatcher = tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(LiveDataEvent::Data {
+                        subscription_id,
+                        data,
+                    }) => {
+                        let entry = dispatch_senders
+                            .lock()
+                            .ok()
+                            .and_then(|senders| senders.get(&subscription_id).cloned());
+                        let send_result = entry.map(|entry| {
+                            native_live_items(data, &entry.config).map(|items| {
+                                for item in items {
+                                    if entry.sender.send(Ok(item)).is_err() {
+                                        break;
+                                    }
+                                }
+                            })
+                        });
+                        if let Some(Err(error)) = send_result {
+                            tracing::error!(subscription_id, %error, "invalid live provider data");
+                        }
+                    }
+                    Ok(LiveDataEvent::Reconnected) => {
+                        tracing::info!("live data provider reconnected");
+                    }
+                    Ok(LiveDataEvent::Disconnected { reason }) => {
+                        tracing::warn!(%reason, "live data provider disconnected; provider is reconnecting");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "live data provider event error");
+                    }
+                }
+            }
+            if let Ok(senders) = dispatch_senders.lock() {
+                for entry in senders.values() {
+                    let _ = entry.sender.send(Err(rlean_core::LeanError::DataError(
+                        "live data provider event stream ended".to_string(),
+                    )));
+                }
+            }
+        });
         let mut set = Self {
-            transport,
+            provider,
             market: HashMap::new(),
             configs: HashMap::new(),
-            remote_ids: HashMap::new(),
-            tasks: HashMap::new(),
-            session_epoch,
+            senders,
+            dispatcher,
             last_synced_ids: None,
         };
         for config in subscriptions {
@@ -1521,22 +1491,17 @@ impl LiveSubscriptionSet {
         let existing: Vec<u64> = self.configs.keys().copied().collect();
         for id in existing {
             if !desired.contains(&id) {
-                if let Some(subscription_config) = self.configs.remove(&id) {
-                    let _ = subscription_config;
-                    if let Some(task) = self.tasks.remove(&id) {
-                        task.abort();
-                    }
-                    if let Some(remote_id) = self.remote_ids.remove(&id) {
-                        self.transport.remove_subscription(remote_id).await?;
-                    }
-                }
+                self.provider.unsubscribe(id).await?;
+                self.configs.remove(&id);
                 self.market.remove(&id);
+                if let Ok(mut senders) = self.senders.lock() {
+                    senders.remove(&id);
+                }
             }
         }
-
-        for subscription_config in current {
-            if !self.configs.contains_key(&subscription_config.unique_id()) {
-                self.add(subscription_config.clone()).await?;
+        for config in current {
+            if !self.configs.contains_key(&config.unique_id()) {
+                self.add(config.clone()).await?;
             }
         }
         Ok(())
@@ -1544,251 +1509,68 @@ impl LiveSubscriptionSet {
 
     async fn add(&mut self, config: SubscriptionDataConfig) -> Result<()> {
         let id = config.unique_id();
-        tracing::info!(
-            "subscribing live market data for {} ({:?} {:?})",
-            config.symbol,
-            config.resolution,
-            config.tick_type
-        );
-        let data_type = WireDataType::try_from(SubscriptionSpec::from(&config).data_type)
-            .map_err(|value| anyhow::anyhow!("unknown live data type {value}"))?;
-        let (remote_id, mut stream) = self.transport.subscribe_live(&config).await?;
         let (sender, receiver) = rlean_data::live_data_channel();
-        let live_config = config.clone();
-        let symbol = config.symbol.clone();
-        let task = tokio::spawn(async move {
-            while let Some(batch) = stream.next().await {
-                match batch {
-                    Ok(batch) => {
-                        match decode_batch(data_type, batch, &live_config.symbol)
-                            .and_then(|batch| live_items(batch, &live_config))
-                        {
-                            Ok(items) => {
-                                for item in items {
-                                    if sender.send(Ok(item)).is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            // A single undecodable batch is a hard data error:
-                            // note it and keep the subscription alive rather than
-                            // tearing it down over one bad message.
-                            Err(error) => {
-                                tracing::error!(
-                                    symbol = %symbol,
-                                    "skipping undecodable live batch: {error}"
-                                );
-                            }
-                        }
-                    }
-                    // A stream error is the sidecar session dropping (restart,
-                    // crash-loop). End the task; dropping `sender` disconnects the
-                    // channel, which the runner observes and re-establishes.
-                    Err(error) => {
-                        tracing::warn!(
-                            symbol = %symbol,
-                            "live data stream ended; runner will re-establish it: {error}"
-                        );
-                        return;
-                    }
-                }
-            }
-            // Stream ended cleanly (sidecar closed the exchange). Returning drops
-            // `sender`, so the runner sees the drop and reconnects.
-        });
-        let subscription = LiveDataSubscription::new(
-            rlean_data::LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
-            receiver,
+        self.provider
+            .subscribe(LiveSubscription {
+                id,
+                configuration: config.clone(),
+            })
+            .await?;
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.insert(
+                id,
+                ProviderSubscriptionSender {
+                    config: config.clone(),
+                    sender,
+                },
+            );
+        }
+        self.market.insert(
+            id,
+            LiveDataSubscription::new(
+                rlean_data::LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
+                receiver,
+            ),
         );
         self.configs.insert(id, config);
-        self.remote_ids.insert(id, remote_id);
-        self.tasks.insert(id, task);
-        self.market.insert(id, subscription);
-        Ok(())
-    }
-
-    /// Re-establish the sidecar session after it dropped, then re-register every
-    /// currently-desired subscription on the fresh session.
-    ///
-    /// Reconnection uses bounded exponential backoff (1s → 60s cap) and retries a
-    /// restarting sidecar forever — the sidecar restarting is a normal event.
-    /// Only the subscriptions still in `configs` are re-registered, so anything
-    /// the algorithm removed during downtime is not resurrected. Fresh remote ids
-    /// are minted for the new session; the old session's ids died with it, so no
-    /// subscription is duplicated. The slice synchronizer's frontier is untouched,
-    /// so algorithm time never moves backward across a reconnect.
-    #[cfg(test)]
-    async fn reconnect(&mut self) -> Result<()> {
-        self.begin_reconnect().await??;
-        self.finish_reconnect().await
-    }
-
-    /// Start only the potentially unbounded transport recovery. The runner
-    /// keeps this join handle off its data/schedule loop, matching LEAN's
-    /// independent real-time handler.
-    fn begin_reconnect(&self) -> tokio::task::JoinHandle<Result<()>> {
-        let transport = self.transport.clone();
-        let failed_epoch = self.session_epoch;
-        tokio::spawn(async move {
-            let policy = rlean_live::ReconnectPolicy::sidecar_session();
-            let mut attempt: u32 = 0;
-            loop {
-                match transport.reconnect_session(failed_epoch).await {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        if !is_transient_sidecar_error(&error) {
-                            return Err(
-                                error.context("live sidecar reconnect failed and is not retryable")
-                            );
-                        }
-                        attempt = attempt.saturating_add(1);
-                        let delay = policy.delay_for_attempt(attempt - 1);
-                        tracing::warn!(
-                            attempt,
-                            delay_secs = delay.as_secs(),
-                            "live sidecar session down; retrying reconnect: {error}"
-                        );
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        })
-    }
-
-    /// Re-register the desired subscriptions after transport recovery.
-    async fn finish_reconnect(&mut self) -> Result<()> {
-        // Snapshot the desired set before we start; removals during downtime have
-        // already dropped their entries from `configs`.
-        let desired: Vec<SubscriptionDataConfig> = self.configs.values().cloned().collect();
-
-        // Abort the drained forwarding tasks and clear the dead session's state.
-        for (_, task) in self.tasks.drain() {
-            task.abort();
-        }
-        self.remote_ids.clear();
-        self.market.clear();
-        self.configs.clear();
-
-        let mut resubscribed = 0usize;
-        for config in desired {
-            self.add(config).await?;
-            resubscribed += 1;
-        }
-        self.session_epoch = self.transport.session_epoch();
-        tracing::warn!(
-            resubscribed,
-            session_epoch = self.session_epoch,
-            "re-established live sidecar subscriptions after reconnect"
-        );
         Ok(())
     }
 
     async fn unsubscribe_all(&mut self) {
-        self.configs.clear();
-        for (_, task) in self.tasks.drain() {
-            task.abort();
-        }
-        let remote_ids: Vec<_> = self.remote_ids.drain().map(|(_, id)| id).collect();
-        for remote_id in remote_ids {
-            if let Err(error) = self.transport.remove_subscription(remote_id).await {
-                tracing::warn!(
-                    "failed to unsubscribe live sidecar subscription {remote_id}: {error}"
-                );
+        let ids: Vec<u64> = self.configs.keys().copied().collect();
+        for id in ids {
+            if let Err(error) = self.provider.unsubscribe(id).await {
+                tracing::warn!(subscription_id = id, %error, "failed to unsubscribe live provider");
             }
         }
+        self.configs.clear();
         self.market.clear();
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.clear();
+        }
+        self.dispatcher.abort();
     }
 }
 
-fn live_items(
-    batch: CanonicalDataBatch,
+fn native_live_items(
+    batch: HistoricalData,
     config: &SubscriptionDataConfig,
 ) -> anyhow::Result<Vec<LiveDataItem>> {
     Ok(match batch {
-        CanonicalDataBatch::TradeBars(rows) => rows
+        HistoricalData::TradeBars(rows) => rows
             .into_iter()
             .map(|mut bar| {
                 bar.venue.get_or_insert_with(|| config.venue.clone());
                 LiveDataItem::TradeBar(bar)
             })
             .collect(),
-        CanonicalDataBatch::QuoteBars(rows) => rows
+        HistoricalData::QuoteBars(rows) => rows
             .into_iter()
             .map(|mut bar| {
                 bar.venue.get_or_insert_with(|| config.venue.clone());
                 LiveDataItem::QuoteBar(bar)
             })
             .collect(),
-        CanonicalDataBatch::Ticks(rows) => rows
-            .into_iter()
-            .map(|mut tick| {
-                tick.venue.get_or_insert_with(|| config.venue.clone());
-                LiveDataItem::Tick(tick)
-            })
-            .collect(),
-        CanonicalDataBatch::Custom(rows) => {
-            let source_type = config
-                .custom
-                .as_ref()
-                .map(|value| value.source_type.clone())
-                .unwrap_or_default();
-            let ticker = config
-                .custom
-                .as_ref()
-                .map(|value| value.ticker.clone())
-                .unwrap_or_else(|| config.symbol.value.to_string());
-            rows.into_iter()
-                .map(|mut point| {
-                    point.venue.get_or_insert_with(|| config.venue.clone());
-                    LiveDataItem::CustomData {
-                        symbol: config.symbol.clone(),
-                        source_type: source_type.clone(),
-                        ticker: ticker.clone(),
-                        point,
-                    }
-                })
-                .collect()
-        }
-        CanonicalDataBatch::Universe(mut rows) => {
-            for point in &mut rows {
-                point.venue.get_or_insert_with(|| config.venue.clone());
-            }
-            let Some(time) = rows.first().map(|point| point.time) else {
-                return Ok(Vec::new());
-            };
-            let custom = config.custom.as_ref();
-            vec![LiveDataItem::UniverseData {
-                source_type: custom
-                    .map(|value| value.source_type.clone())
-                    .unwrap_or_default(),
-                ticker: custom
-                    .map(|value| value.ticker.clone())
-                    .unwrap_or_else(|| config.symbol.value.to_string()),
-                resolution: config.resolution,
-                time,
-                data: rows,
-            }]
-        }
-        CanonicalDataBatch::Fundamentals(rows) => {
-            let Some(time) = rows.first().map(|row| row.end_time) else {
-                return Ok(Vec::new());
-            };
-            vec![LiveDataItem::FundamentalUniverseData { time, data: rows }]
-        }
-        CanonicalDataBatch::OptionUniverse(rows) => {
-            let time = rlean_core::DateTime::now();
-            crate::option_universe::option_chains_from_rows(config, rows)?
-                .into_iter()
-                .map(|(_, chain)| LiveDataItem::OptionChainData {
-                    time,
-                    canonical_permtick: config.symbol.permtick.to_string(),
-                    chain: Arc::new(chain),
-                })
-                .collect()
-        }
-        CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
-            anyhow::bail!("unsupported canonical live batch type")
-        }
     })
 }
 
@@ -1935,217 +1717,5 @@ mod unmanaged_liquidation_tests {
             algorithm.portfolio.get_holding(&symbol).last_price,
             dec!(45.23)
         );
-    }
-}
-
-#[cfg(test)]
-mod sidecar_reconnect_tests {
-    use super::*;
-    use rlean_core::{DataNormalizationMode, Market, Resolution, Symbol};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::Mutex as StdMutex;
-    use tokio_stream::wrappers::ReceiverStream;
-
-    fn equity_config(ticker: &str) -> SubscriptionDataConfig {
-        SubscriptionDataConfig::new_equity(
-            Symbol::create_equity(ticker, &Market::usa()),
-            Resolution::Minute,
-            DataNormalizationMode::Adjusted,
-        )
-    }
-
-    /// Test double for the sidecar transport. Records every subscribe/remove and
-    /// can be told to fail a bounded number of session reconnects (a crash-loop)
-    /// before recovering, or to fail permanently (a hard/auth failure).
-    struct FakeTransport {
-        reconnect_calls: AtomicUsize,
-        session_epoch: AtomicU64,
-        next_remote_id: AtomicU64,
-        subscribe_log: StdMutex<Vec<String>>,
-        remove_log: StdMutex<Vec<u64>>,
-        reconnects_to_fail: AtomicUsize,
-        hard_fail: bool,
-    }
-
-    impl FakeTransport {
-        fn new() -> Self {
-            Self {
-                reconnect_calls: AtomicUsize::new(0),
-                session_epoch: AtomicU64::new(0),
-                next_remote_id: AtomicU64::new(1000),
-                subscribe_log: StdMutex::new(Vec::new()),
-                remove_log: StdMutex::new(Vec::new()),
-                reconnects_to_fail: AtomicUsize::new(0),
-                hard_fail: false,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LiveFeedTransport for FakeTransport {
-        fn session_epoch(&self) -> u64 {
-            self.session_epoch.load(AtomicOrdering::SeqCst)
-        }
-
-        async fn reconnect_session(&self, failed_epoch: u64) -> Result<()> {
-            if self.session_epoch() != failed_epoch {
-                return Ok(());
-            }
-            self.reconnect_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            if self.hard_fail {
-                return Err(anyhow::anyhow!("invalid Flight authorization metadata"));
-            }
-            if self.reconnects_to_fail.load(AtomicOrdering::SeqCst) > 0 {
-                self.reconnects_to_fail.fetch_sub(1, AtomicOrdering::SeqCst);
-                return Err(anyhow::anyhow!("Flight exchange closed"));
-            }
-            self.session_epoch.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(())
-        }
-
-        async fn subscribe_live(
-            &self,
-            config: &SubscriptionDataConfig,
-        ) -> Result<(u64, rlean_data_sidecar::DataBatchStream)> {
-            self.subscribe_log
-                .lock()
-                .unwrap()
-                .push(config.symbol.value.to_string());
-            let remote_id = self.next_remote_id.fetch_add(1, AtomicOrdering::SeqCst);
-            // An empty, immediately-ended stream: the runner's forwarding task
-            // exits at once, which is all these reconnect assertions need.
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            drop(tx);
-            Ok((remote_id, ReceiverStream::new(rx)))
-        }
-
-        async fn remove_subscription(&self, remote_id: u64) -> Result<()> {
-            self.remove_log.lock().unwrap().push(remote_id);
-            Ok(())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnect_resubscribes_all_with_fresh_remote_ids() {
-        let transport = Arc::new(FakeTransport::new());
-        let configs = vec![equity_config("SPY"), equity_config("QQQ")];
-        let mut set = LiveSubscriptionSet::subscribe_initial(transport.clone(), &configs)
-            .await
-            .unwrap();
-        let remote_ids_before: HashSet<u64> = set.remote_ids.values().copied().collect();
-        assert_eq!(remote_ids_before.len(), 2);
-
-        set.reconnect().await.unwrap();
-
-        assert_eq!(transport.reconnect_calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(set.configs.len(), 2);
-        assert_eq!(set.market.len(), 2);
-        assert_eq!(set.remote_ids.len(), 2);
-        // Fresh remote ids after reconnect: the old session's ids died with it,
-        // so nothing is double-subscribed under a stale id.
-        let remote_ids_after: HashSet<u64> = set.remote_ids.values().copied().collect();
-        assert!(remote_ids_after.is_disjoint(&remote_ids_before));
-        // Two initial subscribes plus two resubscribes.
-        assert_eq!(transport.subscribe_log.lock().unwrap().len(), 4);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn subscription_removed_during_downtime_is_not_resurrected() {
-        let transport = Arc::new(FakeTransport::new());
-        let configs = vec![equity_config("SPY"), equity_config("QQQ")];
-        let mut set = LiveSubscriptionSet::subscribe_initial(transport.clone(), &configs)
-            .await
-            .unwrap();
-        // The algorithm dropped QQQ; the desired set is now just SPY.
-        set.sync(&[equity_config("SPY")]).await.unwrap();
-        assert_eq!(set.configs.len(), 1);
-
-        set.reconnect().await.unwrap();
-
-        assert_eq!(set.configs.len(), 1);
-        assert_eq!(set.market.len(), 1);
-        let resubscribed: Vec<String> = set
-            .configs
-            .values()
-            .map(|config| config.symbol.value.to_string())
-            .collect();
-        assert_eq!(resubscribed, vec!["SPY".to_string()]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnect_retries_through_a_sidecar_crash_loop() {
-        let transport = Arc::new(FakeTransport::new());
-        transport
-            .reconnects_to_fail
-            .store(3, AtomicOrdering::SeqCst);
-        let configs = vec![equity_config("SPY")];
-        let mut set = LiveSubscriptionSet::subscribe_initial(transport.clone(), &configs)
-            .await
-            .unwrap();
-
-        set.reconnect().await.unwrap();
-
-        // Three transient failures then success: four attempts total.
-        assert_eq!(transport.reconnect_calls.load(AtomicOrdering::SeqCst), 4);
-        assert_eq!(set.market.len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnect_surfaces_non_transient_failures() {
-        let mut transport = FakeTransport::new();
-        transport.hard_fail = true;
-        let transport = Arc::new(transport);
-        let configs = vec![equity_config("SPY")];
-        let mut set = LiveSubscriptionSet::subscribe_initial(transport.clone(), &configs)
-            .await
-            .unwrap();
-
-        let result = set.reconnect().await;
-        assert!(
-            result.is_err(),
-            "a hard/auth failure must not retry forever"
-        );
-        assert_eq!(transport.reconnect_calls.load(AtomicOrdering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn stale_stream_owner_adopts_newer_session_generation() {
-        let transport = FakeTransport::new();
-
-        transport.reconnect_session(0).await.unwrap();
-        assert_eq!(transport.session_epoch(), 1);
-        transport.reconnect_session(0).await.unwrap();
-
-        assert_eq!(
-            transport.reconnect_calls.load(AtomicOrdering::SeqCst),
-            1,
-            "a brokerage stream failing after data reconnected must not churn the fresh session"
-        );
-        assert_eq!(transport.session_epoch(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnect_retry_does_not_own_the_live_clock() {
-        let transport = Arc::new(FakeTransport::new());
-        transport
-            .reconnects_to_fail
-            .store(usize::MAX, AtomicOrdering::SeqCst);
-        let set = LiveSubscriptionSet::subscribe_initial(transport, &[equity_config("SPY")])
-            .await
-            .unwrap();
-        let reconnect = set.begin_reconnect();
-        tokio::task::yield_now().await;
-        assert!(
-            !reconnect.is_finished(),
-            "the simulated sidecar remains unavailable"
-        );
-
-        let mut pulses = LiveTimePulse::new(rlean_core::DateTime::from_secs(100));
-        assert_eq!(
-            pulses.next(rlean_core::DateTime::from_secs(101)),
-            Some(rlean_core::DateTime::from_secs(101)),
-            "wall-clock scheduling must continue while sidecar recovery retries"
-        );
-        reconnect.abort();
     }
 }
