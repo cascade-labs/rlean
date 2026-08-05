@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::stream;
 use rlean_engine::{BacktestProgress, BacktestRunResult};
 use serde_json::Value;
-use verglas_sdk::{Client, ColumnSpec, ConnectOptions, TableDefinition};
+use verglas_sdk::{Client, ColumnSpec, TableDefinition};
 
 const RUNS: &str = "rlean.runs";
 const PROGRESS: &str = "rlean.run_progress";
@@ -35,13 +35,11 @@ pub(crate) struct RunCatalog {
 
 impl RunCatalog {
     pub(crate) async fn connect(
+        client: Client,
         run_id: String,
         strategy: String,
         parameters: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let client = Client::connect(ConnectOptions::from_env())
-            .await
-            .context("connect to the Verglas catalog through the local cache")?;
         let catalog = Self {
             client,
             run_id,

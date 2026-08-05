@@ -10,6 +10,7 @@ use rlean_data_providers::{
     MassiveHistoricalDataProvider, VerglasHistoricalDataStore,
 };
 use rlean_data_sidecar::{DataSidecarClient, DataSidecarConfig};
+use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
 use crate::cli::RunArgs;
 use crate::config;
@@ -54,6 +55,7 @@ pub(crate) async fn connect_data_sidecar(
 
 pub(crate) async fn historical_data_provider(
     args: &RunArgs,
+    verglas: Option<VerglasClient>,
 ) -> Result<Option<Arc<dyn HistoricalDataProvider>>> {
     let Some(name) = args
         .data_provider_historical
@@ -82,13 +84,38 @@ pub(crate) async fn historical_data_provider(
         }
         other => bail!("unsupported historical data provider '{other}'"),
     };
-    let store = Arc::new(VerglasHistoricalDataStore::from_env().await?);
+    let client = verglas.ok_or_else(|| {
+        anyhow::anyhow!("historical data providers require a connected Verglas SDK client")
+    })?;
+    let store = Arc::new(VerglasHistoricalDataStore::new(client).await?);
     let provider = CacheFirstHistoryProvider::new(store, vec![provider])?;
     tracing::info!(
         provider = name,
         "Configured cache-first historical data provider"
     );
     Ok(Some(Arc::new(provider)))
+}
+
+/// Connects once to the configured Verglas gateway. The SDK discovers the
+/// catalog, query, and write services and applies one bearer token to all of
+/// them. Environment values override the persisted machine configuration.
+pub(crate) async fn connect_verglas(global_config: &config::GlobalConfig) -> Result<VerglasClient> {
+    let endpoint = std::env::var("VERGLAS_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_endpoint.clone())
+        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned());
+    let token = std::env::var("VERGLAS_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_token.clone());
+    let mut options = ConnectOptions::new(endpoint.clone());
+    if let Some(token) = token {
+        options = options.with_token(token);
+    }
+    VerglasClient::connect(options)
+        .await
+        .with_context(|| format!("connect to Verglas gateway at {endpoint}"))
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {

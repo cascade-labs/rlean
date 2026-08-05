@@ -55,7 +55,16 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 
 ## Data backend
 
-Backtests and live runs receive canonical Arrow batches from a persistent Apache Arrow Flight sidecar session. rlean registers subscriptions; backtests issue bounded range queries against those subscriptions, while live batches are pushed unsolicited by the sidecar. rlean has no market-data storage backend or local cache; persistence is entirely the sidecar's responsibility.
+Historical providers, live providers, and brokerages are selected independently.
+Historical reads are cache-first through the Verglas Rust SDK: rlean queries the
+canonical tables, requests uncovered ranges from the selected provider, and
+persists provider-neutral Arrow batches before consuming them. A single SDK
+connection discovers the catalog, query, and write services from the configured
+Verglas gateway.
+
+Custom and private integrations can still use the persistent Apache Arrow
+Flight sidecar session. Strategy SDK calls remain the source of subscription
+intent.
 
 ### Sidecar config
 
@@ -73,8 +82,16 @@ Plaintext `grpc://` is loopback-only. Remote services use
 `tradier.access_token` are stored in `~/.rlean/integration-configs.json` and
 passed opaquely to the selected sidecar connection.
 
-Storage and catalog configuration belongs to the sidecar. The rlean client
-only needs `data_sidecar` and, when required, `data_sidecar_token`.
+Configure Verglas once per machine. The token is stored masked in CLI output
+and is applied by the SDK to every service discovered from the gateway:
+
+```sh
+rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_token <token>
+```
+
+rlean never receives object-store credentials and does not configure catalog,
+query, or write endpoints separately.
 
 ## Tables
 
@@ -253,7 +270,7 @@ The release workflow builds one `rlean-<version>-<triple>.tar.gz` per supported 
 
 ## Quick start
 
-### 1. Configure the data sidecar
+### 1. Configure data services
 
 A backtest and live run both use a persistent Arrow Flight sidecar session.
 Configure its local or remote endpoint first:
@@ -265,6 +282,14 @@ rlean config set data_sidecar grpc://127.0.0.1:7410
 If the service requires authentication, also set `data_sidecar_token`. Vendor
 credentials use dotted integration keys and are stored separately in
 `~/.rlean/integration-configs.json`.
+
+Configure the one Verglas gateway used by cache-first historical providers and
+durable run results:
+
+```sh
+rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_token <token>
+```
 
 ### 2. Create a workspace and project
 

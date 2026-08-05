@@ -8,6 +8,8 @@ use crate::config::{GlobalConfig, IntegrationConfigs, WorkspaceConfig};
 ///   default-language            python | csharp
 ///   data_sidecar                Arrow Flight sidecar endpoint (e.g. grpc://127.0.0.1:7410)
 ///   data_sidecar_token          Optional sidecar authentication token
+///   verglas_endpoint            Verglas SDK gateway (e.g. http://127.0.0.1:8334)
+///   verglas_token               Verglas bearer token for all discovered services
 ///   artifact_store              Run artifact relay mode: local | s3 | mirror
 ///   artifact_s3                 Artifact destination: s3://bucket/prefix
 ///   artifact_s3_endpoint        Artifact endpoint URL
@@ -96,6 +98,16 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
                 println!("Set {key} = {value} in ~/.rlean/config");
             }
         }
+        "verglas_endpoint" | "verglas_token" => {
+            let mut cfg = GlobalConfig::load()?;
+            set_verglas_key(&mut cfg, key, value.to_string())?;
+            cfg.save()?;
+            if key == "verglas_token" {
+                println!("Set {key} in ~/.rlean/config");
+            } else {
+                println!("Set {key} = {value} in ~/.rlean/config");
+            }
+        }
         "artifact_store" => {
             if rlean_engine::ArtifactStoreMode::parse(value).is_none() {
                 bail!(
@@ -148,6 +160,14 @@ fn cmd_get(key: &str) -> Result<()> {
                 None => println!("(not set)"),
             }
         }
+        "verglas_endpoint" | "verglas_token" => {
+            let cfg = GlobalConfig::load()?;
+            match get_verglas_key(&cfg, key)? {
+                Some(value) if key == "verglas_token" => println!("{}", mask(value)),
+                Some(value) => println!("{value}"),
+                None => println!("(not set)"),
+            }
+        }
         "artifact_store" => {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
@@ -181,6 +201,12 @@ fn cmd_list() -> Result<()> {
     }
     if let Some(token) = global.data_sidecar_token.as_deref() {
         println!("{:<30} {}", "data_sidecar_token", mask(token));
+    }
+    if let Some(endpoint) = global.verglas_endpoint.as_deref() {
+        println!("{:<30} {}", "verglas_endpoint", endpoint);
+    }
+    if let Some(token) = global.verglas_token.as_deref() {
+        println!("{:<30} {}", "verglas_token", mask(token));
     }
     if let Some(mode) = &global.artifact_store {
         println!("{:<30} {}", "artifact_store", mode);
@@ -241,10 +267,28 @@ fn mask(s: &str) -> String {
 fn unknown_key_message(key: &str) -> String {
     format!(
         "Unknown key '{key}'. Known keys: default-language, data_sidecar, data_sidecar_token, \
+         verglas_endpoint, verglas_token, \
          artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
          artifact_s3_access_key, artifact_s3_secret_key. \
          Use <integration>.<key> for sidecar integration config (e.g. thetadata.api_key)."
     )
+}
+
+fn set_verglas_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
+    match key {
+        "verglas_endpoint" => cfg.verglas_endpoint = Some(value),
+        "verglas_token" => cfg.verglas_token = Some(value),
+        _ => bail!("unknown Verglas config key '{key}'"),
+    }
+    Ok(())
+}
+
+fn get_verglas_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
+    match key {
+        "verglas_endpoint" => Ok(cfg.verglas_endpoint.as_deref()),
+        "verglas_token" => Ok(cfg.verglas_token.as_deref()),
+        _ => bail!("unknown Verglas config key '{key}'"),
+    }
 }
 
 fn set_sidecar_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {

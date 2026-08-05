@@ -47,6 +47,22 @@ pub struct GlobalConfig {
     )]
     pub data_sidecar_token: Option<String>,
 
+    /// Verglas gateway used for canonical queries, writes, and catalog access.
+    #[serde(
+        default,
+        rename = "verglas_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verglas_endpoint: Option<String>,
+
+    /// Bearer token used by the Verglas SDK for every discovered endpoint.
+    #[serde(
+        default,
+        rename = "verglas_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verglas_token: Option<String>,
+
     // ── Run artifact relay (backtest/live run dirs → S3) ──────────────────────
     /// Where run artifacts are written: `local` (default), `s3`, or `mirror`.
     #[serde(

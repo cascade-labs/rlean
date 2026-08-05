@@ -3,7 +3,7 @@ use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{Array, RecordBatch};
 use clap::{Args, Subcommand};
 use futures::TryStreamExt;
-use verglas_sdk::{Client, ConnectOptions};
+use verglas_sdk::Client;
 
 #[derive(Args)]
 pub(crate) struct RunsArgs {
@@ -29,7 +29,8 @@ enum RunsCommand {
 }
 
 pub(crate) async fn run(args: RunsArgs) -> Result<()> {
-    let client = Client::connect(ConnectOptions::from_env())
+    let config = crate::config::GlobalConfig::load()?;
+    let client = crate::runtime::connect_verglas(&config)
         .await
         .context("connect to the Verglas catalog through the local cache")?;
     match args.command {

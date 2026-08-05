@@ -61,7 +61,12 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let data_sidecar = connect_data_sidecar(&args, &global_config)
         .await?
         .ok_or_else(|| anyhow::anyhow!("live trading requires --data-sidecar"))?;
-    let historical_provider = historical_data_provider(&args).await?;
+    let verglas = if args.data_provider_historical.is_some() {
+        Some(crate::runtime::connect_verglas(&global_config).await?)
+    } else {
+        None
+    };
+    let historical_provider = historical_data_provider(&args, verglas).await?;
 
     let live_data_feed = args
         .live_data_feed

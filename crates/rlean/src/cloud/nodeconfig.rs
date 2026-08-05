@@ -32,6 +32,8 @@ pub(crate) fn node_config_from_local(
         default_language: local.default_language.clone(),
         data_sidecar: local.data_sidecar.clone(),
         data_sidecar_token: local.data_sidecar_token.clone(),
+        verglas_endpoint: local.verglas_endpoint.clone(),
+        verglas_token: local.verglas_token.clone(),
         artifact_store: Some("mirror".to_string()),
         artifact_s3: local.artifact_s3.clone(),
         artifact_s3_endpoint: artifact_endpoint
@@ -53,6 +55,8 @@ mod tests {
             default_language: "python".to_string(),
             data_sidecar: None,
             data_sidecar_token: None,
+            verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            verglas_token: Some("vgk_test".to_string()),
             // Local operator runs artifact_store=local but supplies artifact creds.
             artifact_store: Some("local".to_string()),
             artifact_s3: Some("s3://runs-bucket/rlean".to_string()),
@@ -86,6 +90,11 @@ mod tests {
         );
         assert_eq!(node.artifact_s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(node.artifact_s3_access_key.as_deref(), Some("AKIA_ART"));
+        assert_eq!(
+            node.verglas_endpoint.as_deref(),
+            Some("http://127.0.0.1:8334")
+        );
+        assert_eq!(node.verglas_token.as_deref(), Some("vgk_test"));
         assert_eq!(node.artifact_s3_secret_key.as_deref(), Some("SECRET_ART"));
     }
 
@@ -123,6 +132,8 @@ mod tests {
         assert!(!json.contains("\"s3_endpoint\""));
         // The artifact credentials DO carry over (proving it's not just absent).
         assert!(json.contains("\"artifact_s3_access_key\": \"AKIA_ART\""));
+        assert!(json.contains("\"verglas_endpoint\": \"http://127.0.0.1:8334\""));
+        assert!(json.contains("\"verglas_token\": \"vgk_test\""));
         // Round-trips back through GlobalConfig identically.
         let reparsed: GlobalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(reparsed.artifact_store.as_deref(), Some("mirror"));

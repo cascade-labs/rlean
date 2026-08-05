@@ -6,7 +6,7 @@ use rlean_data_sidecar::DataSidecarClient;
 use crate::cli::RunArgs;
 use crate::config;
 use crate::runtime::{
-    backtest_progress_bar, connect_data_sidecar, ensure_python_baseline_packages,
+    backtest_progress_bar, connect_data_sidecar, connect_verglas, ensure_python_baseline_packages,
     historical_data_provider, parse_algorithm_parameters_for_strategy, strategy_name_from_path,
     validate_strategy_path,
 };
@@ -29,18 +29,20 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
     validate_strategy_path(&args.strategy)?;
 
     let global_config = config::GlobalConfig::load()?;
+    let verglas = connect_verglas(&global_config).await?;
     let data_sidecar = connect_data_sidecar(&args, &global_config)
         .await?
         .ok_or_else(|| anyhow::anyhow!("backtests require --data-sidecar"))?;
-    let historical_provider = historical_data_provider(&args).await?;
+    let historical_provider = historical_data_provider(&args, Some(verglas.clone())).await?;
 
-    run_strategy_backtest(args, data_sidecar, historical_provider).await
+    run_strategy_backtest(args, data_sidecar, historical_provider, verglas).await
 }
 
 async fn run_strategy_backtest(
     args: RunArgs,
     data_sidecar: Arc<DataSidecarClient>,
     historical_provider: Option<Arc<dyn rlean_data_providers::HistoricalDataProvider>>,
+    verglas: verglas_sdk::Client,
 ) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
 
@@ -66,8 +68,13 @@ async fn run_strategy_backtest(
 
     let strategy_name = strategy_name_from_path(&args.strategy);
     let run_id = format!("bt-{}", uuid::Uuid::new_v4());
-    let run_catalog =
-        crate::run_catalog::RunCatalog::connect(run_id, strategy_name.clone(), &parameters).await?;
+    let run_catalog = crate::run_catalog::RunCatalog::connect(
+        verglas,
+        run_id,
+        strategy_name.clone(),
+        &parameters,
+    )
+    .await?;
     run_catalog.record_started().await?;
 
     // Progress is committed in bounded Arrow batches on a background task so
