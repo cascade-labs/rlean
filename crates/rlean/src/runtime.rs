@@ -6,15 +6,15 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rlean_brokerages::{
-    Brokerage, TradierBrokerage, TradierBrokerageConfig,
+    Brokerage, HttpBrokerage, HttpBrokerageConfig, TradierBrokerage, TradierBrokerageConfig,
     TradierEnvironment as TradierBrokerageEnvironment,
 };
 use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
     CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
     MassiveHistoricalDataProvider, MassiveLiveConfig, MassiveLiveDataProvider,
-    TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider, TradierMarketDataConfig,
-    VerglasHistoricalDataStore,
+    RoutedLiveDataProvider, TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider,
+    TradierMarketDataConfig, VerglasCustomLiveDataProvider, VerglasHistoricalDataStore,
 };
 use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
@@ -71,20 +71,23 @@ pub(crate) async fn historical_data_provider(
     Ok(Arc::new(provider))
 }
 
-pub(crate) fn live_data_provider(args: &RunArgs) -> Result<Arc<dyn LiveDataProvider>> {
+pub(crate) async fn live_data_provider(
+    args: &RunArgs,
+    verglas: VerglasClient,
+) -> Result<Arc<dyn LiveDataProvider>> {
     let name = args
         .live_data_feed
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
-    match name {
+    let market: Arc<dyn LiveDataProvider> = match name {
         "massive" => {
             let integration = config::IntegrationConfigs::load()?.get_integration("massive");
             let api_key = required_string(&integration, "api_key", "massive")?;
-            Ok(Arc::new(MassiveLiveDataProvider::new(
-                MassiveLiveConfig::new(api_key),
-            )?))
+            Arc::new(MassiveLiveDataProvider::new(MassiveLiveConfig::new(
+                api_key,
+            ))?)
         }
         "tradier" => {
             let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
@@ -93,12 +96,16 @@ pub(crate) fn live_data_provider(args: &RunArgs) -> Result<Arc<dyn LiveDataProvi
                 Some("paper") | Some("sandbox") => TradierDataEnvironment::Paper,
                 _ => TradierDataEnvironment::Live,
             };
-            Ok(Arc::new(TradierLiveDataProvider::new(
-                TradierMarketDataConfig::new(token, environment),
-            )?))
+            Arc::new(TradierLiveDataProvider::new(TradierMarketDataConfig::new(
+                token,
+                environment,
+            ))?)
         }
         other => bail!("unsupported live data provider '{other}'"),
-    }
+    };
+    let custom: Arc<dyn LiveDataProvider> =
+        Arc::new(VerglasCustomLiveDataProvider::new(verglas).await?);
+    Ok(Arc::new(RoutedLiveDataProvider::new(market, custom)))
 }
 
 pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Brokerage>>> {
@@ -112,6 +119,17 @@ pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Broke
         return Ok(None);
     }
     match name {
+        "http" => {
+            let url = args
+                .brokerage_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("HTTP brokerage requires --brokerage-url"))?;
+            Ok(Some(Box::new(HttpBrokerage::new(
+                HttpBrokerageConfig::new(url, args.brokerage_account.clone()),
+            )?)))
+        }
         "tradier" | "tradierbrokerage" => {
             let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
             let token = required_string(&integration, "access_token", "tradier")?;

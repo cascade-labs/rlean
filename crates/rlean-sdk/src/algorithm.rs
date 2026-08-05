@@ -455,6 +455,10 @@ impl AlgorithmHandle {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_warm_up_int(n, resolution);
     }
 
+    pub fn set_warm_up_span(&self, span: TimeSpan, resolution: Option<Resolution>) {
+        AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_warm_up_span(span, resolution);
+    }
+
     pub fn set_warm_up(&self, n: i64, resolution: Option<Resolution>) {
         self.set_warm_up_int(n, resolution);
     }
@@ -1123,8 +1127,31 @@ impl AlgorithmHandle {
     }
 
     #[pyo3(name = "set_warm_up", signature = (n, resolution=None))]
-    fn py_set_warm_up(&self, n: i64, resolution: Option<crate::types::Resolution>) {
-        self.set_warm_up(n, resolution.map(Into::into));
+    fn py_set_warm_up(
+        &self,
+        n: &pyo3::Bound<'_, pyo3::PyAny>,
+        resolution: Option<crate::types::Resolution>,
+    ) -> pyo3::PyResult<()> {
+        let resolution = resolution.map(Into::into);
+        if let Ok(duration) = n.extract::<chrono::Duration>() {
+            let nanos = duration.num_nanoseconds().ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err("warm-up duration is out of range")
+            })?;
+            if nanos <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "warm-up duration must be positive",
+                ));
+            }
+            self.set_warm_up_span(TimeSpan::from_nanos(nanos), resolution);
+            return Ok(());
+        }
+        let bars = n.extract::<i64>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "set_warm_up expects a bar count or datetime.timedelta",
+            )
+        })?;
+        self.set_warm_up_int(bars, resolution);
+        Ok(())
     }
 
     #[pyo3(name = "market_order", signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=None))]
@@ -1589,13 +1616,11 @@ impl<'a> AlgorithmApi<'a> {
     }
 
     pub fn set_warm_up_int(&mut self, n: i64, resolution: Option<Resolution>) {
-        if resolution.is_some() || n > 365 {
-            self.algorithm
-                .set_warm_up_bars_with_resolution(n.max(0) as usize, resolution);
-        } else {
-            let nanos = n * 86_400 * 1_000_000_000i64;
-            self.algorithm.set_warm_up(TimeSpan::from_nanos(nanos));
-        }
+        // C# LEAN's SetWarmUp(int, Resolution?) overload always interprets
+        // the integer as a bar count. Calendar durations use the distinct
+        // TimeSpan overload exposed to Python as datetime.timedelta.
+        self.algorithm
+            .set_warm_up_bars_with_resolution(n.max(0) as usize, resolution);
     }
 
     pub fn add_equity_with_normalization(

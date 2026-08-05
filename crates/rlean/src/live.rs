@@ -59,8 +59,8 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     let global_config = config::GlobalConfig::load()?;
     let verglas = connect_verglas(&global_config).await?;
-    let historical_provider = historical_data_provider(&args, verglas).await?;
-    let live_data_provider = live_data_provider(&args)?;
+    let historical_provider = historical_data_provider(&args, verglas.clone()).await?;
+    let live_data_provider = live_data_provider(&args, verglas).await?;
 
     let requested_brokerage = args
         .brokerage
@@ -90,7 +90,11 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     } else {
         Some(requested_brokerage.to_string())
     };
-    let brokerage_model = live_brokerage_model_for_name(requested_brokerage)?;
+    let brokerage_model_name = brokerage
+        .as_deref()
+        .and_then(rlean_brokerages::Brokerage::brokerage_model)
+        .unwrap_or(requested_brokerage);
+    let brokerage_model = live_brokerage_model_for_name(brokerage_model_name)?;
 
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 

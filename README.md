@@ -167,7 +167,9 @@ Pass `--brokerage <name>` (or `paper` for simulated fills) and select a
 `--live-data-feed`. For brokerages with multiple accounts, pass
 `--brokerage-account <account-id>`; the selected account is persisted with that
 deployment and restored by `rleand`. Live data and brokerage operations use
-independent native connections. Strategy SDK calls create and remove symbol
+independent native connections. Use `--brokerage http --brokerage-url <URL>`
+for a private execution service implementing the
+[HTTP brokerage contract](docs/http-brokerage.md). Strategy SDK calls create and remove symbol
 subscriptions; live events are pushed by the selected provider.
 
 Historical market data can be selected independently with

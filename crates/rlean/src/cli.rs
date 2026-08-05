@@ -90,6 +90,11 @@ pub(crate) struct RuntimeArgs {
     #[arg(long, env = "RLEAN_BROKERAGE")]
     pub(crate) brokerage: Option<String>,
 
+    /// Base URL implementing rlean's HTTP brokerage contract. Required when
+    /// --brokerage http is selected.
+    #[arg(long, env = "RLEAN_BROKERAGE_URL")]
+    pub(crate) brokerage_url: Option<String>,
+
     /// Brokerage account identifier for this live deployment. This is passed
     /// to the selected brokerage when the connection is opened.
     #[arg(long, env = "RLEAN_BROKERAGE_ACCOUNT")]

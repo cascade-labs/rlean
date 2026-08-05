@@ -44,5 +44,15 @@ Custom data retains its original named payload in `fields_json`, with stable
 `symbol_sid`/`symbol_value`. `end_time_ns` is the availability frontier and the
 point must not reach a strategy before it.
 
+For live custom data, rlean follows commits to `rlean.custom_points` through
+the Verglas Rust SDK. A commit is only a wake-up signal: rlean queries the
+durable rows separately for each active strategy subscription, pushing its
+provider, feed, venue, symbols, resolution, and time frontier into the query,
+then applies the remaining custom field predicates before adding points to
+`Slice.custom`. Removing the strategy subscription removes that delivery
+route. If a self-hosted catalog does not expose the optional commit feed, rlean
+polls the same subscription-filtered durable frontiers; it never falls back to
+calling the custom-data vendor.
+
 Factor and map rows use the same cache-first provider path as market
 data. They are not files read directly by a strategy process.

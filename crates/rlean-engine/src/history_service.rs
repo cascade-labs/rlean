@@ -458,6 +458,7 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
     columns.insert("end_time".to_string(), Vec::with_capacity(points.len()));
     columns.insert("value".to_string(), Vec::with_capacity(points.len()));
     columns.insert("venue".to_string(), Vec::with_capacity(points.len()));
+    columns.insert("fields_json".to_string(), Vec::with_capacity(points.len()));
     for point in points {
         columns
             .get_mut("time")
@@ -475,6 +476,10 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
             .get_mut("venue")
             .unwrap()
             .push(point.venue.clone().unwrap_or_default());
+        columns
+            .get_mut("fields_json")
+            .unwrap()
+            .push(serde_json::to_string(point.fields.as_ref()).unwrap_or_else(|_| "{}".into()));
     }
     columns
 }
@@ -565,6 +570,29 @@ mod tests {
                 volume: dec!(1),
             },
         )
+    }
+
+    #[test]
+    fn custom_history_preserves_provider_fields() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "net_premium_imbalance".to_string(),
+            serde_json::json!(1234.5),
+        );
+        let point = CustomDataPoint {
+            time: DateTime::from_secs(1_700_000_000),
+            end_time: DateTime::from_secs(1_700_000_060),
+            value: dec!(1234.5),
+            venue: Some("unusual_whales".to_string()),
+            symbol: None,
+            fields: Arc::new(fields),
+        };
+
+        let columns = custom_points_to_columns(&[point]);
+        let decoded: serde_json::Value =
+            serde_json::from_str(&columns["fields_json"][0]).expect("valid fields JSON");
+
+        assert_eq!(decoded["net_premium_imbalance"], serde_json::json!(1234.5));
     }
 
     /// A `tracing` writer that captures emitted events into a shared buffer so a

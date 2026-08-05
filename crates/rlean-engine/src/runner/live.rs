@@ -1578,6 +1578,20 @@ fn native_live_items(
                 LiveDataItem::Tick(tick)
             })
             .collect(),
+        HistoricalData::CustomPoints(rows) => {
+            let custom = config
+                .custom
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("custom live data has no subscription metadata"))?;
+            rows.into_iter()
+                .map(|point| LiveDataItem::CustomData {
+                    symbol: config.symbol.clone(),
+                    source_type: custom.source_type.clone(),
+                    ticker: custom.ticker.clone(),
+                    point,
+                })
+                .collect()
+        }
         HistoricalData::OptionUniverse(rows) => {
             crate::option_universe::option_chains_from_rows(config, rows)?
                 .into_iter()

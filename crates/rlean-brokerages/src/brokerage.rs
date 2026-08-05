@@ -23,6 +23,12 @@ pub struct BrokerageTransaction {
 /// Interface that every brokerage (paper, IB, Alpaca, etc.) implements.
 pub trait Brokerage: Send + Sync {
     fn name(&self) -> &str;
+    /// LEAN brokerage model advertised by this execution adapter. Transport
+    /// adapters use this to keep order and buying-power semantics independent
+    /// from the URL or process serving the brokerage API.
+    fn brokerage_model(&self) -> Option<&str> {
+        None
+    }
     fn is_connected(&self) -> bool;
     /// Returns true when the brokerage adapter should be exercised for
     /// order validation/state, but fills should be generated locally.

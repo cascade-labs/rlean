@@ -376,8 +376,17 @@ async fn produce_native(
             if frontier < start || frontier > end {
                 continue;
             }
+            // LEAN SubscriptionDataReader permits equal EndTime values for
+            // custom data because they can be independent events. Ordinary
+            // non-tick market data still rejects equal frontiers.
             let out_of_order_or_duplicate = last_real_frontier
-                .map(|last| frontier <= last)
+                .map(|last| {
+                    if config.data_kind == rlean_data::SubscriptionDataKind::Custom {
+                        frontier < last
+                    } else {
+                        frontier <= last
+                    }
+                })
                 .unwrap_or(false);
             if out_of_order_or_duplicate && !config.resolution.is_tick() {
                 continue;
@@ -466,14 +475,26 @@ fn native_points(
                 SubscriptionDataPoint::Tick(tick)
             })
             .collect()),
+        HistoricalData::CustomPoints(rows) => {
+            let metadata = config.custom.as_ref().ok_or_else(|| {
+                LeanError::DataError("custom history response has no subscription metadata".into())
+            })?;
+            Ok(rows
+                .into_iter()
+                .map(|point| SubscriptionDataPoint::CustomData {
+                    symbol: config.symbol.clone(),
+                    ticker: metadata.ticker.clone(),
+                    point,
+                })
+                .collect())
+        }
         HistoricalData::OptionUniverse(rows) => {
             let chains = crate::option_universe::option_chains_from_rows(config, rows)
                 .map_err(data_error)?;
             Ok(chains
                 .into_iter()
                 .filter_map(|(date, chain)| {
-                    let frontier_date = date.succ_opt()?;
-                    let frontier_time = partition_day_start(frontier_date);
+                    let frontier_time = option_chain_frontier(config, date)?;
                     Some(SubscriptionDataPoint::OptionChain {
                         canonical_permtick: config
                             .option_chain
@@ -689,6 +710,25 @@ fn partition_day_start(date: chrono::NaiveDate) -> DateTime {
     DateTime::from(date.and_hms_opt(0, 0, 0).expect("valid day start"))
 }
 
+/// LEAN's `BaseChainUniverseData.EndTime` is the following midnight in the
+/// option exchange's time zone. The synchronizer operates in UTC, so emitting
+/// UTC midnight would deliver a US chain on the prior local calendar date and
+/// make same-day expiry filters see an empty chain.
+fn option_chain_frontier(
+    config: &SubscriptionDataConfig,
+    source_date: chrono::NaiveDate,
+) -> Option<DateTime> {
+    let frontier_date = source_date.succ_opt()?;
+    let exchange_symbol = config
+        .symbol
+        .underlying
+        .as_deref()
+        .unwrap_or(&config.symbol);
+    MarketHoursDatabase::global()
+        .exchange_hours(exchange_symbol)
+        .local_midnight_utc(frontier_date)
+}
+
 fn partition_day_end(date: chrono::NaiveDate) -> DateTime {
     DateTime::from(date.and_hms_opt(23, 59, 59).expect("valid day end"))
 }
@@ -870,6 +910,48 @@ mod tests {
         assert_eq!(
             effective_subscription_end(&config, requested_end),
             requested_end
+        );
+    }
+
+    #[test]
+    fn option_chain_frontier_is_following_exchange_local_midnight() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::MIN,
+            dec!(0),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+
+        let frontier = option_chain_frontier(
+            &config,
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 18).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            frontier,
+            DateTime::from(
+                chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                    .unwrap()
+                    .and_hms_opt(4, 0, 0)
+                    .unwrap()
+            )
         );
     }
 

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use reqwest::{Client, StatusCode, Url};
 use rlean_core::{
     DateTime, MarketHoursDatabase, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType,
@@ -13,19 +15,47 @@ use rlean_data::SubscriptionDataKind;
 use rlean_data_tables::{
     Bar, FactorFileEntry, MapFileEntry, OptionUniverseRow, QuoteBar, Tick, TradeBar,
 };
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::{HistoricalData, HistoricalDataProvider, HistoryRequest};
+use crate::{HistoricalData, HistoricalDataProvider, HistoryRequest, TimeRange};
 
 const DEFAULT_BASE_URL: &str = "https://api.massive.com";
 const DEFAULT_REQUESTS_PER_SECOND: f64 = 5.0;
 const MAX_RETRIES: usize = 5;
+const QUOTE_DAY_CONCURRENCY: usize = 8;
 const MARKET_DATA_START: &str = "2003-09-10";
 const AUXILIARY_SENTINEL: &str = "2050-12-31";
+
+pub(crate) fn massive_ticker(symbol: &Symbol) -> String {
+    match symbol.security_type() {
+        SecurityType::Option | SecurityType::IndexOption => {
+            let id = &symbol.id;
+            let underlying = symbol
+                .underlying()
+                .map(|underlying| underlying.permtick())
+                .unwrap_or(symbol.permtick());
+            let expiry = id
+                .expiry
+                .map(|date| date.format("%y%m%d").to_string())
+                .unwrap_or_default();
+            let right = match id.option_right {
+                Some(rlean_core::OptionRight::Put) => "P",
+                _ => "C",
+            };
+            let strike = id
+                .strike
+                .and_then(|value| (value * Decimal::from(1000)).round().to_i64())
+                .unwrap_or_default();
+            format!("O:{underlying}{expiry}{right}{strike:08}")
+        }
+        SecurityType::Index => format!("I:{}", symbol.permtick()),
+        _ => symbol.permtick().to_string(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MassiveConfig {
@@ -41,7 +71,7 @@ impl MassiveConfig {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             requests_per_second: DEFAULT_REQUESTS_PER_SECOND,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(120),
         }
     }
 }
@@ -57,6 +87,23 @@ struct RateLimiter {
     interval: Duration,
     next_allowed: Mutex<Instant>,
 }
+
+#[derive(Debug)]
+struct MassiveEntitlementError {
+    url: String,
+}
+
+impl fmt::Display for MassiveEntitlementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Massive subscription does not include {}",
+            self.url
+        )
+    }
+}
+
+impl std::error::Error for MassiveEntitlementError {}
 
 impl RateLimiter {
     fn new(requests_per_second: f64) -> Self {
@@ -92,7 +139,12 @@ impl MassiveHistoricalDataProvider {
         }
         let client = Client::builder()
             .timeout(config.timeout)
-            .pool_max_idle_per_host(8)
+            .gzip(true)
+            // Massive's cursor endpoint closes long quote responses instead
+            // of maintaining a reusable connection. Do not put those sockets
+            // back into the shared idle pool.
+            .http1_only()
+            .pool_max_idle_per_host(0)
             .build()
             .context("build Massive HTTP client")?;
         let limiter = Arc::new(RateLimiter::new(config.requests_per_second));
@@ -105,7 +157,7 @@ impl MassiveHistoricalDataProvider {
 
     async fn trade_bars(&self, request: &HistoryRequest) -> Result<Vec<TradeBar>> {
         let (timespan, period) = resolution(request.configuration.resolution)?;
-        let ticker = &request.configuration.symbol.permtick;
+        let ticker = massive_ticker(&request.configuration.symbol);
         let mut url = Url::parse(&format!(
             "{}/v2/aggs/ticker/{ticker}/range/1/{timespan}/{}/{}",
             self.config.base_url.trim_end_matches('/'),
@@ -117,7 +169,20 @@ impl MassiveHistoricalDataProvider {
             .append_pair("sort", "asc")
             .append_pair("limit", "50000");
 
-        let mut rows: Vec<Aggregate> = self.paginated(url).await?;
+        let mut rows: Vec<Aggregate> = match self.paginated(url).await {
+            Ok(rows) => rows,
+            Err(error)
+                if request.configuration.symbol.security_type() == SecurityType::Equity
+                    && error.downcast_ref::<MassiveEntitlementError>().is_some() =>
+            {
+                tracing::warn!(
+                    symbol = %request.configuration.symbol,
+                    "Massive plan does not include historical equity aggregates; using any cached trade bars"
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
         rows.sort_by_key(|row| row.timestamp_ms);
         let exchange_hours =
             MarketHoursDatabase::global().exchange_hours(&request.configuration.symbol);
@@ -158,7 +223,50 @@ impl MassiveHistoricalDataProvider {
         if request.configuration.resolution == Resolution::Tick {
             bail!("Massive QuoteBar history requires Second or coarser resolution");
         }
-        let ticker = &request.configuration.symbol.permtick;
+
+        // Massive exposes raw NBBO updates, not aggregate quote bars. A single
+        // SPY request can contain millions of records and hundreds of cursor
+        // pages. Keep pagination ordered within each UTC day, but fetch a
+        // bounded number of independent days concurrently. The shared rate
+        // limiter still enforces the configured account request rate.
+        let results = stream::iter(daily_ranges(request.range))
+            .map(|range| async move {
+                let daily_request = request.with_range(range);
+                self.quote_bar_accumulators(&daily_request).await
+            })
+            .buffer_unordered(QUOTE_DAY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut bars = BTreeMap::new();
+        for result in results {
+            match result {
+                Ok(mut daily) => bars.append(&mut daily),
+                Err(error)
+                    if request.configuration.symbol.security_type() == SecurityType::Equity
+                        && error.downcast_ref::<MassiveEntitlementError>().is_some() =>
+                {
+                    // LEAN treats an unavailable auxiliary/default subscription
+                    // as an empty stream. AddEquity(Minute) creates both trade
+                    // and quote configs, so a stocks plan without historical
+                    // NBBO entitlement must not kill the usable trade stream or
+                    // an otherwise-entitled options backtest.
+                    tracing::warn!(
+                        symbol = %request.configuration.symbol,
+                        "Massive plan does not include historical equity quotes; continuing with the equity trade stream"
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(quote_bars_from_accumulators(request, bars))
+    }
+
+    async fn quote_bar_accumulators(
+        &self,
+        request: &HistoryRequest,
+    ) -> Result<BTreeMap<i64, QuoteAccumulator>> {
+        let ticker = massive_ticker(&request.configuration.symbol);
         let mut url = Url::parse(&format!(
             "{}/v3/quotes/{ticker}",
             self.config.base_url.trim_end_matches('/')
@@ -169,13 +277,38 @@ impl MassiveHistoricalDataProvider {
             .append_pair("sort", "timestamp")
             .append_pair("order", "asc")
             .append_pair("limit", "50000");
-        let mut quotes: Vec<Quote> = self.paginated(url).await?;
-        quotes.sort_by_key(Quote::timestamp_ns);
-        aggregate_quotes(request, quotes)
+
+        // The Massive quotes endpoint returns raw NBBO updates rather than
+        // pre-aggregated QuoteBars. Aggregate each page directly so a liquid
+        // symbol such as SPY does not retain an entire multi-day raw stream.
+        let mut bars = BTreeMap::new();
+        let mut next = Some(url);
+        while let Some(mut url) = next.take() {
+            if !url.query_pairs().any(|(key, _)| key == "apiKey") {
+                url.query_pairs_mut()
+                    .append_pair("apiKey", &self.config.api_key);
+            }
+            let response: Paginated<Quote> = self.get_json(url).await?;
+            if response.status.eq_ignore_ascii_case("ERROR") {
+                bail!(
+                    "Massive request failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+            }
+            aggregate_quote_updates(request, response.results.unwrap_or_default(), &mut bars)?;
+            next = response
+                .next_url
+                .filter(|value| !value.is_empty())
+                .map(|value| Url::parse(&value))
+                .transpose()?;
+        }
+        Ok(bars)
     }
 
     async fn ticks(&self, request: &HistoryRequest) -> Result<Vec<Tick>> {
-        let ticker = &request.configuration.symbol.permtick;
+        let ticker = massive_ticker(&request.configuration.symbol);
         match request.configuration.tick_type {
             TickType::Trade => {
                 let mut url = Url::parse(&format!(
@@ -236,13 +369,19 @@ impl MassiveHistoricalDataProvider {
                         time >= request.range.start && time < request.range.end
                     })
                     .map(|row| {
+                        let bid_price = row
+                            .bid_price
+                            .context("Massive quote is missing bid_price")?;
+                        let ask_price = row
+                            .ask_price
+                            .context("Massive quote is missing ask_price")?;
                         let mut tick = Tick::quote(
                             request.configuration.symbol.clone(),
                             NanosecondTimestamp(row.timestamp_ns()),
-                            decimal(row.bid_price)?,
-                            decimal(row.ask_price)?,
-                            decimal(row.bid_size)?,
-                            decimal(row.ask_size)?,
+                            decimal(bid_price)?,
+                            decimal(ask_price)?,
+                            decimal(row.bid_size.unwrap_or_default())?,
+                            decimal(row.ask_size.unwrap_or_default())?,
                         )
                         .with_venue(request.configuration.venue.clone());
                         tick.exchange = match (row.bid_exchange, row.ask_exchange) {
@@ -284,6 +423,21 @@ impl MassiveHistoricalDataProvider {
                 date = date.succ_opt().context("option-universe date overflow")?;
                 continue;
             }
+            // LEAN's BaseChainUniverseData for `date` is emitted at the next
+            // midnight and OptionFilterUniverse evaluates expiry relative to
+            // the next tradable session. Push that exact expiry window into
+            // Massive so a 0DTE strategy does not download every future SPY
+            // contract for every source date.
+            let mut selection_date = date.succ_opt().context("option selection date overflow")?;
+            while exchange_hours.session_bounds(selection_date).is_none() {
+                selection_date = selection_date
+                    .succ_opt()
+                    .context("option selection date overflow")?;
+            }
+            let min_expiration =
+                selection_date + chrono::Duration::days(i64::from(metadata.filter.min_expiry_days));
+            let max_expiration =
+                selection_date + chrono::Duration::days(i64::from(metadata.filter.max_expiry_days));
             let mut url = Url::parse(&format!(
                 "{}/v3/reference/options/contracts",
                 self.config.base_url.trim_end_matches('/')
@@ -291,12 +445,15 @@ impl MassiveHistoricalDataProvider {
             url.query_pairs_mut()
                 .append_pair("underlying_ticker", &metadata.underlying_ticker)
                 .append_pair("as_of", &date.to_string())
-                .append_pair("expired", "true")
-                .append_pair("expiration_date.gte", &date.to_string())
+                .append_pair("expiration_date.gte", &min_expiration.to_string())
+                .append_pair("expiration_date.lte", &max_expiration.to_string())
                 .append_pair("order", "asc")
                 .append_pair("limit", "1000");
             let contracts: Vec<OptionContractReference> = self.paginated(url).await?;
-            let underlying_close = self.daily_close(&metadata.underlying_ticker, date).await?;
+            // The Options plan does not imply the Stocks aggregates plan.
+            // VerglasHistoricalDataStore joins the canonical underlying
+            // TradeBar close into this sentinel row when the chain is read.
+            let underlying_close = Decimal::ZERO;
             rows.push(OptionUniverseRow {
                 date,
                 market: request.configuration.symbol.market().as_str().to_string(),
@@ -360,21 +517,6 @@ impl MassiveHistoricalDataProvider {
             date = date.succ_opt().context("option-universe date overflow")?;
         }
         Ok(rows)
-    }
-
-    async fn daily_close(&self, ticker: &str, date: chrono::NaiveDate) -> Result<Decimal> {
-        let mut url = Url::parse(&format!(
-            "{}/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}",
-            self.config.base_url.trim_end_matches('/')
-        ))?;
-        url.query_pairs_mut()
-            .append_pair("adjusted", "false")
-            .append_pair("limit", "1");
-        let rows: Vec<Aggregate> = self.paginated(url).await?;
-        rows.first()
-            .map(|row| decimal(row.close))
-            .transpose()
-            .map(Option::unwrap_or_default)
     }
 
     async fn factor_file(&self, symbol: &Symbol) -> Result<Vec<FactorFileEntry>> {
@@ -504,17 +646,46 @@ impl MassiveHistoricalDataProvider {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
+        let safe_url = redacted_url(&url);
         let mut delay = Duration::from_millis(250);
         for attempt in 0..=MAX_RETRIES {
             self.limiter.wait().await;
-            let response = self.client.get(url.clone()).send().await;
+            let response = self
+                .client
+                .get(url.clone())
+                .header(reqwest::header::CONNECTION, "close")
+                .send()
+                .await;
             match response {
-                Ok(response) if response.status().is_success() => {
-                    return response
-                        .json()
-                        .await
-                        .with_context(|| format!("decode Massive response from {url}"));
-                }
+                Ok(response) if response.status().is_success() => match response.bytes().await {
+                    Ok(bytes) => match serde_json::from_slice(&bytes) {
+                        Ok(value) => return Ok(value),
+                        Err(error) if attempt < MAX_RETRIES => {
+                            tracing::warn!(
+                                attempt,
+                                bytes = bytes.len(),
+                                error = %error,
+                                "retrying malformed Massive response"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("decode Massive response from {safe_url}")
+                            });
+                        }
+                    },
+                    Err(error) if attempt < MAX_RETRIES => {
+                        tracing::warn!(
+                            attempt,
+                            timeout = error.is_timeout(),
+                            "retrying incomplete Massive response body"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(error.without_url())
+                            .with_context(|| format!("read Massive response from {safe_url}"));
+                    }
+                },
                 Ok(response)
                     if (response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error())
@@ -522,18 +693,62 @@ impl MassiveHistoricalDataProvider {
                 Ok(response) => {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    bail!("Massive request {url} failed with HTTP {status}: {body}");
+                    if status == StatusCode::FORBIDDEN && body.contains("NOT_AUTHORIZED") {
+                        return Err(MassiveEntitlementError {
+                            url: safe_url.clone(),
+                        }
+                        .into());
+                    }
+                    bail!("Massive request {safe_url} failed with HTTP {status}: {body}");
                 }
                 Err(error) if attempt < MAX_RETRIES => {
-                    tracing::warn!(attempt, %error, "retrying Massive request");
+                    tracing::warn!(
+                        attempt,
+                        timeout = error.is_timeout(),
+                        connect = error.is_connect(),
+                        "retrying Massive request"
+                    );
                 }
-                Err(error) => return Err(error).context("request Massive API"),
+                Err(error) => {
+                    return Err(error.without_url()).context("request Massive API");
+                }
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(8));
         }
         unreachable!("Massive retry loop always returns")
     }
+}
+
+fn redacted_url(url: &Url) -> String {
+    let mut safe = url.clone();
+    let query = safe
+        .query_pairs()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case("apiKey"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    safe.set_query(None);
+    if !query.is_empty() {
+        safe.query_pairs_mut().extend_pairs(query);
+    }
+    safe.to_string()
+}
+
+fn daily_ranges(range: TimeRange) -> Vec<TimeRange> {
+    let mut ranges = Vec::new();
+    let mut start = range.start;
+    while start < range.end {
+        let next_date = start
+            .date_utc()
+            .succ_opt()
+            .expect("Massive history date overflow");
+        let next_midnight =
+            DateTime::from(next_date.and_hms_opt(0, 0, 0).expect("valid UTC midnight"));
+        let end = next_midnight.min(range.end);
+        ranges.push(TimeRange { start, end });
+        start = end;
+    }
+    ranges
 }
 
 #[async_trait]
@@ -586,7 +801,18 @@ impl HistoricalDataProvider for MassiveHistoricalDataProvider {
     }
 }
 
+#[cfg(test)]
 fn aggregate_quotes(request: &HistoryRequest, quotes: Vec<Quote>) -> Result<Vec<QuoteBar>> {
+    let mut bars = BTreeMap::new();
+    aggregate_quote_updates(request, quotes, &mut bars)?;
+    Ok(quote_bars_from_accumulators(request, bars))
+}
+
+fn aggregate_quote_updates(
+    request: &HistoryRequest,
+    quotes: Vec<Quote>,
+    bars: &mut BTreeMap<i64, QuoteAccumulator>,
+) -> Result<()> {
     let period = request
         .configuration
         .resolution
@@ -598,7 +824,6 @@ fn aggregate_quotes(request: &HistoryRequest, quotes: Vec<Quote>) -> Result<Vec<
         .timezone
         .parse()
         .with_context(|| format!("invalid exchange timezone {}", exchange_hours.timezone))?;
-    let mut bars: BTreeMap<i64, QuoteAccumulator> = BTreeMap::new();
     for quote in quotes {
         let timestamp = NanosecondTimestamp(quote.timestamp_ns());
         if timestamp < request.range.start || timestamp >= request.range.end {
@@ -618,64 +843,103 @@ fn aggregate_quotes(request: &HistoryRequest, quotes: Vec<Quote>) -> Result<Vec<
             let start = NanosecondTimestamp(start_ns);
             (start, start + period)
         };
-        let bid = decimal(quote.bid_price)?;
-        let ask = decimal(quote.ask_price)?;
-        let bid_size = decimal(quote.bid_size)?;
-        let ask_size = decimal(quote.ask_size)?;
+        let bid = quote
+            .bid_price
+            .filter(|price| *price > 0.0)
+            .map(decimal)
+            .transpose()?;
+        let ask = quote
+            .ask_price
+            .filter(|price| *price > 0.0)
+            .map(decimal)
+            .transpose()?;
+        if bid.is_none() && ask.is_none() {
+            continue;
+        }
+        let bid_size = quote.bid_size.map(decimal).transpose()?;
+        let ask_size = quote.ask_size.map(decimal).transpose()?;
         bars.entry(start.0)
             .and_modify(|bar| bar.update(bid, ask, bid_size, ask_size))
             .or_insert_with(|| QuoteAccumulator::new(start, end, bid, ask, bid_size, ask_size));
     }
-    Ok(bars
-        .into_values()
+    Ok(())
+}
+
+fn quote_bars_from_accumulators(
+    request: &HistoryRequest,
+    bars: BTreeMap<i64, QuoteAccumulator>,
+) -> Vec<QuoteBar> {
+    bars.into_values()
         .filter(|bar| bar.end > request.range.start && bar.end <= request.range.end)
         .map(|bar| QuoteBar {
             symbol: request.configuration.symbol.clone(),
             venue: Some(request.configuration.venue.clone()),
             time: bar.start,
             end_time: bar.end,
-            bid: Some(bar.bid),
-            ask: Some(bar.ask),
-            last_bid_size: bar.bid_size,
-            last_ask_size: bar.ask_size,
+            bid: bar.bid,
+            ask: bar.ask,
+            last_bid_size: bar.bid_size.unwrap_or_default(),
+            last_ask_size: bar.ask_size.unwrap_or_default(),
             period: bar.end - bar.start,
         })
-        .collect())
+        .collect()
 }
 
 struct QuoteAccumulator {
     start: DateTime,
     end: DateTime,
-    bid: Bar,
-    ask: Bar,
-    bid_size: Decimal,
-    ask_size: Decimal,
+    bid: Option<Bar>,
+    ask: Option<Bar>,
+    bid_size: Option<Decimal>,
+    ask_size: Option<Decimal>,
 }
 
 impl QuoteAccumulator {
     fn new(
         start: DateTime,
         end: DateTime,
-        bid: Decimal,
-        ask: Decimal,
-        bid_size: Decimal,
-        ask_size: Decimal,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        bid_size: Option<Decimal>,
+        ask_size: Option<Decimal>,
     ) -> Self {
         Self {
             start,
             end,
-            bid: Bar::from_price(bid),
-            ask: Bar::from_price(ask),
+            bid: bid.map(Bar::from_price),
+            ask: ask.map(Bar::from_price),
             bid_size,
             ask_size,
         }
     }
 
-    fn update(&mut self, bid: Decimal, ask: Decimal, bid_size: Decimal, ask_size: Decimal) {
-        self.bid.update(bid);
-        self.ask.update(ask);
-        self.bid_size = bid_size;
-        self.ask_size = ask_size;
+    fn update(
+        &mut self,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        bid_size: Option<Decimal>,
+        ask_size: Option<Decimal>,
+    ) {
+        if let Some(bid) = bid {
+            if let Some(bar) = &mut self.bid {
+                bar.update(bid);
+            } else {
+                self.bid = Some(Bar::from_price(bid));
+            }
+        }
+        if let Some(ask) = ask {
+            if let Some(bar) = &mut self.ask {
+                bar.update(ask);
+            } else {
+                self.ask = Some(Bar::from_price(ask));
+            }
+        }
+        if bid_size.is_some() {
+            self.bid_size = bid_size;
+        }
+        if ask_size.is_some() {
+            self.ask_size = ask_size;
+        }
     }
 }
 
@@ -724,10 +988,14 @@ struct Quote {
     participant_timestamp: i64,
     #[serde(default)]
     sip_timestamp: i64,
-    bid_price: f64,
-    ask_price: f64,
-    bid_size: f64,
-    ask_size: f64,
+    #[serde(default)]
+    bid_price: Option<f64>,
+    #[serde(default)]
+    ask_price: Option<f64>,
+    #[serde(default)]
+    bid_size: Option<f64>,
+    #[serde(default)]
+    ask_size: Option<f64>,
     #[serde(default)]
     bid_exchange: Option<i64>,
     #[serde(default)]
@@ -1007,6 +1275,29 @@ mod tests {
     use rlean_data::SubscriptionDataConfig;
 
     #[test]
+    fn splits_raw_quote_requests_at_utc_day_boundaries() {
+        let start = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 6)
+                .unwrap()
+                .and_hms_opt(13, 30, 0)
+                .unwrap(),
+        );
+        let end = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8)
+                .unwrap()
+                .and_hms_opt(20, 0, 0)
+                .unwrap(),
+        );
+
+        let ranges = daily_ranges(TimeRange { start, end });
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.first().unwrap().start, start);
+        assert_eq!(ranges.last().unwrap().end, end);
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+    }
+
+    #[test]
     fn aggregates_quote_updates_into_one_minute_bar() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
         let mut config = SubscriptionDataConfig::new_equity(
@@ -1027,20 +1318,20 @@ mod tests {
                 Quote {
                     participant_timestamp: 61_000_000_000,
                     sip_timestamp: 0,
-                    bid_price: 100.0,
-                    ask_price: 101.0,
-                    bid_size: 10.0,
-                    ask_size: 11.0,
+                    bid_price: Some(100.0),
+                    ask_price: Some(101.0),
+                    bid_size: Some(10.0),
+                    ask_size: Some(11.0),
                     bid_exchange: None,
                     ask_exchange: None,
                 },
                 Quote {
                     participant_timestamp: 119_000_000_000,
                     sip_timestamp: 0,
-                    bid_price: 99.0,
-                    ask_price: 102.0,
-                    bid_size: 12.0,
-                    ask_size: 13.0,
+                    bid_price: Some(99.0),
+                    ask_price: Some(102.0),
+                    bid_size: Some(12.0),
+                    ask_size: Some(13.0),
                     bid_exchange: None,
                     ask_exchange: None,
                 },
@@ -1052,5 +1343,51 @@ mod tests {
         assert_eq!(bars[0].bid.as_ref().unwrap().low, Decimal::from(99));
         assert_eq!(bars[0].ask.as_ref().unwrap().high, Decimal::from(102));
         assert_eq!(bars[0].last_ask_size, Decimal::from(13));
+    }
+
+    #[test]
+    fn aggregates_one_sided_quote_updates_without_losing_the_other_side() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Raw,
+        );
+        config.set_tick_type(TickType::Quote);
+        let request = HistoryRequest::new(
+            config,
+            NanosecondTimestamp(60_000_000_000),
+            NanosecondTimestamp(180_000_000_000),
+        )
+        .unwrap();
+        let bars = aggregate_quotes(
+            &request,
+            vec![
+                Quote {
+                    participant_timestamp: 61_000_000_000,
+                    sip_timestamp: 0,
+                    bid_price: Some(100.0),
+                    ask_price: None,
+                    bid_size: Some(10.0),
+                    ask_size: None,
+                    bid_exchange: None,
+                    ask_exchange: None,
+                },
+                Quote {
+                    participant_timestamp: 62_000_000_000,
+                    sip_timestamp: 0,
+                    bid_price: None,
+                    ask_price: Some(101.0),
+                    bid_size: None,
+                    ask_size: Some(11.0),
+                    bid_exchange: None,
+                    ask_exchange: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].bid.as_ref().unwrap().close, Decimal::from(100));
+        assert_eq!(bars[0].ask.as_ref().unwrap().close, Decimal::from(101));
     }
 }

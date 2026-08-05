@@ -188,6 +188,8 @@ mod tests {
             "tradier",
             "--brokerage",
             "fidelity",
+            "--brokerage-url",
+            "http://127.0.0.1:5199",
             "--brokerage-account",
             "account-1234",
         ])
@@ -199,6 +201,7 @@ mod tests {
                 assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
                 assert_eq!(args.live_data_feed.as_deref(), Some("tradier"));
                 assert_eq!(args.brokerage.as_deref(), Some("fidelity"));
+                assert_eq!(args.brokerage_url.as_deref(), Some("http://127.0.0.1:5199"));
                 assert_eq!(args.brokerage_account.as_deref(), Some("account-1234"));
             }
             _ => panic!("expected live command"),

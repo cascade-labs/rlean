@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use futures::stream;
+use futures::{future::try_join_all, stream};
 use rlean_engine::{BacktestProgress, BacktestRunResult};
 use serde_json::Value;
 use verglas_sdk::{Client, ColumnSpec, TableDefinition};
@@ -79,34 +79,36 @@ impl RunCatalog {
     }
 
     pub(crate) async fn record_completed(&self, result: &BacktestRunResult) -> Result<()> {
-        self.append(ORDERS, orders_batch(&self.run_id, result)?, "orders")
-            .await?;
-        self.append(
-            ORDER_EVENTS,
-            order_events_batch(&self.run_id, result)?,
-            "order-events",
+        let artifacts = vec![
+            (ORDERS, orders_batch(&self.run_id, result)?, "orders"),
+            (
+                ORDER_EVENTS,
+                order_events_batch(&self.run_id, result)?,
+                "order-events",
+            ),
+            (TRADES, trades_batch(&self.run_id, result)?, "trades"),
+            (INSIGHTS, insights_batch(&self.run_id, result)?, "insights"),
+            (
+                STATISTICS,
+                statistics_batch(&self.run_id, result)?,
+                "statistics",
+            ),
+            (CHARTS, charts_batch(&self.run_id, result), "charts"),
+            (
+                DATA_REQUESTS,
+                data_requests_batch(&self.run_id, result),
+                "data-requests",
+            ),
+            (LOGS, summary_log_batch(&self.run_id, result), "summary-log"),
+        ];
+        try_join_all(
+            artifacts
+                .into_iter()
+                .map(|(table, batch, suffix)| self.append(table, batch, suffix)),
         )
         .await?;
-        self.append(TRADES, trades_batch(&self.run_id, result)?, "trades")
-            .await?;
-        self.append(INSIGHTS, insights_batch(&self.run_id, result)?, "insights")
-            .await?;
-        self.append(
-            STATISTICS,
-            statistics_batch(&self.run_id, result)?,
-            "statistics",
-        )
-        .await?;
-        self.append(CHARTS, charts_batch(&self.run_id, result), "charts")
-            .await?;
-        self.append(
-            DATA_REQUESTS,
-            data_requests_batch(&self.run_id, result),
-            "data-requests",
-        )
-        .await?;
-        self.append(LOGS, summary_log_batch(&self.run_id, result), "summary-log")
-            .await?;
+        // Publish the completed run row only after every dependent artifact is
+        // durable. The independent table writes above do not need to serialize.
         self.append(
             RUNS,
             runs_batch(self, "completed", Some(result), None),

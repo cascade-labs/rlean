@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use rlean_core::{DateTime, Symbol};
-use rlean_data::SubscriptionDataConfig;
+use rlean_data::{SubscriptionDataConfig, SubscriptionDataKind};
 use rlean_data_tables::{
-    FactorFileEntry, FundamentalUniverseRow, FutureUniverseRow, MapFileEntry, OptionUniverseRow,
-    QuoteBar, Tick, TradeBar,
+    CustomDataPoint, FactorFileEntry, FundamentalUniverseRow, FutureUniverseRow, MapFileEntry,
+    OptionUniverseRow, QuoteBar, Tick, TradeBar,
 };
 
 /// A half-open UTC range `[start, end)`.
@@ -59,6 +59,7 @@ pub enum HistoricalData {
     TradeBars(Vec<TradeBar>),
     QuoteBars(Vec<QuoteBar>),
     Ticks(Vec<Tick>),
+    CustomPoints(Vec<CustomDataPoint>),
     OptionUniverse(Vec<OptionUniverseRow>),
     FutureUniverse(Vec<FutureUniverseRow>),
     FundamentalUniverse(Vec<FundamentalUniverseRow>),
@@ -70,6 +71,7 @@ impl HistoricalData {
             Self::TradeBars(rows) => rows.is_empty(),
             Self::QuoteBars(rows) => rows.is_empty(),
             Self::Ticks(rows) => rows.is_empty(),
+            Self::CustomPoints(rows) => rows.is_empty(),
             Self::OptionUniverse(rows) => rows.is_empty(),
             Self::FutureUniverse(rows) => rows.is_empty(),
             Self::FundamentalUniverse(rows) => rows.is_empty(),
@@ -108,6 +110,10 @@ impl HistoricalData {
                         && left.quantity == right.quantity
                 });
             }
+            // LEAN custom data may contain several independent records at the
+            // same EndTime. Preserve all of them and only establish the
+            // monotonic ordering expected by SubscriptionDataReader.
+            Self::CustomPoints(rows) => rows.sort_by_key(|row| (row.end_time, row.time)),
             Self::OptionUniverse(rows) => {
                 rows.sort_by(|left, right| {
                     (left.date, &left.symbol_sid).cmp(&(right.date, &right.symbol_sid))
@@ -255,12 +261,23 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
     }
 
     fn supports(&self, request: &HistoryRequest) -> bool {
-        self.providers
-            .iter()
-            .any(|provider| provider.supports(request))
+        request.configuration.data_kind == SubscriptionDataKind::Custom
+            || self
+                .providers
+                .iter()
+                .any(|provider| provider.supports(request))
     }
 
     async fn get_history(&self, request: &HistoryRequest) -> Result<HistoricalData> {
+        // Custom data is produced and persisted by operator applications. It
+        // has no native market-data fallback: LEAN distinguishes custom
+        // subscriptions through SubscriptionDataConfig.IsCustomData and reads
+        // their declared source directly instead of asking the equity provider.
+        if request.configuration.data_kind == SubscriptionDataKind::Custom {
+            let mut data = self.store.read(request).await?;
+            data.sort_and_deduplicate();
+            return Ok(data);
+        }
         let provider = self
             .providers
             .iter()
@@ -329,6 +346,8 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
     use rlean_core::{DataNormalizationMode, Market, NanosecondTimestamp, Resolution, Symbol};
+    use rlean_data::{CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EmptyProvider {
@@ -359,6 +378,7 @@ mod tests {
     struct MemoryStore {
         coverage: Mutex<Coverage>,
         marks: AtomicUsize,
+        reads: AtomicUsize,
     }
 
     #[async_trait]
@@ -368,6 +388,7 @@ mod tests {
         }
 
         async fn read(&self, _request: &HistoryRequest) -> Result<HistoricalData> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(HistoricalData::TradeBars(Vec::new()))
         }
 
@@ -393,6 +414,34 @@ mod tests {
                 Symbol::create_equity("SPY", &Market::usa()),
                 Resolution::Daily,
                 DataNormalizationMode::Raw,
+            ),
+            NanosecondTimestamp(0),
+            NanosecondTimestamp(100),
+        )
+        .unwrap()
+    }
+
+    fn custom_request() -> HistoryRequest {
+        let source_type = "unusual_whales".to_string();
+        let ticker = "market_tide".to_string();
+        let query = CustomDataQuery::default();
+        let metadata = CustomSubscriptionMetadata {
+            source_type: source_type.clone(),
+            ticker: ticker.clone(),
+            config: CustomDataConfig {
+                ticker: ticker.clone(),
+                source_type: source_type.clone(),
+                resolution: Resolution::Minute,
+                properties: HashMap::new(),
+                query: query.clone(),
+            },
+            dynamic_query: query,
+        };
+        HistoryRequest::new(
+            SubscriptionDataConfig::new_custom(
+                Symbol::create_base(&source_type, &ticker, &Market::usa()),
+                Resolution::Minute,
+                metadata,
             ),
             NanosecondTimestamp(0),
             NanosecondTimestamp(100),
@@ -464,6 +513,24 @@ mod tests {
         assert!(coordinator.get_history(&request()).await.is_err());
         assert!(coordinator.get_history(&request()).await.is_err());
         assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(store.marks.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_data_reads_the_operator_table_without_calling_market_provider() {
+        let provider = Arc::new(EmptyProvider {
+            calls: AtomicUsize::new(0),
+            fail: true,
+        });
+        let store = Arc::new(MemoryStore::default());
+        let coordinator =
+            CacheFirstHistoryProvider::new(store.clone(), vec![provider.clone()]).unwrap();
+
+        assert!(coordinator.supports(&custom_request()));
+        coordinator.get_history(&custom_request()).await.unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.reads.load(Ordering::Relaxed), 1);
         assert_eq!(store.marks.load(Ordering::Relaxed), 0);
     }
 }

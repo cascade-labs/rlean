@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
 use rlean_core::{NanosecondTimestamp, Resolution, SecurityType, TickType, TimeSpan};
 use rlean_data_tables::{Bar, QuoteBar, Tick, TradeBar, TradeBarData};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::massive::massive_ticker;
 use crate::{
     HistoricalData, HistoricalDataProvider, HistoryRequest, LiveDataEvent, LiveDataProvider,
     LiveSubscription, MassiveConfig, MassiveHistoricalDataProvider,
@@ -579,33 +580,6 @@ fn number(value: &Value, key: &str) -> Result<Decimal> {
 }
 fn bucket(time: NanosecondTimestamp, period: TimeSpan) -> NanosecondTimestamp {
     NanosecondTimestamp(time.0.div_euclid(period.nanos) * period.nanos)
-}
-
-fn massive_ticker(symbol: &rlean_core::Symbol) -> String {
-    match symbol.security_type() {
-        SecurityType::Option | SecurityType::IndexOption => {
-            let id = &symbol.id;
-            let underlying = symbol
-                .underlying()
-                .map(|s| s.permtick())
-                .unwrap_or(symbol.permtick());
-            let expiry = id
-                .expiry
-                .map(|date| date.format("%y%m%d").to_string())
-                .unwrap_or_default();
-            let right = match id.option_right {
-                Some(rlean_core::OptionRight::Put) => "P",
-                _ => "C",
-            };
-            let strike = id
-                .strike
-                .and_then(|value| (value * Decimal::from(1000)).round().to_i64())
-                .unwrap_or_default();
-            format!("O:{underlying}{expiry}{right}{strike:08}")
-        }
-        SecurityType::Index => format!("I:{}", symbol.permtick()),
-        _ => symbol.permtick().to_string(),
-    }
 }
 
 #[cfg(test)]

@@ -341,6 +341,7 @@ assert insight.symbol in {spy_a}
     fn lean_indicator_helper_methods_are_exposed_in_snake_case() {
         run_python(
             r#"
+from datetime import timedelta
 from AlgorithmImports import QCAlgorithm, Resolution, MovingAverageType
 
 algo = QCAlgorithm()
@@ -381,6 +382,7 @@ assert rsi is not None
 assert momp is not None
 assert std is not None
 algo.set_warm_up(3, Resolution.Daily)
+algo.set_warm_up(timedelta(days=3))
 "#,
         );
     }
