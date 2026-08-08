@@ -1,8 +1,12 @@
-/// ~/.rlean/config and ~/.rlean/credentials management
+/// ~/.rlean/config management
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// Native providers that may store credentials under `providers` in ~/.rlean/config.
+pub const KNOWN_PROVIDERS: &[&str] = &["thetadata", "massive", "tradier", "fred"];
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -13,6 +17,10 @@ pub fn rlean_dir() -> Result<PathBuf> {
 
 pub fn config_path() -> Result<PathBuf> {
     Ok(rlean_dir()?.join("config"))
+}
+
+fn legacy_integration_configs_path() -> Result<PathBuf> {
+    Ok(rlean_dir()?.join("integration-configs.json"))
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -46,54 +54,9 @@ pub struct GlobalConfig {
     )]
     pub verglas_token: Option<String>,
 
-    // ── Run artifact relay (backtest/live run dirs → S3) ──────────────────────
-    /// Where run artifacts are written: `local` (default), `s3`, or `mirror`.
-    #[serde(
-        default,
-        rename = "artifact_store",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_store: Option<String>,
-
-    /// Destination for artifact uploads as `s3://bucket/prefix`.
-    #[serde(
-        default,
-        rename = "artifact_s3",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_s3: Option<String>,
-
-    /// Artifact store endpoint URL.
-    #[serde(
-        default,
-        rename = "artifact_s3_endpoint",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_s3_endpoint: Option<String>,
-
-    /// Artifact store region.
-    #[serde(
-        default,
-        rename = "artifact_s3_region",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_s3_region: Option<String>,
-
-    /// Artifact store access key.
-    #[serde(
-        default,
-        rename = "artifact_s3_access_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_s3_access_key: Option<String>,
-
-    /// Artifact store secret key.
-    #[serde(
-        default,
-        rename = "artifact_s3_secret_key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact_s3_secret_key: Option<String>,
+    /// Native provider credentials: `providers.<name>.<key>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, BTreeMap<String, String>>,
 
     /// Last workspace initialised with `rlean init`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,12 +70,18 @@ fn default_language() -> String {
 impl GlobalConfig {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut cfg = if path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            serde_json::from_str(&text)
+                .with_context(|| format!("Failed to parse {}", path.display()))?
+        } else {
+            Self::default()
+        };
+        if cfg.migrate_legacy_integration_configs()? {
+            cfg.save()?;
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
+        Ok(cfg)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -122,9 +91,96 @@ impl GlobalConfig {
         atomic_write(&path, &text)?;
         secure_owner_read_write(&path)
     }
+
+    /// Return a provider's stored settings (empty when not configured).
+    pub fn get_provider(&self, provider: &str) -> BTreeMap<String, String> {
+        self.providers.get(provider).cloned().unwrap_or_default()
+    }
+
+    /// Insert or overwrite a key in the given provider's config section.
+    pub fn set_provider_key(&mut self, provider: &str, key: &str, value: String) -> Result<()> {
+        ensure_known_provider(provider)?;
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+        Ok(())
+    }
+
+    /// One-time copy of allowlisted keys from the legacy integrations file.
+    ///
+    /// Returns true when the config was mutated and should be saved. The legacy
+    /// file is renamed to `integration-configs.json.bak` so secrets are kept.
+    fn migrate_legacy_integration_configs(&mut self) -> Result<bool> {
+        if !self.providers.is_empty() {
+            return Ok(false);
+        }
+        let legacy_path = legacy_integration_configs_path()?;
+        if !legacy_path.exists() {
+            return Ok(false);
+        }
+        let text = std::fs::read_to_string(&legacy_path)
+            .with_context(|| format!("Failed to read {}", legacy_path.display()))?;
+        let legacy: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(&text)
+                .with_context(|| format!("Failed to parse {}", legacy_path.display()))?;
+
+        let mut migrated = false;
+        for &provider in KNOWN_PROVIDERS {
+            let Some(section) = legacy.get(provider) else {
+                continue;
+            };
+            let mut entries = BTreeMap::new();
+            for (key, value) in section {
+                let Some(string) = json_value_as_config_string(value) else {
+                    continue;
+                };
+                entries.insert(key.clone(), string);
+            }
+            if !entries.is_empty() {
+                self.providers.insert(provider.to_string(), entries);
+                migrated = true;
+            }
+        }
+
+        let bak = legacy_path.with_extension("json.bak");
+        std::fs::rename(&legacy_path, &bak).with_context(|| {
+            format!(
+                "Failed to rename {} → {}",
+                legacy_path.display(),
+                bak.display()
+            )
+        })?;
+        // Rename even when no allowlisted keys were present so load stops
+        // seeing the legacy file. `migrated` only affects whether providers
+        // changed; either way the rename is a durable side effect and we
+        // persist the (possibly still empty) providers map.
+        let _ = migrated;
+        Ok(true)
+    }
 }
 
-// ── Credentials (~/.rlean/credentials) ────────────────────────────────────────
+pub fn ensure_known_provider(provider: &str) -> Result<()> {
+    if KNOWN_PROVIDERS.contains(&provider) {
+        return Ok(());
+    }
+    bail!(
+        "Unknown provider '{provider}'. Known providers: {}",
+        KNOWN_PROVIDERS.join(", ")
+    )
+}
+
+fn json_value_as_config_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
 
 // ── Workspace config (rlean.json) ─────────────────────────────────────────────
 
@@ -203,54 +259,6 @@ impl ProjectConfig {
     }
 }
 
-// ── Provider integration configs ───────────────────────────────────────────────
-
-pub fn integration_configs_path() -> Result<PathBuf> {
-    Ok(rlean_dir()?.join("integration-configs.json"))
-}
-
-/// Provider-specific credentials used by native integrations.
-///
-/// The outer map key is the integration name (for example `"thetadata"`).
-/// rlean never interprets the inner map.
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct IntegrationConfigs(
-    pub std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>,
-);
-
-impl IntegrationConfigs {
-    pub fn load() -> Result<Self> {
-        let path = integration_configs_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = integration_configs_path()?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let text = serde_json::to_string_pretty(&self.0)?;
-        atomic_write(&path, &text)?;
-        secure_owner_read_write(&path)
-    }
-
-    /// Return an integration's stored config map (empty when not configured).
-    pub fn get_integration(&self, integration: &str) -> serde_json::Map<String, serde_json::Value> {
-        self.0.get(integration).cloned().unwrap_or_default()
-    }
-
-    /// Insert or overwrite a key in the given integration's config section.
-    pub fn set_key(&mut self, integration: &str, key: &str, value: serde_json::Value) {
-        self.0
-            .entry(integration.to_string())
-            .or_default()
-            .insert(key.to_string(), value);
-    }
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write to a temp file then rename (atomic on same filesystem).
@@ -276,4 +284,55 @@ pub(crate) fn secure_owner_read_write(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn secure_owner_read_write(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_provider() {
+        assert!(ensure_known_provider("thetadata").is_ok());
+        assert!(ensure_known_provider("massive").is_ok());
+        assert!(ensure_known_provider("tradier").is_ok());
+        assert!(ensure_known_provider("fred").is_ok());
+        assert!(ensure_known_provider("fidelity").is_err());
+    }
+
+    #[test]
+    fn set_provider_key_writes_allowlisted_section() {
+        let mut cfg = GlobalConfig::default();
+        cfg.set_provider_key("thetadata", "api_key", "td-key".into())
+            .unwrap();
+        cfg.set_provider_key("thetadata", "max_concurrent", "4".into())
+            .unwrap();
+        assert!(cfg.set_provider_key("fidelity", "username", "x".into()).is_err());
+        assert_eq!(
+            cfg.get_provider("thetadata").get("api_key").map(String::as_str),
+            Some("td-key")
+        );
+        assert_eq!(
+            cfg.get_provider("thetadata")
+                .get("max_concurrent")
+                .map(String::as_str),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn json_value_as_config_string_coerces_scalars() {
+        assert_eq!(
+            json_value_as_config_string(&serde_json::json!("  key  ")).as_deref(),
+            Some("key")
+        );
+        assert_eq!(
+            json_value_as_config_string(&serde_json::json!(4)).as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            json_value_as_config_string(&serde_json::json!(true)).as_deref(),
+            Some("true")
+        );
+        assert_eq!(json_value_as_config_string(&serde_json::json!({})), None);
+    }
 }

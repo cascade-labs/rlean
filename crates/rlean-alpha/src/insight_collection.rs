@@ -307,11 +307,16 @@ impl InsightCollection {
 
     pub fn expire(&mut self, symbols: &[Symbol], utc_now: DateTime) -> Vec<Insight> {
         let mut expired = Vec::new();
+        // Match C# LEAN Insight.Expire: make the insight expired immediately at
+        // the current frontier. Insight.IsExpired uses a strict comparison, so
+        // assigning utc_now itself would leave it active for this time step.
+        let close_time = utc_now - rlean_core::TimeSpan::ONE_SECOND;
         for symbol in symbols {
             if let Some(symbol_insights) = self.insights.get_mut(&symbol.id.sid) {
                 for insight in symbol_insights.iter_mut() {
-                    if insight.close_time_utc > utc_now {
-                        insight.close_time_utc = utc_now;
+                    if insight.close_time_utc > close_time {
+                        insight.close_time_utc = close_time;
+                        insight.period = insight.close_time_utc - insight.generated_time_utc;
                     }
                     expired.push(insight.clone());
                 }

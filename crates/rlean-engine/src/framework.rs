@@ -366,6 +366,22 @@ impl FrameworkState {
         std::mem::take(&mut self.pending_insight_events)
     }
 
+    /// Cancel active insights for the supplied symbols, matching
+    /// C# LEAN `InsightManager.Cancel`.
+    pub fn cancel_insights(&mut self, symbols: &[Symbol], utc_now: DateTime) {
+        // LEAN does not remove canceled insights from InsightManager. It moves
+        // their close time into the past so the normal PCM expiry path emits a
+        // flat target on this framework time step. Removing them here leaves a
+        // retained ImmediateExecutionModel target alive and can reopen a
+        // position immediately after a scheduled liquidation.
+        let canceled = self.insights.expire(symbols, utc_now);
+        self.push_insight_events(InsightEventKind::Cancelled, utc_now, &canceled);
+        if !canceled.is_empty() {
+            self.pending_rebalance = true;
+            self.expose_insights(utc_now);
+        }
+    }
+
     pub fn take_target_updates(&mut self) -> Vec<(Symbol, Decimal)> {
         std::mem::take(&mut self.pending_target_updates)
     }
@@ -1064,6 +1080,91 @@ mod tests {
         // Insight lifetime remains owned by InsightCollection/alpha emissions.
         assert!(framework.insights.has_active(&symbol, now));
         assert!(framework.pending_flat_targets.is_empty());
+    }
+
+    #[test]
+    fn explicit_insight_cancellation_closes_active_state_and_requests_rebalance() {
+        let mut framework = FrameworkState::new();
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        framework
+            .insights
+            .add(Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now));
+
+        framework.cancel_insights(std::slice::from_ref(&symbol), now + TimeSpan::ONE_MINUTE);
+
+        assert!(!framework
+            .insights
+            .has_active(&symbol, now + TimeSpan::ONE_MINUTE));
+        assert!(framework.pending_rebalance);
+        assert!(framework.pending_insight_events.iter().any(|event| {
+            event.kind == InsightEventKind::Cancelled && event.insight.symbol == symbol
+        }));
+    }
+
+    #[test]
+    fn canceled_insight_overwrites_retained_immediate_execution_target_with_flat() {
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let security = SecurityData {
+            symbol: symbol.clone(),
+            price: Decimal::from(500),
+            bid: None,
+            ask: None,
+            volume: None,
+            vwap_price: None,
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(now),
+            lot_size: Decimal::ONE,
+            minimum_price_variation: Decimal::new(1, 2),
+            current_quantity: Decimal::ZERO,
+            open_order_quantity: Decimal::ZERO,
+        };
+        let securities = HashMap::from([(symbol.id.sid, security)]);
+        let open_orders = Vec::new();
+        let context = ExecutionContext::new(now, &securities, &open_orders, Decimal::from(100_000));
+        let prices = HashMap::from([(symbol.id.sid, Decimal::from(500))]);
+
+        let mut execution = ImmediateExecutionModel::new();
+        assert_eq!(
+            execution
+                .execute(
+                    &[ExecutionTarget {
+                        symbol: symbol.clone(),
+                        quantity: Decimal::from(363),
+                        tag: String::new(),
+                    }],
+                    &context,
+                )
+                .len(),
+            1
+        );
+
+        let mut framework = FrameworkState::new();
+        framework.pcm = Box::new(EqualWeightingPortfolioConstructionModel::new());
+        framework.exec_model = Box::new(execution);
+        framework
+            .insights
+            .add(Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now));
+        let cancel_time = now + TimeSpan::ONE_MINUTE;
+        framework.cancel_insights(std::slice::from_ref(&symbol), cancel_time);
+
+        let slice = rlean_data::Slice::new(cancel_time);
+        let orders = framework.run_pipeline_from_alpha(
+            &slice,
+            Vec::new(),
+            Decimal::from(100_000),
+            &prices,
+            &RiskContext::default(),
+            &context,
+        );
+
+        assert!(orders.is_empty(), "the canceled target must not reopen");
+        assert!(framework
+            .exec_model
+            .execute_with_context(&[], &context)
+            .is_empty());
     }
 
     #[test]

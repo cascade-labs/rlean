@@ -11,11 +11,12 @@ use rlean_brokerages::{
 };
 use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
-    CacheFirstHistoryProvider, HistoricalDataProvider, MassiveConfig,
-    MassiveHistoricalDataProvider, MassiveLiveConfig, MassiveLiveDataProvider,
-    RoutedLiveDataProvider, ThetaDataConfig, ThetaDataHistoricalDataProvider,
-    TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider, TradierMarketDataConfig,
-    VerglasCustomLiveDataProvider, VerglasHistoricalDataStore,
+    CacheFirstHistoryProvider, DroppedCacheWrites, FredConfig, FredHistoricalDataProvider,
+    HistoricalDataProvider, MassiveConfig, MassiveHistoricalDataProvider, MassiveLiveConfig,
+    MassiveLiveDataProvider, RoutedLiveDataProvider, ThetaDataConfig,
+    ThetaDataHistoricalDataProvider, TradierEnvironment as TradierDataEnvironment,
+    TradierLiveDataProvider, TradierMarketDataConfig, VerglasCustomLiveDataProvider,
+    VerglasHistoricalDataStore,
 };
 use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
@@ -34,27 +35,30 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     bar
 }
 
+/// Builds the cache-first historical provider and the tally of canonical cache
+/// batches it drops. The caller reports the tally when its run finishes.
 pub(crate) async fn historical_data_provider(
     args: &RunArgs,
     verglas: VerglasClient,
-) -> Result<Arc<dyn HistoricalDataProvider>> {
+) -> Result<(Arc<dyn HistoricalDataProvider>, DroppedCacheWrites)> {
     let name = args
         .data_provider_historical
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("a historical data provider is required"))?;
+    let global = config::GlobalConfig::load()?;
     let provider: Arc<dyn HistoricalDataProvider> = match name {
         "massive" => {
-            let integration = config::IntegrationConfigs::load()?.get_integration("massive");
-            let api_key = integration
+            let provider_cfg = global.get_provider("massive");
+            let api_key = provider_cfg
                 .get("api_key")
-                .and_then(serde_json::Value::as_str)
+                .map(String::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "historical provider massive requires integration config key massive.api_key"
+                        "historical provider massive requires config key massive.api_key"
                     )
                 })?;
             Arc::new(MassiveHistoricalDataProvider::new(MassiveConfig::new(
@@ -62,29 +66,60 @@ pub(crate) async fn historical_data_provider(
             ))?)
         }
         "thetadata" => {
-            let integration = config::IntegrationConfigs::load()?.get_integration("thetadata");
-            let api_key = optional_string(&integration, "api_key");
+            let provider_cfg = global.get_provider("thetadata");
+            let api_key = optional_string(&provider_cfg, "api_key");
             let mut provider_config = ThetaDataConfig::new(api_key);
-            if let Some(base_url) = optional_string(&integration, "base_url") {
+            if let Some(base_url) = optional_string(&provider_cfg, "base_url") {
                 provider_config.base_url = base_url;
             }
-            if let Some(max_concurrent) = optional_usize(&integration, "max_concurrent") {
+            if let Some(max_concurrent) = optional_usize(&provider_cfg, "max_concurrent") {
                 provider_config.max_concurrent = max_concurrent.max(1);
             }
-            if let Some(requests_per_second) = optional_f64(&integration, "requests_per_second") {
+            if let Some(requests_per_second) = optional_f64(&provider_cfg, "requests_per_second")
+            {
                 provider_config.requests_per_second = requests_per_second;
             }
             Arc::new(ThetaDataHistoricalDataProvider::new(provider_config)?)
         }
         other => bail!("unsupported historical data provider '{other}'"),
     };
+    let mut providers = vec![provider];
+    // The risk-free rate publisher is selected independently of the market-data
+    // provider: it serves one global series and no bars.
+    providers.extend(risk_free_interest_rate_provider()?);
     let store = Arc::new(VerglasHistoricalDataStore::new(verglas).await?);
-    let provider = CacheFirstHistoryProvider::new(store, vec![provider])?;
+    let dropped_cache_writes = store.dropped_cache_writes();
+    let provider = CacheFirstHistoryProvider::new(store, providers)?;
     tracing::info!(
         provider = name,
         "Configured cache-first historical data provider"
     );
-    Ok(Arc::new(provider))
+    Ok((Arc::new(provider), dropped_cache_writes))
+}
+
+/// FRED publishes the discount-window primary credit rate that LEAN's
+/// `InterestRateProvider` reads. An unconfigured key is a legitimate
+/// deployment, not a failure: the run then serves whatever rates are already
+/// cached and otherwise falls back to LEAN's default rate.
+fn risk_free_interest_rate_provider() -> Result<Option<Arc<dyn HistoricalDataProvider>>> {
+    let provider_cfg = config::GlobalConfig::load()?.get_provider("fred");
+    let Some(api_key) = optional_string(&provider_cfg, "api_key") else {
+        tracing::warn!(
+            "config key fred.api_key is not set; risk-free interest rates will not be refreshed \
+             from FRED"
+        );
+        return Ok(None);
+    };
+    let mut provider_config = FredConfig::new(api_key);
+    if let Some(base_url) = optional_string(&provider_cfg, "base_url") {
+        provider_config.base_url = base_url;
+    }
+    if let Some(series_id) = optional_string(&provider_cfg, "series_id") {
+        provider_config.series_id = series_id;
+    }
+    Ok(Some(Arc::new(FredHistoricalDataProvider::new(
+        provider_config,
+    )?)))
 }
 
 pub(crate) async fn live_data_provider(
@@ -97,18 +132,19 @@ pub(crate) async fn live_data_provider(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
+    let global = config::GlobalConfig::load()?;
     let market: Arc<dyn LiveDataProvider> = match name {
         "massive" => {
-            let integration = config::IntegrationConfigs::load()?.get_integration("massive");
-            let api_key = required_string(&integration, "api_key", "massive")?;
+            let provider_cfg = global.get_provider("massive");
+            let api_key = required_string(&provider_cfg, "api_key", "massive")?;
             Arc::new(MassiveLiveDataProvider::new(MassiveLiveConfig::new(
                 api_key,
             ))?)
         }
         "tradier" => {
-            let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
-            let token = required_string(&integration, "access_token", "tradier")?;
-            let environment = match optional_string(&integration, "environment").as_deref() {
+            let provider_cfg = global.get_provider("tradier");
+            let token = required_string(&provider_cfg, "access_token", "tradier")?;
+            let environment = match optional_string(&provider_cfg, "environment").as_deref() {
                 Some("paper") | Some("sandbox") => TradierDataEnvironment::Paper,
                 _ => TradierDataEnvironment::Live,
             };
@@ -147,17 +183,17 @@ pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Broke
             )?)))
         }
         "tradier" | "tradierbrokerage" => {
-            let integration = config::IntegrationConfigs::load()?.get_integration("tradier");
-            let token = required_string(&integration, "access_token", "tradier")?;
+            let provider_cfg = config::GlobalConfig::load()?.get_provider("tradier");
+            let token = required_string(&provider_cfg, "access_token", "tradier")?;
             let account = args
                 .brokerage_account
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
-                .or_else(|| optional_string(&integration, "account_number"))
+                .or_else(|| optional_string(&provider_cfg, "account_number"))
                 .ok_or_else(|| anyhow::anyhow!("Tradier brokerage requires --brokerage-account"))?;
-            let environment = match optional_string(&integration, "environment").as_deref() {
+            let environment = match optional_string(&provider_cfg, "environment").as_deref() {
                 Some("paper") | Some("sandbox") => TradierBrokerageEnvironment::Paper,
                 _ => TradierBrokerageEnvironment::Live,
             };
@@ -170,42 +206,32 @@ pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Broke
 }
 
 fn required_string(
-    values: &serde_json::Map<String, serde_json::Value>,
+    values: &std::collections::BTreeMap<String, String>,
     key: &str,
-    integration: &str,
+    provider: &str,
 ) -> Result<String> {
-    optional_string(values, key).ok_or_else(|| {
-        anyhow::anyhow!("{integration} requires integration config key {integration}.{key}")
-    })
+    optional_string(values, key)
+        .ok_or_else(|| anyhow::anyhow!("{provider} requires config key {provider}.{key}"))
 }
 
 fn optional_string(
-    values: &serde_json::Map<String, serde_json::Value>,
+    values: &std::collections::BTreeMap<String, String>,
     key: &str,
 ) -> Option<String> {
     values
         .get(key)
-        .and_then(serde_json::Value::as_str)
+        .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
 
-fn optional_usize(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<usize> {
-    values.get(key).and_then(|value| {
-        value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .or_else(|| value.as_str()?.trim().parse().ok())
-    })
+fn optional_usize(values: &std::collections::BTreeMap<String, String>, key: &str) -> Option<usize> {
+    values.get(key).and_then(|value| value.trim().parse().ok())
 }
 
-fn optional_f64(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
-    values.get(key).and_then(|value| {
-        value
-            .as_f64()
-            .or_else(|| value.as_str()?.trim().parse().ok())
-    })
+fn optional_f64(values: &std::collections::BTreeMap<String, String>, key: &str) -> Option<f64> {
+    values.get(key).and_then(|value| value.trim().parse().ok())
 }
 
 /// Connects once to the configured Verglas gateway. The SDK discovers the

@@ -457,21 +457,23 @@ impl ThetaDataHistoricalDataProvider {
             if close <= request.range.start || close > request.range.end {
                 continue;
             }
+            // C# LEAN BaseChainUniverseData for `date` becomes available at
+            // the following midnight. OptionFilterUniverse evaluates expiry
+            // against that local end time and advances it only when closed.
             let mut selection_date = date.succ_opt().context("option selection date overflow")?;
             while exchange_hours.session_bounds(selection_date).is_none() {
                 selection_date = selection_date
                     .succ_opt()
                     .context("option selection date overflow")?;
             }
+            let max_dte =
+                option_query_max_dte(date, selection_date, metadata.filter.max_expiry_days);
             let url = self.url(
                 "/v3/option/list/contracts/quote",
                 &[
                     ("symbol", metadata.underlying_ticker.to_ascii_uppercase()),
                     ("date", vendor_date(date)),
-                    (
-                        "max_dte",
-                        metadata.filter.max_expiry_days.max(0).to_string(),
-                    ),
+                    ("max_dte", max_dte.to_string()),
                     ("format", "ndjson".to_string()),
                 ],
             )?;
@@ -659,6 +661,14 @@ impl ThetaDataHistoricalDataProvider {
         }
         unreachable!("ThetaData retry loop returns")
     }
+}
+
+fn option_query_max_dte(
+    source_date: NaiveDate,
+    selection_date: NaiveDate,
+    max_expiry_days: i32,
+) -> i64 {
+    (selection_date - source_date).num_days() + i64::from(max_expiry_days.max(0))
 }
 
 #[async_trait]
@@ -1307,6 +1317,17 @@ mod tests {
         OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
     };
     use serde_json::json;
+
+    #[test]
+    fn option_query_bound_includes_lean_selection_session_gap() {
+        let thursday = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
+        assert_eq!(option_query_max_dte(thursday, friday, 0), 1);
+
+        let friday = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2025, 1, 6).unwrap();
+        assert_eq!(option_query_max_dte(friday, monday, 0), 3);
+    }
 
     #[test]
     fn parses_stock_quote_as_new_york_time() {

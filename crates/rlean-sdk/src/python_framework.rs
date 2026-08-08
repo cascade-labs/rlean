@@ -708,12 +708,14 @@ pub fn insight_period_from_py(period: &Bound<'_, PyAny>) -> PyResult<rlean_core:
 #[derive(Clone)]
 pub struct InsightCollectionHandle {
     snapshot: Arc<std::sync::Mutex<rlean_alpha::ActiveInsightSnapshot>>,
+    registry: Arc<dyn FrameworkModelRegistry>,
 }
 
 impl InsightCollectionHandle {
     pub fn from_registry(registry: &Arc<dyn FrameworkModelRegistry>) -> Self {
         Self {
             snapshot: registry.insight_snapshot(),
+            registry: registry.clone(),
         }
     }
 }
@@ -746,6 +748,26 @@ impl InsightCollectionHandle {
             .filter(|insight| insight.is_active(utc))
             .map(project_alpha_insight)
             .collect()
+    }
+
+    /// Cancel active insights for the supplied symbols.
+    ///
+    /// This is the Python surface for C# LEAN
+    /// `QCAlgorithm.Insights.Cancel(symbols)`. Cancellation closes the insight
+    /// and requests a PCM rebalance; it does not itself submit liquidation
+    /// orders.
+    #[pyo3(name = "cancel", signature = (symbols, utc_time=None))]
+    fn py_cancel(
+        &self,
+        symbols: Vec<crate::securities::SymbolHandle>,
+        utc_time: Option<chrono::NaiveDateTime>,
+    ) {
+        let symbols = symbols
+            .into_iter()
+            .map(crate::securities::SymbolHandle::into_inner)
+            .collect::<Vec<_>>();
+        let utc_now = utc_time.map(DateTime::from).unwrap_or_else(DateTime::now);
+        self.registry.cancel_insights(&symbols, utc_now);
     }
 }
 

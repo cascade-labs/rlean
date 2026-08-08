@@ -19,13 +19,12 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-mod artifacts_config;
 mod backtest;
 mod cli;
 mod cloud;
 mod config;
 mod config_cmd;
-mod daemon_cmd;
+mod container_runtime;
 mod data_cmd;
 mod init;
 mod live;
@@ -87,7 +86,6 @@ async fn main() -> Result<()> {
         Command::Stubs(args) => run_stubs(args),
         Command::Vcs(args) => run_vcs(args),
         Command::Cloud(args) => cloud::run(args),
-        Command::Daemon(args) => daemon_cmd::run(args),
         Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
@@ -206,12 +204,6 @@ mod tests {
             }
             _ => panic!("expected live command"),
         }
-    }
-
-    #[test]
-    fn test_daemon_install_cli_parse() {
-        let cli = Cli::try_parse_from(["rlean", "daemon", "install"]).unwrap();
-        assert!(matches!(cli.command, Command::Daemon(_)));
     }
 
     #[test]

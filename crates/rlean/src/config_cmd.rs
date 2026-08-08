@@ -1,20 +1,15 @@
-use crate::config::{GlobalConfig, IntegrationConfigs, WorkspaceConfig};
-/// `rlean config` — get/set/list workspace and provider integration configuration
+use crate::config::{ensure_known_provider, GlobalConfig, KNOWN_PROVIDERS, WorkspaceConfig};
+/// `rlean config` — get/set/list workspace and provider configuration
 ///
-/// Integration credentials are stored in ~/.rlean/integration-configs.json.
-/// Workspace settings are stored in ~/.rlean/config and rlean.json.
+/// All values are stored in ~/.rlean/config (mode 0600). Workspace language
+/// may also update rlean.json in the current directory.
 ///
 /// Known keys:
 ///   default-language            python | csharp
 ///   verglas_endpoint            Verglas SDK gateway (e.g. http://127.0.0.1:8334)
 ///   verglas_token               Verglas bearer token for all discovered services
-///   artifact_store              Run artifact relay mode: local | s3 | mirror
-///   artifact_s3                 Artifact destination: s3://bucket/prefix
-///   artifact_s3_endpoint        Artifact endpoint URL
-///   artifact_s3_region          Artifact region
-///   artifact_s3_access_key      Artifact access key
-///   artifact_s3_secret_key      Artifact secret key
-///   <integration>.<key>         Provider integration config (e.g. thetadata.api_key)
+///   <provider>.<key>            Provider credentials (e.g. thetadata.api_key)
+///                               Known providers: thetadata, massive, tradier, fred
 use anyhow::{bail, Result};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
@@ -56,16 +51,13 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_set(key: &str, value: &str) -> Result<()> {
-    // Dotted keys configure a named provider integration.
-    if let Some((integration, subkey)) = key.split_once('.') {
-        let mut configs = IntegrationConfigs::load()?;
-        configs.set_key(
-            integration,
-            subkey,
-            serde_json::Value::String(value.to_string()),
-        );
-        configs.save()?;
-        println!("Set {integration}.{subkey} in ~/.rlean/integration-configs.json");
+    // Dotted keys configure a named native provider.
+    if let Some((provider, subkey)) = key.split_once('.') {
+        ensure_known_provider(provider)?;
+        let mut cfg = GlobalConfig::load()?;
+        cfg.set_provider_key(provider, subkey, value.to_string())?;
+        cfg.save()?;
+        println!("Set {provider}.{subkey} in ~/.rlean/config");
         return Ok(());
     }
 
@@ -96,40 +88,17 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
                 println!("Set {key} = {value} in ~/.rlean/config");
             }
         }
-        "artifact_store" => {
-            if rlean_engine::ArtifactStoreMode::parse(value).is_none() {
-                bail!(
-                    "artifact_store must be local, s3, or mirror, got '{}'",
-                    value
-                );
-            }
-            let mut cfg = GlobalConfig::load()?;
-            cfg.artifact_store = Some(value.to_string());
-            cfg.save()?;
-            println!("Set artifact_store = {value} in ~/.rlean/config");
-        }
-        "artifact_s3"
-        | "artifact_s3_endpoint"
-        | "artifact_s3_region"
-        | "artifact_s3_access_key"
-        | "artifact_s3_secret_key" => {
-            let mut cfg = GlobalConfig::load()?;
-            set_s3_key(&mut cfg, key, value.to_string())?;
-            cfg.save()?;
-            println!("Set {key} in ~/.rlean/config");
-        }
         _ => bail!("{}", unknown_key_message(key)),
     }
     Ok(())
 }
 
 fn cmd_get(key: &str) -> Result<()> {
-    if let Some((integration, subkey)) = key.split_once('.') {
-        let configs = IntegrationConfigs::load()?;
-        let integration_cfg = configs.get_integration(integration);
-        match integration_cfg.get(subkey) {
-            Some(serde_json::Value::String(s)) => println!("{}", mask(s)),
-            Some(v) => println!("{v}"),
+    if let Some((provider, subkey)) = key.split_once('.') {
+        ensure_known_provider(provider)?;
+        let cfg = GlobalConfig::load()?;
+        match cfg.get_provider(provider).get(subkey) {
+            Some(s) => println!("{}", mask(s)),
             None => println!("(not set)"),
         }
         return Ok(());
@@ -148,22 +117,6 @@ fn cmd_get(key: &str) -> Result<()> {
                 None => println!("(not set)"),
             }
         }
-        "artifact_store" => {
-            let cfg = GlobalConfig::load()?;
-            println!("{}", cfg.artifact_store.as_deref().unwrap_or("local"));
-        }
-        "artifact_s3"
-        | "artifact_s3_endpoint"
-        | "artifact_s3_region"
-        | "artifact_s3_access_key"
-        | "artifact_s3_secret_key" => {
-            let cfg = GlobalConfig::load()?;
-            match get_s3_key(&cfg, key)? {
-                Some(value) if is_secret_key(key) => println!("{}", mask(value)),
-                Some(value) => println!("{value}"),
-                None => println!("(not set)"),
-            }
-        }
         _ => bail!("{}", unknown_key_message(key)),
     }
     Ok(())
@@ -171,7 +124,6 @@ fn cmd_get(key: &str) -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let global = GlobalConfig::load()?;
-    let integration_cfgs = IntegrationConfigs::load()?;
     println!("{:<30} VALUE", "KEY");
     println!("{}", "-".repeat(60));
 
@@ -182,46 +134,15 @@ fn cmd_list() -> Result<()> {
     if let Some(token) = global.verglas_token.as_deref() {
         println!("{:<30} {}", "verglas_token", mask(token));
     }
-    if let Some(mode) = &global.artifact_store {
-        println!("{:<30} {}", "artifact_store", mode);
-    }
-    for key in [
-        "artifact_s3",
-        "artifact_s3_endpoint",
-        "artifact_s3_region",
-        "artifact_s3_access_key",
-        "artifact_s3_secret_key",
-    ] {
-        if let Some(value) = get_s3_key(&global, key)? {
-            let display = if is_secret_key(key) {
-                mask(value)
-            } else {
-                value.to_string()
-            };
-            println!("{:<30} {}", key, display);
+
+    for provider in KNOWN_PROVIDERS {
+        let section = global.get_provider(provider);
+        if section.is_empty() {
+            continue;
         }
-    }
-
-    let mut integration_names: Vec<&str> = integration_cfgs.0.keys().map(String::as_str).collect();
-    integration_names.sort();
-
-    if !integration_names.is_empty() {
-        println!();
-        println!("Provider integration configs (~/.rlean/integration-configs.json):");
-        println!("{}", "-".repeat(60));
-        for integration in integration_names {
-            let cfg = integration_cfgs.get_integration(integration);
-            let mut keys: Vec<&str> = cfg.keys().map(String::as_str).collect();
-            keys.sort();
-            for key in keys {
-                let display_key = format!("{integration}.{key}");
-                let display_val = match cfg.get(key) {
-                    Some(serde_json::Value::String(s)) => mask(s),
-                    Some(v) => v.to_string(),
-                    None => "(not set)".to_string(),
-                };
-                println!("{:<30} {}", display_key, display_val);
-            }
+        for (key, value) in section {
+            let display_key = format!("{provider}.{key}");
+            println!("{:<30} {}", display_key, mask(&value));
         }
     }
 
@@ -240,10 +161,10 @@ fn mask(s: &str) -> String {
 
 fn unknown_key_message(key: &str) -> String {
     format!(
-        "Unknown key '{key}'. Known keys: default-language, verglas_endpoint, verglas_token, \
-         artifact_store, artifact_s3, artifact_s3_endpoint, artifact_s3_region, \
-         artifact_s3_access_key, artifact_s3_secret_key. \
-         Use <integration>.<key> for provider integration config (e.g. massive.api_key)."
+        "Unknown key '{key}'. Known keys: default-language, verglas_endpoint, verglas_token. \
+         Use <provider>.<key> for provider credentials (e.g. massive.api_key). \
+         Known providers: {}.",
+        KNOWN_PROVIDERS.join(", ")
     )
 }
 
@@ -262,31 +183,4 @@ fn get_verglas_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a st
         "verglas_token" => Ok(cfg.verglas_token.as_deref()),
         _ => bail!("unknown Verglas config key '{key}'"),
     }
-}
-
-fn set_s3_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
-    match key {
-        "artifact_s3" => cfg.artifact_s3 = Some(value),
-        "artifact_s3_endpoint" => cfg.artifact_s3_endpoint = Some(value),
-        "artifact_s3_region" => cfg.artifact_s3_region = Some(value),
-        "artifact_s3_access_key" => cfg.artifact_s3_access_key = Some(value),
-        "artifact_s3_secret_key" => cfg.artifact_s3_secret_key = Some(value),
-        _ => bail!("unknown S3 config key '{key}'"),
-    }
-    Ok(())
-}
-
-fn get_s3_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
-    match key {
-        "artifact_s3" => Ok(cfg.artifact_s3.as_deref()),
-        "artifact_s3_endpoint" => Ok(cfg.artifact_s3_endpoint.as_deref()),
-        "artifact_s3_region" => Ok(cfg.artifact_s3_region.as_deref()),
-        "artifact_s3_access_key" => Ok(cfg.artifact_s3_access_key.as_deref()),
-        "artifact_s3_secret_key" => Ok(cfg.artifact_s3_secret_key.as_deref()),
-        _ => bail!("unknown S3 config key '{key}'"),
-    }
-}
-
-fn is_secret_key(key: &str) -> bool {
-    matches!(key, "artifact_s3_access_key" | "artifact_s3_secret_key")
 }

@@ -373,38 +373,67 @@ impl FeeModel for AlpacaFeeModel {
 /// Tradier fee model.
 ///
 /// Tradier Pro charges no commission for equities or equity/ETF options, but
-/// options still incur clearing, regulatory, and exchange pass-through fees.
-/// Tradier's fill/status REST payload does not report those charges, so the
-/// live engine cannot apply an exact brokerage fee at fill time. This model
-/// uses Tradier's published July 2026 clearing/regulatory schedule plus the
-/// average exchange charge observed on a production SPY option round trip.
+/// options still incur clearing and regulatory pass-through fees. The rates
+/// below are Tradier's published schedule (https://tradier.com/individuals/pricing).
 ///
-/// The exchange component is deliberately isolated: it can be replaced when
-/// Tradier exposes the routed venue or an authoritative per-fill fee.
+/// # Deliberate divergence from LEAN — do not "fix" this back
+///
+/// LEAN's `TradierBrokerageModel.GetFeeModel` returns `ConstantFeeModel(0m)`
+/// (`Lean/Common/Brokerages/TradierBrokerageModel.cs:228`, commented "Trading
+/// stocks at Tradier Brokerage is free"). That is wrong for options: the Pro
+/// plan waives *commission*, but clearing, regulatory, and reporting fees are
+/// still passed through per contract. Modelling them as zero overstates
+/// returns, and the error scales with contract count — a strategy trading
+/// thousands of contracts per order books a cost that does not exist in a
+/// LEAN-parity backtest but does exist in the brokerage statement.
+///
+/// rlean therefore charges Tradier's published schedule instead of zero. This
+/// is intentional. Restoring `ConstantFeeModel(0m)` for the sake of LEAN parity
+/// would silently inflate every options backtest.
+///
+/// # The $15.00-per-leg clearing cap is load-bearing
+///
+/// Tradier publishes the clearing fee as $0.0775/contract with a $15.00 maximum
+/// *per leg*. The cap binds above ~194 contracts, so it is not a rounding
+/// detail: a 4,761-contract leg costs $135.93 with the cap and $369.00 without.
+/// Because the cap is per order rather than per contract, the total cannot be
+/// expressed as a single per-contract rate — see [`Self::option_order_fee`].
+///
+/// # Do not reintroduce a back-solved "exchange fee"
+///
+/// An earlier revision carried `OPTION_EXCHANGE_FEE_ESTIMATE = 0.1572234375`
+/// per contract per side, derived as the residual of a single 16-contract SPY
+/// round trip after subtracting the known components. It accounted for ~60% of
+/// every fee charged, had no counterpart anywhere in Tradier's published
+/// schedule, and inflated a round trip to $0.524/contract against a true
+/// $0.209. It was removed. If a routed-venue charge ever needs modelling, take
+/// it from an authoritative per-fill fee that Tradier reports — never
+/// back-solve a constant from one observation and apply it to every contract.
 pub struct TradierFeeModel;
 
 impl TradierFeeModel {
-    /// Tradier-published option clearing fee per contract.
+    /// Option clearing fee per contract.
     pub const OPTION_CLEARING_FEE: Price = dec!(0.0775);
+    /// Maximum clearing fee charged on a single leg.
+    pub const OPTION_CLEARING_FEE_MAX: Price = dec!(15.00);
     /// Options Regulatory Fee per contract.
-    pub const OPTION_REGULATORY_FEE: Price = dec!(0.0187);
-    /// Regulatory reporting fee: $0.000072 per equivalent share, with one
-    /// option contract representing 100 equivalent shares.
-    pub const OPTION_REPORTING_FEE: Price = dec!(0.0072);
+    pub const OPTION_REGULATORY_FEE: Price = dec!(0.02);
+    /// Trade reporting and processing fee: $0.000054 per equivalent share,
+    /// with one option contract representing 100 equivalent shares.
+    pub const OPTION_REPORTING_FEE: Price = dec!(0.0054);
     /// FINRA Trading Activity Fee, charged on option sales.
     pub const OPTION_SELL_TAF: Price = dec!(0.00279);
-    /// Average routed-exchange charge calibrated from the 2026-07-29 SPY
-    /// 0-DTE round trip: 16 contracts bought and sold generated $8.38459 in
-    /// broker cash charges after removing the gross trade P&L.
-    pub const OPTION_EXCHANGE_FEE_ESTIMATE: Price = dec!(0.1572234375);
 
-    fn option_fee_per_contract(order: &Order) -> Price {
-        let mut fee = Self::OPTION_CLEARING_FEE
-            + Self::OPTION_REGULATORY_FEE
-            + Self::OPTION_REPORTING_FEE
-            + Self::OPTION_EXCHANGE_FEE_ESTIMATE;
+    /// Total pass-through cost for one option leg. The cap applies to the
+    /// order, not the contract, so the fee cannot be expressed as a single
+    /// per-contract rate.
+    fn option_order_fee(order: &Order) -> Price {
+        let contracts = order.abs_quantity();
+        let clearing = (contracts * Self::OPTION_CLEARING_FEE).min(Self::OPTION_CLEARING_FEE_MAX);
+        let mut fee =
+            clearing + contracts * (Self::OPTION_REGULATORY_FEE + Self::OPTION_REPORTING_FEE);
         if order.direction() == OrderDirection::Sell {
-            fee += Self::OPTION_SELL_TAF;
+            fee += contracts * Self::OPTION_SELL_TAF;
         }
         fee
     }
@@ -413,10 +442,9 @@ impl TradierFeeModel {
 impl FeeModel for TradierFeeModel {
     fn get_order_fee(&self, params: &OrderFeeParameters<'_>) -> OrderFee {
         match params.security_type {
-            SecurityType::Option | SecurityType::IndexOption => OrderFee::new(
-                params.order.abs_quantity() * Self::option_fee_per_contract(params.order),
-                &params.quote_currency,
-            ),
+            SecurityType::Option | SecurityType::IndexOption => {
+                OrderFee::new(Self::option_order_fee(params.order), &params.quote_currency)
+            }
             _ => OrderFee::zero(),
         }
     }

@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "python")]
 use pyo3::types::{PyAnyMethods, PyTupleMethods};
 
-use crate::data::ns_to_exchange_naive;
 use crate::indicators::{
     AverageTrueRange, BollingerBandsIndicator, ExponentialMovingAverage, IdentityIndicator,
     MacdIndicator, MomentumPercentIndicator, RelativeStrengthIndex, SimpleMovingAverage,
@@ -326,6 +325,10 @@ impl AlgorithmHandle {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_end_date(year, month, day);
     }
 
+    pub fn set_time_zone(&self, time_zone: &str) -> Result<(), String> {
+        AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_time_zone(time_zone)
+    }
+
     pub fn set_cash(&self, amount: f64) {
         let mut algorithm = self.inner.lock().unwrap();
         AlgorithmApi::new(&mut algorithm).set_cash(amount);
@@ -420,11 +423,8 @@ impl AlgorithmHandle {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).is_invested(symbol.inner())
     }
     pub fn current_time(&self) -> chrono::NaiveDateTime {
-        ns_to_exchange_naive(
-            AlgorithmApi::new(&mut self.inner.lock().unwrap())
-                .current_time()
-                .0,
-        )
+        let algorithm = self.inner.lock().unwrap();
+        algorithm.time.to_tz(algorithm.time_zone).naive_local()
     }
     pub fn utc_time(&self) -> chrono::NaiveDateTime {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
@@ -964,6 +964,12 @@ impl AlgorithmHandle {
         self.set_end_date(year, month, day);
     }
 
+    #[pyo3(name = "set_time_zone")]
+    fn py_set_time_zone(&self, time_zone: String) -> pyo3::PyResult<()> {
+        self.set_time_zone(&time_zone)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
     #[pyo3(name = "set_cash")]
     fn py_set_cash(&self, amount: f64) {
         self.set_cash(amount);
@@ -1500,6 +1506,10 @@ impl<'a> AlgorithmApi<'a> {
         self.algorithm.set_end_date(year, month, day);
     }
 
+    pub fn set_time_zone(&mut self, time_zone: &str) -> Result<(), String> {
+        self.algorithm.set_time_zone(time_zone)
+    }
+
     pub fn set_cash(&mut self, amount: f64) {
         self.algorithm.set_cash(f2d(amount));
     }
@@ -1548,8 +1558,10 @@ impl<'a> AlgorithmApi<'a> {
     }
 
     pub fn history_end_date(&self) -> chrono::NaiveDate {
-        let current = self.algorithm.time.date_utc();
-        if current == DateTime::EPOCH.date_utc() {
+        let current = self.algorithm.local_date(self.algorithm.time);
+        if self.algorithm.time == DateTime::EPOCH {
+            // rlean's start-date storage remains a date-only UTC sentinel for
+            // now; do not project it backward across the New York offset.
             self.algorithm.start_date.date_utc()
         } else {
             current

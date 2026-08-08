@@ -1,0 +1,51 @@
+name: API Coverage
+
+# QCAlgorithm / QuantBook Python API surface vs local stubs.
+# Informational for now (continue-on-error). Enforce a floor later by removing
+# continue-on-error and passing --min-coverage to the script.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-coverage:
+    name: Python API coverage
+    runs-on: ubuntu-latest
+    # Soft check until a coverage floor is set in the run step below.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Measure QCAlgorithm API coverage
+        run: python3 scripts/qc_algorithm_api_coverage.py
+        # When ready to enforce: add `--min-coverage <pct>` and drop
+        # job-level continue-on-error.
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qc-algorithm-api-coverage
+          path: |
+            target/api-coverage/qc_algorithm_api_coverage.json
+            target/api-coverage/qc_algorithm_api_coverage.svg
+          if-no-files-found: ignore

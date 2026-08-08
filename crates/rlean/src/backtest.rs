@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::cli::RunArgs;
 use crate::config;
+use crate::container_runtime::{self, BacktestRunSpec};
 use crate::runtime::{
     backtest_progress_bar, connect_verglas, ensure_python_baseline_packages,
     historical_data_provider, parse_algorithm_parameters_for_strategy, strategy_name_from_path,
@@ -27,16 +28,51 @@ pub(crate) async fn run(mut args: RunArgs) -> Result<()> {
 
     validate_strategy_path(&args.strategy)?;
 
+    if !args.native {
+        return run_containerized(args);
+    }
+
     let global_config = config::GlobalConfig::load()?;
     let verglas = connect_verglas(&global_config).await?;
-    let historical_provider = historical_data_provider(&args, verglas.clone()).await?;
+    let (historical_provider, dropped_cache_writes) =
+        historical_data_provider(&args, verglas.clone()).await?;
 
-    run_strategy_backtest(args, historical_provider, verglas).await
+    run_strategy_backtest(args, historical_provider, dropped_cache_writes, verglas).await
+}
+
+fn run_containerized(args: RunArgs) -> Result<()> {
+    let global = config::GlobalConfig::load()?;
+    let image = container_runtime::default_image();
+    let engine_args = container_runtime::runtime_engine_args(
+        args.data_provider_historical.as_deref(),
+        args.live_data_feed.as_deref(),
+        args.brokerage.as_deref(),
+        args.brokerage_url.as_deref(),
+        args.brokerage_account.as_deref(),
+        args.start_date.as_deref(),
+        args.end_date.as_deref(),
+        &args.parameters,
+        args.verbose,
+        args.live_limits.live_max_slices,
+        args.live_limits.live_max_runtime_seconds,
+    );
+    let code = container_runtime::run_backtest_container(BacktestRunSpec {
+        image: &image,
+        pull: args.pull,
+        strategy_file: &args.strategy,
+        engine_args,
+        global: &global,
+    })?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 async fn run_strategy_backtest(
     args: RunArgs,
     historical_provider: Arc<dyn rlean_data_providers::HistoricalDataProvider>,
+    dropped_cache_writes: rlean_data_providers::DroppedCacheWrites,
     verglas: verglas_sdk::Client,
 ) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
@@ -72,21 +108,32 @@ async fn run_strategy_backtest(
     .await?;
     run_catalog.record_started().await?;
 
-    // Progress is committed in bounded Arrow batches on a background task so
-    // catalog latency never blocks the deterministic engine loop.
-    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let progress_catalog = run_catalog.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut buffered = Vec::with_capacity(32);
-        while let Some(row) = progress_rx.recv().await {
-            buffered.push(row);
-            if buffered.len() == 32 {
-                progress_catalog
-                    .record_progress(std::mem::take(&mut buffered))
-                    .await?;
+    // Stream progress and fills through a bounded channel. Backtests can
+    // advance much faster than an Iceberg commit; collecting 32 updates keeps
+    // result persistence from contending with historical queries while still
+    // publishing multiple progress snapshots during a long run. Channel close
+    // always flushes the final partial batch.
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
+    let stream_catalog = run_catalog.clone();
+    let stream_task = tokio::spawn(async move {
+        let mut sequence = 0_u64;
+        let mut updates = Vec::with_capacity(32);
+        while let Some(update) = stream_rx.recv().await {
+            updates.push(update);
+            if updates.len() < 32 {
+                continue;
             }
+            stream_catalog
+                .record_stream_updates(std::mem::take(&mut updates), sequence)
+                .await?;
+            sequence = sequence.wrapping_add(1);
         }
-        progress_catalog.record_progress(buffered).await
+        if !updates.is_empty() {
+            stream_catalog
+                .record_stream_updates(updates, sequence)
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
     });
 
     let progress_bar = backtest_progress_bar();
@@ -95,10 +142,8 @@ async fn run_strategy_backtest(
     progress_bar.tick();
     let progress = {
         let progress_bar = progress_bar.clone();
-        let progress_tx = progress_tx.clone();
         let last_drawn_percent = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let last_drawn_percent_for_progress = last_drawn_percent.clone();
-        let last_catalog_date = Arc::new(std::sync::Mutex::new(None));
         Arc::new(move |progress: rlean_engine::BacktestProgress| {
             let total_days = (progress.end_date - progress.start_date).num_days().max(1) as u64;
             let elapsed_days = (progress.current_date - progress.start_date)
@@ -117,13 +162,6 @@ async fn run_strategy_backtest(
             } else {
                 progress_bar.tick();
             }
-            let mut last_date = last_catalog_date
-                .lock()
-                .expect("backtest progress date poisoned");
-            if last_date.as_ref() != Some(&progress.current_date) {
-                *last_date = Some(progress.current_date);
-                let _ = progress_tx.send(progress);
-            }
         })
     };
     let data_feed_options = rlean_engine::data_feed::DataFeedOptions::default();
@@ -134,9 +172,8 @@ async fn run_strategy_backtest(
         end_date_override,
         parameters,
         data_feed_options,
-        output_dir: None,
-        artifact_sink: None,
         progress: Some(progress),
+        stream_updates: Some(stream_tx),
     };
 
     let runtime_context =
@@ -166,12 +203,11 @@ async fn run_strategy_backtest(
     let run_result =
         rlean_engine::runner::backtest::run_backtest_with_runtime(bridge, config, runtime_context)
             .await;
-    drop(progress_tx);
-    if let Err(progress_error) = progress_task
+    if let Err(progress_error) = stream_task
         .await
-        .context("join Verglas progress writer")?
+        .context("join Verglas run stream writer")?
     {
-        let error = anyhow::anyhow!("persist backtest progress: {progress_error}");
+        let error = anyhow::anyhow!("persist backtest progress: {progress_error:#}");
         let _ = run_catalog.record_failed(&error).await;
         return Err(error);
     }
@@ -196,6 +232,10 @@ async fn run_strategy_backtest(
         results.end_date, results.final_value, results.trading_days
     ));
     results.print_summary();
+    // Persistence that was dropped to keep the run alive is reported once here
+    // so a run that lost cache or telemetry writes does not look clean.
+    dropped_cache_writes.log_summary();
+    run_catalog.log_dropped_appends_summary();
     run_catalog.record_completed(&results).await?;
     println!("Results: verglas://rlean/runs/{}", run_catalog.run_id());
 

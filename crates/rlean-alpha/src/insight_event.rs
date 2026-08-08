@@ -11,6 +11,7 @@ pub enum InsightEventKind {
     Expired,
     FlatClosed,
     UniverseRemoved,
+    Cancelled,
     RiskCancelled,
     Restored,
 }

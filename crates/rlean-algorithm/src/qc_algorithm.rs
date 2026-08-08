@@ -3,6 +3,7 @@ use crate::{
     runtime_statistics::RuntimeStatistics, securities::SecurityManager, BuyingPowerModel,
 };
 use chrono::Timelike;
+use chrono_tz::Tz;
 use rlean_core::{
     DataNormalizationMode, DateTime, Market, MarketHoursDatabase, OptionRight, OptionStyle, Price,
     Quantity, Resolution, SecurityType, SettlementType, Symbol, SymbolOptionsExt, SymbolProperties,
@@ -158,6 +159,10 @@ pub struct QcAlgorithm {
     // Current time (updated each bar)
     pub time: DateTime,
     pub utc_time: DateTime,
+    /// Time zone used by the algorithm's `Time` property and calendar-day
+    /// transitions. C# LEAN defaults this to New York and keeps `UtcTime`
+    /// separate from the projected algorithm-local time.
+    pub time_zone: Tz,
     /// Whether the algorithm is executing against live data and brokerage
     /// services. Mirrors C# LEAN's `QCAlgorithm.LiveMode`.
     pub live_mode: bool,
@@ -250,6 +255,7 @@ impl QcAlgorithm {
             subscription_manager: SubscriptionManager::new(),
             time: DateTime::EPOCH,
             utc_time: DateTime::EPOCH,
+            time_zone: chrono_tz::America::New_York,
             live_mode: false,
             log: AlgorithmLogging::default(),
             statistics: RuntimeStatistics::default(),
@@ -396,6 +402,22 @@ impl QcAlgorithm {
         use chrono::{TimeZone, Utc};
         let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
         self.end_date = DateTime::from(dt);
+    }
+
+    /// Set the time zone used by the algorithm's `Time` property.
+    ///
+    /// Matches C# LEAN `QCAlgorithm.SetTimeZone`; IANA identifiers such as
+    /// `America/New_York` are accepted.
+    pub fn set_time_zone(&mut self, time_zone: &str) -> Result<(), String> {
+        self.time_zone = time_zone
+            .parse::<Tz>()
+            .map_err(|_| format!("unknown algorithm time zone: {time_zone}"))?;
+        Ok(())
+    }
+
+    /// Project a UTC engine frontier into the algorithm's configured calendar.
+    pub fn local_date(&self, utc_time: DateTime) -> chrono::NaiveDate {
+        utc_time.to_tz(self.time_zone).date_naive()
     }
 
     pub fn set_cash(&self, amount: Price) {
@@ -2521,6 +2543,39 @@ impl QcAlgorithm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn algorithm_date_does_not_roll_at_midnight_utc_in_new_york() {
+        let algorithm = QcAlgorithm::new("test", dec!(100_000));
+        let before_utc_midnight = DateTime::from_secs(1_723_852_740); // 2024-08-16 23:59 UTC
+        let at_utc_midnight = DateTime::from_secs(1_723_852_800); // 2024-08-17 00:00 UTC
+
+        assert_eq!(
+            algorithm.local_date(before_utc_midnight),
+            chrono::NaiveDate::from_ymd_opt(2024, 8, 16).unwrap()
+        );
+        assert_eq!(
+            algorithm.local_date(at_utc_midnight),
+            chrono::NaiveDate::from_ymd_opt(2024, 8, 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn algorithm_date_rolls_at_midnight_in_configured_time_zone() {
+        let mut algorithm = QcAlgorithm::new("test", dec!(100_000));
+        algorithm.set_time_zone("America/Los_Angeles").unwrap();
+
+        let before_local_midnight = DateTime::from_secs(1_723_877_940); // 2024-08-17 06:59 UTC
+        let at_local_midnight = DateTime::from_secs(1_723_878_000); // 2024-08-17 07:00 UTC
+        assert_eq!(
+            algorithm.local_date(before_local_midnight),
+            chrono::NaiveDate::from_ymd_opt(2024, 8, 16).unwrap()
+        );
+        assert_eq!(
+            algorithm.local_date(at_local_midnight),
+            chrono::NaiveDate::from_ymd_opt(2024, 8, 17).unwrap()
+        );
+    }
     use chrono::NaiveDate;
     use rust_decimal_macros::dec;
 

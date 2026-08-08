@@ -63,7 +63,7 @@ Verglas gateway.
 
 Strategy SDK calls remain the source of subscription intent. Provider and
 brokerage credentials such as `tradier.access_token` are stored once per
-machine in `~/.rlean/integration-configs.json`.
+machine in `~/.rlean/config` via `rlean config set <provider>.<key>`.
 
 Configure Verglas once per machine. The token is stored masked in CLI output
 and is applied by the SDK to every service discovered from the gateway:
@@ -151,13 +151,22 @@ factor values use the canonical decimal type.
 
 ## Live trading
 
-`rlean live <strategy>` submits a strategy to the persistent `rleand` supervisor. Install it once with `rlean daemon install`; launchd on macOS or systemd on Linux keeps it running across logouts and reboots. You inspect or control deployments with subcommands.
+Backtest and live always run inside Docker containers that the host `rlean` CLI
+starts. The host must have Docker and a reachable Verglas gateway. The engine
+image defaults to `ghcr.io/cascade-labs/rlean:latest` (override with
+`RLEAN_IMAGE`). Merges to `main` publish that image to GHCR.
 
-Only long-running live deployments belong to `rleand`. Backtests, data and
-configuration commands, research setup, and cloud probes run directly and exit.
-Both `rlean` and `rleand` must be installed beside one another; `rlean daemon
-status|start|stop|uninstall` manages the per-user service (or the machine-wide
-service when `--system` is explicit).
+```sh
+rlean backtest ./my_strategy/main.py --data-provider-historical thetadata
+rlean live ./my_strategy/main.py \
+  --live-data-feed tradier \
+  --brokerage http \
+  --brokerage-url http://host.docker.internal:5199
+```
+
+`rlean live <strategy>` places a detached container (`restart: unless-stopped`)
+with a durable deploy directory for portfolio/insights/orders. Inspect or
+control deployments with subcommands:
 
 - `rlean live list` — list local live deployments
 - `rlean live status` / `portfolio` / `orders` / `logs` — inspect one deployment
@@ -166,11 +175,13 @@ service when `--system` is explicit).
 Pass `--brokerage <name>` (or `paper` for simulated fills) and select a
 `--live-data-feed`. For brokerages with multiple accounts, pass
 `--brokerage-account <account-id>`; the selected account is persisted with that
-deployment and restored by `rleand`. Live data and brokerage operations use
-independent native connections. Use `--brokerage http --brokerage-url <URL>`
-for a private execution service implementing the
-[HTTP brokerage contract](docs/http-brokerage.md). Strategy SDK calls create and remove symbol
-subscriptions; live events are pushed by the selected provider.
+deployment. Live data and brokerage operations use independent native
+connections. Use `--brokerage http --brokerage-url <URL>` for a private
+execution service implementing the
+[HTTP brokerage contract](docs/http-brokerage.md). From inside the container,
+reach host-side services via `host.docker.internal`. Strategy SDK calls create
+and remove symbol subscriptions; live events are pushed by the selected
+provider.
 
 Historical market data can be selected independently with
 `--data-provider-historical massive` or `--data-provider-historical thetadata`.
@@ -179,8 +190,8 @@ they reach the engine or cache. The native ThetaData provider supports US
 equity and option TradeBars, QuoteBars, ticks, and option-universe history;
 configure it once with `rlean config set thetadata.api_key <key>`. Optional
 `thetadata.base_url`, `thetadata.max_concurrent`, and
-`thetadata.requests_per_second` integration settings control private gateways
-and request limits. Equity map and factor files are loaded through their
+`thetadata.requests_per_second` settings control private gateways and request
+limits. Equity map and factor files are loaded through their
 separate LEAN-style auxiliary provider paths. Every contract is queried
 cache-first through Verglas and a newly fetched range is synchronously
 persisted through the Verglas write role before the engine consumes it.
@@ -194,31 +205,30 @@ receive object-store credentials or embed an Iceberg query engine.
 
 ### Cloud fleet
 
-`rlean cloud` manages a fleet of remote nodes reachable over SSH. The control machine only syncs code and submits deployments; each node's `rleand` supervises its live strategy processes after that.
+`rlean cloud` manages a fleet of remote nodes reachable over SSH. Nodes are
+Docker + Verglas hosts: the control machine syncs code and asks the remote host
+CLI to pull the latest engine image and place a live container.
 
 - `rlean cloud add-node` / `list` / `remove` — manage the node registry (`~/.rlean/nodes.json`)
 - `rlean cloud exec` — run a command on a node
-- `rlean cloud install` — install `rlean`, `rleand`, and configuration onto a node from a GitHub release bundle
-- `rlean cloud deploy` — snapshot a strategy to a node and launch `rlean live` there
+- `rlean cloud install` — install the host `rlean` CLI and config; require Docker + Verglas; `docker pull` the engine image
+- `rlean cloud deploy` — snapshot a strategy to a node, always `docker pull` latest, then place a live container
 - `rlean cloud status` / `logs` / `portfolio` — monitor node deployments
 
-`rlean cloud list` probes each node over SSH, reports both the installed rlean
-version and rleand control-socket health, and refreshes `last_seen`. Pass
+`rlean cloud list` probes each node over SSH, reports the installed rlean
+version plus Docker and Verglas health, and refreshes `last_seen`. Pass
 `--offline` for a registry-only view without network calls.
-Re-running `rlean cloud install` with a release tag is the node binary-upgrade
-flow: release checksums are verified, both binaries are atomically replaced,
-configuration and `integration-configs.json` are copied with mode `0600`, and
-the node's user `rleand` service is installed/started. `rlean live upgrade`, by
-contrast, only refreshes a paused/stopped deployment's strategy snapshot.
-
-The repository Justfile exposes local development and macOS daemon deployment:
+Re-running `rlean cloud install` with a release tag refreshes the host CLI and
+config (mode `0600`) and re-pulls the engine image; install fails if Docker or
+Verglas checks fail. `rlean live upgrade` / cloud redeploy always pull
+`:latest` before replacing a paused/stopped deployment.
 
 ```sh
 just format        # apply rustfmt
 just lint          # run the PR formatting, check, and clippy gates
 just test          # run all workspace tests
 just ci            # run every PR gate
-just deploy-local  # validate, install rlean+rleand, and restart launchd
+just install       # install the host rlean CLI locally
 ```
 
 Cloud upgrades remain first-class rlean operations and are intentionally not
@@ -338,10 +348,6 @@ rlean live my_first_strategy/main.py \
   --live-data-feed tradier \
   --brokerage paper
 ```
-
-## Known rough edges
-
-Remote reads for very wide backtests (many symbols over long ranges) can be slow against a remote catalog. This is an active workstream.
 
 ## Contributing
 

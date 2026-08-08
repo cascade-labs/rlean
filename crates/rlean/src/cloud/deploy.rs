@@ -1,9 +1,10 @@
 //! `rlean cloud deploy` and the `status` / `logs` / `portfolio` monitors.
 //!
 //! Deploy snapshots a local strategy working tree to a node with rsync, then
-//! submits the deployment to the node's persistent `rleand` supervisor. The
-//! remote run directory + `deployment.json` remain the durable strategy state;
-//! rleand owns process restart and reboot recovery.
+//! launches `rlean live --pull` on the node so the host CLI pulls the latest
+//! engine image and places a Docker container. The remote deploy directory +
+//! `deployment.json` remain the durable strategy state; Docker restart policy
+//! owns process keep-alive.
 
 use std::path::{Path, PathBuf};
 
@@ -62,18 +63,17 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
 
 /// Build the shell command run on the node to launch the deployment.
 ///
-/// This invokes the node's own `rlean live` launcher (NOT `--foreground`):
-/// exactly what a local deploy does. The launcher reserves the deploy dir,
-/// snapshots the code, writes `deployment.json`, and submits the foreground
-/// engine command to rleand, so the run survives SSH disconnects and reboots.
-/// The launcher exits after confirming startup, printing
-/// `Live deployment started: deploy_id=<id> pid=<pid> ...`, which
+/// This invokes the node's own `rlean live --pull` launcher (NOT `--foreground`):
+/// the host CLI pulls the latest engine image, reserves the deploy dir, snapshots
+/// the code, writes `deployment.json`, and starts a Docker container with
+/// `restart: unless-stopped`. The launcher exits after confirming startup,
+/// printing `Live deployment started: deploy_id=<id> container=<id> ...`, which
 /// [`parse_launch_line`] consumes.
 ///
 /// Extracted as a pure string builder so the exact command is unit-testable.
 pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> String {
     format!(
-        "cd {strategy} && rlean live {main} \
+        "cd {strategy} && rlean live --pull {main} \
          --live-data-feed {feed} \
          --brokerage {brok}",
         strategy = paths.strategy_dir,
@@ -83,22 +83,28 @@ pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> 
     )
 }
 
-/// Parse the launcher's `Live deployment started: deploy_id=<id> pid=<pid> ...`
-/// stdout line into `(deploy_id, pid)`.
+/// Parse the launcher's `Live deployment started: deploy_id=<id> ...` stdout
+/// line into `(deploy_id, optional numeric id)`. Prefers `container=` and
+/// falls back to legacy `pid=` for older launchers.
 pub(crate) fn parse_launch_line(stdout: &str) -> Option<(String, u32)> {
     let line = stdout
         .lines()
         .find(|l| l.starts_with("Live deployment started:"))?;
     let mut deploy_id = None;
-    let mut pid = None;
+    let mut numeric_id = None;
     for token in line.split_whitespace() {
         if let Some(v) = token.strip_prefix("deploy_id=") {
             deploy_id = Some(v.to_string());
         } else if let Some(v) = token.strip_prefix("pid=") {
-            pid = v.parse::<u32>().ok();
+            numeric_id = v.parse::<u32>().ok();
+        } else if let Some(v) = token.strip_prefix("container=") {
+            // Container ids are hex; keep a stable u32 fingerprint for the
+            // cloud registry which still stores an optional pid field.
+            let hex: String = v.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+            numeric_id = u32::from_str_radix(&hex, 16).ok().or(Some(0));
         }
     }
-    Some((deploy_id?, pid?))
+    Some((deploy_id?, numeric_id.unwrap_or(0)))
 }
 
 /// Build the argv for a `rlean live <sub> <deploy_id> ...` command run on the
@@ -173,8 +179,9 @@ pub(crate) fn cmd_deploy(
     // 1. rsync the working tree to the node.
     rsync_to(ssh, local_strategy_dir, &paths.strategy_dir, RSYNC_EXCLUDES)?;
 
-    // 2. Launch via the node's own `rlean live` launcher; it reserves the
-    // deploy dir, writes deployment.json, and submits the engine to rleand.
+    // 2. Launch via the node's own `rlean live --pull` launcher; it pulls the
+    // latest engine image, reserves the deploy dir, writes deployment.json,
+    // and places a Docker container.
     // The compound command is passed as a SINGLE argv element: OpenSSH joins
     // remote argv with spaces (no quoting), so a ["sh","-c",cmd] triple would
     // arrive as `sh -c cd ...` and `sh -c` would receive only `cd` — the rest
@@ -446,6 +453,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_launch_line_extracts_container_id() {
+        let stdout = "Live deployment started: deploy_id=d1 container=a1b2c3d4e5f67890 dir=/x\n";
+        let (id, fingerprint) = parse_launch_line(stdout).unwrap();
+        assert_eq!(id, "d1");
+        assert_eq!(fingerprint, 0xa1b2c3d4);
+    }
+
+    #[test]
     fn parse_launch_line_rejects_missing_marker() {
         assert!(parse_launch_line("engine crashed\n").is_none());
         assert!(parse_launch_line("Live deployment started: dir=/x\n").is_none());
@@ -469,9 +484,11 @@ mod tests {
             live_data_feed: "tradier".to_string(),
         };
         let cmd = remote_launch_command(&p, &opts);
-        // The node's own launcher owns detachment (setsid + SIGHUP ignore) and
-        // deployment.json — the command must NOT hand-roll --foreground.
-        assert!(cmd.starts_with("cd /home/opc/rlean-cloud/workspace/uw_control && rlean live "));
+        // The node's own launcher pulls the image, owns detachment via Docker,
+        // and writes deployment.json — the command must NOT hand-roll --foreground.
+        assert!(cmd.starts_with(
+            "cd /home/opc/rlean-cloud/workspace/uw_control && rlean live --pull "
+        ));
         assert!(!cmd.contains("--foreground"));
         assert!(!cmd.contains("--live-deploy-dir"));
         assert!(cmd.contains(" /home/opc/rlean-cloud/workspace/uw_control/main.py"));

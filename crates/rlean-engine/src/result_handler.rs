@@ -19,6 +19,14 @@ impl ResultHandler {
         self.equity_curve.insert(time.0, equity);
     }
 
+    /// Record one algorithm-local daily sample. LEAN's result sampling is
+    /// scheduled in algorithm time, so an evening New York slice must not
+    /// create a second portfolio day merely because UTC crossed midnight.
+    pub fn record_daily_equity(&mut self, date: chrono::NaiveDate, equity: Price) {
+        let time = DateTime::from(date.and_hms_opt(0, 0, 0).expect("valid daily sample"));
+        self.equity_curve.insert(time.0, equity);
+    }
+
     pub fn record_benchmark(&mut self, time: DateTime, price: Price) {
         self.benchmark_curve.insert(time.0, price);
     }
@@ -142,6 +150,25 @@ mod tests {
         curve.insert(timestamp(2024, 1, 3, 21).0, dec!(103));
 
         assert_eq!(daily_close_values(&curve), vec![dec!(101), dec!(103)]);
+    }
+
+    #[test]
+    fn algorithm_local_daily_samples_do_not_split_at_utc_midnight() {
+        let mut result_handler = ResultHandler::new();
+        let friday = chrono::NaiveDate::from_ymd_opt(2024, 7, 19).unwrap();
+
+        result_handler.record_daily_equity(friday, dec!(100));
+        result_handler.record_daily_equity(friday, dec!(101));
+
+        assert_eq!(result_handler.equity_curve.len(), 1);
+        assert_eq!(
+            result_handler
+                .equity_curve
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![dec!(101)]
+        );
     }
 
     #[test]

@@ -84,12 +84,9 @@ where
     let real_routing = config.brokerage.is_some();
     let mut snapshot = crate::live::snapshots::LiveDeploymentSnapshot::new(
         config
-            .output_dir
-            .as_ref()
-            .and_then(|dir| dir.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("live")
-            .to_string(),
+            .deploy_id
+            .clone()
+            .unwrap_or_else(|| "live".to_string()),
     );
 
     // LEAN's BrokerageSetupHandler sets the live algorithm clock to UTC now
@@ -112,8 +109,10 @@ where
     algorithm_manager.set_brokerage_model(config.brokerage_model);
     let risk_free_interest_rate_model: Arc<dyn rlean_core::RiskFreeInterestRateModel> = Arc::new(
         crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
+            &config.historical_provider,
             chrono::Utc::now().date_naive(),
-        )?,
+        )
+        .await?,
     );
     if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
         algorithm_state
@@ -122,14 +121,16 @@ where
             .set_risk_free_interest_rate_model(risk_free_interest_rate_model.clone());
     }
 
-    if let Some(dir) = config.output_dir.as_deref() {
-        if let Some((active, closed)) = crate::live::deployment_writer::restore_live_insights(
-            &algorithm_manager.framework(),
-            dir,
-        ) {
-            tracing::info!(
-                "Restored live framework insights from deploy dir: active={active} closed={closed}"
-            );
+    if let Some(restore) = config.restore.as_ref() {
+        if let Some(insights) = restore.insights.as_ref() {
+            if let Some((active, closed)) = crate::live::catalog_state::restore_live_insights(
+                &algorithm_manager.framework(),
+                insights,
+            ) {
+                tracing::info!(
+                    "Restored live framework insights from Verglas catalog: active={active} closed={closed}"
+                );
+            }
         }
     }
 
@@ -202,6 +203,7 @@ where
                     .initialize_feed(&warmup_subscriptions, warmup_start, warmup_end)
                     .await?;
                 while let Some(mut slice) = warmup_data_manager.next_slice().await? {
+                    algorithm_manager.include_active_option_chains(&mut slice);
                     apply_risk_free_rate_to_option_chains(
                         &mut slice,
                         risk_free_interest_rate_model.as_ref(),
@@ -282,7 +284,7 @@ where
                     )
                     .await?;
                     if let Some(portfolio) = portfolio.as_ref() {
-                        crate::live::deployment_writer::set_live_starting_portfolio_value_from_synced_account(portfolio);
+                        crate::live::catalog_state::set_live_starting_portfolio_value_from_synced_account(portfolio);
                     }
                     tracing::info!(
                         "Live brokerage routing active: cash={} holdings={} open_orders={}",
@@ -332,20 +334,12 @@ where
             brokerage_router = Some(router);
         }
     }
-    // Prefer an artifact sink (mirrors snapshots to S3 per its mode); fall back
-    // to a plain local writer when only an output dir is set.
-    let live_writer = match config.artifact_sink.clone() {
-        Some(sink) => Some(crate::live::deployment_writer::LiveDeploymentWriter::with_sink(sink)),
-        None => config
-            .output_dir
-            .as_ref()
-            .map(|dir| crate::live::deployment_writer::LiveDeploymentWriter::new(dir.clone())),
-    };
+    let stream_updates = config.stream_updates.clone();
+    let deploy_started_at = config.deploy_started_at;
+    let deploy_id = config.deploy_id.clone();
+    let mut catalog_progress_date: Option<chrono::NaiveDate> = None;
     let restored = if config.paper_trading {
-        config
-            .output_dir
-            .as_deref()
-            .and_then(crate::live::deployment_writer::load_deploy_restore)
+        config.restore.clone()
     } else {
         None
     };
@@ -358,20 +352,22 @@ where
         Some(restore) => restore.trades.clone(),
         None => Vec::new(),
     };
+    let mut catalog_order_events = all_order_events.len();
+    let mut catalog_trades = completed_trades.len();
     if let (Some(restore), Some(algorithm_state)) = (
         restored.as_ref(),
         algorithm_manager.algorithm().algorithm_state(),
     ) {
-        crate::live::deployment_writer::apply_initial_brokerage_account_state(
+        crate::live::catalog_state::apply_initial_brokerage_account_state(
             &algorithm_state,
             &restore.account_state,
         );
         if let Some(portfolio) = portfolio.as_ref() {
-            let starting_value = crate::live::deployment_writer::set_live_starting_portfolio_value_from_synced_account(
+            let starting_value = crate::live::catalog_state::set_live_starting_portfolio_value_from_synced_account(
                 portfolio,
             );
             tracing::info!(
-                "Restored paper account from deploy dir: cash={} holdings={} open_orders={} order_events={} trades={} starting_value={starting_value}",
+                "Restored paper account from Verglas catalog: cash={} holdings={} open_orders={} order_events={} trades={} starting_value={starting_value}",
                 restore.account_state.cash,
                 restore.account_state.holdings.len(),
                 restore.account_state.open_orders.len(),
@@ -395,22 +391,27 @@ where
             );
         }
     }
-    if let (Some(writer), Some(processor), Some(portfolio)) = (
-        live_writer.as_ref(),
-        order_processor.as_ref(),
+    if let (Some(sender), Some(transactions), Some(portfolio)) = (
+        stream_updates.as_ref(),
+        transactions.as_ref(),
         portfolio.as_ref(),
     ) {
-        writer.record_snapshot(
+        emit_live_catalog_update(
+            sender,
             rlean_core::DateTime::now(),
             portfolio,
-            processor,
+            transactions,
             Some(&algorithm_manager.framework()),
-            crate::live::deployment_writer::LiveSnapshotCounts {
-                slices_processed: algorithm_manager.slices_processed() as usize,
-                order_events: all_order_events.len(),
-                trades: completed_trades.len(),
-            },
-        );
+            deploy_id.as_deref(),
+            deploy_started_at,
+            &all_order_events,
+            &completed_trades,
+            &mut catalog_order_events,
+            &mut catalog_trades,
+            &mut catalog_progress_date,
+            true,
+        )
+        .await?;
     }
     let run_started = Instant::now();
     let mut assembler = LiveSliceAssembler::new();
@@ -443,17 +444,6 @@ where
             // the current wall-clock frontier afterwards without invoking
             // OnData, universe selection, indicators, or slice counters.
             algorithm_manager.advance_frontier(&rlean_data::Slice::new(pulse_time), &mut services);
-            if let (Some(writer), Some(portfolio)) = (live_writer.as_ref(), portfolio.as_ref()) {
-                writer.record_time_pulse(
-                    pulse_time,
-                    portfolio,
-                    crate::live::deployment_writer::LiveSnapshotCounts {
-                        slices_processed: algorithm_manager.slices_processed() as usize,
-                        order_events: all_order_events.len(),
-                        trades: completed_trades.len(),
-                    },
-                );
-            }
             if let (Some(router), Some(transactions)) =
                 (brokerage_router.as_mut(), transactions.as_ref())
             {
@@ -464,11 +454,17 @@ where
                     router,
                     transactions,
                     portfolio.as_ref(),
-                    live_writer.as_ref(),
+                    stream_updates.as_ref(),
+                    deploy_id.as_deref(),
+                    deploy_started_at,
+                    &mut catalog_order_events,
+                    &mut catalog_trades,
+                    &mut catalog_progress_date,
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
-                );
+                )
+                .await?;
             }
         }
 
@@ -513,15 +509,22 @@ where
                     router,
                     transactions,
                     portfolio.as_ref(),
-                    live_writer.as_ref(),
+                    stream_updates.as_ref(),
+                    deploy_id.as_deref(),
+                    deploy_started_at,
+                    &mut catalog_order_events,
+                    &mut catalog_trades,
+                    &mut catalog_progress_date,
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
-                );
+                )
+                .await?;
             }
         }
 
         for mut slice in ready_slices {
+            algorithm_manager.include_active_option_chains(&mut slice);
             apply_risk_free_rate_to_option_chains(
                 &mut slice,
                 risk_free_interest_rate_model.as_ref(),
@@ -535,7 +538,12 @@ where
                 brokerage_router.as_mut(),
                 transactions.as_ref(),
                 portfolio.as_ref(),
-                live_writer.as_ref(),
+                stream_updates.as_ref(),
+                deploy_id.as_deref(),
+                deploy_started_at,
+                &mut catalog_order_events,
+                &mut catalog_trades,
+                &mut catalog_progress_date,
                 &mut all_order_events,
                 &mut trade_builder,
                 &mut completed_trades,
@@ -565,6 +573,7 @@ where
         && algorithm_manager.algorithm().runtime_error().is_none()
     {
         if let Some(mut slice) = assembler.advance(rlean_core::DateTime::now()) {
+            algorithm_manager.include_active_option_chains(&mut slice);
             apply_risk_free_rate_to_option_chains(
                 &mut slice,
                 risk_free_interest_rate_model.as_ref(),
@@ -584,7 +593,12 @@ where
                     brokerage_router.as_mut(),
                     transactions.as_ref(),
                     portfolio.as_ref(),
-                    live_writer.as_ref(),
+                    stream_updates.as_ref(),
+                    deploy_id.as_deref(),
+                    deploy_started_at,
+                    &mut catalog_order_events,
+                    &mut catalog_trades,
+                    &mut catalog_progress_date,
                     &mut all_order_events,
                     &mut trade_builder,
                     &mut completed_trades,
@@ -610,11 +624,6 @@ where
         .parse::<f64>()
         .unwrap_or(0.0);
     snapshot.recent_order_events = all_order_events.clone();
-
-    // Clean shutdown: drain any queued S3 uploads so the final snapshot lands.
-    if let Some(writer) = live_writer.as_ref() {
-        writer.flush();
-    }
 
     Ok(LiveRunResult {
         slices_processed: algorithm_manager.slices_processed() as usize,
@@ -1072,6 +1081,77 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     }
 }
 
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_live_catalog_update(
+    sender: &tokio::sync::mpsc::Sender<crate::BacktestStreamUpdate>,
+    time: rlean_core::DateTime,
+    portfolio: &rlean_algorithm::portfolio::SecurityPortfolioManager,
+    transactions: &rlean_orders::TransactionManager,
+    framework: Option<&std::sync::Arc<std::sync::Mutex<crate::framework::FrameworkState>>>,
+    deploy_id: Option<&str>,
+    deploy_started_at: chrono::DateTime<chrono::Utc>,
+    all_order_events: &[OrderEvent],
+    completed_trades: &[Trade],
+    catalog_order_events: &mut usize,
+    catalog_trades: &mut usize,
+    catalog_progress_date: &mut Option<chrono::NaiveDate>,
+    force_checkpoint: bool,
+) -> Result<()> {
+    let current_date = time.date_utc();
+    let start_date = deploy_started_at.date_naive();
+    let trading_days = (current_date - start_date).num_days().max(0);
+    let starting_cash = portfolio
+        .starting_cash()
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let portfolio_value = portfolio
+        .total_portfolio_value()
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let progress = crate::BacktestProgress {
+        current_date,
+        start_date,
+        end_date: current_date,
+        trading_days,
+        starting_cash,
+        portfolio_value,
+    };
+    let is_new_day = *catalog_progress_date != Some(current_date);
+    let has_events = all_order_events.len() > *catalog_order_events;
+    let has_trades = completed_trades.len() > *catalog_trades;
+    if !(force_checkpoint || has_events || has_trades || is_new_day) {
+        return Ok(());
+    }
+
+    let (checkpoint, insight_events) = crate::live::catalog_state::build_live_checkpoint(
+        time,
+        portfolio,
+        transactions,
+        framework,
+        deploy_id,
+        deploy_started_at,
+    );
+    let checkpoint_json = serde_json::to_string(&checkpoint).ok();
+    sender
+        .send(crate::BacktestStreamUpdate {
+            progress,
+            record_daily_progress: is_new_day,
+            order_events: all_order_events[*catalog_order_events..].to_vec(),
+            trades: completed_trades[*catalog_trades..].to_vec(),
+            insight_events,
+            checkpoint_json,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("live run-catalog stream closed"))?;
+    *catalog_order_events = all_order_events.len();
+    *catalog_trades = completed_trades.len();
+    *catalog_progress_date = Some(current_date);
+    Ok(())
+}
+
 fn open_closing_quantity(
     transactions: &rlean_orders::TransactionManager,
     symbol_sid: u64,
@@ -1092,17 +1172,22 @@ fn open_closing_quantity(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn service_live_brokerage<B: AlgorithmBridge>(
+async fn service_live_brokerage<B: AlgorithmBridge>(
     algorithm_manager: &mut AlgorithmManager<B>,
     services: &mut dyn AlgorithmServices,
     router: &mut crate::live::transaction_handler::LiveBrokerageRouter,
     transactions: &Arc<rlean_orders::TransactionManager>,
     portfolio: Option<&Arc<rlean_algorithm::portfolio::SecurityPortfolioManager>>,
-    live_writer: Option<&crate::live::deployment_writer::LiveDeploymentWriter>,
+    stream_updates: Option<&tokio::sync::mpsc::Sender<crate::BacktestStreamUpdate>>,
+    deploy_id: Option<&str>,
+    deploy_started_at: chrono::DateTime<chrono::Utc>,
+    catalog_order_events: &mut usize,
+    catalog_trades: &mut usize,
+    catalog_progress_date: &mut Option<chrono::NaiveDate>,
     all_order_events: &mut Vec<OrderEvent>,
     trade_builder: &mut TradeBuilder,
     completed_trades: &mut Vec<Trade>,
-) {
+) -> Result<()> {
     let previous_order_events = all_order_events.len();
     let previous_trades = completed_trades.len();
     router.drain_events(
@@ -1114,11 +1199,6 @@ fn service_live_brokerage<B: AlgorithmBridge>(
         trade_builder,
         completed_trades,
     );
-    if let Some(writer) = live_writer {
-        writer.append_order_events(&all_order_events[previous_order_events..]);
-        writer.append_trades(&completed_trades[previous_trades..]);
-    }
-
     let invalid_events = algorithm_manager
         .algorithm()
         .algorithm_state()
@@ -1131,32 +1211,33 @@ fn service_live_brokerage<B: AlgorithmBridge>(
         for event in &invalid_events {
             algorithm_manager.algorithm.on_order_event(event, services);
         }
-        if let Some(writer) = live_writer {
-            writer.append_order_events(&invalid_events);
-        }
         all_order_events.extend(invalid_events);
     }
 
-    // Brokerage events are independent of market-data slices. Match LEAN's
-    // transaction/result lifecycle by refreshing restart and CLI artifacts as
-    // soon as submitted/filled/invalid state changes, including for sparse
-    // Daily strategies that may not receive another slice today.
+    // Brokerage events are independent of market-data slices. Stream catalog
+    // updates as soon as submitted/filled/invalid state changes.
     if all_order_events.len() != previous_order_events || completed_trades.len() != previous_trades
     {
-        if let (Some(writer), Some(portfolio)) = (live_writer, portfolio) {
-            writer.record_snapshot_from_transactions(
+        if let (Some(sender), Some(portfolio)) = (stream_updates, portfolio) {
+            emit_live_catalog_update(
+                sender,
                 rlean_core::DateTime::now(),
                 portfolio,
                 transactions.as_ref(),
                 Some(&algorithm_manager.framework()),
-                crate::live::deployment_writer::LiveSnapshotCounts {
-                    slices_processed: algorithm_manager.slices_processed() as usize,
-                    order_events: all_order_events.len(),
-                    trades: completed_trades.len(),
-                },
-            );
+                deploy_id,
+                deploy_started_at,
+                all_order_events,
+                completed_trades,
+                catalog_order_events,
+                catalog_trades,
+                catalog_progress_date,
+                true,
+            )
+            .await?;
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1250,12 @@ async fn process_live_slice<B: AlgorithmBridge>(
     mut brokerage_router: Option<&mut crate::live::transaction_handler::LiveBrokerageRouter>,
     transactions: Option<&std::sync::Arc<rlean_orders::TransactionManager>>,
     portfolio: Option<&std::sync::Arc<rlean_algorithm::portfolio::SecurityPortfolioManager>>,
-    live_writer: Option<&crate::live::deployment_writer::LiveDeploymentWriter>,
+    stream_updates: Option<&tokio::sync::mpsc::Sender<crate::BacktestStreamUpdate>>,
+    deploy_id: Option<&str>,
+    deploy_started_at: chrono::DateTime<chrono::Utc>,
+    catalog_order_events: &mut usize,
+    catalog_trades: &mut usize,
+    catalog_progress_date: &mut Option<chrono::NaiveDate>,
     all_order_events: &mut Vec<OrderEvent>,
     trade_builder: &mut TradeBuilder,
     completed_trades: &mut Vec<Trade>,
@@ -1238,11 +1324,6 @@ async fn process_live_slice<B: AlgorithmBridge>(
             completed_trades,
         );
     }
-    if let Some(writer) = live_writer {
-        writer.append_order_events(&all_order_events[prev_order_events..]);
-        writer.append_trades(&completed_trades[prev_trades..]);
-    }
-
     algorithm_manager.deliver_data(
         rlean_algorithm::algorithm::DataDeliveryPayload { slice: slice_arc },
         services,
@@ -1262,9 +1343,6 @@ async fn process_live_slice<B: AlgorithmBridge>(
         if !invalid_events.is_empty() {
             for event in &invalid_events {
                 algorithm_manager.algorithm.on_order_event(event, services);
-            }
-            if let Some(writer) = live_writer {
-                writer.append_order_events(&invalid_events);
             }
             all_order_events.extend(invalid_events);
         }
@@ -1290,20 +1368,27 @@ async fn process_live_slice<B: AlgorithmBridge>(
         all_order_events.len(),
         completed_trades.len()
     );
-    if let (Some(writer), Some(processor), Some(portfolio)) =
-        (live_writer, order_processor.as_ref(), portfolio)
+    if let (Some(sender), Some(transactions), Some(portfolio)) =
+        (stream_updates, transactions, portfolio)
     {
-        writer.record_snapshot(
+        let force_checkpoint = all_order_events.len() != prev_order_events
+            || completed_trades.len() != prev_trades;
+        emit_live_catalog_update(
+            sender,
             slice.time,
             portfolio,
-            processor,
+            transactions.as_ref(),
             Some(&algorithm_manager.framework()),
-            crate::live::deployment_writer::LiveSnapshotCounts {
-                slices_processed: algorithm_manager.slices_processed() as usize,
-                order_events: all_order_events.len(),
-                trades: completed_trades.len(),
-            },
-        );
+            deploy_id,
+            deploy_started_at,
+            all_order_events,
+            completed_trades,
+            catalog_order_events,
+            catalog_trades,
+            catalog_progress_date,
+            force_checkpoint,
+        )
+        .await?;
     }
     Ok(())
 }

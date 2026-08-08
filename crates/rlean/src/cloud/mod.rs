@@ -59,7 +59,7 @@ pub enum CloudCommand {
     },
     /// List registered nodes
     List {
-        /// Show only the cached node registry without checking rlean or rleand
+        /// Show only the cached node registry without checking Docker/Verglas
         #[arg(long)]
         offline: bool,
     },
@@ -76,20 +76,15 @@ pub enum CloudCommand {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Install rlean, rleand, and configuration onto a node
+    /// Install the host CLI, config, and pull the engine image onto a node
     Install {
         /// Node name
         name: String,
         /// Release tag for the bundles (defaults to the cloud RC tag)
         #[arg(long)]
         release_tag: Option<String>,
-        /// Override the artifact S3 endpoint written into the node config
-        /// (for nodes that reach the object store via a different route than
-        /// the control machine)
-        #[arg(long)]
-        artifact_s3_endpoint: Option<String>,
     },
-    /// Snapshot a strategy to a node and submit it to the node's rleand
+    /// Snapshot a strategy to a node and place a live container there
     Deploy {
         /// Node name
         name: String,
@@ -98,7 +93,7 @@ pub enum CloudCommand {
         /// Live brokerage used for order execution
         #[arg(long)]
         brokerage: String,
-        /// Live market-data integration serving strategy market subscriptions
+        /// Live market-data provider serving strategy market subscriptions
         #[arg(long)]
         live_data_feed: String,
     },
@@ -180,11 +175,10 @@ pub fn run(args: CloudArgs) -> Result<()> {
         CloudCommand::Install {
             name,
             release_tag,
-            artifact_s3_endpoint,
         } => {
             let reg = NodeRegistry::load()?;
             let tag = release_tag.as_deref().unwrap_or(DEFAULT_RELEASE_TAG);
-            let summary = cmd_install(&exec, &reg, &name, tag, artifact_s3_endpoint.as_deref())?;
+            let summary = cmd_install(&exec, &reg, &name, tag)?;
             print_install_summary(&summary);
             Ok(())
         }
@@ -402,8 +396,10 @@ struct ListRow {
     last_seen: String,
     /// Installed rlean version/reachability, or `None` when not probed.
     rlean_status: Option<String>,
-    /// rleand service/control-socket health, or `None` when not probed.
-    daemon_status: Option<String>,
+    /// Docker daemon health, or `None` when not probed.
+    docker_status: Option<String>,
+    /// Verglas gateway reachability from the node, or `None` when not probed.
+    verglas_status: Option<String>,
 }
 
 /// Build list rows, probing each node when requested.
@@ -429,15 +425,13 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
         } else {
             None
         };
-        let daemon_status = if probe
-            && rlean_status
-                .as_deref()
-                .map(rlean_is_available)
-                .unwrap_or(false)
-        {
-            Some(probe_daemon(exec, &ssh_dest))
-        } else if probe {
-            Some("unknown".to_owned())
+        let docker_status = if probe {
+            Some(probe_docker(exec, &ssh_dest))
+        } else {
+            None
+        };
+        let verglas_status = if probe {
+            Some(probe_verglas(exec, &ssh_dest))
         } else {
             None
         };
@@ -460,7 +454,8 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
             roles,
             last_seen,
             rlean_status,
-            daemon_status,
+            docker_status,
+            verglas_status,
         });
     }
     Ok(rows)
@@ -468,11 +463,7 @@ fn cmd_list(exec: &dyn RemoteExec, reg: &mut NodeRegistry, probe: bool) -> Resul
 
 /// Whether a probe status string represents a reachable node.
 fn is_reachable(status: &str) -> bool {
-    status != "unreachable"
-}
-
-fn rlean_is_available(status: &str) -> bool {
-    is_reachable(status) && status != "rlean not installed"
+    status != "unreachable" && status != "rlean not installed"
 }
 
 /// Probe a single node: run `rlean --version` and classify the result.
@@ -500,22 +491,23 @@ fn probe_node(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
     }
 }
 
-/// Probe rleand through the same public control path users invoke locally.
-fn probe_daemon(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
-    match exec.run(ssh_dest, &["rlean", "daemon", "status"]) {
-        Ok(out) if out.status == 0 && out.stdout.contains("control: reachable") => {
-            "running".to_owned()
-        }
-        Ok(out) if out.status == 0 => "unhealthy".to_owned(),
-        Ok(out)
-            if out.status == 127
-                || out.stderr.contains("unrecognized subcommand 'daemon'")
-                || out.stderr.contains("unrecognized subcommand `daemon`")
-                || out.stderr.contains("not found")
-                || out.stderr.contains("No such file") =>
-        {
+fn probe_docker(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
+    match exec.run(ssh_dest, &["docker", "info"]) {
+        Ok(out) if out.status == 0 => "ok".to_owned(),
+        Ok(out) if out.status == 127 || out.stderr.contains("not found") => {
             "not installed".to_owned()
         }
+        Ok(_) | Err(_) => "unreachable".to_owned(),
+    }
+}
+
+/// Remote one-liner used by [`probe_verglas`]. Kept as a const so unit tests can
+/// stub the exact argv FakeExec expects.
+const VERGLAS_PROBE_SCRIPT: &str = r#"EP="${VERGLAS_ENDPOINT:-}"; if [ -z "$EP" ] && [ -f "$HOME/.rlean/config" ]; then EP=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verglas_endpoint") or "")' "$HOME/.rlean/config" 2>/dev/null || true); fi; EP="${EP:-http://127.0.0.1:8334}"; CODE=$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' "$EP" 2>/dev/null || curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' "$EP/health" 2>/dev/null || echo 000); case "$CODE" in 2*|3*|4*) echo ok;; *) echo unreachable;; esac"#;
+
+fn probe_verglas(exec: &dyn RemoteExec, ssh_dest: &str) -> String {
+    match exec.run(ssh_dest, &["sh", "-c", VERGLAS_PROBE_SCRIPT]) {
+        Ok(out) if out.status == 0 && out.stdout.trim() == "ok" => "ok".to_owned(),
         Ok(_) | Err(_) => "unreachable".to_owned(),
     }
 }
@@ -544,8 +536,8 @@ fn cmd_exec(exec: &dyn RemoteExec, reg: &NodeRegistry, name: &str, cmd: &[String
 fn print_list(rows: &[ListRow], probe: bool) {
     if probe {
         println!(
-            "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} RLEAND",
-            "NAME", "SSH_DEST", "PLATFORM", "ROLES", "LAST_SEEN", "RLEAN"
+            "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} {:<12} VERGLAS",
+            "NAME", "SSH_DEST", "PLATFORM", "ROLES", "LAST_SEEN", "RLEAN", "DOCKER"
         );
     } else {
         println!(
@@ -556,14 +548,15 @@ fn print_list(rows: &[ListRow], probe: bool) {
     for r in rows {
         if probe {
             println!(
-                "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} {}",
+                "{:<16} {:<20} {:<28} {:<16} {:<26} {:<16} {:<12} {}",
                 r.name,
                 r.ssh_dest,
                 r.platform,
                 r.roles,
                 r.last_seen,
                 r.rlean_status.as_deref().unwrap_or(""),
-                r.daemon_status.as_deref().unwrap_or("")
+                r.docker_status.as_deref().unwrap_or(""),
+                r.verglas_status.as_deref().unwrap_or("")
             );
         } else {
             println!(
@@ -702,16 +695,14 @@ mod tests {
         reg.get_mut("box").unwrap().last_seen = "1970-01-01T00:00:00+00:00".to_string();
 
         fake.set("box", &["rlean", "--version"], ok("rlean 0.1.0\n"));
-        fake.set(
-            "box",
-            &["rlean", "daemon", "status"],
-            ok("service: active\ncontrol: reachable pid=42\n"),
-        );
+        fake.set("box", &["docker", "info"], ok("Server Version: 27.0\n"));
+        fake.set("box", &["sh", "-c", VERGLAS_PROBE_SCRIPT], ok("ok\n"));
 
         let rows = cmd_list(&fake, &mut reg, true).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rlean_status.as_deref(), Some("rlean 0.1.0"));
-        assert_eq!(rows[0].daemon_status.as_deref(), Some("running"));
+        assert_eq!(rows[0].docker_status.as_deref(), Some("ok"));
+        assert_eq!(rows[0].verglas_status.as_deref(), Some("ok"));
         // last_seen advanced past the epoch sentinel.
         assert_ne!(
             reg.get("box").unwrap().last_seen,
@@ -738,14 +729,29 @@ mod tests {
                 stderr: "bash: rlean: command not found\n".to_string(),
             },
         );
+        fake.set(
+            "box",
+            &["docker", "info"],
+            RemoteOutput {
+                status: 127,
+                stdout: String::new(),
+                stderr: "bash: docker: command not found\n".to_string(),
+            },
+        );
+        fake.set(
+            "box",
+            &["sh", "-c", VERGLAS_PROBE_SCRIPT],
+            ok("unreachable\n"),
+        );
 
         let rows = cmd_list(&fake, &mut reg, true).unwrap();
         assert_eq!(rows[0].rlean_status.as_deref(), Some("rlean not installed"));
-        assert_eq!(rows[0].daemon_status.as_deref(), Some("unknown"));
+        assert_eq!(rows[0].docker_status.as_deref(), Some("not installed"));
+        assert_eq!(rows[0].verglas_status.as_deref(), Some("unreachable"));
     }
 
     #[test]
-    fn list_probe_reports_missing_daemon() {
+    fn list_probe_reports_docker_unreachable() {
         let mut fake = FakeExec::new();
         fake.set("box", &["true"], ok(""));
         fake.set("box", &["uname", "-s", "-m"], ok("Linux x86_64\n"));
@@ -756,16 +762,18 @@ mod tests {
         fake.set("box", &["rlean", "--version"], ok("rlean 0.1.1\n"));
         fake.set(
             "box",
-            &["rlean", "daemon", "status"],
+            &["docker", "info"],
             RemoteOutput {
-                status: 2,
+                status: 1,
                 stdout: String::new(),
-                stderr: "error: unrecognized subcommand 'daemon'\n".to_owned(),
+                stderr: "Cannot connect to the Docker daemon\n".to_owned(),
             },
         );
+        fake.set("box", &["sh", "-c", VERGLAS_PROBE_SCRIPT], ok("ok\n"));
 
         let rows = cmd_list(&fake, &mut reg, true).unwrap();
-        assert_eq!(rows[0].daemon_status.as_deref(), Some("not installed"));
+        assert_eq!(rows[0].docker_status.as_deref(), Some("unreachable"));
+        assert_eq!(rows[0].verglas_status.as_deref(), Some("ok"));
     }
 
     #[test]

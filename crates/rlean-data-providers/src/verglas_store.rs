@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,20 +13,24 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use chrono::Datelike;
 use futures::{stream, StreamExt, TryStreamExt};
-use rlean_core::{NanosecondTimestamp, TickType, TimeSpan};
+use rlean_core::{MarketHoursDatabase, NanosecondTimestamp, SecurityType, TickType, TimeSpan};
 use rlean_data::SubscriptionDataKind;
 use rlean_data_tables::{
     Bar, CustomDataPoint, DataMappingMode, FactorFileEntry, MapFileEntry, OptionUniverseRow,
-    PartitionTransform, QuoteBar, TableContract, Tick, TradeBar, DECIMAL_PRECISION, DECIMAL_SCALE,
+    PartitionTransform, QuoteBar, RiskFreeInterestRate, TableContract, Tick, TradeBar,
+    DECIMAL_PRECISION, DECIMAL_SCALE,
 };
 use rust_decimal::Decimal;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use verglas_sdk::{
     Client, ClientError, ColumnSpec, ConnectOptions, PartitionSpec, QueryStream,
     TableDefinition as VerglasTableDefinition,
 };
 
-use crate::{Coverage, HistoricalData, HistoricalDataStore, HistoryRequest, TimeRange};
+use crate::{
+    CacheAppendOutcome, Coverage, DroppedCacheWrites, HistoricalData, HistoricalDataStore,
+    HistoryRequest, TimeRange,
+};
 
 const TRADE_BARS: &str = "rlean.market_trade_bars";
 const QUOTE_BARS: &str = "rlean.market_quote_bars";
@@ -33,21 +39,43 @@ const OPTION_UNIVERSE: &str = "rlean.option_universe";
 const CUSTOM_POINTS: &str = "rlean.custom_points";
 const FACTOR_FILES: &str = "rlean.factor_files";
 const MAP_FILES: &str = "rlean.map_files";
+const RISK_FREE_INTEREST_RATES: &str = "rlean.risk_free_interest_rates";
 const COVERAGE: &str = "rlean.history_coverage";
 const BATCH_ROWS: usize = 8_192;
-const MAX_CONCURRENT_VERGLAS_IO: usize = 16;
+// Each Verglas query is an isolated worker, not a lightweight HTTP request.
+// Keep enough parallelism to overlap independent tables without creating a
+// process and memory spike while prefetching an option-universe window.
+const MAX_CONCURRENT_VERGLAS_IO: usize = 4;
 const QUERY_OPEN_ATTEMPTS: usize = 4;
 const QUERY_BATCH_DELAY: Duration = Duration::from_millis(2);
 const QUERY_BATCH_CAPACITY: usize = 4_096;
 const QUERY_BATCH_MAX: usize = 512;
+// Trade and quote streams can straddle a day boundary while independent
+// subscription readers drain. Six entries retain three trading days for both
+// tables without allowing a long backtest to accumulate option history.
+const SHARED_OPTION_WINDOW_CACHE_CAPACITY: usize = 16;
 
 struct CoverageQuery {
     request: HistoryRequest,
     response: oneshot::Sender<Result<Coverage>>,
 }
 
+struct CoverageWrite {
+    request: HistoryRequest,
+    provider: String,
+    response: oneshot::Sender<Result<()>>,
+}
+
+struct HistoryWrite {
+    request: HistoryRequest,
+    provider: String,
+    data: HistoricalData,
+    response: oneshot::Sender<Result<CacheAppendOutcome>>,
+}
+
 struct MarketDataQuery {
     request: HistoryRequest,
+    cache_generation: u64,
     response: oneshot::Sender<Result<HistoricalData>>,
 }
 
@@ -58,8 +86,130 @@ struct MarketDataBatchKey {
     security_type: String,
     market: String,
     resolution: String,
+    symbol_root: Option<String>,
     start_ns: i64,
     end_ns: i64,
+}
+
+#[derive(Default)]
+struct SharedOptionWindowCache {
+    entries: HashMap<(MarketDataBatchKey, u64), Arc<SharedOptionWindow>>,
+    order: VecDeque<(MarketDataBatchKey, u64)>,
+}
+
+impl SharedOptionWindowCache {
+    fn get(
+        &mut self,
+        key: &MarketDataBatchKey,
+        generation: u64,
+    ) -> Option<Arc<SharedOptionWindow>> {
+        let cache_key = self
+            .entries
+            .keys()
+            .find(|(candidate, candidate_generation)| {
+                *candidate_generation == generation
+                    && same_market_data_source(candidate, key)
+                    && candidate.start_ns <= key.start_ns
+                    && candidate.end_ns >= key.end_ns
+            })?
+            .clone();
+        let window = self.entries.get(&cache_key)?.clone();
+        if let Some(position) = self
+            .order
+            .iter()
+            .position(|candidate| candidate == &cache_key)
+        {
+            self.order.remove(position);
+        }
+        self.order.push_back(cache_key);
+        Some(window)
+    }
+
+    fn insert(
+        &mut self,
+        key: MarketDataBatchKey,
+        generation: u64,
+        window: Arc<SharedOptionWindow>,
+    ) {
+        let cache_key = (key, generation);
+        if self.entries.insert(cache_key.clone(), window).is_some() {
+            if let Some(position) = self
+                .order
+                .iter()
+                .position(|candidate| candidate == &cache_key)
+            {
+                self.order.remove(position);
+            }
+        }
+        self.order.push_back(cache_key);
+        while self.order.len() > SHARED_OPTION_WINDOW_CACHE_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+}
+
+fn same_market_data_source(left: &MarketDataBatchKey, right: &MarketDataBatchKey) -> bool {
+    left.table == right.table
+        && left.venue == right.venue
+        && left.security_type == right.security_type
+        && left.market == right.market
+        && left.resolution == right.resolution
+        && left.symbol_root == right.symbol_root
+}
+
+#[derive(Clone, Default)]
+struct SharedOptionWindow {
+    by_sid: HashMap<i64, Vec<RecordBatch>>,
+    loaded_sids: HashSet<i64>,
+}
+
+impl SharedOptionWindow {
+    fn index(batches: Vec<RecordBatch>, loaded_sids: HashSet<i64>) -> Result<Self> {
+        let mut by_sid: HashMap<i64, Vec<RecordBatch>> = HashMap::new();
+        for batch in batches {
+            let sids = int64(&batch, "symbol_sid")?;
+            let values = sids.values();
+            let mut start = 0;
+            while start < values.len() {
+                let sid = values[start];
+                let mut end = start + 1;
+                while end < values.len() && values[end] == sid {
+                    end += 1;
+                }
+                // The Verglas query is ordered by symbol_sid. RecordBatch::slice
+                // retains Arrow buffers, so indexing a month by SID is zero-copy.
+                by_sid
+                    .entry(sid)
+                    .or_default()
+                    .push(batch.slice(start, end - start));
+                start = end;
+            }
+        }
+        Ok(Self {
+            by_sid,
+            loaded_sids,
+        })
+    }
+
+    fn missing_sids(&self, requested: &HashSet<i64>) -> HashSet<i64> {
+        requested.difference(&self.loaded_sids).copied().collect()
+    }
+
+    fn merge(&self, newer: Self) -> Self {
+        let mut merged = self.clone();
+        merged.loaded_sids.extend(newer.loaded_sids);
+        for (sid, batches) in newer.by_sid {
+            merged.by_sid.entry(sid).or_default().extend(batches);
+        }
+        merged
+    }
+}
+
+enum MarketDataRead {
+    Direct(Arc<Vec<RecordBatch>>),
+    SharedOption(Arc<SharedOptionWindow>),
 }
 
 /// Canonical historical storage backed by Verglas.
@@ -72,7 +222,11 @@ pub struct VerglasHistoricalDataStore {
     client: Client,
     io_permits: Arc<Semaphore>,
     coverage_queries: mpsc::Sender<CoverageQuery>,
+    coverage_writes: mpsc::Sender<CoverageWrite>,
+    history_writes: mpsc::Sender<HistoryWrite>,
     market_data_queries: mpsc::Sender<MarketDataQuery>,
+    market_data_cache_generation: Arc<AtomicU64>,
+    dropped_cache_writes: DroppedCacheWrites,
 }
 
 impl VerglasHistoricalDataStore {
@@ -121,11 +275,20 @@ impl VerglasHistoricalDataStore {
             .await
             .context("ensure canonical map-file table")?;
         client
+            .ensure_table(
+                RISK_FREE_INTEREST_RATES,
+                &contract_definition::<RiskFreeInterestRate>()?,
+            )
+            .await
+            .context("ensure canonical risk-free interest-rate table")?;
+        client
             .ensure_table(COVERAGE, &coverage_definition())
             .await
             .context("ensure historical coverage table")?;
         let io_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_VERGLAS_IO));
         let (coverage_queries, coverage_receiver) = mpsc::channel(QUERY_BATCH_CAPACITY);
+        let (coverage_writes, coverage_write_receiver) = mpsc::channel(QUERY_BATCH_CAPACITY);
+        let (history_writes, history_write_receiver) = mpsc::channel(QUERY_BATCH_CAPACITY);
         let (market_data_queries, market_data_receiver) = mpsc::channel(QUERY_BATCH_CAPACITY);
         tokio::spawn(run_coverage_query_batcher(
             client.clone(),
@@ -137,12 +300,34 @@ impl VerglasHistoricalDataStore {
             io_permits.clone(),
             market_data_receiver,
         ));
+        tokio::spawn(run_coverage_write_batcher(
+            client.clone(),
+            io_permits.clone(),
+            coverage_write_receiver,
+        ));
+        let dropped_cache_writes = DroppedCacheWrites::default();
+        tokio::spawn(run_history_write_batcher(
+            client.clone(),
+            io_permits.clone(),
+            dropped_cache_writes.clone(),
+            history_write_receiver,
+        ));
         Ok(Self {
             client,
             io_permits,
             coverage_queries,
+            coverage_writes,
+            history_writes,
             market_data_queries,
+            market_data_cache_generation: Arc::new(AtomicU64::new(0)),
+            dropped_cache_writes,
         })
+    }
+
+    /// Shared tally of canonical batches this store could not commit. The
+    /// deployment reports it once when the run finishes.
+    pub fn dropped_cache_writes(&self) -> DroppedCacheWrites {
+        self.dropped_cache_writes.clone()
     }
 
     async fn query_stream(&self, sql: &str) -> Result<QueryStream> {
@@ -178,6 +363,7 @@ impl VerglasHistoricalDataStore {
         self.market_data_queries
             .send(MarketDataQuery {
                 request: request.clone(),
+                cache_generation: self.market_data_cache_generation.load(Ordering::Acquire),
                 response,
             })
             .await
@@ -401,11 +587,40 @@ async fn run_coverage_query_batcher(
 ) {
     while let Some(first) = receiver.recv().await {
         let jobs = collect_query_batch(&mut receiver, first).await;
-        let result = execute_coverage_query_batch(&client, &io_permits, &jobs).await;
+        let batch_client = client.clone();
+        let batch_io_permits = io_permits.clone();
+        tokio::spawn(async move {
+            let result =
+                execute_coverage_query_batch(&batch_client, &batch_io_permits, &jobs).await;
+            match result {
+                Ok(mut coverage) => {
+                    for (job, covered) in jobs.into_iter().zip(coverage.drain(..)) {
+                        let _ = job.response.send(Ok(covered));
+                    }
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    for job in jobs {
+                        let _ = job.response.send(Err(anyhow::anyhow!(message.clone())));
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn run_coverage_write_batcher(
+    client: Client,
+    io_permits: Arc<Semaphore>,
+    mut receiver: mpsc::Receiver<CoverageWrite>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let jobs = collect_query_batch(&mut receiver, first).await;
+        let result = execute_coverage_write_batch(&client, &io_permits, &jobs).await;
         match result {
-            Ok(mut coverage) => {
-                for (job, covered) in jobs.into_iter().zip(coverage.drain(..)) {
-                    let _ = job.response.send(Ok(covered));
+            Ok(()) => {
+                for job in jobs {
+                    let _ = job.response.send(Ok(()));
                 }
             }
             Err(error) => {
@@ -416,6 +631,261 @@ async fn run_coverage_query_batcher(
             }
         }
     }
+}
+
+async fn run_history_write_batcher(
+    client: Client,
+    io_permits: Arc<Semaphore>,
+    dropped_cache_writes: DroppedCacheWrites,
+    mut receiver: mpsc::Receiver<HistoryWrite>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let jobs = collect_query_batch(&mut receiver, first).await;
+        let mut groups: HashMap<&'static str, Vec<HistoryWrite>> = HashMap::new();
+        for job in jobs {
+            match VerglasHistoricalDataStore::table(&job.request) {
+                Ok(table) => groups.entry(table).or_default().push(job),
+                Err(error) => {
+                    let _ = job.response.send(Err(error));
+                }
+            }
+        }
+        for (table, jobs) in groups {
+            let result = execute_history_write_batch(
+                &client,
+                &io_permits,
+                &dropped_cache_writes,
+                table,
+                &jobs,
+            )
+            .await;
+            match result {
+                Ok(outcome) => {
+                    for job in jobs {
+                        let _ = job.response.send(Ok(outcome));
+                    }
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    for job in jobs {
+                        let _ = job.response.send(Err(anyhow::anyhow!(message.clone())));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One attempt at committing a canonical cache batch. The trait exists so the
+/// retry and drop policy is exercised without a live Verglas service.
+#[async_trait]
+trait CacheBatchAppend: Send + Sync {
+    async fn append_once(&self) -> std::result::Result<(), ClientError>;
+}
+
+struct HistoryBatchAppend<'a> {
+    client: &'a Client,
+    table: &'a str,
+    batches: &'a [RecordBatch],
+    idempotency_key: &'a str,
+}
+
+#[async_trait]
+impl CacheBatchAppend for HistoryBatchAppend<'_> {
+    async fn append_once(&self) -> std::result::Result<(), ClientError> {
+        self.client
+            .append_stream(
+                self.table,
+                stream::iter(self.batches.iter().cloned().map(Ok)),
+                self.idempotency_key,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Drives a canonical cache batch through its retry budget.
+///
+/// Persisting canonical history is an optimization for later runs: the rows
+/// are already in memory feeding the engine. A cache backend that will not
+/// commit therefore costs the batch, not the run. The caller keeps the rows
+/// and leaves the range uncovered, so a later run refetches and repersists it.
+async fn append_cache_batch(
+    appender: &dyn CacheBatchAppend,
+    table: &str,
+    requests: usize,
+    rows: usize,
+    dropped_cache_writes: &DroppedCacheWrites,
+) -> CacheAppendOutcome {
+    let mut delay = Duration::from_secs(60);
+    for attempt in 1..=QUERY_OPEN_ATTEMPTS {
+        let error = match appender.append_once().await {
+            Ok(()) => return CacheAppendOutcome::Persisted,
+            Err(error) => error,
+        };
+        if attempt < QUERY_OPEN_ATTEMPTS && is_coverage_commit_rate_limit(&error) {
+            tracing::warn!(
+                attempt,
+                max_attempts = QUERY_OPEN_ATTEMPTS,
+                table,
+                requests,
+                rows,
+                error = %error,
+                retry_after_seconds = delay.as_secs(),
+                "retrying rate-limited canonical history batch"
+            );
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+            continue;
+        }
+        tracing::error!(
+            attempts = attempt,
+            table,
+            requests,
+            rows,
+            error = %error,
+            "dropping canonical history batch the cache would not commit; the run continues on \
+             the rows already in memory and the range stays uncovered"
+        );
+        dropped_cache_writes.record(rows);
+        return CacheAppendOutcome::Dropped;
+    }
+    unreachable!("canonical history append retry loop always returns")
+}
+
+async fn execute_history_write_batch(
+    client: &Client,
+    io_permits: &Semaphore,
+    dropped_cache_writes: &DroppedCacheWrites,
+    table: &'static str,
+    jobs: &[HistoryWrite],
+) -> Result<CacheAppendOutcome> {
+    let mut batches = Vec::new();
+    let mut keys = Vec::new();
+    for job in jobs {
+        batches.extend(encode_history(&job.request, &job.data)?);
+        keys.push(idempotency_key("data", table, &job.request, &job.provider)?);
+    }
+    keys.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    keys.hash(&mut hasher);
+    let key = format!("rlean-history:data-batch:{:016x}", hasher.finish());
+    let rows = batches.iter().map(RecordBatch::num_rows).sum();
+    let _permit = io_permits
+        .acquire()
+        .await
+        .context("acquire Verglas I/O permit")?;
+    Ok(append_cache_batch(
+        &HistoryBatchAppend {
+            client,
+            table,
+            batches: &batches,
+            idempotency_key: &key,
+        },
+        table,
+        jobs.len(),
+        rows,
+        dropped_cache_writes,
+    )
+    .await)
+}
+
+async fn execute_coverage_write_batch(
+    client: &Client,
+    io_permits: &Semaphore,
+    jobs: &[CoverageWrite],
+) -> Result<()> {
+    let batch = coverage_batch(jobs)?;
+    let idempotency_key = coverage_batch_idempotency_key(jobs)?;
+    let _permit = io_permits
+        .acquire()
+        .await
+        .context("acquire Verglas I/O permit")?;
+    let mut delay = Duration::from_secs(60);
+    for attempt in 1..=QUERY_OPEN_ATTEMPTS {
+        match client
+            .append_stream(
+                COVERAGE,
+                stream::iter(vec![Ok(batch.clone())]),
+                &idempotency_key,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if attempt < QUERY_OPEN_ATTEMPTS && is_coverage_commit_rate_limit(&error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = QUERY_OPEN_ATTEMPTS,
+                    rows = jobs.len(),
+                    error = %error,
+                    retry_after_seconds = delay.as_secs(),
+                    "retrying rate-limited historical coverage batch"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error).context("persist successful historical coverage"),
+        }
+    }
+    unreachable!("coverage write retry loop always returns")
+}
+
+fn coverage_batch(jobs: &[CoverageWrite]) -> Result<RecordBatch> {
+    let tables = jobs
+        .iter()
+        .map(|job| VerglasHistoricalDataStore::table(&job.request))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(
+        coverage_schema(),
+        vec![
+            Arc::new(StringArray::from_iter_values(tables)) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(
+                jobs.iter()
+                    .map(|job| signed_sid(job.request.configuration.symbol.sid())),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                jobs.iter()
+                    .map(|job| job.request.configuration.venue.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                jobs.iter()
+                    .map(|job| job.request.configuration.resolution.to_string()),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                jobs.iter().map(|job| job.request.range.start.0),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                jobs.iter().map(|job| job.request.range.end.0),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                jobs.iter().map(|job| job.provider.as_str()),
+            )),
+        ],
+    )
+    .context("encode historical coverage batch")
+}
+
+fn coverage_batch_idempotency_key(jobs: &[CoverageWrite]) -> Result<String> {
+    let mut row_keys = jobs
+        .iter()
+        .map(|job| idempotency_key("coverage", COVERAGE, &job.request, &job.provider))
+        .collect::<Result<Vec<_>>>()?;
+    row_keys.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    row_keys.hash(&mut hasher);
+    Ok(format!(
+        "rlean-history:coverage-batch:{:016x}",
+        hasher.finish()
+    ))
+}
+
+fn is_coverage_commit_rate_limit(error: &ClientError) -> bool {
+    let message = error.to_string();
+    message.contains("Rate limit exceeded")
+        || message.contains("TooManyRequestsException")
+        || message.contains("429 Too Many Requests")
 }
 
 async fn execute_coverage_query_batch(
@@ -510,93 +980,242 @@ async fn run_market_data_query_batcher(
     io_permits: Arc<Semaphore>,
     mut receiver: mpsc::Receiver<MarketDataQuery>,
 ) {
+    let shared_option_windows = Arc::new(Mutex::new(SharedOptionWindowCache::default()));
     while let Some(first) = receiver.recv().await {
         let jobs = collect_query_batch(&mut receiver, first).await;
-        let mut groups: HashMap<MarketDataBatchKey, Vec<MarketDataQuery>> = HashMap::new();
-        for job in jobs {
-            match market_data_batch_key(&job.request) {
-                Ok(key) => groups.entry(key).or_default().push(job),
-                Err(error) => {
-                    let _ = job.response.send(Err(error));
-                }
+        let batch_client = client.clone();
+        let batch_io_permits = io_permits.clone();
+        let batch_windows = shared_option_windows.clone();
+        tokio::spawn(async move {
+            execute_market_data_query_jobs(batch_client, batch_io_permits, batch_windows, jobs)
+                .await;
+        });
+    }
+}
+
+async fn execute_market_data_query_jobs(
+    client: Client,
+    io_permits: Arc<Semaphore>,
+    shared_option_windows: Arc<Mutex<SharedOptionWindowCache>>,
+    jobs: Vec<MarketDataQuery>,
+) {
+    let mut groups: HashMap<(MarketDataBatchKey, u64), Vec<MarketDataQuery>> = HashMap::new();
+    for job in jobs {
+        match market_data_batch_key(&job.request) {
+            Ok(key) => groups
+                .entry((key, job.cache_generation))
+                .or_default()
+                .push(job),
+            Err(error) => {
+                let _ = job.response.send(Err(error));
             }
         }
-        let results = stream::iter(groups)
-            .map(|(key, jobs)| {
-                let client = client.clone();
-                let io_permits = io_permits.clone();
-                async move {
-                    let result =
-                        execute_market_data_query_batch(&client, &io_permits, &key, &jobs).await;
-                    (jobs, result)
+    }
+    let mut cached_results = Vec::new();
+    let mut uncached_groups = Vec::new();
+    for ((key, generation), jobs) in groups {
+        let requested_sids = jobs
+            .iter()
+            .map(|job| signed_sid(job.request.configuration.symbol.sid()))
+            .collect::<HashSet<_>>();
+        if is_shared_option_window(&key) {
+            if let Some(window) = shared_option_windows.lock().await.get(&key, generation) {
+                let missing_sids = window.missing_sids(&requested_sids);
+                if missing_sids.is_empty() {
+                    cached_results.push((
+                        key,
+                        generation,
+                        jobs,
+                        Ok(MarketDataRead::SharedOption(window)),
+                    ));
+                    continue;
                 }
-            })
-            .buffer_unordered(MAX_CONCURRENT_VERGLAS_IO)
-            .collect::<Vec<_>>()
-            .await;
-        for (jobs, result) in results {
-            match result {
-                Ok(mut data) => {
-                    for (job, rows) in jobs.into_iter().zip(data.drain(..)) {
-                        let _ = job.response.send(Ok(rows));
+                uncached_groups.push((key, generation, jobs, missing_sids, Some(window)));
+                continue;
+            }
+        }
+        uncached_groups.push((key, generation, jobs, requested_sids, None));
+    }
+    let mut results = stream::iter(uncached_groups)
+        .map(|(key, generation, jobs, query_sids, existing_window)| {
+            let client = client.clone();
+            let io_permits = io_permits.clone();
+            async move {
+                let result =
+                    execute_market_data_query_batch(&client, &io_permits, &key, &query_sids)
+                        .await
+                        .and_then(|batches| {
+                            if is_shared_option_window(&key) {
+                                SharedOptionWindow::index(batches, query_sids).map(|fresh| {
+                                    let window = existing_window
+                                        .map_or(fresh.clone(), |existing| existing.merge(fresh));
+                                    MarketDataRead::SharedOption(Arc::new(window))
+                                })
+                            } else {
+                                Ok(MarketDataRead::Direct(Arc::new(batches)))
+                            }
+                        });
+                (key, generation, jobs, result)
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_VERGLAS_IO)
+        .collect::<Vec<_>>()
+        .await;
+    results.extend(cached_results);
+    for (key, generation, jobs, result) in results {
+        match result {
+            Ok(read) => {
+                let decoded = match &read {
+                    MarketDataRead::Direct(batches) => {
+                        decode_market_data_query_batch(&key, &jobs, batches.as_ref())
                     }
+                    MarketDataRead::SharedOption(window) => {
+                        shared_option_windows.lock().await.insert(
+                            key.clone(),
+                            generation,
+                            window.clone(),
+                        );
+                        decode_shared_option_window(&key, &jobs, window)
+                    }
+                };
+                let mut data = match decoded {
+                    Ok(data) => data,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        for job in jobs {
+                            let _ = job.response.send(Err(anyhow::anyhow!(message.clone())));
+                        }
+                        continue;
+                    }
+                };
+                for (job, rows) in jobs.into_iter().zip(data.drain(..)) {
+                    let _ = job.response.send(Ok(rows));
                 }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    for job in jobs {
-                        let _ = job.response.send(Err(anyhow::anyhow!(message.clone())));
-                    }
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                for job in jobs {
+                    let _ = job.response.send(Err(anyhow::anyhow!(message.clone())));
                 }
             }
         }
     }
 }
 
+fn decode_shared_option_window(
+    key: &MarketDataBatchKey,
+    jobs: &[MarketDataQuery],
+    window: &SharedOptionWindow,
+) -> Result<Vec<HistoricalData>> {
+    jobs.iter()
+        .map(|job| {
+            let sid = signed_sid(job.request.configuration.symbol.sid());
+            let batches = window.by_sid.get(&sid).map(Vec::as_slice).unwrap_or(&[]);
+            decode_market_data_query_batch(key, std::slice::from_ref(job), batches).map(
+                |mut data| {
+                    data.pop().unwrap_or_else(|| {
+                        if key.table == TRADE_BARS {
+                            HistoricalData::TradeBars(Vec::new())
+                        } else {
+                            HistoricalData::QuoteBars(Vec::new())
+                        }
+                    })
+                },
+            )
+        })
+        .collect()
+}
+
+fn is_shared_option_window(key: &MarketDataBatchKey) -> bool {
+    key.security_type == SecurityType::Option.to_string()
+        && matches!(key.table, TRADE_BARS | QUOTE_BARS)
+}
+
 fn market_data_batch_key(request: &HistoryRequest) -> Result<MarketDataBatchKey> {
+    let shared_option_source = request.configuration.symbol.security_type() == SecurityType::Option
+        && matches!(
+            VerglasHistoricalDataStore::table(request)?,
+            TRADE_BARS | QUOTE_BARS
+        );
+    let (start_ns, end_ns, symbol_root) = if shared_option_source {
+        let exchange_tz = request
+            .configuration
+            .exchange_time_zone
+            .parse()
+            .with_context(|| {
+                format!(
+                    "invalid exchange timezone {}",
+                    request.configuration.exchange_time_zone
+                )
+            })?;
+        let mut source_date = request.range.start.to_tz(exchange_tz).date_naive();
+        let inclusive_end = request.range.end - TimeSpan::from_nanos(1);
+        let mut source_end_date = inclusive_end.to_tz(exchange_tz).date_naive();
+        let exchange_hours =
+            MarketHoursDatabase::global().exchange_hours(&request.configuration.symbol);
+        while exchange_hours.session_bounds(source_date).is_none() {
+            source_date = source_date
+                .succ_opt()
+                .context("derive next open option source session")?;
+        }
+        while exchange_hours.session_bounds(source_end_date).is_none() {
+            source_end_date = source_end_date
+                .succ_opt()
+                .context("derive final open option source session")?;
+        }
+        let (start, end) = containing_dates(source_date, source_end_date)?;
+        let root = request
+            .configuration
+            .symbol
+            .underlying()
+            .map(|underlying| underlying.permtick().to_ascii_uppercase())
+            .context("option market-data request has no underlying root")?;
+        (start.0, end.0, Some(root))
+    } else {
+        (request.range.start.0, request.range.end.0, None)
+    };
     Ok(MarketDataBatchKey {
         table: VerglasHistoricalDataStore::table(request)?,
         venue: request.configuration.venue.clone(),
         security_type: request.configuration.symbol.security_type().to_string(),
         market: request.configuration.symbol.market().as_str().to_string(),
         resolution: request.configuration.resolution.to_string(),
-        start_ns: request.range.start.0,
-        end_ns: request.range.end.0,
+        symbol_root,
+        start_ns,
+        end_ns,
     })
+}
+
+fn containing_dates(
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<(NanosecondTimestamp, NanosecondTimestamp)> {
+    let start = start_date
+        .and_hms_opt(0, 0, 0)
+        .map(NanosecondTimestamp::from)
+        .context("derive option day start")?;
+    let next_day = end_date
+        .succ_opt()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(NanosecondTimestamp::from)
+        .context("derive following option day")?;
+    Ok((start, NanosecondTimestamp(next_day.0 - 1)))
 }
 
 async fn execute_market_data_query_batch(
     client: &Client,
     io_permits: &Semaphore,
     key: &MarketDataBatchKey,
-    jobs: &[MarketDataQuery],
-) -> Result<Vec<HistoricalData>> {
-    let sids = jobs
-        .iter()
-        .map(|job| signed_sid(job.request.configuration.symbol.sid()))
-        .collect::<HashSet<_>>();
-    let sid_list = sids
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    sids: &HashSet<i64>,
+) -> Result<Vec<RecordBatch>> {
     tracing::debug!(
         table = key.table,
-        requests = jobs.len(),
         symbols = sids.len(),
         start_ns = key.start_ns,
         end_ns = key.end_ns,
         "querying batched cached market data"
     );
-    let sql = format!(
-        "SELECT * FROM {} WHERE symbol_sid IN ({sid_list}) AND venue = '{}' AND security_type = '{}' AND market = '{}' AND {} AND end_time_ns > {} AND end_time_ns <= {} ORDER BY symbol_sid, end_time_ns",
-        key.table,
-        sql_string(&key.venue),
-        sql_string(&key.security_type),
-        sql_string(&key.market),
-        resolution_predicate_from_str(&key.resolution),
-        key.start_ns,
-        key.end_ns,
-    );
+    let sql = market_data_sql(key, &sids);
     let _permit = io_permits
         .acquire()
         .await
@@ -604,6 +1223,46 @@ async fn execute_market_data_query_batch(
     let mut stream = query_stream_with_retry(client, &sql)
         .await
         .with_context(|| format!("query batched cached history from {}", key.table))?;
+    let mut batches = Vec::new();
+    loop {
+        match stream.try_next().await {
+            Ok(Some(batch)) => batches.push(batch),
+            Ok(None) => break,
+            Err(error) if batches.is_empty() && is_empty_arrow_stream(&error) => break,
+            Err(error) => return Err(error).context("stream batched cached market data"),
+        }
+    }
+    Ok(batches)
+}
+
+fn market_data_sql(key: &MarketDataBatchKey, sids: &HashSet<i64>) -> String {
+    let sid_list = sids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let symbol_predicate = format!("symbol_sid IN ({sid_list}) AND ");
+    let start_day = NanosecondTimestamp(key.start_ns).date_utc();
+    let end_day = NanosecondTimestamp(key.end_ns).date_utc();
+    format!(
+        "SELECT * FROM {} WHERE {symbol_predicate}venue = '{}' AND security_type = '{}' AND market = '{}' AND {} AND day >= DATE '{}' AND day <= DATE '{}' AND end_time_ns > {} AND end_time_ns <= {} ORDER BY symbol_sid, end_time_ns",
+        key.table,
+        sql_string(&key.venue),
+        sql_string(&key.security_type),
+        sql_string(&key.market),
+        resolution_predicate_from_str(&key.resolution),
+        start_day.format("%Y-%m-%d"),
+        end_day.format("%Y-%m-%d"),
+        key.start_ns,
+        key.end_ns,
+    )
+}
+
+fn decode_market_data_query_batch(
+    key: &MarketDataBatchKey,
+    jobs: &[MarketDataQuery],
+    batches: &[RecordBatch],
+) -> Result<Vec<HistoricalData>> {
     let symbols = jobs
         .iter()
         .map(|job| {
@@ -615,46 +1274,57 @@ async fn execute_market_data_query_batch(
         .collect::<HashMap<_, _>>();
     let mut trade_rows: HashMap<i64, Vec<TradeBar>> = HashMap::new();
     let mut quote_rows: HashMap<i64, Vec<QuoteBar>> = HashMap::new();
-    loop {
-        match stream.try_next().await {
-            Ok(Some(batch)) => {
-                let batch_sids = int64(&batch, "symbol_sid")?;
-                for sid in batch_sids.values().iter().copied().collect::<HashSet<_>>() {
-                    let Some(symbol) = symbols.get(&sid) else {
-                        continue;
-                    };
-                    if key.table == TRADE_BARS {
-                        trade_rows
-                            .entry(sid)
-                            .or_default()
-                            .extend(decode_trade_bars_for_sid(&batch, symbol, sid)?);
-                    } else {
-                        quote_rows
-                            .entry(sid)
-                            .or_default()
-                            .extend(decode_quote_bars_for_sid(&batch, symbol, sid)?);
-                    }
-                }
+    for batch in batches {
+        let batch_sids = int64(&batch, "symbol_sid")?;
+        for sid in batch_sids.values().iter().copied().collect::<HashSet<_>>() {
+            let Some(symbol) = symbols.get(&sid) else {
+                continue;
+            };
+            if key.table == TRADE_BARS {
+                trade_rows
+                    .entry(sid)
+                    .or_default()
+                    .extend(decode_trade_bars_for_sid(&batch, symbol, sid)?);
+            } else {
+                quote_rows
+                    .entry(sid)
+                    .or_default()
+                    .extend(decode_quote_bars_for_sid(&batch, symbol, sid)?);
             }
-            Ok(None) => break,
-            Err(error)
-                if trade_rows.is_empty()
-                    && quote_rows.is_empty()
-                    && is_empty_arrow_stream(&error) =>
-            {
-                break;
-            }
-            Err(error) => return Err(error).context("stream batched cached market data"),
         }
     }
     Ok(jobs
         .iter()
         .map(|job| {
             let sid = signed_sid(job.request.configuration.symbol.sid());
-            if key.table == TRADE_BARS {
-                HistoricalData::TradeBars(trade_rows.get(&sid).cloned().unwrap_or_default())
+            let (filter_start, filter_end) = if is_shared_option_window(key) {
+                (
+                    NanosecondTimestamp(key.start_ns),
+                    NanosecondTimestamp(key.end_ns),
+                )
             } else {
-                HistoricalData::QuoteBars(quote_rows.get(&sid).cloned().unwrap_or_default())
+                (job.request.range.start, job.request.range.end)
+            };
+            if key.table == TRADE_BARS {
+                HistoricalData::TradeBars(
+                    trade_rows
+                        .get(&sid)
+                        .into_iter()
+                        .flatten()
+                        .filter(|bar| bar.end_time > filter_start && bar.end_time <= filter_end)
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                HistoricalData::QuoteBars(
+                    quote_rows
+                        .get(&sid)
+                        .into_iter()
+                        .flatten()
+                        .filter(|bar| bar.end_time > filter_start && bar.end_time <= filter_end)
+                        .cloned()
+                        .collect(),
+                )
             }
         })
         .collect())
@@ -672,6 +1342,19 @@ fn resolution_predicate_from_str(resolution: &str) -> String {
 impl HistoricalDataStore for VerglasHistoricalDataStore {
     async fn coverage(&self, request: &HistoryRequest) -> Result<Coverage> {
         self.batched_coverage(request).await
+    }
+
+    async fn prefetch(&self, requests: &[HistoryRequest]) -> Result<()> {
+        tracing::debug!(
+            requests = requests.len(),
+            "prefetching selected option market data"
+        );
+        stream::iter(requests.iter().cloned())
+            .map(|request| async move { self.batched_market_data(&request).await.map(|_| ()) })
+            .buffer_unordered(QUERY_BATCH_MAX)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
     }
 
     async fn read(&self, request: &HistoryRequest) -> Result<HistoricalData> {
@@ -802,53 +1485,44 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
         request: &HistoryRequest,
         provider: &str,
         data: &HistoricalData,
-    ) -> Result<()> {
-        let table = Self::table(request)?;
-        let batches = encode_history(request, data)?;
-        let key = idempotency_key("data", table, request, provider)?;
-        let _permit = self
-            .io_permits
-            .acquire()
+    ) -> Result<CacheAppendOutcome> {
+        let (response, receiver) = oneshot::channel();
+        self.history_writes
+            .send(HistoryWrite {
+                request: request.clone(),
+                provider: provider.to_owned(),
+                data: data.clone(),
+                response,
+            })
             .await
-            .context("acquire Verglas I/O permit")?;
-        self.client
-            .append_stream(table, stream::iter(batches.into_iter().map(Ok)), &key)
+            .context("queue canonical historical data write")?;
+        let outcome = receiver
             .await
-            .with_context(|| format!("append canonical history to {table}"))?;
-        Ok(())
+            .context("canonical historical data writer stopped")??;
+        // A cold cache-first read can fill a previously uncovered day after a
+        // day window has already been cached. Version subsequent reads so
+        // they cannot observe the pre-append snapshot. Arrow windows already
+        // in flight remain valid for the requests that created them. A dropped
+        // batch is versioned too: its commit state is unknown, so it may still
+        // have landed.
+        self.market_data_cache_generation
+            .fetch_add(1, Ordering::Release);
+        Ok(outcome)
     }
 
     async fn mark_covered(&self, request: &HistoryRequest, provider: &str) -> Result<()> {
-        let sid = signed_sid(request.configuration.symbol.sid());
-        let batch = RecordBatch::try_new(
-            coverage_schema(),
-            vec![
-                Arc::new(StringArray::from(vec![Self::table(request)?])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![sid])),
-                Arc::new(StringArray::from(vec![request
-                    .configuration
-                    .venue
-                    .as_str()])),
-                Arc::new(StringArray::from(vec![request
-                    .configuration
-                    .resolution
-                    .to_string()])),
-                Arc::new(Int64Array::from(vec![request.range.start.0])),
-                Arc::new(Int64Array::from(vec![request.range.end.0])),
-                Arc::new(StringArray::from(vec![provider])),
-            ],
-        )?;
-        let key = idempotency_key("coverage", COVERAGE, request, provider)?;
-        let _permit = self
-            .io_permits
-            .acquire()
+        let (response, receiver) = oneshot::channel();
+        self.coverage_writes
+            .send(CoverageWrite {
+                request: request.clone(),
+                provider: provider.to_owned(),
+                response,
+            })
             .await
-            .context("acquire Verglas I/O permit")?;
-        self.client
-            .append_stream(COVERAGE, stream::iter(vec![Ok(batch)]), &key)
+            .context("queue historical coverage write")?;
+        receiver
             .await
-            .context("persist successful historical coverage")?;
-        Ok(())
+            .context("historical coverage writer stopped")?
     }
 
     async fn read_factor_file(&self, symbol: &rlean_core::Symbol) -> Result<Vec<FactorFileEntry>> {
@@ -962,6 +1636,68 @@ impl HistoricalDataStore for VerglasHistoricalDataStore {
             .append_stream(MAP_FILES, stream::iter(vec![Ok(batch)]), &key)
             .await
             .map_err(|error| anyhow::anyhow!("append map file: {error}"))?;
+        Ok(())
+    }
+
+    async fn read_risk_free_interest_rates(
+        &self,
+        range: TimeRange,
+    ) -> Result<Vec<RiskFreeInterestRate>> {
+        let sql = format!(
+            "SELECT * FROM {RISK_FREE_INTEREST_RATES} \
+             WHERE time_ns >= {} AND time_ns < {} ORDER BY time_ns",
+            range.start.0, range.end.0
+        );
+        let _permit = self
+            .io_permits
+            .acquire()
+            .await
+            .context("acquire Verglas I/O permit")?;
+        let mut stream = self
+            .query_stream(&sql)
+            .await
+            .context("query cached risk-free interest rates")?;
+        let mut rows = Vec::new();
+        loop {
+            match stream.try_next().await {
+                Ok(Some(batch)) => rows.extend(decode_risk_free_interest_rates(&batch)?),
+                Ok(None) => break,
+                Err(error) if rows.is_empty() && is_empty_arrow_stream(&error) => break,
+                Err(error) => {
+                    return Err(error).context("stream cached risk-free interest rates");
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn append_risk_free_interest_rates(
+        &self,
+        provider: &str,
+        rows: &[RiskFreeInterestRate],
+    ) -> Result<()> {
+        let batch = encode_risk_free_interest_rates(rows)?;
+        // The series is global, so the rows themselves identify the batch: two
+        // runs that fetch the same unpublished tail write the same key once.
+        let first = rows.iter().map(|row| row.time.0).min().unwrap_or_default();
+        let last = rows.iter().map(|row| row.time.0).max().unwrap_or_default();
+        let key = format!(
+            "rlean-auxiliary:risk-free-rate:{provider}:{first}:{last}:{}",
+            rows.len()
+        );
+        let _permit = self
+            .io_permits
+            .acquire()
+            .await
+            .context("acquire Verglas I/O permit")?;
+        self.client
+            .append_stream(
+                RISK_FREE_INTEREST_RATES,
+                stream::iter(vec![Ok(batch)]),
+                &key,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("append risk-free interest rates: {error}"))?;
         Ok(())
     }
 }
@@ -1558,6 +2294,46 @@ fn decode_factor_file(batch: &RecordBatch) -> Result<Vec<FactorFileEntry>> {
         .collect())
 }
 
+fn encode_risk_free_interest_rates(rows: &[RiskFreeInterestRate]) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        RiskFreeInterestRate::schema(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.time.0),
+            )),
+            Arc::new(
+                Decimal128Array::from(
+                    rows.iter()
+                        .map(|row| scale_decimal(row.annual_rate))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(DECIMAL_PRECISION, DECIMAL_SCALE)?,
+            ),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.venue.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Date32Array::from_iter_values(
+                rows.iter().map(|row| date32(row.time)),
+            )),
+        ],
+    )
+    .context("encode canonical risk-free interest rates")
+}
+
+fn decode_risk_free_interest_rates(batch: &RecordBatch) -> Result<Vec<RiskFreeInterestRate>> {
+    let time_ns = int64(batch, "time_ns")?;
+    let annual_rate = decimal(batch, "annual_rate")?;
+    Ok((0..batch.num_rows())
+        .map(|row| RiskFreeInterestRate {
+            time: NanosecondTimestamp(time_ns.value(row)),
+            annual_rate: decimal_value(annual_rate.value(row)),
+            venue: string_at(batch, "venue", row),
+        })
+        .collect())
+}
+
 fn encode_map_file(symbol: &rlean_core::Symbol, rows: &[MapFileEntry]) -> Result<RecordBatch> {
     RecordBatch::try_new(
         MapFileEntry::schema(),
@@ -1873,6 +2649,291 @@ mod tests {
         };
         let batch = encode_trade_bars(&request, std::slice::from_ref(&bar)).unwrap();
         assert_eq!(decode_trade_bars(&batch, &bar.symbol).unwrap(), vec![bar]);
+    }
+
+    fn coverage_write(offset: i64) -> CoverageWrite {
+        let mut request = request(TickType::Quote);
+        request.range = TimeRange {
+            start: NanosecondTimestamp::from_secs(1_700_000_000 + offset * 2),
+            end: NanosecondTimestamp::from_secs(1_700_000_000 + offset * 2 + 1),
+        };
+        let (response, _receiver) = oneshot::channel();
+        CoverageWrite {
+            request,
+            provider: "thetadata".to_owned(),
+            response,
+        }
+    }
+
+    #[test]
+    fn option_subscription_coverage_burst_encodes_as_one_batch() {
+        let jobs = (0..32).map(coverage_write).collect::<Vec<_>>();
+        let batch = coverage_batch(&jobs).unwrap();
+
+        assert_eq!(batch.num_rows(), 32);
+        assert_eq!(batch.num_columns(), coverage_schema().fields().len());
+    }
+
+    struct ScriptedAppend {
+        attempts: AtomicU64,
+        failures: u64,
+        error: fn() -> ClientError,
+    }
+
+    impl ScriptedAppend {
+        fn always_failing(error: fn() -> ClientError) -> Self {
+            Self {
+                attempts: AtomicU64::new(0),
+                failures: u64::MAX,
+                error,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CacheBatchAppend for ScriptedAppend {
+        async fn append_once(&self) -> std::result::Result<(), ClientError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) < self.failures {
+                return Err((self.error)());
+            }
+            Ok(())
+        }
+    }
+
+    fn rate_limited_commit() -> ClientError {
+        ClientError::Http {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "iceberg error: Unexpected => 429 Too Many Requests, \
+                      the commit state is unknown"
+                .to_owned(),
+        }
+    }
+
+    fn service_unavailable() -> ClientError {
+        ClientError::Http {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: "upstream write service is unavailable".to_owned(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_history_retries_drop_the_batch_instead_of_failing_the_run() {
+        let appender = ScriptedAppend::always_failing(rate_limited_commit);
+        let dropped = DroppedCacheWrites::default();
+
+        let outcome = append_cache_batch(&appender, TRADE_BARS, 3, 900, &dropped).await;
+
+        assert_eq!(outcome, CacheAppendOutcome::Dropped);
+        assert_eq!(
+            appender.attempts.load(Ordering::Relaxed),
+            QUERY_OPEN_ATTEMPTS as u64
+        );
+        assert_eq!(dropped.batches(), 1);
+        assert_eq!(dropped.rows(), 900);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_cache_failure_drops_the_batch_without_retrying() {
+        let appender = ScriptedAppend::always_failing(service_unavailable);
+        let dropped = DroppedCacheWrites::default();
+
+        let outcome = append_cache_batch(&appender, QUOTE_BARS, 1, 42, &dropped).await;
+
+        assert_eq!(outcome, CacheAppendOutcome::Dropped);
+        assert_eq!(appender.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.batches(), 1);
+        assert_eq!(dropped.rows(), 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_history_batch_that_later_commits_is_not_counted_as_dropped() {
+        let appender = ScriptedAppend {
+            attempts: AtomicU64::new(0),
+            failures: QUERY_OPEN_ATTEMPTS as u64 - 1,
+            error: rate_limited_commit,
+        };
+        let dropped = DroppedCacheWrites::default();
+
+        let outcome = append_cache_batch(&appender, TRADE_BARS, 1, 10, &dropped).await;
+
+        assert_eq!(outcome, CacheAppendOutcome::Persisted);
+        assert_eq!(
+            appender.attempts.load(Ordering::Relaxed),
+            QUERY_OPEN_ATTEMPTS as u64
+        );
+        assert_eq!(dropped.batches(), 0);
+    }
+
+    #[test]
+    fn coverage_batch_idempotency_is_independent_of_arrival_order() {
+        let forward = (0..32).map(coverage_write).collect::<Vec<_>>();
+        let reverse = (0..32).rev().map(coverage_write).collect::<Vec<_>>();
+
+        assert_eq!(
+            coverage_batch_idempotency_key(&forward).unwrap(),
+            coverage_batch_idempotency_key(&reverse).unwrap()
+        );
+    }
+
+    fn market_data_key(security_type: SecurityType, start_ns: i64) -> MarketDataBatchKey {
+        MarketDataBatchKey {
+            table: QUOTE_BARS,
+            venue: "opra".to_string(),
+            security_type: security_type.to_string(),
+            market: "usa".to_string(),
+            resolution: Resolution::Minute.to_string(),
+            symbol_root: (security_type == SecurityType::Option).then(|| "SPY".to_string()),
+            start_ns,
+            end_ns: start_ns + 86_400_000_000_000,
+        }
+    }
+
+    #[test]
+    fn option_window_query_filters_the_shared_daily_source_to_requested_contracts() {
+        let key = market_data_key(SecurityType::Option, 1_700_000_000);
+        let sql = market_data_sql(&key, &HashSet::from([11, 12, 13]));
+
+        assert!(sql.contains("symbol_sid IN"));
+        assert!(sql.contains("11"));
+        assert!(sql.contains("12"));
+        assert!(sql.contains("13"));
+        assert!(sql.contains("security_type = 'Option'"));
+        assert!(!sql.contains("symbol_value LIKE"));
+    }
+
+    #[test]
+    fn equity_window_query_remains_symbol_filtered() {
+        let key = market_data_key(SecurityType::Equity, 1_700_000_000);
+        let sql = market_data_sql(&key, &HashSet::from([11]));
+
+        assert!(sql.contains("symbol_sid IN (11)"));
+        assert!(sql.contains("day >= DATE"));
+    }
+
+    #[test]
+    fn concrete_option_requests_share_one_day_key() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::from_ymd_opt(2024, 9, 6).unwrap(),
+            dec!(550),
+            rlean_core::OptionRight::Call,
+            rlean_core::OptionStyle::American,
+        );
+        let start = NanosecondTimestamp::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 9, 6)
+                .unwrap()
+                .and_hms_opt(13, 30, 0)
+                .unwrap(),
+        );
+        let request = HistoryRequest::new(
+            SubscriptionDataConfig::new_option(contract, Resolution::Minute),
+            start,
+            start + TimeSpan::from_secs(60),
+        )
+        .unwrap();
+        let key = market_data_batch_key(&request).unwrap();
+
+        assert_eq!(key.symbol_root.as_deref(), Some("SPY"));
+        assert_eq!(
+            NanosecondTimestamp(key.start_ns).date_utc(),
+            chrono::NaiveDate::from_ymd_opt(2024, 9, 6).unwrap()
+        );
+        assert_eq!(
+            NanosecondTimestamp(key.end_ns).date_utc(),
+            chrono::NaiveDate::from_ymd_opt(2024, 9, 6).unwrap()
+        );
+    }
+
+    #[test]
+    fn weekend_option_frontier_reads_next_open_exchange_session() {
+        let session = chrono::NaiveDate::from_ymd_opt(2024, 9, 9).unwrap();
+        let expiry = chrono::NaiveDate::from_ymd_opt(2024, 9, 9).unwrap();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let contract = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            expiry,
+            dec!(550),
+            rlean_core::OptionRight::Call,
+            rlean_core::OptionStyle::American,
+        );
+        let following_midnight = NanosecondTimestamp::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 9, 7)
+                .unwrap()
+                .and_hms_opt(4, 0, 0)
+                .unwrap(),
+        );
+        let request = HistoryRequest::new(
+            SubscriptionDataConfig::new_option(contract, Resolution::Minute),
+            following_midnight,
+            following_midnight + TimeSpan::from_secs(60),
+        )
+        .unwrap();
+
+        let key = market_data_batch_key(&request).unwrap();
+
+        assert_eq!(NanosecondTimestamp(key.start_ns).date_utc(), session);
+        assert_eq!(NanosecondTimestamp(key.end_ns).date_utc(), session);
+    }
+
+    #[test]
+    fn shared_option_window_cache_is_bounded_and_refreshes_hits() {
+        let mut cache = SharedOptionWindowCache::default();
+        let window = Arc::new(SharedOptionWindow::default());
+        let first = market_data_key(SecurityType::Option, 0);
+        cache.insert(first.clone(), 0, window.clone());
+        cache.insert(market_data_key(SecurityType::Option, 1), 0, window.clone());
+        assert!(cache.get(&first, 0).is_some());
+
+        for offset in 2..=SHARED_OPTION_WINDOW_CACHE_CAPACITY {
+            cache.insert(
+                market_data_key(SecurityType::Option, offset as i64),
+                0,
+                window.clone(),
+            );
+        }
+
+        assert_eq!(cache.entries.len(), SHARED_OPTION_WINDOW_CACHE_CAPACITY);
+        assert!(cache.get(&first, 0).is_some());
+        assert!(cache
+            .get(&market_data_key(SecurityType::Option, 1), 0)
+            .is_none());
+    }
+
+    #[test]
+    fn shared_option_window_cache_does_not_reuse_pre_append_generation() {
+        let mut cache = SharedOptionWindowCache::default();
+        let key = market_data_key(SecurityType::Option, 0);
+        cache.insert(key.clone(), 7, Arc::new(SharedOptionWindow::default()));
+
+        assert!(cache.get(&key, 7).is_some());
+        assert!(cache.get(&key, 8).is_none());
+    }
+
+    #[test]
+    fn shared_option_window_indexes_sorted_batches_by_sid() {
+        let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
+            "symbol_sid",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![11, 11, 12, 13, 13, 13]))],
+        )
+        .unwrap();
+        let window = SharedOptionWindow::index(vec![batch], HashSet::from([11, 12, 13])).unwrap();
+
+        assert_eq!(window.by_sid[&11][0].num_rows(), 2);
+        assert_eq!(window.by_sid[&12][0].num_rows(), 1);
+        assert_eq!(window.by_sid[&13][0].num_rows(), 3);
+        assert!(window.missing_sids(&HashSet::from([11, 13])).is_empty());
+        assert_eq!(
+            window.missing_sids(&HashSet::from([11, 14])),
+            HashSet::from([14])
+        );
     }
 
     #[test]

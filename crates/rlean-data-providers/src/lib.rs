@@ -5,6 +5,7 @@
 //! are pushed by the provider. Persistence is an independent concern wrapped
 //! around history providers, not implemented inside a vendor adapter.
 
+mod fred;
 mod history;
 mod live;
 mod massive;
@@ -14,9 +15,11 @@ mod thetadata;
 mod tradier;
 mod verglas_store;
 
+pub use fred::{FredConfig, FredHistoricalDataProvider};
 pub use history::{
-    CacheFirstHistoryProvider, Coverage, HistoricalData, HistoricalDataProvider,
-    HistoricalDataStore, HistoryRequest, TimeRange,
+    CacheAppendOutcome, CacheFirstHistoryProvider, Coverage, DroppedCacheWrites, HistoricalData,
+    HistoricalDataProvider, HistoricalDataStore, HistoryRequest, RiskFreeInterestRateUnavailable,
+    TimeRange,
 };
 pub use live::{LiveDataEvent, LiveDataProvider, LiveSubscription};
 pub use massive::{MassiveConfig, MassiveHistoricalDataProvider};

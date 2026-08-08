@@ -12,10 +12,6 @@ license.workspace = true
 name = "rlean"
 path = "src/main.rs"
 
-[[bin]]
-name = "rleand"
-path = "src/rleand_main.rs"
-
 [dependencies]
 rlean-core           = { path = "../rlean-core", version = "0.1.1" }
 rlean-data           = { path = "../rlean-data", version = "0.1.1" }
@@ -23,8 +19,11 @@ rlean-data-tables    = { path = "../rlean-data-tables", version = "0.1.1" }
 rlean-data-providers = { path = "../rlean-data-providers", version = "0.1.1" }
 rlean-brokerages = { path = "../rlean-brokerages", version = "0.1.1" }
 rlean-engine         = { path = "../rlean-engine", version = "0.1.1" }
+rlean-orders         = { path = "../rlean-orders", version = "0.1.1" }
+rlean-statistics     = { path = "../rlean-statistics", version = "0.1.1" }
 rlean-sdk            = { path = "../rlean-sdk", version = "0.1.1" }
 rlean-algorithm      = { path = "../rlean-algorithm", version = "0.1.1" }
+rlean-alpha          = { path = "../rlean-alpha", version = "0.1.1" }
 rlean-live           = { path = "../rlean-live", version = "0.1.1" }
 rlean-python-runtime = { path = "../rlean-python-runtime", version = "0.1.1" }
 verglas-sdk         = { workspace = true }

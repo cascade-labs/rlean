@@ -2,13 +2,13 @@ use crate::data_feed::DataFeedContext;
 use crate::normalization::{normalize_quote_bar, normalize_trade_bar};
 use crate::subscription_data::SubscriptionDataPoint;
 use rlean_core::{
-    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, SecurityType,
-    SymbolOptionsExt,
+    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, SymbolOptionsExt,
+    TickType, TimeSpan,
 };
 use rlean_data::SubscriptionDataConfig;
 use rlean_data_providers::{HistoricalData, HistoricalDataProvider, HistoryRequest};
 use rlean_data_tables::FactorFileEntry;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -363,6 +363,13 @@ async fn produce_native(
         let mut points = native_points(config, data, auxiliary.0)?;
         points.sort_by_key(SubscriptionDataPoint::frontier_time);
         points = deduplicate_points(config, points);
+        let prefetch_requests = option_chain_prefetch_requests(config, &points)?;
+        if !prefetch_requests.is_empty() {
+            tokio::select! {
+                _ = &mut *cancelled => return Ok(()),
+                result = provider.prefetch_history(&prefetch_requests) => result.map_err(data_error)?,
+            }
+        }
         tracing::debug!(
             provider = provider.name(),
             symbol = %config.symbol.value,
@@ -443,6 +450,42 @@ async fn produce_native(
         };
     }
     Ok(())
+}
+
+fn option_chain_prefetch_requests(
+    config: &SubscriptionDataConfig,
+    points: &[SubscriptionDataPoint],
+) -> LeanResult<Vec<HistoryRequest>> {
+    if config.option_chain.is_none() || config.resolution != Resolution::Minute {
+        return Ok(Vec::new());
+    }
+    let frontiers = points.iter().filter_map(|point| match point {
+        SubscriptionDataPoint::OptionChain { frontier_time, .. } => Some(*frontier_time),
+        _ => None,
+    });
+    let Some(start) = frontiers.clone().min() else {
+        return Ok(Vec::new());
+    };
+    let end = frontiers.max().unwrap_or(start) + TimeSpan::from_nanos(1);
+    let mut requests = Vec::new();
+    let mut seen = HashSet::new();
+    for point in points {
+        let SubscriptionDataPoint::OptionChain { chain, .. } = point else {
+            continue;
+        };
+        for symbol in chain.contracts.keys() {
+            for tick_type in [TickType::Trade, TickType::Quote] {
+                let mut market_config =
+                    SubscriptionDataConfig::new_option(symbol.clone(), config.resolution);
+                market_config.set_tick_type(tick_type);
+                if !seen.insert(market_config.unique_id()) {
+                    continue;
+                }
+                requests.push(HistoryRequest::new(market_config, start, end).map_err(data_error)?);
+            }
+        }
+    }
+    Ok(requests)
 }
 
 fn native_points(
@@ -665,9 +708,10 @@ fn is_market_open(
     frontier: DateTime,
     period: rlean_core::TimeSpan,
 ) -> bool {
-    if config.symbol.security_type() != SecurityType::Equity {
-        return true;
-    }
+    // LEAN's FillForwardEnumerator calls Exchange.IsOpenDuringBar for every
+    // market-data security type. Treating non-equities as always open creates
+    // synthetic option bars on weekends and advances the algorithm on dates
+    // when the option exchange is closed.
     market_hours_database
         .exchange_hours(&config.symbol)
         .is_open_at(frontier - period)
@@ -784,7 +828,12 @@ fn fill_forward_point(
 }
 
 fn data_error(error: impl std::fmt::Display) -> LeanError {
-    LeanError::DataError(error.to_string())
+    // Preserve anyhow's full context chain at the boundary where provider
+    // errors become the string-backed LEAN error contract. Formatting with
+    // `{:#}` is identical for ordinary Display values and includes every
+    // source for `anyhow::Error`, which keeps storage/provider failures
+    // actionable after crossing this boundary.
+    LeanError::DataError(format!("{error:#}"))
 }
 
 use chrono::Datelike;
@@ -792,6 +841,7 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use rlean_core::{Market, OptionRight, OptionStyle, Symbol, TimeSpan};
     use rlean_data::{
         CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, OptionChainFilterMetadata,
@@ -800,6 +850,17 @@ mod tests {
     use rlean_data_tables::{CustomDataPoint, TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+
+    #[test]
+    fn data_errors_preserve_the_provider_error_chain() {
+        let error = Err::<(), _>(anyhow::anyhow!("HTTP 409 commit conflict"))
+            .context("persist successful historical coverage")
+            .unwrap_err();
+
+        let rendered = data_error(error).to_string();
+        assert!(rendered.contains("persist successful historical coverage"));
+        assert!(rendered.contains("HTTP 409 commit conflict"));
+    }
 
     #[test]
     fn non_tick_batches_are_deduplicated_by_frontier() {
@@ -1114,6 +1175,53 @@ mod tests {
             &last_fill,
             next_real,
             next_real,
+            &sender,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn option_fill_forward_does_not_cross_a_closed_weekend() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let option = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 22).unwrap(),
+            dec!(550),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let mut config = SubscriptionDataConfig::new_option(option.clone(), Resolution::Minute);
+        config.fill_data_forward = true;
+        let period = TimeSpan::ONE_MINUTE;
+        let friday_close = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                .unwrap()
+                .and_hms_opt(20, 0, 0)
+                .unwrap(),
+        );
+        let previous = SubscriptionDataPoint::TradeBar(TradeBar::new(
+            option,
+            friday_close - period,
+            period,
+            TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(1)),
+        ));
+        let monday_open = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 22)
+                .unwrap()
+                .and_hms_opt(13, 31, 0)
+                .unwrap(),
+        );
+        let (sender, _receiver) = mpsc::channel(128);
+
+        assert!(send_fill_forward_before(
+            &config,
+            MarketHoursDatabase::global().as_ref(),
+            &previous,
+            monday_open,
+            monday_open,
             &sender,
         )
         .await

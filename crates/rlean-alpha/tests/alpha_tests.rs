@@ -267,6 +267,22 @@ mod insight_collection_tests {
     }
 
     #[test]
+    fn collection_expire_matches_lean_and_is_visible_to_expiry_processing_immediately() {
+        let mut col = InsightCollection::new();
+        let spy = spy();
+        let now = NanosecondTimestamp::from_secs(1_700_000_000);
+        col.add(Insight::up(spy.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now));
+
+        let frontier = now + TimeSpan::from_hours(1);
+        let canceled = col.expire(std::slice::from_ref(&spy), frontier);
+
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].close_time_utc, frontier - TimeSpan::ONE_SECOND);
+        assert!(!col.has_active(&spy, frontier));
+        assert_eq!(col.remove_expired(frontier).len(), 1);
+    }
+
+    #[test]
     fn collection_active_excludes_expired() {
         let mut col = InsightCollection::new();
         let sym = spy();
