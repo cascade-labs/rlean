@@ -232,7 +232,7 @@ impl Coverage {
 pub struct RiskFreeInterestRateUnavailable(String);
 
 impl RiskFreeInterestRateUnavailable {
-    pub fn new(message: impl Into<String>) -> anyhow::Error {
+    pub fn error(message: impl Into<String>) -> anyhow::Error {
         anyhow::Error::new(Self(message.into()))
     }
 }
@@ -689,21 +689,18 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
             .read_risk_free_interest_rates(range)
             .await
             .map_err(|error| {
-                RiskFreeInterestRateUnavailable::new(format!(
+                RiskFreeInterestRateUnavailable::error(format!(
                     "read cached risk-free interest rates: {error:#}"
                 ))
             })?;
         let mut published = !rows.is_empty();
-        // The series is append-only and forward-filled, so the persisted rows
-        // are their own coverage: only the span after the newest cached
-        // observation can still be missing. Re-running a settled backtest
-        // therefore asks the vendor for nothing, and a live run asks only for
-        // the unpublished tail.
-        let missing = match rows.iter().map(|row| row.time).max() {
-            Some(latest) => TimeRange::new(NanosecondTimestamp(latest.0 + 1), range.end).ok(),
-            None => Some(range),
-        };
-        if let Some(missing) = missing {
+        // Append-only + forward-filled: interior gaps between observations are
+        // non-publication days (weekends/holidays), not uncovered cache holes.
+        // The spans that can still be missing are the prefix before the
+        // earliest cached row and the suffix after the newest — matching how
+        // LEAN's InterestRateProvider expects the full CSV history for the
+        // requested window before forward-filling.
+        for missing in risk_free_rate_missing_ranges(range, &rows) {
             for provider in &self.providers {
                 let Some(fetched) = provider.get_risk_free_interest_rates(missing).await? else {
                     continue;
@@ -725,6 +722,35 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
         rows.dedup_by(|left, right| left.time == right.time && left.venue == right.venue);
         Ok(Some(rows))
     }
+}
+
+/// Uncovered spans for a cached risk-free series inside `requested`.
+///
+/// Empty cache → the whole range. Otherwise only the prefix before the earliest
+/// row and the suffix after the newest row; interior calendar gaps stay local
+/// to the forward-fill model.
+fn risk_free_rate_missing_ranges(
+    requested: TimeRange,
+    rows: &[RiskFreeInterestRate],
+) -> Vec<TimeRange> {
+    let Some(earliest) = rows.iter().map(|row| row.time).min() else {
+        return vec![requested];
+    };
+    let latest = rows
+        .iter()
+        .map(|row| row.time)
+        .max()
+        .expect("earliest implies latest");
+    let mut missing = Vec::new();
+    if earliest > requested.start {
+        if let Ok(prefix) = TimeRange::new(requested.start, earliest) {
+            missing.push(prefix);
+        }
+    }
+    if let Ok(suffix) = TimeRange::new(NanosecondTimestamp(latest.0 + 1), requested.end) {
+        missing.push(suffix);
+    }
+    missing
 }
 
 #[cfg(test)]
@@ -1169,9 +1195,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_rates_only_refetch_the_span_after_the_newest_observation() {
+    async fn cached_rates_refetch_prefix_before_earliest_and_suffix_after_newest() {
         let publisher = Arc::new(RatePublisher {
-            rows: vec![rate(60, Decimal::new(55, 3))],
+            rows: vec![rate(5, Decimal::new(15, 3)), rate(60, Decimal::new(55, 3))],
             requested: Mutex::new(Vec::new()),
         });
         let store = Arc::new(MemoryStore::default());
@@ -1185,14 +1211,71 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(
             *publisher.requested.lock(),
-            vec![TimeRange {
-                start: NanosecondTimestamp(11),
-                end: NanosecondTimestamp(100),
-            }]
+            vec![
+                TimeRange {
+                    start: NanosecondTimestamp(0),
+                    end: NanosecondTimestamp(10),
+                },
+                TimeRange {
+                    start: NanosecondTimestamp(11),
+                    end: NanosecondTimestamp(100),
+                },
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn cached_rates_spanning_the_request_do_not_refetch() {
+        let publisher = Arc::new(RatePublisher {
+            rows: vec![rate(60, Decimal::new(55, 3))],
+            requested: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MemoryStore::default());
+        store
+            .rates
+            .lock()
+            .extend([rate(0, Decimal::new(15, 3)), rate(99, Decimal::new(225, 4))]);
+        let coordinator =
+            CacheFirstHistoryProvider::new(store.clone(), vec![publisher.clone()]).unwrap();
+
+        let rows = coordinator
+            .get_risk_free_interest_rates(rate_range())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(publisher.requested.lock().is_empty());
+    }
+
+    #[test]
+    fn risk_free_missing_ranges_cover_prefix_and_suffix_only() {
+        let requested = rate_range();
+        assert_eq!(
+            risk_free_rate_missing_ranges(requested, &[]),
+            vec![requested]
+        );
+        assert_eq!(
+            risk_free_rate_missing_ranges(requested, &[rate(40, Decimal::ONE)]),
+            vec![
+                TimeRange {
+                    start: NanosecondTimestamp(0),
+                    end: NanosecondTimestamp(40),
+                },
+                TimeRange {
+                    start: NanosecondTimestamp(41),
+                    end: NanosecondTimestamp(100),
+                },
+            ]
+        );
+        assert!(risk_free_rate_missing_ranges(
+            requested,
+            &[rate(0, Decimal::ONE), rate(99, Decimal::ONE)]
+        )
+        .is_empty());
     }
 
     #[tokio::test]

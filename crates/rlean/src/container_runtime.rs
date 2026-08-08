@@ -54,7 +54,16 @@ pub(crate) fn ensure_verglas(global: &GlobalConfig) -> Result<()> {
     // Gateway may not expose /health; accept any HTTP response from the root.
     let root = endpoint.trim_end_matches('/').to_owned();
     let probe = Command::new("curl")
-        .args(["-fsS", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", &root])
+        .args([
+            "-fsS",
+            "--max-time",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &root,
+        ])
         .output();
     if let Ok(output) = probe {
         let code = String::from_utf8_lossy(&output.stdout);
@@ -222,12 +231,7 @@ pub(crate) fn run_live_container(spec: LiveRunSpec<'_>) -> Result<String> {
 }
 
 pub(crate) fn stop_container(name_or_id: &str, timeout_seconds: u64) -> Result<()> {
-    let output = docker_output([
-        "stop",
-        "-t",
-        &timeout_seconds.to_string(),
-        name_or_id,
-    ])?;
+    let output = docker_output(["stop", "-t", &timeout_seconds.to_string(), name_or_id])?;
     if !output.status.success() {
         // Already stopped is fine.
         let err = stderr_tail(&output);
@@ -250,16 +254,11 @@ pub(crate) fn remove_container(name_or_id: &str) -> Result<()> {
 }
 
 pub(crate) fn container_is_running(name_or_id: &str) -> bool {
-    docker_output([
-        "inspect",
-        "-f",
-        "{{.State.Running}}",
-        name_or_id,
-    ])
-    .ok()
-    .filter(|o| o.status.success())
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-    .unwrap_or(false)
+    docker_output(["inspect", "-f", "{{.State.Running}}", name_or_id])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
 }
 
 pub(crate) fn print_container_logs(name_or_id: &str, lines: usize) -> Result<()> {
@@ -329,6 +328,7 @@ fn stderr_tail(output: &Output) -> String {
 }
 
 /// Build engine argv flags from runtime options (without the subcommand/strategy).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn runtime_engine_args(
     data_provider_historical: Option<&str>,
     live_data_feed: Option<&str>,
@@ -353,10 +353,7 @@ pub(crate) fn runtime_engine_args(
         values.extend(["--brokerage".into(), value.to_owned()]);
     }
     if let Some(value) = brokerage_url {
-        values.extend([
-            "--brokerage-url".into(),
-            containerize_loopback_url(value),
-        ]);
+        values.extend(["--brokerage-url".into(), containerize_loopback_url(value)]);
     }
     if let Some(value) = brokerage_account {
         values.extend(["--brokerage-account".into(), value.to_owned()]);

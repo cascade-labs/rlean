@@ -208,9 +208,7 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
             let name = metadata
                 .container_name
                 .unwrap_or_else(|| container_runtime::live_container_name(&deploy_id));
-            if container_runtime::container_is_running(&name)
-                || docker_container_exists(&name)
-            {
+            if container_runtime::container_is_running(&name) || docker_container_exists(&name) {
                 container_runtime::print_container_logs(&name, lines)
             } else {
                 print_tail(&dir.join("live.log"), lines)
@@ -803,10 +801,7 @@ fn print_catalog_checkpoint_field(run_id: &str, field: &str) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no catalog checkpoint for run_id={run_id}"))?;
         let value: serde_json::Value =
             serde_json::from_str(&payload).context("parse checkpoint payload")?;
-        let field_value = value
-            .get(field)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let field_value = value.get(field).cloned().unwrap_or(serde_json::Value::Null);
         print_json_value(&field_value)
     })
 }

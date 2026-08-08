@@ -283,6 +283,26 @@ mod insight_collection_tests {
     }
 
     #[test]
+    fn collection_expire_skips_already_expired_insights_like_lean() {
+        // C# Insight.Expire only mutates when IsActive(utcTime). Re-canceling
+        // the same symbol must not return already-expired insights.
+        let mut col = InsightCollection::new();
+        let spy = spy();
+        let now = NanosecondTimestamp::from_secs(1_700_000_000);
+        col.add(Insight::up(spy.clone(), TimeSpan::from_days(1)).with_generated_time_utc(now));
+
+        let frontier = now + TimeSpan::from_hours(1);
+        assert_eq!(col.expire(std::slice::from_ref(&spy), frontier).len(), 1);
+        assert!(col.expire(std::slice::from_ref(&spy), frontier).is_empty());
+        assert!(col
+            .expire(
+                std::slice::from_ref(&spy),
+                frontier + TimeSpan::from_hours(1)
+            )
+            .is_empty());
+    }
+
+    #[test]
     fn collection_active_excludes_expired() {
         let mut col = InsightCollection::new();
         let sym = spy();

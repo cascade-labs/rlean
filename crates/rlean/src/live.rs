@@ -189,12 +189,9 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     );
     let adapter = rlean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
 
-    let run_result = rlean_engine::runner::live::run_live_with_runtime(
-        adapter,
-        live_config,
-        runtime_context,
-    )
-    .await;
+    let run_result =
+        rlean_engine::runner::live::run_live_with_runtime(adapter, live_config, runtime_context)
+            .await;
 
     // Drop the sender by ending the engine; then drain the catalog writer.
     let join_result = stream_task.await;
@@ -217,7 +214,11 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     // BacktestRunResult is overkill; mark stopped with a final running→failed
     // style append that records final value on the runs table.
     run_catalog
-        .record_live_stopped(result.final_value, result.slices_processed, result.order_events.len())
+        .record_live_stopped(
+            result.final_value,
+            result.slices_processed,
+            result.order_events.len(),
+        )
         .await?;
 
     if let Some(brokerage_name) = brokerage_name {

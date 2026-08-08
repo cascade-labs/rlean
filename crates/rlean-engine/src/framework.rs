@@ -1103,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn re_canceling_already_expired_insights_does_not_rebalance() {
+        let mut framework = FrameworkState::new();
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        framework
+            .insights
+            .add(Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now));
+        let cancel_time = now + TimeSpan::ONE_MINUTE;
+        framework.cancel_insights(std::slice::from_ref(&symbol), cancel_time);
+        framework.pending_rebalance = false;
+        framework.pending_insight_events.clear();
+
+        framework.cancel_insights(std::slice::from_ref(&symbol), cancel_time);
+
+        assert!(!framework.pending_rebalance);
+        assert!(framework.pending_insight_events.is_empty());
+    }
+
+    #[test]
     fn canceled_insight_overwrites_retained_immediate_execution_target_with_flat() {
         let now = dt(2026, 1, 1);
         let symbol = Symbol::create_equity("SPY", &Market::usa());

@@ -253,7 +253,7 @@ where
                     request.symbol.clone(),
                     request.quantity,
                     time,
-                    &request.tag,
+                    request.tag,
                 )
             })
             .collect::<Vec<_>>();

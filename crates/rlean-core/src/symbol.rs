@@ -65,6 +65,7 @@ impl SecurityIdentifier {
 
     /// Produces the canonical textual C# LEAN option SID, including its
     /// canonical underlying SID.
+    #[allow(clippy::too_many_arguments)]
     pub fn lean_option_sid(
         first_ticker: &str,
         market: &Market,
@@ -102,6 +103,7 @@ impl SecurityIdentifier {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lean_sid(
         ticker: &str,
         market: &Market,

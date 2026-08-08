@@ -231,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_publisher_degrades_but_a_malformed_one_fails() {
         let (unavailable, _) = provider(Err(|| {
-            RiskFreeInterestRateUnavailable::new("request FRED observations: connection refused")
+            RiskFreeInterestRateUnavailable::error("request FRED observations: connection refused")
         }));
         let (malformed, _) = provider(Err(|| anyhow::anyhow!("decode FRED observations")));
         let end = NaiveDate::from_ymd_opt(2024, 1, 31).unwrap();

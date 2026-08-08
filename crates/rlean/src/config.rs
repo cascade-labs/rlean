@@ -306,9 +306,13 @@ mod tests {
             .unwrap();
         cfg.set_provider_key("thetadata", "max_concurrent", "4".into())
             .unwrap();
-        assert!(cfg.set_provider_key("fidelity", "username", "x".into()).is_err());
+        assert!(cfg
+            .set_provider_key("fidelity", "username", "x".into())
+            .is_err());
         assert_eq!(
-            cfg.get_provider("thetadata").get("api_key").map(String::as_str),
+            cfg.get_provider("thetadata")
+                .get("api_key")
+                .map(String::as_str),
             Some("td-key")
         );
         assert_eq!(

@@ -1215,7 +1215,7 @@ async fn execute_market_data_query_batch(
         end_ns = key.end_ns,
         "querying batched cached market data"
     );
-    let sql = market_data_sql(key, &sids);
+    let sql = market_data_sql(key, sids);
     let _permit = io_permits
         .acquire()
         .await
@@ -1275,7 +1275,7 @@ fn decode_market_data_query_batch(
     let mut trade_rows: HashMap<i64, Vec<TradeBar>> = HashMap::new();
     let mut quote_rows: HashMap<i64, Vec<QuoteBar>> = HashMap::new();
     for batch in batches {
-        let batch_sids = int64(&batch, "symbol_sid")?;
+        let batch_sids = int64(batch, "symbol_sid")?;
         for sid in batch_sids.values().iter().copied().collect::<HashSet<_>>() {
             let Some(symbol) = symbols.get(&sid) else {
                 continue;
@@ -1284,12 +1284,12 @@ fn decode_market_data_query_batch(
                 trade_rows
                     .entry(sid)
                     .or_default()
-                    .extend(decode_trade_bars_for_sid(&batch, symbol, sid)?);
+                    .extend(decode_trade_bars_for_sid(batch, symbol, sid)?);
             } else {
                 quote_rows
                     .entry(sid)
                     .or_default()
-                    .extend(decode_quote_bars_for_sid(&batch, symbol, sid)?);
+                    .extend(decode_quote_bars_for_sid(batch, symbol, sid)?);
             }
         }
     }

@@ -45,6 +45,29 @@ pub(crate) fn strategy_name_from_dir(strategy_dir: &Path) -> String {
         .to_string()
 }
 
+/// Reject strategy directory names that could escape the workspace path or be
+/// interpreted by a remote login shell when embedded in deploy commands.
+///
+/// Allowed: ASCII letters, digits, `.`, `_`, `-`. Rejected: empty, `.`, `..`,
+/// path separators, and any other metacharacter.
+pub(crate) fn validate_strategy_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("invalid strategy name '{name}': must be a non-empty directory basename");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("invalid strategy name '{name}': use only letters, digits, '.', '_', or '-'");
+    }
+    Ok(())
+}
+
+/// POSIX single-quote a string for safe embedding in a remote shell command.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// The absolute node paths for a strategy (the deploy dir is created by the
 /// node's own `rlean live` launcher under `<strategy_dir>/live/<deploy-id>`).
 pub(crate) struct NodePaths {
@@ -70,16 +93,20 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
 /// printing `Live deployment started: deploy_id=<id> container=<id> ...`, which
 /// [`parse_launch_line`] consumes.
 ///
+/// Paths and CLI option values are single-quoted so a compromised strategy
+/// directory name (or hostile CLI flag) cannot break out of the remote shell
+/// command. Prefer validating names at the deploy entrypoint as well.
+///
 /// Extracted as a pure string builder so the exact command is unit-testable.
 pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> String {
     format!(
         "cd {strategy} && rlean live --pull {main} \
          --live-data-feed {feed} \
          --brokerage {brok}",
-        strategy = paths.strategy_dir,
-        main = paths.main_py,
-        feed = opts.live_data_feed,
-        brok = opts.brokerage,
+        strategy = shell_single_quote(&paths.strategy_dir),
+        main = shell_single_quote(&paths.main_py),
+        feed = shell_single_quote(&opts.live_data_feed),
+        brok = shell_single_quote(&opts.brokerage),
     )
 }
 
@@ -100,7 +127,11 @@ pub(crate) fn parse_launch_line(stdout: &str) -> Option<(String, u32)> {
         } else if let Some(v) = token.strip_prefix("container=") {
             // Container ids are hex; keep a stable u32 fingerprint for the
             // cloud registry which still stores an optional pid field.
-            let hex: String = v.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+            let hex: String = v
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(8)
+                .collect();
             numeric_id = u32::from_str_radix(&hex, 16).ok().or(Some(0));
         }
     }
@@ -110,11 +141,18 @@ pub(crate) fn parse_launch_line(stdout: &str) -> Option<(String, u32)> {
 /// Build the argv for a `rlean live <sub> <deploy_id> ...` command run on the
 /// node with cwd = the strategy dir (so the deploy resolves under `<cwd>/live/`).
 ///
-/// The command is `sh -c 'cd <strategy_dir> && rlean live <sub...>'` so the cwd
-/// is honored over ssh.
+/// The command is `cd <strategy_dir> && rlean live <sub...>` so the cwd is
+/// honored over ssh. Each interpolated token is single-quoted.
 pub(crate) fn live_control_command(strategy_dir: &str, live_args: &[&str]) -> String {
-    let joined = live_args.join(" ");
-    format!("cd {strategy_dir} && rlean live {joined}")
+    let joined = live_args
+        .iter()
+        .map(|a| shell_single_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "cd {} && rlean live {joined}",
+        shell_single_quote(strategy_dir)
+    )
 }
 
 // ── Deploy ───────────────────────────────────────────────────────────────────
@@ -138,6 +176,7 @@ pub(crate) fn resolve_local_strategy(input: &Path) -> Result<(PathBuf, String)> 
         bail!("strategy directory has no main.py: {}", dir.display());
     }
     let name = strategy_name_from_dir(&dir);
+    validate_strategy_name(&name)?;
     Ok((dir, name))
 }
 
@@ -173,6 +212,7 @@ pub(crate) fn cmd_deploy(
         opts,
         now,
     } = *req;
+    validate_strategy_name(strategy_name)?;
     let ssh = &node.ssh_dest;
     let paths = node_paths(node_home, strategy_name);
 
@@ -486,22 +526,68 @@ mod tests {
         let cmd = remote_launch_command(&p, &opts);
         // The node's own launcher pulls the image, owns detachment via Docker,
         // and writes deployment.json — the command must NOT hand-roll --foreground.
-        assert!(cmd.starts_with(
-            "cd /home/opc/rlean-cloud/workspace/uw_control && rlean live --pull "
-        ));
+        assert!(cmd
+            .starts_with("cd '/home/opc/rlean-cloud/workspace/uw_control' && rlean live --pull "));
         assert!(!cmd.contains("--foreground"));
         assert!(!cmd.contains("--live-deploy-dir"));
-        assert!(cmd.contains(" /home/opc/rlean-cloud/workspace/uw_control/main.py"));
-        assert!(cmd.contains("--brokerage tradier"));
-        assert!(cmd.contains("--live-data-feed tradier"));
+        assert!(cmd.contains(" '/home/opc/rlean-cloud/workspace/uw_control/main.py'"));
+        assert!(cmd.contains("--brokerage 'tradier'"));
+        assert!(cmd.contains("--live-data-feed 'tradier'"));
         assert!(!cmd.contains("--data-provider"));
         assert!(!cmd.contains("--data "));
     }
 
     #[test]
+    fn launch_command_quotes_metacharacters() {
+        let p = node_paths("/home/opc", "evil;id");
+        let opts = DeployOptions {
+            brokerage: "tradier;reboot".to_string(),
+            live_data_feed: "tradier$(id)".to_string(),
+        };
+        let cmd = remote_launch_command(&p, &opts);
+        assert!(cmd.contains("cd '/home/opc/rlean-cloud/workspace/evil;id'"));
+        assert!(cmd.contains("--brokerage 'tradier;reboot'"));
+        assert!(cmd.contains("--live-data-feed 'tradier$(id)'"));
+        // Metacharacters must not appear outside quotes as shell syntax.
+        assert!(!cmd.contains("cd /home/opc/rlean-cloud/workspace/evil;id &&"));
+    }
+
+    #[test]
     fn live_control_command_sets_cwd() {
         let cmd = live_control_command("/home/opc/ws/uw", &["logs", "d1", "--lines", "40"]);
-        assert_eq!(cmd, "cd /home/opc/ws/uw && rlean live logs d1 --lines 40");
+        assert_eq!(
+            cmd,
+            "cd '/home/opc/ws/uw' && rlean live 'logs' 'd1' '--lines' '40'"
+        );
+    }
+
+    #[test]
+    fn validate_strategy_name_accepts_safe_basenames() {
+        assert!(validate_strategy_name("uw_control").is_ok());
+        assert!(validate_strategy_name("my-strat.v2").is_ok());
+        assert!(validate_strategy_name("A1").is_ok());
+    }
+
+    #[test]
+    fn validate_strategy_name_rejects_escape_and_injection() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../.ssh",
+            "evil;id",
+            "evil`id`",
+            "evil$(id)",
+            "evil|id",
+            "evil && id",
+            "name with space",
+            "slash/name",
+        ] {
+            assert!(
+                validate_strategy_name(bad).is_err(),
+                "expected reject for {bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -198,7 +198,7 @@ fn tradier_accepts_supported_index_option_orders() {
 }
 
 #[test]
-fn tradier_algorithm_uses_realistic_pass_through_fee_model_for_options() {
+fn tradier_algorithm_uses_published_pass_through_fee_model_for_options() {
     let algorithm = tradier_algorithm();
     let underlying = Symbol::create_equity("SPY", &Market::usa());
     let option = Symbol::create_option(
@@ -213,7 +213,8 @@ fn tradier_algorithm_uses_realistic_pass_through_fee_model_for_options() {
 
     let fee = algorithm.order_fee(&order, dec!(1.25));
 
-    assert_eq!(fee.amount, dec!(2.6062343750));
+    // 10 contracts: clearing 0.775 + ORF/reporting 0.254 = 1.029
+    assert_eq!(fee.amount, dec!(1.029));
 }
 
 fn ny_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> rlean_core::DateTime {

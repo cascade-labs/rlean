@@ -114,7 +114,7 @@ impl FredHistoricalDataProvider {
                     continue;
                 }
                 Err(error) => {
-                    return Err(RiskFreeInterestRateUnavailable::new(format!(
+                    return Err(RiskFreeInterestRateUnavailable::error(format!(
                         "request FRED observations: {error}"
                     )));
                 }
@@ -131,13 +131,13 @@ impl FredHistoricalDataProvider {
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
-                    return Err(RiskFreeInterestRateUnavailable::new(format!(
+                    return Err(RiskFreeInterestRateUnavailable::error(format!(
                         "read FRED response: {error}"
                     )));
                 }
             };
             if !status.is_success() {
-                return Err(RiskFreeInterestRateUnavailable::new(format!(
+                return Err(RiskFreeInterestRateUnavailable::error(format!(
                     "FRED HTTP {status} for {}: {}",
                     redacted_url(&url),
                     body.chars().take(500).collect::<String>()

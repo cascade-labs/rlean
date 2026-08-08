@@ -75,8 +75,7 @@ pub(crate) async fn historical_data_provider(
             if let Some(max_concurrent) = optional_usize(&provider_cfg, "max_concurrent") {
                 provider_config.max_concurrent = max_concurrent.max(1);
             }
-            if let Some(requests_per_second) = optional_f64(&provider_cfg, "requests_per_second")
-            {
+            if let Some(requests_per_second) = optional_f64(&provider_cfg, "requests_per_second") {
                 provider_config.requests_per_second = requests_per_second;
             }
             Arc::new(ThetaDataHistoricalDataProvider::new(provider_config)?)

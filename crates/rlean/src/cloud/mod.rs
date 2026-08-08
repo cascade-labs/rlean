@@ -172,10 +172,7 @@ pub fn run(args: CloudArgs) -> Result<()> {
             let reg = NodeRegistry::load()?;
             cmd_exec(&exec, &reg, &name, &cmd)
         }
-        CloudCommand::Install {
-            name,
-            release_tag,
-        } => {
+        CloudCommand::Install { name, release_tag } => {
             let reg = NodeRegistry::load()?;
             let tag = release_tag.as_deref().unwrap_or(DEFAULT_RELEASE_TAG);
             let summary = cmd_install(&exec, &reg, &name, tag)?;

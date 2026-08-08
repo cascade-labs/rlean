@@ -363,9 +363,10 @@ where
             &restore.account_state,
         );
         if let Some(portfolio) = portfolio.as_ref() {
-            let starting_value = crate::live::catalog_state::set_live_starting_portfolio_value_from_synced_account(
-                portfolio,
-            );
+            let starting_value =
+                crate::live::catalog_state::set_live_starting_portfolio_value_from_synced_account(
+                    portfolio,
+                );
             tracing::info!(
                 "Restored paper account from Verglas catalog: cash={} holdings={} open_orders={} order_events={} trades={} starting_value={starting_value}",
                 restore.account_state.cash,
@@ -1081,7 +1082,6 @@ fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
     }
 }
 
-
 #[allow(clippy::too_many_arguments)]
 async fn emit_live_catalog_update(
     sender: &tokio::sync::mpsc::Sender<crate::BacktestStreamUpdate>,
@@ -1371,8 +1371,8 @@ async fn process_live_slice<B: AlgorithmBridge>(
     if let (Some(sender), Some(transactions), Some(portfolio)) =
         (stream_updates, transactions, portfolio)
     {
-        let force_checkpoint = all_order_events.len() != prev_order_events
-            || completed_trades.len() != prev_trades;
+        let force_checkpoint =
+            all_order_events.len() != prev_order_events || completed_trades.len() != prev_trades;
         emit_live_catalog_update(
             sender,
             slice.time,

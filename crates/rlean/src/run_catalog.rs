@@ -995,6 +995,7 @@ mod tests {
                 ORDER_EVENTS,
                 TRADES,
                 INSIGHTS,
+                CHECKPOINTS,
                 STATISTICS,
                 CHARTS,
                 DATA_REQUESTS,

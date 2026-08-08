@@ -1,4 +1,4 @@
-use crate::config::{ensure_known_provider, GlobalConfig, KNOWN_PROVIDERS, WorkspaceConfig};
+use crate::config::{ensure_known_provider, GlobalConfig, WorkspaceConfig, KNOWN_PROVIDERS};
 /// `rlean config` — get/set/list workspace and provider configuration
 ///
 /// All values are stored in ~/.rlean/config (mode 0600). Workspace language
