@@ -1225,6 +1225,8 @@ mod tests {
                 DateTime::EPOCH,
                 "test order",
             )],
+            trades: vec![],
+            insight_events: vec![],
             succeeded_data_requests: vec!["SPY/2026-01-02".to_string()],
             failed_data_requests: vec!["SPY/2026-01-05".to_string()],
             backtest_id: 1_744_000_000,

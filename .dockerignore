@@ -1,0 +1,8 @@
+target
+.git
+.weco
+**/backtests
+**/live
+**/__pycache__
+*.pyc
+

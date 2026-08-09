@@ -18,7 +18,7 @@ pub enum SubscriptionDataPoint {
     },
     /// One complete daily selection snapshot. Keeping rows together is
     /// essential: a selector must never see a partial cross-section merely
-    /// because Arrow split a Flight response into record batches.
+    /// because Arrow split a provider response into record batches.
     FundamentalUniverse {
         data: Vec<FundamentalData>,
         frontier_time: DateTime,

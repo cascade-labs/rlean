@@ -66,6 +66,14 @@ impl FrameworkModelRegistry for EngineFrameworkRegistry {
         self.snapshot.clone()
     }
 
+    fn cancel_insights(&self, symbols: &[rlean_core::Symbol], utc_now: DateTime) {
+        self.ensure_insight_observer();
+        self.framework
+            .lock()
+            .unwrap()
+            .cancel_insights(symbols, utc_now);
+    }
+
     fn ensure_insight_observer(&self) {
         let mut framework = self.framework.lock().unwrap();
         if framework.has_observer() {

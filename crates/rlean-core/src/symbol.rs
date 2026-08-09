@@ -1,5 +1,6 @@
 use crate::{Market, OptionRight, OptionStyle, Price, SecurityType};
 use chrono::NaiveDate;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -25,6 +26,165 @@ pub struct SecurityIdentifier {
 }
 
 impl SecurityIdentifier {
+    const LEAN_MARKET_OFFSET: u64 = 100;
+    const LEAN_STRIKE_SCALE_OFFSET: u64 = 100_000;
+    const LEAN_STRIKE_OFFSET: u64 = 10_000_000;
+    const LEAN_OPTION_STYLE_OFFSET: u64 = 10_000_000_000_000;
+    const LEAN_DAYS_OFFSET: u64 = 100_000_000_000_000;
+    const LEAN_PUT_CALL_OFFSET: u64 = 10_000_000_000_000_000_000;
+
+    /// Produces the canonical textual C# LEAN equity SID used by persisted
+    /// data contracts. `first_ticker` and `first_date` are the first map-file
+    /// entry, matching `SecurityIdentifier.GetFirstTickerAndDate`.
+    pub fn lean_equity_sid(
+        first_ticker: &str,
+        market: &Market,
+        first_date: NaiveDate,
+    ) -> anyhow::Result<String> {
+        Self::lean_security_sid(first_ticker, market, SecurityType::Equity, first_date)
+    }
+
+    /// Produces a canonical textual C# LEAN SID for a non-derivative security.
+    pub fn lean_security_sid(
+        first_ticker: &str,
+        market: &Market,
+        security_type: SecurityType,
+        first_date: NaiveDate,
+    ) -> anyhow::Result<String> {
+        Self::lean_sid(
+            first_ticker,
+            market,
+            security_type,
+            first_date,
+            Price::ZERO,
+            OptionRight::Call,
+            OptionStyle::American,
+            None,
+        )
+    }
+
+    /// Produces the canonical textual C# LEAN option SID, including its
+    /// canonical underlying SID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lean_option_sid(
+        first_ticker: &str,
+        market: &Market,
+        underlying_security_type: SecurityType,
+        underlying_first_date: NaiveDate,
+        expiry: NaiveDate,
+        strike: Price,
+        right: OptionRight,
+        style: OptionStyle,
+    ) -> anyhow::Result<String> {
+        let underlying = Self::lean_sid(
+            first_ticker,
+            market,
+            underlying_security_type,
+            underlying_first_date,
+            Price::ZERO,
+            OptionRight::Call,
+            OptionStyle::American,
+            None,
+        )?;
+        let security_type = match underlying_security_type {
+            SecurityType::Index => SecurityType::IndexOption,
+            SecurityType::Future => SecurityType::FutureOption,
+            _ => SecurityType::Option,
+        };
+        Self::lean_sid(
+            first_ticker,
+            market,
+            security_type,
+            expiry,
+            strike,
+            right,
+            style,
+            Some(&underlying),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lean_sid(
+        ticker: &str,
+        market: &Market,
+        security_type: SecurityType,
+        date: NaiveDate,
+        strike: Price,
+        right: OptionRight,
+        style: OptionStyle,
+        underlying: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let oa_epoch = NaiveDate::from_ymd_opt(1899, 12, 30).expect("valid OLE Automation epoch");
+        let oa_days = date.signed_duration_since(oa_epoch).num_days();
+        anyhow::ensure!(
+            oa_days >= 0,
+            "LEAN SID date predates OLE Automation epoch: {date}"
+        );
+        let (encoded_strike, strike_scale) = Self::lean_normalize_strike(strike)?;
+        let properties = u64::from(right as u8) * Self::LEAN_PUT_CALL_OFFSET
+            + (oa_days as u64) * Self::LEAN_DAYS_OFFSET
+            + u64::from(style as u8) * Self::LEAN_OPTION_STYLE_OFFSET
+            + encoded_strike * Self::LEAN_STRIKE_OFFSET
+            + strike_scale * Self::LEAN_STRIKE_SCALE_OFFSET
+            + u64::from(Market::encode(market.as_str())) * Self::LEAN_MARKET_OFFSET
+            + u64::from(security_type as u8);
+        let mut text = format!(
+            "{} {}",
+            ticker.to_ascii_uppercase(),
+            Self::lean_encode_base36(properties)
+        );
+        if let Some(underlying) = underlying {
+            text.push('|');
+            text.push_str(underlying);
+        }
+        Ok(text)
+    }
+
+    fn lean_normalize_strike(mut strike: Price) -> anyhow::Result<(u64, u64)> {
+        if strike.is_zero() {
+            return Ok((0, 0));
+        }
+        strike *= Price::from(1_000_000_u64);
+        let mut scale = 0_u64;
+        while (strike % Price::TEN).is_zero() {
+            strike /= Price::TEN;
+            scale += 1;
+        }
+        let encoded = strike.trunc().to_i64().ok_or_else(|| {
+            anyhow::anyhow!("option strike cannot be encoded in a LEAN SID: {strike}")
+        })?;
+        const NEGATIVE_MASK: u64 = 1 << 19;
+        const MAX_STRIKE_PRICE: u64 = 475_711;
+        anyhow::ensure!(
+            encoded.unsigned_abs() < MAX_STRIKE_PRICE,
+            "option strike is outside the LEAN SID range: {strike}"
+        );
+        let encoded = if encoded < 0 {
+            encoded.unsigned_abs() | NEGATIVE_MASK
+        } else {
+            encoded as u64
+        };
+        Ok((encoded, scale))
+    }
+
+    fn lean_encode_base36(mut value: u64) -> String {
+        if value == 0 {
+            return "0".to_string();
+        }
+        let mut output = Vec::with_capacity(15);
+        while value != 0 {
+            let digit = (value % 36) as u8;
+            output.push(if digit < 10 {
+                b'0' + digit
+            } else {
+                b'A' + digit - 10
+            });
+            value /= 36;
+        }
+        output.reverse();
+        String::from_utf8(output).expect("base36 is ASCII")
+    }
+
     pub fn generate_base(ticker: &str, market: &Market, data_type: &str) -> Self {
         let base_ticker = format!("{}:{}", data_type.to_uppercase(), ticker.to_uppercase());
         let sid = Self::hash_sid(
@@ -653,5 +813,66 @@ mod tests {
         let restored: Symbol = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, symbol);
         assert_eq!(restored.value.as_ref(), "SPY");
+    }
+
+    #[test]
+    fn canonical_option_sids_match_csharp_lean_vectors() {
+        let first_date = NaiveDate::from_ymd_opt(1998, 1, 2).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2020, 5, 21).unwrap();
+        let cases = [
+            (
+                OptionStyle::American,
+                OptionRight::Call,
+                Price::new(100, 0),
+                "AAPL XEOLB4YAUINA|AAPL R735QTJ8XC9X",
+            ),
+            (
+                OptionStyle::American,
+                OptionRight::Put,
+                Price::new(100, 0),
+                "AAPL 31DSLGKXI4C12|AAPL R735QTJ8XC9X",
+            ),
+            (
+                OptionStyle::European,
+                OptionRight::Call,
+                Price::new(100, 0),
+                "AAPL XEOOUQW0NLD2|AAPL R735QTJ8XC9X",
+            ),
+            (
+                OptionStyle::European,
+                OptionRight::Put,
+                Price::new(100, 0),
+                "AAPL 31DSP06V7XEQU|AAPL R735QTJ8XC9X",
+            ),
+            (
+                OptionStyle::American,
+                OptionRight::Call,
+                Price::new(1, 2),
+                "AAPL XEOLB4YALY06|AAPL R735QTJ8XC9X",
+            ),
+            (
+                OptionStyle::American,
+                OptionRight::Put,
+                Price::new(1, 2),
+                "AAPL 31DSLGKXHVRDY|AAPL R735QTJ8XC9X",
+            ),
+        ];
+
+        for (style, right, strike, expected) in cases {
+            assert_eq!(
+                SecurityIdentifier::lean_option_sid(
+                    "AAPL",
+                    &Market::usa(),
+                    SecurityType::Equity,
+                    first_date,
+                    expiry,
+                    strike,
+                    right,
+                    style,
+                )
+                .unwrap(),
+                expected
+            );
+        }
     }
 }

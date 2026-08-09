@@ -6,12 +6,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::cloud::CloudArgs;
 use crate::config_cmd::ConfigArgs;
-use crate::daemon_cmd::DaemonArgs;
 use crate::data_cmd::DataArgs;
 use crate::init::InitArgs;
 use crate::project::CreateProjectArgs;
 use crate::research::ResearchArgs;
 use crate::research_daemon::ResearchDaemonArgs;
+use crate::runs_cmd::RunsArgs;
 use crate::stubs_cmd::StubsArgs;
 use crate::vcs_cmd::VcsArgs;
 
@@ -35,14 +35,17 @@ pub(crate) enum Command {
     #[command(name = "create-project")]
     CreateProject(CreateProjectArgs),
 
-    /// Get, set, or list runtime and sidecar integration configuration
+    /// Get, set, or list runtime and provider configuration
     Config(ConfigArgs),
 
-    /// Inspect the canonical sidecar data contract
+    /// Inspect the canonical data contract
     Data(DataArgs),
 
     /// Run a backtest
     Backtest(RunArgs),
+
+    /// Inspect durable backtest results in the Verglas catalog
+    Runs(RunsArgs),
 
     /// Run live trading or inspect local live deployments
     Live(LiveArgs),
@@ -59,9 +62,6 @@ pub(crate) enum Command {
     /// Manage a fleet of remote nodes reachable over SSH
     Cloud(CloudArgs),
 
-    /// Install and control the persistent live-deployment supervisor
-    Daemon(DaemonArgs),
-
     /// Hidden: persistent PyO3 research kernel daemon (started by `rlean research`)
     #[command(name = "__research-daemon", hide = true)]
     ResearchDaemon(ResearchDaemonArgs),
@@ -70,28 +70,29 @@ pub(crate) enum Command {
 #[derive(clap::Args, Clone)]
 pub(crate) struct RuntimeArgs {
     // ── Data ─────────────────────────────────────────────────────────────────
-    /// Apache Arrow Flight data sidecar endpoint. Examples:
-    /// grpc://127.0.0.1:7410, grpc+tls://data.example.com:443.
-    #[arg(long, env = "RLEAN_DATA_SIDECAR")]
-    pub(crate) data_sidecar: Option<String>,
+    /// Historical market-data provider. Provider responses are normalized to
+    /// rlean's canonical tables and cached through Verglas before consumption.
+    #[arg(long, env = "RLEAN_DATA_PROVIDER_HISTORICAL")]
+    pub(crate) data_provider_historical: Option<String>,
 
-    /// Optional bearer token sent to the data sidecar.
-    #[arg(long, env = "RLEAN_DATA_SIDECAR_TOKEN", hide_env_values = true)]
-    pub(crate) data_sidecar_token: Option<String>,
-
-    /// Sidecar live market-data provider. Symbols and resolutions remain
-    /// strategy SDK subscriptions; this selects the integration serving them.
+    /// Live market-data provider. Symbols and resolutions remain
+    /// strategy SDK subscriptions; this selects the provider serving them.
     #[arg(long, env = "RLEAN_LIVE_DATA_FEED")]
     pub(crate) live_data_feed: Option<String>,
 
     /// Execution brokerage for live runs. Use "paper" for local simulated
-    /// fills, or a sidecar brokerage such as "robinhood" for live orders. This
+    /// fills, or a native brokerage such as "tradier" for live orders. This
     /// is independent from --live-data-feed.
     #[arg(long, env = "RLEAN_BROKERAGE")]
     pub(crate) brokerage: Option<String>,
 
+    /// Base URL implementing rlean's HTTP brokerage contract. Required when
+    /// --brokerage http is selected.
+    #[arg(long, env = "RLEAN_BROKERAGE_URL")]
+    pub(crate) brokerage_url: Option<String>,
+
     /// Brokerage account identifier for this live deployment. This is passed
-    /// to the selected sidecar brokerage when the connection is opened.
+    /// to the selected brokerage when the connection is opened.
     #[arg(long, env = "RLEAN_BROKERAGE_ACCOUNT")]
     pub(crate) brokerage_account: Option<String>,
 
@@ -107,17 +108,6 @@ pub(crate) struct RuntimeArgs {
     /// Algorithm parameter as KEY=VALUE for LEAN-style GetParameter access.
     #[arg(long = "parameter", short = 'p', value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     pub(crate) parameters: Vec<String>,
-
-    // ── Run artifact relay ────────────────────────────────────────────────────
-    /// Where run artifacts (backtest/live run dirs) are written: local, s3, or
-    /// mirror. Defaults to local. Overrides RLEAN_ARTIFACT_STORE and config.
-    #[arg(long, value_name = "local|s3|mirror", env = "RLEAN_ARTIFACT_STORE")]
-    pub(crate) artifact_store: Option<String>,
-
-    /// S3 destination for run artifacts as s3://bucket/prefix. Required when
-    /// --artifact-store is s3 or mirror. Overrides RLEAN_ARTIFACT_S3 and config.
-    #[arg(long, value_name = "s3://bucket/prefix", env = "RLEAN_ARTIFACT_S3")]
-    pub(crate) artifact_s3: Option<String>,
 
     // ── Logging ───────────────────────────────────────────────────────────────
     /// Enable debug logging for rlean crates
@@ -144,13 +134,17 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
 
-    // ── Output ────────────────────────────────────────────────────────────────
-    /// Override the report output path (default: <project>/backtests/<timestamp>.html)
-    #[arg(long)]
-    pub(crate) report: Option<PathBuf>,
-
     #[command(flatten)]
     pub(crate) live_limits: LiveLimitArgs,
+
+    /// Run the engine in-process instead of spawning a container.
+    /// Used as the container entrypoint; host operators should not need this.
+    #[arg(long, hide = true)]
+    pub(crate) native: bool,
+
+    /// Always `docker pull` the engine image before starting (cloud deploy/upgrade).
+    #[arg(long, hide = true)]
+    pub(crate) pull: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -174,6 +168,10 @@ pub(crate) struct LiveArgs {
     /// Run live trading in the foreground instead of creating a detached deployment.
     #[arg(long, hide = true)]
     pub(crate) foreground: bool,
+
+    /// Always `docker pull` the engine image before starting (cloud deploy/upgrade).
+    #[arg(long, hide = true)]
+    pub(crate) pull: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -265,8 +263,9 @@ impl LiveArgs {
         Ok(RunArgs {
             strategy,
             runtime: self.runtime.clone(),
-            report: None,
             live_limits: self.live_limits.clone(),
+            native: false,
+            pull: self.pull,
         })
     }
 }

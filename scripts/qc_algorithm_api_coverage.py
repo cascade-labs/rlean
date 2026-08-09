@@ -8,12 +8,14 @@ the embedded `AlgorithmImports.pyi` stub, and writes JSON plus SVG reports.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import html
 import json
+import os
 import re
-import sys
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -935,7 +937,29 @@ def escape_xml(text: str) -> str:
     )
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare LEAN-facing Python API coverage against local rlean stubs."
+    )
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help=(
+            "Fail if overall coverage is below this percentage (0-100). "
+            "Omit to report only (default)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.min_coverage is not None and not (0.0 <= args.min_coverage <= 100.0):
+        print("error: --min-coverage must be between 0 and 100", file=sys.stderr)
+        return 2
+
     qcalgorithm_docs_text = fetch_text(QCALGORITHM_DOCS_URL)
     qcalgorithm_docs_members = extract_documented_members(qcalgorithm_docs_text)
     if not qcalgorithm_docs_members:
@@ -969,7 +993,8 @@ def main() -> int:
     write_json_report(json_path, sections, overall, stub_source, api_audit)
     write_svg_chart(svg_path, sections, overall)
 
-    print(f"Python API coverage: {overall.ratio * 100.0:.1f}%")
+    overall_pct = overall.ratio * 100.0
+    print(f"Python API coverage: {overall_pct:.1f}%")
     for name, coverage in sections.items():
         print(
             f"  {name:20} {coverage.ratio * 100.0:5.1f}% "
@@ -984,6 +1009,35 @@ def main() -> int:
     print(f"  generated local-only {len(api_audit.local_only_generated)}")
     print(f"  report: {json_path}")
     print(f"  chart:  {svg_path}")
+
+    summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"]) if "GITHUB_STEP_SUMMARY" in os.environ else None
+    if summary_path is not None:
+        lines = [
+            "## Python API coverage",
+            "",
+            f"**{overall_pct:.1f}%** overall",
+            "",
+            "| Surface | Coverage |",
+            "| --- | ---: |",
+        ]
+        for name, coverage in sections.items():
+            lines.append(
+                f"| {name} | {coverage.ratio * 100.0:.1f}% "
+                f"({len(coverage.covered)}/{len(coverage.expected)}) |"
+            )
+        if args.min_coverage is not None:
+            lines.extend(["", f"Floor: `{args.min_coverage:.1f}%`"])
+        else:
+            lines.extend(["", "_Informational only — no coverage floor enforced._"])
+        summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    if args.min_coverage is not None and overall_pct + 1e-9 < args.min_coverage:
+        print(
+            f"error: overall coverage {overall_pct:.1f}% is below floor "
+            f"{args.min_coverage:.1f}%",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

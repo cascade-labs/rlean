@@ -1,18 +1,14 @@
 use crate::data_feed::DataFeedContext;
 use crate::normalization::{normalize_quote_bar, normalize_trade_bar};
 use crate::subscription_data::SubscriptionDataPoint;
-use futures::StreamExt;
 use rlean_core::{
-    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, SecurityType,
-    SymbolOptionsExt,
+    DateTime, LeanError, MarketHoursDatabase, Resolution, Result as LeanResult, SymbolOptionsExt,
+    TickType, TimeSpan,
 };
 use rlean_data::SubscriptionDataConfig;
-use rlean_data_sidecar::{
-    decode_batch, decode_factor_file_batch, CanonicalDataBatch, DeliveryMode, SubscriptionSpec,
-    WireDataType,
-};
+use rlean_data_providers::{HistoricalData, HistoricalDataProvider, HistoryRequest};
 use rlean_data_tables::FactorFileEntry;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,11 +24,10 @@ impl SubscriptionStreamMessage {
     }
 }
 
-/// One engine subscription backed by one registered sidecar subscription.
+/// One engine subscription backed by the selected historical provider.
 ///
 /// The producer requests bounded backtest windows and the channel supplies the
-/// same backpressure that the synchronizer used before the Flight migration.
-/// There is no storage/provider fallback: a sidecar session is mandatory.
+/// same backpressure as C# LEAN's pull enumerators.
 pub struct SubscriptionStream {
     config: SubscriptionDataConfig,
     receiver: mpsc::Receiver<LeanResult<SubscriptionStreamMessage>>,
@@ -99,7 +94,7 @@ impl SubscriptionStream {
         }
     }
 
-    /// Build a stream fed by a bare channel instead of a sidecar-backed
+    /// Build a stream fed by a bare channel instead of a provider-backed
     /// producer, so synchronizer wait behavior can be driven under tokio's
     /// virtual clock in tests. The test owns the sender: an in-flight provider
     /// request is "sender alive, nothing sent yet", a transport failure is an
@@ -268,9 +263,7 @@ fn validate_point_against_watermark(
 
 impl Drop for SubscriptionStream {
     fn drop(&mut self) {
-        // Let the producer cancel its in-flight sidecar query and explicitly
-        // unregister the remote subscription. Aborting the task here skips the
-        // cleanup after `produce_registered`, leaking both on the sidecar.
+        // Let the producer cancel its in-flight provider query.
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
         }
@@ -285,142 +278,70 @@ async fn produce(
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
     mut cancelled: oneshot::Receiver<()>,
 ) -> LeanResult<()> {
-    let sidecar = &context.sidecar;
-    let registration = sidecar
-        .add_subscription(&config, DeliveryMode::Backtest)
-        .await
-        .map_err(data_error)?;
-    let subscription_id = registration.subscription_id;
-    let effective_start = effective_subscription_start(start, registration.available_from);
-    tracing::debug!(
-        subscription_id,
-        symbol = %config.symbol.value,
-        source = ?config.custom.as_ref().map(|custom| custom.source_type.as_str()),
-        requested_start = %start,
-        available_from = ?registration.available_from.map(|value| value.to_string()),
-        effective_start = %effective_start,
-        "registered backtest subscription"
-    );
-    let factor_rows_result = tokio::select! {
-        _ = &mut cancelled => {
-            let _ = sidecar.remove_subscription(subscription_id).await;
-            return Ok(());
+    let provider = context.historical_provider.clone();
+    let request = HistoryRequest::new(config.clone(), start, end).map_err(data_error)?;
+    if !provider.supports(&request) {
+        return Err(LeanError::DataError(format!(
+            "historical provider '{}' does not support {:?} {:?} data for {}",
+            provider.name(),
+            config.symbol.security_type(),
+            config.tick_type,
+            config.symbol.value
+        )));
+    }
+    let auxiliary_key = format!("{}:{}", config.symbol.market(), config.symbol.permtick);
+    let factor_rows = if config.symbol.security_type() == rlean_core::SecurityType::Equity {
+        if let Some(rows) = context.cached_auxiliary_factor_rows(&auxiliary_key) {
+            rows
+        } else {
+            let rows = provider
+                .get_factor_file(&config.symbol)
+                .await
+                .map_err(data_error)?
+                .unwrap_or_default();
+            context.cache_auxiliary_factor_rows(auxiliary_key.clone(), rows.clone());
+            rows
         }
-        result = load_auxiliary_rows(&config, &context) => result,
+    } else {
+        Vec::new()
     };
-    let factor_rows = match factor_rows_result {
-        Ok(rows) => rows,
-        Err(error) => {
-            let _ = sidecar.remove_subscription(subscription_id).await;
-            return Err(error);
+    let map_rows = if config.symbol.security_type() == rlean_core::SecurityType::Equity {
+        if let Some(rows) = context.cached_auxiliary_map_rows(&auxiliary_key) {
+            rows
+        } else {
+            let rows = provider
+                .get_map_file(&config.symbol)
+                .await
+                .map_err(data_error)?
+                .unwrap_or_default();
+            context.cache_auxiliary_map_rows(auxiliary_key, rows.clone());
+            rows
         }
+    } else {
+        Vec::new()
     };
-    let result = tokio::select! {
-        _ = &mut cancelled => Ok(()),
-        result = produce_registered(
-            &config,
-            &context,
-            subscription_id,
-            (effective_start, end),
-            &factor_rows,
-            sender,
-        ) => result,
-    };
-    if let Err(error) = sidecar.remove_subscription(subscription_id).await {
-        tracing::warn!(subscription_id, %error, "failed to remove sidecar subscription");
-    }
-    result
-}
-
-fn effective_subscription_start(start: DateTime, available_from: Option<DateTime>) -> DateTime {
-    available_from
-        .map(|available_from| start.max(available_from))
-        .unwrap_or(start)
-}
-
-async fn load_auxiliary_rows(
-    config: &SubscriptionDataConfig,
-    context: &DataFeedContext,
-) -> LeanResult<Vec<FactorFileEntry>> {
-    if config.symbol.security_type() != SecurityType::Equity {
-        return Ok(Vec::new());
-    }
-    let cache_key = auxiliary_cache_key(config);
-    if let Some(rows) = context.cached_auxiliary_factor_rows(&cache_key) {
-        return Ok(rows);
-    }
-
-    let mut factor_spec = SubscriptionSpec::from(config);
-    factor_spec.config_id ^= 0xfac7_0000_0000_0000;
-    factor_spec.data_type = WireDataType::FactorFile as i32;
-    factor_spec.resolution = 4;
-    factor_spec.tick_type = 0;
-    let factor_batches = query_auxiliary(context, factor_spec).await?;
-    let mut factor_rows = Vec::new();
-    for batch in &factor_batches {
-        factor_rows.extend(decode_factor_file_batch(batch).map_err(data_error)?);
-    }
-    factor_rows.sort_by_key(|row| row.date);
-
-    tracing::info!(
-        ticker = %config.symbol.permtick,
-        factor_rows = factor_rows.len(),
-        "loaded equity factor rows from sidecar"
-    );
-    if config.normalization_mode != rlean_core::DataNormalizationMode::Raw && factor_rows.is_empty()
-    {
-        context.record_unadjusted_equity(config.symbol.permtick.as_ref());
-    }
-    context.cache_auxiliary_factor_rows(cache_key, factor_rows.clone());
-    Ok(factor_rows)
-}
-
-fn auxiliary_cache_key(config: &SubscriptionDataConfig) -> String {
-    format!(
-        "{}:{}:{:?}",
-        config.symbol.id.sid, config.symbol.permtick, config.normalization_mode
+    produce_native(
+        &config,
+        &context,
+        provider,
+        (start, end),
+        (&factor_rows, &map_rows),
+        sender,
+        &mut cancelled,
     )
+    .await
 }
 
-async fn query_auxiliary(
-    context: &DataFeedContext,
-    spec: SubscriptionSpec,
-) -> LeanResult<Vec<arrow::record_batch::RecordBatch>> {
-    let sidecar = &context.sidecar;
-    let registration = sidecar
-        .add_subscription_spec(spec, DeliveryMode::Backtest)
-        .await
-        .map_err(data_error)?;
-    let subscription_id = registration.subscription_id;
-    let result = async {
-        let mut stream = sidecar
-            .query(subscription_id, 0, 0)
-            .await
-            .map_err(data_error)?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch.map_err(data_error)?);
-        }
-        Ok(batches)
-    }
-    .await;
-    if let Err(error) = sidecar.remove_subscription(subscription_id).await {
-        tracing::warn!(subscription_id, %error, "failed to remove auxiliary sidecar subscription");
-    }
-    result
-}
-
-async fn produce_registered(
+async fn produce_native(
     config: &SubscriptionDataConfig,
     context: &DataFeedContext,
-    subscription_id: u64,
+    provider: Arc<dyn HistoricalDataProvider>,
     range: (DateTime, DateTime),
-    factor_rows: &[FactorFileEntry],
+    auxiliary: (&[FactorFileEntry], &[rlean_data_tables::MapFileEntry]),
     sender: &mpsc::Sender<LeanResult<SubscriptionStreamMessage>>,
+    cancelled: &mut oneshot::Receiver<()>,
 ) -> LeanResult<()> {
     let (start, end) = range;
-    let wire_type = WireDataType::try_from(SubscriptionSpec::from(config).data_type)
-        .map_err(|value| LeanError::DataError(format!("unknown sidecar data type {value}")))?;
     let mut window_start = start.date_utc();
     let end_date = effective_subscription_end(config, end.date_utc());
     let mut last_point: Option<SubscriptionDataPoint> = None;
@@ -429,45 +350,43 @@ async fn produce_registered(
     while window_start <= end_date {
         let window_end = backtest_window_candidate(config.resolution, window_start).min(end_date);
         let (query_start, query_end) = bounded_query_times(window_start, window_end, start, end);
-        let mut batches = context
-            .sidecar
-            .query(subscription_id, query_start.0, query_end.0)
-            .await
-            .map_err(data_error)?;
-        let mut points = Vec::new();
-        while let Some(batch) = batches.next().await {
-            let batch = batch.map_err(data_error)?;
-            points.extend(decode_points(
-                config,
-                wire_type,
-                batch,
-                factor_rows,
-                &context.market_hours_database,
-            )?);
+        let mut query_config = config.clone();
+        if let Some(mapped) = auxiliary.1.iter().find(|row| row.date >= window_start) {
+            query_config.symbol = config.symbol.with_mapped_value(&mapped.mapped_symbol);
         }
-        // Flight is free to split one daily cross-section across record
-        // batches. Reassemble all pieces before the synchronizer sees it so a
-        // universe selector always receives the complete snapshot.
-        points = coalesce_fundamental_snapshots(points);
+        let request =
+            HistoryRequest::new(query_config, query_start, query_end).map_err(data_error)?;
+        let data = tokio::select! {
+            _ = &mut *cancelled => return Ok(()),
+            result = provider.get_history(&request) => result.map_err(data_error)?,
+        };
+        let mut points = native_points(config, data, auxiliary.0)?;
         points.sort_by_key(SubscriptionDataPoint::frontier_time);
         points = deduplicate_points(config, points);
+        let prefetch_requests = option_chain_prefetch_requests(config, &points)?;
+        if !prefetch_requests.is_empty() {
+            tokio::select! {
+                _ = &mut *cancelled => return Ok(()),
+                result = provider.prefetch_history(&prefetch_requests) => result.map_err(data_error)?,
+            }
+        }
         tracing::debug!(
-            subscription_id,
+            provider = provider.name(),
             symbol = %config.symbol.value,
-            source = ?config.custom.as_ref().map(|custom| custom.source_type.as_str()),
             window_start = %window_start,
             window_end = %window_end,
             points = points.len(),
-            first_frontier = ?points.first().map(SubscriptionDataPoint::frontier_time),
-            last_frontier = ?points.last().map(SubscriptionDataPoint::frontier_time),
-            "decoded backtest subscription window"
+            "decoded native historical-provider window"
         );
         for point in points {
             let frontier = point.frontier_time();
             if frontier < start || frontier > end {
                 continue;
             }
-            let is_out_of_order_or_duplicate = last_real_frontier
+            // LEAN SubscriptionDataReader permits equal EndTime values for
+            // custom data because they can be independent events. Ordinary
+            // non-tick market data still rejects equal frontiers.
+            let out_of_order_or_duplicate = last_real_frontier
                 .map(|last| {
                     if config.data_kind == rlean_data::SubscriptionDataKind::Custom {
                         frontier < last
@@ -476,7 +395,7 @@ async fn produce_registered(
                     }
                 })
                 .unwrap_or(false);
-            if is_out_of_order_or_duplicate && !config.resolution.is_tick() {
+            if out_of_order_or_duplicate && !config.resolution.is_tick() {
                 continue;
             }
             if let Some(previous) = last_point.as_ref() {
@@ -504,12 +423,6 @@ async fn produce_registered(
         }
 
         let watermark = query_end;
-        // C# LEAN places FillForwardEnumerator in front of the subscription
-        // synchronizer, so every synthetic point covered by a frontier is
-        // emitted before the synchronizer can advance beyond that frontier.
-        // Our source is queried in bounded windows. Complete fill-forward for
-        // the proven window before publishing its inclusive watermark so the
-        // next window can never manufacture data behind that watermark.
         if let Some(previous) = last_point.as_ref() {
             if let Some(fill) = send_fill_forward_through(
                 config,
@@ -539,6 +452,148 @@ async fn produce_registered(
     Ok(())
 }
 
+fn option_chain_prefetch_requests(
+    config: &SubscriptionDataConfig,
+    points: &[SubscriptionDataPoint],
+) -> LeanResult<Vec<HistoryRequest>> {
+    if config.option_chain.is_none() || config.resolution != Resolution::Minute {
+        return Ok(Vec::new());
+    }
+    let frontiers = points.iter().filter_map(|point| match point {
+        SubscriptionDataPoint::OptionChain { frontier_time, .. } => Some(*frontier_time),
+        _ => None,
+    });
+    let Some(start) = frontiers.clone().min() else {
+        return Ok(Vec::new());
+    };
+    let end = frontiers.max().unwrap_or(start) + TimeSpan::from_nanos(1);
+    let mut requests = Vec::new();
+    let mut seen = HashSet::new();
+    for point in points {
+        let SubscriptionDataPoint::OptionChain { chain, .. } = point else {
+            continue;
+        };
+        for symbol in chain.contracts.keys() {
+            for tick_type in [TickType::Trade, TickType::Quote] {
+                let mut market_config =
+                    SubscriptionDataConfig::new_option(symbol.clone(), config.resolution);
+                market_config.set_tick_type(tick_type);
+                if !seen.insert(market_config.unique_id()) {
+                    continue;
+                }
+                requests.push(HistoryRequest::new(market_config, start, end).map_err(data_error)?);
+            }
+        }
+    }
+    Ok(requests)
+}
+
+fn native_points(
+    config: &SubscriptionDataConfig,
+    data: HistoricalData,
+    factor_rows: &[FactorFileEntry],
+) -> LeanResult<Vec<SubscriptionDataPoint>> {
+    match data {
+        HistoricalData::TradeBars(rows) => Ok(rows
+            .into_iter()
+            .filter_map(|mut bar| {
+                bar.venue.get_or_insert_with(|| config.venue.clone());
+                normalize_trade_bar(&mut bar, config.normalization_mode, factor_rows);
+                bar.is_valid()
+                    .then_some(SubscriptionDataPoint::TradeBar(bar))
+            })
+            .collect()),
+        HistoricalData::QuoteBars(rows) => Ok(rows
+            .into_iter()
+            .map(|mut bar| {
+                bar.venue.get_or_insert_with(|| config.venue.clone());
+                normalize_quote_bar(&mut bar, config.normalization_mode, factor_rows);
+                SubscriptionDataPoint::QuoteBar(bar)
+            })
+            .collect()),
+        HistoricalData::Ticks(rows) => Ok(rows
+            .into_iter()
+            .map(|mut tick| {
+                tick.venue.get_or_insert_with(|| config.venue.clone());
+                SubscriptionDataPoint::Tick(tick)
+            })
+            .collect()),
+        HistoricalData::CustomPoints(rows) => {
+            let metadata = config.custom.as_ref().ok_or_else(|| {
+                LeanError::DataError("custom history response has no subscription metadata".into())
+            })?;
+            Ok(rows
+                .into_iter()
+                .map(|point| SubscriptionDataPoint::CustomData {
+                    symbol: config.symbol.clone(),
+                    ticker: metadata.ticker.clone(),
+                    point,
+                })
+                .collect())
+        }
+        HistoricalData::OptionUniverse(rows) => {
+            let chains = crate::option_universe::option_chains_from_rows(config, rows)
+                .map_err(data_error)?;
+            Ok(chains
+                .into_iter()
+                .filter_map(|(date, chain)| {
+                    let frontier_time = option_chain_frontier(config, date)?;
+                    Some(SubscriptionDataPoint::OptionChain {
+                        canonical_permtick: config
+                            .option_chain
+                            .as_ref()?
+                            .canonical_permtick
+                            .clone(),
+                        chain: std::sync::Arc::new(chain),
+                        frontier_time,
+                    })
+                })
+                .collect())
+        }
+        HistoricalData::FundamentalUniverse(rows) => {
+            let mut by_frontier = std::collections::BTreeMap::new();
+            for row in rows {
+                let frontier_time = rlean_core::NanosecondTimestamp(
+                    row.end_time
+                        .and_utc()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_default(),
+                );
+                let time = rlean_core::NanosecondTimestamp(
+                    row.time.and_utc().timestamp_nanos_opt().unwrap_or_default(),
+                );
+                let mut point = rlean_data::FundamentalData::new(
+                    rlean_core::Symbol::create_equity(
+                        &row.symbol_value,
+                        &rlean_core::Market::new(&row.market),
+                    ),
+                    time,
+                );
+                point.end_time = frontier_time;
+                point.volume = Some(row.volume);
+                point.dollar_volume = Some(row.dollar_volume);
+                point.market_cap = Some(row.market_cap);
+                by_frontier
+                    .entry(frontier_time)
+                    .or_insert_with(Vec::new)
+                    .push(point);
+            }
+            Ok(by_frontier
+                .into_iter()
+                .map(
+                    |(frontier_time, data)| SubscriptionDataPoint::FundamentalUniverse {
+                        data,
+                        frontier_time,
+                    },
+                )
+                .collect())
+        }
+        HistoricalData::FutureUniverse(_) => Err(LeanError::DataError(
+            "future-universe delivery is not yet supported by the engine".to_string(),
+        )),
+    }
+}
+
 /// Keep partition-aligned interior windows while preserving the caller's exact
 /// first and final frontiers. In particular, a live last-known-price request
 /// ending during an open session must not be widened to 23:59:59: C# LEAN ends
@@ -554,133 +609,6 @@ fn bounded_query_times(
         partition_day_start(window_start).max(requested_start),
         partition_day_end(window_end).min(requested_end),
     )
-}
-
-fn decode_points(
-    config: &SubscriptionDataConfig,
-    wire_type: WireDataType,
-    batch: arrow::record_batch::RecordBatch,
-    factor_rows: &[FactorFileEntry],
-    market_hours_database: &MarketHoursDatabase,
-) -> LeanResult<Vec<SubscriptionDataPoint>> {
-    let decoded = decode_batch(wire_type, batch, &config.symbol).map_err(data_error)?;
-    match decoded {
-        CanonicalDataBatch::TradeBars(rows) => Ok(rows
-            .into_iter()
-            .filter_map(|mut bar| {
-                bar.venue.get_or_insert_with(|| config.venue.clone());
-                normalize_trade_bar(&mut bar, config.normalization_mode, factor_rows);
-                bar.is_valid()
-                    .then_some(SubscriptionDataPoint::TradeBar(bar))
-            })
-            .collect()),
-        CanonicalDataBatch::QuoteBars(rows) => Ok(rows
-            .into_iter()
-            .map(|mut bar| {
-                bar.venue.get_or_insert_with(|| config.venue.clone());
-                normalize_quote_bar(&mut bar, config.normalization_mode, factor_rows);
-                SubscriptionDataPoint::QuoteBar(bar)
-            })
-            .collect()),
-        CanonicalDataBatch::Ticks(rows) => Ok(rows
-            .into_iter()
-            .map(|mut tick| {
-                tick.venue.get_or_insert_with(|| config.venue.clone());
-                SubscriptionDataPoint::Tick(tick)
-            })
-            .collect()),
-        CanonicalDataBatch::Custom(rows) | CanonicalDataBatch::Universe(rows) => {
-            let ticker = config
-                .custom
-                .as_ref()
-                .map(|custom| custom.ticker.clone())
-                .unwrap_or_else(|| config.symbol.value.to_string());
-            Ok(rows
-                .into_iter()
-                .map(|mut point| {
-                    point.venue.get_or_insert_with(|| config.venue.clone());
-                    SubscriptionDataPoint::CustomData {
-                        symbol: config.symbol.clone(),
-                        ticker: ticker.clone(),
-                        point,
-                    }
-                })
-                .collect())
-        }
-        CanonicalDataBatch::Fundamentals(rows) => {
-            let mut snapshots: BTreeMap<DateTime, Vec<rlean_data::FundamentalData>> =
-                BTreeMap::new();
-            for row in rows {
-                snapshots.entry(row.end_time).or_default().push(row);
-            }
-            Ok(snapshots
-                .into_iter()
-                .map(
-                    |(frontier_time, data)| SubscriptionDataPoint::FundamentalUniverse {
-                        data,
-                        frontier_time,
-                    },
-                )
-                .collect())
-        }
-        CanonicalDataBatch::OptionUniverse(rows) => {
-            let chains = crate::option_universe::option_chains_from_rows(config, rows)
-                .map_err(data_error)?;
-            chains
-                .into_iter()
-                .map(|(date, chain)| {
-                    let frontier_date = date.succ_opt().unwrap_or(date);
-                    // LEAN assigns BaseChainUniverseData the exchange data
-                    // time zone, so EndTime at the following midnight is
-                    // converted from exchange-local time to UTC. A raw UTC
-                    // midnight appears on the previous algorithm date for US
-                    // markets and breaks same-day expiry filters.
-                    let frontier_time = market_hours_database
-                        .exchange_hours(&config.symbol)
-                        .local_midnight_utc(frontier_date)
-                        .ok_or_else(|| {
-                            LeanError::DataError(format!(
-                                "invalid option-universe exchange timezone for {}",
-                                config.symbol.value
-                            ))
-                        })?;
-                    Ok(SubscriptionDataPoint::OptionChain {
-                        canonical_permtick: config.symbol.permtick.to_string(),
-                        chain: Arc::new(chain),
-                        frontier_time,
-                    })
-                })
-                .collect()
-        }
-        CanonicalDataBatch::RiskFreeInterestRates(_) | CanonicalDataBatch::RecordBatch(_) => {
-            Err(LeanError::DataError(format!(
-                "sidecar data type {wire_type:?} is not consumable by a subscription"
-            )))
-        }
-    }
-}
-
-fn coalesce_fundamental_snapshots(
-    points: Vec<SubscriptionDataPoint>,
-) -> Vec<SubscriptionDataPoint> {
-    let mut snapshots: BTreeMap<DateTime, Vec<rlean_data::FundamentalData>> = BTreeMap::new();
-    let mut other = Vec::with_capacity(points.len());
-    for point in points {
-        match point {
-            SubscriptionDataPoint::FundamentalUniverse {
-                data,
-                frontier_time,
-            } => snapshots.entry(frontier_time).or_default().extend(data),
-            point => other.push(point),
-        }
-    }
-    other.extend(snapshots.into_iter().map(|(frontier_time, data)| {
-        SubscriptionDataPoint::FundamentalUniverse {
-            data,
-            frontier_time,
-        }
-    }));
-    other
 }
 
 fn deduplicate_points(
@@ -780,9 +708,10 @@ fn is_market_open(
     frontier: DateTime,
     period: rlean_core::TimeSpan,
 ) -> bool {
-    if config.symbol.security_type() != SecurityType::Equity {
-        return true;
-    }
+    // LEAN's FillForwardEnumerator calls Exchange.IsOpenDuringBar for every
+    // market-data security type. Treating non-equities as always open creates
+    // synthetic option bars on weekends and advances the algorithm on dates
+    // when the option exchange is closed.
     market_hours_database
         .exchange_hours(&config.symbol)
         .is_open_at(frontier - period)
@@ -798,7 +727,7 @@ fn backtest_window_candidate(
         // A 21-calendar-day minute window is normally about 15 US equity
         // sessions (5,850 rows), keeping each subscription comfortably below
         // the default 100,000-row prefetch budget while avoiding one provider
-        // request and sidecar round trip per trading day.
+        // request per trading day.
         Resolution::Minute => add_days_saturating(start, 20),
         Resolution::Tick | Resolution::Second => start,
     }
@@ -823,6 +752,25 @@ fn effective_subscription_end(
 
 fn partition_day_start(date: chrono::NaiveDate) -> DateTime {
     DateTime::from(date.and_hms_opt(0, 0, 0).expect("valid day start"))
+}
+
+/// LEAN's `BaseChainUniverseData.EndTime` is the following midnight in the
+/// option exchange's time zone. The synchronizer operates in UTC, so emitting
+/// UTC midnight would deliver a US chain on the prior local calendar date and
+/// make same-day expiry filters see an empty chain.
+fn option_chain_frontier(
+    config: &SubscriptionDataConfig,
+    source_date: chrono::NaiveDate,
+) -> Option<DateTime> {
+    let frontier_date = source_date.succ_opt()?;
+    let exchange_symbol = config
+        .symbol
+        .underlying
+        .as_deref()
+        .unwrap_or(&config.symbol);
+    MarketHoursDatabase::global()
+        .exchange_hours(exchange_symbol)
+        .local_midnight_utc(frontier_date)
 }
 
 fn partition_day_end(date: chrono::NaiveDate) -> DateTime {
@@ -880,7 +828,12 @@ fn fill_forward_point(
 }
 
 fn data_error(error: impl std::fmt::Display) -> LeanError {
-    LeanError::DataError(error.to_string())
+    // Preserve anyhow's full context chain at the boundary where provider
+    // errors become the string-backed LEAN error contract. Formatting with
+    // `{:#}` is identical for ordinary Display values and includes every
+    // source for `anyhow::Error`, which keeps storage/provider failures
+    // actionable after crossing this boundary.
+    LeanError::DataError(format!("{error:#}"))
 }
 
 use chrono::Datelike;
@@ -888,6 +841,7 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use rlean_core::{Market, OptionRight, OptionStyle, Symbol, TimeSpan};
     use rlean_data::{
         CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, OptionChainFilterMetadata,
@@ -896,6 +850,17 @@ mod tests {
     use rlean_data_tables::{CustomDataPoint, TradeBar, TradeBarData};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+
+    #[test]
+    fn data_errors_preserve_the_provider_error_chain() {
+        let error = Err::<(), _>(anyhow::anyhow!("HTTP 409 commit conflict"))
+            .context("persist successful historical coverage")
+            .unwrap_err();
+
+        let rendered = data_error(error).to_string();
+        assert!(rendered.contains("persist successful historical coverage"));
+        assert!(rendered.contains("HTTP 409 commit conflict"));
+    }
 
     #[test]
     fn non_tick_batches_are_deduplicated_by_frontier() {
@@ -1010,6 +975,48 @@ mod tests {
     }
 
     #[test]
+    fn option_chain_frontier_is_following_exchange_local_midnight() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::MIN,
+            dec!(0),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+
+        let frontier = option_chain_frontier(
+            &config,
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 18).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            frontier,
+            DateTime::from(
+                chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                    .unwrap()
+                    .and_hms_opt(4, 0, 0)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn daily_and_hour_queries_use_stable_windows_not_consumer_frontier_fragments() {
         let start = chrono::NaiveDate::from_ymd_opt(2019, 4, 9).unwrap();
 
@@ -1057,18 +1064,6 @@ mod tests {
             ),
             expiry
         );
-    }
-
-    #[test]
-    fn provider_availability_clamps_subscription_start() {
-        let requested = partition_day_start(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
-        let available = partition_day_start(chrono::NaiveDate::from_ymd_opt(2023, 8, 16).unwrap());
-
-        assert_eq!(
-            effective_subscription_start(requested, Some(available)),
-            available
-        );
-        assert_eq!(effective_subscription_start(available, None), available);
     }
 
     #[test]
@@ -1180,6 +1175,53 @@ mod tests {
             &last_fill,
             next_real,
             next_real,
+            &sender,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn option_fill_forward_does_not_cross_a_closed_weekend() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let option = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 22).unwrap(),
+            dec!(550),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let mut config = SubscriptionDataConfig::new_option(option.clone(), Resolution::Minute);
+        config.fill_data_forward = true;
+        let period = TimeSpan::ONE_MINUTE;
+        let friday_close = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 19)
+                .unwrap()
+                .and_hms_opt(20, 0, 0)
+                .unwrap(),
+        );
+        let previous = SubscriptionDataPoint::TradeBar(TradeBar::new(
+            option,
+            friday_close - period,
+            period,
+            TradeBarData::new(dec!(1), dec!(1), dec!(1), dec!(1), dec!(1)),
+        ));
+        let monday_open = DateTime::from(
+            chrono::NaiveDate::from_ymd_opt(2024, 7, 22)
+                .unwrap()
+                .and_hms_opt(13, 31, 0)
+                .unwrap(),
+        );
+        let (sender, _receiver) = mpsc::channel(128);
+
+        assert!(send_fill_forward_before(
+            &config,
+            MarketHoursDatabase::global().as_ref(),
+            &previous,
+            monday_open,
+            monday_open,
             &sender,
         )
         .await

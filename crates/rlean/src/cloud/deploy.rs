@@ -1,9 +1,10 @@
 //! `rlean cloud deploy` and the `status` / `logs` / `portfolio` monitors.
 //!
 //! Deploy snapshots a local strategy working tree to a node with rsync, then
-//! submits the deployment to the node's persistent `rleand` supervisor. The
-//! remote run directory + `deployment.json` remain the durable strategy state;
-//! rleand owns process restart and reboot recovery.
+//! launches `rlean live --pull` on the node so the host CLI pulls the latest
+//! engine image and places a Docker container. The remote deploy directory +
+//! `deployment.json` remain the durable strategy state; Docker restart policy
+//! owns process keep-alive.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,29 @@ pub(crate) fn strategy_name_from_dir(strategy_dir: &Path) -> String {
         .to_string()
 }
 
+/// Reject strategy directory names that could escape the workspace path or be
+/// interpreted by a remote login shell when embedded in deploy commands.
+///
+/// Allowed: ASCII letters, digits, `.`, `_`, `-`. Rejected: empty, `.`, `..`,
+/// path separators, and any other metacharacter.
+pub(crate) fn validate_strategy_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("invalid strategy name '{name}': must be a non-empty directory basename");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("invalid strategy name '{name}': use only letters, digits, '.', '_', or '-'");
+    }
+    Ok(())
+}
+
+/// POSIX single-quote a string for safe embedding in a remote shell command.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// The absolute node paths for a strategy (the deploy dir is created by the
 /// node's own `rlean live` launcher under `<strategy_dir>/live/<deploy-id>`).
 pub(crate) struct NodePaths {
@@ -62,53 +86,73 @@ pub(crate) fn node_paths(node_home: &str, strategy_name: &str) -> NodePaths {
 
 /// Build the shell command run on the node to launch the deployment.
 ///
-/// This invokes the node's own `rlean live` launcher (NOT `--foreground`):
-/// exactly what a local deploy does. The launcher reserves the deploy dir,
-/// snapshots the code, writes `deployment.json`, and submits the foreground
-/// engine command to rleand, so the run survives SSH disconnects and reboots.
-/// The launcher exits after confirming startup, printing
-/// `Live deployment started: deploy_id=<id> pid=<pid> ...`, which
+/// This invokes the node's own `rlean live --pull` launcher (NOT `--foreground`):
+/// the host CLI pulls the latest engine image, reserves the deploy dir, snapshots
+/// the code, writes `deployment.json`, and starts a Docker container with
+/// `restart: unless-stopped`. The launcher exits after confirming startup,
+/// printing `Live deployment started: deploy_id=<id> container=<id> ...`, which
 /// [`parse_launch_line`] consumes.
+///
+/// Paths and CLI option values are single-quoted so a compromised strategy
+/// directory name (or hostile CLI flag) cannot break out of the remote shell
+/// command. Prefer validating names at the deploy entrypoint as well.
 ///
 /// Extracted as a pure string builder so the exact command is unit-testable.
 pub(crate) fn remote_launch_command(paths: &NodePaths, opts: &DeployOptions) -> String {
     format!(
-        "cd {strategy} && rlean live {main} \
+        "cd {strategy} && rlean live --pull {main} \
          --live-data-feed {feed} \
          --brokerage {brok}",
-        strategy = paths.strategy_dir,
-        main = paths.main_py,
-        feed = opts.live_data_feed,
-        brok = opts.brokerage,
+        strategy = shell_single_quote(&paths.strategy_dir),
+        main = shell_single_quote(&paths.main_py),
+        feed = shell_single_quote(&opts.live_data_feed),
+        brok = shell_single_quote(&opts.brokerage),
     )
 }
 
-/// Parse the launcher's `Live deployment started: deploy_id=<id> pid=<pid> ...`
-/// stdout line into `(deploy_id, pid)`.
+/// Parse the launcher's `Live deployment started: deploy_id=<id> ...` stdout
+/// line into `(deploy_id, optional numeric id)`. Prefers `container=` and
+/// falls back to legacy `pid=` for older launchers.
 pub(crate) fn parse_launch_line(stdout: &str) -> Option<(String, u32)> {
     let line = stdout
         .lines()
         .find(|l| l.starts_with("Live deployment started:"))?;
     let mut deploy_id = None;
-    let mut pid = None;
+    let mut numeric_id = None;
     for token in line.split_whitespace() {
         if let Some(v) = token.strip_prefix("deploy_id=") {
             deploy_id = Some(v.to_string());
         } else if let Some(v) = token.strip_prefix("pid=") {
-            pid = v.parse::<u32>().ok();
+            numeric_id = v.parse::<u32>().ok();
+        } else if let Some(v) = token.strip_prefix("container=") {
+            // Container ids are hex; keep a stable u32 fingerprint for the
+            // cloud registry which still stores an optional pid field.
+            let hex: String = v
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(8)
+                .collect();
+            numeric_id = u32::from_str_radix(&hex, 16).ok().or(Some(0));
         }
     }
-    Some((deploy_id?, pid?))
+    Some((deploy_id?, numeric_id.unwrap_or(0)))
 }
 
 /// Build the argv for a `rlean live <sub> <deploy_id> ...` command run on the
 /// node with cwd = the strategy dir (so the deploy resolves under `<cwd>/live/`).
 ///
-/// The command is `sh -c 'cd <strategy_dir> && rlean live <sub...>'` so the cwd
-/// is honored over ssh.
+/// The command is `cd <strategy_dir> && rlean live <sub...>` so the cwd is
+/// honored over ssh. Each interpolated token is single-quoted.
 pub(crate) fn live_control_command(strategy_dir: &str, live_args: &[&str]) -> String {
-    let joined = live_args.join(" ");
-    format!("cd {strategy_dir} && rlean live {joined}")
+    let joined = live_args
+        .iter()
+        .map(|a| shell_single_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "cd {} && rlean live {joined}",
+        shell_single_quote(strategy_dir)
+    )
 }
 
 // ── Deploy ───────────────────────────────────────────────────────────────────
@@ -132,6 +176,7 @@ pub(crate) fn resolve_local_strategy(input: &Path) -> Result<(PathBuf, String)> 
         bail!("strategy directory has no main.py: {}", dir.display());
     }
     let name = strategy_name_from_dir(&dir);
+    validate_strategy_name(&name)?;
     Ok((dir, name))
 }
 
@@ -167,14 +212,16 @@ pub(crate) fn cmd_deploy(
         opts,
         now,
     } = *req;
+    validate_strategy_name(strategy_name)?;
     let ssh = &node.ssh_dest;
     let paths = node_paths(node_home, strategy_name);
 
     // 1. rsync the working tree to the node.
     rsync_to(ssh, local_strategy_dir, &paths.strategy_dir, RSYNC_EXCLUDES)?;
 
-    // 2. Launch via the node's own `rlean live` launcher; it reserves the
-    // deploy dir, writes deployment.json, and submits the engine to rleand.
+    // 2. Launch via the node's own `rlean live --pull` launcher; it pulls the
+    // latest engine image, reserves the deploy dir, writes deployment.json,
+    // and places a Docker container.
     // The compound command is passed as a SINGLE argv element: OpenSSH joins
     // remote argv with spaces (no quoting), so a ["sh","-c",cmd] triple would
     // arrive as `sh -c cd ...` and `sh -c` would receive only `cd` — the rest
@@ -446,6 +493,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_launch_line_extracts_container_id() {
+        let stdout = "Live deployment started: deploy_id=d1 container=a1b2c3d4e5f67890 dir=/x\n";
+        let (id, fingerprint) = parse_launch_line(stdout).unwrap();
+        assert_eq!(id, "d1");
+        assert_eq!(fingerprint, 0xa1b2c3d4);
+    }
+
+    #[test]
     fn parse_launch_line_rejects_missing_marker() {
         assert!(parse_launch_line("engine crashed\n").is_none());
         assert!(parse_launch_line("Live deployment started: dir=/x\n").is_none());
@@ -469,22 +524,70 @@ mod tests {
             live_data_feed: "tradier".to_string(),
         };
         let cmd = remote_launch_command(&p, &opts);
-        // The node's own launcher owns detachment (setsid + SIGHUP ignore) and
-        // deployment.json — the command must NOT hand-roll --foreground.
-        assert!(cmd.starts_with("cd /home/opc/rlean-cloud/workspace/uw_control && rlean live "));
+        // The node's own launcher pulls the image, owns detachment via Docker,
+        // and writes deployment.json — the command must NOT hand-roll --foreground.
+        assert!(cmd
+            .starts_with("cd '/home/opc/rlean-cloud/workspace/uw_control' && rlean live --pull "));
         assert!(!cmd.contains("--foreground"));
         assert!(!cmd.contains("--live-deploy-dir"));
-        assert!(cmd.contains(" /home/opc/rlean-cloud/workspace/uw_control/main.py"));
-        assert!(cmd.contains("--brokerage tradier"));
-        assert!(cmd.contains("--live-data-feed tradier"));
+        assert!(cmd.contains(" '/home/opc/rlean-cloud/workspace/uw_control/main.py'"));
+        assert!(cmd.contains("--brokerage 'tradier'"));
+        assert!(cmd.contains("--live-data-feed 'tradier'"));
         assert!(!cmd.contains("--data-provider"));
         assert!(!cmd.contains("--data "));
     }
 
     #[test]
+    fn launch_command_quotes_metacharacters() {
+        let p = node_paths("/home/opc", "evil;id");
+        let opts = DeployOptions {
+            brokerage: "tradier;reboot".to_string(),
+            live_data_feed: "tradier$(id)".to_string(),
+        };
+        let cmd = remote_launch_command(&p, &opts);
+        assert!(cmd.contains("cd '/home/opc/rlean-cloud/workspace/evil;id'"));
+        assert!(cmd.contains("--brokerage 'tradier;reboot'"));
+        assert!(cmd.contains("--live-data-feed 'tradier$(id)'"));
+        // Metacharacters must not appear outside quotes as shell syntax.
+        assert!(!cmd.contains("cd /home/opc/rlean-cloud/workspace/evil;id &&"));
+    }
+
+    #[test]
     fn live_control_command_sets_cwd() {
         let cmd = live_control_command("/home/opc/ws/uw", &["logs", "d1", "--lines", "40"]);
-        assert_eq!(cmd, "cd /home/opc/ws/uw && rlean live logs d1 --lines 40");
+        assert_eq!(
+            cmd,
+            "cd '/home/opc/ws/uw' && rlean live 'logs' 'd1' '--lines' '40'"
+        );
+    }
+
+    #[test]
+    fn validate_strategy_name_accepts_safe_basenames() {
+        assert!(validate_strategy_name("uw_control").is_ok());
+        assert!(validate_strategy_name("my-strat.v2").is_ok());
+        assert!(validate_strategy_name("A1").is_ok());
+    }
+
+    #[test]
+    fn validate_strategy_name_rejects_escape_and_injection() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../.ssh",
+            "evil;id",
+            "evil`id`",
+            "evil$(id)",
+            "evil|id",
+            "evil && id",
+            "name with space",
+            "slash/name",
+        ] {
+            assert!(
+                validate_strategy_name(bad).is_err(),
+                "expected reject for {bad:?}"
+            );
+        }
     }
 
     #[test]

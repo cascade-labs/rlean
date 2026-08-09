@@ -1,12 +1,12 @@
 use rlean_core::MarketHoursDatabase;
-use rlean_data_sidecar::DataSidecarClient;
-use rlean_data_tables::FactorFileEntry;
+use rlean_data_providers::HistoricalDataProvider;
+use rlean_data_tables::{FactorFileEntry, MapFileEntry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// Bounds the adapter queue between each sidecar-backed enumerator and the
+/// Bounds the adapter queue between each provider-backed enumerator and the
 /// synchronizer. C# LEAN keeps one `Current` value per subscription and pulls
-/// the next value on demand. Flight reads are batched, so a small bounded queue
+/// the next value on demand. Provider reads are batched, so a small bounded queue
 /// preserves that pull/backpressure model without issuing one RPC per point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataFeedOptions {
@@ -21,25 +21,27 @@ impl Default for DataFeedOptions {
     }
 }
 
-/// Shared subscription services. Market data comes exclusively from the
-/// persistent Flight session; the engine owns only flow control and calendars.
+/// Shared subscription services. The engine owns flow control and calendars;
+/// the selected provider owns data acquisition.
 #[derive(Clone)]
 pub struct DataFeedContext {
-    pub sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
     pub options: DataFeedOptions,
     pub market_hours_database: Arc<MarketHoursDatabase>,
     unadjusted_equities: Arc<Mutex<HashSet<String>>>,
     auxiliary_factor_rows: Arc<Mutex<HashMap<String, Vec<FactorFileEntry>>>>,
+    auxiliary_map_rows: Arc<Mutex<HashMap<String, Vec<MapFileEntry>>>>,
 }
 
 impl DataFeedContext {
-    pub fn new(sidecar: Arc<DataSidecarClient>) -> Self {
+    pub fn new(historical_provider: Arc<dyn HistoricalDataProvider>) -> Self {
         Self {
-            sidecar,
+            historical_provider,
             options: DataFeedOptions::default(),
             market_hours_database: MarketHoursDatabase::global(),
             unadjusted_equities: Arc::new(Mutex::new(HashSet::new())),
             auxiliary_factor_rows: Arc::new(Mutex::new(HashMap::new())),
+            auxiliary_map_rows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -85,6 +87,19 @@ impl DataFeedContext {
 
     pub fn cache_auxiliary_factor_rows(&self, key: String, rows: Vec<FactorFileEntry>) {
         if let Ok(mut cache) = self.auxiliary_factor_rows.lock() {
+            cache.insert(key, rows);
+        }
+    }
+
+    pub fn cached_auxiliary_map_rows(&self, key: &str) -> Option<Vec<MapFileEntry>> {
+        self.auxiliary_map_rows
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(key).cloned())
+    }
+
+    pub fn cache_auxiliary_map_rows(&self, key: String, rows: Vec<MapFileEntry>) {
+        if let Ok(mut cache) = self.auxiliary_map_rows.lock() {
             cache.insert(key, rows);
         }
     }

@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "python")]
 use pyo3::types::{PyAnyMethods, PyTupleMethods};
 
-use crate::data::ns_to_exchange_naive;
 use crate::indicators::{
     AverageTrueRange, BollingerBandsIndicator, ExponentialMovingAverage, IdentityIndicator,
     MacdIndicator, MomentumPercentIndicator, RelativeStrengthIndex, SimpleMovingAverage,
@@ -326,6 +325,10 @@ impl AlgorithmHandle {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_end_date(year, month, day);
     }
 
+    pub fn set_time_zone(&self, time_zone: &str) -> Result<(), String> {
+        AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_time_zone(time_zone)
+    }
+
     pub fn set_cash(&self, amount: f64) {
         let mut algorithm = self.inner.lock().unwrap();
         AlgorithmApi::new(&mut algorithm).set_cash(amount);
@@ -420,11 +423,8 @@ impl AlgorithmHandle {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).is_invested(symbol.inner())
     }
     pub fn current_time(&self) -> chrono::NaiveDateTime {
-        ns_to_exchange_naive(
-            AlgorithmApi::new(&mut self.inner.lock().unwrap())
-                .current_time()
-                .0,
-        )
+        let algorithm = self.inner.lock().unwrap();
+        algorithm.time.to_tz(algorithm.time_zone).naive_local()
     }
     pub fn utc_time(&self) -> chrono::NaiveDateTime {
         AlgorithmApi::new(&mut self.inner.lock().unwrap())
@@ -453,6 +453,10 @@ impl AlgorithmHandle {
 
     pub fn set_warm_up_int(&self, n: i64, resolution: Option<Resolution>) {
         AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_warm_up_int(n, resolution);
+    }
+
+    pub fn set_warm_up_span(&self, span: TimeSpan, resolution: Option<Resolution>) {
+        AlgorithmApi::new(&mut self.inner.lock().unwrap()).set_warm_up_span(span, resolution);
     }
 
     pub fn set_warm_up(&self, n: i64, resolution: Option<Resolution>) {
@@ -960,6 +964,12 @@ impl AlgorithmHandle {
         self.set_end_date(year, month, day);
     }
 
+    #[pyo3(name = "set_time_zone")]
+    fn py_set_time_zone(&self, time_zone: String) -> pyo3::PyResult<()> {
+        self.set_time_zone(&time_zone)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
     #[pyo3(name = "set_cash")]
     fn py_set_cash(&self, amount: f64) {
         self.set_cash(amount);
@@ -1123,8 +1133,31 @@ impl AlgorithmHandle {
     }
 
     #[pyo3(name = "set_warm_up", signature = (n, resolution=None))]
-    fn py_set_warm_up(&self, n: i64, resolution: Option<crate::types::Resolution>) {
-        self.set_warm_up(n, resolution.map(Into::into));
+    fn py_set_warm_up(
+        &self,
+        n: &pyo3::Bound<'_, pyo3::PyAny>,
+        resolution: Option<crate::types::Resolution>,
+    ) -> pyo3::PyResult<()> {
+        let resolution = resolution.map(Into::into);
+        if let Ok(duration) = n.extract::<chrono::Duration>() {
+            let nanos = duration.num_nanoseconds().ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err("warm-up duration is out of range")
+            })?;
+            if nanos <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "warm-up duration must be positive",
+                ));
+            }
+            self.set_warm_up_span(TimeSpan::from_nanos(nanos), resolution);
+            return Ok(());
+        }
+        let bars = n.extract::<i64>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "set_warm_up expects a bar count or datetime.timedelta",
+            )
+        })?;
+        self.set_warm_up_int(bars, resolution);
+        Ok(())
     }
 
     #[pyo3(name = "market_order", signature = (symbol, quantity, time_in_force=None, outside_regular_trading_hours=None))]
@@ -1473,6 +1506,10 @@ impl<'a> AlgorithmApi<'a> {
         self.algorithm.set_end_date(year, month, day);
     }
 
+    pub fn set_time_zone(&mut self, time_zone: &str) -> Result<(), String> {
+        self.algorithm.set_time_zone(time_zone)
+    }
+
     pub fn set_cash(&mut self, amount: f64) {
         self.algorithm.set_cash(f2d(amount));
     }
@@ -1521,8 +1558,10 @@ impl<'a> AlgorithmApi<'a> {
     }
 
     pub fn history_end_date(&self) -> chrono::NaiveDate {
-        let current = self.algorithm.time.date_utc();
-        if current == DateTime::EPOCH.date_utc() {
+        let current = self.algorithm.local_date(self.algorithm.time);
+        if self.algorithm.time == DateTime::EPOCH {
+            // rlean's start-date storage remains a date-only UTC sentinel for
+            // now; do not project it backward across the New York offset.
             self.algorithm.start_date.date_utc()
         } else {
             current
@@ -1589,13 +1628,11 @@ impl<'a> AlgorithmApi<'a> {
     }
 
     pub fn set_warm_up_int(&mut self, n: i64, resolution: Option<Resolution>) {
-        if resolution.is_some() || n > 365 {
-            self.algorithm
-                .set_warm_up_bars_with_resolution(n.max(0) as usize, resolution);
-        } else {
-            let nanos = n * 86_400 * 1_000_000_000i64;
-            self.algorithm.set_warm_up(TimeSpan::from_nanos(nanos));
-        }
+        // C# LEAN's SetWarmUp(int, Resolution?) overload always interprets
+        // the integer as a bar count. Calendar durations use the distinct
+        // TimeSpan overload exposed to Python as datetime.timedelta.
+        self.algorithm
+            .set_warm_up_bars_with_resolution(n.max(0) as usize, resolution);
     }
 
     pub fn add_equity_with_normalization(

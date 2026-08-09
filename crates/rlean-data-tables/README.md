@@ -1,6 +1,6 @@
 # rlean-data-tables
 
-This crate owns the canonical data values shared by sidecars and the runtime
+This crate owns the canonical data values shared by providers, persistence, and the runtime
 engine. `rlean-data` re-exports the runtime market types; it
 does not define a second persistence representation.
 

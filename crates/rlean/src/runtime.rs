@@ -5,7 +5,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rlean_data_sidecar::{DataSidecarClient, DataSidecarConfig};
+use rlean_brokerages::{
+    Brokerage, HttpBrokerage, HttpBrokerageConfig, TradierBrokerage, TradierBrokerageConfig,
+    TradierEnvironment as TradierBrokerageEnvironment,
+};
+use rlean_data_providers::LiveDataProvider;
+use rlean_data_providers::{
+    CacheFirstHistoryProvider, DroppedCacheWrites, FredConfig, FredHistoricalDataProvider,
+    HistoricalDataProvider, MassiveConfig, MassiveHistoricalDataProvider, MassiveLiveConfig,
+    MassiveLiveDataProvider, RoutedLiveDataProvider, ThetaDataConfig,
+    ThetaDataHistoricalDataProvider, TradierEnvironment as TradierDataEnvironment,
+    TradierLiveDataProvider, TradierMarketDataConfig, VerglasCustomLiveDataProvider,
+    VerglasHistoricalDataStore,
+};
+use verglas_sdk::{Client as VerglasClient, ConnectOptions};
 
 use crate::cli::RunArgs;
 use crate::config;
@@ -22,30 +35,224 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     bar
 }
 
-pub(crate) async fn connect_data_sidecar(
+/// Builds the cache-first historical provider and the tally of canonical cache
+/// batches it drops. The caller reports the tally when its run finishes.
+pub(crate) async fn historical_data_provider(
     args: &RunArgs,
-    global_config: &config::GlobalConfig,
-) -> Result<Option<Arc<DataSidecarClient>>> {
-    let Some(endpoint) = args
-        .data_sidecar
-        .clone()
-        .or_else(|| global_config.data_sidecar.clone())
-    else {
+    verglas: VerglasClient,
+) -> Result<(Arc<dyn HistoricalDataProvider>, DroppedCacheWrites)> {
+    let name = args
+        .data_provider_historical
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("a historical data provider is required"))?;
+    let global = config::GlobalConfig::load()?;
+    let provider: Arc<dyn HistoricalDataProvider> = match name {
+        "massive" => {
+            let provider_cfg = global.get_provider("massive");
+            let api_key = provider_cfg
+                .get("api_key")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "historical provider massive requires config key massive.api_key"
+                    )
+                })?;
+            Arc::new(MassiveHistoricalDataProvider::new(MassiveConfig::new(
+                api_key,
+            ))?)
+        }
+        "thetadata" => {
+            let provider_cfg = global.get_provider("thetadata");
+            let api_key = optional_string(&provider_cfg, "api_key");
+            let mut provider_config = ThetaDataConfig::new(api_key);
+            if let Some(base_url) = optional_string(&provider_cfg, "base_url") {
+                provider_config.base_url = base_url;
+            }
+            if let Some(max_concurrent) = optional_usize(&provider_cfg, "max_concurrent") {
+                provider_config.max_concurrent = max_concurrent.max(1);
+            }
+            if let Some(requests_per_second) = optional_f64(&provider_cfg, "requests_per_second") {
+                provider_config.requests_per_second = requests_per_second;
+            }
+            Arc::new(ThetaDataHistoricalDataProvider::new(provider_config)?)
+        }
+        other => bail!("unsupported historical data provider '{other}'"),
+    };
+    let mut providers = vec![provider];
+    // The risk-free rate publisher is selected independently of the market-data
+    // provider: it serves one global series and no bars.
+    providers.extend(risk_free_interest_rate_provider()?);
+    let store = Arc::new(VerglasHistoricalDataStore::new(verglas).await?);
+    let dropped_cache_writes = store.dropped_cache_writes();
+    let provider = CacheFirstHistoryProvider::new(store, providers)?;
+    tracing::info!(
+        provider = name,
+        "Configured cache-first historical data provider"
+    );
+    Ok((Arc::new(provider), dropped_cache_writes))
+}
+
+/// FRED publishes the discount-window primary credit rate that LEAN's
+/// `InterestRateProvider` reads. An unconfigured key is a legitimate
+/// deployment, not a failure: the run then serves whatever rates are already
+/// cached and otherwise falls back to LEAN's default rate.
+fn risk_free_interest_rate_provider() -> Result<Option<Arc<dyn HistoricalDataProvider>>> {
+    let provider_cfg = config::GlobalConfig::load()?.get_provider("fred");
+    let Some(api_key) = optional_string(&provider_cfg, "api_key") else {
+        tracing::warn!(
+            "config key fred.api_key is not set; risk-free interest rates will not be refreshed \
+             from FRED"
+        );
         return Ok(None);
     };
-    let token = args
-        .data_sidecar_token
-        .clone()
-        .or_else(|| global_config.data_sidecar_token.clone());
-    let client = DataSidecarClient::connect(DataSidecarConfig {
-        endpoint: endpoint.clone(),
-        token,
-        connect_timeout_ms: 10_000,
-    })
-    .await
-    .with_context(|| format!("failed to connect to data sidecar at {endpoint}"))?;
-    tracing::info!(%endpoint, "Connected to Arrow Flight data sidecar");
-    Ok(Some(Arc::new(client)))
+    let mut provider_config = FredConfig::new(api_key);
+    if let Some(base_url) = optional_string(&provider_cfg, "base_url") {
+        provider_config.base_url = base_url;
+    }
+    if let Some(series_id) = optional_string(&provider_cfg, "series_id") {
+        provider_config.series_id = series_id;
+    }
+    Ok(Some(Arc::new(FredHistoricalDataProvider::new(
+        provider_config,
+    )?)))
+}
+
+pub(crate) async fn live_data_provider(
+    args: &RunArgs,
+    verglas: VerglasClient,
+) -> Result<Arc<dyn LiveDataProvider>> {
+    let name = args
+        .live_data_feed
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
+    let global = config::GlobalConfig::load()?;
+    let market: Arc<dyn LiveDataProvider> = match name {
+        "massive" => {
+            let provider_cfg = global.get_provider("massive");
+            let api_key = required_string(&provider_cfg, "api_key", "massive")?;
+            Arc::new(MassiveLiveDataProvider::new(MassiveLiveConfig::new(
+                api_key,
+            ))?)
+        }
+        "tradier" => {
+            let provider_cfg = global.get_provider("tradier");
+            let token = required_string(&provider_cfg, "access_token", "tradier")?;
+            let environment = match optional_string(&provider_cfg, "environment").as_deref() {
+                Some("paper") | Some("sandbox") => TradierDataEnvironment::Paper,
+                _ => TradierDataEnvironment::Live,
+            };
+            Arc::new(TradierLiveDataProvider::new(TradierMarketDataConfig::new(
+                token,
+                environment,
+            ))?)
+        }
+        other => bail!("unsupported live data provider '{other}'"),
+    };
+    let custom: Arc<dyn LiveDataProvider> =
+        Arc::new(VerglasCustomLiveDataProvider::new(verglas).await?);
+    Ok(Arc::new(RoutedLiveDataProvider::new(market, custom)))
+}
+
+pub(crate) fn execution_brokerage(args: &RunArgs) -> Result<Option<Box<dyn Brokerage>>> {
+    let name = args
+        .brokerage
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("live trading requires --brokerage"))?;
+    if matches!(name, "paper" | "paperbrokerage") {
+        return Ok(None);
+    }
+    match name {
+        "http" => {
+            let url = args
+                .brokerage_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("HTTP brokerage requires --brokerage-url"))?;
+            Ok(Some(Box::new(HttpBrokerage::new(
+                HttpBrokerageConfig::new(url, args.brokerage_account.clone()),
+            )?)))
+        }
+        "tradier" | "tradierbrokerage" => {
+            let provider_cfg = config::GlobalConfig::load()?.get_provider("tradier");
+            let token = required_string(&provider_cfg, "access_token", "tradier")?;
+            let account = args
+                .brokerage_account
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| optional_string(&provider_cfg, "account_number"))
+                .ok_or_else(|| anyhow::anyhow!("Tradier brokerage requires --brokerage-account"))?;
+            let environment = match optional_string(&provider_cfg, "environment").as_deref() {
+                Some("paper") | Some("sandbox") => TradierBrokerageEnvironment::Paper,
+                _ => TradierBrokerageEnvironment::Live,
+            };
+            Ok(Some(Box::new(TradierBrokerage::new(
+                TradierBrokerageConfig::new(token, account, environment),
+            )?)))
+        }
+        other => bail!("unsupported execution brokerage '{other}'"),
+    }
+}
+
+fn required_string(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    provider: &str,
+) -> Result<String> {
+    optional_string(values, key)
+        .ok_or_else(|| anyhow::anyhow!("{provider} requires config key {provider}.{key}"))
+}
+
+fn optional_string(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn optional_usize(values: &std::collections::BTreeMap<String, String>, key: &str) -> Option<usize> {
+    values.get(key).and_then(|value| value.trim().parse().ok())
+}
+
+fn optional_f64(values: &std::collections::BTreeMap<String, String>, key: &str) -> Option<f64> {
+    values.get(key).and_then(|value| value.trim().parse().ok())
+}
+
+/// Connects once to the configured Verglas gateway. The SDK discovers the
+/// catalog, query, and write services and applies one bearer token to all of
+/// them. Environment values override the persisted machine configuration.
+pub(crate) async fn connect_verglas(global_config: &config::GlobalConfig) -> Result<VerglasClient> {
+    let endpoint = std::env::var("VERGLAS_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_endpoint.clone())
+        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned());
+    let token = std::env::var("VERGLAS_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_token.clone());
+    let mut options = ConnectOptions::new(endpoint.clone());
+    if let Some(token) = token {
+        options = options.with_token(token);
+    }
+    VerglasClient::connect(options)
+        .await
+        .with_context(|| format!("connect to Verglas gateway at {endpoint}"))
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {
@@ -275,73 +482,12 @@ pub(crate) fn strategy_name_from_path(strategy: &Path) -> String {
     }
 }
 
-/// Build the backtest output directory path in LEAN format:
-///   `<backtests_root>/YYYY-MM-DD_HHMMSS_<strategy_name>`
+/// Stable timestamped name used for live deployment snapshots.
 pub(crate) fn backtest_dir_name(
     datetime: chrono::DateTime<chrono::Utc>,
     strategy_name: &str,
 ) -> String {
     format!("{}_{}", datetime.format("%Y-%m-%d_%H%M%S"), strategy_name)
-}
-
-pub(crate) fn reserve_backtest_dir(
-    backtests_root: &Path,
-    datetime: chrono::DateTime<chrono::Utc>,
-    strategy_name: &str,
-) -> Result<PathBuf> {
-    std::fs::create_dir_all(backtests_root)?;
-    let base = backtest_dir_name(datetime, strategy_name);
-    for attempt in 0..1000 {
-        let name = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{base}_{}", attempt + 1)
-        };
-        let candidate = backtests_root.join(name);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!(
-        "could not reserve unique backtest directory under {} for {}",
-        backtests_root.display(),
-        base
-    )
-}
-
-/// Point `<backtests_root>/latest` at the most recently completed backtest directory.
-pub(crate) fn update_backtests_latest_symlink(
-    backtests_root: &Path,
-    backtest_dir: &Path,
-) -> Result<()> {
-    let dir_name = backtest_dir
-        .file_name()
-        .context("backtest directory has no name")?;
-    let latest = backtests_root.join("latest");
-
-    match std::fs::symlink_metadata(&latest) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            std::fs::remove_file(&latest)?;
-        }
-        Ok(_) => {
-            bail!(
-                "{} exists and is not a symlink; remove it manually to enable backtests/latest",
-                latest.display()
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(dir_name, &latest)?;
-
-    #[cfg(all(windows, not(unix)))]
-    std::os::windows::fs::symlink_dir(dir_name, &latest)?;
-
-    Ok(())
 }
 
 pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
@@ -351,66 +497,9 @@ pub(crate) fn validate_strategy_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Serialize one integration's running rlean configuration as an opaque secret
-/// bundle. Only the sidecar adapter interprets provider-specific fields.
-pub(crate) fn integration_config_json(name: &str) -> Result<Vec<u8>> {
-    let configs = config::IntegrationConfigs::load()?;
-    let value = serde_json::Value::Object(configs.get_integration(name));
-    serde_json::to_vec(&value).context("failed to serialize sidecar integration configuration")
-}
-
-/// Serialize a brokerage's configured credentials together with the account
-/// selected for this deployment. Account selection belongs to the deployment,
-/// not the shared integration configuration.
-pub(crate) fn brokerage_config_json(name: &str, account: Option<&str>) -> Result<Vec<u8>> {
-    let configs = config::IntegrationConfigs::load()?;
-    let value = brokerage_config(configs.get_integration(name), account);
-    serde_json::to_vec(&serde_json::Value::Object(value))
-        .context("failed to serialize sidecar brokerage configuration")
-}
-
-fn brokerage_config(
-    mut value: serde_json::Map<String, serde_json::Value>,
-    account: Option<&str>,
-) -> serde_json::Map<String, serde_json::Value> {
-    if let Some(account) = account {
-        value.insert(
-            "account_number".to_string(),
-            serde_json::Value::String(account.to_string()),
-        );
-    }
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn brokerage_account_overrides_shared_integration_default() {
-        let mut config = serde_json::Map::new();
-        config.insert(
-            "account_number".to_string(),
-            serde_json::Value::String("old-account".to_string()),
-        );
-        config.insert(
-            "username".to_string(),
-            serde_json::Value::String("configured-user".to_string()),
-        );
-
-        let config = brokerage_config(config, Some("deployment-account"));
-
-        assert_eq!(
-            config
-                .get("account_number")
-                .and_then(|value| value.as_str()),
-            Some("deployment-account")
-        );
-        assert_eq!(
-            config.get("username").and_then(|value| value.as_str()),
-            Some("configured-user")
-        );
-    }
     use std::path::Path;
 
     #[test]
@@ -502,94 +591,6 @@ mod tests {
 
         assert_eq!(parameters.get("max_holds").map(String::as_str), Some("12"));
         assert_eq!(parameters.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_backtest_dir_name_format() {
-        use chrono::{TimeZone, Utc};
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-        let dir = backtest_dir_name(dt, "sma_crossover");
-        assert_eq!(dir, "2026-04-10_143000_sma_crossover");
-    }
-
-    #[test]
-    fn test_backtest_dir_name_seconds_unique() {
-        use chrono::{TimeZone, Utc};
-        let dt1 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-        let dt2 = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 5).unwrap();
-        let d1 = backtest_dir_name(dt1, "spy_wheel");
-        let d2 = backtest_dir_name(dt2, "spy_wheel");
-        assert_ne!(d1, d2, "runs on same day must produce different dirs");
-    }
-
-    #[test]
-    fn test_backtest_dir_name_date_prefix() {
-        use chrono::{TimeZone, Utc};
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 9, 5, 3).unwrap();
-        let dir = backtest_dir_name(dt, "sma_crossover");
-        assert!(dir.starts_with("2026-04-10_090503_"), "dir={dir}");
-    }
-
-    #[test]
-    fn test_reserve_backtest_dir_adds_suffix_on_collision() {
-        use chrono::{TimeZone, Utc};
-        let root =
-            std::env::temp_dir().join(format!("rlean-backtest-dir-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let dt = Utc.with_ymd_and_hms(2026, 4, 10, 14, 30, 0).unwrap();
-
-        let first = reserve_backtest_dir(&root, dt, "strategy").unwrap();
-        let second = reserve_backtest_dir(&root, dt, "strategy").unwrap();
-
-        assert_eq!(
-            first.file_name().and_then(|n| n.to_str()),
-            Some("2026-04-10_143000_strategy")
-        );
-        assert_eq!(
-            second.file_name().and_then(|n| n.to_str()),
-            Some("2026-04-10_143000_strategy_2")
-        );
-        assert!(first.is_dir());
-        assert!(second.is_dir());
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_update_backtests_latest_symlink() {
-        let root =
-            std::env::temp_dir().join(format!("rlean-backtest-latest-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        let first = root.join("2026-06-24_120000_strategy");
-        let second = root.join("2026-06-24_120100_strategy");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-
-        update_backtests_latest_symlink(&root, &first).unwrap();
-        let latest = root.join("latest");
-        assert!(latest.is_symlink());
-        assert_eq!(
-            std::fs::read_link(&latest).unwrap(),
-            PathBuf::from("2026-06-24_120000_strategy")
-        );
-        assert_eq!(
-            latest.canonicalize().unwrap(),
-            first.canonicalize().unwrap()
-        );
-
-        update_backtests_latest_symlink(&root, &second).unwrap();
-        assert_eq!(
-            std::fs::read_link(&latest).unwrap(),
-            PathBuf::from("2026-06-24_120100_strategy")
-        );
-        assert_eq!(
-            latest.canonicalize().unwrap(),
-            second.canonicalize().unwrap()
-        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

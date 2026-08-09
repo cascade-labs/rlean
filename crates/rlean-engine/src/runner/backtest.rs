@@ -20,7 +20,7 @@ use rlean_data_tables::TradeBar;
 use rlean_options::OptionChain;
 use rlean_orders::{fill_model::ImmediateFillModel, order_processor::OrderProcessor, OrderEvent};
 use rlean_statistics::{PortfolioStatistics, TradeBuilder};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 
@@ -32,8 +32,10 @@ pub async fn run_backtest<B>(bridge: B, config: BacktestRunConfig) -> Result<Bac
 where
     B: AlgorithmBridge,
 {
-    let runtime_context =
-        crate::AlgorithmRuntimeContext::new(config.data_sidecar.clone(), config.parameters.clone());
+    let runtime_context = crate::AlgorithmRuntimeContext::new(
+        config.historical_provider.clone(),
+        config.parameters.clone(),
+    );
     run_backtest_with_runtime(bridge, config, runtime_context).await
 }
 
@@ -62,7 +64,7 @@ where
     let starting_cash = algorithm_manager.starting_cash();
     let risk_free_interest_rate_model: Arc<dyn RiskFreeInterestRateModel> = Arc::new(
         crate::risk_free_interest_rate::load_risk_free_interest_rate_model(
-            &config.data_sidecar,
+            &config.historical_provider,
             end,
         )
         .await?,
@@ -104,16 +106,15 @@ where
         last_version: None,
     };
 
-    let feed_context = DataFeedContext::new(config.data_sidecar.clone())
+    let feed_context = DataFeedContext::new(config.historical_provider.clone())
         .with_options(config.data_feed_options)
         .with_market_hours_database(market_hours_database.clone());
 
-    let normal_start = rlean_core::NanosecondTimestamp::from(
-        start.and_hms_opt(0, 0, 0).expect("valid start of day"),
-    );
-    let normal_end = rlean_core::NanosecondTimestamp::from(
-        end.and_hms_opt(23, 59, 59).expect("valid end of day"),
-    );
+    let normal_start = algorithm_manager.local_midnight_utc(start)?;
+    let normal_end = algorithm_manager.local_midnight_utc(
+        end.succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("backtest end date has no following day"))?,
+    )? - rlean_core::TimeSpan::from_nanos(1);
 
     let had_warmup = algorithm_manager.is_warming_up();
     if had_warmup {
@@ -128,11 +129,8 @@ where
                 bar_count,
                 start,
             )
-            .map(|date| {
-                rlean_core::NanosecondTimestamp::from(
-                    date.and_hms_opt(0, 0, 0).expect("valid warmup start"),
-                )
-            })
+            .map(|date| algorithm_manager.local_midnight_utc(date))
+            .transpose()?
         } else {
             algorithm_manager
                 .warmup_duration()
@@ -155,6 +153,7 @@ where
                     .initialize_feed(&warmup_subscriptions, warmup_start, warmup_end)
                     .await?;
                 while let Some(mut slice) = warmup_data_manager.next_slice().await? {
+                    algorithm_manager.include_active_option_chains(&mut slice);
                     apply_risk_free_rate_to_option_chains(
                         &mut slice,
                         risk_free_interest_rate_model.as_ref(),
@@ -198,26 +197,25 @@ where
     let mut market_slices_after_warmup = 0usize;
     let mut trade_builder = TradeBuilder::new();
     let mut completed_trades = Vec::new();
+    let mut insight_events = Vec::new();
+    let mut next_margin_call_time = rlean_core::DateTime::EPOCH;
 
-    // Optional incremental result streamer. When an output directory (or an
-    // artifact sink) is set the runner appends order events / trades and
-    // rewrites progress.json while the backtest is still running, matching the
-    // live path's streaming sidecars. An artifact sink also mirrors these files
-    // to S3 per its configured mode.
-    let mut stream_writer = config
-        .artifact_sink
-        .clone()
-        .or_else(|| {
-            config
-                .output_dir
-                .as_ref()
-                .map(|dir| Arc::new(crate::artifacts::RunArtifactSink::local(dir.clone())))
-        })
-        .map(|sink| crate::runner::stream_writer::BacktestStreamWriter::new(sink, start, end));
-    let mut streamed_order_events = 0usize;
-    let mut streamed_trades = 0usize;
+    let mut catalog_order_events = 0usize;
+    let mut catalog_trades = 0usize;
+    let mut catalog_progress_date = None;
 
     while let Some(mut slice) = data_manager.next_slice().await? {
+        // Match C# LEAN AlgorithmManager.Run: once a backtest portfolio is
+        // bankrupt, stop before processing the next time slice. Continuing can
+        // manufacture fills, fees, and statistics for capital that no longer
+        // exists.
+        if portfolio_is_bankrupt(algorithm_manager.portfolio_value()) {
+            tracing::error!(
+                "AlgorithmManager.Run(): Portfolio value is less than or equal to zero, stopping algorithm."
+            );
+            break;
+        }
+        algorithm_manager.include_active_option_chains(&mut slice);
         apply_risk_free_rate_to_option_chains(&mut slice, risk_free_interest_rate_model.as_ref());
         if !slice.has_data {
             continue;
@@ -244,7 +242,6 @@ where
             }
         }
 
-        let _ = algorithm_manager.scan_scheduled_events(slice.time)?;
         let slice = Arc::new(slice);
         algorithm_manager.advance_frontier(slice.as_ref(), &mut services);
         let option_chains: Vec<(&str, &OptionChain)> = slice
@@ -265,6 +262,75 @@ where
                 trade_builder: &mut trade_builder,
                 completed_trades: &mut completed_trades,
             });
+        }
+
+        // C# LEAN AlgorithmManager updates security prices and processes
+        // synchronous fills before advancing the real-time handler. Scheduled
+        // callbacks must therefore observe the current slice's prices and
+        // settled holdings, not the preceding slice.
+        let _ = algorithm_manager.scan_scheduled_events(slice.time)?;
+        if has_fill_data {
+            // BacktestingRealTimeHandler callbacks submit synchronous market
+            // orders in LEAN. Settle those orders before OnData/framework so a
+            // scheduled liquidation is authoritative for the remainder of the
+            // time step.
+            algorithm_manager.process_order_events(OrderEventProcessing {
+                slice: slice.as_ref(),
+                option_chains: &option_chains,
+                order_processor: order_processor.as_ref(),
+                portfolio: portfolio.as_ref(),
+                services: &mut services,
+                all_order_events: &mut all_order_events,
+                trade_builder: &mut trade_builder,
+                completed_trades: &mut completed_trades,
+            });
+        }
+
+        // Match C# LEAN AlgorithmManager and
+        // InsufficientBuyingPowerForAutomaticExerciseRegressionAlgorithm:
+        // scan the portfolio every five
+        // minutes after scheduled events and synchronously execute generated
+        // margin-call orders before OnData. This is particularly important
+        // after physical option exercise creates an underlying position.
+        if slice.time >= next_margin_call_time {
+            next_margin_call_time = slice.time + rlean_core::TimeSpan::from_nanos(300_000_000_000);
+            let (requests, issue_warning, exchanges_open) =
+                algorithm_manager.margin_call_requests(slice.time);
+            let mut executed = 0usize;
+            if !requests.is_empty() && exchanges_open && has_fill_data {
+                algorithm_manager.notify_margin_call(&requests, slice.time, &mut services);
+                for request in &requests {
+                    if algorithm_manager
+                        .margin_remaining()
+                        .is_some_and(|remaining| remaining >= rust_decimal::Decimal::ZERO)
+                    {
+                        break;
+                    }
+                    let Some(order_id) = algorithm_manager.submit_margin_call_order(request) else {
+                        continue;
+                    };
+                    let event_count_before = all_order_events.len();
+                    algorithm_manager.process_order_events(OrderEventProcessing {
+                        slice: slice.as_ref(),
+                        option_chains: &option_chains,
+                        order_processor: order_processor.as_ref(),
+                        portfolio: portfolio.as_ref(),
+                        services: &mut services,
+                        all_order_events: &mut all_order_events,
+                        trade_builder: &mut trade_builder,
+                        completed_trades: &mut completed_trades,
+                    });
+                    if all_order_events[event_count_before..]
+                        .iter()
+                        .any(|event| event.order_id == order_id && event.is_fill())
+                    {
+                        executed += 1;
+                    }
+                }
+            }
+            if executed == 0 && issue_warning {
+                algorithm_manager.notify_margin_call_warning(&mut services);
+            }
         }
 
         algorithm_manager.deliver_data(
@@ -325,36 +391,55 @@ where
             });
             algorithm_manager.process_option_expirations(slice.as_ref(), &mut services);
         }
+        insight_events.extend(
+            algorithm_manager
+                .framework()
+                .lock()
+                .expect("framework state poisoned")
+                .take_insight_events(),
+        );
         algorithm_manager.end_time_step(&mut services);
 
         if has_data_for_algorithm {
             let portfolio_value = algorithm_manager.portfolio_value();
-            result_handler.record_equity(slice.time, portfolio_value);
-            if let Some(progress) = &config.progress {
-                progress(BacktestProgress {
-                    current_date: slice.time.date_utc(),
-                    start_date: start,
-                    end_date: end,
-                    trading_days: algorithm_manager.trading_days(),
-                    portfolio_value: portfolio_value.to_string().parse::<f64>().unwrap_or(0.0),
-                });
+            let current_date = algorithm_manager
+                .current_date()
+                .expect("a processed slice must establish an algorithm-local date");
+            if !algorithm_manager.is_trading_date(current_date) {
+                continue;
             }
-            if let Some(writer) = stream_writer.as_mut() {
-                if all_order_events.len() > streamed_order_events {
-                    writer.append_order_events(&all_order_events[streamed_order_events..]);
-                    streamed_order_events = all_order_events.len();
+            result_handler.record_daily_equity(current_date, portfolio_value);
+            let progress_update = BacktestProgress {
+                current_date,
+                start_date: start,
+                end_date: end,
+                trading_days: algorithm_manager.trading_days(),
+                starting_cash: starting_cash.to_string().parse::<f64>().unwrap_or(0.0),
+                portfolio_value: portfolio_value.to_string().parse::<f64>().unwrap_or(0.0),
+            };
+            if let Some(progress) = &config.progress {
+                progress(progress_update.clone());
+            }
+            let has_catalog_events = all_order_events.len() > catalog_order_events;
+            let has_catalog_trades = completed_trades.len() > catalog_trades;
+            let is_new_catalog_date = catalog_progress_date != Some(progress_update.current_date);
+            if has_catalog_events || has_catalog_trades || is_new_catalog_date {
+                if let Some(sender) = &config.stream_updates {
+                    sender
+                        .send(crate::BacktestStreamUpdate {
+                            progress: progress_update,
+                            record_daily_progress: is_new_catalog_date,
+                            order_events: all_order_events[catalog_order_events..].to_vec(),
+                            trades: completed_trades[catalog_trades..].to_vec(),
+                            insight_events: Vec::new(),
+                            checkpoint_json: None,
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("backtest run-catalog stream closed"))?;
+                    catalog_order_events = all_order_events.len();
+                    catalog_trades = completed_trades.len();
+                    catalog_progress_date = Some(current_date);
                 }
-                if completed_trades.len() > streamed_trades {
-                    writer.append_trades(&completed_trades[streamed_trades..]);
-                    streamed_trades = completed_trades.len();
-                }
-                writer.record_progress(
-                    slice.time.date_utc(),
-                    algorithm_manager.trading_days(),
-                    portfolio_value,
-                    all_order_events.len(),
-                    completed_trades.len(),
-                );
             }
             if let Some(benchmark_bar) = benchmark_subscription
                 .as_ref()
@@ -381,6 +466,13 @@ where
     }
 
     algorithm_manager.finish(&mut services);
+    insight_events.extend(
+        algorithm_manager
+            .framework()
+            .lock()
+            .expect("framework state poisoned")
+            .take_insight_events(),
+    );
 
     let total_fees: f64 = all_order_events
         .iter()
@@ -395,21 +487,6 @@ where
 
     // Flush any trailing order events / trades and finalize the streaming
     // progress file before the batch report writers run.
-    if let Some(writer) = stream_writer.as_mut() {
-        if all_order_events.len() > streamed_order_events {
-            writer.append_order_events(&all_order_events[streamed_order_events..]);
-        }
-        if completed_trades.len() > streamed_trades {
-            writer.append_trades(&completed_trades[streamed_trades..]);
-        }
-        let final_value = algorithm_manager.portfolio_value();
-        writer.mark_completed(
-            trading_days,
-            final_value,
-            all_order_events.len(),
-            completed_trades.len(),
-        );
-    }
 
     result_handler.finalize(
         &completed_trades,
@@ -425,10 +502,16 @@ where
         end,
         all_order_events,
         final_orders,
+        completed_trades,
+        insight_events,
         total_fees,
         algorithm_manager,
         config,
     ))
+}
+
+fn portfolio_is_bankrupt(portfolio_value: Decimal) -> bool {
+    portfolio_value <= Decimal::ZERO
 }
 
 pub(crate) fn apply_risk_free_rate_to_option_chains(
@@ -442,7 +525,36 @@ pub(crate) fn apply_risk_free_rate_to_option_chains(
     let price_model = rlean_options::BlackScholesPriceModel;
     for chain in slice.option_chains.values_mut() {
         let chain = Arc::make_mut(chain);
+        let underlying_sid = chain
+            .contracts
+            .values()
+            .find_map(|contract| contract.symbol.underlying.as_ref())
+            .map(|symbol| symbol.id.sid);
+        if let Some(underlying_sid) = underlying_sid {
+            let underlying_price = slice
+                .quote_bars
+                .get(&underlying_sid)
+                .map(|quote| quote.mid_close())
+                .filter(|price| *price > dec!(0))
+                .or_else(|| slice.bars.get(&underlying_sid).map(|bar| bar.close))
+                .filter(|price| *price > dec!(0))
+                .unwrap_or(chain.underlying_price);
+            chain.underlying_price = underlying_price;
+        }
         for contract in chain.contracts.values_mut() {
+            contract.data.underlying_last_price = chain.underlying_price;
+            if let Some(quote) = slice.quote_bars.get(&contract.symbol.id.sid) {
+                contract.data.bid_price =
+                    quote.bid.as_ref().map(|bar| bar.close).unwrap_or_default();
+                contract.data.ask_price =
+                    quote.ask.as_ref().map(|bar| bar.close).unwrap_or_default();
+                contract.data.bid_size = quote.last_bid_size.to_i64().unwrap_or_default();
+                contract.data.ask_size = quote.last_ask_size.to_i64().unwrap_or_default();
+            }
+            if let Some(bar) = slice.bars.get(&contract.symbol.id.sid) {
+                contract.data.last_price = bar.close;
+                contract.data.volume = bar.volume.to_i64().unwrap_or_default();
+            }
             rlean_options::evaluate_contract_with_market_iv(
                 &price_model,
                 contract,
@@ -724,6 +836,11 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         return Ok(());
     }
 
+    let replaced_ids: std::collections::HashSet<u64> = diff
+        .replaced
+        .iter()
+        .map(SubscriptionDataConfig::unique_id)
+        .collect();
     for config in &diff.replaced {
         if let Some(custom) = &config.custom {
             tracing::debug!(
@@ -741,8 +858,21 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
         data_manager.remove_subscription(config);
     }
 
+    // Brand-new subscriptions are eligible at the current frontier. Replaced
+    // streams are not: the old stream already supplied that frontier, and
+    // LEAN's in-place config mutation affects the next data point rather than
+    // replaying Current. Start replacements one nanosecond later to preserve
+    // that behavior while using rlean's immutable-config stream replacement.
+    let added = diff
+        .added
+        .iter()
+        .filter(|config| !replaced_ids.contains(&config.unique_id()))
+        .cloned()
+        .collect();
+    data_manager.add_subscriptions_async(added, start).await?;
+    let replacement_start = rlean_core::NanosecondTimestamp(start.0.saturating_add(1));
     data_manager
-        .add_subscriptions_async(diff.added, start)
+        .add_subscriptions_async(diff.replaced, replacement_start)
         .await?;
     for config in sync_state.active.iter() {
         if diff.removed_ids.contains(&config.unique_id()) {
@@ -759,7 +889,7 @@ async fn sync_data_manager_subscriptions<B: AlgorithmBridge>(
 /// The benchmark is engine-owned and therefore absent from `bridge.subscriptions()`
 /// when the strategy has not separately subscribed to it. It must be re-added on
 /// every sync just like option-chain feeds; otherwise the first sync treats it as
-/// removed and tears down the sidecar stream.
+/// removed and tears down the provider stream.
 fn desired_backtest_subscriptions<B: AlgorithmBridge>(
     bridge: &B,
     benchmark_subscription: Option<&SubscriptionDataConfig>,
@@ -794,6 +924,16 @@ fn subscription_requires_stream_replacement(
     previous: &rlean_data::SubscriptionDataConfig,
     current: &rlean_data::SubscriptionDataConfig,
 ) -> bool {
+    // C# LEAN's Security.SetDataNormalizationMode mutates the active
+    // SubscriptionDataConfig instances in place. rlean keeps configs immutable
+    // behind Arc and publishes replacements through SubscriptionManager, so an
+    // already-running reader must be restarted to observe the new mode. This is
+    // especially important for AddOptionContract: LEAN switches the underlying
+    // equity to Raw immediately, even when the contract is added mid-backtest.
+    if previous.normalization_mode != current.normalization_mode {
+        return true;
+    }
+
     match (previous.custom.as_ref(), current.custom.as_ref()) {
         (Some(previous_custom), Some(current_custom)) => {
             previous_custom.dynamic_query != current_custom.dynamic_query
@@ -890,6 +1030,8 @@ fn build_backtest_result(
     end_date: chrono::NaiveDate,
     order_events: Vec<OrderEvent>,
     orders: Vec<rlean_orders::Order>,
+    trades: Vec<rlean_statistics::Trade>,
+    insight_events: Vec<rlean_alpha::InsightEvent>,
     total_fees: f64,
     algorithm_manager: AlgorithmManager<impl AlgorithmBridge>,
     _config: BacktestRunConfig,
@@ -958,6 +1100,8 @@ fn build_backtest_result(
         charts: algorithm_manager.charts(),
         order_events,
         orders,
+        trades,
+        insight_events,
         succeeded_data_requests: Vec::new(),
         failed_data_requests: Vec::new(),
         backtest_id: chrono::Utc::now().timestamp(),
@@ -969,18 +1113,23 @@ fn build_backtest_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        benchmark_subscription_for_symbol, compute_subscription_diff,
-        desired_backtest_subscriptions_from_parts, lean_style_active_subscriptions,
-        resolve_backtest_dates, should_run_framework_on_slice, slice_has_algorithm_data,
+        apply_risk_free_rate_to_option_chains, benchmark_subscription_for_symbol,
+        compute_subscription_diff, desired_backtest_subscriptions_from_parts,
+        lean_style_active_subscriptions, portfolio_is_bankrupt, resolve_backtest_dates,
+        should_run_framework_on_slice, slice_has_algorithm_data,
         subscription_requires_stream_replacement, warmup_subscriptions_at_resolution,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rlean_core::{
-        DataNormalizationMode, DateTime, Market, Resolution, Symbol, SymbolOptionsExt,
+        ConstantRiskFreeInterestRateModel, DataNormalizationMode, DateTime, Market, OptionRight,
+        OptionStyle, Resolution, Symbol, SymbolOptionsExt, TimeSpan,
     };
     use rlean_data::{
-        CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, SubscriptionDataConfig,
+        CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata, OptionChain, OptionContract,
+        SubscriptionDataConfig,
     };
+    use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
+    use rust_decimal_macros::dec;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
@@ -990,6 +1139,73 @@ mod tests {
             Resolution::Minute,
             DataNormalizationMode::Adjusted,
         )
+    }
+
+    #[test]
+    fn backtest_bankruptcy_matches_lean_algorithm_manager() {
+        assert!(!portfolio_is_bankrupt(dec!(0.01)));
+        assert!(portfolio_is_bankrupt(dec!(0)));
+        assert!(portfolio_is_bankrupt(dec!(-1)));
+    }
+
+    #[test]
+    fn option_contract_pricing_uses_current_slice_quotes_like_lean() {
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying.clone(),
+            &Market::usa(),
+            date(2024, 8, 19),
+            dec!(0),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let option = Symbol::create_option(
+            underlying.clone(),
+            &Market::usa(),
+            date(2024, 8, 19),
+            dec!(555),
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let time = DateTime::from(
+            Utc.with_ymd_and_hms(2024, 8, 19, 14, 30, 0)
+                .single()
+                .unwrap(),
+        );
+        let mut chain = OptionChain::new(canonical, dec!(554));
+        chain.add_contract(OptionContract::new(option.clone()));
+        let mut slice = rlean_data::Slice::new(time);
+        slice.add_bar(TradeBar::new(
+            underlying,
+            time,
+            TimeSpan::from_mins(1),
+            TradeBarData::new(dec!(555), dec!(555), dec!(555), dec!(555), dec!(1000)),
+        ));
+        slice.add_quote_bar(QuoteBar::new(
+            option.clone(),
+            time,
+            TimeSpan::from_mins(1),
+            Some(Bar::from_price(dec!(1.90))),
+            Some(Bar::from_price(dec!(2.00))),
+            dec!(40),
+            dec!(44),
+        ));
+        slice
+            .option_chains
+            .insert("SPY".to_string(), Arc::new(chain));
+
+        apply_risk_free_rate_to_option_chains(
+            &mut slice,
+            &ConstantRiskFreeInterestRateModel::new(dec!(0.01)),
+        );
+
+        let contract = slice.option_chains["SPY"].contracts.get(&option).unwrap();
+        assert_eq!(contract.data.bid_price, dec!(1.90));
+        assert_eq!(contract.data.ask_price, dec!(2.00));
+        assert_eq!(contract.data.bid_size, 40);
+        assert_eq!(contract.data.ask_size, 44);
+        assert_eq!(contract.data.underlying_last_price, dec!(555));
+        assert!(contract.data.greeks.delta > dec!(0));
     }
 
     /// Reference implementation of the diff using the original O(N²) nested-scan
@@ -1263,6 +1479,27 @@ mod tests {
         assert!(subscription_requires_stream_replacement(
             &previous, &current
         ));
+    }
+
+    #[test]
+    fn normalization_mode_change_requires_stream_replacement() {
+        let previous = equity_config("SPY");
+        let mut current = previous.clone();
+        current.normalization_mode = DataNormalizationMode::Raw;
+
+        assert_eq!(previous.unique_id(), current.unique_id());
+        assert!(subscription_requires_stream_replacement(
+            &previous, &current
+        ));
+
+        let diff = compute_subscription_diff(
+            &into_arcs(std::slice::from_ref(&previous)),
+            &into_arcs(std::slice::from_ref(&current)),
+        );
+        assert_eq!(diff.replaced.len(), 1);
+        assert_eq!(diff.added.len(), 1);
+        assert!(diff.removed_ids.is_empty());
+        assert_eq!(diff.added[0].normalization_mode, DataNormalizationMode::Raw);
     }
 
     #[test]

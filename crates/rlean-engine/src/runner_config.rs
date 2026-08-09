@@ -1,13 +1,13 @@
-use crate::artifacts::RunArtifactSink;
 use crate::data_feed::DataFeedOptions;
+use crate::live::catalog_state::LiveRestoreState;
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::qc_algorithm::BrokerageModel;
-use rlean_alpha::AlphaAnalytics;
-use rlean_data_sidecar::{BrokerageEventStream, DataSidecarClient};
+use rlean_alpha::{AlphaAnalytics, InsightEvent};
+use rlean_brokerages::Brokerage;
+use rlean_data_providers::{HistoricalDataProvider, LiveDataProvider};
 use rlean_orders::{Order, OrderEvent};
-use rlean_statistics::PortfolioStatistics;
+use rlean_statistics::{PortfolioStatistics, Trade};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,11 +17,40 @@ pub struct BacktestProgress {
     pub start_date: chrono::NaiveDate,
     pub end_date: chrono::NaiveDate,
     pub trading_days: i64,
+    pub starting_cash: f64,
     pub portfolio_value: f64,
 }
 
+/// Durable run telemetry shared by backtest and live. Consumed by `RunCatalog`
+/// and appended to the same Verglas tables (`rlean.runs`, `run_progress`,
+/// `order_events`, `trades`, `insights`, `checkpoints`).
+#[derive(Debug, Clone)]
+pub struct BacktestStreamUpdate {
+    pub progress: BacktestProgress,
+    pub record_daily_progress: bool,
+    pub order_events: Vec<OrderEvent>,
+    pub trades: Vec<Trade>,
+    pub insight_events: Vec<InsightEvent>,
+    /// Optional restore checkpoint JSON (portfolio + open orders + insights).
+    /// Live emits this on state changes; backtests leave it `None`.
+    pub checkpoint_json: Option<String>,
+}
+
+impl BacktestStreamUpdate {
+    pub fn empty_with_progress(progress: BacktestProgress, record_daily_progress: bool) -> Self {
+        Self {
+            progress,
+            record_daily_progress,
+            order_events: Vec::new(),
+            trades: Vec::new(),
+            insight_events: Vec::new(),
+            checkpoint_json: None,
+        }
+    }
+}
+
 pub struct BacktestRunConfig {
-    pub data_sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
     pub _compression_level: i32,
     /// Override the strategy's set_start_date (YYYY-MM-DD).
     pub start_date_override: Option<chrono::NaiveDate>,
@@ -31,26 +60,19 @@ pub struct BacktestRunConfig {
     pub parameters: HashMap<String, String>,
     /// Subscription feed caching/prefetch behavior.
     pub data_feed_options: DataFeedOptions,
-    /// Optional backtest output directory. When set, progress/order/trade sidecar
-    /// files are written while the backtest is still running.
-    pub output_dir: Option<PathBuf>,
-    /// Optional artifact sink. When set, streaming files are written into the
-    /// sink's working dir and mirrored to S3 per the sink's mode. Takes
-    /// precedence over `output_dir` for the streaming writer's location.
-    pub artifact_sink: Option<Arc<RunArtifactSink>>,
     pub progress: Option<Arc<dyn Fn(BacktestProgress) + Send + Sync>>,
+    /// Bounded, lossless stream of durable run updates. The engine awaits
+    /// capacity instead of dropping fills when the catalog writer falls behind.
+    pub stream_updates: Option<tokio::sync::mpsc::Sender<BacktestStreamUpdate>>,
 }
 
 pub struct LiveRunConfig {
-    pub data_sidecar: Arc<DataSidecarClient>,
-    /// Session-scoped live feed selected by deployment configuration. Strategy
-    /// SDK calls create the actual subscriptions beneath this connection.
-    pub live_data_feed_connection_id: u64,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
+    pub live_data_provider: Arc<dyn LiveDataProvider>,
     pub parameters: HashMap<String, String>,
-    /// Optional authenticated sidecar execution connection. Market-data
-    /// subscriptions do not reference this connection and may use a completely
-    /// different provider. `None` keeps execution in rlean's paper path.
-    pub brokerage: Option<SidecarBrokerageConnection>,
+    /// Optional authenticated execution brokerage. Market data remains an
+    /// independent provider. `None` keeps execution in rlean's paper path.
+    pub brokerage: Option<Box<dyn Brokerage>>,
     /// Brokerage model selected by the live deployment. The execution
     /// brokerage and account type are modeled together, matching C# LEAN's
     /// `IBrokerageModel` boundary.
@@ -62,24 +84,14 @@ pub struct LiveRunConfig {
     /// Stops the live run after this wall-clock duration. Intended for paper
     /// deployment soaks and integration tests.
     pub max_runtime: Option<Duration>,
-    /// Optional live deployment directory. When set, live portfolio/order/log
-    /// sidecars are written while the run is still active.
-    pub output_dir: Option<PathBuf>,
-    /// Optional artifact sink. When set, snapshots are written into the sink's
-    /// working dir and mirrored to S3 asynchronously per the sink's mode.
-    pub artifact_sink: Option<Arc<RunArtifactSink>>,
-}
-
-pub struct SidecarBrokerageConnection {
-    pub client: Arc<DataSidecarClient>,
-    pub connection_id: u64,
-    /// Flight session generation that owns `events`.
-    pub session_epoch: u64,
-    pub name: String,
-    /// Opaque brokerage credentials/config, kept so the worker can re-open the
-    /// brokerage connection after the sidecar session is re-established.
-    pub opaque_config_json: Vec<u8>,
-    pub events: BrokerageEventStream,
+    /// Bounded stream of durable catalog updates (same shape as backtests).
+    pub stream_updates: Option<tokio::sync::mpsc::Sender<BacktestStreamUpdate>>,
+    /// Wall-clock start of this deployment; used as the progress window start.
+    pub deploy_started_at: chrono::DateTime<chrono::Utc>,
+    /// Optional restore payload loaded from the Verglas catalog before start.
+    pub restore: Option<LiveRestoreState>,
+    /// Deployment id used when tagging insight checkpoints.
+    pub deploy_id: Option<String>,
 }
 
 pub struct LiveRunResult {
@@ -115,7 +127,11 @@ pub struct BacktestRunResult {
     pub order_events: Vec<OrderEvent>,
     /// Final order states from the backtest run.
     pub orders: Vec<Order>,
-    /// Symbols/dates for which the sidecar returned data.
+    /// Completed round-trip trades used to compute the final statistics.
+    pub trades: Vec<Trade>,
+    /// Complete framework insight lifecycle, in engine event order.
+    pub insight_events: Vec<InsightEvent>,
+    /// Symbols/dates for which the configured provider returned data.
     pub succeeded_data_requests: Vec<String>,
     /// Symbols/dates for which no data was found.
     pub failed_data_requests: Vec<String>,

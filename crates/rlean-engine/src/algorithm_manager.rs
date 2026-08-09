@@ -1,19 +1,24 @@
 use crate::orders::{record_trade_fill, settle_fill_event_bridge};
 use crate::runtime_context::AlgorithmRuntimeContext;
+use chrono::TimeZone;
 use rlean_algorithm::algorithm::{DataDeliveryPayload, SecurityChanges};
 use rlean_algorithm::charting::ChartCollection;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices, OptionSubscription};
+use rlean_algorithm::margin_call::{
+    build_margin_call_context, MarginCallModel, MarginCallOrderRequest,
+};
 use rlean_algorithm::qc_algorithm::BrokerageModel;
 use rlean_alpha::AlphaAnalytics;
 use rlean_core::{
     DateTime, LeanError, MarketHoursDatabase, Price, Resolution, Result as LeanResult, TimeSpan,
 };
-use rlean_data::{Slice, SubscriptionDataConfig};
+use rlean_data::{Slice, SubscriptionDataConfig, SubscriptionDataKind};
 use rlean_data_tables::{Bar, QuoteBar, TradeBar, TradeBarData};
 use rlean_options::{get_exercise_quantity, is_auto_exercised, OptionContract};
-use rlean_orders::{order_processor::OrderProcessor, Order, OrderEvent, SlippageModel};
+use rlean_orders::{order_processor::OrderProcessor, Order, OrderEvent, OrderType, SlippageModel};
 use rlean_statistics::{Trade, TradeBuilder};
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -70,6 +75,11 @@ where
     last_date: Option<chrono::NaiveDate>,
     trading_days: i64,
     slices_processed: i64,
+    // LEAN fill models read from `Security.Cache`, not only from the current
+    // Slice. Retain the last market datum so minute/second/tick market orders
+    // submitted between updates can fill synchronously from that cache.
+    cached_bars: HashMap<u64, TradeBar>,
+    cached_quote_bars: HashMap<u64, QuoteBar>,
 }
 
 impl<B> AlgorithmManager<B>
@@ -83,6 +93,8 @@ where
             last_date: None,
             trading_days: 0,
             slices_processed: 0,
+            cached_bars: HashMap::new(),
+            cached_quote_bars: HashMap::new(),
         }
     }
 
@@ -191,12 +203,145 @@ where
         self.algorithm.portfolio()
     }
 
+    /// Scan the default portfolio margin-call model using the current
+    /// algorithm state. C# LEAN performs this scan every five minutes after
+    /// scheduled events and before OnData.
+    pub fn margin_call_requests(
+        &self,
+        time: DateTime,
+    ) -> (Vec<MarginCallOrderRequest>, bool, bool) {
+        let Some(state) = self.algorithm.algorithm_state() else {
+            return (Vec::new(), false, false);
+        };
+        let Some(portfolio) = self.algorithm.portfolio() else {
+            return (Vec::new(), false, false);
+        };
+        let algorithm = state.lock().unwrap();
+        let model = portfolio.margin_call_model();
+        if model.is_null() {
+            return (Vec::new(), false, false);
+        }
+        let context = build_margin_call_context(&portfolio, &algorithm);
+        let (requests, warning) = model.get_margin_call_orders(&context);
+        let exchanges_open = requests.iter().all(|request| {
+            algorithm
+                .securities
+                .get(&request.symbol)
+                .map(|security| security.exchange_hours.is_open_at(time))
+                .unwrap_or(false)
+        });
+        (requests, warning, exchanges_open)
+    }
+
+    pub fn margin_remaining(&self) -> Option<Price> {
+        self.algorithm
+            .algorithm_state()
+            .map(|state| state.lock().unwrap().margin_remaining())
+    }
+
+    pub fn notify_margin_call(
+        &mut self,
+        requests: &[MarginCallOrderRequest],
+        time: DateTime,
+        services: &mut dyn AlgorithmServices,
+    ) {
+        let orders = requests
+            .iter()
+            .map(|request| {
+                Order::market(
+                    0,
+                    request.symbol.clone(),
+                    request.quantity,
+                    time,
+                    request.tag,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.algorithm.on_margin_call(&orders, services);
+    }
+
+    pub fn notify_margin_call_warning(&mut self, services: &mut dyn AlgorithmServices) {
+        self.algorithm.on_margin_call_warning(services);
+    }
+
+    pub fn submit_margin_call_order(&mut self, request: &MarginCallOrderRequest) -> Option<i64> {
+        let state = self.algorithm.algorithm_state()?;
+        let mut algorithm = state.lock().unwrap();
+        let ticket = algorithm.market_order_with_options_and_tag(
+            &request.symbol,
+            request.quantity,
+            None,
+            false,
+            request.tag,
+        );
+        Some(ticket.order_id)
+    }
+
     pub fn algorithm(&self) -> &B {
         &self.algorithm
     }
 
     pub fn trading_days(&self) -> i64 {
         self.trading_days
+    }
+
+    /// Current algorithm-local calendar date. LEAN advances its UTC frontier but
+    /// exposes and compares dates in `QCAlgorithm.TimeZone` (New York by default).
+    pub fn current_date(&self) -> Option<chrono::NaiveDate> {
+        self.last_date
+    }
+
+    /// Convert an algorithm-local calendar boundary to UTC. LEAN interprets
+    /// SetStartDate/SetEndDate in QCAlgorithm.TimeZone, not as UTC dates.
+    pub fn local_midnight_utc(&self, date: chrono::NaiveDate) -> LeanResult<DateTime> {
+        let time_zone = self
+            .algorithm
+            .algorithm_state()
+            .map(|state| state.lock().unwrap().time_zone)
+            .unwrap_or(chrono_tz::America::New_York);
+        let local = date
+            .and_hms_opt(0, 0, 0)
+            .expect("valid algorithm-local midnight");
+        let zoned = time_zone
+            .from_local_datetime(&local)
+            .single()
+            .or_else(|| time_zone.from_local_datetime(&local).earliest())
+            .ok_or_else(|| {
+                LeanError::DataError(format!(
+                    "algorithm-local midnight does not exist: date={date}, timezone={time_zone}"
+                ))
+            })?;
+        Ok(DateTime::from(zoned.with_timezone(&chrono::Utc)))
+    }
+
+    /// Whether at least one active non-custom subscription can trade on the
+    /// algorithm-local date. LEAN advances custom data independently, but its
+    /// exchange-date keepers and result sampling only emit dates open for the
+    /// associated market subscription.
+    pub fn is_trading_date(&self, date: chrono::NaiveDate) -> bool {
+        let Some(state) = self.algorithm.algorithm_state() else {
+            return true;
+        };
+        let algorithm = state.lock().unwrap();
+        let market_configs = algorithm
+            .subscription_manager
+            .get_all()
+            .into_iter()
+            .filter(|config| config.data_kind != SubscriptionDataKind::Custom)
+            .collect::<Vec<_>>();
+        market_configs.is_empty()
+            || market_configs.iter().any(|config| {
+                let exchange_symbol = config
+                    .symbol
+                    .underlying
+                    .as_deref()
+                    .unwrap_or(&config.symbol);
+                algorithm
+                    .market_hours_database
+                    .exchange_hours(exchange_symbol)
+                    .session_bounds(date)
+                    .is_some()
+            })
     }
 
     pub fn slices_processed(&self) -> i64 {
@@ -208,8 +353,13 @@ where
         slice: &Slice,
         services: &mut dyn AlgorithmServices,
     ) -> LeanResult<bool> {
-        let slice_date = slice.time.date_utc();
-        let new_trading_day = trading_day_transition(self.last_date, slice_date, slice.time)?;
+        let slice_date = algorithm_local_date(self.algorithm.algorithm_state(), slice.time);
+        let new_trading_day = trading_day_transition(
+            self.last_date,
+            slice_date,
+            self.is_trading_date(slice_date),
+            slice.time,
+        )?;
         if new_trading_day {
             if self.last_date.is_some() {
                 self.algorithm.on_end_of_day(None, services);
@@ -382,12 +532,50 @@ where
         changes
     }
 
+    /// Add the algorithm's active option chain to slices containing concrete
+    /// contract data. C# LEAN's `TimeSliceFactory.HandleOptionData` rebuilds the
+    /// chain on every contract update; rlean's universe snapshot and contract
+    /// streams are separate, so this joins them before pricing and delivery.
+    pub fn include_active_option_chains(&self, slice: &mut Slice) {
+        let Some(algorithm_state) = self.algorithm.algorithm_state() else {
+            return;
+        };
+        let algorithm = algorithm_state.lock().unwrap();
+        let chains = algorithm
+            .option_subscriptions
+            .iter()
+            .filter_map(|canonical| {
+                let key = canonical.permtick.to_string();
+                if slice.option_chains.contains_key(&key) {
+                    return None;
+                }
+                let chain = algorithm.get_option_chain(&key)?;
+                let has_contract_data = chain.contracts.keys().any(|symbol| {
+                    slice.quote_bars.contains_key(&symbol.id.sid)
+                        || slice.bars.contains_key(&symbol.id.sid)
+                        || slice.ticks.contains_key(&symbol.id.sid)
+                });
+                has_contract_data.then_some((key, Arc::new(chain)))
+            })
+            .collect::<Vec<_>>();
+        drop(algorithm);
+        slice.option_chains.extend(chains);
+    }
+
     pub fn advance_frontier(&mut self, slice: &Slice, _services: &mut dyn AlgorithmServices) {
         if let Some(algorithm_state) = self.algorithm.algorithm_state() {
             let mut algorithm = algorithm_state.lock().unwrap();
             crate::algorithm_services::advance_algorithm_time(&mut algorithm, slice.time);
             crate::algorithm_services::apply_slice_security_prices(&mut algorithm, slice);
         }
+        self.cached_bars
+            .extend(slice.bars.iter().map(|(sid, bar)| (*sid, bar.clone())));
+        self.cached_quote_bars.extend(
+            slice
+                .quote_bars
+                .iter()
+                .map(|(sid, quote)| (*sid, quote.clone())),
+        );
         self.runtime_context.update_registered_indicators(slice);
     }
 
@@ -459,6 +647,12 @@ where
         // sell at bid) instead of falling back to the synthesized trade bar.
         let mut quote_bars = slice.quote_bars.clone();
         extend_quote_bars_with_option_contracts(&mut quote_bars, slice, option_chains);
+        self.extend_with_cached_market_order_data(
+            processor,
+            slice.time,
+            &mut bars,
+            &mut quote_bars,
+        );
         let mut events =
             processor.generate_order_events_with_quotes(&bars, &quote_bars, slice.time);
         for event in events.iter_mut() {
@@ -470,6 +664,46 @@ where
             all_order_events.push(event.clone());
             if let Some(fee) = fee {
                 record_trade_fill(trade_builder, completed_trades, event, fee);
+            }
+        }
+    }
+
+    /// Match C# LEAN `FillModel.InternalMarketFill`: fine-resolution market
+    /// orders may fill from the security cache when the current Slice has no
+    /// row for their symbol. Hour/daily subscriptions still wait for fresh
+    /// data, matching `ShouldWaitForFreshData`.
+    fn extend_with_cached_market_order_data(
+        &self,
+        processor: &OrderProcessor,
+        time: DateTime,
+        bars: &mut HashMap<u64, TradeBar>,
+        quote_bars: &mut HashMap<u64, QuoteBar>,
+    ) {
+        let algorithm_state = self.algorithm.algorithm_state();
+        let algorithm = algorithm_state.as_ref().map(|state| state.lock().unwrap());
+        for order in processor.transaction_manager.get_open_orders() {
+            if order.order_type != OrderType::Market {
+                continue;
+            }
+            let sid = order.symbol.id.sid;
+            if bars.contains_key(&sid) || quote_bars.contains_key(&sid) {
+                continue;
+            }
+            let Some(security) = algorithm
+                .as_ref()
+                .and_then(|algorithm| algorithm.securities.get(&order.symbol))
+            else {
+                continue;
+            };
+            if matches!(security.resolution, Resolution::Hour | Resolution::Daily)
+                || !security.exchange_hours.is_open_at(time)
+            {
+                continue;
+            }
+            if let Some(quote) = self.cached_quote_bars.get(&sid) {
+                quote_bars.insert(sid, quote.clone());
+            } else if let Some(bar) = self.cached_bars.get(&sid) {
+                bars.insert(sid, bar.clone());
             }
         }
     }
@@ -746,15 +980,25 @@ where
 fn trading_day_transition(
     previous: Option<chrono::NaiveDate>,
     incoming: chrono::NaiveDate,
+    incoming_is_open: bool,
     slice_time: DateTime,
 ) -> LeanResult<bool> {
     match previous {
         Some(previous) if incoming < previous => Err(LeanError::DataError(format!(
             "algorithm time moved backward across trading days: previous={previous}, incoming={incoming}, slice_time={slice_time}"
         ))),
-        Some(previous) => Ok(incoming > previous),
-        None => Ok(true),
+        Some(previous) => Ok(incoming > previous && incoming_is_open),
+        None => Ok(incoming_is_open),
     }
+}
+
+fn algorithm_local_date(
+    algorithm_state: Option<Arc<Mutex<rlean_algorithm::qc_algorithm::QcAlgorithm>>>,
+    utc_time: DateTime,
+) -> chrono::NaiveDate {
+    algorithm_state
+        .map(|state| state.lock().unwrap().local_date(utc_time))
+        .unwrap_or_else(|| utc_time.to_tz(chrono_tz::America::New_York).date_naive())
 }
 
 /// Synthesize quote bars for option contracts from their chain bid/ask so the
@@ -824,19 +1068,45 @@ mod trading_day_tests {
     use super::*;
 
     #[test]
+    fn midnight_utc_does_not_start_a_new_algorithm_day() {
+        let state = Arc::new(Mutex::new(rlean_algorithm::qc_algorithm::QcAlgorithm::new(
+            "test",
+            dec!(100_000),
+        )));
+        let before_utc_midnight = DateTime::from_secs(1_723_852_740); // 2024-08-16 23:59 UTC
+        let at_utc_midnight = DateTime::from_secs(1_723_852_800); // 2024-08-17 00:00 UTC
+        let at_new_york_midnight = DateTime::from_secs(1_723_867_200); // 2024-08-17 04:00 UTC
+
+        let friday = algorithm_local_date(Some(state.clone()), before_utc_midnight);
+        assert_eq!(
+            algorithm_local_date(Some(state.clone()), at_utc_midnight),
+            friday
+        );
+        assert!(!trading_day_transition(Some(friday), friday, true, at_utc_midnight).unwrap());
+
+        let saturday = algorithm_local_date(Some(state), at_new_york_midnight);
+        assert_ne!(saturday, friday);
+        assert!(
+            !trading_day_transition(Some(friday), saturday, false, at_new_york_midnight).unwrap()
+        );
+    }
+
+    #[test]
     fn backward_date_errors_before_it_can_increment_the_day_count() {
         let august = chrono::NaiveDate::from_ymd_opt(2025, 8, 21).unwrap();
         let december = chrono::NaiveDate::from_ymd_opt(2025, 12, 24).unwrap();
         let mut trading_days = 0;
 
-        if trading_day_transition(None, august, DateTime::from_secs(1_000)).unwrap() {
+        if trading_day_transition(None, august, true, DateTime::from_secs(1_000)).unwrap() {
             trading_days += 1;
         }
-        if trading_day_transition(Some(august), december, DateTime::from_secs(2_000)).unwrap() {
+        if trading_day_transition(Some(august), december, true, DateTime::from_secs(2_000)).unwrap()
+        {
             trading_days += 1;
         }
         let error =
-            trading_day_transition(Some(december), august, DateTime::from_secs(1_000)).unwrap_err();
+            trading_day_transition(Some(december), august, true, DateTime::from_secs(1_000))
+                .unwrap_err();
 
         assert_eq!(trading_days, 2);
         assert!(error
@@ -848,7 +1118,9 @@ mod trading_day_tests {
     fn repeated_slices_on_one_date_do_not_double_count_the_day() {
         let date = chrono::NaiveDate::from_ymd_opt(2025, 12, 24).unwrap();
 
-        assert!(trading_day_transition(None, date, DateTime::from_secs(1_000)).unwrap());
-        assert!(!trading_day_transition(Some(date), date, DateTime::from_secs(2_000)).unwrap());
+        assert!(trading_day_transition(None, date, true, DateTime::from_secs(1_000)).unwrap());
+        assert!(
+            !trading_day_transition(Some(date), date, true, DateTime::from_secs(2_000)).unwrap()
+        );
     }
 }

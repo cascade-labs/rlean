@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,10 +8,11 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use rlean::daemon::{self, DeploymentSpec, Request};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{LiveArgs, LiveStatusFilter, LiveSubcommand, RunArgs};
+use crate::config::GlobalConfig;
+use crate::container_runtime::{self, LiveRunSpec};
 use crate::live::is_paper_brokerage_name;
 use crate::runtime::{
     backtest_dir_name, resolve_strategy_file, strategy_name_from_path, validate_strategy_path,
@@ -23,7 +24,17 @@ struct LiveDeploymentMetadata {
     strategy: PathBuf,
     strategy_name: String,
     deployment_dir: PathBuf,
+    #[serde(default)]
     pid: Option<u32>,
+    #[serde(default)]
+    container_id: Option<String>,
+    #[serde(default)]
+    container_name: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    /// Stable Verglas run catalog id (`live-<deploy_id>`).
+    #[serde(default)]
+    run_id: Option<String>,
     status: String,
     launched: String,
     stopped: Option<String>,
@@ -32,12 +43,14 @@ struct LiveDeploymentMetadata {
     #[serde(default)]
     brokerage_account: Option<String>,
     paper_trading: bool,
+    /// Engine argv stored for resume (without the docker wrapper).
     command: Vec<String>,
     error: Option<String>,
     exit_code: Option<i32>,
 }
 
 pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
+    let pull = args.pull;
     let mut run_args = args.to_run_args()?;
     run_args.strategy = resolve_strategy_file(run_args.strategy)?;
     if let Ok(canonical) = std::fs::canonicalize(&run_args.strategy) {
@@ -51,7 +64,7 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
+            anyhow::anyhow!("live mode requires --brokerage paper or a native execution brokerage")
         })?;
     let paper_trading = is_paper_brokerage_name(requested_brokerage);
     let brokerage_account = run_args
@@ -81,11 +94,9 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("deployment")
         .to_string();
-    let exe = std::env::current_exe().context("failed to resolve current rlean executable")?;
-    let child_args = live_child_args(&child_run_args, &deployment_dir);
-    let command = std::iter::once(exe.to_string_lossy().to_string())
-        .chain(child_args.iter().cloned())
-        .collect::<Vec<_>>();
+    let engine_args = live_engine_args(&child_run_args);
+    let image = container_runtime::default_image();
+    let container_name = container_runtime::live_container_name(&deploy_id);
 
     let now = chrono::Utc::now().to_rfc3339();
     let initial_metadata = LiveDeploymentMetadata {
@@ -94,6 +105,10 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         strategy_name,
         deployment_dir: deployment_dir.clone(),
         pid: None,
+        container_id: None,
+        container_name: Some(container_name.clone()),
+        image: Some(image.clone()),
+        run_id: Some(format!("live-{deploy_id}")),
         status: "launching".to_string(),
         launched: now.clone(),
         stopped: None,
@@ -101,7 +116,7 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
         brokerage: run_args.brokerage.clone(),
         brokerage_account,
         paper_trading,
-        command,
+        command: engine_args.clone(),
         error: None,
         exit_code: None,
     };
@@ -109,36 +124,25 @@ pub(crate) fn launch_live_detached(args: LiveArgs) -> Result<()> {
 
     let log_path = deployment_dir.join("live.log");
     File::create(&log_path).with_context(|| format!("failed to create {}", log_path.display()))?;
-    let mut environment = BTreeMap::new();
-    if let Some(token) = &run_args.data_sidecar_token {
-        environment.insert("RLEAN_DATA_SIDECAR_TOKEN".to_owned(), token.clone());
-    }
     register_live_deployment(&deployment_dir);
-    let response = daemon::request(&Request::Start(DeploymentSpec {
-        deploy_id: deploy_id.clone(),
-        deployment_dir: deployment_dir.clone(),
-        program: exe,
-        args: child_args,
-        working_dir: deployment_strategy
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        log_path: log_path.clone(),
-        environment,
-        desired_state: "running".to_owned(),
-        restart: false,
-    }))?;
-    let pid = response
-        .pid
-        .ok_or_else(|| anyhow::anyhow!("rleand did not return a child pid"))?;
-    confirm_live_deployment_started(&deployment_dir, pid, &log_path, Duration::from_secs(10))?;
+
+    let global = GlobalConfig::load()?;
+    let container_id = container_runtime::run_live_container(LiveRunSpec {
+        image: &image,
+        pull,
+        deploy_id: &deploy_id,
+        deployment_dir: &deployment_dir,
+        strategy_file: &deployment_strategy,
+        engine_args,
+        global: &global,
+    })?;
+    confirm_live_container_started(&deployment_dir, &container_name, Duration::from_secs(15))?;
 
     println!(
-        "Live deployment started: deploy_id={} pid={} dir={} log={}",
+        "Live deployment started: deploy_id={} container={} dir={}",
         deploy_id,
-        pid,
-        deployment_dir.display(),
-        log_path.display()
+        container_id,
+        deployment_dir.display()
     );
     Ok(())
 }
@@ -151,14 +155,15 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
             let metadata =
                 normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
             let effective_status = effective_live_status(&metadata);
-            let running_pid = running_live_pid(&metadata);
-            let process_alive = running_pid.is_some();
+            let container_alive = live_container_alive(&metadata);
             let payload = serde_json::json!({
                 "deploy_id": metadata.deploy_id,
                 "status": effective_status,
                 "recorded_status": metadata.status,
-                "process_alive": process_alive,
-                "pid": running_pid,
+                "container_alive": container_alive,
+                "container_id": metadata.container_id,
+                "container_name": metadata.container_name,
+                "image": metadata.image,
                 "strategy": metadata.strategy,
                 "strategy_name": metadata.strategy_name,
                 "deployment_dir": metadata.deployment_dir,
@@ -168,16 +173,14 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
                 "brokerage": metadata.brokerage,
                 "brokerage_account": metadata.brokerage_account,
                 "paper_trading": metadata.paper_trading,
+                "run_id": metadata
+                    .run_id
+                    .clone()
+                    .unwrap_or_else(|| format!("live-{}", metadata.deploy_id)),
                 "error": metadata.error,
                 "exit_code": metadata.exit_code,
                 "files": {
-                    "pid": dir.join("pid"),
                     "log": dir.join("live.log"),
-                    "portfolio": dir.join("portfolio.json"),
-                    "orders": dir.join("orders.json"),
-                    "order_events": dir.join("order-events.jsonl"),
-                    "trades": dir.join("trades.jsonl"),
-                    "progress": dir.join("progress.json"),
                     "deployment": dir.join("deployment.json")
                 }
             });
@@ -185,15 +188,31 @@ pub(crate) fn run_live_control(command: LiveSubcommand) -> Result<()> {
         }
         LiveSubcommand::Portfolio { deploy_id } => {
             let dir = find_live_deployment_dir(&deploy_id)?;
-            print_json_file(&dir.join("portfolio.json"))
+            let metadata = read_live_deployment_metadata(&dir)?;
+            let run_id = metadata
+                .run_id
+                .unwrap_or_else(|| format!("live-{deploy_id}"));
+            print_catalog_checkpoint_field(&run_id, "portfolio")
         }
         LiveSubcommand::Orders { deploy_id } => {
             let dir = find_live_deployment_dir(&deploy_id)?;
-            print_json_file(&dir.join("orders.json"))
+            let metadata = read_live_deployment_metadata(&dir)?;
+            let run_id = metadata
+                .run_id
+                .unwrap_or_else(|| format!("live-{deploy_id}"));
+            print_catalog_checkpoint_field(&run_id, "open_orders")
         }
         LiveSubcommand::Logs { deploy_id, lines } => {
             let dir = find_live_deployment_dir(&deploy_id)?;
-            print_tail(&dir.join("live.log"), lines)
+            let metadata = read_live_deployment_metadata(&dir)?;
+            let name = metadata
+                .container_name
+                .unwrap_or_else(|| container_runtime::live_container_name(&deploy_id));
+            if container_runtime::container_is_running(&name) || docker_container_exists(&name) {
+                container_runtime::print_container_logs(&name, lines)
+            } else {
+                print_tail(&dir.join("live.log"), lines)
+            }
         }
         LiveSubcommand::Pause {
             deploy_id,
@@ -221,26 +240,24 @@ fn pause_live_deployment(deploy_id: &str, timeout: Duration) -> Result<()> {
         bail!("live deployment {deploy_id} is not running; current status is {effective_status}");
     }
 
-    let pid = metadata.pid;
-    daemon::request(&Request::Stop {
-        deploy_id: metadata.deploy_id.clone(),
-        timeout_seconds: timeout.as_secs(),
-    })?;
+    let name = metadata
+        .container_name
+        .clone()
+        .unwrap_or_else(|| container_runtime::live_container_name(&metadata.deploy_id));
+    container_runtime::stop_container(&name, timeout.as_secs())?;
 
     metadata.pid = None;
+    metadata.container_id = None;
     metadata.status = "paused".to_string();
     metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
     metadata.updated_at = chrono::Utc::now().to_rfc3339();
     metadata.error = None;
     metadata.exit_code = None;
     write_live_deployment_metadata(&dir, &metadata)?;
-    let _ = std::fs::remove_file(dir.join("pid"));
 
     println!(
-        "Live deployment paused: deploy_id={} pid={}",
-        metadata.deploy_id,
-        pid.map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_owned())
+        "Live deployment paused: deploy_id={} container={}",
+        metadata.deploy_id, name
     );
     Ok(())
 }
@@ -258,44 +275,37 @@ fn resume_live_deployment(deploy_id: &str) -> Result<()> {
     }
 
     let deployment_strategy = deployment_strategy_path(&metadata, &dir);
-    if deployment_strategy.exists() {
-        rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
+    if !deployment_strategy.exists() {
+        bail!(
+            "live deployment {deploy_id} is missing strategy snapshot at {}",
+            deployment_strategy.display()
+        );
     }
-    // Persist the snapshot strategy path so rleand replays the same command on
-    // every later restart.
     write_live_deployment_metadata(&dir, &metadata)?;
 
-    let exe = PathBuf::from(&metadata.command[0]);
-    let child_args = metadata.command[1..].to_vec();
-    let log_path = dir.join("live.log");
-    let working_dir = deployment_strategy
-        .parent()
-        .or_else(|| metadata.strategy.parent())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let response = daemon::request(&Request::Start(DeploymentSpec {
-        deploy_id: metadata.deploy_id.clone(),
-        deployment_dir: dir.clone(),
-        program: exe,
-        args: child_args,
-        working_dir,
-        log_path: log_path.clone(),
-        environment: BTreeMap::new(),
-        desired_state: "running".to_owned(),
-        restart: true,
-    }))?;
-    let pid = response
-        .pid
-        .ok_or_else(|| anyhow::anyhow!("rleand did not return a child pid"))?;
+    let image = metadata
+        .image
+        .clone()
+        .unwrap_or_else(container_runtime::default_image);
+    let global = GlobalConfig::load()?;
+    let container_id = container_runtime::run_live_container(LiveRunSpec {
+        image: &image,
+        pull: false,
+        deploy_id: &metadata.deploy_id,
+        deployment_dir: &dir,
+        strategy_file: &deployment_strategy,
+        engine_args: metadata.command.clone(),
+        global: &global,
+    })?;
+    let name = container_runtime::live_container_name(&metadata.deploy_id);
     register_live_deployment(&dir);
-    metadata = confirm_live_deployment_started(&dir, pid, &log_path, Duration::from_secs(10))?;
+    metadata = confirm_live_container_started(&dir, &name, Duration::from_secs(15))?;
 
     println!(
-        "Live deployment resumed: deploy_id={} pid={} dir={} log={}",
+        "Live deployment resumed: deploy_id={} container={} dir={}",
         metadata.deploy_id,
-        pid,
-        dir.display(),
-        log_path.display()
+        container_id,
+        dir.display()
     );
     Ok(())
 }
@@ -311,16 +321,19 @@ fn upgrade_live_deployment(deploy_id: &str) -> Result<()> {
         );
     }
 
+    let image = container_runtime::default_image();
+    container_runtime::ensure_image(&image, true)?;
     let deployment_strategy = snapshot_strategy_code(&metadata.strategy, &dir)?;
-    rewrite_live_command_strategy(&mut metadata.command, &deployment_strategy);
+    metadata.image = Some(image);
     metadata.updated_at = chrono::Utc::now().to_rfc3339();
     metadata.error = None;
     metadata.exit_code = None;
     write_live_deployment_metadata(&dir, &metadata)?;
 
     println!(
-        "Live deployment upgraded: deploy_id={} code={}",
+        "Live deployment upgraded: deploy_id={} image={} code={}",
         metadata.deploy_id,
+        metadata.image.as_deref().unwrap_or("-"),
         deployment_strategy.display()
     );
     Ok(())
@@ -330,19 +343,17 @@ fn remove_live_deployment(deploy_id: &str, force: bool) -> Result<()> {
     let dir = find_live_deployment_dir(deploy_id)?;
     let metadata = normalize_live_deployment_metadata(&dir, read_live_deployment_metadata(&dir)?);
     let effective_status = effective_live_status(&metadata);
+    let name = metadata
+        .container_name
+        .clone()
+        .unwrap_or_else(|| container_runtime::live_container_name(&metadata.deploy_id));
     if effective_status == "running" {
         if !force {
             bail!("live deployment {deploy_id} is running; pause it first or pass --force");
         }
-        daemon::request(&Request::Stop {
-            deploy_id: metadata.deploy_id.clone(),
-            timeout_seconds: 30,
-        })?;
+        container_runtime::stop_container(&name, 30)?;
     }
-
-    daemon::request(&Request::Remove {
-        deploy_id: metadata.deploy_id.clone(),
-    })?;
+    container_runtime::remove_container(&name)?;
 
     unregister_live_deployment(&dir);
     std::fs::remove_dir_all(&dir).with_context(|| {
@@ -373,21 +384,24 @@ fn list_live_deployments(status_filter: Option<LiveStatusFilter>) -> Result<()> 
 
     let filter = status_filter.map(|status| status.as_str().to_string());
     println!(
-        "{:<36} {:<14} {:<8} {:<24} {:<16} {:<12} STRATEGY",
-        "DEPLOY ID", "STATUS", "PID", "LAUNCHED", "BROKERAGE", "ACCOUNT"
+        "{:<36} {:<14} {:<12} {:<24} {:<16} {:<12} STRATEGY",
+        "DEPLOY ID", "STATUS", "CONTAINER", "LAUNCHED", "BROKERAGE", "ACCOUNT"
     );
     for (_, metadata) in rows {
         let status = effective_live_status(&metadata);
         if filter.as_ref().is_some_and(|wanted| wanted != &status) {
             continue;
         }
+        let container = if live_container_alive(&metadata) {
+            "up"
+        } else {
+            "-"
+        };
         println!(
-            "{:<36} {:<14} {:<8} {:<24} {:<16} {:<12} {}",
+            "{:<36} {:<14} {:<12} {:<24} {:<16} {:<12} {}",
             metadata.deploy_id,
             status,
-            running_live_pid(&metadata)
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+            container,
             metadata.launched,
             metadata.brokerage.as_deref().unwrap_or("Paper"),
             metadata
@@ -414,53 +428,20 @@ impl LiveStatusFilter {
     }
 }
 
-fn live_child_args(args: &RunArgs, deployment_dir: &Path) -> Vec<String> {
-    let mut values = vec![
-        "live".to_string(),
-        "--foreground".to_string(),
-        "--live-deploy-dir".to_string(),
-        deployment_dir.to_string_lossy().to_string(),
-        args.strategy.to_string_lossy().to_string(),
-    ];
-
-    if let Some(value) = &args.data_sidecar {
-        values.extend(["--data-sidecar".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.live_data_feed {
-        values.extend(["--live-data-feed".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.brokerage {
-        values.extend(["--brokerage".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.brokerage_account {
-        values.extend(["--brokerage-account".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.start_date {
-        values.extend(["--start-date".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.end_date {
-        values.extend(["--end-date".to_string(), value.clone()]);
-    }
-    for parameter in &args.parameters {
-        values.extend(["--parameter".to_string(), parameter.clone()]);
-    }
-    if let Some(value) = args.live_limits.live_max_slices {
-        values.extend(["--live-max-slices".to_string(), value.to_string()]);
-    }
-    if let Some(value) = args.live_limits.live_max_runtime_seconds {
-        values.extend(["--live-max-runtime-seconds".to_string(), value.to_string()]);
-    }
-    // Propagate the artifact relay flags so the detached child mirrors to S3 too.
-    if let Some(value) = &args.artifact_store {
-        values.extend(["--artifact-store".to_string(), value.clone()]);
-    }
-    if let Some(value) = &args.artifact_s3 {
-        values.extend(["--artifact-s3".to_string(), value.clone()]);
-    }
-    if args.verbose {
-        values.push("--verbose".to_string());
-    }
-    values
+fn live_engine_args(args: &RunArgs) -> Vec<String> {
+    container_runtime::runtime_engine_args(
+        args.data_provider_historical.as_deref(),
+        args.live_data_feed.as_deref(),
+        args.brokerage.as_deref(),
+        args.brokerage_url.as_deref(),
+        args.brokerage_account.as_deref(),
+        args.start_date.as_deref(),
+        args.end_date.as_deref(),
+        &args.parameters,
+        args.verbose,
+        args.live_limits.live_max_slices,
+        args.live_limits.live_max_runtime_seconds,
+    )
 }
 
 fn live_dir_name(datetime: chrono::DateTime<chrono::Utc>, strategy_name: &str) -> String {
@@ -528,18 +509,6 @@ fn deployment_strategy_path(metadata: &LiveDeploymentMetadata, dir: &Path) -> Pa
     )
 }
 
-fn rewrite_live_command_strategy(command: &mut [String], deployment_strategy: &Path) {
-    let Some(last_strategy_arg) = command
-        .iter()
-        .enumerate()
-        .rfind(|(_, arg)| arg.ends_with(".py") || arg.ends_with(".rs"))
-        .map(|(index, _)| index)
-    else {
-        return;
-    };
-    command[last_strategy_arg] = deployment_strategy.display().to_string();
-}
-
 fn deployment_metadata_path(dir: &Path) -> PathBuf {
     dir.join("deployment.json")
 }
@@ -561,87 +530,43 @@ fn read_live_deployment_metadata(dir: &Path) -> Result<LiveDeploymentMetadata> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn write_pid_file(dir: &Path, pid: u32) -> Result<()> {
-    std::fs::write(dir.join("pid"), format!("{pid}\n"))?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn mark_live_deployment_running(
+fn confirm_live_container_started(
     dir: &Path,
-    fallback: &LiveDeploymentMetadata,
-    pid: u32,
-) -> Result<LiveDeploymentMetadata> {
-    let mut metadata = read_live_deployment_metadata(dir).unwrap_or_else(|_| fallback.clone());
-    if is_terminal_live_status(&metadata.status) && metadata.pid == Some(pid) {
-        return Ok(metadata);
-    }
-
-    metadata.pid = Some(pid);
-    metadata.status = "running".to_string();
-    metadata.stopped = None;
-    metadata.updated_at = chrono::Utc::now().to_rfc3339();
-    metadata.error = None;
-    metadata.exit_code = None;
-    write_live_deployment_metadata(dir, &metadata)?;
-    Ok(metadata)
-}
-
-fn confirm_live_deployment_started(
-    dir: &Path,
-    pid: u32,
-    log_path: &Path,
+    container_name: &str,
     timeout: Duration,
 ) -> Result<LiveDeploymentMetadata> {
     let deadline = Instant::now() + timeout;
     loop {
-        let metadata = match read_live_deployment_metadata(dir) {
-            Ok(metadata) => normalize_live_deployment_metadata(dir, metadata),
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+        if container_runtime::container_is_running(container_name) {
+            let mut metadata = read_live_deployment_metadata(dir)?;
+            metadata.container_name = Some(container_name.to_owned());
+            metadata.status = "running".to_string();
+            metadata.stopped = None;
+            metadata.updated_at = chrono::Utc::now().to_rfc3339();
+            metadata.error = None;
+            metadata.exit_code = None;
+            if let Ok(output) = ProcessCommand::new("docker")
+                .args(["inspect", "-f", "{{.Id}}", container_name])
+                .output()
+            {
+                if output.status.success() {
+                    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    if !id.is_empty() {
+                        metadata.container_id = Some(id);
+                    }
+                }
             }
-            Err(error) => return Err(error),
-        };
-
-        if running_live_pid(&metadata) == Some(pid) {
+            write_live_deployment_metadata(dir, &metadata)?;
             return Ok(metadata);
-        }
-
-        // The daemon can return the new child pid before that child replaces a
-        // previous terminal deployment.json snapshot with `running`. Treat a
-        // terminal status as belonging to this launch only after the snapshot
-        // carries this exact pid; otherwise keep waiting while the child lives.
-        if (is_terminal_live_status(&metadata.status) && metadata.pid == Some(pid))
-            || !process_is_alive(pid)
-        {
-            bail!(
-                "live deployment {} exited during startup; status={}{}{}; log={}",
-                metadata.deploy_id,
-                metadata.status,
-                metadata
-                    .exit_code
-                    .map(|code| format!(" exit_code={code}"))
-                    .unwrap_or_default(),
-                metadata
-                    .error
-                    .as_ref()
-                    .map(|error| format!(" error={error}"))
-                    .unwrap_or_default(),
-                log_path.display()
-            );
         }
 
         if Instant::now() >= deadline {
             bail!(
-                "live deployment {} did not report running within {}s; pid={pid} log={}",
-                metadata.deploy_id,
-                timeout.as_secs(),
-                log_path.display()
+                "live deployment container '{container_name}' did not become running within {}s",
+                timeout.as_secs()
             );
         }
-
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -650,7 +575,7 @@ pub(crate) fn update_live_deployment_status(
     status: &str,
     error: Option<String>,
     exit_code: Option<i32>,
-    pid: Option<u32>,
+    _pid: Option<u32>,
 ) {
     let Ok(mut metadata) = read_live_deployment_metadata(dir) else {
         return;
@@ -668,12 +593,9 @@ pub(crate) fn update_live_deployment_status(
     if let Some(exit_code) = exit_code {
         metadata.exit_code = Some(exit_code);
     }
-    if let Some(pid) = pid {
-        metadata.pid = Some(pid);
-        let _ = write_pid_file(dir, pid);
-    }
     if is_terminal_live_status(status) {
         metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
+        metadata.container_id = None;
     }
     let _ = write_live_deployment_metadata(dir, &metadata);
 }
@@ -682,9 +604,27 @@ fn is_terminal_live_status(status: &str) -> bool {
     matches!(status, "stopped" | "runtime-error" | "liquidated")
 }
 
+fn live_container_alive(metadata: &LiveDeploymentMetadata) -> bool {
+    let name = metadata
+        .container_name
+        .clone()
+        .unwrap_or_else(|| container_runtime::live_container_name(&metadata.deploy_id));
+    container_runtime::container_is_running(&name)
+}
+
+fn docker_container_exists(name_or_id: &str) -> bool {
+    ProcessCommand::new("docker")
+        .args(["inspect", name_or_id])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn effective_live_status(metadata: &LiveDeploymentMetadata) -> String {
     if matches!(metadata.status.as_str(), "running" | "launching") {
-        if running_live_pid(metadata).is_some() {
+        if live_container_alive(metadata) {
             return "running".to_string();
         }
         return "stopped".to_string();
@@ -697,13 +637,11 @@ fn normalize_live_deployment_metadata(
     mut metadata: LiveDeploymentMetadata,
 ) -> LiveDeploymentMetadata {
     let effective_status = effective_live_status(&metadata);
-    let should_clear_pid = effective_status != "running" && metadata.pid.is_some();
     let should_update_status = metadata.status != effective_status;
-    if should_clear_pid || should_update_status {
+    if should_update_status {
         metadata.status = effective_status;
         if metadata.status != "running" {
-            metadata.pid = None;
-            let _ = std::fs::remove_file(dir.join("pid"));
+            metadata.container_id = None;
             if metadata.stopped.is_none() {
                 metadata.stopped = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -712,57 +650,6 @@ fn normalize_live_deployment_metadata(
         let _ = write_live_deployment_metadata(dir, &metadata);
     }
     metadata
-}
-
-fn running_live_pid(metadata: &LiveDeploymentMetadata) -> Option<u32> {
-    if !matches!(metadata.status.as_str(), "running" | "launching") {
-        return None;
-    }
-    let pid = metadata.pid?;
-    if process_matches_live_deployment(pid, &metadata.deployment_dir) {
-        Some(pid)
-    } else {
-        None
-    }
-}
-
-fn process_matches_live_deployment(pid: u32, deployment_dir: &Path) -> bool {
-    if !process_is_alive(pid) {
-        return false;
-    }
-    let Ok(output) = ProcessCommand::new("ps")
-        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
-        .output()
-    else {
-        return true;
-    };
-    if !output.status.success() {
-        return true;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let deployment_dir = deployment_dir.to_string_lossy();
-    command.contains("--live-deploy-dir") && command.contains(deployment_dir.as_ref())
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if result == 0 {
-            return true;
-        }
-        let error = std::io::Error::last_os_error();
-        error.raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    ProcessCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 fn register_live_deployment(dir: &Path) {
@@ -871,21 +758,52 @@ fn find_live_deployment_dir(deploy_id: &str) -> Result<PathBuf> {
     bail!("live deployment not found: {deploy_id}")
 }
 
-fn print_json_file(path: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(value) => print_json_value(&value),
-        Err(_) => {
-            print!("{text}");
-            Ok(())
-        }
-    }
-}
-
 fn print_json_value(value: &serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn print_catalog_checkpoint_field(run_id: &str, field: &str) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create tokio runtime for catalog query")?;
+    runtime.block_on(async {
+        let config = GlobalConfig::load()?;
+        let client = crate::runtime::connect_verglas(&config).await?;
+        let escaped = run_id.replace('\'', "''");
+        let sql = format!(
+            "SELECT payload_json FROM rlean.checkpoints \
+             WHERE run_id = '{escaped}' ORDER BY recorded_at DESC LIMIT 1"
+        );
+        use futures::TryStreamExt;
+        let batches = client
+            .query_stream(&sql)
+            .await
+            .context("query live checkpoint")?
+            .try_collect::<Vec<_>>()
+            .await
+            .context("read live checkpoint stream")?;
+        let payload = batches
+            .iter()
+            .flat_map(|batch| {
+                use arrow_array::Array;
+                let col = batch.column(0);
+                (0..batch.num_rows()).filter_map(move |row| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        arrow_cast::display::array_value_to_string(col.as_ref(), row).ok()
+                    }
+                })
+            })
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no catalog checkpoint for run_id={run_id}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).context("parse checkpoint payload")?;
+        let field_value = value.get(field).cloned().unwrap_or(serde_json::Value::Null);
+        print_json_value(&field_value)
+    })
 }
 
 fn print_tail(path: &Path, lines: usize) -> Result<()> {
@@ -935,80 +853,60 @@ mod tests {
     }
 
     #[test]
-    fn test_live_child_args_include_foreground_and_deploy_dir() {
+    fn test_live_engine_args_include_runtime_flags() {
         let args = RunArgs {
             strategy: PathBuf::from("/tmp/strategy/main.py"),
             runtime: RuntimeArgs {
-                data_sidecar: Some("tcp://127.0.0.1:50051".to_string()),
-                data_sidecar_token: None,
+                data_provider_historical: Some("massive".to_string()),
                 live_data_feed: Some("tradier".to_string()),
-                brokerage: Some("hyperliquid".to_string()),
+                brokerage: Some("http".to_string()),
+                brokerage_url: Some("http://127.0.0.1:5199".to_string()),
                 brokerage_account: Some("account-1234".to_string()),
                 start_date: None,
                 end_date: None,
                 parameters: vec!["foo=bar".to_string()],
-                artifact_store: None,
-                artifact_s3: None,
                 verbose: true,
             },
-            report: None,
             live_limits: LiveLimitArgs {
                 live_max_slices: Some(2),
                 live_max_runtime_seconds: Some(10),
             },
+            native: false,
+            pull: false,
         };
-        let child_args = live_child_args(&args, Path::new("/tmp/strategy/live/deploy"));
+        let engine_args = live_engine_args(&args);
 
-        assert_eq!(child_args[0], "live");
-        assert!(child_args.contains(&"--foreground".to_string()));
-        assert!(child_args.contains(&"--live-deploy-dir".to_string()));
-        assert!(!child_args.contains(&"--live-trading".to_string()));
-        assert!(child_args.contains(&"/tmp/strategy/live/deploy".to_string()));
-        assert!(child_args.contains(&"--parameter".to_string()));
-        assert!(child_args.contains(&"foo=bar".to_string()));
-        assert!(child_args.contains(&"--data-sidecar".to_string()));
-        assert!(child_args.contains(&"--live-data-feed".to_string()));
-        assert!(child_args.contains(&"--brokerage-account".to_string()));
-        assert!(child_args.contains(&"account-1234".to_string()));
-        assert!(!child_args.contains(&"--data-sidecar-token".to_string()));
-        assert!(child_args.contains(&"--verbose".to_string()));
+        assert!(engine_args.contains(&"--parameter".to_string()));
+        assert!(engine_args.contains(&"foo=bar".to_string()));
+        assert!(engine_args.contains(&"--data-provider-historical".to_string()));
+        assert!(engine_args.contains(&"massive".to_string()));
+        assert!(engine_args.contains(&"--live-data-feed".to_string()));
+        assert!(engine_args.contains(&"--brokerage-url".to_string()));
+        assert!(engine_args.contains(&"http://host.docker.internal:5199".to_string()));
+        assert!(engine_args.contains(&"--brokerage-account".to_string()));
+        assert!(engine_args.contains(&"account-1234".to_string()));
+        assert!(engine_args.contains(&"-v".to_string()));
     }
 
     #[test]
-    fn test_rewrite_live_command_strategy_uses_snapshot_path() {
-        let mut command = vec![
-            "/usr/local/bin/rlean".to_string(),
-            "live".to_string(),
-            "--foreground".to_string(),
-            "--live-deploy-dir".to_string(),
-            "/tmp/deploy".to_string(),
-            "/tmp/source/main.py".to_string(),
-            "--parameter".to_string(),
-            "mode=review".to_string(),
-            "--verbose".to_string(),
-        ];
-
-        rewrite_live_command_strategy(&mut command, Path::new("/tmp/deploy/code/main.py"));
-
-        assert_eq!(command[5], "/tmp/deploy/code/main.py");
-        assert_eq!(command[7], "mode=review");
-    }
-
-    #[test]
-    fn test_mark_live_deployment_running_preserves_terminal_child_status() {
+    fn test_metadata_round_trips_container_fields() {
         let root = std::env::temp_dir().join(format!(
-            "rlean-live-terminal-status-test-{}",
+            "rlean-live-container-meta-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        let stale = LiveDeploymentMetadata {
+        let meta = LiveDeploymentMetadata {
             deploy_id: "deploy-1".to_string(),
             strategy: PathBuf::from("/tmp/source/main.py"),
             strategy_name: "source".to_string(),
             deployment_dir: root.clone(),
             pid: None,
+            container_id: Some("abc123".into()),
+            container_name: Some("rlean-live-deploy-1".into()),
+            image: Some(container_runtime::DEFAULT_IMAGE.into()),
+            run_id: Some("live-deploy-1".into()),
             status: "paused".to_string(),
             launched: "2026-06-22T00:00:00Z".to_string(),
             stopped: Some("2026-06-22T00:01:00Z".to_string()),
@@ -1016,34 +914,17 @@ mod tests {
             brokerage: Some("paper".to_string()),
             brokerage_account: None,
             paper_trading: true,
-            command: vec![
-                "/usr/local/bin/rlean".to_string(),
-                "live".to_string(),
-                "--foreground".to_string(),
-                "--live-deploy-dir".to_string(),
-                root.to_string_lossy().to_string(),
-                "/tmp/source/main.py".to_string(),
-            ],
+            command: vec!["--brokerage".into(), "paper".into()],
             error: None,
             exit_code: None,
         };
-        let mut terminal = stale.clone();
-        terminal.pid = Some(42);
-        terminal.status = "runtime-error".to_string();
-        terminal.stopped = Some("2026-06-22T00:02:00Z".to_string());
-        terminal.updated_at = "2026-06-22T00:02:00Z".to_string();
-        terminal.error = Some("boom".to_string());
-        terminal.exit_code = Some(1);
-        write_live_deployment_metadata(&root, &terminal).unwrap();
-
-        let result = mark_live_deployment_running(&root, &stale, 42).unwrap();
+        write_live_deployment_metadata(&root, &meta).unwrap();
         let persisted = read_live_deployment_metadata(&root).unwrap();
-
-        assert_eq!(result.status, "runtime-error");
-        assert_eq!(persisted.status, "runtime-error");
-        assert_eq!(persisted.pid, Some(42));
-        assert_eq!(persisted.error.as_deref(), Some("boom"));
-
+        assert_eq!(persisted.container_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            persisted.container_name.as_deref(),
+            Some("rlean-live-deploy-1")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

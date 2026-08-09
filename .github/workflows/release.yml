@@ -183,7 +183,6 @@ jobs:
           OUT="dist"
           mkdir -p "$OUT/stage"
           cp target/release/rlean "$OUT/stage/rlean"
-          cp target/release/rleand "$OUT/stage/rleand"
           # coreutils sha256sum on Linux, shasum -a 256 on macOS.
           if command -v sha256sum >/dev/null 2>&1; then
             SHACMD="sha256sum"
@@ -191,7 +190,6 @@ jobs:
             SHACMD="shasum -a 256"
           fi
           SHA=$($SHACMD "$OUT/stage/rlean" | awk '{print $1}')
-          DAEMON_SHA=$($SHACMD "$OUT/stage/rleand" | awk '{print $1}')
           if [ -z "${{ matrix.container }}" ]; then
             PYVER=$("$PYO3_PYTHON" -c 'import platform; print(platform.python_version())')
             cat > "$OUT/stage/manifest.json" <<EOF
@@ -204,7 +202,6 @@ jobs:
             "python_build_version": "${PYVER}",
             "requires_python_framework": "/opt/homebrew/opt/python@3.14",
             "sha256": "${SHA}",
-            "rleand_sha256": "${DAEMON_SHA}",
             "git_sha": "${GITHUB_SHA}"
           }
           EOF
@@ -220,13 +217,12 @@ jobs:
             "python_build_version": "${PYVER}",
             "requires_libpython": "libpython3.9.so.1.0",
             "sha256": "${SHA}",
-            "rleand_sha256": "${DAEMON_SHA}",
             "git_sha": "${GITHUB_SHA}"
           }
           EOF
           fi
           TARBALL="rlean-${VERSION}-${TRIPLE}.tar.gz"
-          tar -C "$OUT/stage" -czf "$OUT/${TARBALL}" rlean rleand manifest.json
+          tar -C "$OUT/stage" -czf "$OUT/${TARBALL}" rlean manifest.json
           ( cd "$OUT" && $SHACMD "${TARBALL}" > "${TARBALL}.sha256" )
           rm -rf "$OUT/stage"
           echo "== bundle =="; ls -la "$OUT"; cat "$OUT/${TARBALL}.sha256"

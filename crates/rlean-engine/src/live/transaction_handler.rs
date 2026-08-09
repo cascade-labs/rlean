@@ -1,11 +1,10 @@
 //! Engine-owned live transaction handler.
 //!
-//! Modeled on C# LEAN's `BrokerageTransactionHandler`. With a sidecar execution
-//! connection, new orders are sent over the persistent Flight exchange and
-//! fills/status changes are pushed back by the sidecar instead of being filled
-//! locally by the `ImmediateFillModel`.
+//! Modeled on C# LEAN's `BrokerageTransactionHandler`. Orders are sent through
+//! the selected native brokerage instead of being filled locally by the
+//! `ImmediateFillModel`.
 //!
-//! A dedicated worker owns the sidecar event stream. The live loop communicates
+//! A dedicated worker owns the brokerage connection. The live loop communicates
 //! with it over two crossbeam channels:
 //!
 //!   * request channel (loop -> worker): submit/cancel/update/cash-sync/stop.
@@ -14,18 +13,13 @@
 //! Portfolio, `TransactionManager` and algorithm callbacks are only ever touched
 //! on the live-loop thread. The worker only talks to the brokerage.
 
-use anyhow::Context;
 use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
 use rlean_algorithm::qc_algorithm::{AccountType, QcAlgorithm};
-#[cfg(test)]
 use rlean_brokerages::Brokerage;
 use rlean_core::{DateTime, Price, Quantity};
-use rlean_data_sidecar::{
-    order_status_from_wire, symbol_from_wire, BrokerageEvent as SidecarBrokerageEvent,
-};
 use rlean_orders::{Order, OrderEvent, OrderStatus, OrderType, TransactionManager};
 use rlean_statistics::{Trade, TradeBuilder};
 use rust_decimal::Decimal;
@@ -82,9 +76,6 @@ pub(crate) enum BrokerageEvent {
     },
     /// Authoritative per-currency cash balances returned by the brokerage.
     CashSnapshot { cash_balances: Vec<(String, Price)> },
-    /// A cash snapshot failed. Trading continues and the synchronization state
-    /// retries with backoff; a brokerage outage must not terminate a strategy.
-    CashSyncFailed { message: String },
 }
 
 /// Backoff schedule for retrying a failed order submission. Its length + 1 is
@@ -92,7 +83,7 @@ pub(crate) enum BrokerageEvent {
 /// up to three times (initial submit, then a retry 5s later, then 15s later).
 /// A submission that still fails after the last delay goes terminally `Invalid`.
 ///
-/// The delays are deliberately short and few: a retryable sidecar response is
+/// The delays are deliberately short and few: a retryable brokerage response is
 /// most often a transient transport hiccup (e.g. a response-decode failure), so a
 /// couple of spaced-out retries recover it, while a genuine rejection surfaced
 /// as `Err` just fails a couple more times and reaches the same terminal state
@@ -205,7 +196,6 @@ impl LiveCashSyncState {
 
 /// State the worker tracks per order it has seen from the brokerage, so it only
 /// emits an event when something actually changed.
-#[cfg(test)]
 #[derive(Default, Clone)]
 struct TrackedBrokerageOrder {
     status: Option<OrderStatus>,
@@ -228,7 +218,7 @@ pub struct LiveBrokerageRouter {
     /// Cumulative filled quantity already applied to the portfolio per order, so
     /// repeated pushed snapshots only apply the incremental delta.
     applied_filled: HashMap<i64, Quantity>,
-    /// Cumulative brokerage fees already applied per order. Sidecar updates are
+    /// Cumulative brokerage fees already applied per order. Brokerage updates are
     /// snapshots and may be repeated, so only the incremental fee is charged.
     applied_fees: HashMap<i64, Price>,
     /// Backoff schedule between submission retries. Kept as a field (rather than a
@@ -273,7 +263,6 @@ fn fee_model_order_for_fill(order: &Order, fill_quantity: Quantity) -> Order {
 impl LiveBrokerageRouter {
     /// Spawn the worker thread and hand ownership of the brokerage to it, using
     /// the default `SUBMIT_BACKOFF` retry schedule.
-    #[cfg(test)]
     pub fn spawn(brokerage: Box<dyn Brokerage>) -> Self {
         Self::spawn_with_backoff(brokerage, SUBMIT_BACKOFF.to_vec())
     }
@@ -281,7 +270,6 @@ impl LiveBrokerageRouter {
     /// Spawn with an explicit submission-retry backoff schedule. Tests use this
     /// to inject a fast (near-zero) schedule so retry behavior can be exercised
     /// without sleeping the production 5s/15s delays.
-    #[cfg(test)]
     pub fn spawn_with_backoff(
         brokerage: Box<dyn Brokerage>,
         submit_backoff: Vec<std::time::Duration>,
@@ -310,39 +298,10 @@ impl LiveBrokerageRouter {
         }
     }
 
-    /// Route live orders through the authenticated sidecar execution
-    /// connection. The worker consumes pushed brokerage events; it never polls
-    /// the remote brokerage from rlean.
-    pub fn spawn_sidecar(connection: crate::runner_config::SidecarBrokerageConnection) -> Self {
-        let (request_tx, request_rx) = crossbeam_channel::unbounded::<BrokerageRequest>();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<BrokerageEvent>();
-        let worker = std::thread::Builder::new()
-            .name("live-sidecar-brokerage-router".to_string())
-            .spawn(move || run_sidecar_worker(connection, request_rx, event_tx))
-            .expect("failed to spawn live sidecar brokerage router worker");
-        Self {
-            request_tx,
-            event_rx,
-            worker: Some(worker),
-            submitted_ids: std::collections::HashSet::new(),
-            cancel_forwarded: std::collections::HashSet::new(),
-            update_forwarded: std::collections::HashSet::new(),
-            applied_filled: HashMap::new(),
-            applied_fees: HashMap::new(),
-            submit_backoff: SUBMIT_BACKOFF.to_vec(),
-            submit_attempts: HashMap::new(),
-            retry_not_before: HashMap::new(),
-            moo_deferred_logged: std::collections::HashSet::new(),
-            price_deferred_logged: std::collections::HashSet::new(),
-            cash_sync: LiveCashSyncState::new(DateTime::now()),
-        }
-    }
-
     /// Request C# LEAN-style authoritative cash synchronization when the
     /// brokerage session has crossed into a new New York date and it is at
     /// least 07:45 ET. The request is non-blocking and runs through the worker
-    /// that owns the current sidecar connection id, so reconnects cannot leave
-    /// this path pointing at a stale connection.
+    /// that owns the current brokerage connection.
     pub fn request_cash_sync_if_due(&mut self, now: DateTime) {
         if !self.cash_sync.should_request(now) {
             return;
@@ -429,7 +388,7 @@ impl LiveBrokerageRouter {
                 {
                     // C# LEAN's BrokerageSetupHandler resolves a zero brokerage
                     // holding price through GetLastKnownPrice before orders can
-                    // be submitted. Live sidecar pricing is asynchronous, so if
+                    // be submitted. Live pricing is asynchronous, so if
                     // both snapshot and history seeding are empty, keep a
                     // reducing order New until its first quote instead of
                     // terminally invalidating a liquidation that requires no
@@ -486,7 +445,7 @@ impl LiveBrokerageRouter {
     /// respecting market hours:
     ///
     /// * A `MarketOnOpen` order is engine-held while its exchange is closed and
-    ///   released only once the exchange is open. Sidecar adapters have no
+    ///   released only once the exchange is open. Brokerage adapters have no
     ///   native market-on-open type, so the released submission goes out as a
     ///   plain market order — the engine-side hold is what provides LEAN's
     ///   "fill at the next market open" semantics.
@@ -552,7 +511,7 @@ impl LiveBrokerageRouter {
         self.retry_not_before.remove(&order_id);
         self.submitted_ids.insert(order_id);
         *self.submit_attempts.entry(order_id).or_default() += 1;
-        // Sidecar brokerage adapters translate market/limit/stop types, so a released
+        // Brokerage adapters translate market/limit/stop types, so a released
         // market-on-open order crosses the wire as a market order; the engine
         // order keeps its MarketOnOpen type for the audit trail.
         let mut wire_order = order;
@@ -829,14 +788,6 @@ impl LiveBrokerageRouter {
                 }
                 self.cash_sync.request_succeeded(now);
             }
-            BrokerageEvent::CashSyncFailed { message } => {
-                let now = DateTime::now();
-                self.cash_sync.request_failed(now);
-                tracing::warn!(
-                    attempt = self.cash_sync.failures,
-                    "brokerage cash synchronization failed; trading remains active and the sync will retry: {message}"
-                );
-            }
         }
     }
 
@@ -909,310 +860,11 @@ fn status_message(status: OrderStatus) -> String {
 }
 
 /// Poll cadence for brokerage account-order reconciliation.
-#[cfg(test)]
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
-
-/// Re-establish a sidecar brokerage connection after its event stream dropped.
-///
-/// First re-establishes the shared Flight session (coalesced with the data
-/// feed's own reconnect), then re-opens the brokerage connection to obtain a
-/// fresh event stream. Uses the same bounded 1s→60s backoff and retries a
-/// restarting sidecar forever; a non-transient failure (bad credentials,
-/// misconfiguration) is surfaced instead of looping.
-async fn reopen_sidecar_brokerage(
-    client: &rlean_data_sidecar::DataSidecarClient,
-    failed_epoch: u64,
-    provider: &str,
-    opaque_config_json: &[u8],
-) -> anyhow::Result<(u64, rlean_data_sidecar::BrokerageEventStream, u64)> {
-    let policy = rlean_live::ReconnectPolicy::sidecar_session();
-    let mut attempt: u32 = 0;
-    loop {
-        let outcome = async {
-            client.reconnect_failed_epoch(failed_epoch).await?;
-            let connection = client
-                .open_brokerage(provider.to_string(), opaque_config_json.to_vec())
-                .await?;
-            Ok::<_, anyhow::Error>((connection.0, connection.1, client.session_epoch()))
-        }
-        .await;
-        match outcome {
-            Ok(connection) => return Ok(connection),
-            Err(error) => {
-                if !rlean_live::is_transient_sidecar_error(&error) {
-                    return Err(error);
-                }
-                attempt = attempt.saturating_add(1);
-                let delay = policy.delay_for_attempt(attempt - 1);
-                tracing::warn!(
-                    attempt,
-                    delay_secs = delay.as_secs(),
-                    brokerage = %provider,
-                    "sidecar brokerage down; retrying reconnect: {error}"
-                );
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
-fn run_sidecar_worker(
-    mut connection: crate::runner_config::SidecarBrokerageConnection,
-    request_rx: Receiver<BrokerageRequest>,
-    event_tx: Sender<BrokerageEvent>,
-) {
-    use futures::StreamExt;
-
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!("live sidecar brokerage worker failed to start runtime: {error}");
-            return;
-        }
-    };
-    runtime.block_on(async move {
-        let client = connection.client.clone();
-        // Updated when the brokerage connection is re-opened after a sidecar
-        // restart. The logical session id stays stable for idempotent commands;
-        // each underlying Flight transport generation has its own protocol id.
-        let mut connection_id = connection.connection_id;
-        // Epoch that owns `connection.events`. A concurrent data-stream
-        // reconnect may already have advanced the shared session by the time
-        // this stream reports its failure; retaining the owning epoch prevents
-        // the brokerage worker from reconnecting that fresh session again.
-        let mut connection_epoch = connection.session_epoch;
-        let session_id = client.session_id().to_string();
-        let mut stop = false;
-        while !stop {
-            loop {
-                match request_rx.try_recv() {
-                    Ok(BrokerageRequest::Stop) => {
-                        stop = true;
-                        break;
-                    }
-                    Ok(BrokerageRequest::Submit(order)) => {
-                        let command_id =
-                            format!("{session_id}:{connection_id}:submit:{}", order.id);
-                        let order_id = order.id;
-                        match client
-                            .submit_order(connection_id, command_id, (&order).into())
-                            .await
-                        {
-                            Ok(result) if result.accepted => {
-                                let _ = event_tx.send(BrokerageEvent::Submitted {
-                                    order_id,
-                                    brokerage_ids: result.brokerage_order_ids,
-                                });
-                            }
-                            Ok(result) if result.retryable => {
-                                let _ = event_tx.send(BrokerageEvent::SubmitFailed {
-                                    order_id,
-                                    message: result.message,
-                                });
-                            }
-                            Ok(result) => {
-                                let _ = event_tx.send(BrokerageEvent::Invalid {
-                                    order_id,
-                                    message: result.message,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = event_tx.send(BrokerageEvent::SubmitFailed {
-                                    order_id,
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Ok(BrokerageRequest::Update(order)) => {
-                        let command_id =
-                            format!("{session_id}:{connection_id}:update:{}", order.id);
-                        match client
-                            .update_order(connection_id, command_id, (&order).into())
-                            .await
-                        {
-                            Ok(result) if result.accepted => {}
-                            Ok(result) => tracing::warn!(
-                                order_id = order.id,
-                                retryable = result.retryable,
-                                "sidecar brokerage rejected order update: {}",
-                                result.message
-                            ),
-                            Err(error) => tracing::warn!(
-                                order_id = order.id,
-                                "sidecar brokerage update failed: {error}"
-                            ),
-                        }
-                    }
-                    Ok(BrokerageRequest::Cancel(order)) => {
-                        let command_id =
-                            format!("{session_id}:{connection_id}:cancel:{}", order.id);
-                        match client
-                            .cancel_order(
-                                connection_id,
-                                command_id,
-                                order.id,
-                                order.brokerage_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok(result) if result.accepted => {}
-                            Ok(result) => tracing::warn!(
-                                order_id = order.id,
-                                retryable = result.retryable,
-                                "sidecar brokerage rejected order cancellation: {}",
-                                result.message
-                            ),
-                            Err(error) => tracing::warn!(
-                                order_id = order.id,
-                                "sidecar brokerage cancellation failed: {error}"
-                            ),
-                        }
-                    }
-                    Ok(BrokerageRequest::CashSync) => {
-                        let result = client
-                            .brokerage_snapshot(connection_id)
-                            .await
-                            .and_then(|snapshot| {
-                                snapshot
-                                    .cash
-                                    .into_iter()
-                                    .map(|balance| {
-                                        Ok((
-                                            balance.currency,
-                                            balance.amount.parse().with_context(|| {
-                                                format!(
-                                                    "invalid brokerage cash amount '{}'",
-                                                    balance.amount
-                                                )
-                                            })?,
-                                        ))
-                                    })
-                                    .collect::<anyhow::Result<Vec<_>>>()
-                            });
-                        match result {
-                            Ok(cash_balances) => {
-                                let _ = event_tx.send(BrokerageEvent::CashSnapshot {
-                                    cash_balances,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = event_tx.send(BrokerageEvent::CashSyncFailed {
-                                    message: error.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        stop = true;
-                        break;
-                    }
-                }
-            }
-            if stop {
-                break;
-            }
-
-            let mut reconnect_reason = None;
-            tokio::select! {
-                event = connection.events.next() => {
-                    match event {
-                        Some(Ok(SidecarBrokerageEvent::Order(update))) => {
-                            let parsed = (|| -> anyhow::Result<BrokerageEvent> {
-                                let symbol = symbol_from_wire(
-                                    update.symbol.context("brokerage order update is missing symbol")?
-                                )?;
-                                let status = order_status_from_wire(update.status)?;
-                                let cumulative_filled = update.cumulative_filled_quantity.parse()
-                                    .context("invalid cumulative brokerage fill quantity")?;
-                                let fill_price = update.average_fill_price.parse()
-                                    .context("invalid brokerage average fill price")?;
-                                let commission = update.cumulative_fee
-                                    .as_deref()
-                                    .map(str::parse)
-                                    .transpose()
-                                    .context("invalid cumulative brokerage fee")?;
-                                Ok(BrokerageEvent::Status {
-                                    order_id: update.engine_order_id,
-                                    symbol,
-                                    status,
-                                    fill_price,
-                                    cumulative_filled,
-                                    commission,
-                                })
-                            })();
-                            match parsed {
-                                Ok(event) => { let _ = event_tx.send(event); }
-                                Err(error) => tracing::error!("invalid sidecar brokerage update: {error}"),
-                            }
-                        }
-                        Some(Ok(SidecarBrokerageEvent::Connection(state))) => {
-                            if !state.connected {
-                                reconnect_reason = Some(format!(
-                                    "brokerage reported disconnected: {}",
-                                    state.message
-                                ));
-                            }
-                        }
-                        Some(Err(error)) => {
-                            reconnect_reason =
-                                Some(format!("brokerage event stream failed: {error}"));
-                        }
-                        None => {
-                            reconnect_reason =
-                                Some("brokerage event stream closed".to_string());
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-            }
-            if let Some(reason) = reconnect_reason {
-                tracing::warn!(
-                    brokerage = %connection.name,
-                    "{reason}; re-establishing"
-                );
-                match reopen_sidecar_brokerage(
-                    &client,
-                    connection_epoch,
-                    &connection.name,
-                    &connection.opaque_config_json,
-                )
-                .await
-                {
-                    Ok((new_id, events, new_epoch)) => {
-                        connection_id = new_id;
-                        connection_epoch = new_epoch;
-                        connection.events = events;
-                        tracing::warn!(
-                            brokerage = %connection.name,
-                            connection_id = new_id,
-                            session_epoch = new_epoch,
-                            "re-established sidecar brokerage event stream"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            "sidecar brokerage reconnect is not retryable: {error}"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-        if let Err(error) = client.close_brokerage(connection_id).await {
-            tracing::warn!("failed to close sidecar brokerage connection: {error}");
-        }
-    });
-}
 
 /// Worker loop: owns the brokerage, services submission/cancel/update requests,
 /// and polls order state. Runs on its own thread with a current-thread tokio
 /// runtime so brokerage adapters that `block_on` internally work correctly.
-#[cfg(test)]
 fn run_worker(
     mut brokerage: Box<dyn Brokerage>,
     request_rx: Receiver<BrokerageRequest>,
@@ -1268,7 +920,6 @@ fn run_worker(
     }
 }
 
-#[cfg(test)]
 fn handle_submit(
     brokerage: &mut dyn Brokerage,
     order: Order,
@@ -1310,7 +961,6 @@ fn handle_submit(
 
 /// Poll the brokerage for all account orders and emit an event for any that
 /// changed status or accumulated additional fills.
-#[cfg(test)]
 fn poll_account_orders(
     brokerage: &dyn Brokerage,
     event_tx: &Sender<BrokerageEvent>,
@@ -1349,7 +999,6 @@ fn poll_account_orders(
 /// Map a polled account order back to the engine order id. Uses the brokerage-id
 /// map first, then falls back to the engine order id carried on the order when
 /// the brokerage echoes it.
-#[cfg(test)]
 fn resolve_engine_order_id(
     order: &Order,
     brokerage_to_engine: &HashMap<String, i64>,
@@ -1377,109 +1026,11 @@ pub struct StartupAccountSync {
     pub open_orders: Vec<Order>,
 }
 
-/// Pull the initial account snapshot through the already-authenticated sidecar
-/// brokerage connection and seed the engine-owned portfolio/order state.
-pub async fn startup_sidecar_account_sync(
-    connection: &crate::runner_config::SidecarBrokerageConnection,
-    portfolio: Option<&Arc<SecurityPortfolioManager>>,
-    transactions: Option<&Arc<TransactionManager>>,
-) -> anyhow::Result<StartupAccountSync> {
-    let snapshot = connection
-        .client
-        .brokerage_snapshot(connection.connection_id)
-        .await?;
-    let cash_balances = snapshot
-        .cash
-        .into_iter()
-        .map(|balance| {
-            Ok((
-                balance.currency,
-                balance.amount.parse().with_context(|| {
-                    format!("invalid brokerage cash amount '{}'", balance.amount)
-                })?,
-            ))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let holdings = snapshot
-        .holdings
-        .into_iter()
-        .map(|holding| {
-            Ok(rlean_brokerages::BrokerageHolding {
-                symbol: symbol_from_wire(
-                    holding
-                        .symbol
-                        .context("brokerage holding is missing its symbol")?,
-                )?,
-                quantity: holding
-                    .quantity
-                    .parse()
-                    .context("invalid brokerage holding quantity")?,
-                average_price: holding
-                    .average_price
-                    .parse()
-                    .context("invalid brokerage holding average price")?,
-                market_price: holding
-                    .market_price
-                    .parse()
-                    .context("invalid brokerage holding market price")?,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let open_orders = snapshot
-        .open_orders
-        .into_iter()
-        .map(Order::try_from)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let cash = rlean_live::account_sync::settlement_cash(&cash_balances);
-
-    if let Some(portfolio) = portfolio {
-        if !cash_balances.is_empty() {
-            *portfolio.cash.write() = cash;
-        }
-        for holding in &holdings {
-            if holding.quantity.is_zero() {
-                continue;
-            }
-            let multiplier = rlean_algorithm::portfolio::SecurityHolding::infer_contract_multiplier(
-                &holding.symbol,
-            );
-            portfolio.set_holdings(
-                &holding.symbol,
-                holding.average_price,
-                holding.quantity,
-                multiplier,
-            );
-            if holding.market_price > Decimal::ZERO {
-                portfolio.update_prices(&holding.symbol, holding.market_price);
-            }
-        }
-    }
-    if let Some(transactions) = transactions {
-        for order in &open_orders {
-            transactions.add_or_update_order(order.clone());
-        }
-    }
-    tracing::info!(
-        "Brokerage account sync: brokerage={} cash={cash} currencies={} holdings={} open_orders={}",
-        connection.name,
-        cash_balances.len(),
-        holdings.len(),
-        open_orders.len(),
-    );
-    Ok(StartupAccountSync {
-        cash,
-        cash_balances,
-        holdings,
-        open_orders,
-    })
-}
-
 /// Connect the brokerage and pull cash, holdings and open orders, seeding the
 /// portfolio and transaction manager. Mirrors C# `BrokerageSetupHandler`.
 ///
 /// Runs the blocking brokerage calls on a dedicated thread so we do not stall
 /// the async runtime, matching the worker's isolation model.
-#[cfg(test)]
 pub fn startup_account_sync(
     brokerage: &mut Box<dyn Brokerage>,
     portfolio: Option<&Arc<SecurityPortfolioManager>>,

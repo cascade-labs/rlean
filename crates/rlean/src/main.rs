@@ -19,13 +19,12 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-mod artifacts_config;
 mod backtest;
 mod cli;
 mod cloud;
 mod config;
 mod config_cmd;
-mod daemon_cmd;
+mod container_runtime;
 mod data_cmd;
 mod init;
 mod live;
@@ -33,6 +32,8 @@ mod live_deployments;
 mod project;
 mod research;
 mod research_daemon;
+mod run_catalog;
+mod runs_cmd;
 mod runtime;
 mod stubs_cmd;
 mod vcs_cmd;
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
         if verbose {
             EnvFilter::new(
                 "info,rlean=debug,rlean_algorithm=debug,rlean_core=debug,rlean_data=debug,\
-                 rlean_data_sidecar=debug,rlean_engine=debug,lean_python=debug",
+                 rlean_engine=debug,lean_python=debug",
             )
         } else {
             EnvFilter::new("info")
@@ -79,12 +80,12 @@ async fn main() -> Result<()> {
         Command::Config(args) => run_config(args),
         Command::Data(args) => run_data(args).await,
         Command::Backtest(args) => backtest::run(args).await,
+        Command::Runs(args) => runs_cmd::run(args).await,
         Command::Live(args) => live::run(args).await,
         Command::Research(args) => run_research(args),
         Command::Stubs(args) => run_stubs(args),
         Command::Vcs(args) => run_vcs(args),
         Command::Cloud(args) => cloud::run(args),
-        Command::Daemon(args) => daemon_cmd::run(args),
         Command::ResearchDaemon(args) => run_daemon(args),
     }
 }
@@ -181,10 +182,12 @@ mod tests {
             "rlean",
             "live",
             "main.py",
-            "--data-sidecar",
-            "tcp://127.0.0.1:50051",
+            "--live-data-feed",
+            "tradier",
             "--brokerage",
             "fidelity",
+            "--brokerage-url",
+            "http://127.0.0.1:5199",
             "--brokerage-account",
             "account-1234",
         ])
@@ -194,18 +197,13 @@ mod tests {
             Command::Live(args) => {
                 assert!(args.command.is_none());
                 assert_eq!(args.strategy.as_deref(), Some(Path::new("main.py")));
-                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
+                assert_eq!(args.live_data_feed.as_deref(), Some("tradier"));
                 assert_eq!(args.brokerage.as_deref(), Some("fidelity"));
+                assert_eq!(args.brokerage_url.as_deref(), Some("http://127.0.0.1:5199"));
                 assert_eq!(args.brokerage_account.as_deref(), Some("account-1234"));
             }
             _ => panic!("expected live command"),
         }
-    }
-
-    #[test]
-    fn test_daemon_install_cli_parse() {
-        let cli = Cli::try_parse_from(["rlean", "daemon", "install"]).unwrap();
-        assert!(matches!(cli.command, Command::Daemon(_)));
     }
 
     #[test]
@@ -327,8 +325,8 @@ mod tests {
             "--live-deploy-dir",
             "/tmp/deploy",
             "/tmp/strategy/main.py",
-            "--data-sidecar",
-            "tcp://127.0.0.1:50051",
+            "--live-data-feed",
+            "tradier",
         ])
         .unwrap();
 
@@ -340,7 +338,7 @@ mod tests {
                     args.strategy.as_deref(),
                     Some(Path::new("/tmp/strategy/main.py"))
                 );
-                assert_eq!(args.data_sidecar.as_deref(), Some("tcp://127.0.0.1:50051"));
+                assert_eq!(args.live_data_feed.as_deref(), Some("tradier"));
             }
             _ => panic!("expected live command"),
         }

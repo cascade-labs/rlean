@@ -21,12 +21,8 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    /// Backoff for re-establishing a live sidecar Flight session.
-    ///
-    /// The data sidecar restarting is a normal event — its own supervisor
-    /// restarts it on the same 1s→60s curve — so reconnection retries
-    /// indefinitely rather than giving up on the strategy's market data.
-    pub fn sidecar_session() -> Self {
+    /// Backoff for re-establishing a live provider or brokerage stream.
+    pub fn live_stream() -> Self {
         Self {
             max_attempts: u32::MAX,
             initial_delay: Duration::from_secs(1),
@@ -45,19 +41,14 @@ impl ReconnectPolicy {
     }
 }
 
-/// Classify a sidecar failure for a reconnect supervisor.
-///
-/// A restarting or crash-looping sidecar is a transient failure: retry with
-/// backoff, forever. Permanent misconfiguration or protocol violations will not
-/// fix themselves, so they are surfaced instead of looping. Mirrors the daemon's
-/// `transient_sidecar_failure` policy.
-pub fn is_transient_sidecar_error(error: &anyhow::Error) -> bool {
+/// Classify a provider or brokerage failure for a reconnect supervisor.
+pub fn is_transient_connection_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_lowercase();
     const HARD_MARKERS: [&str; 4] = [
         "authorization",
-        "unsupported flight endpoint",
-        "protocol version",
-        "invalid initialize acknowledgement",
+        "unsupported provider",
+        "invalid provider configuration",
+        "invalid brokerage configuration",
     ];
     !HARD_MARKERS.iter().any(|marker| message.contains(marker))
 }
@@ -100,34 +91,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidecar_session_backoff_starts_at_one_second_and_caps_at_sixty() {
-        let policy = ReconnectPolicy::sidecar_session();
+    fn live_stream_backoff_starts_at_one_second_and_caps_at_sixty() {
+        let policy = ReconnectPolicy::live_stream();
         assert_eq!(policy.delay_for_attempt(0), Duration::from_secs(1));
         assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(2));
         assert_eq!(policy.delay_for_attempt(3), Duration::from_secs(8));
-        // Caps at the 60s ceiling no matter how long the sidecar stays down.
+        // Caps at the 60s ceiling no matter how long the provider stays down.
         assert_eq!(policy.delay_for_attempt(20), Duration::from_secs(60));
         assert_eq!(policy.delay_for_attempt(1000), Duration::from_secs(60));
     }
 
     #[test]
-    fn sidecar_session_retries_indefinitely() {
-        let policy = ReconnectPolicy::sidecar_session();
-        // A restarting sidecar is a normal event, so reconnection never gives up.
+    fn live_stream_retries_indefinitely() {
+        let policy = ReconnectPolicy::live_stream();
         assert!(policy.should_retry(10_000));
         assert!(policy.should_retry(u32::MAX - 1));
     }
 
     #[test]
     fn classifier_separates_transient_from_hard_failures() {
-        assert!(is_transient_sidecar_error(&anyhow::anyhow!(
-            "Flight exchange closed"
+        assert!(is_transient_connection_error(&anyhow::anyhow!(
+            "provider websocket closed"
         )));
-        assert!(is_transient_sidecar_error(&anyhow::anyhow!(
-            "failed to connect to grpc://127.0.0.1:7410: connection refused"
+        assert!(is_transient_connection_error(&anyhow::anyhow!(
+            "failed to connect to provider: connection refused"
         )));
-        assert!(!is_transient_sidecar_error(&anyhow::anyhow!(
-            "invalid Flight authorization metadata"
+        assert!(!is_transient_connection_error(&anyhow::anyhow!(
+            "invalid provider configuration"
         )));
     }
 }

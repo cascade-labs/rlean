@@ -13,7 +13,7 @@ arrow = { workspace = true }
 rlean-core = { path = "../rlean-core", version = "0.1.1" }
 rlean-data = { path = "../rlean-data", version = "0.1.1" }
 rlean-data-tables = { path = "../rlean-data-tables", version = "0.1.1" }
-rlean-data-sidecar = { path = "../rlean-data-sidecar", version = "0.1.1" }
+rlean-data-providers = { path = "../rlean-data-providers", version = "0.1.1" }
 rlean-sdk = { path = "../rlean-sdk", version = "0.1.1" }
 rlean-options = { path = "../rlean-options", version = "0.1.1" }
 rlean-orders = { path = "../rlean-orders", version = "0.1.1" }
@@ -33,6 +33,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 reqwest = { workspace = true }
@@ -48,8 +49,6 @@ rayon = { workspace = true }
 num_cpus = { workspace = true }
 rlean-brokerages = { path = "../rlean-brokerages", version = "0.1.1" }
 rlean-indicators = { path = "../rlean-indicators", version = "0.1.1" }
-object_store = { workspace = true }
-tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

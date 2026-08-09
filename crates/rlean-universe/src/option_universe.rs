@@ -32,7 +32,7 @@ pub enum OptionRight {
 ///
 /// Mirrors the intent of C# `OptionUniverseSelectionModel.Filter(OptionFilterUniverse)`.
 ///
-/// In rlean the full option chain is requested from the sidecar each day, so this
+/// In rlean the full option chain is requested from the provider each day, so this
 /// model acts as a pure filter rather than a universe subscription creator.
 #[derive(Debug, Clone)]
 pub struct OptionUniverseSelectionModel {

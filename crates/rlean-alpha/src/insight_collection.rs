@@ -307,12 +307,20 @@ impl InsightCollection {
 
     pub fn expire(&mut self, symbols: &[Symbol], utc_now: DateTime) -> Vec<Insight> {
         let mut expired = Vec::new();
+        // Match C# LEAN `Insight.Expire`: only active insights are mutated
+        // (`if (IsActive(utcTime)) { CloseTimeUtc = utcTime - 1s; ... }`).
+        // Already-expired insights stay untouched and are not returned, so
+        // framework cancel does not emit duplicate Cancelled events or force
+        // a rebalance when nothing active was canceled.
+        let close_time = utc_now - rlean_core::TimeSpan::ONE_SECOND;
         for symbol in symbols {
             if let Some(symbol_insights) = self.insights.get_mut(&symbol.id.sid) {
                 for insight in symbol_insights.iter_mut() {
-                    if insight.close_time_utc > utc_now {
-                        insight.close_time_utc = utc_now;
+                    if !insight.is_active(utc_now) {
+                        continue;
                     }
+                    insight.close_time_utc = close_time;
+                    insight.period = insight.close_time_utc - insight.generated_time_utc;
                     expired.push(insight.clone());
                 }
             }

@@ -1,4 +1,4 @@
-# Development and local daemon deployment tasks for rlean.
+# Development tasks for rlean.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -23,8 +23,6 @@ test:
 # Run every pull-request gate locally.
 ci: lint test
 
-# Validate, install rlean and rleand together, and restart the local daemon.
-deploy-local: lint test
+# Install the host CLI binary locally.
+install:
     cargo install --path crates/rlean --locked --force
-    "$HOME/.cargo/bin/rlean" daemon install
-    "$HOME/.cargo/bin/rlean" daemon status

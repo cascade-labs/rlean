@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// Generic query hints for custom data providers.
 ///
 /// Providers may use these to push filtering/projection into their native
-/// canonical sidecar contract. The runner forwards them with subscriptions.
+/// canonical data contract. The runner forwards them with subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CustomDataQuery {
     /// Provider-neutral symbol filter matched against the canonical
@@ -28,7 +28,7 @@ pub struct CustomDataQuery {
     pub numeric_max: HashMap<String, f64>,
     /// Provider-specific settings not covered by the generic fields.
     ///
-    /// Sidecars may also recognize comma-separated `not_null` and
+    /// Providers may also recognize comma-separated `not_null` and
     /// `required_columns` values here as opt-in non-null row filters.
     pub properties: HashMap<String, String>,
 }
@@ -201,10 +201,10 @@ fn json_number(value: &serde_json::Value) -> Option<f64> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomDataConfig {
     pub ticker: String,
-    /// Unique sidecar series identifier (e.g. "fred", "cboe_vix").
+    /// Unique provider series identifier (e.g. "fred", "cboe_vix").
     pub source_type: String,
     pub resolution: Resolution,
-    /// Arbitrary string properties passed to the sidecar integration.
+    /// Arbitrary string properties passed to the selected provider.
     pub properties: HashMap<String, String>,
     pub query: CustomDataQuery,
 }
@@ -273,7 +273,7 @@ mod tests {
             ..Default::default()
         };
         // Live providers must populate point.symbol; an unset symbol is dropped
-        // when a symbol filter is active (mirrors historical sidecar queries).
+        // when a symbol filter is active (mirrors historical provider queries).
         assert!(!query.matches_point(&point_with_symbol(None)));
     }
 

@@ -60,7 +60,7 @@ pub struct OptionChainSubscriptionMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubscriptionDataConfig {
     pub symbol: Symbol,
-    /// Physical venue requested from the sidecar. `market` remains encoded in
+    /// Physical venue requested from the provider. `market` remains encoded in
     /// the symbol/SID and is not interchangeable with this value.
     pub venue: String,
     pub resolution: Resolution,
@@ -269,7 +269,7 @@ impl SubscriptionDataConfig {
 
     /// An internal, daily, whole-market fundamental snapshot subscription.
     /// `symbol` is a stable internal base symbol; individual equity symbols
-    /// are carried by the rows returned by the sidecar.
+    /// are carried by the rows returned by the provider.
     pub fn new_fundamental_universe(
         symbol: Symbol,
         resolution: Resolution,
@@ -400,7 +400,7 @@ impl SubscriptionDataConfig {
 /// subscription-sync loop runs on every slice; comparing the stamp against the
 /// last-synced value lets it skip the whole diff walk when nothing changed
 /// (issue #64). The stamp lives on the manager itself, which never crosses the
-/// sidecar protocol, so it does not change the wire contract.
+/// provider interface, so it does not change the wire contract.
 #[derive(Debug, Default)]
 pub struct SubscriptionManager {
     state: RwLock<SubscriptionState>,

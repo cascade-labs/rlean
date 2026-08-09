@@ -1,11 +1,15 @@
-//! `rlean cloud install` — provision rlean, rleand, and their configuration.
+//! `rlean cloud install` — provision the host CLI, config, and container runtime.
 //!
 //! Bundles are downloaded on the CONTROL machine with `gh release download`
 //! (the node never needs `gh` creds — the private cascadelabs repo is only
 //! reachable with the operator's local gh auth), verified against their
 //! `.sha256` sidecars, unpacked locally, then shipped to the node over
-//! scp/rsync. Secrets (`integration-configs.json`) are transferred as files only,
+//! scp/rsync. Secrets in `~/.rlean/config` are transferred as a file only,
 //! never as ssh argv, and chmod 0600 on the node.
+//!
+//! The node must already have Docker and a reachable Verglas gateway. Install
+//! pulls the published engine image (`ghcr.io/cascade-labs/rlean:latest` by
+//! default) so subsequent `cloud deploy` can place live containers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +21,8 @@ use sha2::{Digest, Sha256};
 use super::nodeconfig::node_config_from_local;
 use super::registry::NodeRegistry;
 use super::remote::{scp_to, RemoteExec};
-use crate::config::{atomic_write, integration_configs_path, GlobalConfig};
+use crate::config::{atomic_write, GlobalConfig};
+use crate::container_runtime;
 
 /// Default release tag for cloud bundles. A `const` so it is easy to bump.
 pub(crate) const DEFAULT_RELEASE_TAG: &str = "v0.1.1";
@@ -35,7 +40,6 @@ struct RleanManifest {
     version: String,
     triple: String,
     sha256: String,
-    rleand_sha256: String,
 }
 
 // ── sha256 verification ─────────────────────────────────────────────────────────
@@ -180,7 +184,6 @@ pub(crate) fn cmd_install(
     reg: &NodeRegistry,
     name: &str,
     release_tag: &str,
-    artifact_endpoint: Option<&str>,
 ) -> Result<InstallSummary> {
     // 1. Resolve node + validate triple.
     let node = reg
@@ -225,8 +228,6 @@ pub(crate) fn cmd_install(
     }
     let rlean_bin = rlean_unpack.join("rlean");
     verify_inner_sha256(&rlean_bin, &rlean_manifest.sha256)?;
-    let rleand_bin = rlean_unpack.join("rleand");
-    verify_inner_sha256(&rleand_bin, &rlean_manifest.rleand_sha256)?;
 
     // 4. Create node dirs.
     ssh_ok(
@@ -236,27 +237,14 @@ pub(crate) fn cmd_install(
             "mkdir",
             "-p",
             "~/.local/bin",
+            "~/.rlean",
             "~/rlean-cloud/data",
             "~/rlean-cloud/workspace",
         ],
         "create node directories",
     )?;
-    let daemon_tmp = "~/.local/bin/rleand.new";
-    scp_to(ssh, &rleand_bin, daemon_tmp)?;
-    ssh_ok(
-        exec,
-        ssh,
-        &["chmod", "+x", daemon_tmp],
-        "chmod +x rleand binary",
-    )?;
-    ssh_ok(
-        exec,
-        ssh,
-        &["mv", "-f", daemon_tmp, "~/.local/bin/rleand"],
-        "install rleand binary",
-    )?;
 
-    // 5. Ship the rlean binary atomically (temp name → chmod → mv).
+    // 5. Ship the rlean host CLI atomically (temp name → chmod → mv).
     let bin_tmp = "~/.local/bin/rlean.new";
     scp_to(ssh, &rlean_bin, bin_tmp)?;
     ssh_ok(
@@ -275,7 +263,7 @@ pub(crate) fn cmd_install(
     // 6. Generate the node config locally, ship it, chmod 0600.
     let local_config = GlobalConfig::load().context("failed to read local ~/.rlean/config")?;
     let node_home = probe_node_home(exec, ssh)?;
-    let node_config = node_config_from_local(&local_config, &node_home, artifact_endpoint);
+    let node_config = node_config_from_local(&local_config, &node_home);
     let config_json = serde_json::to_string_pretty(&node_config)?;
     let local_config_tmp = tmp_path.join("node-config");
     atomic_write(&local_config_tmp, &config_json)?;
@@ -287,33 +275,18 @@ pub(crate) fn cmd_install(
         "chmod config",
     )?;
 
-    // 7. Copy integration credentials verbatim (secret file, never argv).
-    let local_integration_configs = integration_configs_path()?;
-    if local_integration_configs.exists() {
-        scp_to(
-            ssh,
-            &local_integration_configs,
-            "~/.rlean/integration-configs.json",
-        )?;
-        ssh_ok(
-            exec,
-            ssh,
-            &["chmod", "0600", "~/.rlean/integration-configs.json"],
-            "chmod integration-configs.json",
-        )?;
-    }
-
-    // 8. Install rleand as the node's persistent user service. All subsequent
-    // cloud deployments are submitted to this supervisor; no nohup/setsid
-    // process is left behind by the SSH session.
+    // 7. Require Docker + Verglas on the node, then pull the engine image.
+    ensure_remote_docker(exec, ssh)?;
+    ensure_remote_verglas(exec, ssh, &node_config)?;
+    let image = container_runtime::default_image();
     ssh_ok(
         exec,
         ssh,
-        &["~/.local/bin/rlean", "daemon", "install"],
-        "install and start rleand",
+        &["docker", "pull", &image],
+        &format!("pull engine image {image}"),
     )?;
 
-    // 9. Verify by running the installed binary.
+    // 8. Verify by running the installed host CLI.
     let version = exec.run(ssh, &["~/.local/bin/rlean", "--version"])?;
     if version.status != 0 {
         bail!(
@@ -329,6 +302,44 @@ pub(crate) fn cmd_install(
         rlean_version: rlean_manifest.version,
         version_output,
     })
+}
+
+fn ensure_remote_docker(exec: &dyn RemoteExec, ssh: &str) -> Result<()> {
+    let out = exec.run(ssh, &["docker", "info"])?;
+    if out.status != 0 {
+        bail!(
+            "Docker is required on the node but `docker info` failed (status {}):\n{}",
+            out.status,
+            out.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_remote_verglas(exec: &dyn RemoteExec, ssh: &str, config: &GlobalConfig) -> Result<()> {
+    let endpoint = config
+        .verglas_endpoint
+        .clone()
+        .or_else(|| std::env::var("VERGLAS_ENDPOINT").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned());
+    // Probe from the node itself so we validate the node's view of Verglas.
+    let script = format!(
+        "curl -fsS --max-time 5 -o /dev/null -w '%{{http_code}}' {endpoint} || \
+         curl -fsS --max-time 5 -o /dev/null -w '%{{http_code}}' {endpoint}/health || true"
+    );
+    let out = exec.run(ssh, &["sh", "-c", &script])?;
+    let code = out.stdout.trim();
+    if !(code.starts_with('2') || code.starts_with('3') || code.starts_with('4')) {
+        bail!(
+            "Verglas gateway is not reachable from the node at {endpoint}. \
+             Install/start Verglas on the node (or set verglas_endpoint) before cloud install. \
+             probe output: status={} stdout={:?} stderr={}",
+            out.status,
+            out.stdout.trim(),
+            out.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn read_manifest<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {

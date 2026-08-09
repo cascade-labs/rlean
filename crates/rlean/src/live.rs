@@ -10,9 +10,9 @@ use crate::live_deployments::{
     launch_live_detached, run_live_control, update_live_deployment_status,
 };
 use crate::runtime::{
-    brokerage_config_json, connect_data_sidecar, ensure_python_baseline_packages,
-    integration_config_json, parse_algorithm_parameters_for_strategy, resolve_strategy_file,
-    validate_strategy_path,
+    connect_verglas, ensure_python_baseline_packages, execution_brokerage,
+    historical_data_provider, live_data_provider, parse_algorithm_parameters_for_strategy,
+    resolve_strategy_file, strategy_name_from_path, validate_strategy_path,
 };
 
 pub(crate) async fn run(args: LiveArgs) -> Result<()> {
@@ -58,29 +58,17 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     validate_strategy_path(&args.strategy)?;
 
     let global_config = config::GlobalConfig::load()?;
-    let data_sidecar = connect_data_sidecar(&args, &global_config)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("live trading requires --data-sidecar"))?;
-
-    let live_data_feed = args
-        .live_data_feed
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("live trading requires --live-data-feed"))?;
-    let live_data_feed_connection_id = data_sidecar
-        .open_live_data_feed(live_data_feed, integration_config_json(live_data_feed)?)
-        .await
-        .with_context(|| format!("failed to open live data feed '{live_data_feed}'"))?;
+    let verglas = connect_verglas(&global_config).await?;
+    let (historical_provider, dropped_cache_writes) =
+        historical_data_provider(&args, verglas.clone()).await?;
+    let live_data_provider = live_data_provider(&args, verglas.clone()).await?;
 
     let requested_brokerage = args
         .brokerage
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("live mode requires --brokerage paper or a sidecar execution brokerage")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("live mode requires --brokerage"))?;
     let requested_paper_brokerage = is_paper_brokerage_name(requested_brokerage);
     let brokerage_account = args
         .brokerage_account
@@ -96,30 +84,18 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     pyo3::append_to_inittab!(AlgorithmImports);
     pyo3::Python::initialize();
 
-    let brokerage = if requested_paper_brokerage {
-        None
-    } else {
-        let opaque_config_json = brokerage_config_json(requested_brokerage, brokerage_account)?;
-        let (connection_id, events) = data_sidecar
-            .open_brokerage(requested_brokerage, opaque_config_json.clone())
-            .await
-            .with_context(|| format!("failed to open sidecar brokerage '{requested_brokerage}'"))?;
-        Some(rlean_engine::SidecarBrokerageConnection {
-            client: data_sidecar.clone(),
-            connection_id,
-            session_epoch: data_sidecar.session_epoch(),
-            name: requested_brokerage.to_string(),
-            opaque_config_json,
-            events,
-        })
-    };
+    let brokerage = execution_brokerage(&args)?;
     let paper_trading = requested_paper_brokerage;
     let brokerage_name = if requested_paper_brokerage {
         Some("Paper".to_string())
     } else {
         Some(requested_brokerage.to_string())
     };
-    let brokerage_model = live_brokerage_model_for_name(requested_brokerage)?;
+    let brokerage_model_name = brokerage
+        .as_deref()
+        .and_then(rlean_brokerages::Brokerage::brokerage_model)
+        .unwrap_or(requested_brokerage);
+    let brokerage_model = live_brokerage_model_for_name(brokerage_model_name)?;
 
     let parameters = parse_algorithm_parameters_for_strategy(&args.strategy, &args.parameters)?;
 
@@ -132,15 +108,57 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         bail!("Live trading currently supports Python strategies only");
     }
 
-    // Build the artifact sink for this deployment. Live always keeps the local
-    // deploy dir (the live control surface reads it); `s3`-only is treated like
-    // `mirror` so we never delete the local dir out from under the control layer.
-    let artifact_sink = build_live_artifact_sink(&global_config, deploy_dir.as_deref(), &args)?;
+    let strategy_name = strategy_name_from_path(&args.strategy);
+    let deploy_id = deploy_dir
+        .as_ref()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    let run_id = deploy_id
+        .as_deref()
+        .map(|id| format!("live-{id}"))
+        .unwrap_or_else(|| format!("live-{}", uuid::Uuid::new_v4()));
+    let deploy_started_at = chrono::Utc::now();
+
+    let run_catalog = crate::run_catalog::RunCatalog::connect(
+        verglas.clone(),
+        run_id.clone(),
+        strategy_name,
+        &parameters,
+    )
+    .await?;
+    let restore = crate::run_catalog::RunCatalog::load_live_restore(&verglas, &run_id)
+        .await
+        .context("load live restore state from Verglas")?;
+    run_catalog.record_started().await?;
+
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
+    let stream_catalog = run_catalog.clone();
+    let stream_task = tokio::spawn(async move {
+        let mut sequence = 0_u64;
+        let mut updates = Vec::with_capacity(32);
+        while let Some(update) = stream_rx.recv().await {
+            updates.push(update);
+            if updates.len() < 32 {
+                continue;
+            }
+            stream_catalog
+                .record_stream_updates(std::mem::take(&mut updates), sequence)
+                .await?;
+            sequence = sequence.wrapping_add(1);
+        }
+        if !updates.is_empty() {
+            stream_catalog
+                .record_stream_updates(updates, sequence)
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
 
     let strategy_path = args.strategy.clone();
     let live_config = rlean_engine::LiveRunConfig {
-        data_sidecar,
-        live_data_feed_connection_id,
+        historical_provider: historical_provider.clone(),
+        live_data_provider,
         parameters,
         brokerage,
         brokerage_model,
@@ -150,8 +168,10 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             .live_limits
             .live_max_runtime_seconds
             .map(Duration::from_secs),
-        output_dir: deploy_dir,
-        artifact_sink,
+        stream_updates: Some(stream_tx),
+        deploy_started_at,
+        restore,
+        deploy_id,
     };
     let state = Arc::new(std::sync::Mutex::new(
         rlean_algorithm::qc_algorithm::QcAlgorithm::new(
@@ -160,7 +180,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         ),
     ));
     let runtime_context = rlean_engine::AlgorithmRuntimeContext::new(
-        live_config.data_sidecar.clone(),
+        historical_provider,
         live_config.parameters.clone(),
     );
     let context = rlean_sdk::algorithm::AlgorithmConstructionContext::new_with_runtime_services(
@@ -169,19 +189,37 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     );
     let adapter = rlean_python_runtime::load_strategy_bridge_with_context(&strategy_path, context)?;
 
-    let result = match rlean_engine::runner::live::run_live_with_runtime(
-        adapter,
-        live_config,
-        runtime_context,
-    )
-    .await
-    {
+    let run_result =
+        rlean_engine::runner::live::run_live_with_runtime(adapter, live_config, runtime_context)
+            .await;
+
+    // Drop the sender by ending the engine; then drain the catalog writer.
+    let join_result = stream_task.await;
+    run_catalog.log_dropped_appends_summary();
+    dropped_cache_writes.log_summary();
+
+    let result = match run_result {
         Ok(result) => result,
         Err(error) if rlean_sdk::interrupt::is_interrupted_error(&error) => {
             std::process::exit(130);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            let _ = run_catalog.record_failed(&error).await;
+            return Err(error);
+        }
     };
+    join_result.context("live catalog stream task")??;
+
+    // Terminal live row: reuse the completed path shape via a synthetic
+    // BacktestRunResult is overkill; mark stopped with a final running→failed
+    // style append that records final value on the runs table.
+    run_catalog
+        .record_live_stopped(
+            result.final_value,
+            result.slices_processed,
+            result.order_events.len(),
+        )
+        .await?;
 
     if let Some(brokerage_name) = brokerage_name {
         let mode = if paper_trading {
@@ -190,100 +228,28 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             "live-order"
         };
         println!(
-            "Live brokerage {} run stopped: brokerage={} slices={} final_value=${:.2} order_events={} started_at={} stopped_at={}",
+            "Live brokerage {} run stopped: brokerage={} slices={} final_value=${:.2} order_events={} started_at={} stopped_at={} run_id={}",
             mode,
             brokerage_name,
             result.slices_processed,
             result.final_value,
             result.order_events.len(),
             result.started_at.to_rfc3339(),
-            result.stopped_at.to_rfc3339()
+            result.stopped_at.to_rfc3339(),
+            run_catalog.run_id(),
         );
     } else {
         println!(
-            "Live paper run stopped: slices={} final_value=${:.2} order_events={} started_at={} stopped_at={}",
+            "Live paper run stopped: slices={} final_value=${:.2} order_events={} started_at={} stopped_at={} run_id={}",
             result.slices_processed,
             result.final_value,
             result.order_events.len(),
             result.started_at.to_rfc3339(),
-            result.stopped_at.to_rfc3339()
+            result.stopped_at.to_rfc3339(),
+            run_catalog.run_id(),
         );
     }
     Ok(())
-}
-
-/// Build the artifact sink for a live deployment.
-///
-/// Returns `None` when there is no deploy dir (nothing to mirror) or the mode
-/// is local. For live, `s3`-only is treated like `mirror`: the local deploy dir
-/// is always kept because the live control surface reads it, and snapshots are
-/// mirrored to S3 asynchronously.
-fn build_live_artifact_sink(
-    global_config: &config::GlobalConfig,
-    deploy_dir: Option<&std::path::Path>,
-    args: &crate::cli::RunArgs,
-) -> Result<Option<std::sync::Arc<rlean_engine::RunArtifactSink>>> {
-    let Some(dir) = deploy_dir else {
-        return Ok(None);
-    };
-    let artifact_config = crate::artifacts_config::resolve(
-        args.artifact_store.as_deref(),
-        args.artifact_s3.as_deref(),
-        global_config,
-    )?;
-    if artifact_config.mode == rlean_engine::ArtifactStoreMode::Local {
-        return Ok(None);
-    }
-    // Never use an s3-only temp buffer for live — force local-primary mirroring.
-    let mode = rlean_engine::ArtifactStoreMode::Mirror;
-    let project = live_project_name(dir, &args.strategy);
-    let deploy_id = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&project)
-        .to_string();
-    let sink = rlean_engine::RunArtifactSink::new(
-        mode,
-        rlean_engine::RunKind::Live,
-        dir.to_path_buf(),
-        &project,
-        &deploy_id,
-        artifact_config.s3.as_ref(),
-    );
-    Ok(Some(std::sync::Arc::new(sink)))
-}
-
-/// Resolve the project name for a live deployment's S3 keys.
-///
-/// The strategy path inside a deployment is the code snapshot
-/// (`<project>/live/<deploy-id>/code/main.py`), so deriving the name from the
-/// file's parent dir would yield `code`. Prefer the recorded metadata:
-///
-/// 1. `deployment.json` in the deploy dir (`strategy_name` field),
-/// 2. the project dir name when the deploy dir sits at `<project>/live/<id>`,
-/// 3. the strategy file name as a last resort.
-fn live_project_name(deploy_dir: &std::path::Path, strategy: &std::path::Path) -> String {
-    if let Ok(text) = std::fs::read_to_string(deploy_dir.join("deployment.json")) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(name) = value.get("strategy_name").and_then(|v| v.as_str()) {
-                if !name.is_empty() {
-                    return name.to_string();
-                }
-            }
-        }
-    }
-    if let Some(live_dir) = deploy_dir.parent() {
-        if live_dir.file_name().and_then(|n| n.to_str()) == Some("live") {
-            if let Some(project) = live_dir
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-            {
-                return project.to_string();
-            }
-        }
-    }
-    crate::runtime::strategy_name_from_path(strategy)
 }
 
 fn live_brokerage_model_for_name(name: &str) -> Result<BrokerageModel> {
@@ -367,61 +333,5 @@ mod tests {
         assert!(is_paper_brokerage_name("PaperBrokerage"));
         assert!(!is_paper_brokerage_name("tradier"));
         assert!(live_brokerage_model_for_name("custom").is_err());
-    }
-
-    /// A deployment's strategy path is the code snapshot
-    /// (`<project>/live/<deploy-id>/code/main.py`). The S3 project component
-    /// must resolve to the project name, never the `code` snapshot dir.
-    #[test]
-    fn test_live_project_name_prefers_deployment_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let deploy_dir = tmp
-            .path()
-            .join("uw_control")
-            .join("live")
-            .join("2026-07-08_060145_uw_control");
-        let code_dir = deploy_dir.join("code");
-        std::fs::create_dir_all(&code_dir).unwrap();
-        let strategy = code_dir.join("main.py");
-        std::fs::write(&strategy, "pass").unwrap();
-        std::fs::write(
-            deploy_dir.join("deployment.json"),
-            r#"{"deploy_id":"2026-07-08_060145_uw_control","strategy_name":"uw_control"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(live_project_name(&deploy_dir, &strategy), "uw_control");
-    }
-
-    #[test]
-    fn test_live_project_name_falls_back_to_project_dir() {
-        // No deployment.json: derive the project from <project>/live/<deploy-id>.
-        let tmp = tempfile::tempdir().unwrap();
-        let deploy_dir = tmp
-            .path()
-            .join("uw_control")
-            .join("live")
-            .join("2026-07-08_060145_uw_control");
-        let code_dir = deploy_dir.join("code");
-        std::fs::create_dir_all(&code_dir).unwrap();
-        let strategy = code_dir.join("main.py");
-        std::fs::write(&strategy, "pass").unwrap();
-
-        assert_eq!(live_project_name(&deploy_dir, &strategy), "uw_control");
-    }
-
-    #[test]
-    fn test_live_project_name_last_resort_uses_strategy_path() {
-        // Exotic layout without live/<id> structure or metadata: fall back to
-        // the strategy file's name derivation.
-        let tmp = tempfile::tempdir().unwrap();
-        let deploy_dir = tmp.path().join("somewhere");
-        std::fs::create_dir_all(&deploy_dir).unwrap();
-        let strategy_dir = tmp.path().join("my_algo");
-        std::fs::create_dir_all(&strategy_dir).unwrap();
-        let strategy = strategy_dir.join("main.py");
-        std::fs::write(&strategy, "pass").unwrap();
-
-        assert_eq!(live_project_name(&deploy_dir, &strategy), "my_algo");
     }
 }

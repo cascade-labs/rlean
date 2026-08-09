@@ -6,7 +6,7 @@ use rlean_algorithm::lifecycle::{AlgorithmHistoryService, HistoryColumns};
 use rlean_algorithm::qc_algorithm::QcAlgorithm;
 use rlean_core::{DataNormalizationMode, DateTime, NanosecondTimestamp, Resolution, Symbol};
 use rlean_data::SubscriptionDataConfig;
-use rlean_data_sidecar::DataSidecarClient;
+use rlean_data_providers::HistoricalDataProvider;
 use rlean_data_tables::{CustomDataPoint, TradeBar};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AlgorithmHistoryContext {
-    pub data_sidecar: Arc<DataSidecarClient>,
+    pub historical_provider: Arc<dyn HistoricalDataProvider>,
 }
 
 #[derive(Clone)]
@@ -126,7 +126,7 @@ impl HistoryService {
     }
 
     fn subscription_history_provider(&self) -> SubscriptionHistoryProvider {
-        let context = DataFeedContext::new(self.context.data_sidecar.clone());
+        let context = DataFeedContext::new(self.context.historical_provider.clone());
         SubscriptionHistoryProvider::new(context)
     }
 }
@@ -458,6 +458,7 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
     columns.insert("end_time".to_string(), Vec::with_capacity(points.len()));
     columns.insert("value".to_string(), Vec::with_capacity(points.len()));
     columns.insert("venue".to_string(), Vec::with_capacity(points.len()));
+    columns.insert("fields_json".to_string(), Vec::with_capacity(points.len()));
     for point in points {
         columns
             .get_mut("time")
@@ -475,6 +476,10 @@ fn custom_points_to_columns(points: &[CustomDataPoint]) -> HistoryColumns {
             .get_mut("venue")
             .unwrap()
             .push(point.venue.clone().unwrap_or_default());
+        columns
+            .get_mut("fields_json")
+            .unwrap()
+            .push(serde_json::to_string(point.fields.as_ref()).unwrap_or_else(|_| "{}".into()));
     }
     columns
 }
@@ -516,7 +521,7 @@ fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> Dat
 /// Run a history read on a dedicated current-thread runtime on a fresh
 /// thread, blocking the caller until the query resolves.
 ///
-/// Deadlock note: reads are answered over the sidecar Flight exchange whose
+/// Deadlock note: reads are answered over the provider future whose
 /// response router runs as a task on the *main* multi-threaded runtime.
 /// Parking the calling worker here, even for minutes, cannot starve the
 /// router: it keeps making progress on the main runtime's other workers,
@@ -565,6 +570,29 @@ mod tests {
                 volume: dec!(1),
             },
         )
+    }
+
+    #[test]
+    fn custom_history_preserves_provider_fields() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "net_premium_imbalance".to_string(),
+            serde_json::json!(1234.5),
+        );
+        let point = CustomDataPoint {
+            time: DateTime::from_secs(1_700_000_000),
+            end_time: DateTime::from_secs(1_700_000_060),
+            value: dec!(1234.5),
+            venue: Some("unusual_whales".to_string()),
+            symbol: None,
+            fields: Arc::new(fields),
+        };
+
+        let columns = custom_points_to_columns(&[point]);
+        let decoded: serde_json::Value =
+            serde_json::from_str(&columns["fields_json"][0]).expect("valid fields JSON");
+
+        assert_eq!(decoded["net_premium_imbalance"], serde_json::json!(1234.5));
     }
 
     /// A `tracing` writer that captures emitted events into a shared buffer so a
@@ -632,7 +660,7 @@ mod tests {
     // CALENDAR — not a speculative multi-day range. Mid-session on Monday
     // 2026-07-27 17:00Z (13:00 ET), five minute-bars start five minutes ago.
     // This is the request shape whose 7-calendar-day predecessor forced the
-    // sidecar into a 2,094-row 26.5s gap-fill for what should be ~5 rows.
+    // provider into a 2,094-row 26.5s gap-fill for what should be ~5 rows.
     #[test]
     fn first_seed_attempt_requests_five_bars_through_the_exchange_calendar() {
         let symbol = Symbol::create_equity("TRMB", &Market::usa());
@@ -761,13 +789,13 @@ mod tests {
             as_of,
             |_, _| -> Result<Vec<TradeBar>> {
                 calls += 1;
-                Err(anyhow!("sidecar transport failed"))
+                Err(anyhow!("provider transport failed"))
             },
         )
         .expect_err("a transport failure must propagate");
 
         assert_eq!(calls, 1);
-        assert!(error.to_string().contains("sidecar transport failed"));
+        assert!(error.to_string().contains("provider transport failed"));
     }
 
     // Regression for the 2026-07-27 lost-signal incident: a seed that returns
@@ -835,7 +863,7 @@ mod tests {
     fn failed_seed_read_logs_a_loud_error_naming_the_symbol() {
         let symbol = Symbol::create_equity("TRMB", &Market::usa());
         let (price, captured) =
-            resolve_seed_price_capturing_logs(&symbol, Err(anyhow!("sidecar query failed")));
+            resolve_seed_price_capturing_logs(&symbol, Err(anyhow!("provider query failed")));
 
         assert!(price.is_none());
         assert!(captured.contains("ERROR"), "captured: {captured:?}");

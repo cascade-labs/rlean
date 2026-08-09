@@ -18,7 +18,7 @@ use rlean_algorithm::lifecycle::{
 };
 use rlean_algorithm::FrameworkModelRegistry;
 use rlean_core::{DateTime, Resolution};
-use rlean_data_sidecar::DataSidecarClient;
+use rlean_data_providers::HistoricalDataProvider;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -37,11 +37,11 @@ pub struct AlgorithmRuntimeContext {
 
 impl AlgorithmRuntimeContext {
     pub fn new(
-        data_sidecar: Arc<DataSidecarClient>,
+        historical_provider: Arc<dyn HistoricalDataProvider>,
         runtime_parameters: HashMap<String, String>,
     ) -> Self {
         let history_service = Arc::new(HistoryService::new(AlgorithmHistoryContext {
-            data_sidecar,
+            historical_provider,
         }));
         Self::with_history_service(history_service, runtime_parameters)
     }
@@ -257,7 +257,7 @@ impl AlgorithmRuntimeServices for AlgorithmRuntimeContext {
             ..rlean_sdk::universe::UniverseSettings::default()
         };
         // There is no custom-data subscription associated with this selector;
-        // the fundamental Flight feed is registered directly by QcAlgorithm.
+        // the fundamental provider feed is registered directly by QcAlgorithm.
         let descriptor = rlean_sdk::universe::ScheduledUniverseDescriptor::user_defined(
             registration.resolution,
             settings,

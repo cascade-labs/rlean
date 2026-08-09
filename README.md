@@ -42,7 +42,7 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 | `rlean-scheduling` | Scheduled events |
 | `rlean-statistics` | Backtest result statistics |
 | `rlean-python-runtime` | PyO3 bindings — embeds Python strategies in a Rust process |
-| `rlean-data-sidecar` | Persistent Arrow Flight subscription protocol and client |
+| `rlean-data-providers` | LEAN-style historical/live providers and cache-first Verglas storage |
 | `rlean-options` | Option chain, greeks, exercise models |
 | `rlean-execution` | Order routing / execution models |
 | `rlean-optimization` | Parameter optimization |
@@ -54,44 +54,33 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 
 ## Data backend
 
-Backtests and live runs receive canonical Arrow batches from a persistent Apache Arrow Flight sidecar session. rlean registers subscriptions; backtests issue bounded range queries against those subscriptions, while live batches are pushed unsolicited by the sidecar. rlean has no market-data storage backend or local cache; persistence is entirely the sidecar's responsibility.
+Historical providers, live providers, and brokerages are selected independently.
+Historical reads are cache-first through the Verglas Rust SDK: rlean queries the
+canonical tables, requests uncovered ranges from the selected provider, and
+persists provider-neutral Arrow batches before consuming them. A single SDK
+connection discovers the catalog, query, and write services from the configured
+Verglas gateway.
 
-### Sidecar config
+Strategy SDK calls remain the source of subscription intent. Provider and
+brokerage credentials such as `tradier.access_token` are stored once per
+machine in `~/.rlean/config` via `rlean config set <provider>.<key>`.
 
-Strategy runs require only a reachable sidecar endpoint and, when configured by
-the service, a bearer token:
+Configure Verglas once per machine. The token is stored masked in CLI output
+and is applied by the SDK to every service discovered from the gateway:
 
 ```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
-rlean config set data_sidecar_token <token>
+rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_token <token>
 ```
 
-Plaintext `grpc://` is loopback-only. Remote services use
-`grpc+tls://host:port`; local Unix sockets use
-`grpc+unix:///absolute/path`. Integration credentials such as
-`tradier.access_token` are stored in `~/.rlean/integration-configs.json` and
-passed opaquely to the selected sidecar connection.
-
-Storage and catalog configuration belongs to the sidecar. The rlean client
-only needs `data_sidecar` and, when required, `data_sidecar_token`.
+rlean never receives object-store credentials and does not configure catalog,
+query, or write endpoints separately.
 
 ## Tables
 
 `rlean-data-tables` defines eleven canonical Arrow table contracts. Use
 `rlean data tables` and `rlean data schema <table>` as the executable source of
 truth.
-
-Inspect and query the configured sidecar through the same exchange used by
-backtests:
-
-```sh
-rlean data manifest --json
-rlean data query market_trade_bars SPY --resolution daily \
-  --start 2025-07-01 --end 2025-07-01 --json
-rlean data query custom_points SPY --provider unusual_whales \
-  --feed flow_alerts --resolution tick \
-  --start 2026-07-01 --end 2026-07-15 --json
-```
 
 Prices, quantities, rates, and custom values use `decimal(38,18)`. Timestamps
 are `i64` nanoseconds since the Unix epoch (UTC), and partition days are logical
@@ -162,54 +151,84 @@ factor values use the canonical decimal type.
 
 ## Live trading
 
-`rlean live <strategy>` submits a strategy to the persistent `rleand` supervisor. Install it once with `rlean daemon install`; launchd on macOS or systemd on Linux keeps it running across logouts and reboots. You inspect or control deployments with subcommands.
+Backtest and live always run inside Docker containers that the host `rlean` CLI
+starts. The host must have Docker and a reachable Verglas gateway. The engine
+image defaults to `ghcr.io/cascade-labs/rlean:latest` (override with
+`RLEAN_IMAGE`). Merges to `main` publish that image to GHCR.
 
-Only long-running live deployments belong to `rleand`. Backtests, data and
-configuration commands, research setup, and cloud probes run directly and exit.
-Both `rlean` and `rleand` must be installed beside one another; `rlean daemon
-status|start|stop|uninstall` manages the per-user service (or the machine-wide
-service when `--system` is explicit).
+```sh
+rlean backtest ./my_strategy/main.py --data-provider-historical thetadata
+rlean live ./my_strategy/main.py \
+  --live-data-feed tradier \
+  --brokerage http \
+  --brokerage-url http://host.docker.internal:5199
+```
+
+`rlean live <strategy>` places a detached container (`restart: unless-stopped`)
+with a durable deploy directory for portfolio/insights/orders. Inspect or
+control deployments with subcommands:
 
 - `rlean live list` — list local live deployments
 - `rlean live status` / `portfolio` / `orders` / `logs` — inspect one deployment
 - `rlean live pause` / `resume` / `upgrade` / `remove` — control a deployment
 
-Pass `--brokerage <name>` (or `paper` for simulated fills), select a
-`--live-data-feed`, and configure `--data-sidecar grpc://host:port` plus an
-optional `--data-sidecar-token`. For brokerages with multiple accounts, pass
+Pass `--brokerage <name>` (or `paper` for simulated fills) and select a
+`--live-data-feed`. For brokerages with multiple accounts, pass
 `--brokerage-account <account-id>`; the selected account is persisted with that
-deployment and restored by `rleand`. Live data and brokerage operations use
-independent connections through the persistent Flight session. Strategy SDK
-calls create and remove symbol subscriptions; live batches are pushed
-unsolicited and routed by subscription id.
+deployment. Live data and brokerage operations use independent native
+connections. Use `--brokerage http --brokerage-url <URL>` for a private
+execution service implementing the
+[HTTP brokerage contract](docs/http-brokerage.md). From inside the container,
+reach host-side services via `host.docker.internal`. Strategy SDK calls create
+and remove symbol subscriptions; live events are pushed by the selected
+provider.
+
+Historical market data can be selected independently with
+`--data-provider-historical massive` or `--data-provider-historical thetadata`.
+Both providers convert vendor responses to provider-neutral contracts before
+they reach the engine or cache. The native ThetaData provider supports US
+equity and option TradeBars, QuoteBars, ticks, and option-universe history;
+configure it once with `rlean config set thetadata.api_key <key>`. Optional
+`thetadata.base_url`, `thetadata.max_concurrent`, and
+`thetadata.requests_per_second` settings control private gateways and request
+limits. Equity map and factor files are loaded through their
+separate LEAN-style auxiliary provider paths. Every contract is queried
+cache-first through Verglas and a newly fetched range is synchronously
+persisted through the Verglas write role before the engine consumes it.
+
+Use `--live-data-feed massive` for Massive websocket trades and quotes. rlean
+maintains dynamic websocket membership as strategy subscriptions are added and
+removed, reconnects and re-authenticates automatically, and aggregates raw
+events into the requested resolution before emitting completed bars. Configure
+both historical and live Massive access with `massive.api_key`; rlean does not
+receive object-store credentials or embed an Iceberg query engine.
 
 ### Cloud fleet
 
-`rlean cloud` manages a fleet of remote nodes reachable over SSH. The control machine only syncs code and submits deployments; each node's `rleand` supervises its live strategy processes after that.
+`rlean cloud` manages a fleet of remote nodes reachable over SSH. Nodes are
+Docker + Verglas hosts: the control machine syncs code and asks the remote host
+CLI to pull the latest engine image and place a live container.
 
 - `rlean cloud add-node` / `list` / `remove` — manage the node registry (`~/.rlean/nodes.json`)
 - `rlean cloud exec` — run a command on a node
-- `rlean cloud install` — install `rlean`, `rleand`, and configuration onto a node from a GitHub release bundle
-- `rlean cloud deploy` — snapshot a strategy to a node and launch `rlean live` there
+- `rlean cloud install` — install the host `rlean` CLI and config; require Docker + Verglas; `docker pull` the engine image
+- `rlean cloud deploy` — snapshot a strategy to a node, always `docker pull` latest, then place a live container
 - `rlean cloud status` / `logs` / `portfolio` — monitor node deployments
 
-`rlean cloud list` probes each node over SSH, reports both the installed rlean
-version and rleand control-socket health, and refreshes `last_seen`. Pass
+`rlean cloud list` probes each node over SSH, reports the installed rlean
+version plus Docker and Verglas health, and refreshes `last_seen`. Pass
 `--offline` for a registry-only view without network calls.
-Re-running `rlean cloud install` with a release tag is the node binary-upgrade
-flow: release checksums are verified, both binaries are atomically replaced,
-configuration and `integration-configs.json` are copied with mode `0600`, and
-the node's user `rleand` service is installed/started. `rlean live upgrade`, by
-contrast, only refreshes a paused/stopped deployment's strategy snapshot.
-
-The repository Justfile exposes local development and macOS daemon deployment:
+Re-running `rlean cloud install` with a release tag refreshes the host CLI and
+config (mode `0600`) and re-pulls the engine image; install fails if Docker or
+Verglas checks fail. `rlean live upgrade` / cloud redeploy always pull
+`:latest` before replacing a paused/stopped deployment.
 
 ```sh
 just format        # apply rustfmt
 just lint          # run the PR formatting, check, and clippy gates
 just test          # run all workspace tests
 just ci            # run every PR gate
-just deploy-local  # validate, install rlean+rleand, and restart launchd
+just install       # install the host rlean CLI locally
 ```
 
 Cloud upgrades remain first-class rlean operations and are intentionally not
@@ -244,18 +263,15 @@ The release workflow builds one `rlean-<version>-<triple>.tar.gz` per supported 
 
 ## Quick start
 
-### 1. Configure the data sidecar
+### 1. Configure data services
 
-A backtest and live run both use a persistent Arrow Flight sidecar session.
-Configure its local or remote endpoint first:
+Configure the one Verglas gateway used by cache-first historical providers and
+durable run results:
 
 ```sh
-rlean config set data_sidecar grpc://127.0.0.1:7410
+rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_token <token>
 ```
-
-If the service requires authentication, also set `data_sidecar_token`. Vendor
-credentials use dotted integration keys and are stored separately in
-`~/.rlean/integration-configs.json`.
 
 ### 2. Create a workspace and project
 
@@ -324,18 +340,14 @@ impl IAlgorithm for MyStrategy {
 rlean backtest my_first_strategy/main.py
 ```
 
-### 5. Configure the sidecar and run live
+### 5. Run live
 
 ```sh
 rlean live my_first_strategy/main.py \
-  --data-sidecar grpc://127.0.0.1:7410 \
+  --data-provider-historical massive \
   --live-data-feed tradier \
   --brokerage paper
 ```
-
-## Known rough edges
-
-Remote reads for very wide backtests (many symbols over long ranges) can be slow against a remote catalog. This is an active workstream.
 
 ## Contributing
 

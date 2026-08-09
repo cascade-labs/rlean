@@ -65,7 +65,7 @@ pub fn run_fundamental_universe_selections(
     let mut selectors = registry.lock().unwrap();
     let mut selections = Vec::new();
     for selector in selectors.iter_mut() {
-        // The sidecar's `end_time` is the point-in-time availability barrier.
+        // The provider row's `end_time` is the point-in-time availability barrier.
         if !selector
             .state
             .should_trigger_data(utc_ns, selector.resolution)

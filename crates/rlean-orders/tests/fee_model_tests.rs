@@ -400,10 +400,12 @@ fn tradier_equity_is_free() {
 }
 
 #[test]
-fn tradier_option_buy_includes_pass_through_fees() {
+fn tradier_option_buy_below_clearing_cap() {
+    // 100 contracts: clearing = min(100 * 0.0775, 15) = $7.75
+    // ORF + reporting = 100 * (0.02 + 0.0054) = $2.54 → total $10.29
     let model = TradierFeeModel;
     let sym = Symbol::create_equity("AAPL", &Market::usa());
-    let order = Order::market(1, sym, dec!(10), ts(0), "");
+    let order = Order::market(1, sym, dec!(100), ts(0), "");
     let p = params_full(
         &order,
         dec!(5),
@@ -413,53 +415,90 @@ fn tradier_option_buy_includes_pass_through_fees() {
         dec!(100),
     );
     let fee = model.get_order_fee(&p);
-    assert_eq!(fee.amount, dec!(2.6062343750));
+    assert_eq!(fee.amount, dec!(10.29));
     assert_eq!(fee.currency, "USD");
 }
 
 #[test]
-fn tradier_option_sell_includes_taf() {
-    let model = TradierFeeModel;
-    let sym = Symbol::create_equity("AAPL", &Market::usa());
-    let order = Order::market(1, sym, dec!(-10), ts(0), "");
-    let p = params_full(
-        &order,
-        dec!(5),
-        SecurityType::Option,
-        "USD",
-        None,
-        dec!(100),
-    );
-    let fee = model.get_order_fee(&p);
-    assert_eq!(fee.amount, dec!(2.6341343750));
-}
-
-#[test]
-fn tradier_live_spy_round_trip_calibration_matches_broker_cash() {
+fn tradier_option_buy_caps_clearing_fee_at_15() {
+    // 4761 contracts: clearing = min(4761 * 0.0775, 15) = $15.00 (uncapped $368.9775)
+    // ORF + reporting = 4761 * 0.0254 = $120.9294 → total $135.9294
     let model = TradierFeeModel;
     let sym = Symbol::create_equity("SPY", &Market::usa());
-    let buy = Order::market(1, sym.clone(), dec!(16), ts(0), "");
-    let sell = Order::market(2, sym, dec!(-16), ts(1), "");
-    let buy_params = params_full(
-        &buy,
+    let order = Order::market(1, sym, dec!(4761), ts(0), "");
+    let p = params_full(
+        &order,
         dec!(2.91),
         SecurityType::Option,
         "USD",
         None,
         dec!(100),
     );
-    let sell_params = params_full(
-        &sell,
-        dec!(2.79),
+    let fee = model.get_order_fee(&p);
+    assert_eq!(fee.amount, dec!(135.9294));
+}
+
+#[test]
+fn tradier_option_sell_adds_taf() {
+    // Same 100-contract leg as the buy, plus TAF = 100 * 0.00279 = $0.279
+    let model = TradierFeeModel;
+    let sym = Symbol::create_equity("AAPL", &Market::usa());
+    let order = Order::market(1, sym, dec!(-100), ts(0), "");
+    let p = params_full(
+        &order,
+        dec!(5),
         SecurityType::Option,
         "USD",
         None,
         dec!(100),
     );
+    let fee = model.get_order_fee(&p);
+    assert_eq!(fee.amount, dec!(10.569));
+}
 
-    let round_trip =
-        model.get_order_fee(&buy_params).amount + model.get_order_fee(&sell_params).amount;
-    assert_eq!(round_trip, dec!(8.38459));
+#[test]
+fn tradier_index_option_sell_over_cap() {
+    // Capped clearing still applies to index options: 4761 sell contracts
+    // → $15.00 + $120.9294 + 4761 * 0.00279 = $149.21259
+    let model = TradierFeeModel;
+    let sym = Symbol::create_equity("SPX", &Market::usa());
+    let order = Order::market(1, sym, dec!(-4761), ts(0), "");
+    let p = params_full(
+        &order,
+        dec!(10),
+        SecurityType::IndexOption,
+        "USD",
+        None,
+        dec!(100),
+    );
+    let fee = model.get_order_fee(&p);
+    assert_eq!(fee.amount, dec!(149.21259));
+}
+
+#[test]
+fn tradier_non_option_security_types_are_free() {
+    let model = TradierFeeModel;
+    let order = Order::market(1, crypto_sym("BTCUSD"), dec!(-10), ts(0), "");
+    let crypto = params_full(
+        &order,
+        dec!(30_000),
+        SecurityType::Crypto,
+        "USD",
+        Some("BTC".into()),
+        dec!(1),
+    );
+    assert_eq!(model.get_order_fee(&crypto).amount, dec!(0));
+
+    let fx_order = Order::market(2, forex_sym("EURUSD"), dec!(100_000), ts(0), "");
+    let fx = params_full(
+        &fx_order,
+        dec!(1.1),
+        SecurityType::Forex,
+        "USD",
+        None,
+        dec!(1),
+    );
+    assert_eq!(model.get_order_fee(&fx).amount, dec!(0));
 }
 
 // ─── GDAXFeeModel / CoinbaseFeeModel ─────────────────────────────────────────

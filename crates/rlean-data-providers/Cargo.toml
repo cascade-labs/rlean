@@ -1,0 +1,35 @@
+[package]
+name = "rlean-data-providers"
+description = "LEAN-compatible historical and live data-provider contracts for rlean"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+rlean-core = { path = "../rlean-core" }
+rlean-data = { path = "../rlean-data" }
+rlean-data-tables = { path = "../rlean-data-tables" }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+verglas-sdk = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
+rust_decimal_macros = { workspace = true }
+# `test-util` drives the cache-append retry backoff on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
