@@ -56,10 +56,10 @@ rlean is a Cargo workspace. Each crate owns one part of the engine.
 
 Historical providers, live providers, and brokerages are selected independently.
 Historical reads are cache-first through the Verglas Rust SDK: rlean queries the
-canonical tables, requests uncovered ranges from the selected provider, and
+canonical tables in one explicitly selected database, requests uncovered ranges from the selected provider, and
 persists provider-neutral Arrow batches before consuming them. A single SDK
-connection discovers the catalog, query, and write services from the configured
-Verglas gateway.
+connection binds catalog, query, and write operations to that database through
+the configured Verglas gateway.
 
 Strategy SDK calls remain the source of subscription intent. Provider and
 brokerage credentials such as `tradier.access_token` are stored once per
@@ -70,6 +70,7 @@ and is applied by the SDK to every service discovered from the gateway:
 
 ```sh
 rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_database <database>
 rlean config set verglas_token <token>
 ```
 
@@ -201,7 +202,11 @@ maintains dynamic websocket membership as strategy subscriptions are added and
 removed, reconnects and re-authenticates automatically, and aggregates raw
 events into the requested resolution before emitting completed bars. Configure
 both historical and live Massive access with `massive.api_key`; rlean does not
-receive object-store credentials or embed an Iceberg query engine.
+receive object-store credentials or embed an Iceberg query engine. To share
+one upstream Massive connection across live deployments, also set
+`massive.live_websocket_base_url` to a Massive-compatible relay and
+`massive.live_relay_token` to that relay's private credential. Historical REST
+requests continue to use `massive.api_key`.
 
 ### Cloud fleet
 
@@ -270,6 +275,7 @@ durable run results:
 
 ```sh
 rlean config set verglas_endpoint http://127.0.0.1:8334
+rlean config set verglas_database <database>
 rlean config set verglas_token <token>
 ```
 

@@ -3,6 +3,7 @@ target
 .weco
 **/backtests
 **/live
+!crates/rlean-engine/src/live
+!crates/rlean-engine/src/live/**
 **/__pycache__
 *.pyc
-

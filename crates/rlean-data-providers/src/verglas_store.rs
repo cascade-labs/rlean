@@ -23,7 +23,7 @@ use rlean_data_tables::{
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use verglas_sdk::{
-    Client, ClientError, ColumnSpec, ConnectOptions, PartitionSpec, QueryStream,
+    Client, ClientError, ColumnSpec, ConnectOptions, Database, PartitionSpec, QueryStream,
     TableDefinition as VerglasTableDefinition,
 };
 
@@ -219,7 +219,7 @@ enum MarketDataRead {
 /// idempotency; this type owns only rlean's table contract and predicates.
 #[derive(Clone)]
 pub struct VerglasHistoricalDataStore {
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     coverage_queries: mpsc::Sender<CoverageQuery>,
     coverage_writes: mpsc::Sender<CoverageWrite>,
@@ -230,18 +230,19 @@ pub struct VerglasHistoricalDataStore {
 }
 
 impl VerglasHistoricalDataStore {
-    pub async fn connect(options: ConnectOptions) -> Result<Self> {
+    pub async fn connect(options: ConnectOptions, database: impl Into<String>) -> Result<Self> {
         let client = Client::connect(options)
             .await
             .context("connect to Verglas historical store")?;
-        Self::new(client).await
+        Self::new(client.database(&database.into())?).await
     }
 
     pub async fn from_env() -> Result<Self> {
-        Self::connect(ConnectOptions::from_env()).await
+        let database = std::env::var("VERGLAS_DATABASE").context("VERGLAS_DATABASE is required")?;
+        Self::connect(ConnectOptions::from_env(), database).await
     }
 
-    pub async fn new(client: Client) -> Result<Self> {
+    pub async fn new(client: Database) -> Result<Self> {
         client
             .ensure_table(TRADE_BARS, &contract_definition::<TradeBar>()?)
             .await
@@ -539,14 +540,20 @@ fn signed_sid(sid: u64) -> i64 {
 fn retryable_query_error(error: &ClientError) -> bool {
     match error {
         ClientError::RequestTimeout | ClientError::Transport(_) => true,
-        ClientError::Http { status, .. } => {
-            status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        ClientError::Http { status, message } => {
+            status.is_server_error()
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                // Verglas returns this transient optimistic-catalog conflict as
+                // HTTP 400 and explicitly directs the client to retry.
+                || (*status == reqwest::StatusCode::BAD_REQUEST
+                    && message.contains("catalog changed while rebuilding the query session")
+                    && message.contains("retry the query"))
         }
         _ => false,
     }
 }
 
-async fn query_stream_with_retry(client: &Client, sql: &str) -> Result<QueryStream> {
+async fn query_stream_with_retry(client: &Database, sql: &str) -> Result<QueryStream> {
     let mut delay = Duration::from_millis(100);
     for attempt in 1..=QUERY_OPEN_ATTEMPTS {
         match client.query_stream(sql).await {
@@ -581,7 +588,7 @@ async fn collect_query_batch<T>(receiver: &mut mpsc::Receiver<T>, first: T) -> V
 }
 
 async fn run_coverage_query_batcher(
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     mut receiver: mpsc::Receiver<CoverageQuery>,
 ) {
@@ -610,7 +617,7 @@ async fn run_coverage_query_batcher(
 }
 
 async fn run_coverage_write_batcher(
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     mut receiver: mpsc::Receiver<CoverageWrite>,
 ) {
@@ -634,7 +641,7 @@ async fn run_coverage_write_batcher(
 }
 
 async fn run_history_write_batcher(
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     dropped_cache_writes: DroppedCacheWrites,
     mut receiver: mpsc::Receiver<HistoryWrite>,
@@ -684,7 +691,7 @@ trait CacheBatchAppend: Send + Sync {
 }
 
 struct HistoryBatchAppend<'a> {
-    client: &'a Client,
+    client: &'a Database,
     table: &'a str,
     batches: &'a [RecordBatch],
     idempotency_key: &'a str,
@@ -754,7 +761,7 @@ async fn append_cache_batch(
 }
 
 async fn execute_history_write_batch(
-    client: &Client,
+    client: &Database,
     io_permits: &Semaphore,
     dropped_cache_writes: &DroppedCacheWrites,
     table: &'static str,
@@ -791,7 +798,7 @@ async fn execute_history_write_batch(
 }
 
 async fn execute_coverage_write_batch(
-    client: &Client,
+    client: &Database,
     io_permits: &Semaphore,
     jobs: &[CoverageWrite],
 ) -> Result<()> {
@@ -889,7 +896,7 @@ fn is_coverage_commit_rate_limit(error: &ClientError) -> bool {
 }
 
 async fn execute_coverage_query_batch(
-    client: &Client,
+    client: &Database,
     io_permits: &Semaphore,
     jobs: &[CoverageQuery],
 ) -> Result<Vec<Coverage>> {
@@ -976,7 +983,7 @@ async fn execute_coverage_query_batch(
 }
 
 async fn run_market_data_query_batcher(
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     mut receiver: mpsc::Receiver<MarketDataQuery>,
 ) {
@@ -994,7 +1001,7 @@ async fn run_market_data_query_batcher(
 }
 
 async fn execute_market_data_query_jobs(
-    client: Client,
+    client: Database,
     io_permits: Arc<Semaphore>,
     shared_option_windows: Arc<Mutex<SharedOptionWindowCache>>,
     jobs: Vec<MarketDataQuery>,
@@ -1203,7 +1210,7 @@ fn containing_dates(
 }
 
 async fn execute_market_data_query_batch(
-    client: &Client,
+    client: &Database,
     io_permits: &Semaphore,
     key: &MarketDataBatchKey,
     sids: &HashSet<i64>,
@@ -2553,7 +2560,10 @@ fn contract_definition<T: TableContract>() -> Result<VerglasTableDefinition> {
                 DataType::Boolean => "boolean".to_owned(),
                 DataType::Date32 => "date32".to_owned(),
                 DataType::Decimal128(precision, scale) => {
-                    format!("decimal128({precision},{scale})")
+                    // Iceberg's REST representation includes a space after the
+                    // precision separator. Match that canonical spelling so an
+                    // existing table is stable across process restarts.
+                    format!("decimal128({precision}, {scale})")
                 }
                 other => bail!("unsupported canonical Arrow type {other}"),
             };
@@ -2714,6 +2724,28 @@ mod tests {
             status: reqwest::StatusCode::BAD_GATEWAY,
             message: "upstream write service is unavailable".to_owned(),
         }
+    }
+
+    #[test]
+    fn catalog_rebuild_conflict_is_retryable() {
+        let error = ClientError::Http {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message:
+                "query failed: catalog changed while rebuilding the query session; retry the query"
+                    .to_owned(),
+        };
+
+        assert!(retryable_query_error(&error));
+    }
+
+    #[test]
+    fn unrelated_bad_request_is_not_retryable() {
+        let error = ClientError::Http {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "query failed: invalid SQL".to_owned(),
+        };
+
+        assert!(!retryable_query_error(&error));
     }
 
     #[tokio::test(start_paused = true)]

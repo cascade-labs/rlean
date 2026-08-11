@@ -149,6 +149,7 @@ impl ThetaDataHistoricalDataProvider {
                         ("symbol", ticker.clone()),
                         ("start_date", vendor_date(chunk_start)),
                         ("end_date", vendor_date(chunk_end)),
+                        ("venue", "utp_cta".to_string()),
                         ("format", "ndjson".to_string()),
                     ],
                 )?;
@@ -171,6 +172,7 @@ impl ThetaDataHistoricalDataProvider {
                     ("start_date", vendor_date(chunk_start)),
                     ("end_date", vendor_date(chunk_end)),
                     ("interval", interval.to_string()),
+                    ("venue", "utp_cta".to_string()),
                     ("format", "ndjson".to_string()),
                 ],
             )?;
@@ -209,6 +211,7 @@ impl ThetaDataHistoricalDataProvider {
                 ("symbol", ticker.clone()),
                 ("date", vendor_date(date)),
                 ("interval", interval.to_string()),
+                ("venue", "utp_cta".to_string()),
                 ("format", "ndjson".to_string()),
             ];
             if !request.configuration.extended_market_hours || daily {
@@ -398,6 +401,8 @@ impl ThetaDataHistoricalDataProvider {
                 parameters.push(("expiration", vendor_date(contract.expiration)));
                 parameters.push(("strike", contract.strike.normalize().to_string()));
                 parameters.push(("right", option_right_query(contract.right).to_string()));
+            } else {
+                parameters.push(("venue", "utp_cta".to_string()));
             }
             let url = self.url(path, &parameters)?;
             for value in self.get_ndjson(url).await? {

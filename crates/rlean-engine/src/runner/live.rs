@@ -9,7 +9,7 @@ use crate::{
     },
     LiveRunConfig, LiveRunResult,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel::RecvTimeoutError;
 use futures::StreamExt;
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
@@ -22,6 +22,11 @@ use rlean_statistics::{Trade, TradeBuilder};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Allow one five-minute custom-data publication cycle plus provider and
+/// scheduler delay. Older rows remain available through History, but must not
+/// enter the live event stream.
+const LIVE_CUSTOM_DATA_MAX_AGE_NS: i64 = 10 * 60 * 1_000_000_000;
 
 /// LEAN-style real-time pulse source. LiveSynchronizer advances the algorithm
 /// clock from wall time after warmup even when no subscription produced data;
@@ -1134,7 +1139,8 @@ async fn emit_live_catalog_update(
         deploy_id,
         deploy_started_at,
     );
-    let checkpoint_json = serde_json::to_string(&checkpoint).ok();
+    let checkpoint_json =
+        Some(serde_json::to_string(&checkpoint).context("serialize durable live checkpoint")?);
     sender
         .send(crate::BacktestStreamUpdate {
             progress,
@@ -1216,7 +1222,14 @@ async fn service_live_brokerage<B: AlgorithmBridge>(
 
     // Brokerage events are independent of market-data slices. Stream catalog
     // updates as soon as submitted/filled/invalid state changes.
-    if all_order_events.len() != previous_order_events || completed_trades.len() != previous_trades
+    let insight_state_changed = algorithm_manager
+        .framework()
+        .lock()
+        .map(|framework| framework.has_pending_insight_events())
+        .unwrap_or(true);
+    if insight_state_changed
+        || all_order_events.len() != previous_order_events
+        || completed_trades.len() != previous_trades
     {
         if let (Some(sender), Some(portfolio)) = (stream_updates, portfolio) {
             emit_live_catalog_update(
@@ -1371,8 +1384,18 @@ async fn process_live_slice<B: AlgorithmBridge>(
     if let (Some(sender), Some(transactions), Some(portfolio)) =
         (stream_updates, transactions, portfolio)
     {
-        let force_checkpoint =
-            all_order_events.len() != prev_order_events || completed_trades.len() != prev_trades;
+        // An alpha refresh can change the active insight expiry/weight without
+        // producing an order. Persist that framework state immediately; using
+        // only order/trade events leaves a stale checkpoint that can make a
+        // real brokerage holding look unmanaged after restart.
+        let insight_state_changed = algorithm_manager
+            .framework()
+            .lock()
+            .map(|framework| framework.has_pending_insight_events())
+            .unwrap_or(true);
+        let force_checkpoint = insight_state_changed
+            || all_order_events.len() != prev_order_events
+            || completed_trades.len() != prev_trades;
         emit_live_catalog_update(
             sender,
             slice.time,
@@ -1523,13 +1546,15 @@ impl LiveSubscriptionSet {
                             .ok()
                             .and_then(|senders| senders.get(&subscription_id).cloned());
                         let send_result = entry.map(|entry| {
-                            native_live_items(data, &entry.config).map(|items| {
-                                for item in items {
-                                    if entry.sender.send(Ok(item)).is_err() {
-                                        break;
+                            native_live_items(data, &entry.config, rlean_core::DateTime::now()).map(
+                                |items| {
+                                    for item in items {
+                                        if entry.sender.send(Ok(item)).is_err() {
+                                            break;
+                                        }
                                     }
-                                }
-                            })
+                                },
+                            )
                         });
                         if let Some(Err(error)) = send_result {
                             tracing::error!(subscription_id, %error, "invalid live provider data");
@@ -1640,6 +1665,7 @@ impl LiveSubscriptionSet {
 fn native_live_items(
     batch: HistoricalData,
     config: &SubscriptionDataConfig,
+    now: rlean_core::DateTime,
 ) -> anyhow::Result<Vec<LiveDataItem>> {
     Ok(match batch {
         HistoricalData::TradeBars(rows) => rows
@@ -1668,14 +1694,37 @@ fn native_live_items(
                 .custom
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("custom live data has no subscription metadata"))?;
-            rows.into_iter()
+            // <DIV> C# LEAN's LiveCustomDataSubscriptionEnumeratorFactory
+            // disables maximum-age filtering because some daily custom sources
+            // publish after weekends. rlean custom points share a durable table
+            // with historical backfills, so live delivery uses a bounded grace
+            // period to prevent an archive append from replaying through OnData.
+            let cutoff = now - rlean_core::TimeSpan::from_nanos(LIVE_CUSTOM_DATA_MAX_AGE_NS);
+            let mut stale = 0usize;
+            let items = rows
+                .into_iter()
+                .filter(|point| {
+                    let fresh = point.end_time >= cutoff;
+                    stale += usize::from(!fresh);
+                    fresh
+                })
                 .map(|point| LiveDataItem::CustomData {
                     symbol: config.symbol.clone(),
                     source_type: custom.source_type.clone(),
                     ticker: custom.ticker.clone(),
                     point,
                 })
-                .collect()
+                .collect();
+            if stale > 0 {
+                tracing::warn!(
+                    provider = %custom.source_type,
+                    feed = %custom.ticker,
+                    stale_rows = stale,
+                    cutoff_ns = cutoff.0,
+                    "discarded stale live custom-data events"
+                );
+            }
+            items
         }
         HistoricalData::OptionUniverse(rows) => {
             crate::option_universe::option_chains_from_rows(config, rows)?
@@ -1769,6 +1818,56 @@ mod live_time_pulse_tests {
             pulses.next(rlean_core::DateTime::from_secs(101)),
             Some(rlean_core::DateTime::from_secs(101))
         );
+    }
+}
+
+#[cfg(test)]
+mod live_custom_data_age_tests {
+    use super::*;
+    use rlean_core::{Market, Resolution, Symbol, TimeSpan};
+    use rlean_data::{CustomDataConfig, CustomDataQuery, CustomSubscriptionMetadata};
+    use rlean_data_tables::CustomDataPoint;
+    use rust_decimal_macros::dec;
+
+    fn custom_config() -> SubscriptionDataConfig {
+        let query = CustomDataQuery::default();
+        let metadata = CustomSubscriptionMetadata {
+            source_type: "unusual_whales".to_string(),
+            ticker: "market_tide".to_string(),
+            config: CustomDataConfig {
+                ticker: "market_tide".to_string(),
+                source_type: "unusual_whales".to_string(),
+                resolution: Resolution::Minute,
+                properties: HashMap::new(),
+                query: query.clone(),
+            },
+            dynamic_query: query,
+        };
+        SubscriptionDataConfig::new_custom(
+            Symbol::create_base("unusual_whales", "market_tide", &Market::usa()),
+            Resolution::Minute,
+            metadata,
+        )
+    }
+
+    #[test]
+    fn live_custom_data_keeps_delay_grace_and_rejects_archive_rows() {
+        let now = rlean_core::DateTime::from_secs(2_000_000);
+        let exactly_at_cutoff = now - TimeSpan::from_mins(10);
+        let stale = exactly_at_cutoff - TimeSpan::from_nanos(1);
+        let recent = now - TimeSpan::from_mins(5);
+        let rows = vec![
+            CustomDataPoint::empty(stale, stale, dec!(1)),
+            CustomDataPoint::empty(exactly_at_cutoff, exactly_at_cutoff, dec!(2)),
+            CustomDataPoint::empty(recent, recent, dec!(3)),
+        ];
+
+        let items =
+            native_live_items(HistoricalData::CustomPoints(rows), &custom_config(), now).unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].end_time(), exactly_at_cutoff);
+        assert_eq!(items[1].end_time(), recent);
     }
 }
 

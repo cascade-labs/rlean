@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::{future::try_join_all, stream};
 use rlean_engine::{BacktestProgress, BacktestRunResult, BacktestStreamUpdate};
 use serde_json::Value;
-use verglas_sdk::{Client, ColumnSpec, TableDefinition};
+use verglas_sdk::{ColumnSpec, Database, TableDefinition};
 
 const RUNS: &str = "rlean.runs";
 const PROGRESS: &str = "rlean.run_progress";
@@ -28,7 +28,7 @@ const CHARTS: &str = "rlean.charts";
 const DATA_REQUESTS: &str = "rlean.data_requests";
 const LOGS: &str = "rlean.logs";
 const APPEND_ATTEMPTS: usize = 4;
-// `verglas_sdk::Client::append_stream` commits each incoming RecordBatch as an
+// `verglas_sdk::Database::append_stream` commits each incoming RecordBatch as an
 // independent bounded write. Keep the remaining terminal artifacts bounded as
 // well; no result family should depend on a run-sized request body.
 const APPEND_BATCH_ROWS: usize = 4_096;
@@ -55,7 +55,7 @@ struct DroppedAppends {
 
 #[derive(Clone)]
 pub(crate) struct RunCatalog {
-    client: Client,
+    client: Database,
     run_id: String,
     strategy: String,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -65,7 +65,7 @@ pub(crate) struct RunCatalog {
 
 impl RunCatalog {
     pub(crate) async fn connect(
-        client: Client,
+        client: Database,
         run_id: String,
         strategy: String,
         parameters: &std::collections::HashMap<String, String>,
@@ -185,7 +185,9 @@ impl RunCatalog {
             self.append(ORDER_EVENTS, order_batch, &suffix, AppendFailure::Drop),
             self.append(TRADES, trade_batch, &suffix, AppendFailure::Drop),
             self.append(INSIGHTS, insight_batch, &suffix, AppendFailure::Drop),
-            self.append(CHECKPOINTS, checkpoint_batch, &suffix, AppendFailure::Drop),
+            // A live checkpoint is the source of restart truth. Do not report a
+            // successful stream write when Verglas did not commit it.
+            self.append(CHECKPOINTS, checkpoint_batch, &suffix, AppendFailure::Fail),
         ])
         .await?;
         Ok(())
@@ -193,7 +195,7 @@ impl RunCatalog {
 
     /// Load the latest restore checkpoint for a live run, plus historical fills.
     pub(crate) async fn load_live_restore(
-        client: &Client,
+        client: &Database,
         run_id: &str,
     ) -> Result<Option<rlean_engine::live::catalog_state::LiveRestoreState>> {
         use futures::TryStreamExt;
@@ -481,7 +483,7 @@ fn table_schemas() -> Vec<(&'static str, SchemaRef)> {
 }
 
 async fn load_json_payloads<T: serde::de::DeserializeOwned>(
-    client: &Client,
+    client: &Database,
     sql: &str,
 ) -> Result<Vec<T>> {
     use futures::TryStreamExt;

@@ -19,6 +19,7 @@ pub(crate) fn node_config_from_local(local: &GlobalConfig, node_home: &str) -> G
     GlobalConfig {
         default_language: local.default_language.clone(),
         verglas_endpoint: local.verglas_endpoint.clone(),
+        verglas_database: local.verglas_database.clone(),
         verglas_token: local.verglas_token.clone(),
         providers: local.providers.clone(),
         workspace: Some(format!("{node_home}/rlean-cloud/workspace")),
@@ -33,6 +34,7 @@ mod tests {
         GlobalConfig {
             default_language: "python".to_string(),
             verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            verglas_database: Some("rlean".to_string()),
             verglas_token: Some("vgk_test".to_string()),
             providers: Default::default(),
             workspace: Some("/Users/op/strategies".to_string()),
@@ -61,6 +63,7 @@ mod tests {
             Some("http://127.0.0.1:8334")
         );
         assert_eq!(node.verglas_token.as_deref(), Some("vgk_test"));
+        assert_eq!(node.verglas_database.as_deref(), Some("rlean"));
         assert_eq!(
             node.get_provider("thetadata")
                 .get("api_key")
@@ -93,6 +96,7 @@ mod tests {
         assert!(!json.contains("artifact_store"));
         assert!(json.contains("\"default-language\": \"python\""));
         assert!(json.contains("\"verglas_endpoint\": \"http://127.0.0.1:8334\""));
+        assert!(json.contains("\"verglas_database\": \"rlean\""));
         assert!(json.contains("\"verglas_token\": \"vgk_test\""));
         let reparsed: GlobalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(

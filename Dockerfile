@@ -15,7 +15,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3 python3-numpy libpython3.11 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libpython3.11 \
+        python3 \
+        python3-numpy \
+        python3-pandas \
+        python3-scipy \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/rlean /usr/local/bin/rlean

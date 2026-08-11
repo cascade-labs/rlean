@@ -32,7 +32,7 @@ fn home_dir() -> Result<PathBuf> {
 
 // ── Global config (~/.rlean/config) ──────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalConfig {
     #[serde(default = "default_language")]
@@ -45,6 +45,14 @@ pub struct GlobalConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub verglas_endpoint: Option<String>,
+
+    /// Named Verglas lakehouse used by every rlean query and write.
+    #[serde(
+        default,
+        rename = "verglas_database",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verglas_database: Option<String>,
 
     /// Bearer token used by the Verglas SDK for every discovered endpoint.
     #[serde(
@@ -168,6 +176,23 @@ pub fn ensure_known_provider(provider: &str) -> Result<()> {
         "Unknown provider '{provider}'. Known providers: {}",
         KNOWN_PROVIDERS.join(", ")
     )
+}
+
+pub fn validate_verglas_database(name: &str) -> Result<()> {
+    let Some((first, remainder)) = name.as_bytes().split_first() else {
+        bail!("Verglas database name cannot be empty");
+    };
+    if !(first.is_ascii_alphabetic() || *first == b'_')
+        || !remainder
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    {
+        bail!(
+            "Verglas database name must start with a letter or underscore and contain only \
+             ASCII letters, digits, underscores, or hyphens"
+        );
+    }
+    Ok(())
 }
 
 fn json_value_as_config_string(value: &serde_json::Value) -> Option<String> {
@@ -297,6 +322,16 @@ mod tests {
         assert!(ensure_known_provider("tradier").is_ok());
         assert!(ensure_known_provider("fred").is_ok());
         assert!(ensure_known_provider("fidelity").is_err());
+    }
+
+    #[test]
+    fn validates_verglas_database_resource_names() {
+        for valid in ["rlean", "_rlean", "market-data", "market_data2"] {
+            assert!(validate_verglas_database(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "2rlean", "market/data", "market data"] {
+            assert!(validate_verglas_database(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
