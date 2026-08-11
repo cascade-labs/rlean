@@ -27,6 +27,7 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 verglas-sdk = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }
