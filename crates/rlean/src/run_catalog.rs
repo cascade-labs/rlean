@@ -57,6 +57,7 @@ struct DroppedAppends {
 pub(crate) struct RunCatalog {
     client: Database,
     run_id: String,
+    process_generation: uuid::Uuid,
     strategy: String,
     started_at: chrono::DateTime<chrono::Utc>,
     parameters_json: String,
@@ -73,6 +74,7 @@ impl RunCatalog {
         let catalog = Self {
             client,
             run_id,
+            process_generation: uuid::Uuid::new_v4(),
             strategy,
             started_at: chrono::Utc::now(),
             parameters_json: serde_json::to_string(parameters)?,
@@ -327,7 +329,11 @@ impl RunCatalog {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let idempotency_key = format!("{}:{suffix}", self.run_id);
+        // A deployment ID survives process restarts. Include this process
+        // generation so sequence zero after a restart cannot be mistaken for
+        // sequence zero from the prior process. Retries within this process
+        // still reuse the same key and remain idempotent.
+        let idempotency_key = append_idempotency_key(&self.run_id, self.process_generation, suffix);
         let mut delay = Duration::from_secs(2);
         for attempt in 1..=APPEND_ATTEMPTS {
             match self
@@ -386,6 +392,10 @@ impl RunCatalog {
         }
         Ok(())
     }
+}
+
+fn append_idempotency_key(run_id: &str, process_generation: uuid::Uuid, suffix: &str) -> String {
+    format!("{run_id}:{process_generation}:{suffix}")
 }
 
 fn record_batch_chunks(batch: &RecordBatch) -> impl Iterator<Item = RecordBatch> + '_ {
@@ -1031,5 +1041,17 @@ mod tests {
             retry_after_from_error(&error),
             Some(Duration::from_secs(60))
         );
+    }
+
+    #[test]
+    fn append_keys_are_stable_for_retries_and_distinct_across_restarts() {
+        let first_process = uuid::Uuid::new_v4();
+        let second_process = uuid::Uuid::new_v4();
+        let first_attempt = append_idempotency_key("live-strategy", first_process, "stream-0");
+        let retry = append_idempotency_key("live-strategy", first_process, "stream-0");
+        let restarted = append_idempotency_key("live-strategy", second_process, "stream-0");
+
+        assert_eq!(first_attempt, retry);
+        assert_ne!(first_attempt, restarted);
     }
 }
