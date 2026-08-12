@@ -59,9 +59,15 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
 
     let global_config = config::GlobalConfig::load()?;
     let verglas = connect_verglas(&global_config).await?;
+    let custom_data_group = deploy_dir
+        .as_ref()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(|id| format!("live-{id}"))
+        .unwrap_or_else(|| format!("live-{}", uuid::Uuid::new_v4()));
     let (historical_provider, dropped_cache_writes) =
         historical_data_provider(&args, verglas.clone()).await?;
-    let live_data_provider = live_data_provider(&args, verglas.clone()).await?;
+    let live_data_provider = live_data_provider(&args, verglas.clone(), &custom_data_group).await?;
 
     let requested_brokerage = args
         .brokerage
@@ -136,21 +142,14 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
     let stream_catalog = run_catalog.clone();
     let stream_task = tokio::spawn(async move {
         let mut sequence = 0_u64;
-        let mut updates = Vec::with_capacity(32);
         while let Some(update) = stream_rx.recv().await {
-            updates.push(update);
-            if updates.len() < 32 {
-                continue;
-            }
+            // Live checkpoints are restart state, not bulk telemetry. Commit
+            // each update before accepting the next one so a process failure
+            // cannot strand the latest insight refresh in an in-memory batch.
             stream_catalog
-                .record_stream_updates(std::mem::take(&mut updates), sequence)
+                .record_stream_updates(vec![update], sequence)
                 .await?;
             sequence = sequence.wrapping_add(1);
-        }
-        if !updates.is_empty() {
-            stream_catalog
-                .record_stream_updates(updates, sequence)
-                .await?;
         }
         Ok::<_, anyhow::Error>(())
     });

@@ -3,7 +3,7 @@
 //! The host `rlean` CLI never runs the engine natively for those modes; it
 //! validates Docker + Verglas, ensures the image, and spawns containers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -126,7 +126,7 @@ pub(crate) fn run_backtest_container(spec: BacktestRunSpec<'_>) -> Result<i32> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid strategy file name"))?;
-    let config_file = config::config_path()?;
+    let config_file = write_container_config(spec.global)?;
 
     let mut args = base_run_args(spec.image, spec.global)?;
     args.push("--rm".into());
@@ -134,12 +134,10 @@ pub(crate) fn run_backtest_container(spec: BacktestRunSpec<'_>) -> Result<i32> {
         "-v".into(),
         format!("{}:/strategy:ro", strategy_dir.display()),
     ]);
-    if config_file.exists() {
-        args.extend([
-            "-v".into(),
-            format!("{}:/root/.rlean/config:ro", config_file.display()),
-        ]);
-    }
+    args.extend([
+        "-v".into(),
+        format!("{}:/root/.rlean/config:ro", config_file.display()),
+    ]);
     args.push(spec.image.to_owned());
     args.push("backtest".into());
     args.push("--native".into());
@@ -188,7 +186,7 @@ pub(crate) fn run_live_container(spec: LiveRunSpec<'_>) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("invalid strategy file name"))?;
     let deployment_dir = std::fs::canonicalize(spec.deployment_dir)
         .with_context(|| format!("canonicalize {}", spec.deployment_dir.display()))?;
-    let config_file = config::config_path()?;
+    let config_file = write_container_config(spec.global)?;
 
     let mut args = base_run_args(spec.image, spec.global)?;
     args.extend([
@@ -202,12 +200,10 @@ pub(crate) fn run_live_container(spec: LiveRunSpec<'_>) -> Result<String> {
         "-v".into(),
         format!("{}:/data/live/{}", deployment_dir.display(), spec.deploy_id),
     ]);
-    if config_file.exists() {
-        args.extend([
-            "-v".into(),
-            format!("{}:/root/.rlean/config:ro", config_file.display()),
-        ]);
-    }
+    args.extend([
+        "-v".into(),
+        format!("{}:/root/.rlean/config:ro", config_file.display()),
+    ]);
     args.push(spec.image.to_owned());
     args.push("live".into());
     args.push("--foreground".into());
@@ -281,6 +277,58 @@ pub(crate) fn containerize_loopback_url(url: &str) -> String {
         .replace("localhost", "host.docker.internal")
 }
 
+/// Materialize the host configuration for container use. Provider endpoints
+/// are machine-local configuration, so loopback URLs must point at the Docker
+/// host while credentials and all non-endpoint settings remain unchanged.
+fn write_container_config(global: &GlobalConfig) -> Result<PathBuf> {
+    let container = containerized_config(global, container_uses_host_network());
+    let path = config::config_path()?.with_file_name("container-config");
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&container)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temporary, &path)?;
+    Ok(path)
+}
+
+fn containerized_config(global: &GlobalConfig, host_network: bool) -> GlobalConfig {
+    let mut container = global.clone();
+    if !host_network {
+        container.verglas_endpoint = container
+            .verglas_endpoint
+            .as_deref()
+            .map(containerize_loopback_url);
+        for provider in container.providers.values_mut() {
+            for (key, value) in provider.iter_mut() {
+                let key = key.to_ascii_lowercase();
+                if key.contains("url") || key.contains("endpoint") {
+                    *value = containerize_loopback_url(value);
+                }
+            }
+        }
+    }
+    // ThetaData's native default is its host-side terminal port. A configured
+    // provider with no explicit base URL therefore still needs the Docker host
+    // gateway when the engine runs in a container.
+    if let Some(thetadata) = container.providers.get_mut("thetadata") {
+        thetadata.entry("base_url".to_string()).or_insert_with(|| {
+            if host_network {
+                "http://127.0.0.1:25510".to_string()
+            } else {
+                "http://host.docker.internal:25510".to_string()
+            }
+        });
+    }
+    container
+}
+
+fn container_uses_host_network() -> bool {
+    cfg!(target_os = "linux")
+}
+
 fn verglas_endpoint_for_host(global: &GlobalConfig) -> String {
     std::env::var("VERGLAS_ENDPOINT")
         .ok()
@@ -289,18 +337,38 @@ fn verglas_endpoint_for_host(global: &GlobalConfig) -> String {
 }
 
 fn verglas_endpoint_for_container(global: &GlobalConfig) -> String {
-    containerize_loopback_url(&verglas_endpoint_for_host(global))
+    let endpoint = verglas_endpoint_for_host(global);
+    if container_uses_host_network() {
+        endpoint
+    } else {
+        containerize_loopback_url(&endpoint)
+    }
 }
 
 fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
     let _ = image;
-    let mut args = vec![
-        "run".into(),
-        "--add-host".into(),
-        "host.docker.internal:host-gateway".into(),
-    ];
+    let mut args = vec!["run".into()];
+    if container_uses_host_network() {
+        args.extend(["--network".into(), "host".into()]);
+    } else {
+        args.extend([
+            "--add-host".into(),
+            "host.docker.internal:host-gateway".into(),
+        ]);
+    }
     let endpoint = verglas_endpoint_for_container(global);
     args.extend(["-e".into(), format!("VERGLAS_ENDPOINT={endpoint}")]);
+    let database = std::env::var("VERGLAS_DATABASE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global.verglas_database.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Verglas database is not configured; set verglas_database or VERGLAS_DATABASE"
+            )
+        })?;
+    config::validate_verglas_database(&database)?;
+    args.extend(["-e".into(), format!("VERGLAS_DATABASE={database}")]);
     if let Some(token) = std::env::var("VERGLAS_TOKEN")
         .ok()
         .or_else(|| global.verglas_token.clone())
@@ -392,6 +460,78 @@ mod tests {
         assert_eq!(
             containerize_loopback_url("http://localhost:5199"),
             "http://host.docker.internal:5199"
+        );
+    }
+
+    #[test]
+    fn container_config_rewrites_provider_endpoints_without_changing_credentials() {
+        let mut global = GlobalConfig {
+            verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            ..GlobalConfig::default()
+        };
+        global.providers.insert(
+            "thetadata".to_string(),
+            [
+                ("api_key".to_string(), "secret".to_string()),
+                (
+                    "base_url".to_string(),
+                    "http://localhost:25510/v3".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let container = containerized_config(&global, false);
+        assert_eq!(
+            container.verglas_endpoint.as_deref(),
+            Some("http://host.docker.internal:8334")
+        );
+        assert_eq!(
+            container.providers["thetadata"]["base_url"],
+            "http://host.docker.internal:25510/v3"
+        );
+        assert_eq!(container.providers["thetadata"]["api_key"], "secret");
+    }
+
+    #[test]
+    fn container_config_materializes_thetadata_host_default() {
+        let mut global = GlobalConfig::default();
+        global.providers.insert(
+            "thetadata".to_string(),
+            [("api_key".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let container = containerized_config(&global, false);
+        assert_eq!(
+            container.providers["thetadata"]["base_url"],
+            "http://host.docker.internal:25510"
+        );
+    }
+
+    #[test]
+    fn host_network_container_config_preserves_loopback_endpoints() {
+        let mut global = GlobalConfig {
+            verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            ..GlobalConfig::default()
+        };
+        global.providers.insert(
+            "thetadata".to_string(),
+            [("api_key".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let container = containerized_config(&global, true);
+        assert_eq!(
+            container.verglas_endpoint.as_deref(),
+            Some("http://127.0.0.1:8334")
+        );
+        assert_eq!(
+            container.providers["thetadata"]["base_url"],
+            "http://127.0.0.1:25510"
         );
     }
 

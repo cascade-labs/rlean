@@ -366,6 +366,13 @@ impl FrameworkState {
         std::mem::take(&mut self.pending_insight_events)
     }
 
+    /// True when the durable live checkpoint is stale relative to framework
+    /// insight state. A refreshed insight can leave the desired portfolio
+    /// unchanged, so order events cannot serve as the checkpoint trigger.
+    pub fn has_pending_insight_events(&self) -> bool {
+        !self.pending_insight_events.is_empty()
+    }
+
     /// Cancel active insights for the supplied symbols, matching
     /// C# LEAN `InsightManager.Cancel`.
     pub fn cancel_insights(&mut self, symbols: &[Symbol], utc_now: DateTime) {
@@ -1100,6 +1107,26 @@ mod tests {
         assert!(framework.pending_insight_events.iter().any(|event| {
             event.kind == InsightEventKind::Cancelled && event.insight.symbol == symbol
         }));
+    }
+
+    #[test]
+    fn insight_events_mark_live_checkpoint_state_dirty_until_drained() {
+        let mut framework = FrameworkState::new();
+        let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+
+        framework.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![Insight::up(symbol, TimeSpan::ONE_DAY).with_generated_time_utc(now)],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            now,
+        );
+
+        assert!(framework.has_pending_insight_events());
+        assert_eq!(framework.take_insight_events().len(), 1);
+        assert!(!framework.has_pending_insight_events());
     }
 
     #[test]

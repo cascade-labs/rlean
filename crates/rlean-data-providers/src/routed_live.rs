@@ -2,20 +2,17 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
-use futures::{stream, Stream, StreamExt};
-use rlean_core::{DateTime, TimeSpan};
-use rlean_data::SubscriptionDataKind;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
-use verglas_sdk::Client;
 
 use crate::{
     HistoricalData, HistoricalDataStore, HistoryRequest, LiveDataEvent, LiveDataProvider,
     LiveSubscription, VerglasHistoricalDataStore,
 };
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use futures::{stream, Stream};
+use rlean_core::{DateTime, TimeSpan};
+use rlean_data::SubscriptionDataKind;
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
 /// Routes LEAN subscription intent to independent market and custom-data live
 /// sources while exposing one event stream to the engine synchronizer.
@@ -92,12 +89,13 @@ struct CustomSubscriptionState {
     frontier: DateTime,
 }
 
-/// Turns Verglas table commits into bounded custom-data reads and unsolicited
-/// live events. The catalog feed carries only commit notifications; rows remain
-/// provider-neutral canonical `rlean.custom_points` records.
+/// Subscribes to durable Verglas table commits and publishes custom-data rows.
+/// Rows remain provider-neutral canonical `rlean.custom_points` records.
 pub struct VerglasCustomLiveDataProvider {
-    client: Client,
+    database: verglas_sdk::Database,
     store: VerglasHistoricalDataStore,
+    consumer_group: String,
+    consumer_owner: String,
     subscriptions: Arc<RwLock<HashMap<u64, CustomSubscriptionState>>>,
     event_tx: mpsc::Sender<Result<LiveDataEvent>>,
     event_rx: Mutex<Option<mpsc::Receiver<Result<LiveDataEvent>>>>,
@@ -107,13 +105,18 @@ pub struct VerglasCustomLiveDataProvider {
 }
 
 impl VerglasCustomLiveDataProvider {
-    pub async fn new(client: Client) -> Result<Self> {
+    pub async fn new(client: verglas_sdk::Database, consumer_group: String) -> Result<Self> {
+        if consumer_group.trim().is_empty() {
+            bail!("Verglas custom subscription consumer group must not be empty");
+        }
         let store = VerglasHistoricalDataStore::new(client.clone()).await?;
         let (event_tx, event_rx) = mpsc::channel(4_096);
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
-            client,
+            database: client,
             store,
+            consumer_group,
+            consumer_owner: format!("rlean-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
@@ -121,17 +124,6 @@ impl VerglasCustomLiveDataProvider {
             shutdown,
             worker: Mutex::new(None),
         })
-    }
-
-    async fn publish_subscription(&self, subscription_id: u64, end: DateTime) -> Result<()> {
-        publish_subscription(
-            &self.store,
-            &self.subscriptions,
-            &self.event_tx,
-            subscription_id,
-            end,
-        )
-        .await
     }
 }
 
@@ -151,21 +143,27 @@ impl LiveDataProvider for VerglasCustomLiveDataProvider {
             return Ok(());
         }
         let _ = self.shutdown.send(false);
-        *worker = Some(tokio::spawn(run_follow(
-            self.client.clone(),
-            self.store.clone(),
-            self.subscriptions.clone(),
-            self.event_tx.clone(),
-            self.connected.clone(),
-            self.shutdown.subscribe(),
-        )));
+        *worker = Some(tokio::spawn(
+            CustomSubscriptionWorker {
+                database: self.database.clone(),
+                store: self.store.clone(),
+                consumer_group: self.consumer_group.clone(),
+                consumer_owner: self.consumer_owner.clone(),
+                subscriptions: self.subscriptions.clone(),
+                events: self.event_tx.clone(),
+                connected: self.connected.clone(),
+            }
+            .run(self.shutdown.subscribe()),
+        ));
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<()> {
         let _ = self.shutdown.send(true);
         if let Some(worker) = self.worker.lock().await.take() {
-            worker.await.context("join Verglas custom follow worker")?;
+            worker
+                .await
+                .context("join Verglas custom subscription worker")?;
         }
         self.connected.store(false, Ordering::Release);
         Ok(())
@@ -175,13 +173,25 @@ impl LiveDataProvider for VerglasCustomLiveDataProvider {
         if subscription.configuration.data_kind != SubscriptionDataKind::Custom {
             bail!("Verglas custom live provider accepts only custom subscriptions");
         }
+        let custom = subscription
+            .configuration
+            .custom
+            .as_ref()
+            .context("custom live subscription has no metadata")?;
+        tracing::info!(
+            subscription_id = subscription.id,
+            provider = %custom.source_type,
+            feed = %custom.ticker,
+            resolution = %subscription.configuration.resolution,
+            "subscribed to Verglas custom-data events"
+        );
         let lookback = subscription
             .configuration
             .resolution
             .to_time_span()
             .unwrap_or(TimeSpan::ONE_MINUTE);
         let start =
-            DateTime::now() - TimeSpan::from_nanos((lookback.nanos * 2).max(120_000_000_000));
+            DateTime::now() - TimeSpan::from_nanos((lookback.nanos * 2).max(600_000_000_000));
         self.subscriptions.write().await.insert(
             subscription.id,
             CustomSubscriptionState {
@@ -189,15 +199,17 @@ impl LiveDataProvider for VerglasCustomLiveDataProvider {
                 frontier: start,
             },
         );
-        if let Err(error) = self
-            .publish_subscription(subscription.id, DateTime::now() + TimeSpan::ONE_MINUTE)
-            .await
+        if let Err(error) = publish_subscription(
+            &self.store,
+            &self.subscriptions,
+            &self.event_tx,
+            subscription.id,
+            DateTime::now() + TimeSpan::ONE_MINUTE,
+        )
+        .await
         {
-            tracing::warn!(
-                subscription_id = subscription.id,
-                %error,
-                "initial durable custom-data read failed; the live provider will retry"
-            );
+            self.subscriptions.write().await.remove(&subscription.id);
+            return Err(error.context("initial Verglas custom-data catch-up"));
         }
         Ok(())
     }
@@ -218,124 +230,114 @@ impl LiveDataProvider for VerglasCustomLiveDataProvider {
     }
 }
 
-async fn run_follow(
-    client: Client,
+struct CustomSubscriptionWorker {
+    database: verglas_sdk::Database,
     store: VerglasHistoricalDataStore,
+    consumer_group: String,
+    consumer_owner: String,
     subscriptions: Arc<RwLock<HashMap<u64, CustomSubscriptionState>>>,
     events: mpsc::Sender<Result<LiveDataEvent>>,
     connected: Arc<AtomicBool>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut retry = Duration::from_millis(250);
-    loop {
-        if *shutdown.borrow() {
-            return;
-        }
-        let mut changes = match client.follow(["rlean.custom_points"], None) {
-            Ok(changes) => changes,
+}
+
+impl CustomSubscriptionWorker {
+    async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        use futures::StreamExt;
+        use verglas_sdk::TableSubscriptionEvent;
+
+        let mut feed = match self.database.subscribe(
+            &self.consumer_group,
+            &self.consumer_owner,
+            ["rlean.custom_points"],
+            60,
+        ) {
+            Ok(feed) => feed,
             Err(error) => {
-                let _ = events.send(Err(error.into())).await;
+                let _ = self
+                    .events
+                    .send(Err(
+                        anyhow::Error::new(error).context("subscribe to Verglas table events")
+                    ))
+                    .await;
                 return;
             }
         };
-        connected.store(true, Ordering::Release);
-        // A commit can land while the follow stream is reconnecting. Read from
-        // each durable frontier before waiting for the next notification so a
-        // quiet table cannot strand that data indefinitely.
-        let ids = subscriptions
-            .read()
-            .await
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        let end = DateTime::now() + TimeSpan::ONE_MINUTE;
-        for id in ids {
-            if let Err(error) = publish_subscription(&store, &subscriptions, &events, id, end).await
-            {
-                tracing::warn!(subscription_id = id, %error, "durable custom-data read failed");
-            }
-        }
         loop {
             tokio::select! {
                 _ = shutdown.changed() => if *shutdown.borrow() { return; },
-                change = changes.next() => match change {
-                    Some(Ok(_)) => {
-                        let ids = subscriptions.read().await.keys().copied().collect::<Vec<_>>();
-                        let end = DateTime::now() + TimeSpan::ONE_MINUTE;
-                        for id in ids {
-                            if let Err(error) = publish_subscription(&store, &subscriptions, &events, id, end).await {
-                                tracing::warn!(subscription_id = id, %error, "durable custom-data read failed");
-                            }
+                next = feed.next() => match next {
+                Some(Ok(TableSubscriptionEvent::Connected)) => {
+                    self.connected.store(true, Ordering::Release);
+                    let ids = self.subscriptions.read().await.keys().copied().collect::<Vec<_>>();
+                    let end = DateTime::now() + TimeSpan::ONE_MINUTE;
+                    for id in ids {
+                        if let Err(error) = publish_subscription(
+                            &self.store,
+                            &self.subscriptions,
+                            &self.events,
+                            id,
+                            end,
+                        ).await {
+                            let _ = self.events.send(Err(error.context(
+                                "Verglas custom-data reconnect catch-up",
+                            ))).await;
                         }
-                        retry = Duration::from_millis(250);
                     }
-                    Some(Err(error)) => {
-                        if is_unsupported_follow(&error) {
-                            tracing::info!(
-                                "Verglas catalog follow is unavailable; polling durable custom-data frontiers"
-                            );
-                            run_polling(
-                                &store,
-                                &subscriptions,
-                                &events,
-                                &connected,
-                                &mut shutdown,
-                            )
-                            .await;
-                            return;
+                    let _ = self.events.send(Ok(LiveDataEvent::Reconnected)).await;
+                }
+                Some(Ok(TableSubscriptionEvent::Disconnected)) => {
+                    self.connected.store(false, Ordering::Release);
+                    let _ = self.events.send(Ok(LiveDataEvent::Disconnected {
+                        reason: "Verglas table subscription disconnected; SDK is reconnecting"
+                            .to_owned(),
+                    })).await;
+                }
+                Some(Ok(TableSubscriptionEvent::Delivery(delivery))) => {
+                    let ids = self.subscriptions.read().await.keys().copied().collect::<Vec<_>>();
+                    let end = DateTime::now() + TimeSpan::ONE_MINUTE;
+                    let mut published = true;
+                    for id in ids {
+                        if let Err(error) = publish_subscription(
+                            &self.store,
+                            &self.subscriptions,
+                            &self.events,
+                            id,
+                            end,
+                        ).await {
+                            published = false;
+                            let _ = self.events.send(Err(error.context(
+                                "Verglas custom-data commit delivery",
+                            ))).await;
                         }
-                        connected.store(false, Ordering::Release);
-                        tracing::warn!(%error, "Verglas custom-data follow disconnected");
-                        break;
                     }
-                    None => {
-                        connected.store(false, Ordering::Release);
-                        break;
+                    if published {
+                        if let Err(error) =
+                            self.database.ack(&self.consumer_group, &delivery.receipt).await
+                        {
+                            let _ = self.events
+                                .send(Err(anyhow::Error::new(error).context(
+                                    "acknowledge Verglas custom-data commit",
+                                )))
+                                .await;
+                        }
                     }
                 }
+                Some(Err(error)) => {
+                    self.connected.store(false, Ordering::Release);
+                    let _ = self.events.send(Err(anyhow::Error::new(error).context(
+                        "Verglas table subscription failed",
+                    ))).await;
+                    return;
+                }
+                None => {
+                    self.connected.store(false, Ordering::Release);
+                    let _ = self.events.send(Err(anyhow::anyhow!(
+                        "Verglas table subscription ended unexpectedly",
+                    ))).await;
+                    return;
+                }
+                },
             }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(retry) => {},
-            _ = shutdown.changed() => if *shutdown.borrow() { return; },
-        }
-        retry = (retry * 2).min(Duration::from_secs(30));
-    }
-}
-
-fn is_unsupported_follow(error: &verglas_sdk::ClientError) -> bool {
-    matches!(
-        error,
-        verglas_sdk::ClientError::Http { status, .. }
-            if *status == reqwest::StatusCode::NOT_FOUND
-                || *status == reqwest::StatusCode::NOT_IMPLEMENTED
-    ) || error.to_string().contains("404 Not Found")
-}
-
-async fn run_polling(
-    store: &VerglasHistoricalDataStore,
-    subscriptions: &RwLock<HashMap<u64, CustomSubscriptionState>>,
-    events: &mpsc::Sender<Result<LiveDataEvent>>,
-    connected: &AtomicBool,
-    shutdown: &mut watch::Receiver<bool>,
-) {
-    connected.store(true, Ordering::Release);
-    loop {
-        let ids = subscriptions
-            .read()
-            .await
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        let end = DateTime::now() + TimeSpan::ONE_MINUTE;
-        for id in ids {
-            if let Err(error) = publish_subscription(store, subscriptions, events, id, end).await {
-                tracing::warn!(subscription_id = id, %error, "durable custom-data poll failed");
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-            _ = shutdown.changed() => if *shutdown.borrow() { return; },
         }
     }
 }
@@ -363,6 +365,12 @@ async fn publish_subscription(
     let HistoricalData::CustomPoints(rows) = data else {
         bail!("Verglas custom live query returned non-custom data");
     };
+    let custom = state
+        .subscription
+        .configuration
+        .custom
+        .as_ref()
+        .context("custom live subscription has no metadata")?;
     if rows.is_empty() {
         return Ok(());
     }
@@ -378,13 +386,23 @@ async fn publish_subscription(
         // commit notification from relaying it again.
         current.frontier = current.frontier.max(frontier + TimeSpan::from_nanos(1));
     }
+    let row_count = rows.len();
     events
         .send(Ok(LiveDataEvent::Data {
             subscription_id,
             data: HistoricalData::CustomPoints(rows),
         }))
         .await
-        .context("publish Verglas custom live data")
+        .context("publish Verglas custom live data")?;
+    tracing::info!(
+        subscription_id,
+        provider = %custom.source_type,
+        feed = %custom.ticker,
+        rows = row_count,
+        frontier_ns = frontier.0,
+        "published Verglas custom-data events"
+    );
+    Ok(())
 }
 
 struct MpscStream<T>(mpsc::Receiver<T>);

@@ -18,7 +18,7 @@ use rlean_data_providers::{
     TradierLiveDataProvider, TradierMarketDataConfig, VerglasCustomLiveDataProvider,
     VerglasHistoricalDataStore,
 };
-use verglas_sdk::{Client as VerglasClient, ConnectOptions};
+use verglas_sdk::{Client as VerglasClient, ConnectOptions, Database};
 
 use crate::cli::RunArgs;
 use crate::config;
@@ -39,7 +39,7 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
 /// batches it drops. The caller reports the tally when its run finishes.
 pub(crate) async fn historical_data_provider(
     args: &RunArgs,
-    verglas: VerglasClient,
+    verglas: Database,
 ) -> Result<(Arc<dyn HistoricalDataProvider>, DroppedCacheWrites)> {
     let name = args
         .data_provider_historical
@@ -123,7 +123,8 @@ fn risk_free_interest_rate_provider() -> Result<Option<Arc<dyn HistoricalDataPro
 
 pub(crate) async fn live_data_provider(
     args: &RunArgs,
-    verglas: VerglasClient,
+    verglas: Database,
+    consumer_group: &str,
 ) -> Result<Arc<dyn LiveDataProvider>> {
     let name = args
         .live_data_feed
@@ -136,9 +137,18 @@ pub(crate) async fn live_data_provider(
         "massive" => {
             let provider_cfg = global.get_provider("massive");
             let api_key = required_string(&provider_cfg, "api_key", "massive")?;
-            Arc::new(MassiveLiveDataProvider::new(MassiveLiveConfig::new(
-                api_key,
-            ))?)
+            let relay_url = optional_string(&provider_cfg, "live_websocket_base_url");
+            let relay_token = optional_string(&provider_cfg, "live_relay_token");
+            let live_config = match (relay_url, relay_token) {
+                (Some(url), Some(token)) => {
+                    MassiveLiveConfig::new(api_key).with_websocket_relay(url, token)?
+                }
+                (None, None) => MassiveLiveConfig::new(api_key),
+                _ => bail!(
+                    "massive.live_websocket_base_url and massive.live_relay_token must be set together"
+                ),
+            };
+            Arc::new(MassiveLiveDataProvider::new(live_config)?)
         }
         "tradier" => {
             let provider_cfg = global.get_provider("tradier");
@@ -155,7 +165,7 @@ pub(crate) async fn live_data_provider(
         other => bail!("unsupported live data provider '{other}'"),
     };
     let custom: Arc<dyn LiveDataProvider> =
-        Arc::new(VerglasCustomLiveDataProvider::new(verglas).await?);
+        Arc::new(VerglasCustomLiveDataProvider::new(verglas, consumer_group.to_owned()).await?);
     Ok(Arc::new(RoutedLiveDataProvider::new(market, custom)))
 }
 
@@ -233,10 +243,11 @@ fn optional_f64(values: &std::collections::BTreeMap<String, String>, key: &str) 
     values.get(key).and_then(|value| value.trim().parse().ok())
 }
 
-/// Connects once to the configured Verglas gateway. The SDK discovers the
-/// catalog, query, and write services and applies one bearer token to all of
-/// them. Environment values override the persisted machine configuration.
-pub(crate) async fn connect_verglas(global_config: &config::GlobalConfig) -> Result<VerglasClient> {
+/// Connects once to the configured Verglas gateway and selects one database.
+/// Environment values override the persisted machine configuration.
+pub(crate) async fn connect_verglas(
+    global_config: &config::GlobalConfig,
+) -> Result<verglas_sdk::Database> {
     let endpoint = std::env::var("VERGLAS_ENDPOINT")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -246,13 +257,30 @@ pub(crate) async fn connect_verglas(global_config: &config::GlobalConfig) -> Res
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| global_config.verglas_token.clone());
-    let mut options = ConnectOptions::new(endpoint.clone());
-    if let Some(token) = token {
-        options = options.with_token(token);
+    let database = std::env::var("VERGLAS_DATABASE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_database.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Verglas database is not configured; set verglas_database or VERGLAS_DATABASE"
+            )
+        })?;
+    config::validate_verglas_database(&database)?;
+    // The configured endpoint is the stable Verglas gateway. Bind query,
+    // catalog, and write traffic to it explicitly so a gateway deployed on the
+    // Docker host cannot redirect the client to its own loopback address from
+    // `/admin/access` discovery metadata.
+    let mut options = ConnectOptions::new(endpoint.clone()).with_query_uri(endpoint.clone());
+    if let Some(value) = token.as_ref() {
+        options = options.with_token(value);
     }
-    VerglasClient::connect(options)
+    let client = VerglasClient::connect(options)
         .await
-        .with_context(|| format!("connect to Verglas gateway at {endpoint}"))
+        .with_context(|| format!("connect to Verglas database {database} at {endpoint}"))?;
+    client
+        .database(&database)
+        .context("bind Verglas client to configured database")
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {

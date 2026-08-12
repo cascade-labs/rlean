@@ -23,7 +23,10 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct MassiveLiveConfig {
+    /// Credential sent to the live websocket endpoint.
     pub api_key: String,
+    /// Credential used for REST-backed option-universe refreshes.
+    pub historical_api_key: String,
     pub stocks_websocket_url: String,
     pub options_websocket_url: String,
     pub futures_websocket_url: String,
@@ -31,12 +34,35 @@ pub struct MassiveLiveConfig {
 
 impl MassiveLiveConfig {
     pub fn new(api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into();
         Self {
-            api_key: api_key.into(),
+            api_key: api_key.clone(),
+            historical_api_key: api_key,
             stocks_websocket_url: "wss://socket.massive.com/stocks".to_string(),
             options_websocket_url: "wss://socket.massive.com/options".to_string(),
             futures_websocket_url: "wss://socket.massive.com/futures".to_string(),
         }
+    }
+
+    /// Route live sockets through a shared Massive-compatible relay.
+    pub fn with_websocket_relay(
+        mut self,
+        base_url: impl AsRef<str>,
+        relay_token: impl Into<String>,
+    ) -> Result<Self> {
+        let base_url = base_url.as_ref().trim().trim_end_matches('/');
+        if base_url.is_empty() {
+            bail!("Massive relay websocket base URL cannot be empty");
+        }
+        let relay_token = relay_token.into();
+        if relay_token.trim().is_empty() {
+            bail!("Massive relay token cannot be empty");
+        }
+        self.api_key = relay_token;
+        self.stocks_websocket_url = format!("{base_url}/stocks");
+        self.options_websocket_url = format!("{base_url}/options");
+        self.futures_websocket_url = format!("{base_url}/futures");
+        Ok(self)
     }
 }
 
@@ -304,14 +330,15 @@ async fn run_option_universes(
     events: mpsc::Sender<Result<LiveDataEvent>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let provider =
-        match MassiveHistoricalDataProvider::new(MassiveConfig::new(config.api_key.clone())) {
-            Ok(provider) => provider,
-            Err(error) => {
-                let _ = events.send(Err(error)).await;
-                return;
-            }
-        };
+    let provider = match MassiveHistoricalDataProvider::new(MassiveConfig::new(
+        config.historical_api_key.clone(),
+    )) {
+        Ok(provider) => provider,
+        Err(error) => {
+            let _ = events.send(Err(error)).await;
+            return;
+        }
+    };
     let mut delivered = HashMap::<u64, chrono::NaiveDate>::new();
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -615,6 +642,18 @@ mod tests {
             &Market::usa(),
         );
         assert_eq!(massive_ticker(&option), "O:SPY260804C00500000");
+    }
+
+    #[test]
+    fn relay_changes_only_live_websocket_credentials_and_urls() {
+        let config = MassiveLiveConfig::new("upstream-key")
+            .with_websocket_relay("ws://127.0.0.1:8190/", "relay-token")
+            .unwrap();
+        assert_eq!(config.api_key, "relay-token");
+        assert_eq!(config.historical_api_key, "upstream-key");
+        assert_eq!(config.stocks_websocket_url, "ws://127.0.0.1:8190/stocks");
+        assert_eq!(config.options_websocket_url, "ws://127.0.0.1:8190/options");
+        assert_eq!(config.futures_websocket_url, "ws://127.0.0.1:8190/futures");
     }
 
     #[test]

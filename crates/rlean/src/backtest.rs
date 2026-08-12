@@ -73,7 +73,7 @@ async fn run_strategy_backtest(
     args: RunArgs,
     historical_provider: Arc<dyn rlean_data_providers::HistoricalDataProvider>,
     dropped_cache_writes: rlean_data_providers::DroppedCacheWrites,
-    verglas: verglas_sdk::Client,
+    verglas: verglas_sdk::Database,
 ) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
 

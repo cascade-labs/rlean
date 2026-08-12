@@ -3,7 +3,7 @@ use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{Array, RecordBatch};
 use clap::{Args, Subcommand};
 use futures::TryStreamExt;
-use verglas_sdk::Client;
+use verglas_sdk::Database;
 
 #[derive(Args)]
 pub(crate) struct RunsArgs {
@@ -59,7 +59,7 @@ pub(crate) async fn run(args: RunsArgs) -> Result<()> {
     }
 }
 
-async fn query(client: &Client, sql: &str) -> Result<Vec<RecordBatch>> {
+async fn query(client: &Database, sql: &str) -> Result<Vec<RecordBatch>> {
     client
         .query_stream(sql)
         .await
