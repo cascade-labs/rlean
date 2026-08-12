@@ -222,7 +222,24 @@ impl RunCatalog {
              WHERE run_id = '{escaped}' ORDER BY recorded_at DESC LIMIT 1"
         );
         let checkpoint_payload = load_latest_payload(client, &checkpoint_sql).await?;
-        let insight_payload = load_latest_payload(client, &insight_state_sql).await?;
+        let mut insight_payload = load_latest_payload(client, &insight_state_sql).await?;
+        if insight_payload.is_none() {
+            if let Some(migrated) = checkpoint_payload
+                .as_deref()
+                .and_then(legacy_checkpoint_insight_state)
+            {
+                let batch = state_payloads_batch(run_id, std::slice::from_ref(&migrated));
+                client
+                    .append_stream(
+                        INSIGHT_STATE,
+                        stream::iter([Ok(batch)]),
+                        &format!("migrate-legacy-insight-state-{run_id}"),
+                    )
+                    .await
+                    .context("migrate legacy live insight state")?;
+                insight_payload = Some(migrated);
+            }
+        }
 
         // Fills/trades are streamed into the same tables as backtests; reload
         // the full history so paper trade builders and CLI views stay consistent.
@@ -376,6 +393,17 @@ impl RunCatalog {
         }
         Ok(())
     }
+}
+
+/// Extracts the pre-`rlean.insight_state` snapshot for one-time migration.
+/// New account checkpoints never contain this field.
+fn legacy_checkpoint_insight_state(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let insights = value.get("insights")?;
+    if insights.is_null() {
+        return None;
+    }
+    serde_json::to_string(insights).ok()
 }
 
 fn assemble_live_restore(
@@ -1114,6 +1142,41 @@ mod tests {
         let restored_insights = restore.insights.expect("restored insight state");
         assert_eq!(restored_insights.state.active.len(), 1);
         assert_eq!(restored_insights.state.active[0].id, insight.id);
+    }
+
+    #[test]
+    fn legacy_checkpoint_insights_are_extracted_for_one_time_migration() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "portfolio": {"cash": "100000"},
+            "open_orders": [],
+            "insights": {
+                "schema_version": 1,
+                "deployment_id": "live-test",
+                "written_at": "2026-08-12T00:00:00Z",
+                "state": {"active": [], "closed": [], "total_count": 0}
+            }
+        })
+        .to_string();
+
+        let migrated = legacy_checkpoint_insight_state(&payload).expect("legacy insight state");
+        let decoded: rlean_engine::live::catalog_state::LiveInsightSnapshot =
+            serde_json::from_str(&migrated).unwrap();
+
+        assert_eq!(decoded.deployment_id.as_deref(), Some("live-test"));
+        assert_eq!(decoded.state.total_count, 0);
+    }
+
+    #[test]
+    fn current_account_checkpoint_has_no_legacy_insight_state() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "portfolio": {"cash": "100000"},
+            "open_orders": []
+        })
+        .to_string();
+
+        assert!(legacy_checkpoint_insight_state(&payload).is_none());
     }
 
     #[test]
