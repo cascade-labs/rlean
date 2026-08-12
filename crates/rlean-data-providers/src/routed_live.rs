@@ -241,8 +241,9 @@ struct CustomSubscriptionWorker {
 }
 
 // A table commit wakes every filtered custom-data subscription that shares the
-// table. One subscriber can therefore receive a burst of commits for unrelated
-// feeds and must finish its bounded queries before the queue fences its receipts.
+// table. Claim one commit at a time so a subscriber never holds fenced receipts
+// while another commit's bounded query runs through the serialized dispatcher.
+const TABLE_EVENT_MAX_IN_FLIGHT: usize = 1;
 const TABLE_EVENT_LEASE_SECONDS: u64 = 10 * 60;
 
 impl CustomSubscriptionWorker {
@@ -254,6 +255,7 @@ impl CustomSubscriptionWorker {
             &self.consumer_group,
             &self.consumer_owner,
             ["rlean.custom_points"],
+            Some(TABLE_EVENT_MAX_IN_FLIGHT),
             TABLE_EVENT_LEASE_SECONDS,
         ) {
             Ok(feed) => feed,
