@@ -345,6 +345,19 @@ fn verglas_endpoint_for_container(global: &GlobalConfig) -> String {
     }
 }
 
+fn optional_endpoint_for_container(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|endpoint| {
+            if container_uses_host_network() {
+                endpoint
+            } else {
+                containerize_loopback_url(&endpoint)
+            }
+        })
+}
+
 fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
     let _ = image;
     let mut args = vec!["run".into()];
@@ -358,6 +371,9 @@ fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
     }
     let endpoint = verglas_endpoint_for_container(global);
     args.extend(["-e".into(), format!("VERGLAS_ENDPOINT={endpoint}")]);
+    if let Some(access_uri) = optional_endpoint_for_container("VERGLAS_ACCESS_URI") {
+        args.extend(["-e".into(), format!("VERGLAS_ACCESS_URI={access_uri}")]);
+    }
     let database = std::env::var("VERGLAS_DATABASE")
         .ok()
         .filter(|value| !value.trim().is_empty())
