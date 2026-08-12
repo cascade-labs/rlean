@@ -241,9 +241,9 @@ struct CustomSubscriptionWorker {
 }
 
 // A table commit wakes every filtered custom-data subscription that shares the
-// table. Claim one commit at a time so a subscriber never holds fenced receipts
-// while another commit's bounded query runs through the serialized dispatcher.
-const TABLE_EVENT_MAX_IN_FLIGHT: usize = 1;
+// table. Keep claim batches small and acknowledge receipts in the reader task;
+// a separate coalescing task performs the slower bounded table queries.
+const TABLE_EVENT_CLAIM_BATCH: usize = 1;
 const TABLE_EVENT_LEASE_SECONDS: u64 = 10 * 60;
 
 impl CustomSubscriptionWorker {
@@ -255,7 +255,7 @@ impl CustomSubscriptionWorker {
             &self.consumer_group,
             &self.consumer_owner,
             ["rlean.custom_points"],
-            Some(TABLE_EVENT_MAX_IN_FLIGHT),
+            Some(TABLE_EVENT_CLAIM_BATCH),
             TABLE_EVENT_LEASE_SECONDS,
         ) {
             Ok(feed) => feed,
@@ -269,28 +269,24 @@ impl CustomSubscriptionWorker {
                 return;
             }
         };
+        let (refresh_tx, refresh_rx) = mpsc::channel(1);
+        let announce_reconnected = Arc::new(AtomicBool::new(false));
+        let refresh_task = tokio::spawn(run_custom_refreshes(
+            self.store.clone(),
+            self.subscriptions.clone(),
+            self.events.clone(),
+            refresh_rx,
+            announce_reconnected.clone(),
+            shutdown.clone(),
+        ));
         loop {
             tokio::select! {
-                _ = shutdown.changed() => if *shutdown.borrow() { return; },
+                _ = shutdown.changed() => if *shutdown.borrow() { break; },
                 next = feed.next() => match next {
                 Some(Ok(TableSubscriptionEvent::Connected)) => {
                     self.connected.store(true, Ordering::Release);
-                    let ids = self.subscriptions.read().await.keys().copied().collect::<Vec<_>>();
-                    let end = DateTime::now() + TimeSpan::ONE_MINUTE;
-                    for id in ids {
-                        if let Err(error) = publish_subscription(
-                            &self.store,
-                            &self.subscriptions,
-                            &self.events,
-                            id,
-                            end,
-                        ).await {
-                            let _ = self.events.send(Err(error.context(
-                                "Verglas custom-data reconnect catch-up",
-                            ))).await;
-                        }
-                    }
-                    let _ = self.events.send(Ok(LiveDataEvent::Reconnected)).await;
+                    announce_reconnected.store(true, Ordering::Release);
+                    let _ = refresh_tx.try_send(());
                 }
                 Some(Ok(TableSubscriptionEvent::Disconnected)) => {
                     self.connected.store(false, Ordering::Release);
@@ -300,33 +296,16 @@ impl CustomSubscriptionWorker {
                     })).await;
                 }
                 Some(Ok(TableSubscriptionEvent::Delivery(delivery))) => {
-                    let ids = self.subscriptions.read().await.keys().copied().collect::<Vec<_>>();
-                    let end = DateTime::now() + TimeSpan::ONE_MINUTE;
-                    let mut published = true;
-                    for id in ids {
-                        if let Err(error) = publish_subscription(
-                            &self.store,
-                            &self.subscriptions,
-                            &self.events,
-                            id,
-                            end,
-                        ).await {
-                            published = false;
-                            let _ = self.events.send(Err(error.context(
-                                "Verglas custom-data commit delivery",
-                            ))).await;
-                        }
-                    }
-                    if published {
-                        if let Err(error) =
-                            self.database.ack(&self.consumer_group, &delivery.receipt).await
-                        {
-                            let _ = self.events
-                                .send(Err(anyhow::Error::new(error).context(
-                                    "acknowledge Verglas custom-data commit",
-                                )))
-                                .await;
-                        }
+                    if let Err(error) =
+                        self.database.ack(&self.consumer_group, &delivery.receipt).await
+                    {
+                        let _ = self.events
+                            .send(Err(anyhow::Error::new(error).context(
+                                "acknowledge Verglas custom-data commit",
+                            )))
+                            .await;
+                    } else {
+                        let _ = refresh_tx.try_send(());
                     }
                 }
                 Some(Err(error)) => {
@@ -334,16 +313,53 @@ impl CustomSubscriptionWorker {
                     let _ = self.events.send(Err(anyhow::Error::new(error).context(
                         "Verglas table subscription failed",
                     ))).await;
-                    return;
+                    break;
                 }
                 None => {
                     self.connected.store(false, Ordering::Release);
                     let _ = self.events.send(Err(anyhow::anyhow!(
                         "Verglas table subscription ended unexpectedly",
                     ))).await;
-                    return;
+                    break;
                 }
                 },
+            }
+        }
+        refresh_task.abort();
+    }
+}
+
+async fn run_custom_refreshes(
+    store: VerglasHistoricalDataStore,
+    subscriptions: Arc<RwLock<HashMap<u64, CustomSubscriptionState>>>,
+    events: mpsc::Sender<Result<LiveDataEvent>>,
+    mut refresh_rx: mpsc::Receiver<()>,
+    announce_reconnected: Arc<AtomicBool>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => if *shutdown.borrow() { return; },
+            refresh = refresh_rx.recv() => {
+                let Some(()) = refresh else { return; };
+                let ids = subscriptions.read().await.keys().copied().collect::<Vec<_>>();
+                let end = DateTime::now() + TimeSpan::ONE_MINUTE;
+                for id in ids {
+                    if let Err(error) = publish_subscription(
+                        &store,
+                        &subscriptions,
+                        &events,
+                        id,
+                        end,
+                    ).await {
+                        let _ = events.send(Err(error.context(
+                            "Verglas custom-data table refresh",
+                        ))).await;
+                    }
+                }
+                if announce_reconnected.swap(false, Ordering::AcqRel) {
+                    let _ = events.send(Ok(LiveDataEvent::Reconnected)).await;
+                }
             }
         }
     }
