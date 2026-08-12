@@ -356,13 +356,16 @@ where
     };
     let mut catalog_order_events = all_order_events.len();
     let mut catalog_trades = completed_trades.len();
-    if let (Some(restore), Some(algorithm_state)) = (
+    if let (Some(restore), Some(account_state), Some(algorithm_state)) = (
         restored.as_ref(),
+        restored
+            .as_ref()
+            .and_then(|restore| restore.account_state.as_ref()),
         algorithm_manager.algorithm().algorithm_state(),
     ) {
         crate::live::catalog_state::apply_initial_brokerage_account_state(
             &algorithm_state,
-            &restore.account_state,
+            account_state,
         );
         if let Some(portfolio) = portfolio.as_ref() {
             let starting_value =
@@ -371,15 +374,15 @@ where
                 );
             tracing::info!(
                 "Restored paper account from Verglas catalog: cash={} holdings={} open_orders={} order_events={} trades={} starting_value={starting_value}",
-                restore.account_state.cash,
-                restore.account_state.holdings.len(),
-                restore.account_state.open_orders.len(),
+                account_state.cash,
+                account_state.holdings.len(),
+                account_state.open_orders.len(),
                 restore.order_events.len(),
                 restore.trades.len(),
             );
         }
         let algorithm = algorithm_state.lock().unwrap();
-        for holding in &restore.account_state.holdings {
+        for holding in &account_state.holdings {
             if holding.quantity.is_zero() {
                 continue;
             }
@@ -934,7 +937,7 @@ async fn emit_live_catalog_update(
     catalog_order_events: &mut usize,
     catalog_trades: &mut usize,
     catalog_progress_date: &mut Option<chrono::NaiveDate>,
-    force_checkpoint: bool,
+    force_state_write: bool,
 ) -> Result<()> {
     let current_date = time.date_utc();
     let start_date = deploy_started_at.date_naive();
@@ -960,20 +963,25 @@ async fn emit_live_catalog_update(
     let is_new_day = *catalog_progress_date != Some(current_date);
     let has_events = all_order_events.len() > *catalog_order_events;
     let has_trades = completed_trades.len() > *catalog_trades;
-    if !(force_checkpoint || has_events || has_trades || is_new_day) {
+    if !(force_state_write || has_events || has_trades || is_new_day) {
         return Ok(());
     }
 
-    let (checkpoint, insight_events) = crate::live::catalog_state::build_live_checkpoint(
-        time,
-        portfolio,
-        transactions,
-        framework,
-        deploy_id,
-        deploy_started_at,
-    );
+    let (checkpoint, insight_state, insight_events) =
+        crate::live::catalog_state::build_live_checkpoint(
+            time,
+            portfolio,
+            transactions,
+            framework,
+            deploy_id,
+            deploy_started_at,
+        );
     let checkpoint_json =
         Some(serde_json::to_string(&checkpoint).context("serialize durable live checkpoint")?);
+    let insight_state_json = insight_state
+        .map(|state| serde_json::to_string(&state))
+        .transpose()
+        .context("serialize durable live insight state")?;
     sender
         .send(crate::BacktestStreamUpdate {
             progress,
@@ -982,6 +990,7 @@ async fn emit_live_catalog_update(
             trades: completed_trades[*catalog_trades..].to_vec(),
             insight_events,
             checkpoint_json,
+            insight_state_json,
         })
         .await
         .map_err(|_| anyhow::anyhow!("live run-catalog stream closed"))?;
@@ -1207,7 +1216,7 @@ async fn process_live_slice<B: AlgorithmBridge>(
             .lock()
             .map(|framework| framework.has_pending_insight_events())
             .unwrap_or(true);
-        let force_checkpoint = insight_state_changed
+        let force_state_write = insight_state_changed
             || all_order_events.len() != prev_order_events
             || completed_trades.len() != prev_trades;
         emit_live_catalog_update(
@@ -1223,7 +1232,7 @@ async fn process_live_slice<B: AlgorithmBridge>(
             catalog_order_events,
             catalog_trades,
             catalog_progress_date,
-            force_checkpoint,
+            force_state_write,
         )
         .await?;
     }

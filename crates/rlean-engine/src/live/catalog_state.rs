@@ -1,9 +1,9 @@
-//! Live portfolio / insight state for the Verglas run catalog.
+//! Live portfolio and insight state for the Verglas run catalog.
 //!
 //! Backtest and live share the same `BacktestStreamUpdate` → `RunCatalog` path.
-//! Live additionally streams restore checkpoints (`rlean.checkpoints`) so a
-//! restarted paper deployment can reload cash, holdings, open orders, and
-//! framework insights without local sidecar files.
+//! Live streams account checkpoints to `rlean.checkpoints` and framework insight
+//! snapshots to `rlean.insight_state`. A restart loads these independent sources
+//! without local sidecar files.
 
 use crate::framework::FrameworkState;
 use rlean_algorithm::{portfolio::SecurityPortfolioManager, qc_algorithm::QcAlgorithm};
@@ -31,7 +31,7 @@ pub struct LiveInsightSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct LiveRestoreState {
-    pub account_state: AccountState,
+    pub account_state: Option<AccountState>,
     pub order_events: Vec<OrderEvent>,
     pub trades: Vec<Trade>,
     pub insights: Option<LiveInsightSnapshot>,
@@ -44,7 +44,6 @@ pub struct LiveCheckpoint {
     pub written_at: String,
     pub portfolio: serde_json::Value,
     pub open_orders: Vec<Order>,
-    pub insights: Option<LiveInsightSnapshot>,
 }
 
 pub fn build_live_checkpoint(
@@ -54,7 +53,11 @@ pub fn build_live_checkpoint(
     framework: Option<&Arc<Mutex<FrameworkState>>>,
     deploy_id: Option<&str>,
     started_at: chrono::DateTime<chrono::Utc>,
-) -> (LiveCheckpoint, Vec<rlean_alpha::InsightEvent>) {
+) -> (
+    LiveCheckpoint,
+    Option<LiveInsightSnapshot>,
+    Vec<rlean_alpha::InsightEvent>,
+) {
     let updated_at = chrono::Utc::now().to_rfc3339();
     let holdings = portfolio
         .all_holdings()
@@ -121,17 +124,15 @@ pub fn build_live_checkpoint(
         })
     });
 
-    (
-        LiveCheckpoint {
-            schema_version: LIVE_CHECKPOINT_SCHEMA_VERSION,
-            deployment_id: deploy_id.map(str::to_owned),
-            written_at: chrono::Utc::now().to_rfc3339(),
-            portfolio: portfolio_payload,
-            open_orders,
-            insights,
-        },
-        insight_events,
-    )
+    let checkpoint = LiveCheckpoint {
+        schema_version: LIVE_CHECKPOINT_SCHEMA_VERSION,
+        deployment_id: deploy_id.map(str::to_owned),
+        written_at: chrono::Utc::now().to_rfc3339(),
+        portfolio: portfolio_payload,
+        open_orders,
+    };
+
+    (checkpoint, insights, insight_events)
 }
 
 pub fn parse_checkpoint_json(payload: &str) -> Option<LiveCheckpoint> {
@@ -412,6 +413,51 @@ mod tests {
     use super::*;
     use rlean_core::{Market, TimeSpan};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn account_checkpoint_serialization_excludes_insight_state() {
+        let checkpoint = LiveCheckpoint {
+            schema_version: LIVE_CHECKPOINT_SCHEMA_VERSION,
+            deployment_id: Some("live-test".to_string()),
+            written_at: "2026-08-12T00:00:00Z".to_string(),
+            portfolio: serde_json::json!({"cash": "100000"}),
+            open_orders: Vec::new(),
+        };
+
+        let json = serde_json::to_value(checkpoint).unwrap();
+
+        assert!(json.get("portfolio").is_some());
+        assert!(json.get("open_orders").is_some());
+        assert!(json.get("insights").is_none());
+        assert!(json.get("state").is_none());
+    }
+
+    #[test]
+    fn insight_state_round_trips_without_account_state() {
+        let now = DateTime::from_secs(2_000_000);
+        let insight = Insight::up(
+            Symbol::create_equity("SPY", &Market::usa()),
+            TimeSpan::from_days(14),
+        )
+        .with_generated_time_utc(now);
+        let snapshot = LiveInsightSnapshot {
+            schema_version: LIVE_INSIGHTS_SCHEMA_VERSION,
+            deployment_id: Some("live-test".to_string()),
+            written_at: "2026-08-12T00:00:00Z".to_string(),
+            state: InsightCollectionSnapshot {
+                active: vec![insight.clone()],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+        };
+
+        let restored: LiveInsightSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        assert_eq!(restored.state.active.len(), 1);
+        assert_eq!(restored.state.active[0].id, insight.id);
+        assert_eq!(restored.state.total_count, 1);
+    }
 
     #[test]
     fn warmup_merge_keeps_restored_identity_without_losing_unique_signals() {
