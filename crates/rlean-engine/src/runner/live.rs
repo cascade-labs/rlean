@@ -324,22 +324,15 @@ where
             };
             let router = crate::live::transaction_handler::LiveBrokerageRouter::spawn(brokerage);
             // Match C# LEAN's BrokerageSetupHandler.LoadExistingHoldingsAndOrders:
-            // brokerage holdings are authoritative startup state. Loading them
-            // must not itself create liquidation orders. The framework can change
-            // positions only after its restored or newly generated insights create
-            // portfolio targets through the normal execution path.
-            // A live insight checkpoint restores the source of portfolio
-            // targets, not the execution model's transient target collection.
-            // Once actual brokerage holdings/orders are known, rebuild those
-            // targets once from the complete active insight set. This mirrors
-            // C# PortfolioConstructionModel.CreateTargets, which evaluates the
-            // active Algorithm.Insights collection when reconciliation is due,
-            // without pretending the restored insights are newly emitted alpha.
+            // brokerage holdings are authoritative startup state. Importing them
+            // does not invoke PortfolioConstruction.CreateTargets. The framework
+            // may change the position only after normal post-startup alpha or
+            // scheduled logic requests a new target.
             algorithm_manager
                 .framework()
                 .lock()
                 .expect("framework poisoned during startup reconciliation")
-                .request_rebalance();
+                .accept_brokerage_startup_state();
             brokerage_router = Some(router);
         }
     }
