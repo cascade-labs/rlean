@@ -240,6 +240,11 @@ struct CustomSubscriptionWorker {
     connected: Arc<AtomicBool>,
 }
 
+// A table commit wakes every filtered custom-data subscription that shares the
+// table. One subscriber can therefore receive a burst of commits for unrelated
+// feeds and must finish its bounded queries before the queue fences its receipts.
+const TABLE_EVENT_LEASE_SECONDS: u64 = 10 * 60;
+
 impl CustomSubscriptionWorker {
     async fn run(self, mut shutdown: watch::Receiver<bool>) {
         use futures::StreamExt;
@@ -249,7 +254,7 @@ impl CustomSubscriptionWorker {
             &self.consumer_group,
             &self.consumer_owner,
             ["rlean.custom_points"],
-            60,
+            TABLE_EVENT_LEASE_SECONDS,
         ) {
             Ok(feed) => feed,
             Err(error) => {
