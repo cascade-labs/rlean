@@ -222,6 +222,23 @@ where
         }
     }
     algorithm_manager.warmup_finished(&mut services);
+    if let Some(insights) = config
+        .restore
+        .as_ref()
+        .and_then(|restore| restore.insights.as_ref())
+    {
+        if let Some((active, closed)) =
+            crate::live::catalog_state::reconcile_live_insights_after_warmup(
+                &algorithm_manager.framework(),
+                insights,
+                rlean_core::DateTime::now(),
+            )
+        {
+            tracing::info!(
+                "Reconciled restored framework insights after warm-up: active={active} closed={closed}"
+            );
+        }
+    }
     // Match C# LEAN's live real-time handler: scheduled events that elapsed
     // while the deployment was offline or warming up are skipped, not replayed.
     algorithm_manager.prime_scheduled_events(rlean_core::DateTime::now());

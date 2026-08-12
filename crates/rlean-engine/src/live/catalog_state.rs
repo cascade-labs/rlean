@@ -7,13 +7,14 @@
 
 use crate::framework::FrameworkState;
 use rlean_algorithm::{portfolio::SecurityPortfolioManager, qc_algorithm::QcAlgorithm};
-use rlean_alpha::InsightCollectionSnapshot;
+use rlean_alpha::{Insight, InsightCollectionSnapshot, InsightDirection, InsightType};
 use rlean_core::{DateTime, Resolution, Symbol};
 use rlean_live::AccountState;
 use rlean_orders::order::Order;
 use rlean_orders::{OrderEvent, TransactionManager};
 use rlean_statistics::Trade;
 use rust_decimal::Decimal;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -225,6 +226,144 @@ pub fn restore_live_insights(
     Some((active_count, closed_count))
 }
 
+/// Reconcile insights emitted while rebuilding model state during warm-up with
+/// the durable pre-restart collection.
+///
+/// <DIV> C# LEAN does not persist framework insights across engine processes.
+/// rlean persists them in Verglas, then replays warm-up to rebuild Python and
+/// model-local state. The replay can reproduce the same logical insights with
+/// new IDs. Keep the restored instance for matching signals so scores and IDs
+/// survive, retain genuinely new replay signals, and retain restored event-only
+/// signals that historical warm-up cannot reproduce.
+pub fn reconcile_live_insights_after_warmup(
+    framework: &Arc<Mutex<FrameworkState>>,
+    restored: &LiveInsightSnapshot,
+    now: DateTime,
+) -> Option<(usize, usize)> {
+    if restored.schema_version != LIVE_INSIGHTS_SCHEMA_VERSION {
+        warn!(
+            "live insight warm-up reconciliation: unsupported schema version {}",
+            restored.schema_version
+        );
+        return None;
+    }
+    let mut framework = framework.lock().ok()?;
+    let replayed = framework.insight_snapshot();
+    let merged = merge_insight_snapshots(&restored.state, &replayed, now);
+
+    // Warm-up events describe the replayed copies. Replace them with one
+    // Restored event set for the reconciled authoritative collection.
+    let _ = framework.take_insight_events();
+    let active = merged.active.len();
+    let closed = merged.closed.len();
+    framework.restore_insights(merged, now);
+    Some((active, closed))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InsightSemanticKey {
+    sid: u64,
+    insight_type: u8,
+    direction: i8,
+    generated_time: i64,
+    close_time: i64,
+    magnitude: Option<Decimal>,
+    confidence: Option<Decimal>,
+    weight: Option<Decimal>,
+    source_model: String,
+}
+
+impl InsightSemanticKey {
+    fn from_insight(insight: &Insight) -> Self {
+        Self {
+            sid: insight.symbol.id.sid,
+            insight_type: match insight.insight_type {
+                InsightType::Price => 0,
+                InsightType::Volatility => 1,
+            },
+            direction: match insight.direction {
+                InsightDirection::Down => -1,
+                InsightDirection::Flat => 0,
+                InsightDirection::Up => 1,
+            },
+            generated_time: insight.generated_time_utc.0,
+            close_time: insight.close_time_utc.0,
+            magnitude: insight.magnitude,
+            confidence: insight.confidence,
+            weight: insight.weight,
+            source_model: insight.source_model.to_string(),
+        }
+    }
+}
+
+fn merge_insight_snapshots(
+    restored: &InsightCollectionSnapshot,
+    replayed: &InsightCollectionSnapshot,
+    now: DateTime,
+) -> InsightCollectionSnapshot {
+    let restored_by_key: HashMap<InsightSemanticKey, Insight> = restored
+        .active
+        .iter()
+        .chain(restored.closed.iter())
+        .cloned()
+        .map(|insight| (InsightSemanticKey::from_insight(&insight), insight))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut replayed_duplicates = 0usize;
+    let mut active = Vec::with_capacity(replayed.active.len() + restored.active.len());
+    let mut closed = Vec::with_capacity(replayed.closed.len() + restored.closed.len());
+
+    for replayed_insight in &replayed.active {
+        let key = InsightSemanticKey::from_insight(replayed_insight);
+        if !seen.insert(key.clone()) {
+            replayed_duplicates += 1;
+            continue;
+        }
+        active.push(
+            restored_by_key
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| replayed_insight.clone()),
+        );
+    }
+    for replayed_insight in &replayed.closed {
+        let key = InsightSemanticKey::from_insight(replayed_insight);
+        if !seen.insert(key.clone()) {
+            replayed_duplicates += 1;
+            continue;
+        }
+        closed.push(
+            restored_by_key
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| replayed_insight.clone()),
+        );
+    }
+
+    let mut restored_only = 0usize;
+    for restored_insight in restored.active.iter().chain(restored.closed.iter()) {
+        let key = InsightSemanticKey::from_insight(restored_insight);
+        if !seen.insert(key) {
+            continue;
+        }
+        restored_only += 1;
+        if restored_insight.is_active(now) {
+            active.push(restored_insight.clone());
+        } else {
+            closed.push(restored_insight.clone());
+        }
+    }
+
+    InsightCollectionSnapshot {
+        active,
+        closed,
+        total_count: replayed
+            .total_count
+            .saturating_sub(replayed_duplicates)
+            .saturating_add(restored_only),
+    }
+}
+
 pub fn apply_initial_brokerage_account_state(
     algorithm: &Arc<Mutex<QcAlgorithm>>,
     account_state: &AccountState,
@@ -266,4 +405,61 @@ pub fn set_live_starting_portfolio_value_from_synced_account(
     let starting_value = portfolio.total_portfolio_value();
     portfolio.set_starting_cash(starting_value);
     starting_value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlean_core::{Market, TimeSpan};
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn warmup_merge_keeps_restored_identity_without_losing_unique_signals() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let now = DateTime::from_secs(2_000_000);
+        let duplicate_time = DateTime::from_secs(1_900_000);
+        let mut restored_duplicate = Insight::up(symbol.clone(), TimeSpan::from_days(14))
+            .with_generated_time_utc(duplicate_time);
+        restored_duplicate.score = Some(dec!(0.75));
+        let replayed_duplicate = Insight::up(symbol.clone(), TimeSpan::from_days(14))
+            .with_generated_time_utc(duplicate_time);
+        assert_ne!(restored_duplicate.id, replayed_duplicate.id);
+
+        let replayed_new = Insight::down(symbol.clone(), TimeSpan::from_days(14))
+            .with_generated_time_utc(DateTime::from_secs(1_950_000));
+        let mut restored_event = Insight::up(symbol, TimeSpan::from_days(14))
+            .with_generated_time_utc(DateTime::from_secs(1_975_000));
+        restored_event.source_model = Arc::from("event-only");
+
+        let restored = InsightCollectionSnapshot {
+            active: vec![restored_duplicate.clone(), restored_event.clone()],
+            closed: Vec::new(),
+            total_count: 2,
+        };
+        let replayed = InsightCollectionSnapshot {
+            active: vec![
+                replayed_duplicate.clone(),
+                replayed_duplicate,
+                replayed_new.clone(),
+            ],
+            closed: Vec::new(),
+            total_count: 3,
+        };
+
+        let merged = merge_insight_snapshots(&restored, &replayed, now);
+
+        assert_eq!(merged.active.len(), 3);
+        assert_eq!(merged.total_count, 3);
+        assert!(merged.active.iter().any(
+            |insight| insight.id == restored_duplicate.id && insight.score == Some(dec!(0.75))
+        ));
+        assert!(merged
+            .active
+            .iter()
+            .any(|insight| insight.id == replayed_new.id));
+        assert!(merged
+            .active
+            .iter()
+            .any(|insight| insight.id == restored_event.id));
+    }
 }
