@@ -222,6 +222,23 @@ where
         }
     }
     algorithm_manager.warmup_finished(&mut services);
+    if let Some(insights) = config
+        .restore
+        .as_ref()
+        .and_then(|restore| restore.insights.as_ref())
+    {
+        if let Some((active, closed)) =
+            crate::live::catalog_state::reconcile_live_insights_after_warmup(
+                &algorithm_manager.framework(),
+                insights,
+                rlean_core::DateTime::now(),
+            )
+        {
+            tracing::info!(
+                "Reconciled restored framework insights after warm-up: active={active} closed={closed}"
+            );
+        }
+    }
     // Match C# LEAN's live real-time handler: scheduled events that elapsed
     // while the deployment was offline or warming up are skipped, not replayed.
     algorithm_manager.prime_scheduled_events(rlean_core::DateTime::now());
@@ -260,7 +277,7 @@ where
     if real_routing {
         if let Some(brokerage) = config.brokerage.take() {
             let mut brokerage = brokerage;
-            let sync = match crate::live::transaction_handler::startup_account_sync(
+            match crate::live::transaction_handler::startup_account_sync(
                 &mut brokerage,
                 portfolio.as_ref(),
                 transactions.as_ref(),
@@ -305,25 +322,12 @@ where
                     ));
                 }
             };
-            let mut router =
-                crate::live::transaction_handler::LiveBrokerageRouter::spawn(brokerage);
-            // Feature B: unconditionally liquidate synced account holdings that no
-            // active (restored) framework insight covers. This is the default,
-            // always-on convergence behavior under real brokerage routing: live
-            // startup drives the brokerage account to the framework's insight
-            // state — unmanaged positions closed here, insight-backed positions
-            // kept, and missing insight-backed positions bought by the framework
-            // rebalance (Feature A). Runs after the account sync and after Feature
-            // A's insight/security restore, so the managed set reflects every
-            // restored insight. Idempotent across restarts: once liquidated the
-            // holding disappears from the next sync.
-            liquidate_unmanaged_holdings(
-                &algorithm_manager,
-                transactions.as_ref(),
-                &sync.holdings,
-                &mut router,
-                rlean_core::DateTime::now(),
-            );
+            let router = crate::live::transaction_handler::LiveBrokerageRouter::spawn(brokerage);
+            // Match C# LEAN's BrokerageSetupHandler.LoadExistingHoldingsAndOrders:
+            // brokerage holdings are authoritative startup state. Loading them
+            // must not itself create liquidation orders. The framework can change
+            // positions only after its restored or newly generated insights create
+            // portfolio targets through the normal execution path.
             // A live insight checkpoint restores the source of portfolio
             // targets, not the execution model's transient target collection.
             // Once actual brokerage holdings/orders are known, rebuild those
@@ -670,7 +674,7 @@ fn ensure_brokerage_holding_securities(
 /// Match C# LEAN BrokerageSetupHandler.LoadExistingHoldingsAndOrders: after
 /// creating an unrequested security and applying the brokerage holding, resolve
 /// a zero brokerage MarketPrice through GetLastKnownPrice and seed both the
-/// security and portfolio before any liquidation/order validation runs.
+/// security and portfolio before order validation runs.
 fn seed_missing_brokerage_holding_prices(
     algorithm: &mut rlean_algorithm::qc_algorithm::QcAlgorithm,
     holdings: &[rlean_brokerages::BrokerageHolding],
@@ -923,170 +927,6 @@ fn is_restorable_security_type(security_type: rlean_core::SecurityType) -> bool 
     )
 }
 
-/// Feature B: submit market orders to close every synced account holding that no
-/// active (restored) framework insight covers.
-///
-/// The unmanaged set is: each synced holding with a nonzero quantity whose symbol
-/// has no active insight. Holdings covered by an active insight are kept (the PCM
-/// manages them). For each unmanaged holding a `-quantity` market order is
-/// registered in the transaction manager and dispatched through the existing
-/// brokerage router submission path, so it reconciles via the normal poll path.
-/// Existing brokerage orders that already reduce the holding are included in
-/// the target delta. This makes startup idempotent: restarting while a closing
-/// order is queued cannot submit the full liquidation again.
-///
-/// Order ids for these liquidations are drawn from the algorithm's single
-/// order-id authority (`QcAlgorithm::next_order_id`) — the exact same counter
-/// every framework/algorithm order uses. Historically this path pulled ids from
-/// `TransactionManager::next_order_id`, a *parallel* counter that also starts at
-/// 1, so liquidation id=1,2,... collided with the framework's id=1,2,.... The
-/// router maps brokerage ids back to engine ids, so a colliding pair let a
-/// liquidation's fill be applied to a different framework order (different
-/// symbol/quantity) — the production incident in issue #33. Using the algorithm
-/// counter guarantees liquidation and framework orders never share an id.
-///
-/// Market-hours aware (issue #86): if a holding's exchange is closed at `now`
-/// (e.g. a weekend restart), the liquidation is registered as a `MarketOnOpen`
-/// order that the router holds and releases at the next open, instead of a
-/// market order that would be submitted into a closed market. Futures and
-/// future options are exempt (extended-hours trading), mirroring C# LEAN
-/// `QCAlgorithm.Trading.cs` `MarketOrder`, which converts closed-market market
-/// orders to MarketOnOpen for every other security type. `now` is a parameter
-/// so tests can simulate weekend/weekday times; production passes the wall
-/// clock.
-fn liquidate_unmanaged_holdings<B: AlgorithmBridge>(
-    algorithm_manager: &AlgorithmManager<B>,
-    transactions: Option<&Arc<rlean_orders::TransactionManager>>,
-    holdings: &[rlean_brokerages::BrokerageHolding],
-    router: &mut crate::live::transaction_handler::LiveBrokerageRouter,
-    now: rlean_core::DateTime,
-) {
-    let Some(transactions) = transactions else {
-        tracing::warn!(
-            "liquidate-unmanaged-holdings requested but no transaction manager is available; skipping"
-        );
-        return;
-    };
-    let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() else {
-        tracing::warn!(
-            "liquidate-unmanaged-holdings requested but no algorithm state is available; skipping"
-        );
-        return;
-    };
-
-    let framework = algorithm_manager.framework();
-    let managed_sids: HashSet<u64> = match framework.lock() {
-        Ok(fw) => fw
-            .insights
-            .active(rlean_core::DateTime::now())
-            .into_iter()
-            .map(|insight| insight.symbol.id.sid)
-            .collect(),
-        Err(_) => HashSet::new(),
-    };
-
-    let mut kept = 0usize;
-    let mut liquidated = 0usize;
-    for holding in holdings {
-        if holding.quantity.is_zero() {
-            continue;
-        }
-        if managed_sids.contains(&holding.symbol.id.sid) {
-            kept += 1;
-            continue;
-        }
-        // Asset-agnostic: -quantity closes longs (sell) and shorts (buy-to-cover)
-        // alike, and preserves fractional/options/crypto quantities unchanged.
-        let desired_quantity = -holding.quantity;
-        let already_open_quantity =
-            open_closing_quantity(transactions, holding.symbol.id.sid, desired_quantity);
-        let quantity = desired_quantity - already_open_quantity;
-        if quantity.is_zero() {
-            tracing::info!(
-                "unmanaged holding {} already has a complete closing order queued; not duplicating it",
-                holding.symbol.value
-            );
-            continue;
-        }
-        if (quantity.is_sign_positive() && desired_quantity.is_sign_negative())
-            || (quantity.is_sign_negative() && desired_quantity.is_sign_positive())
-        {
-            tracing::error!(
-                "unmanaged holding {} has over-covering open orders: holding={} desired_close={} open_close={}; refusing to submit another order",
-                holding.symbol.value,
-                holding.quantity,
-                desired_quantity,
-                already_open_quantity,
-            );
-            continue;
-        }
-        // Single id authority: allocate from the algorithm's order-id counter, the
-        // same sequence framework/algorithm orders draw from, so ids never collide
-        // with later framework orders (issue #33).
-        let order_id = match algorithm_state.lock() {
-            Ok(mut algorithm) => algorithm.next_order_id(),
-            Err(_) => {
-                tracing::error!(
-                    "liquidate-unmanaged-holdings: algorithm lock poisoned; skipping {}",
-                    holding.symbol.value
-                );
-                continue;
-            }
-        };
-        let mut order = rlean_orders::Order::market(
-            order_id,
-            holding.symbol.clone(),
-            quantity,
-            now,
-            "Liquidate unmanaged holding",
-        );
-        // Closed exchange (weekend/overnight restart): register as MarketOnOpen
-        // so the router holds it until the next open instead of submitting into
-        // a closed market. Futures/FOPs trade extended hours and stay market
-        // orders, mirroring LEAN.
-        let moo_exempt = matches!(
-            holding.symbol.security_type(),
-            rlean_core::SecurityType::Future | rlean_core::SecurityType::FutureOption
-        );
-        if !moo_exempt
-            && !rlean_core::MarketHoursDatabase::global()
-                .exchange_hours(&holding.symbol)
-                .is_open_at(now)
-        {
-            order.order_type = rlean_orders::OrderType::MarketOnOpen;
-            tracing::info!(
-                "liquidation for {} (order_id={order_id}) created while market closed; \
-                 registering as market-on-open to fill at the next open",
-                holding.symbol.value,
-            );
-        }
-        transactions.add_or_update_order(order);
-        liquidated += 1;
-        tracing::info!(
-            "liquidating unmanaged holding: {} (order_id={order_id}) quantity={}",
-            holding.symbol.value,
-            quantity
-        );
-    }
-
-    tracing::info!("liquidate-unmanaged-holdings: kept={kept} (managed) liquidated={liquidated}");
-
-    if liquidated > 0 {
-        // Reuse the router's existing submission path; the New orders just
-        // registered flow to the brokerage and reconcile on the poll path.
-        // Market-on-open registrations are held by the router until their
-        // exchange opens.
-        match algorithm_state.lock() {
-            Ok(algorithm) => {
-                let _ = router.dispatch_pending_at(transactions, &algorithm, now);
-            }
-            Err(_) => tracing::error!(
-                "liquidate-unmanaged-holdings: algorithm lock poisoned before submission"
-            ),
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn emit_live_catalog_update(
     sender: &tokio::sync::mpsc::Sender<crate::BacktestStreamUpdate>,
@@ -1156,25 +996,6 @@ async fn emit_live_catalog_update(
     *catalog_trades = completed_trades.len();
     *catalog_progress_date = Some(current_date);
     Ok(())
-}
-
-fn open_closing_quantity(
-    transactions: &rlean_orders::TransactionManager,
-    symbol_sid: u64,
-    desired_quantity: rlean_core::Quantity,
-) -> rlean_core::Quantity {
-    transactions
-        .get_open_orders()
-        .into_iter()
-        .filter(|order| {
-            order.symbol.id.sid == symbol_sid
-                && ((order.remaining_quantity().is_sign_positive()
-                    && desired_quantity.is_sign_positive())
-                    || (order.remaining_quantity().is_sign_negative()
-                        && desired_quantity.is_sign_negative()))
-        })
-        .map(|order| order.remaining_quantity())
-        .sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1872,7 +1693,7 @@ mod live_custom_data_age_tests {
 }
 
 #[cfg(test)]
-mod unmanaged_liquidation_tests {
+mod brokerage_holding_restore_tests {
     use super::*;
     use rlean_algorithm::lifecycle::AlgorithmHistoryService;
     use rlean_core::{Resolution, Symbol};
@@ -1902,37 +1723,7 @@ mod unmanaged_liquidation_tests {
     }
 
     #[test]
-    fn queued_closing_orders_reduce_restart_liquidation_quantity() {
-        let symbol = rlean_core::Symbol::create_equity("AA", &rlean_core::Market::usa());
-        let transactions = rlean_orders::TransactionManager::new();
-        let mut closing = rlean_orders::Order::market(
-            -1,
-            symbol.clone(),
-            dec!(-150),
-            rlean_core::DateTime::now(),
-            "existing brokerage order",
-        );
-        closing.status = rlean_orders::OrderStatus::Submitted;
-        transactions.add_order(closing);
-        let mut opposing = rlean_orders::Order::market(
-            -2,
-            symbol.clone(),
-            dec!(3),
-            rlean_core::DateTime::now(),
-            "opposing order",
-        );
-        opposing.status = rlean_orders::OrderStatus::Submitted;
-        transactions.add_order(opposing);
-
-        assert_eq!(
-            open_closing_quantity(&transactions, symbol.id.sid, dec!(-198)),
-            dec!(-150)
-        );
-        assert_eq!(dec!(-198) - dec!(-150), dec!(-48));
-    }
-
-    #[test]
-    fn brokerage_holdings_are_registered_as_securities_before_liquidation() {
+    fn brokerage_holdings_are_registered_as_securities_during_startup_sync() {
         let symbol = rlean_core::Symbol::create_equity("AA", &rlean_core::Market::usa());
         let mut algorithm = rlean_algorithm::qc_algorithm::QcAlgorithm::new("test", dec!(10000));
         algorithm.set_brokerage_model(
