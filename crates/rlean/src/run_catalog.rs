@@ -229,14 +229,7 @@ impl RunCatalog {
                 .and_then(legacy_checkpoint_insight_state)
             {
                 let batch = state_payloads_batch(run_id, std::slice::from_ref(&migrated));
-                client
-                    .append_stream(
-                        INSIGHT_STATE,
-                        stream::iter([Ok(batch)]),
-                        &format!("migrate-legacy-insight-state-{run_id}"),
-                    )
-                    .await
-                    .context("migrate legacy live insight state")?;
+                append_insight_state_migration(client, run_id, batch).await?;
                 insight_payload = Some(migrated);
             }
         }
@@ -566,13 +559,27 @@ async fn load_json_payloads<T: serde::de::DeserializeOwned>(
 
 async fn load_latest_payload(client: &Database, sql: &str) -> Result<Option<String>> {
     use futures::TryStreamExt;
-    let batches = client
-        .query_stream(sql)
-        .await
-        .with_context(|| format!("query {sql}"))?
-        .try_collect::<Vec<_>>()
-        .await
-        .with_context(|| format!("read query stream for {sql}"))?;
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 1_u32;
+    let batches = loop {
+        let result = match client.query_stream(sql).await {
+            Ok(stream) => stream
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("read query stream for {sql}")),
+            Err(error) => Err(anyhow::Error::new(error).context(format!("query {sql}"))),
+        };
+        match result {
+            Ok(batches) => break batches,
+            Err(error) if attempt < 8 && is_retryable_catalog_state_error(&error) => {
+                tracing::warn!(%error, attempt, max_attempts = 8, retry_after_seconds = delay.as_secs(), "retrying live state query");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     Ok(batches.iter().find_map(|batch| {
         let column = batch.column(0);
         (0..batch.num_rows()).find_map(|row| {
@@ -583,6 +590,43 @@ async fn load_latest_payload(client: &Database, sql: &str) -> Result<Option<Stri
             }
         })
     }))
+}
+
+async fn append_insight_state_migration(
+    client: &Database,
+    run_id: &str,
+    batch: RecordBatch,
+) -> Result<()> {
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 1_u32;
+    loop {
+        match client
+            .append_stream(
+                INSIGHT_STATE,
+                stream::iter([Ok(batch.clone())]),
+                &format!("migrate-legacy-insight-state-{run_id}"),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < 8 && is_retryable_catalog_state_error(&error) => {
+                tracing::warn!(%error, attempt, max_attempts = 8, retry_after_seconds = delay.as_secs(), "retrying legacy insight-state migration");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+                attempt += 1;
+            }
+            Err(error) => {
+                return Err(error).context("migrate legacy live insight state");
+            }
+        }
+    }
+}
+
+fn is_retryable_catalog_state_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("catalog changed while rebuilding the query session")
+        || message.contains("authorization service unavailable")
+        || message.contains("503 Service Unavailable")
 }
 
 fn runs_schema() -> SchemaRef {
@@ -1177,6 +1221,19 @@ mod tests {
         .to_string();
 
         assert!(legacy_checkpoint_insight_state(&payload).is_none());
+    }
+
+    #[test]
+    fn live_state_retry_classifies_catalog_rebuild_and_auth_unavailable() {
+        assert!(is_retryable_catalog_state_error(
+            &"catalog changed while rebuilding the query session; retry the query"
+        ));
+        assert!(is_retryable_catalog_state_error(
+            &"503 Service Unavailable: authorization service unavailable"
+        ));
+        assert!(!is_retryable_catalog_state_error(
+            &"400 Bad Request: unknown column"
+        ));
     }
 
     #[test]
