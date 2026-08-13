@@ -275,6 +275,7 @@ pub(crate) async fn connect_verglas(
     if let Some(access_uri) = std::env::var("VERGLAS_ACCESS_URI")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_access_uri.clone())
     {
         options = options.with_access_uri(access_uri);
     }

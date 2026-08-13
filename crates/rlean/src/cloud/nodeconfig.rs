@@ -19,6 +19,7 @@ pub(crate) fn node_config_from_local(local: &GlobalConfig, node_home: &str) -> G
     GlobalConfig {
         default_language: local.default_language.clone(),
         verglas_endpoint: local.verglas_endpoint.clone(),
+        verglas_access_uri: local.verglas_access_uri.clone(),
         verglas_database: local.verglas_database.clone(),
         verglas_token: local.verglas_token.clone(),
         providers: local.providers.clone(),
@@ -34,6 +35,7 @@ mod tests {
         GlobalConfig {
             default_language: "python".to_string(),
             verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            verglas_access_uri: Some("http://127.0.0.1:8345".to_string()),
             verglas_database: Some("rlean".to_string()),
             verglas_token: Some("vgk_test".to_string()),
             providers: Default::default(),

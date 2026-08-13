@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     HistoricalData, HistoricalDataStore, HistoryRequest, LiveDataEvent, LiveDataProvider,
@@ -251,24 +252,6 @@ impl CustomSubscriptionWorker {
         use futures::StreamExt;
         use verglas_sdk::TableSubscriptionEvent;
 
-        let mut feed = match self.database.subscribe(
-            &self.consumer_group,
-            &self.consumer_owner,
-            ["rlean.custom_points"],
-            Some(TABLE_EVENT_CLAIM_BATCH),
-            TABLE_EVENT_LEASE_SECONDS,
-        ) {
-            Ok(feed) => feed,
-            Err(error) => {
-                let _ = self
-                    .events
-                    .send(Err(
-                        anyhow::Error::new(error).context("subscribe to Verglas table events")
-                    ))
-                    .await;
-                return;
-            }
-        };
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
         let announce_reconnected = Arc::new(AtomicBool::new(false));
         let refresh_task = tokio::spawn(run_custom_refreshes(
@@ -279,53 +262,94 @@ impl CustomSubscriptionWorker {
             announce_reconnected.clone(),
             shutdown.clone(),
         ));
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => if *shutdown.borrow() { break; },
-                next = feed.next() => match next {
-                Some(Ok(TableSubscriptionEvent::Connected)) => {
-                    self.connected.store(true, Ordering::Release);
-                    announce_reconnected.store(true, Ordering::Release);
-                    let _ = refresh_tx.try_send(());
-                }
-                Some(Ok(TableSubscriptionEvent::Disconnected)) => {
+        let mut retry_delay = Duration::from_millis(250);
+        'reconnect: loop {
+            let mut feed = match self.database.subscribe(
+                &self.consumer_group,
+                &self.consumer_owner,
+                ["rlean.custom_points"],
+                Some(TABLE_EVENT_CLAIM_BATCH),
+                TABLE_EVENT_LEASE_SECONDS,
+            ) {
+                Ok(feed) => feed,
+                Err(error) => {
                     self.connected.store(false, Ordering::Release);
-                    let _ = self.events.send(Ok(LiveDataEvent::Disconnected {
-                        reason: "Verglas table subscription disconnected; SDK is reconnecting"
-                            .to_owned(),
-                    })).await;
+                    tracing::warn!(%error, "Verglas custom subscription setup failed; retrying");
+                    if wait_to_retry(&mut shutdown, retry_delay).await {
+                        break;
+                    }
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                    continue;
                 }
-                Some(Ok(TableSubscriptionEvent::Delivery(delivery))) => {
-                    if let Err(error) =
-                        self.database.ack(&self.consumer_group, &delivery.receipt).await
-                    {
-                        let _ = self.events
-                            .send(Err(anyhow::Error::new(error).context(
-                                "acknowledge Verglas custom-data commit",
-                            )))
-                            .await;
-                    } else {
+            };
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => if *shutdown.borrow() { break 'reconnect; },
+                    next = feed.next() => match next {
+                    Some(Ok(TableSubscriptionEvent::Connected)) => {
+                        self.connected.store(true, Ordering::Release);
+                        retry_delay = Duration::from_millis(250);
+                        announce_reconnected.store(true, Ordering::Release);
                         let _ = refresh_tx.try_send(());
                     }
+                    Some(Ok(TableSubscriptionEvent::Disconnected)) => {
+                        self.connected.store(false, Ordering::Release);
+                        let _ = self.events.send(Ok(LiveDataEvent::Disconnected {
+                            reason: "Verglas table subscription disconnected; SDK is reconnecting"
+                                .to_owned(),
+                        })).await;
+                    }
+                    Some(Ok(TableSubscriptionEvent::Delivery(delivery))) => {
+                        if let Err(error) =
+                            self.database.ack(&self.consumer_group, &delivery.receipt).await
+                        {
+                            let _ = self.events
+                                .send(Err(anyhow::Error::new(error).context(
+                                    "acknowledge Verglas custom-data commit",
+                                )))
+                                .await;
+                        } else {
+                            let _ = refresh_tx.try_send(());
+                        }
+                    }
+                    Some(Err(error)) => {
+                        self.connected.store(false, Ordering::Release);
+                        tracing::warn!(%error, "Verglas custom subscription failed; recreating it");
+                        let _ = self.events.send(Ok(LiveDataEvent::Disconnected {
+                            reason: format!(
+                                "Verglas table subscription failed; retrying: {error}"
+                            ),
+                        })).await;
+                        break;
+                    }
+                    None => {
+                        self.connected.store(false, Ordering::Release);
+                        tracing::warn!(
+                            "Verglas custom subscription ended unexpectedly; recreating it"
+                        );
+                        let _ = self.events.send(Ok(LiveDataEvent::Disconnected {
+                            reason: "Verglas table subscription ended; retrying".to_owned(),
+                        })).await;
+                        break;
+                    }
+                    },
                 }
-                Some(Err(error)) => {
-                    self.connected.store(false, Ordering::Release);
-                    let _ = self.events.send(Err(anyhow::Error::new(error).context(
-                        "Verglas table subscription failed",
-                    ))).await;
-                    break;
-                }
-                None => {
-                    self.connected.store(false, Ordering::Release);
-                    let _ = self.events.send(Err(anyhow::anyhow!(
-                        "Verglas table subscription ended unexpectedly",
-                    ))).await;
-                    break;
-                }
-                },
             }
+            if wait_to_retry(&mut shutdown, retry_delay).await {
+                break;
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
         }
+        self.connected.store(false, Ordering::Release);
         refresh_task.abort();
+    }
+}
+
+/// Returns true when shutdown wins the reconnect wait.
+async fn wait_to_retry(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
     }
 }
 

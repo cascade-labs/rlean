@@ -46,6 +46,14 @@ pub struct GlobalConfig {
     )]
     pub verglas_endpoint: Option<String>,
 
+    /// Verglas control/data-plane access service used for subscriptions.
+    #[serde(
+        default,
+        rename = "verglas_access_uri",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verglas_access_uri: Option<String>,
+
     /// Named Verglas lakehouse used by every rlean query and write.
     #[serde(
         default,

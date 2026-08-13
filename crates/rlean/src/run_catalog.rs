@@ -222,7 +222,8 @@ impl RunCatalog {
              WHERE run_id = '{escaped}' ORDER BY recorded_at DESC LIMIT 1"
         );
         let checkpoint_payload = load_latest_payload(client, &checkpoint_sql).await?;
-        let mut insight_payload = load_latest_payload(client, &insight_state_sql).await?;
+        let mut insight_payload =
+            load_latest_payload_retrying_empty(client, &insight_state_sql).await?;
         if insight_payload.is_none() {
             if let Some(migrated) = checkpoint_payload
                 .as_deref()
@@ -231,6 +232,18 @@ impl RunCatalog {
                 let batch = state_payloads_batch(run_id, std::slice::from_ref(&migrated));
                 append_insight_state_migration(client, run_id, batch).await?;
                 insight_payload = Some(migrated);
+            } else if checkpoint_payload
+                .as_deref()
+                .is_some_and(checkpoint_has_invested_holdings)
+            {
+                // <DIV> LEAN restores brokerage holdings but does not persist
+                // framework insights. Rlean persists them independently and
+                // refuses an ambiguous restart because an empty framework can
+                // liquidate positions that still have active insight targets.
+                anyhow::bail!(
+                    "refusing live restart: the latest checkpoint has invested holdings, but no \
+                     durable insight state is visible"
+                );
             }
         }
 
@@ -397,6 +410,25 @@ fn legacy_checkpoint_insight_state(payload: &str) -> Option<String> {
         return None;
     }
     serde_json::to_string(insights).ok()
+}
+
+fn checkpoint_has_invested_holdings(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    value
+        .get("portfolio")
+        .and_then(|portfolio| portfolio.get("holdings"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|holdings| {
+            holdings.iter().any(|holding| {
+                holding
+                    .get("quantity")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|quantity| quantity.parse::<rust_decimal::Decimal>().ok())
+                    .is_some_and(|quantity| quantity != rust_decimal::Decimal::ZERO)
+            })
+        })
 }
 
 fn assemble_live_restore(
@@ -590,6 +622,33 @@ async fn load_latest_payload(client: &Database, sql: &str) -> Result<Option<Stri
             }
         })
     }))
+}
+
+/// Retry an empty latest-row query because a newly prepared Verglas query
+/// session can briefly precede the catalog snapshot that contains a committed
+/// state append. Each SQL comment makes the retry a distinct prepared query.
+async fn load_latest_payload_retrying_empty(
+    client: &Database,
+    sql: &str,
+) -> Result<Option<String>> {
+    let mut delay = Duration::from_millis(250);
+    for attempt in 1..=8 {
+        let attempt_sql = format!("{sql} /* live-state-empty-retry-{attempt} */");
+        if let Some(payload) = load_latest_payload(client, &attempt_sql).await? {
+            return Ok(Some(payload));
+        }
+        if attempt < 8 {
+            tracing::warn!(
+                attempt,
+                max_attempts = 8,
+                retry_after_milliseconds = delay.as_millis(),
+                "retrying empty live insight-state query"
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+    Ok(None)
 }
 
 async fn append_insight_state_migration(
@@ -1221,6 +1280,27 @@ mod tests {
         .to_string();
 
         assert!(legacy_checkpoint_insight_state(&payload).is_none());
+    }
+
+    #[test]
+    fn checkpoint_detects_invested_holdings_without_trusting_invested_flag() {
+        let invested = serde_json::json!({
+            "portfolio": {
+                "holdings": [
+                    {"symbol": "FLAT", "quantity": "0", "invested": true},
+                    {"symbol": "OPEN", "quantity": "12.5", "invested": false}
+                ]
+            }
+        })
+        .to_string();
+        let flat = serde_json::json!({
+            "portfolio": {"holdings": [{"symbol": "FLAT", "quantity": "0"}]}
+        })
+        .to_string();
+
+        assert!(checkpoint_has_invested_holdings(&invested));
+        assert!(!checkpoint_has_invested_holdings(&flat));
+        assert!(!checkpoint_has_invested_holdings("not-json"));
     }
 
     #[test]
