@@ -1419,7 +1419,8 @@ mod tests {
             for (attempt, incoming) in listener.incoming().take(2).enumerate() {
                 let mut stream = incoming.unwrap();
                 let mut request = [0_u8; 8192];
-                stream.read(&mut request).unwrap();
+                let read = stream.read(&mut request).unwrap();
+                assert!(read > 0, "ThetaData test server received an empty request");
                 let (status, body) = if attempt == 0 {
                     ("500 Internal Server Error", "{\"error\":\"Proxy error\"}")
                 } else {
