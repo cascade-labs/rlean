@@ -288,6 +288,53 @@ mod tests {
     }
 
     #[test]
+    fn relative_strike_filter_rejects_zero_underlying_price() {
+        let source_date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let selection_date = source_date.succ_opt().unwrap();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::MIN,
+            Decimal::ZERO,
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+        let mut rows = vec![
+            row(source_date, None, None),
+            row(
+                source_date,
+                Some(selection_date),
+                Some(Decimal::new(500, 0)),
+            ),
+        ];
+        rows[0].open = Decimal::ZERO;
+        rows[0].high = Decimal::ZERO;
+        rows[0].low = Decimal::ZERO;
+        rows[0].close = Decimal::ZERO;
+
+        let result = option_chains_from_rows(&config, rows);
+        assert!(
+            result.is_err(),
+            "relative strike selection must not treat missing price as zero"
+        );
+    }
+
+    #[test]
     fn relative_strikes_match_lean_when_underlying_is_between_strikes() {
         let strikes = [
             Decimal::new(739, 0),
