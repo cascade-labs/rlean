@@ -549,6 +549,32 @@ impl ThetaDataHistoricalDataProvider {
             if contracts.is_empty() {
                 continue;
             }
+            // Contract-list rows describe only the option identifiers.  They
+            // intentionally carry no underlying price, so hydrate the
+            // canonical underlying row from the source session before this
+            // universe can be cached or selected.
+            let eod_url = self.url(
+                "/v3/stock/history/eod",
+                &[
+                    ("symbol", metadata.underlying_ticker.to_ascii_uppercase()),
+                    ("start_date", vendor_date(date)),
+                    ("end_date", vendor_date(date)),
+                    ("venue", "utp_cta".to_string()),
+                    ("format", "ndjson".to_string()),
+                ],
+            )?;
+            let underlying_eod = self
+                .get_ndjson(eod_url)
+                .await?
+                .iter()
+                .filter_map(parse_eod)
+                .find(|row| row.date == date)
+                .with_context(|| {
+                    format!(
+                        "ThetaData has no valid underlying EOD OHLC for {} on {date}",
+                        metadata.underlying_ticker
+                    )
+                })?;
             output.push(OptionUniverseRow {
                 date,
                 market: request.configuration.symbol.market().as_str().to_string(),
@@ -560,11 +586,11 @@ impl ThetaDataHistoricalDataProvider {
                 expiration: None,
                 strike: None,
                 right: None,
-                open: Decimal::ZERO,
-                high: Decimal::ZERO,
-                low: Decimal::ZERO,
-                close: Decimal::ZERO,
-                volume: Decimal::ZERO,
+                open: decimal(underlying_eod.open)?,
+                high: decimal(underlying_eod.high)?,
+                low: decimal(underlying_eod.low)?,
+                close: decimal(underlying_eod.close)?,
+                volume: decimal(underlying_eod.volume)?,
                 open_interest: None,
                 implied_volatility: None,
                 delta: None,

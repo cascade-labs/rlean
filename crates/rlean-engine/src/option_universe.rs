@@ -63,6 +63,11 @@ fn chain_for_date(
         .find(|row| row.expiration.is_none())
         .map(|row| row.close)
         .unwrap_or_default();
+    anyhow::ensure!(
+        underlying_price > Decimal::ZERO,
+        "option universe for {} on {date} has no positive underlying price required for relative strike selection",
+        underlying.value
+    );
     let mut contracts = rows
         .into_iter()
         .filter_map(|row| contract_from_row(&underlying, underlying_price, date, row))
