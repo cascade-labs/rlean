@@ -657,10 +657,10 @@ impl ThetaDataHistoricalDataProvider {
             if matches!(status.as_u16(), 472 | 475 | 572) || status == StatusCode::NOT_FOUND {
                 return Ok(Vec::new());
             }
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
+            if is_transient_status(status) && attempt < MAX_RETRIES {
                 drop(_permit);
                 let delay = Duration::from_secs(2_u64.pow(attempt + 1));
-                tracing::warn!(?delay, "ThetaData rate limited; retrying");
+                tracing::warn!(?status, ?delay, "ThetaData transient failure; retrying");
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -692,6 +692,13 @@ impl ThetaDataHistoricalDataProvider {
         }
         unreachable!("ThetaData retry loop returns")
     }
+}
+
+fn is_transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
 }
 
 fn option_query_max_dte(
@@ -1440,6 +1447,29 @@ mod tests {
         let rows = provider.get_ndjson(url).await.unwrap();
 
         assert_eq!(rows, vec![json!({"close": 552.08})]);
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_transient_status(status));
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(!is_transient_status(status));
+        }
     }
 
     #[tokio::test]
