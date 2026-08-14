@@ -1405,6 +1405,43 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn transient_theta_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (attempt, incoming) in listener.incoming().take(2).enumerate() {
+                let mut stream = incoming.unwrap();
+                let mut request = [0_u8; 8192];
+                stream.read(&mut request).unwrap();
+                let (status, body) = if attempt == 0 {
+                    ("500 Internal Server Error", "{\"error\":\"Proxy error\"}")
+                } else {
+                    ("200 OK", "{\"close\":552.08}\n")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn retries_transient_server_error() {
+        let mut config = ThetaDataConfig::new(None);
+        config.base_url = transient_theta_server();
+        let provider = ThetaDataHistoricalDataProvider::new(config).unwrap();
+        let url = provider
+            .url("/v3/stock/history/eod", &[("symbol", "SPY".to_string())])
+            .unwrap();
+
+        let rows = provider.get_ndjson(url).await.unwrap();
+
+        assert_eq!(rows, vec![json!({"close": 552.08})]);
+    }
+
     #[tokio::test]
     async fn option_universe_uses_observed_underlying_eod_row() {
         let mut config = ThetaDataConfig::new(None);
