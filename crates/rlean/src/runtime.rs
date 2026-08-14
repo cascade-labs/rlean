@@ -272,6 +272,13 @@ pub(crate) async fn connect_verglas(
     // Docker host cannot redirect the client to its own loopback address from
     // `/admin/access` discovery metadata.
     let mut options = ConnectOptions::new(endpoint.clone()).with_query_uri(endpoint.clone());
+    if let Some(access_uri) = std::env::var("VERGLAS_ACCESS_URI")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| global_config.verglas_access_uri.clone())
+    {
+        options = options.with_access_uri(access_uri);
+    }
     if let Some(value) = token.as_ref() {
         options = options.with_token(value);
     }

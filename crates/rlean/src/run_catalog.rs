@@ -22,6 +22,7 @@ const PROGRESS: &str = "rlean.run_progress";
 const ORDER_EVENTS: &str = "rlean.order_events";
 const TRADES: &str = "rlean.trades";
 const INSIGHTS: &str = "rlean.insights";
+const INSIGHT_STATE: &str = "rlean.insight_state";
 const CHECKPOINTS: &str = "rlean.checkpoints";
 const STATISTICS: &str = "rlean.statistics";
 const CHARTS: &str = "rlean.charts";
@@ -160,6 +161,10 @@ impl RunCatalog {
             .iter()
             .filter_map(|update| update.checkpoint_json.clone())
             .collect::<Vec<_>>();
+        let insight_states = updates
+            .iter()
+            .filter_map(|update| update.insight_state_json.clone())
+            .collect::<Vec<_>>();
         let snapshots = updates
             .iter()
             .map(|update| update.progress.clone())
@@ -168,6 +173,7 @@ impl RunCatalog {
         let order_batch = order_event_rows_batch(&self.run_id, &order_events)?;
         let trade_batch = trade_rows_batch(&self.run_id, &trades)?;
         let insight_batch = insight_event_rows_batch(&self.run_id, &insight_events)?;
+        let insight_state_batch = state_payloads_batch(&self.run_id, &insight_states);
         let checkpoint_batch = checkpoints_batch(&self.run_id, &checkpoints);
         // Progress telemetry must never unwind a run that is still computing
         // correct results, so these appends drop instead of failing.
@@ -187,58 +193,59 @@ impl RunCatalog {
             self.append(ORDER_EVENTS, order_batch, &suffix, AppendFailure::Drop),
             self.append(TRADES, trade_batch, &suffix, AppendFailure::Drop),
             self.append(INSIGHTS, insight_batch, &suffix, AppendFailure::Drop),
-            // A live checkpoint is the source of restart truth. Do not report a
-            // successful stream write when Verglas did not commit it.
+            self.append(
+                INSIGHT_STATE,
+                insight_state_batch,
+                &suffix,
+                AppendFailure::Fail,
+            ),
+            // Account state is restart truth independent from framework state.
+            // Do not report success when Verglas did not commit it.
             self.append(CHECKPOINTS, checkpoint_batch, &suffix, AppendFailure::Fail),
         ])
         .await?;
         Ok(())
     }
 
-    /// Load the latest restore checkpoint for a live run, plus historical fills.
+    /// Load independent account and insight state for a live run, plus fills.
     pub(crate) async fn load_live_restore(
         client: &Database,
         run_id: &str,
     ) -> Result<Option<rlean_engine::live::catalog_state::LiveRestoreState>> {
-        use futures::TryStreamExt;
-        use rlean_engine::live::catalog_state::{
-            account_state_from_checkpoint, parse_checkpoint_json, LiveRestoreState,
-        };
-
         let escaped = run_id.replace('\'', "''");
         let checkpoint_sql = format!(
             "SELECT payload_json FROM rlean.checkpoints \
              WHERE run_id = '{escaped}' ORDER BY recorded_at DESC LIMIT 1"
         );
-        let checkpoint_batches = client
-            .query_stream(&checkpoint_sql)
-            .await
-            .context("query live checkpoints")?
-            .try_collect::<Vec<_>>()
-            .await
-            .context("read live checkpoints")?;
-        let payload = checkpoint_batches
-            .iter()
-            .flat_map(|batch| {
-                let col = batch.column(0);
-                (0..batch.num_rows()).filter_map(move |row| {
-                    if col.is_null(row) {
-                        None
-                    } else {
-                        arrow_cast::display::array_value_to_string(col.as_ref(), row).ok()
-                    }
-                })
-            })
-            .next();
-        let Some(payload) = payload else {
-            return Ok(None);
-        };
-        let Some(checkpoint) = parse_checkpoint_json(&payload) else {
-            return Ok(None);
-        };
-        let Some(account_state) = account_state_from_checkpoint(&checkpoint) else {
-            return Ok(None);
-        };
+        let insight_state_sql = format!(
+            "SELECT payload_json FROM rlean.insight_state \
+             WHERE run_id = '{escaped}' ORDER BY recorded_at DESC LIMIT 1"
+        );
+        let checkpoint_payload = load_latest_payload(client, &checkpoint_sql).await?;
+        let mut insight_payload =
+            load_latest_payload_retrying_empty(client, &insight_state_sql).await?;
+        if insight_payload.is_none() {
+            if let Some(migrated) = checkpoint_payload
+                .as_deref()
+                .and_then(legacy_checkpoint_insight_state)
+            {
+                let batch = state_payloads_batch(run_id, std::slice::from_ref(&migrated));
+                append_insight_state_migration(client, run_id, batch).await?;
+                insight_payload = Some(migrated);
+            } else if checkpoint_payload
+                .as_deref()
+                .is_some_and(checkpoint_has_invested_holdings)
+            {
+                // <DIV> LEAN restores brokerage holdings but does not persist
+                // framework insights. Rlean persists them independently and
+                // refuses an ambiguous restart because an empty framework can
+                // liquidate positions that still have active insight targets.
+                anyhow::bail!(
+                    "refusing live restart: the latest checkpoint has invested holdings, but no \
+                     durable insight state is visible"
+                );
+            }
+        }
 
         // Fills/trades are streamed into the same tables as backtests; reload
         // the full history so paper trade builders and CLI views stay consistent.
@@ -257,12 +264,12 @@ impl RunCatalog {
             .await
             .unwrap_or_default();
 
-        Ok(Some(LiveRestoreState {
-            account_state,
+        assemble_live_restore(
+            checkpoint_payload.as_deref(),
+            insight_payload.as_deref(),
             order_events,
             trades,
-            insights: checkpoint.insights,
-        }))
+        )
     }
 
     /// One summary line at the end of a run. Silence means nothing was lost.
@@ -394,6 +401,67 @@ impl RunCatalog {
     }
 }
 
+/// Extracts the pre-`rlean.insight_state` snapshot for one-time migration.
+/// New account checkpoints never contain this field.
+fn legacy_checkpoint_insight_state(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let insights = value.get("insights")?;
+    if insights.is_null() {
+        return None;
+    }
+    serde_json::to_string(insights).ok()
+}
+
+fn checkpoint_has_invested_holdings(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    value
+        .get("portfolio")
+        .and_then(|portfolio| portfolio.get("holdings"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|holdings| {
+            holdings.iter().any(|holding| {
+                holding
+                    .get("quantity")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|quantity| quantity.parse::<rust_decimal::Decimal>().ok())
+                    .is_some_and(|quantity| quantity != rust_decimal::Decimal::ZERO)
+            })
+        })
+}
+
+fn assemble_live_restore(
+    checkpoint_payload: Option<&str>,
+    insight_payload: Option<&str>,
+    order_events: Vec<rlean_orders::OrderEvent>,
+    trades: Vec<rlean_statistics::Trade>,
+) -> Result<Option<rlean_engine::live::catalog_state::LiveRestoreState>> {
+    use rlean_engine::live::catalog_state::{
+        account_state_from_checkpoint, parse_checkpoint_json, LiveRestoreState,
+    };
+
+    let account_state = checkpoint_payload
+        .and_then(parse_checkpoint_json)
+        .as_ref()
+        .and_then(account_state_from_checkpoint);
+    let insights = insight_payload
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parse live insight state")?;
+    if account_state.is_none() && insights.is_none() && order_events.is_empty() && trades.is_empty()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(LiveRestoreState {
+        account_state,
+        order_events,
+        trades,
+        insights,
+    }))
+}
+
 fn append_idempotency_key(run_id: &str, process_generation: uuid::Uuid, suffix: &str) -> String {
     format!("{run_id}:{process_generation}:{suffix}")
 }
@@ -484,6 +552,7 @@ fn table_schemas() -> Vec<(&'static str, SchemaRef)> {
         (ORDER_EVENTS, order_events_schema()),
         (TRADES, trades_schema()),
         (INSIGHTS, insights_schema()),
+        (INSIGHT_STATE, state_payloads_schema()),
         (CHECKPOINTS, checkpoints_schema()),
         (STATISTICS, statistics_schema()),
         (CHARTS, charts_schema()),
@@ -518,6 +587,105 @@ async fn load_json_payloads<T: serde::de::DeserializeOwned>(
         }
     }
     Ok(out)
+}
+
+async fn load_latest_payload(client: &Database, sql: &str) -> Result<Option<String>> {
+    use futures::TryStreamExt;
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 1_u32;
+    let batches = loop {
+        let result = match client.query_stream(sql).await {
+            Ok(stream) => stream
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("read query stream for {sql}")),
+            Err(error) => Err(anyhow::Error::new(error).context(format!("query {sql}"))),
+        };
+        match result {
+            Ok(batches) => break batches,
+            Err(error) if attempt < 8 && is_retryable_catalog_state_error(&error) => {
+                tracing::warn!(%error, attempt, max_attempts = 8, retry_after_seconds = delay.as_secs(), "retrying live state query");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(batches.iter().find_map(|batch| {
+        let column = batch.column(0);
+        (0..batch.num_rows()).find_map(|row| {
+            if column.is_null(row) {
+                None
+            } else {
+                arrow_cast::display::array_value_to_string(column.as_ref(), row).ok()
+            }
+        })
+    }))
+}
+
+/// Retry an empty latest-row query because a newly prepared Verglas query
+/// session can briefly precede the catalog snapshot that contains a committed
+/// state append. Each SQL comment makes the retry a distinct prepared query.
+async fn load_latest_payload_retrying_empty(
+    client: &Database,
+    sql: &str,
+) -> Result<Option<String>> {
+    let mut delay = Duration::from_millis(250);
+    for attempt in 1..=8 {
+        let attempt_sql = format!("{sql} /* live-state-empty-retry-{attempt} */");
+        if let Some(payload) = load_latest_payload(client, &attempt_sql).await? {
+            return Ok(Some(payload));
+        }
+        if attempt < 8 {
+            tracing::warn!(
+                attempt,
+                max_attempts = 8,
+                retry_after_milliseconds = delay.as_millis(),
+                "retrying empty live insight-state query"
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+    Ok(None)
+}
+
+async fn append_insight_state_migration(
+    client: &Database,
+    run_id: &str,
+    batch: RecordBatch,
+) -> Result<()> {
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 1_u32;
+    loop {
+        match client
+            .append_stream(
+                INSIGHT_STATE,
+                stream::iter([Ok(batch.clone())]),
+                &format!("migrate-legacy-insight-state-{run_id}"),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < 8 && is_retryable_catalog_state_error(&error) => {
+                tracing::warn!(%error, attempt, max_attempts = 8, retry_after_seconds = delay.as_secs(), "retrying legacy insight-state migration");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+                attempt += 1;
+            }
+            Err(error) => {
+                return Err(error).context("migrate legacy live insight state");
+            }
+        }
+    }
+}
+
+fn is_retryable_catalog_state_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("catalog changed while rebuilding the query session")
+        || message.contains("authorization service unavailable")
+        || message.contains("503 Service Unavailable")
 }
 
 fn runs_schema() -> SchemaRef {
@@ -753,6 +921,10 @@ fn insight_event_rows_batch(
 }
 
 fn checkpoints_schema() -> SchemaRef {
+    state_payloads_schema()
+}
+
+fn state_payloads_schema() -> SchemaRef {
     schema(vec![
         f("run_id", DataType::Utf8),
         f("recorded_at", DataType::Utf8),
@@ -761,9 +933,13 @@ fn checkpoints_schema() -> SchemaRef {
 }
 
 fn checkpoints_batch(run_id: &str, payloads: &[String]) -> RecordBatch {
+    state_payloads_batch(run_id, payloads)
+}
+
+fn state_payloads_batch(run_id: &str, payloads: &[String]) -> RecordBatch {
     let recorded_at = chrono::Utc::now().to_rfc3339();
     RecordBatch::try_new(
-        checkpoints_schema(),
+        state_payloads_schema(),
         vec![
             strings(payloads.iter().map(|_| run_id.to_owned())),
             strings(payloads.iter().map(|_| recorded_at.clone())),
@@ -1007,6 +1183,7 @@ mod tests {
                 ORDER_EVENTS,
                 TRADES,
                 INSIGHTS,
+                INSIGHT_STATE,
                 CHECKPOINTS,
                 STATISTICS,
                 CHARTS,
@@ -1014,6 +1191,129 @@ mod tests {
                 LOGS
             ]
         );
+    }
+
+    #[test]
+    fn insight_state_has_a_dedicated_catalog_contract() {
+        let tables = table_schemas();
+        let insight_state = tables
+            .iter()
+            .find(|(name, _)| *name == INSIGHT_STATE)
+            .expect("dedicated insight state table");
+        let checkpoint = tables
+            .iter()
+            .find(|(name, _)| *name == CHECKPOINTS)
+            .expect("account checkpoint table");
+
+        assert_ne!(insight_state.0, checkpoint.0);
+        assert_eq!(
+            insight_state
+                .1
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_id", "recorded_at", "payload_json"]
+        );
+    }
+
+    #[test]
+    fn insight_restore_does_not_require_an_account_checkpoint() {
+        let now = rlean_core::DateTime::from_secs(2_000_000);
+        let insight = rlean_alpha::Insight::up(
+            rlean_core::Symbol::create_equity("SPY", &rlean_core::Market::usa()),
+            rlean_core::TimeSpan::ONE_DAY,
+        )
+        .with_generated_time_utc(now);
+        let state = rlean_engine::live::catalog_state::LiveInsightSnapshot {
+            schema_version: rlean_engine::live::catalog_state::LIVE_INSIGHTS_SCHEMA_VERSION,
+            deployment_id: Some("live-test".to_string()),
+            written_at: "2026-08-12T00:00:00Z".to_string(),
+            state: rlean_alpha::InsightCollectionSnapshot {
+                active: vec![insight.clone()],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+        };
+        let state_json = serde_json::to_string(&state).unwrap();
+
+        let restore = assemble_live_restore(None, Some(&state_json), Vec::new(), Vec::new())
+            .unwrap()
+            .expect("insight-only restore state");
+
+        assert!(restore.account_state.is_none());
+        let restored_insights = restore.insights.expect("restored insight state");
+        assert_eq!(restored_insights.state.active.len(), 1);
+        assert_eq!(restored_insights.state.active[0].id, insight.id);
+    }
+
+    #[test]
+    fn legacy_checkpoint_insights_are_extracted_for_one_time_migration() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "portfolio": {"cash": "100000"},
+            "open_orders": [],
+            "insights": {
+                "schema_version": 1,
+                "deployment_id": "live-test",
+                "written_at": "2026-08-12T00:00:00Z",
+                "state": {"active": [], "closed": [], "total_count": 0}
+            }
+        })
+        .to_string();
+
+        let migrated = legacy_checkpoint_insight_state(&payload).expect("legacy insight state");
+        let decoded: rlean_engine::live::catalog_state::LiveInsightSnapshot =
+            serde_json::from_str(&migrated).unwrap();
+
+        assert_eq!(decoded.deployment_id.as_deref(), Some("live-test"));
+        assert_eq!(decoded.state.total_count, 0);
+    }
+
+    #[test]
+    fn current_account_checkpoint_has_no_legacy_insight_state() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "portfolio": {"cash": "100000"},
+            "open_orders": []
+        })
+        .to_string();
+
+        assert!(legacy_checkpoint_insight_state(&payload).is_none());
+    }
+
+    #[test]
+    fn checkpoint_detects_invested_holdings_without_trusting_invested_flag() {
+        let invested = serde_json::json!({
+            "portfolio": {
+                "holdings": [
+                    {"symbol": "FLAT", "quantity": "0", "invested": true},
+                    {"symbol": "OPEN", "quantity": "12.5", "invested": false}
+                ]
+            }
+        })
+        .to_string();
+        let flat = serde_json::json!({
+            "portfolio": {"holdings": [{"symbol": "FLAT", "quantity": "0"}]}
+        })
+        .to_string();
+
+        assert!(checkpoint_has_invested_holdings(&invested));
+        assert!(!checkpoint_has_invested_holdings(&flat));
+        assert!(!checkpoint_has_invested_holdings("not-json"));
+    }
+
+    #[test]
+    fn live_state_retry_classifies_catalog_rebuild_and_auth_unavailable() {
+        assert!(is_retryable_catalog_state_error(
+            &"catalog changed while rebuilding the query session; retry the query"
+        ));
+        assert!(is_retryable_catalog_state_error(
+            &"503 Service Unavailable: authorization service unavailable"
+        ));
+        assert!(!is_retryable_catalog_state_error(
+            &"400 Bad Request: unknown column"
+        ));
     }
 
     #[test]

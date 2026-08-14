@@ -301,6 +301,10 @@ fn containerized_config(global: &GlobalConfig, host_network: bool) -> GlobalConf
             .verglas_endpoint
             .as_deref()
             .map(containerize_loopback_url);
+        container.verglas_access_uri = container
+            .verglas_access_uri
+            .as_deref()
+            .map(containerize_loopback_url);
         for provider in container.providers.values_mut() {
             for (key, value) in provider.iter_mut() {
                 let key = key.to_ascii_lowercase();
@@ -345,6 +349,20 @@ fn verglas_endpoint_for_container(global: &GlobalConfig) -> String {
     }
 }
 
+fn optional_endpoint_for_container(name: &str, configured: Option<&str>) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| configured.map(str::to_owned))
+        .map(|endpoint| {
+            if container_uses_host_network() {
+                endpoint
+            } else {
+                containerize_loopback_url(&endpoint)
+            }
+        })
+}
+
 fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
     let _ = image;
     let mut args = vec!["run".into()];
@@ -358,6 +376,11 @@ fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
     }
     let endpoint = verglas_endpoint_for_container(global);
     args.extend(["-e".into(), format!("VERGLAS_ENDPOINT={endpoint}")]);
+    if let Some(access_uri) =
+        optional_endpoint_for_container("VERGLAS_ACCESS_URI", global.verglas_access_uri.as_deref())
+    {
+        args.extend(["-e".into(), format!("VERGLAS_ACCESS_URI={access_uri}")]);
+    }
     let database = std::env::var("VERGLAS_DATABASE")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -467,6 +490,7 @@ mod tests {
     fn container_config_rewrites_provider_endpoints_without_changing_credentials() {
         let mut global = GlobalConfig {
             verglas_endpoint: Some("http://127.0.0.1:8334".to_string()),
+            verglas_access_uri: Some("http://127.0.0.1:8345".to_string()),
             ..GlobalConfig::default()
         };
         global.providers.insert(
@@ -486,6 +510,10 @@ mod tests {
         assert_eq!(
             container.verglas_endpoint.as_deref(),
             Some("http://host.docker.internal:8334")
+        );
+        assert_eq!(
+            container.verglas_access_uri.as_deref(),
+            Some("http://host.docker.internal:8345")
         );
         assert_eq!(
             container.providers["thetadata"]["base_url"],

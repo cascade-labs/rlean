@@ -433,6 +433,7 @@ where
                             trades: completed_trades[catalog_trades..].to_vec(),
                             insight_events: Vec::new(),
                             checkpoint_json: None,
+                            insight_state_json: None,
                         })
                         .await
                         .map_err(|_| anyhow::anyhow!("backtest run-catalog stream closed"))?;

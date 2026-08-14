@@ -549,6 +549,32 @@ impl ThetaDataHistoricalDataProvider {
             if contracts.is_empty() {
                 continue;
             }
+            // Contract-list rows describe only the option identifiers.  They
+            // intentionally carry no underlying price, so hydrate the
+            // canonical underlying row from the source session before this
+            // universe can be cached or selected.
+            let eod_url = self.url(
+                "/v3/stock/history/eod",
+                &[
+                    ("symbol", metadata.underlying_ticker.to_ascii_uppercase()),
+                    ("start_date", vendor_date(date)),
+                    ("end_date", vendor_date(date)),
+                    ("venue", "utp_cta".to_string()),
+                    ("format", "ndjson".to_string()),
+                ],
+            )?;
+            let underlying_eod = self
+                .get_ndjson(eod_url)
+                .await?
+                .iter()
+                .filter_map(parse_eod)
+                .find(|row| row.date == date)
+                .with_context(|| {
+                    format!(
+                        "ThetaData has no valid underlying EOD OHLC for {} on {date}",
+                        metadata.underlying_ticker
+                    )
+                })?;
             output.push(OptionUniverseRow {
                 date,
                 market: request.configuration.symbol.market().as_str().to_string(),
@@ -560,11 +586,11 @@ impl ThetaDataHistoricalDataProvider {
                 expiration: None,
                 strike: None,
                 right: None,
-                open: Decimal::ZERO,
-                high: Decimal::ZERO,
-                low: Decimal::ZERO,
-                close: Decimal::ZERO,
-                volume: Decimal::ZERO,
+                open: decimal(underlying_eod.open)?,
+                high: decimal(underlying_eod.high)?,
+                low: decimal(underlying_eod.low)?,
+                close: decimal(underlying_eod.close)?,
+                volume: decimal(underlying_eod.volume)?,
                 open_interest: None,
                 implied_volatility: None,
                 delta: None,
@@ -631,10 +657,10 @@ impl ThetaDataHistoricalDataProvider {
             if matches!(status.as_u16(), 472 | 475 | 572) || status == StatusCode::NOT_FOUND {
                 return Ok(Vec::new());
             }
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
+            if is_transient_status(status) && attempt < MAX_RETRIES {
                 drop(_permit);
                 let delay = Duration::from_secs(2_u64.pow(attempt + 1));
-                tracing::warn!(?delay, "ThetaData rate limited; retrying");
+                tracing::warn!(?status, ?delay, "ThetaData transient failure; retrying");
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -666,6 +692,13 @@ impl ThetaDataHistoricalDataProvider {
         }
         unreachable!("ThetaData retry loop returns")
     }
+}
+
+fn is_transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
 }
 
 fn option_query_max_dte(
@@ -1322,6 +1355,163 @@ mod tests {
         OptionChainFilterMetadata, OptionChainSubscriptionMetadata, SubscriptionDataConfig,
     };
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn option_universe_request(date: NaiveDate) -> HistoryRequest {
+        let equity = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_canonical_option(&equity, &Market::usa());
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+        let (open, close) = MarketHoursDatabase::global()
+            .exchange_hours(&equity)
+            .session_bounds(date)
+            .expect("trading session");
+        HistoryRequest::new(config, open - TimeSpan::from_nanos(1), close).unwrap()
+    }
+
+    fn observed_theta_server(eod_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming().take(2) {
+                let mut stream = incoming.unwrap();
+                let mut request = [0_u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.contains("/v3/option/list/contracts/quote?") {
+                    concat!(
+                        "{\"symbol\":\"SPY\",\"strike\":585.0,\"expiration\":\"2024-11-19\",\"right\":\"CALL\"}\n",
+                        "{\"symbol\":\"SPY\",\"strike\":590.0,\"expiration\":\"2024-11-19\",\"right\":\"CALL\"}\n"
+                    )
+                } else if request.contains("/v3/stock/history/eod?") {
+                    eod_body
+                } else {
+                    panic!("unexpected ThetaData request: {request}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn transient_theta_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (attempt, incoming) in listener.incoming().take(2).enumerate() {
+                let mut stream = incoming.unwrap();
+                let mut request = [0_u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                assert!(read > 0, "ThetaData test server received an empty request");
+                let (status, body) = if attempt == 0 {
+                    ("500 Internal Server Error", "{\"error\":\"Proxy error\"}")
+                } else {
+                    ("200 OK", "{\"close\":552.08}\n")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn retries_transient_server_error() {
+        let mut config = ThetaDataConfig::new(None);
+        config.base_url = transient_theta_server();
+        let provider = ThetaDataHistoricalDataProvider::new(config).unwrap();
+        let url = provider
+            .url("/v3/stock/history/eod", &[("symbol", "SPY".to_string())])
+            .unwrap();
+
+        let rows = provider.get_ndjson(url).await.unwrap();
+
+        assert_eq!(rows, vec![json!({"close": 552.08})]);
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_transient_status(status));
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(!is_transient_status(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn option_universe_uses_observed_underlying_eod_row() {
+        let mut config = ThetaDataConfig::new(None);
+        config.base_url = observed_theta_server(
+            "{\"created\":\"2024-11-18T21:01:00Z\",\"open\":586.24,\"high\":589.49,\"low\":585.34,\"close\":588.15,\"volume\":36905686}\n",
+        );
+        let provider = ThetaDataHistoricalDataProvider::new(config).unwrap();
+        let data = provider
+            .get_history(&option_universe_request(
+                NaiveDate::from_ymd_opt(2024, 11, 18).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let HistoricalData::OptionUniverse(rows) = data else {
+            panic!("expected option universe");
+        };
+        let underlying = rows
+            .iter()
+            .find(|row| row.expiration.is_none())
+            .expect("underlying row");
+        assert_eq!(underlying.open, Decimal::from_str_exact("586.24").unwrap());
+        assert_eq!(underlying.high, Decimal::from_str_exact("589.49").unwrap());
+        assert_eq!(underlying.low, Decimal::from_str_exact("585.34").unwrap());
+        assert_eq!(underlying.close, Decimal::from_str_exact("588.15").unwrap());
+        assert_eq!(underlying.volume, Decimal::from(36_905_686));
+    }
+
+    #[tokio::test]
+    async fn option_universe_rejects_missing_underlying_eod_row() {
+        let mut config = ThetaDataConfig::new(None);
+        config.base_url = observed_theta_server("");
+        let provider = ThetaDataHistoricalDataProvider::new(config).unwrap();
+        let result = provider
+            .get_history(&option_universe_request(
+                NaiveDate::from_ymd_opt(2024, 11, 18).unwrap(),
+            ))
+            .await;
+        assert!(result.is_err(), "missing underlying data must fail closed");
+    }
 
     #[test]
     fn option_query_bound_includes_lean_selection_session_gap() {

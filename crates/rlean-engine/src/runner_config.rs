@@ -23,7 +23,7 @@ pub struct BacktestProgress {
 
 /// Durable run telemetry shared by backtest and live. Consumed by `RunCatalog`
 /// and appended to the same Verglas tables (`rlean.runs`, `run_progress`,
-/// `order_events`, `trades`, `insights`, `checkpoints`).
+/// `order_events`, `trades`, `insights`, `insight_state`, `checkpoints`).
 #[derive(Debug, Clone)]
 pub struct BacktestStreamUpdate {
     pub progress: BacktestProgress,
@@ -31,9 +31,12 @@ pub struct BacktestStreamUpdate {
     pub order_events: Vec<OrderEvent>,
     pub trades: Vec<Trade>,
     pub insight_events: Vec<InsightEvent>,
-    /// Optional restore checkpoint JSON (portfolio + open orders + insights).
-    /// Live emits this on state changes; backtests leave it `None`.
+    /// Optional account checkpoint JSON (portfolio + open orders).
+    /// Live emits this on account state changes; backtests leave it `None`.
     pub checkpoint_json: Option<String>,
+    /// Optional complete framework insight snapshot JSON.
+    /// Live persists this independently from brokerage account state.
+    pub insight_state_json: Option<String>,
 }
 
 impl BacktestStreamUpdate {
@@ -45,6 +48,7 @@ impl BacktestStreamUpdate {
             trades: Vec::new(),
             insight_events: Vec::new(),
             checkpoint_json: None,
+            insight_state_json: None,
         }
     }
 }
@@ -90,7 +94,7 @@ pub struct LiveRunConfig {
     pub deploy_started_at: chrono::DateTime<chrono::Utc>,
     /// Optional restore payload loaded from the Verglas catalog before start.
     pub restore: Option<LiveRestoreState>,
-    /// Deployment id used when tagging insight checkpoints.
+    /// Deployment id used when tagging durable insight state.
     pub deploy_id: Option<String>,
 }
 

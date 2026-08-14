@@ -63,6 +63,11 @@ fn chain_for_date(
         .find(|row| row.expiration.is_none())
         .map(|row| row.close)
         .unwrap_or_default();
+    anyhow::ensure!(
+        underlying_price > Decimal::ZERO,
+        "option universe for {} on {date} has no positive underlying price required for relative strike selection",
+        underlying.value
+    );
     let mut contracts = rows
         .into_iter()
         .filter_map(|row| contract_from_row(&underlying, underlying_price, date, row))
@@ -285,6 +290,53 @@ mod tests {
 
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].1.contracts.len(), 1);
+    }
+
+    #[test]
+    fn relative_strike_filter_rejects_zero_underlying_price() {
+        let source_date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let selection_date = source_date.succ_opt().unwrap();
+        let underlying = Symbol::create_equity("SPY", &Market::usa());
+        let canonical = Symbol::create_option(
+            underlying,
+            &Market::usa(),
+            NaiveDate::MIN,
+            Decimal::ZERO,
+            OptionRight::Call,
+            OptionStyle::American,
+        );
+        let config = SubscriptionDataConfig::new_option_chain(
+            canonical,
+            Resolution::Minute,
+            OptionChainSubscriptionMetadata {
+                canonical_permtick: "?SPY".to_string(),
+                underlying_ticker: "SPY".to_string(),
+                filter: OptionChainFilterMetadata {
+                    min_strike_rank: -5,
+                    max_strike_rank: 5,
+                    min_expiry_days: 0,
+                    max_expiry_days: 0,
+                },
+            },
+        );
+        let mut rows = vec![
+            row(source_date, None, None),
+            row(
+                source_date,
+                Some(selection_date),
+                Some(Decimal::new(500, 0)),
+            ),
+        ];
+        rows[0].open = Decimal::ZERO;
+        rows[0].high = Decimal::ZERO;
+        rows[0].low = Decimal::ZERO;
+        rows[0].close = Decimal::ZERO;
+
+        let result = option_chains_from_rows(&config, rows);
+        assert!(
+            result.is_err(),
+            "relative strike selection must not treat missing price as zero"
+        );
     }
 
     #[test]

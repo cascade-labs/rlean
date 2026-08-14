@@ -10,6 +10,7 @@ use crate::config::{
 /// Known keys:
 ///   default-language            python | csharp
 ///   verglas_endpoint            Verglas SDK gateway (e.g. http://127.0.0.1:8334)
+///   verglas_access_uri          Verglas access service (e.g. http://127.0.0.1:8345)
 ///   verglas_database            Named Verglas lakehouse database
 ///   verglas_token               Verglas bearer token for all discovered services
 ///   <provider>.<key>            Provider credentials (e.g. thetadata.api_key)
@@ -82,7 +83,7 @@ fn cmd_set(key: &str, value: &str) -> Result<()> {
             }
             println!("Set default-language = {value}");
         }
-        "verglas_endpoint" | "verglas_database" | "verglas_token" => {
+        "verglas_endpoint" | "verglas_access_uri" | "verglas_database" | "verglas_token" => {
             if key == "verglas_database" {
                 validate_verglas_database(value)?;
             }
@@ -116,7 +117,7 @@ fn cmd_get(key: &str) -> Result<()> {
             let cfg = GlobalConfig::load()?;
             println!("{}", cfg.default_language);
         }
-        "verglas_endpoint" | "verglas_database" | "verglas_token" => {
+        "verglas_endpoint" | "verglas_access_uri" | "verglas_database" | "verglas_token" => {
             let cfg = GlobalConfig::load()?;
             match get_verglas_key(&cfg, key)? {
                 Some(value) if key == "verglas_token" => println!("{}", mask(value)),
@@ -137,6 +138,9 @@ fn cmd_list() -> Result<()> {
     println!("{:<30} {}", "default-language", global.default_language);
     if let Some(endpoint) = global.verglas_endpoint.as_deref() {
         println!("{:<30} {}", "verglas_endpoint", endpoint);
+    }
+    if let Some(access_uri) = global.verglas_access_uri.as_deref() {
+        println!("{:<30} {}", "verglas_access_uri", access_uri);
     }
     if let Some(database) = global.verglas_database.as_deref() {
         println!("{:<30} {}", "verglas_database", database);
@@ -171,7 +175,7 @@ fn mask(s: &str) -> String {
 
 fn unknown_key_message(key: &str) -> String {
     format!(
-        "Unknown key '{key}'. Known keys: default-language, verglas_endpoint, verglas_database, verglas_token. \
+        "Unknown key '{key}'. Known keys: default-language, verglas_endpoint, verglas_access_uri, verglas_database, verglas_token. \
          Use <provider>.<key> for provider credentials (e.g. massive.api_key). \
          Known providers: {}.",
         KNOWN_PROVIDERS.join(", ")
@@ -181,6 +185,7 @@ fn unknown_key_message(key: &str) -> String {
 fn set_verglas_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<()> {
     match key {
         "verglas_endpoint" => cfg.verglas_endpoint = Some(value),
+        "verglas_access_uri" => cfg.verglas_access_uri = Some(value),
         "verglas_database" => cfg.verglas_database = Some(value),
         "verglas_token" => cfg.verglas_token = Some(value),
         _ => bail!("unknown Verglas config key '{key}'"),
@@ -191,6 +196,7 @@ fn set_verglas_key(cfg: &mut GlobalConfig, key: &str, value: String) -> Result<(
 fn get_verglas_key<'a>(cfg: &'a GlobalConfig, key: &str) -> Result<Option<&'a str>> {
     match key {
         "verglas_endpoint" => Ok(cfg.verglas_endpoint.as_deref()),
+        "verglas_access_uri" => Ok(cfg.verglas_access_uri.as_deref()),
         "verglas_database" => Ok(cfg.verglas_database.as_deref()),
         "verglas_token" => Ok(cfg.verglas_token.as_deref()),
         _ => bail!("unknown Verglas config key '{key}'"),

@@ -57,10 +57,9 @@ pub struct FrameworkState {
     pending_flat_targets: Vec<Insight>,
     pending_insight_events: Vec<InsightEvent>,
     pending_security_changes: bool,
-    /// Engine-requested one-shot reconciliation, used after restoring live
-    /// insights and synchronizing the actual brokerage account. This is kept
-    /// separate from insight changes so checkpoint restoration does not turn
-    /// into recurring alpha-driven rebalancing.
+    /// Engine-requested one-shot reconciliation for explicit insight
+    /// cancellation. This is separate from ordinary insight changes so the
+    /// flat target runs on the current framework time step.
     pending_rebalance: bool,
     /// Final PCM/risk targets generated during the current pipeline pass. C#
     /// LEAN stores these on `SecurityHolding.Target` before execution.
@@ -409,15 +408,16 @@ impl FrameworkState {
         }
     }
 
-    /// Request one portfolio-construction pass on the next framework time step.
+    /// Accepts brokerage holdings as authoritative live startup state.
     ///
-    /// Live restart uses this after brokerage state has been synchronized so
-    /// the restored active insight set is converted back into portfolio targets
-    /// exactly once. C# LEAN's PCM derives targets from the complete active
-    /// `Algorithm.Insights` collection whenever a rebalance is due; this flag
-    /// supplies that missing restart boundary without reporting fake new alpha.
-    pub fn request_rebalance(&mut self) {
-        self.pending_rebalance = true;
+    /// C# LEAN's `BrokerageSetupHandler.LoadExistingHoldingsAndOrders` imports
+    /// holdings without invoking `PortfolioConstruction.CreateTargets`.
+    /// Discard any transient target work produced before the account sync while
+    /// retaining the restored insight collection for later alpha processing.
+    pub fn accept_brokerage_startup_state(&mut self) {
+        self.pending_rebalance = false;
+        self.pending_flat_targets.clear();
+        self.pending_target_updates.clear();
     }
 
     pub fn on_securities_changed(&mut self, added: &[Symbol], removed: &[Symbol]) {
@@ -973,6 +973,26 @@ mod tests {
         }
     }
 
+    struct ZeroQuantityInsightChangesOnlyPcm;
+
+    impl IPortfolioConstructionModel for ZeroQuantityInsightChangesOnlyPcm {
+        fn create_targets(
+            &mut self,
+            insights: &[InsightForPcm],
+            _portfolio_value: Decimal,
+            _prices: &HashMap<u64, Decimal>,
+        ) -> Vec<PortfolioTarget> {
+            insights
+                .iter()
+                .map(|insight| PortfolioTarget::new(insight.symbol.clone(), Decimal::ZERO))
+                .collect()
+        }
+
+        fn rebalance_policy(&self) -> RebalancePolicy {
+            RebalancePolicy::insight_changes_only()
+        }
+    }
+
     fn dt(year: i32, month: u32, day: u32) -> DateTime {
         let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
         DateTime::from(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()))
@@ -1055,21 +1075,60 @@ mod tests {
     }
 
     #[test]
-    fn explicit_startup_reconciliation_is_one_shot() {
+    fn brokerage_startup_accepts_imported_holdings_without_scheduling_targets() {
         let mut framework = FrameworkState::new();
-        framework.pcm = Box::new(
-            EqualWeightingPortfolioConstructionModel::with_bias_max_weight_and_rebalance_policy(
-                rlean_portfolio_construction::PortfolioBias::LongShort,
-                None,
-                RebalancePolicy::insight_changes_only(),
-            ),
-        );
+        framework.pcm = Box::new(ZeroQuantityInsightChangesOnlyPcm);
         let now = dt(2026, 1, 1);
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        framework.restore_insights(
+            InsightCollectionSnapshot {
+                active: vec![
+                    Insight::up(symbol.clone(), TimeSpan::ONE_DAY).with_generated_time_utc(now)
+                ],
+                closed: Vec::new(),
+                total_count: 1,
+            },
+            now,
+        );
+        framework.pending_rebalance = true;
+        framework
+            .pending_flat_targets
+            .push(Insight::flat(symbol.clone(), TimeSpan::ZERO).with_generated_time_utc(now));
 
-        framework.request_rebalance();
+        framework.accept_brokerage_startup_state();
 
-        assert!(framework.is_rebalance_due(now, false));
-        assert!(!framework.is_rebalance_due(now + TimeSpan::ONE_MINUTE, false));
+        let security = SecurityData {
+            symbol: symbol.clone(),
+            price: dec!(500),
+            bid: None,
+            ask: None,
+            volume: None,
+            vwap_price: None,
+            average_volume: None,
+            daily_std_dev: None,
+            end_time: Some(now),
+            lot_size: Decimal::ONE,
+            minimum_price_variation: dec!(0.01),
+            current_quantity: dec!(13),
+            open_order_quantity: Decimal::ZERO,
+        };
+        let securities = HashMap::from([(symbol.id.sid, security)]);
+        let prices = HashMap::from([(symbol.id.sid, dec!(500))]);
+        let execution_context = ExecutionContext::new(now, &securities, &[], dec!(100000));
+        let orders = framework.run_pipeline_from_alpha(
+            &rlean_data::Slice::new(now),
+            Vec::new(),
+            dec!(100000),
+            &prices,
+            &RiskContext::default(),
+            &execution_context,
+        );
+
+        assert!(
+            orders.is_empty(),
+            "startup must not liquidate imported holdings"
+        );
+        assert_eq!(framework.insights.active_count(now), 1);
     }
 
     #[test]
