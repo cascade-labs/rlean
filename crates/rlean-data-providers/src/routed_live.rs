@@ -21,6 +21,8 @@ pub struct RoutedLiveDataProvider {
     market: Arc<dyn LiveDataProvider>,
     custom: Arc<dyn LiveDataProvider>,
     routes: RwLock<HashMap<u64, SubscriptionDataKind>>,
+    custom_required: AtomicBool,
+    custom_lifecycle: Mutex<()>,
 }
 
 impl RoutedLiveDataProvider {
@@ -29,6 +31,8 @@ impl RoutedLiveDataProvider {
             market,
             custom,
             routes: RwLock::new(HashMap::new()),
+            custom_required: AtomicBool::new(false),
+            custom_lifecycle: Mutex::new(()),
         }
     }
 }
@@ -40,12 +44,15 @@ impl LiveDataProvider for RoutedLiveDataProvider {
     }
 
     fn is_connected(&self) -> bool {
-        self.market.is_connected() && self.custom.is_connected()
+        self.market.is_connected()
+            && (!self.custom_required.load(Ordering::Acquire) || self.custom.is_connected())
     }
 
     async fn connect(&self) -> Result<()> {
         self.market.connect().await?;
-        self.custom.connect().await?;
+        if self.custom_required.load(Ordering::Acquire) {
+            self.custom.connect().await?;
+        }
         Ok(())
     }
 
@@ -58,22 +65,52 @@ impl LiveDataProvider for RoutedLiveDataProvider {
 
     async fn subscribe(&self, subscription: LiveSubscription) -> Result<()> {
         let kind = subscription.configuration.data_kind;
-        let provider = if kind == SubscriptionDataKind::Custom {
-            &self.custom
+        if kind == SubscriptionDataKind::Custom {
+            let _lifecycle = self.custom_lifecycle.lock().await;
+            self.custom.connect().await?;
+            if let Err(error) = self.custom.subscribe(subscription.clone()).await {
+                let has_custom = self
+                    .routes
+                    .read()
+                    .await
+                    .values()
+                    .any(|existing| *existing == SubscriptionDataKind::Custom);
+                if !has_custom {
+                    let _ = self.custom.disconnect().await;
+                }
+                return Err(error);
+            }
+            self.routes.write().await.insert(subscription.id, kind);
+            self.custom_required.store(true, Ordering::Release);
         } else {
-            &self.market
-        };
-        provider.subscribe(subscription.clone()).await?;
-        self.routes.write().await.insert(subscription.id, kind);
+            self.market.subscribe(subscription.clone()).await?;
+            self.routes.write().await.insert(subscription.id, kind);
+        }
         Ok(())
     }
 
     async fn unsubscribe(&self, subscription_id: u64) -> Result<()> {
-        let kind = self.routes.write().await.remove(&subscription_id);
-        match kind {
-            Some(SubscriptionDataKind::Custom) => self.custom.unsubscribe(subscription_id).await,
-            Some(_) => self.market.unsubscribe(subscription_id).await,
-            None => Ok(()),
+        let kind = self.routes.read().await.get(&subscription_id).copied();
+        if kind == Some(SubscriptionDataKind::Custom) {
+            let _lifecycle = self.custom_lifecycle.lock().await;
+            self.custom.unsubscribe(subscription_id).await?;
+            let mut routes = self.routes.write().await;
+            routes.remove(&subscription_id);
+            let has_custom = routes
+                .values()
+                .any(|existing| *existing == SubscriptionDataKind::Custom);
+            drop(routes);
+            if !has_custom {
+                self.custom_required.store(false, Ordering::Release);
+                self.custom.disconnect().await?;
+            }
+            Ok(())
+        } else if kind.is_some() {
+            self.market.unsubscribe(subscription_id).await?;
+            self.routes.write().await.remove(&subscription_id);
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 

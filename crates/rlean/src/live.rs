@@ -126,33 +126,52 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
         .unwrap_or_else(|| format!("live-{}", uuid::Uuid::new_v4()));
     let deploy_started_at = chrono::Utc::now();
 
-    let run_catalog = crate::run_catalog::RunCatalog::connect(
-        verglas.clone(),
-        run_id.clone(),
-        strategy_name,
-        &parameters,
-    )
-    .await?;
-    let restore = crate::run_catalog::RunCatalog::load_live_restore(&verglas, &run_id)
-        .await
-        .context("load live restore state from Verglas")?;
-    run_catalog.record_started().await?;
+    // The run catalog and the restart state it holds live in Verglas. Without a
+    // gateway the deploy publishes no run rows and always starts flat, exactly
+    // like its first ever deployment.
+    let run_catalog = match verglas.clone() {
+        Some(verglas) => Some(
+            crate::run_catalog::RunCatalog::connect(
+                verglas,
+                run_id.clone(),
+                strategy_name,
+                &parameters,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let restore = match verglas.as_ref() {
+        Some(verglas) => crate::run_catalog::RunCatalog::load_live_restore(verglas, &run_id)
+            .await
+            .context("load live restore state from Verglas")?,
+        None => None,
+    };
+    if let Some(run_catalog) = run_catalog.as_ref() {
+        run_catalog.record_started().await?;
+    }
 
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
-    let stream_catalog = run_catalog.clone();
-    let stream_task = tokio::spawn(async move {
-        let mut sequence = 0_u64;
-        while let Some(update) = stream_rx.recv().await {
-            // Live checkpoints are restart state, not bulk telemetry. Commit
-            // each update before accepting the next one so a process failure
-            // cannot strand the latest insight refresh in an in-memory batch.
-            stream_catalog
-                .record_stream_updates(vec![update], sequence)
-                .await?;
-            sequence = sequence.wrapping_add(1);
+    let (stream_updates, stream_task) = match run_catalog.clone() {
+        Some(stream_catalog) => {
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
+            let task = tokio::spawn(async move {
+                let mut sequence = 0_u64;
+                while let Some(update) = stream_rx.recv().await {
+                    // Live checkpoints are restart state, not bulk telemetry.
+                    // Commit each update before accepting the next one so a
+                    // process failure cannot strand the latest insight refresh
+                    // in an in-memory batch.
+                    stream_catalog
+                        .record_stream_updates(vec![update], sequence)
+                        .await?;
+                    sequence = sequence.wrapping_add(1);
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            (Some(stream_tx), Some(task))
         }
-        Ok::<_, anyhow::Error>(())
-    });
+        None => (None, None),
+    };
 
     let strategy_path = args.strategy.clone();
     let live_config = rlean_engine::LiveRunConfig {
@@ -167,7 +186,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             .live_limits
             .live_max_runtime_seconds
             .map(Duration::from_secs),
-        stream_updates: Some(stream_tx),
+        stream_updates,
         deploy_started_at,
         restore,
         deploy_id,
@@ -193,9 +212,16 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             .await;
 
     // Drop the sender by ending the engine; then drain the catalog writer.
-    let join_result = stream_task.await;
-    run_catalog.log_dropped_appends_summary();
-    dropped_cache_writes.log_summary();
+    let join_result = match stream_task {
+        Some(task) => Some(task.await),
+        None => None,
+    };
+    if let Some(run_catalog) = run_catalog.as_ref() {
+        run_catalog.log_dropped_appends_summary();
+    }
+    if let Some(dropped_cache_writes) = dropped_cache_writes.as_ref() {
+        dropped_cache_writes.log_summary();
+    }
 
     let result = match run_result {
         Ok(result) => result,
@@ -203,22 +229,28 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             std::process::exit(130);
         }
         Err(error) => {
-            let _ = run_catalog.record_failed(&error).await;
+            if let Some(run_catalog) = run_catalog.as_ref() {
+                let _ = run_catalog.record_failed(&error).await;
+            }
             return Err(error);
         }
     };
-    join_result.context("live catalog stream task")??;
+    if let Some(join_result) = join_result {
+        join_result.context("live catalog stream task")??;
+    }
 
     // Terminal live row: reuse the completed path shape via a synthetic
     // BacktestRunResult is overkill; mark stopped with a final running→failed
     // style append that records final value on the runs table.
-    run_catalog
-        .record_live_stopped(
-            result.final_value,
-            result.slices_processed,
-            result.order_events.len(),
-        )
-        .await?;
+    if let Some(run_catalog) = run_catalog.as_ref() {
+        run_catalog
+            .record_live_stopped(
+                result.final_value,
+                result.slices_processed,
+                result.order_events.len(),
+            )
+            .await?;
+    }
 
     if let Some(brokerage_name) = brokerage_name {
         let mode = if paper_trading {
@@ -235,7 +267,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             result.order_events.len(),
             result.started_at.to_rfc3339(),
             result.stopped_at.to_rfc3339(),
-            run_catalog.run_id(),
+            run_id,
         );
     } else {
         println!(
@@ -245,7 +277,7 @@ async fn run_live_foreground(args: LiveArgs) -> Result<()> {
             result.order_events.len(),
             result.started_at.to_rfc3339(),
             result.stopped_at.to_rfc3339(),
-            run_catalog.run_id(),
+            run_id,
         );
     }
     Ok(())

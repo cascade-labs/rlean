@@ -23,7 +23,11 @@ pub(crate) fn live_container_name(deploy_id: &str) -> String {
 
 pub(crate) fn ensure_environment(global: &GlobalConfig) -> Result<()> {
     ensure_docker()?;
-    ensure_verglas(global)?;
+    // A machine with no Verglas configured runs the engine without a cache,
+    // custom-data feed, or run catalog. There is no gateway to preflight.
+    if let Some(settings) = config::verglas_settings(global)? {
+        ensure_verglas(&settings)?;
+    }
     Ok(())
 }
 
@@ -38,8 +42,8 @@ pub(crate) fn ensure_docker() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_verglas(global: &GlobalConfig) -> Result<()> {
-    let endpoint = verglas_endpoint_for_host(global);
+pub(crate) fn ensure_verglas(settings: &config::VerglasSettings) -> Result<()> {
+    let endpoint = settings.endpoint.as_str();
     let health_url = format!("{}/health", endpoint.trim_end_matches('/'));
     // Prefer curl when present; fall back to a TCP connect on the URL host/port.
     let curl = Command::new("curl")
@@ -333,34 +337,43 @@ fn container_uses_host_network() -> bool {
     cfg!(target_os = "linux")
 }
 
-fn verglas_endpoint_for_host(global: &GlobalConfig) -> String {
-    std::env::var("VERGLAS_ENDPOINT")
-        .ok()
-        .or_else(|| global.verglas_endpoint.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned())
-}
-
-fn verglas_endpoint_for_container(global: &GlobalConfig) -> String {
-    let endpoint = verglas_endpoint_for_host(global);
-    if container_uses_host_network() {
-        endpoint
+fn endpoint_for_container(endpoint: &str, host_network: bool) -> String {
+    if host_network {
+        endpoint.to_owned()
     } else {
-        containerize_loopback_url(&endpoint)
+        containerize_loopback_url(endpoint)
     }
 }
 
-fn optional_endpoint_for_container(name: &str, configured: Option<&str>) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| configured.map(str::to_owned))
-        .map(|endpoint| {
-            if container_uses_host_network() {
-                endpoint
-            } else {
-                containerize_loopback_url(&endpoint)
-            }
-        })
+/// `-e VERGLAS_*` flags for the engine container, or nothing at all when this
+/// machine has no Verglas: the container then resolves the same absent
+/// configuration the host did and runs without a gateway.
+fn verglas_run_args(settings: Option<&config::VerglasSettings>, host_network: bool) -> Vec<String> {
+    let Some(settings) = settings else {
+        return Vec::new();
+    };
+    let mut args = vec![
+        "-e".into(),
+        format!(
+            "VERGLAS_ENDPOINT={}",
+            endpoint_for_container(&settings.endpoint, host_network)
+        ),
+        "-e".into(),
+        format!("VERGLAS_DATABASE={}", settings.database),
+    ];
+    if let Some(access_uri) = settings.access_uri.as_deref() {
+        args.extend([
+            "-e".into(),
+            format!(
+                "VERGLAS_ACCESS_URI={}",
+                endpoint_for_container(access_uri, host_network)
+            ),
+        ]);
+    }
+    if let Some(token) = settings.token.as_deref() {
+        args.extend(["-e".into(), format!("VERGLAS_TOKEN={token}")]);
+    }
+    args
 }
 
 fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
@@ -374,31 +387,30 @@ fn base_run_args(image: &str, global: &GlobalConfig) -> Result<Vec<String>> {
             "host.docker.internal:host-gateway".into(),
         ]);
     }
-    let endpoint = verglas_endpoint_for_container(global);
-    args.extend(["-e".into(), format!("VERGLAS_ENDPOINT={endpoint}")]);
-    if let Some(access_uri) =
-        optional_endpoint_for_container("VERGLAS_ACCESS_URI", global.verglas_access_uri.as_deref())
-    {
-        args.extend(["-e".into(), format!("VERGLAS_ACCESS_URI={access_uri}")]);
-    }
-    let database = std::env::var("VERGLAS_DATABASE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| global.verglas_database.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Verglas database is not configured; set verglas_database or VERGLAS_DATABASE"
-            )
-        })?;
-    config::validate_verglas_database(&database)?;
-    args.extend(["-e".into(), format!("VERGLAS_DATABASE={database}")]);
-    if let Some(token) = std::env::var("VERGLAS_TOKEN")
-        .ok()
-        .or_else(|| global.verglas_token.clone())
-    {
-        args.extend(["-e".into(), format!("VERGLAS_TOKEN={token}")]);
+    args.extend(verglas_run_args(
+        config::verglas_settings(global)?.as_ref(),
+        container_uses_host_network(),
+    ));
+    if let Some(api_key) = unusual_whales_api_key(global) {
+        args.extend(["-e".into(), format!("UNUSUALWHALES_KEY={api_key}")]);
     }
     Ok(args)
+}
+
+fn unusual_whales_api_key(global: &GlobalConfig) -> Option<String> {
+    std::env::var("UNUSUALWHALES_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| configured_unusual_whales_api_key(global))
+}
+
+fn configured_unusual_whales_api_key(global: &GlobalConfig) -> Option<String> {
+    global
+        .providers
+        .get("unusual_whales")
+        .and_then(|provider| provider.get("api_key"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
 }
 
 fn docker_output(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> Result<Output> {
@@ -564,10 +576,68 @@ mod tests {
     }
 
     #[test]
+    fn container_verglas_env_rewrites_loopback_endpoints() {
+        let settings = config::VerglasSettings {
+            endpoint: "http://127.0.0.1:8334".to_string(),
+            access_uri: Some("http://127.0.0.1:8345".to_string()),
+            database: "rlean".to_string(),
+            token: Some("secret".to_string()),
+        };
+
+        assert_eq!(
+            verglas_run_args(Some(&settings), false),
+            vec![
+                "-e".to_string(),
+                "VERGLAS_ENDPOINT=http://host.docker.internal:8334".to_string(),
+                "-e".to_string(),
+                "VERGLAS_DATABASE=rlean".to_string(),
+                "-e".to_string(),
+                "VERGLAS_ACCESS_URI=http://host.docker.internal:8345".to_string(),
+                "-e".to_string(),
+                "VERGLAS_TOKEN=secret".to_string(),
+            ]
+        );
+        assert_eq!(
+            verglas_run_args(Some(&settings), true),
+            vec![
+                "-e".to_string(),
+                "VERGLAS_ENDPOINT=http://127.0.0.1:8334".to_string(),
+                "-e".to_string(),
+                "VERGLAS_DATABASE=rlean".to_string(),
+                "-e".to_string(),
+                "VERGLAS_ACCESS_URI=http://127.0.0.1:8345".to_string(),
+                "-e".to_string(),
+                "VERGLAS_TOKEN=secret".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn container_gets_no_verglas_env_when_verglas_is_not_configured() {
+        assert!(verglas_run_args(None, false).is_empty());
+        assert!(verglas_run_args(None, true).is_empty());
+    }
+
+    #[test]
     fn live_container_name_is_stable() {
         assert_eq!(
             live_container_name("2026-08-07_120000_strategy"),
             "rlean-live-2026-08-07_120000_strategy"
+        );
+    }
+
+    #[test]
+    fn unusual_whales_key_comes_from_provider_config() {
+        let mut global = GlobalConfig::default();
+        global.providers.insert(
+            "unusual_whales".to_string(),
+            [("api_key".to_string(), "uw-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            configured_unusual_whales_api_key(&global).as_deref(),
+            Some("uw-secret")
         );
     }
 }

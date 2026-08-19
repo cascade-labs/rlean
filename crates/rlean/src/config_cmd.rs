@@ -14,7 +14,7 @@ use crate::config::{
 ///   verglas_database            Named Verglas lakehouse database
 ///   verglas_token               Verglas bearer token for all discovered services
 ///   <provider>.<key>            Provider credentials (e.g. thetadata.api_key)
-///                               Known providers: thetadata, massive, tradier, fred
+///                               Known providers include unusual_whales
 use anyhow::{bail, Result};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────

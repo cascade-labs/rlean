@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Native providers that may store credentials under `providers` in ~/.rlean/config.
-pub const KNOWN_PROVIDERS: &[&str] = &["thetadata", "massive", "tradier", "fred"];
+pub const KNOWN_PROVIDERS: &[&str] = &["thetadata", "massive", "tradier", "fred", "unusual_whales"];
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -203,6 +203,69 @@ pub fn validate_verglas_database(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Gateway used when Verglas is configured without an explicit endpoint.
+pub const DEFAULT_VERGLAS_ENDPOINT: &str = "http://127.0.0.1:8334";
+
+/// Verglas gateway settings resolved from the environment and the machine
+/// configuration. Environment values override the persisted configuration.
+#[derive(Debug, Clone)]
+pub struct VerglasSettings {
+    pub endpoint: String,
+    pub access_uri: Option<String>,
+    pub database: String,
+    pub token: Option<String>,
+}
+
+/// Resolve the Verglas gateway, or `None` when this machine has no Verglas.
+///
+/// Verglas is a cache, custom-data, and run-catalog tier layered around the
+/// engine, never the engine itself, so a deployment with no gateway at all is
+/// a legitimate configuration and still trades. A *partial* configuration is
+/// not: once any Verglas setting is present the database is required, so a
+/// typo cannot silently downgrade a run that expected persistence.
+pub fn verglas_settings(global: &GlobalConfig) -> Result<Option<VerglasSettings>> {
+    verglas_settings_from(
+        resolved_verglas_setting("VERGLAS_ENDPOINT", global.verglas_endpoint.as_ref()),
+        resolved_verglas_setting("VERGLAS_ACCESS_URI", global.verglas_access_uri.as_ref()),
+        resolved_verglas_setting("VERGLAS_DATABASE", global.verglas_database.as_ref()),
+        resolved_verglas_setting("VERGLAS_TOKEN", global.verglas_token.as_ref()),
+    )
+}
+
+fn verglas_settings_from(
+    endpoint: Option<String>,
+    access_uri: Option<String>,
+    database: Option<String>,
+    token: Option<String>,
+) -> Result<Option<VerglasSettings>> {
+    if endpoint.is_none() && access_uri.is_none() && database.is_none() && token.is_none() {
+        return Ok(None);
+    }
+    let database = database.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Verglas database is not configured; set verglas_database or VERGLAS_DATABASE"
+        )
+    })?;
+    validate_verglas_database(&database)?;
+    Ok(Some(VerglasSettings {
+        endpoint: endpoint.unwrap_or_else(|| DEFAULT_VERGLAS_ENDPOINT.to_owned()),
+        access_uri,
+        database,
+        token,
+    }))
+}
+
+fn resolved_verglas_setting(variable: &str, configured: Option<&String>) -> Option<String> {
+    fn present(value: &str) -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| present(&value))
+        .or_else(|| configured.and_then(|value| present(value)))
+}
+
 fn json_value_as_config_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => {
@@ -340,6 +403,27 @@ mod tests {
         for invalid in ["", "2rlean", "market/data", "market data"] {
             assert!(validate_verglas_database(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn verglas_is_absent_only_when_nothing_at_all_is_configured() {
+        assert!(verglas_settings_from(None, None, None, None)
+            .unwrap()
+            .is_none());
+
+        let settings = verglas_settings_from(None, None, Some("rlean".into()), None)
+            .unwrap()
+            .expect("a configured database is a configured gateway");
+        assert_eq!(settings.endpoint, DEFAULT_VERGLAS_ENDPOINT);
+        assert_eq!(settings.database, "rlean");
+        assert!(settings.token.is_none());
+
+        // Configured but incomplete stays loud: the run would otherwise lose
+        // its cache and catalog because of a single missing key.
+        assert!(
+            verglas_settings_from(Some("http://gateway:8334".into()), None, None, None).is_err()
+        );
+        assert!(verglas_settings_from(None, None, Some("market/data".into()), None).is_err());
     }
 
     #[test]

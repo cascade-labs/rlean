@@ -107,6 +107,18 @@ where
         );
     }
     algorithm_manager.initialize(&mut services)?;
+    // `RemoveSecurity` is deliberately generation-delayed during ordinary
+    // time steps so framework models can observe the logical removal before
+    // the data feed detaches it. Initialize has no preceding time step or live
+    // subscription set to synchronize, so advance that barrier once and apply
+    // safe direct removals before constructing the initial provider set. This
+    // lets a strategy use AddData + History during Initialize and explicitly
+    // remove the live subscription before the provider ever connects.
+    if let Some(algorithm_state) = algorithm_manager.algorithm().algorithm_state() {
+        let mut algorithm = algorithm_state.lock().expect("algorithm state poisoned");
+        algorithm.advance_removal_time_step();
+        algorithm.process_pending_direct_security_removals();
+    }
     // The deployment selects execution independently from strategy source.
     // Strategies often set a brokerage model for backtests in Initialize;
     // re-apply the live deployment model so the same strategy can be deployed

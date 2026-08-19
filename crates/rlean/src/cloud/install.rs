@@ -317,11 +317,12 @@ fn ensure_remote_docker(exec: &dyn RemoteExec, ssh: &str) -> Result<()> {
 }
 
 fn ensure_remote_verglas(exec: &dyn RemoteExec, ssh: &str, config: &GlobalConfig) -> Result<()> {
-    let endpoint = config
-        .verglas_endpoint
-        .clone()
-        .or_else(|| std::env::var("VERGLAS_ENDPOINT").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned());
+    // The node inherits this config, so a node with no Verglas in it runs the
+    // engine without a gateway and has nothing to probe.
+    let Some(settings) = crate::config::verglas_settings(config)? else {
+        return Ok(());
+    };
+    let endpoint = settings.endpoint;
     // Probe from the node itself so we validate the node's view of Verglas.
     let script = format!(
         "curl -fsS --max-time 5 -o /dev/null -w '%{{http_code}}' {endpoint} || \

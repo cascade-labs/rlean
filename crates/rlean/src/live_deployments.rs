@@ -770,7 +770,7 @@ fn print_catalog_checkpoint_field(run_id: &str, field: &str) -> Result<()> {
         .context("create tokio runtime for catalog query")?;
     runtime.block_on(async {
         let config = GlobalConfig::load()?;
-        let client = crate::runtime::connect_verglas(&config).await?;
+        let client = crate::runtime::require_verglas(&config).await?;
         let escaped = run_id.replace('\'', "''");
         let sql = format!(
             "SELECT payload_json FROM rlean.checkpoints \

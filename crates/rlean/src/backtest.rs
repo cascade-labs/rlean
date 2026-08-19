@@ -72,8 +72,8 @@ fn run_containerized(args: RunArgs) -> Result<()> {
 async fn run_strategy_backtest(
     args: RunArgs,
     historical_provider: Arc<dyn rlean_data_providers::HistoricalDataProvider>,
-    dropped_cache_writes: rlean_data_providers::DroppedCacheWrites,
-    verglas: verglas_sdk::Database,
+    dropped_cache_writes: Option<rlean_data_providers::DroppedCacheWrites>,
+    verglas: Option<verglas_sdk::Database>,
 ) -> Result<()> {
     use rlean_python_runtime::AlgorithmImports;
 
@@ -99,42 +99,56 @@ async fn run_strategy_backtest(
 
     let strategy_name = strategy_name_from_path(&args.strategy);
     let run_id = format!("bt-{}", uuid::Uuid::new_v4());
-    let run_catalog = crate::run_catalog::RunCatalog::connect(
-        verglas,
-        run_id,
-        strategy_name.clone(),
-        &parameters,
-    )
-    .await?;
-    run_catalog.record_started().await?;
+    // The run catalog is a Verglas table. Without a gateway the backtest still
+    // computes and prints its results; they are simply not published.
+    let run_catalog = match verglas {
+        Some(verglas) => Some(
+            crate::run_catalog::RunCatalog::connect(
+                verglas,
+                run_id.clone(),
+                strategy_name.clone(),
+                &parameters,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    if let Some(run_catalog) = run_catalog.as_ref() {
+        run_catalog.record_started().await?;
+    }
 
     // Stream progress and fills through a bounded channel. Backtests can
     // advance much faster than an Iceberg commit; collecting 32 updates keeps
     // result persistence from contending with historical queries while still
     // publishing multiple progress snapshots during a long run. Channel close
     // always flushes the final partial batch.
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
-    let stream_catalog = run_catalog.clone();
-    let stream_task = tokio::spawn(async move {
-        let mut sequence = 0_u64;
-        let mut updates = Vec::with_capacity(32);
-        while let Some(update) = stream_rx.recv().await {
-            updates.push(update);
-            if updates.len() < 32 {
-                continue;
-            }
-            stream_catalog
-                .record_stream_updates(std::mem::take(&mut updates), sequence)
-                .await?;
-            sequence = sequence.wrapping_add(1);
+    let (stream_updates, stream_task) = match run_catalog.clone() {
+        Some(stream_catalog) => {
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(256);
+            let task = tokio::spawn(async move {
+                let mut sequence = 0_u64;
+                let mut updates = Vec::with_capacity(32);
+                while let Some(update) = stream_rx.recv().await {
+                    updates.push(update);
+                    if updates.len() < 32 {
+                        continue;
+                    }
+                    stream_catalog
+                        .record_stream_updates(std::mem::take(&mut updates), sequence)
+                        .await?;
+                    sequence = sequence.wrapping_add(1);
+                }
+                if !updates.is_empty() {
+                    stream_catalog
+                        .record_stream_updates(updates, sequence)
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            (Some(stream_tx), Some(task))
         }
-        if !updates.is_empty() {
-            stream_catalog
-                .record_stream_updates(updates, sequence)
-                .await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    });
+        None => (None, None),
+    };
 
     let progress_bar = backtest_progress_bar();
     progress_bar.set_position(0);
@@ -173,7 +187,7 @@ async fn run_strategy_backtest(
         parameters,
         data_feed_options,
         progress: Some(progress),
-        stream_updates: Some(stream_tx),
+        stream_updates,
     };
 
     let runtime_context =
@@ -203,13 +217,17 @@ async fn run_strategy_backtest(
     let run_result =
         rlean_engine::runner::backtest::run_backtest_with_runtime(bridge, config, runtime_context)
             .await;
-    if let Err(progress_error) = stream_task
-        .await
-        .context("join Verglas run stream writer")?
-    {
-        let error = anyhow::anyhow!("persist backtest progress: {progress_error:#}");
-        let _ = run_catalog.record_failed(&error).await;
-        return Err(error);
+    if let Some(stream_task) = stream_task {
+        if let Err(progress_error) = stream_task
+            .await
+            .context("join Verglas run stream writer")?
+        {
+            let error = anyhow::anyhow!("persist backtest progress: {progress_error:#}");
+            if let Some(run_catalog) = run_catalog.as_ref() {
+                let _ = run_catalog.record_failed(&error).await;
+            }
+            return Err(error);
+        }
     }
 
     let results = match run_result {
@@ -218,10 +236,12 @@ async fn run_strategy_backtest(
             std::process::exit(130);
         }
         Err(error) => {
-            if let Err(catalog_error) = run_catalog.record_failed(&error).await {
-                return Err(error).context(format!(
-                    "also failed to persist failed run state: {catalog_error}"
-                ));
+            if let Some(run_catalog) = run_catalog.as_ref() {
+                if let Err(catalog_error) = run_catalog.record_failed(&error).await {
+                    return Err(error).context(format!(
+                        "also failed to persist failed run state: {catalog_error}"
+                    ));
+                }
             }
             return Err(error);
         }
@@ -234,10 +254,14 @@ async fn run_strategy_backtest(
     results.print_summary();
     // Persistence that was dropped to keep the run alive is reported once here
     // so a run that lost cache or telemetry writes does not look clean.
-    dropped_cache_writes.log_summary();
-    run_catalog.log_dropped_appends_summary();
-    run_catalog.record_completed(&results).await?;
-    println!("Results: verglas://rlean/runs/{}", run_catalog.run_id());
+    if let Some(dropped_cache_writes) = dropped_cache_writes.as_ref() {
+        dropped_cache_writes.log_summary();
+    }
+    if let Some(run_catalog) = run_catalog.as_ref() {
+        run_catalog.log_dropped_appends_summary();
+        run_catalog.record_completed(&results).await?;
+        println!("Results: verglas://rlean/runs/{}", run_catalog.run_id());
+    }
 
     Ok(())
 }

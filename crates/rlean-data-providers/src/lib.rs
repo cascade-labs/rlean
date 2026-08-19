@@ -17,9 +17,9 @@ mod verglas_store;
 
 pub use fred::{FredConfig, FredHistoricalDataProvider};
 pub use history::{
-    CacheAppendOutcome, CacheFirstHistoryProvider, Coverage, DroppedCacheWrites, HistoricalData,
-    HistoricalDataProvider, HistoricalDataStore, HistoryRequest, RiskFreeInterestRateUnavailable,
-    TimeRange,
+    CacheAppendOutcome, CacheFirstHistoryProvider, Coverage, DirectHistoryProvider,
+    DroppedCacheWrites, HistoricalData, HistoricalDataProvider, HistoricalDataStore,
+    HistoryRequest, RiskFreeInterestRateUnavailable, TimeRange,
 };
 pub use live::{LiveDataEvent, LiveDataProvider, LiveSubscription};
 pub use massive::{MassiveConfig, MassiveHistoricalDataProvider};

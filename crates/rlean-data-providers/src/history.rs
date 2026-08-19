@@ -444,53 +444,64 @@ impl CacheFirstHistoryProvider {
             cache.pop_front();
         }
     }
+}
 
-    async fn canonicalize_option_universe(
-        &self,
-        request: &HistoryRequest,
-        data: &mut HistoricalData,
-    ) -> Result<()> {
-        let HistoricalData::OptionUniverse(rows) = data else {
-            return Ok(());
-        };
-        let metadata =
-            request.configuration.option_chain.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("option-universe request is missing chain metadata")
-            })?;
-        let underlying = request
-            .configuration
-            .symbol
-            .underlying
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| Symbol::create_equity(&metadata.underlying_ticker, &Market::usa()));
-        let mut map_rows = self.store.read_map_file(&underlying).await?;
-        if map_rows.is_empty() {
-            for provider in &self.providers {
-                if let Some(rows) = provider.get_map_file(&underlying).await? {
-                    if !rows.is_empty() {
-                        self.store
+/// LEAN identifies an option contract by its underlying's *first* mapped
+/// ticker, so universe rows are only canonical once the map file is resolved.
+/// The store is optional: a run with no canonical cache resolves the map file
+/// from the providers alone and persists nothing.
+async fn canonicalize_option_universe(
+    request: &HistoryRequest,
+    data: &mut HistoricalData,
+    store: Option<&dyn HistoricalDataStore>,
+    providers: &[Arc<dyn HistoricalDataProvider>],
+) -> Result<()> {
+    let HistoricalData::OptionUniverse(rows) = data else {
+        return Ok(());
+    };
+    let metadata = request
+        .configuration
+        .option_chain
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("option-universe request is missing chain metadata"))?;
+    let underlying = request
+        .configuration
+        .symbol
+        .underlying
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| Symbol::create_equity(&metadata.underlying_ticker, &Market::usa()));
+    let mut map_rows = match store {
+        Some(store) => store.read_map_file(&underlying).await?,
+        None => Vec::new(),
+    };
+    if map_rows.is_empty() {
+        for provider in providers {
+            if let Some(rows) = provider.get_map_file(&underlying).await? {
+                if !rows.is_empty() {
+                    if let Some(store) = store {
+                        store
                             .append_map_file(&underlying, provider.name(), &rows)
                             .await?;
                     }
-                    map_rows = rows;
-                    break;
                 }
+                map_rows = rows;
+                break;
             }
         }
-        map_rows.sort_by_key(|row| row.date);
-        let (first_ticker, first_date) = map_rows
-            .first()
-            .map(|row| (row.mapped_symbol.as_str(), row.date))
-            .unwrap_or((metadata.underlying_ticker.as_str(), lean_default_sid_date()));
-        canonicalize_option_universe_rows(
-            rows,
-            first_ticker,
-            first_date,
-            underlying.market(),
-            underlying.security_type(),
-        )
     }
+    map_rows.sort_by_key(|row| row.date);
+    let (first_ticker, first_date) = map_rows
+        .first()
+        .map(|row| (row.mapped_symbol.as_str(), row.date))
+        .unwrap_or((metadata.underlying_ticker.as_str(), lean_default_sid_date()));
+    canonicalize_option_universe_rows(
+        rows,
+        first_ticker,
+        first_date,
+        underlying.market(),
+        underlying.security_type(),
+    )
 }
 
 fn lean_default_sid_date() -> NaiveDate {
@@ -590,8 +601,13 @@ impl HistoricalDataProvider for CacheFirstHistoryProvider {
             // Mark coverage only after a successful response. Empty success is
             // intentional negative knowledge and must survive restarts.
             let mut fetched = provider.get_history(&missing_request).await?;
-            self.canonicalize_option_universe(&missing_request, &mut fetched)
-                .await?;
+            canonicalize_option_universe(
+                &missing_request,
+                &mut fetched,
+                Some(self.store.as_ref()),
+                &self.providers,
+            )
+            .await?;
             fetched.sort_and_deduplicate();
             let outcome = if fetched.is_empty() {
                 CacheAppendOutcome::Persisted
@@ -751,6 +767,90 @@ fn risk_free_rate_missing_ranges(
         missing.push(suffix);
     }
     missing
+}
+
+/// The same provider chain with no canonical cache in front of it.
+///
+/// A deployment without a configured store still trades: every request goes to
+/// the first provider that supports it, and nothing is persisted for later
+/// runs. Custom data has no vendor source — LEAN reads it from its declared
+/// store, not from the equity provider — so custom subscriptions are simply
+/// unsupported here.
+pub struct DirectHistoryProvider {
+    providers: Vec<Arc<dyn HistoricalDataProvider>>,
+}
+
+impl DirectHistoryProvider {
+    pub fn new(providers: Vec<Arc<dyn HistoricalDataProvider>>) -> Result<Self> {
+        if providers.is_empty() {
+            bail!("at least one historical data provider is required");
+        }
+        Ok(Self { providers })
+    }
+}
+
+#[async_trait]
+impl HistoricalDataProvider for DirectHistoryProvider {
+    fn name(&self) -> &str {
+        "direct"
+    }
+
+    fn supports(&self, request: &HistoryRequest) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.supports(request))
+    }
+
+    async fn get_history(&self, request: &HistoryRequest) -> Result<HistoricalData> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.supports(request))
+            .ok_or_else(|| anyhow::anyhow!("no historical provider supports the request"))?;
+        let mut data = provider.get_history(request).await?;
+        canonicalize_option_universe(request, &mut data, None, &self.providers).await?;
+        data.sort_and_deduplicate();
+        Ok(data)
+    }
+
+    async fn get_factor_file(&self, symbol: &Symbol) -> Result<Option<Vec<FactorFileEntry>>> {
+        for provider in &self.providers {
+            if let Some(rows) = provider.get_factor_file(symbol).await? {
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_map_file(&self, symbol: &Symbol) -> Result<Option<Vec<MapFileEntry>>> {
+        for provider in &self.providers {
+            if let Some(rows) = provider.get_map_file(symbol).await? {
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_risk_free_interest_rates(
+        &self,
+        range: TimeRange,
+    ) -> Result<Option<Vec<RiskFreeInterestRate>>> {
+        let mut rows = Vec::new();
+        let mut published = false;
+        for provider in &self.providers {
+            let Some(fetched) = provider.get_risk_free_interest_rates(range).await? else {
+                continue;
+            };
+            published = true;
+            rows.extend(fetched);
+        }
+        if !published {
+            return Ok(None);
+        }
+        rows.sort_by_key(|row| row.time);
+        rows.dedup_by(|left, right| left.time == right.time && left.venue == right.venue);
+        Ok(Some(rows))
+    }
 }
 
 #[cfg(test)]
