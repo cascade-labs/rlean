@@ -1,7 +1,7 @@
 use rlean_core::{DateTime, Market, Symbol, TimeSpan};
 use rlean_execution::{
     AdaptiveMakerTakerExecutionModel, AggressivePostOnlyExecutionModel, ExecutionContext,
-    ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionModel,
+    ExecutionOpenOrder, ExecutionOrderType, ExecutionTarget, IExecutionAlgorithm, IExecutionModel,
     ImmediateExecutionModel, MakerThenTakerExecutionModel, NullExecutionModel,
     PassiveMakerExecutionModel, SecurityData, SpreadExecutionModel,
     StandardDeviationExecutionModel, VwapExecutionModel,
@@ -115,6 +115,59 @@ fn context_orders<'a>(
 
 mod immediate_execution_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct BuyingPowerAlgorithm {
+        security: SecurityData,
+        allowed: AtomicBool,
+    }
+
+    impl IExecutionAlgorithm for BuyingPowerAlgorithm {
+        fn is_warming_up(&self) -> bool {
+            false
+        }
+
+        fn security(&self, symbol: &Symbol) -> Option<SecurityData> {
+            (self.security.symbol.id.sid == symbol.id.sid).then(|| self.security.clone())
+        }
+
+        fn security_has_data(&self, _symbol: &Symbol) -> bool {
+            true
+        }
+
+        fn security_is_tradable(&self, _symbol: &Symbol) -> bool {
+            true
+        }
+
+        fn projected_quantity(&self, _symbol: &Symbol) -> Decimal {
+            self.security.current_quantity
+        }
+
+        fn holdings_quantity(&self, _symbol: &Symbol) -> Decimal {
+            self.security.current_quantity
+        }
+
+        fn validate_market_order_buying_power(
+            &self,
+            _symbol: &Symbol,
+            _quantity: Decimal,
+        ) -> Result<(), String> {
+            if self.allowed.load(Ordering::Relaxed) {
+                Ok(())
+            } else {
+                Err("Insufficient buying power".to_string())
+            }
+        }
+
+        fn above_minimum_order_margin_portfolio_percentage(
+            &self,
+            _symbol: &Symbol,
+            _quantity: Decimal,
+            _minimum_order_margin_portfolio_percentage: Decimal,
+        ) -> bool {
+            true
+        }
+    }
 
     /// No targets provided → no orders submitted.
     /// Mirrors: OrdersAreNotSubmittedWhenNoTargetsToExecute
@@ -190,6 +243,47 @@ mod immediate_execution_tests {
         assert_eq!(first[0].quantity, dec!(90));
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].quantity, dec!(90));
+    }
+
+    #[test]
+    fn retained_target_waits_for_live_buying_power_recovery() {
+        let mut model = ImmediateExecutionModel::new();
+        let security = make_security("AAPL", 250.0, 10.0);
+        let securities = securities_map(vec![security.clone()]);
+        let algorithm = BuyingPowerAlgorithm {
+            security,
+            allowed: AtomicBool::new(false),
+        };
+        let context = context_default(&securities).with_algorithm(&algorithm);
+        let targets = vec![make_target("AAPL", 100.0)];
+
+        let first = model.execute(&targets, &context);
+        let second = model.execute(&[], &context);
+        algorithm.allowed.store(true, Ordering::Relaxed);
+        let recovered = model.execute(&[], &context);
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].quantity, dec!(90));
+    }
+
+    #[test]
+    fn buying_power_preflight_never_blocks_position_reduction() {
+        let mut model = ImmediateExecutionModel::new();
+        let security = make_security("AAPL", 250.0, 100.0);
+        let securities = securities_map(vec![security.clone()]);
+        let algorithm = BuyingPowerAlgorithm {
+            security,
+            allowed: AtomicBool::new(false),
+        };
+        let context = context_default(&securities).with_algorithm(&algorithm);
+        let targets = vec![make_target("AAPL", 50.0)];
+
+        let orders = model.execute(&targets, &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, dec!(-50));
     }
 
     #[test]

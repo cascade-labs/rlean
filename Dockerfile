@@ -27,8 +27,7 @@ RUN apt-get update \
 COPY --from=builder /tmp/rlean /usr/local/bin/rlean
 WORKDIR /strategy
 
-# One Verglas gateway advertises the catalog and routes bounded Arrow queries
-# and writes to its isolated query/write roles. rlean never receives object
-# store credentials and never embeds an Iceberg query engine.
-ENV VERGLAS_ENDPOINT=http://host.docker.internal:8334
+# Verglas is optional. Baking an endpoint in would make every container read as
+# "configured", so a node without a gateway would fail the preflight instead of
+# running uncached. The host injects VERGLAS_* only when one is configured.
 ENTRYPOINT ["/usr/local/bin/rlean"]

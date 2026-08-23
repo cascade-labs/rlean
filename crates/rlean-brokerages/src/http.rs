@@ -8,7 +8,7 @@ use rlean_orders::{Order, OrderStatus, OrderType, TimeInForce, UpdateOrderReques
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{Brokerage, BrokerageHolding};
+use crate::{Brokerage, BrokerageHolding, BrokerageOrderSubmission};
 
 /// Configuration for the language-neutral HTTP execution brokerage contract.
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ impl HttpBrokerage {
         self.get(if open_only { "/orders/open" } else { "/orders" })
     }
 
-    fn submit(&self, order: &Order) -> Result<String> {
+    fn submit(&self, order: &Order) -> Result<BrokerageOrderSubmission> {
         let order_type = match order.order_type {
             OrderType::Market => "market",
             OrderType::Limit => "limit",
@@ -124,14 +124,7 @@ impl HttpBrokerage {
             "order submission",
         )?;
         let response: OrderResponse = decode(response, "order submission")?;
-        if !response.success {
-            bail!("HTTP brokerage rejected order: {}", response.message);
-        }
-        response
-            .order
-            .map(|order| order.order_id)
-            .filter(|id| !id.is_empty())
-            .context("HTTP brokerage accepted order without an order id")
+        classify_order_submission(response)
     }
 
     fn cancel(&self, order: &Order) -> Result<()> {
@@ -183,14 +176,17 @@ impl Brokerage for HttpBrokerage {
     }
 
     fn place_order(&mut self, order: Order) -> rlean_core::Result<bool> {
-        Ok(self.place_order_with_brokerage_ids(order)?.is_some())
+        Ok(matches!(
+            self.place_order_with_brokerage_ids(order)?,
+            BrokerageOrderSubmission::Accepted(_)
+        ))
     }
 
     fn place_order_with_brokerage_ids(
         &mut self,
         order: Order,
-    ) -> rlean_core::Result<Option<Vec<String>>> {
-        Ok(Some(vec![self.submit(&order)?]))
+    ) -> rlean_core::Result<BrokerageOrderSubmission> {
+        Ok(self.submit(&order)?)
     }
 
     fn update_order(&mut self, _order: &Order) -> rlean_core::Result<bool> {
@@ -271,6 +267,18 @@ fn decode<T: DeserializeOwned>(response: Response, operation: &str) -> Result<T>
     response
         .json()
         .with_context(|| format!("decode HTTP brokerage {operation} response"))
+}
+
+fn classify_order_submission(response: OrderResponse) -> Result<BrokerageOrderSubmission> {
+    if !response.success {
+        return Ok(BrokerageOrderSubmission::Rejected(response.message));
+    }
+    let brokerage_id = response
+        .order
+        .map(|order| order.order_id)
+        .filter(|id| !id.is_empty())
+        .context("HTTP brokerage accepted order without an order id")?;
+    Ok(BrokerageOrderSubmission::Accepted(vec![brokerage_id]))
 }
 
 fn to_holding(row: HttpHolding) -> BrokerageHolding {
@@ -400,6 +408,35 @@ struct CashBalance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_order_rejection_is_terminal() {
+        let result = classify_order_submission(OrderResponse {
+            success: false,
+            message: "Insufficient buying power".to_string(),
+            order: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            result,
+            BrokerageOrderSubmission::Rejected("Insufficient buying power".to_string())
+        );
+    }
+
+    #[test]
+    fn accepted_order_without_id_is_a_transport_contract_error() {
+        let error = classify_order_submission(OrderResponse {
+            success: true,
+            message: "accepted".to_string(),
+            order: None,
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("accepted order without an order id"));
+    }
 
     #[test]
     fn normalizes_http_order_into_lean_order() {

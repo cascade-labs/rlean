@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{Brokerage, BrokerageHolding};
+use crate::{Brokerage, BrokerageHolding, BrokerageOrderSubmission};
 
 const LIVE_BASE: &str = "https://api.tradier.com/v1";
 const PAPER_BASE: &str = "https://sandbox.tradier.com/v1";
@@ -249,14 +249,19 @@ impl Brokerage for TradierBrokerage {
     }
 
     fn place_order(&mut self, order: Order) -> rlean_core::Result<bool> {
-        Ok(self.place_order_with_brokerage_ids(order)?.is_some())
+        Ok(matches!(
+            self.place_order_with_brokerage_ids(order)?,
+            BrokerageOrderSubmission::Accepted(_)
+        ))
     }
 
     fn place_order_with_brokerage_ids(
         &mut self,
         order: Order,
-    ) -> rlean_core::Result<Option<Vec<String>>> {
-        Ok(Some(vec![self.submit(&order)?]))
+    ) -> rlean_core::Result<BrokerageOrderSubmission> {
+        Ok(BrokerageOrderSubmission::Accepted(vec![
+            self.submit(&order)?
+        ]))
     }
 
     fn update_order(&mut self, order: &Order) -> rlean_core::Result<bool> {

@@ -12,12 +12,14 @@ use rust_decimal::Decimal;
 /// ordered by margin impact until projected holdings satisfy them.
 pub struct ImmediateExecutionModel {
     targets: HashMap<u64, (Symbol, Decimal, String)>,
+    buying_power_blocks: HashMap<u64, (Decimal, String)>,
 }
 
 impl ImmediateExecutionModel {
     pub fn new() -> Self {
         Self {
             targets: HashMap::new(),
+            buying_power_blocks: HashMap::new(),
         }
     }
 
@@ -27,10 +29,17 @@ impl ImmediateExecutionModel {
         context: &ExecutionContext<'_>,
     ) -> Vec<OrderRequest> {
         for target in targets {
+            let key = target.symbol.id.sid;
+            let changed = self.targets.get(&key).is_some_and(|(_, quantity, tag)| {
+                *quantity != target.quantity || *tag != target.tag
+            });
             self.targets.insert(
-                target.symbol.id.sid,
+                key,
                 (target.symbol.clone(), target.quantity, target.tag.clone()),
             );
+            if changed {
+                self.buying_power_blocks.remove(&key);
+            }
         }
 
         if self.targets.is_empty() {
@@ -79,15 +88,45 @@ impl ImmediateExecutionModel {
                 continue;
             }
 
+            let projected_quantity = context.authoritative_projected_quantity(&symbol, &security);
             let delta = crate::execution_model::adjust_by_lot_size(
                 security.lot_size,
-                target_quantity - context.authoritative_projected_quantity(&symbol, &security),
+                target_quantity - projected_quantity,
             );
             if delta == Decimal::ZERO {
                 continue;
             }
             if !context.above_minimum_order_margin_portfolio_percentage(&security, delta) {
                 continue;
+            }
+
+            let expands_exposure = projected_quantity == Decimal::ZERO
+                || (projected_quantity + delta).abs() > projected_quantity.abs();
+            if expands_exposure {
+                if let Err(message) = context.validate_market_order_buying_power(&symbol, delta) {
+                    let first_block = self
+                        .buying_power_blocks
+                        .get(&key)
+                        .is_none_or(|(blocked_delta, _)| *blocked_delta != delta);
+                    if first_block {
+                        tracing::warn!(
+                            symbol = %symbol.value,
+                            quantity = %delta,
+                            "ImmediateExecutionModel retaining target until buying power is sufficient: {message}"
+                        );
+                    }
+                    self.buying_power_blocks.insert(key, (delta, message));
+                    continue;
+                }
+                if self.buying_power_blocks.remove(&key).is_some() {
+                    tracing::info!(
+                        symbol = %symbol.value,
+                        quantity = %delta,
+                        "ImmediateExecutionModel buying power recovered; retrying retained target"
+                    );
+                }
+            } else {
+                self.buying_power_blocks.remove(&key);
             }
 
             let tag = self
@@ -113,6 +152,7 @@ impl ImmediateExecutionModel {
 
         for key in fulfilled {
             self.targets.remove(&key);
+            self.buying_power_blocks.remove(&key);
         }
 
         orders

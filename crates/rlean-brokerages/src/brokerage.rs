@@ -10,6 +10,12 @@ pub struct BrokerageHolding {
     pub market_price: Price,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerageOrderSubmission {
+    Accepted(Vec<String>),
+    Rejected(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerageTransaction {
     pub id: String,
@@ -38,11 +44,16 @@ pub trait Brokerage: Send + Sync {
     fn connect(&mut self) -> LeanResult<()>;
     fn disconnect(&mut self);
     fn place_order(&mut self, order: Order) -> LeanResult<bool>;
-    fn place_order_with_brokerage_ids(&mut self, order: Order) -> LeanResult<Option<Vec<String>>> {
+    fn place_order_with_brokerage_ids(
+        &mut self,
+        order: Order,
+    ) -> LeanResult<BrokerageOrderSubmission> {
         if self.place_order(order)? {
-            Ok(Some(Vec::new()))
+            Ok(BrokerageOrderSubmission::Accepted(Vec::new()))
         } else {
-            Ok(None)
+            Ok(BrokerageOrderSubmission::Rejected(
+                "Brokerage rejected order submission (no reason reported)".to_string(),
+            ))
         }
     }
     fn update_order(&mut self, order: &Order) -> LeanResult<bool>;

@@ -30,7 +30,7 @@ enum RunsCommand {
 
 pub(crate) async fn run(args: RunsArgs) -> Result<()> {
     let config = crate::config::GlobalConfig::load()?;
-    let client = crate::runtime::connect_verglas(&config)
+    let client = crate::runtime::require_verglas(&config)
         .await
         .context("connect to the Verglas catalog through the local cache")?;
     match args.command {

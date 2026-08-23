@@ -11,12 +11,12 @@ use rlean_brokerages::{
 };
 use rlean_data_providers::LiveDataProvider;
 use rlean_data_providers::{
-    CacheFirstHistoryProvider, DroppedCacheWrites, FredConfig, FredHistoricalDataProvider,
-    HistoricalDataProvider, MassiveConfig, MassiveHistoricalDataProvider, MassiveLiveConfig,
-    MassiveLiveDataProvider, RoutedLiveDataProvider, ThetaDataConfig,
-    ThetaDataHistoricalDataProvider, TradierEnvironment as TradierDataEnvironment,
-    TradierLiveDataProvider, TradierMarketDataConfig, VerglasCustomLiveDataProvider,
-    VerglasHistoricalDataStore,
+    CacheFirstHistoryProvider, DirectHistoryProvider, DroppedCacheWrites, FredConfig,
+    FredHistoricalDataProvider, HistoricalDataProvider, MassiveConfig,
+    MassiveHistoricalDataProvider, MassiveLiveConfig, MassiveLiveDataProvider,
+    RoutedLiveDataProvider, ThetaDataConfig, ThetaDataHistoricalDataProvider,
+    TradierEnvironment as TradierDataEnvironment, TradierLiveDataProvider, TradierMarketDataConfig,
+    VerglasCustomLiveDataProvider, VerglasHistoricalDataStore,
 };
 use verglas_sdk::{Client as VerglasClient, ConnectOptions, Database};
 
@@ -35,12 +35,13 @@ pub(crate) fn backtest_progress_bar() -> indicatif::ProgressBar {
     bar
 }
 
-/// Builds the cache-first historical provider and the tally of canonical cache
-/// batches it drops. The caller reports the tally when its run finishes.
+/// Builds the historical provider and, when Verglas backs it, the tally of
+/// canonical cache batches it drops. The caller reports the tally when its run
+/// finishes. Without Verglas there is no cache tier and therefore no tally.
 pub(crate) async fn historical_data_provider(
     args: &RunArgs,
-    verglas: Database,
-) -> Result<(Arc<dyn HistoricalDataProvider>, DroppedCacheWrites)> {
+    verglas: Option<Database>,
+) -> Result<(Arc<dyn HistoricalDataProvider>, Option<DroppedCacheWrites>)> {
     let name = args
         .data_provider_historical
         .as_deref()
@@ -86,6 +87,16 @@ pub(crate) async fn historical_data_provider(
     // The risk-free rate publisher is selected independently of the market-data
     // provider: it serves one global series and no bars.
     providers.extend(risk_free_interest_rate_provider()?);
+    // Without a canonical cache the provider chain is the whole history stack:
+    // every request goes to the vendor and nothing is persisted for later runs.
+    let Some(verglas) = verglas else {
+        let provider = DirectHistoryProvider::new(providers)?;
+        tracing::info!(
+            provider = name,
+            "Configured uncached historical data provider; Verglas is not configured"
+        );
+        return Ok((Arc::new(provider), None));
+    };
     let store = Arc::new(VerglasHistoricalDataStore::new(verglas).await?);
     let dropped_cache_writes = store.dropped_cache_writes();
     let provider = CacheFirstHistoryProvider::new(store, providers)?;
@@ -93,7 +104,7 @@ pub(crate) async fn historical_data_provider(
         provider = name,
         "Configured cache-first historical data provider"
     );
-    Ok((Arc::new(provider), dropped_cache_writes))
+    Ok((Arc::new(provider), Some(dropped_cache_writes)))
 }
 
 /// FRED publishes the discount-window primary credit rate that LEAN's
@@ -123,7 +134,7 @@ fn risk_free_interest_rate_provider() -> Result<Option<Arc<dyn HistoricalDataPro
 
 pub(crate) async fn live_data_provider(
     args: &RunArgs,
-    verglas: Database,
+    verglas: Option<Database>,
     consumer_group: &str,
 ) -> Result<Arc<dyn LiveDataProvider>> {
     let name = args
@@ -163,6 +174,12 @@ pub(crate) async fn live_data_provider(
             ))?)
         }
         other => bail!("unsupported live data provider '{other}'"),
+    };
+    // Custom data is published into Verglas by operator applications. With no
+    // gateway there is no custom feed to route to, so the market provider
+    // serves the whole subscription set on its own.
+    let Some(verglas) = verglas else {
+        return Ok(market);
     };
     let custom: Arc<dyn LiveDataProvider> =
         Arc::new(VerglasCustomLiveDataProvider::new(verglas, consumer_group.to_owned()).await?);
@@ -244,50 +261,52 @@ fn optional_f64(values: &std::collections::BTreeMap<String, String>, key: &str) 
 }
 
 /// Connects once to the configured Verglas gateway and selects one database.
-/// Environment values override the persisted machine configuration.
+///
+/// `None` means this machine has no Verglas configured at all, which is a
+/// supported deployment: the run then serves history straight from its
+/// providers and keeps no run catalog. A gateway that *is* configured but
+/// cannot be reached stays fatal, because that is a broken deployment rather
+/// than an intentionally cache-less one.
 pub(crate) async fn connect_verglas(
     global_config: &config::GlobalConfig,
-) -> Result<verglas_sdk::Database> {
-    let endpoint = std::env::var("VERGLAS_ENDPOINT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| global_config.verglas_endpoint.clone())
-        .unwrap_or_else(|| "http://127.0.0.1:8334".to_owned());
-    let token = std::env::var("VERGLAS_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| global_config.verglas_token.clone());
-    let database = std::env::var("VERGLAS_DATABASE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| global_config.verglas_database.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Verglas database is not configured; set verglas_database or VERGLAS_DATABASE"
-            )
-        })?;
-    config::validate_verglas_database(&database)?;
+) -> Result<Option<Database>> {
+    let Some(settings) = config::verglas_settings(global_config)? else {
+        return Ok(None);
+    };
     // The configured endpoint is the stable Verglas gateway. Bind query,
     // catalog, and write traffic to it explicitly so a gateway deployed on the
     // Docker host cannot redirect the client to its own loopback address from
     // `/admin/access` discovery metadata.
-    let mut options = ConnectOptions::new(endpoint.clone()).with_query_uri(endpoint.clone());
-    if let Some(access_uri) = std::env::var("VERGLAS_ACCESS_URI")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| global_config.verglas_access_uri.clone())
-    {
+    let mut options =
+        ConnectOptions::new(settings.endpoint.clone()).with_query_uri(settings.endpoint.clone());
+    if let Some(access_uri) = settings.access_uri.clone() {
         options = options.with_access_uri(access_uri);
     }
-    if let Some(value) = token.as_ref() {
+    if let Some(value) = settings.token.as_ref() {
         options = options.with_token(value);
     }
-    let client = VerglasClient::connect(options)
-        .await
-        .with_context(|| format!("connect to Verglas database {database} at {endpoint}"))?;
+    let client = VerglasClient::connect(options).await.with_context(|| {
+        format!(
+            "connect to Verglas database {} at {}",
+            settings.database, settings.endpoint
+        )
+    })?;
     client
-        .database(&database)
+        .database(&settings.database)
         .context("bind Verglas client to configured database")
+        .map(Some)
+}
+
+/// Verglas for the commands that only exist to read the run catalog. They have
+/// nothing to fall back to, so an unconfigured gateway is an error here even
+/// though it is legitimate for a run.
+pub(crate) async fn require_verglas(global_config: &config::GlobalConfig) -> Result<Database> {
+    connect_verglas(global_config).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Verglas is not configured; set verglas_database and verglas_endpoint \
+             (or VERGLAS_DATABASE / VERGLAS_ENDPOINT)"
+        )
+    })
 }
 
 pub(crate) fn resolve_strategy_file(path: PathBuf) -> Result<PathBuf> {
