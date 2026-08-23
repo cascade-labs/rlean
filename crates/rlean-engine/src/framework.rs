@@ -691,6 +691,25 @@ impl IExecutionAlgorithm for AlgorithmExecutionContext {
             .set_target(symbol, quantity);
     }
 
+    fn validate_market_order_buying_power(
+        &self,
+        symbol: &Symbol,
+        quantity: Decimal,
+    ) -> Result<(), String> {
+        let algorithm = self.algorithm.lock().unwrap();
+        if !algorithm.live_mode {
+            return Ok(());
+        }
+        let order = rlean_orders::Order::market(
+            0,
+            symbol.clone(),
+            quantity,
+            algorithm.utc_time,
+            "ImmediateExecutionModel buying-power preflight",
+        );
+        algorithm.validate_order_submission_buying_power(&order)
+    }
+
     fn above_minimum_order_margin_portfolio_percentage(
         &self,
         symbol: &Symbol,

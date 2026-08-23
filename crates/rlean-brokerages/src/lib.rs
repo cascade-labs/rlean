@@ -4,7 +4,7 @@ pub mod http;
 pub mod paper_brokerage;
 pub mod tradier;
 
-pub use brokerage::{Brokerage, BrokerageHolding, BrokerageTransaction};
+pub use brokerage::{Brokerage, BrokerageHolding, BrokerageOrderSubmission, BrokerageTransaction};
 pub use brokerage_model::{BrokerageModel, DefaultBrokerageModel};
 pub use http::{HttpBrokerage, HttpBrokerageConfig};
 pub use paper_brokerage::PaperBrokerage;

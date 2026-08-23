@@ -92,6 +92,19 @@ pub trait IExecutionAlgorithm: Send + Sync {
     fn projected_quantity(&self, symbol: &Symbol) -> Decimal;
     fn holdings_quantity(&self, symbol: &Symbol) -> Decimal;
 
+    /// Validate a market order against the algorithm-owned live buying-power
+    /// model before the execution model creates a concrete order. Standalone
+    /// and non-live contexts default to allowing the request; the live router
+    /// repeats the same validation immediately before crossing the brokerage
+    /// boundary to close any race with prices or fills.
+    fn validate_market_order_buying_power(
+        &self,
+        _symbol: &Symbol,
+        _quantity: Decimal,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Store the latest framework portfolio target on the authoritative
     /// holding before execution. C# LEAN's `QCAlgorithm.ProcessInsights` does
     /// this before calling `Execution.Execute`, and pending universe removals
@@ -289,6 +302,16 @@ impl<'a> ExecutionContext<'a> {
         if let Some(algorithm) = self.algorithm {
             algorithm.set_holdings_target(symbol, quantity);
         }
+    }
+
+    pub fn validate_market_order_buying_power(
+        &self,
+        symbol: &Symbol,
+        quantity: Decimal,
+    ) -> Result<(), String> {
+        self.algorithm
+            .map(|algorithm| algorithm.validate_market_order_buying_power(symbol, quantity))
+            .unwrap_or(Ok(()))
     }
 
     pub fn security(&self, symbol: &Symbol) -> Option<&SecurityData> {

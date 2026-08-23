@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rlean_algorithm::lifecycle::{AlgorithmBridge, AlgorithmServices};
 use rlean_algorithm::portfolio::SecurityPortfolioManager;
 use rlean_algorithm::qc_algorithm::{AccountType, QcAlgorithm};
-use rlean_brokerages::Brokerage;
+use rlean_brokerages::{Brokerage, BrokerageOrderSubmission};
 use rlean_core::{DateTime, Price, Quantity};
 use rlean_orders::{Order, OrderEvent, OrderStatus, OrderType, TransactionManager};
 use rlean_statistics::{Trade, TradeBuilder};
@@ -85,9 +85,9 @@ pub(crate) enum BrokerageEvent {
 ///
 /// The delays are deliberately short and few: a retryable brokerage response is
 /// most often a transient transport hiccup (e.g. a response-decode failure), so a
-/// couple of spaced-out retries recover it, while a genuine rejection surfaced
-/// as `Err` just fails a couple more times and reaches the same terminal state
-/// a few seconds later.
+/// couple of spaced-out retries recover it. Brokerage business rejections use
+/// `BrokerageOrderSubmission::Rejected` and go terminal immediately without
+/// entering this retry schedule.
 const SUBMIT_BACKOFF: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(5),
     std::time::Duration::from_secs(15),
@@ -928,7 +928,7 @@ fn handle_submit(
 ) {
     let order_id = order.id;
     match brokerage.place_order_with_brokerage_ids(order) {
-        Ok(Some(brokerage_ids)) => {
+        Ok(BrokerageOrderSubmission::Accepted(brokerage_ids)) => {
             for brokerage_id in &brokerage_ids {
                 brokerage_to_engine.insert(brokerage_id.clone(), order_id);
             }
@@ -937,14 +937,8 @@ fn handle_submit(
                 brokerage_ids,
             });
         }
-        // Ok(None) means the brokerage declined without surfacing a reason (e.g.
-        // the default trait impl returning `false`). Brokerages that know why a
-        // submission failed return `Err`, which carries the real detail below.
-        Ok(None) => {
-            let _ = event_tx.send(BrokerageEvent::Invalid {
-                order_id,
-                message: "Brokerage rejected order submission (no reason reported)".to_string(),
-            });
+        Ok(BrokerageOrderSubmission::Rejected(message)) => {
+            let _ = event_tx.send(BrokerageEvent::Invalid { order_id, message });
         }
         // An `Err` is a transport/transient submission failure (the adapter could
         // not complete the request), NOT a broker rejection. Report it as a
@@ -1099,8 +1093,8 @@ pub(crate) mod test_support {
 
     /// Deterministic mock brokerage for router/startup-sync tests.
     ///
-    /// `submit_should_fail` makes `place_order_with_brokerage_ids` return `None`
-    /// (terminal rejection). `submit_err_count` makes it return `Err` (a
+    /// `submit_should_fail` makes `place_order_with_brokerage_ids` return a
+    /// terminal rejection. `submit_err_count` makes it return `Err` (a
     /// transient submission failure) that many times, decrementing on each call,
     /// then succeed — used to exercise the bounded submission retry.
     /// `account_orders` is what the poll returns; tests mutate it to simulate a
@@ -1145,12 +1139,15 @@ pub(crate) mod test_support {
             self.connected = false;
         }
         fn place_order(&mut self, order: Order) -> LeanResult<bool> {
-            Ok(self.place_order_with_brokerage_ids(order)?.is_some())
+            Ok(matches!(
+                self.place_order_with_brokerage_ids(order)?,
+                BrokerageOrderSubmission::Accepted(_)
+            ))
         }
         fn place_order_with_brokerage_ids(
             &mut self,
             order: Order,
-        ) -> LeanResult<Option<Vec<String>>> {
+        ) -> LeanResult<BrokerageOrderSubmission> {
             // A pending transient-failure budget returns `Err` (a submission
             // failure that the router retries), decrementing each call.
             {
@@ -1163,7 +1160,9 @@ pub(crate) mod test_support {
                 }
             }
             if self.submit_should_fail {
-                return Ok(None);
+                return Ok(BrokerageOrderSubmission::Rejected(
+                    "mock terminal rejection".to_string(),
+                ));
             }
             let brokerage_id = {
                 let mut id = self.next_brokerage_id.lock();
@@ -1177,7 +1176,7 @@ pub(crate) mod test_support {
             reflected.status = OrderStatus::Submitted;
             reflected.brokerage_id = vec![brokerage_id.clone()];
             self.account_orders.lock().push(reflected);
-            Ok(Some(vec![brokerage_id]))
+            Ok(BrokerageOrderSubmission::Accepted(vec![brokerage_id]))
         }
         fn update_order(&mut self, _order: &Order) -> LeanResult<bool> {
             Ok(true)
@@ -1265,6 +1264,26 @@ mod tests {
         assert!(!state.request_in_flight);
         assert!(!state.should_request(rlean_core::NanosecondTimestamp(now.0 + 999_000_000)));
         assert!(state.should_request(rlean_core::NanosecondTimestamp(now.0 + 1_000_000_000)));
+    }
+
+    #[test]
+    fn terminal_brokerage_rejection_is_invalid_without_submit_retry() {
+        let mut brokerage = MockBrokerage {
+            submit_should_fail: true,
+            ..MockBrokerage::new()
+        };
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut brokerage_to_engine = HashMap::new();
+        let order = Order::market(42, spy(), dec!(1), DateTime::now(), "replacement");
+
+        handle_submit(&mut brokerage, order, &event_tx, &mut brokerage_to_engine);
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            BrokerageEvent::Invalid { order_id: 42, message }
+                if message == "mock terminal rejection"
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
